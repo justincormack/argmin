@@ -7,9 +7,9 @@ use ec::{EcConfig, ErasureCodec};
 use s3_types::{BucketLifecycleConfiguration, BucketVersioningState};
 use storage::traits::{PgMetadataStore, ShardStore};
 use storage::{
-    BucketInfo, BucketName, EcShape, GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq,
-    ListObjectsReq, MultipartReclaimPartRecord, ObjectEncryption, ObjectKey, OwnerIdentity,
-    ShardKey, SharedStorageNode, StoredObject, UploadId, UploadState, VersionId,
+    BucketInfo, BucketName, EcShape, GenerationId, MultipartReclaimPartRecord, ObjectEncryption,
+    ObjectKey, OwnerIdentity, ShardKey, SharedStorageNode, StoredObject, UploadId, UploadState,
+    VersionId,
 };
 
 use super::payload::{PooledPayloadBuffer, SharedPayloadBuffer};
@@ -226,33 +226,28 @@ impl ReadRuntime {
             aborted_multipart_uploads: 0,
         };
         let mut processed_buckets: HashSet<BucketName> = HashSet::new();
+        let sweep_buckets = self
+            .storage_node
+            .list_lifecycle_sweep_buckets()
+            .map_err(Coordinator::map_object_pg_action_error)?;
 
-        self.pg_topology.for_each_pg(|pg_id| {
-            let pg = self.storage_node.get_pg(pg_id)?;
-            let buckets = pg.list_buckets_with_lifecycle()?;
-            let aborting_buckets = pg.list_buckets_with_aborting_multipart_uploads()?;
-            drop(pg);
-
-            for bucket in buckets {
-                if processed_buckets.insert(bucket.name.clone()) {
-                    stats.scanned_buckets += 1;
-                }
-                self.expire_due_current_objects_for_bucket(&bucket, now_millis, &mut stats)?;
-                self.expire_due_noncurrent_versions_for_bucket(&bucket, now_millis, &mut stats)?;
-                self.expire_due_delete_markers_for_bucket(&bucket, now_millis, &mut stats)?;
-                self.abort_due_multipart_uploads_for_bucket(&bucket, now_millis, &mut stats)?;
+        for bucket in sweep_buckets.lifecycle_buckets {
+            if processed_buckets.insert(bucket.name.clone()) {
+                stats.scanned_buckets += 1;
             }
+            self.expire_due_current_objects_for_bucket(&bucket, now_millis, &mut stats)?;
+            self.expire_due_noncurrent_versions_for_bucket(&bucket, now_millis, &mut stats)?;
+            self.expire_due_delete_markers_for_bucket(&bucket, now_millis, &mut stats)?;
+            self.abort_due_multipart_uploads_for_bucket(&bucket, now_millis, &mut stats)?;
+        }
 
-            for bucket in aborting_buckets {
-                if processed_buckets.insert(bucket.clone()) {
-                    stats.scanned_buckets += 1;
-                }
-                stats.aborted_multipart_uploads +=
-                    self.finish_aborting_multipart_uploads_for_bucket(&bucket)?;
+        for bucket in sweep_buckets.aborting_buckets {
+            if processed_buckets.insert(bucket.clone()) {
+                stats.scanned_buckets += 1;
             }
-
-            Ok::<(), ServerError>(())
-        })?;
+            stats.aborted_multipart_uploads +=
+                self.finish_aborting_multipart_uploads_for_bucket(&bucket)?;
+        }
 
         Ok(stats)
     }
@@ -268,41 +263,31 @@ impl ReadRuntime {
         };
 
         let mut candidates = Vec::new();
-        self.pg_topology.for_each_pg(|pg_id| {
-            let pg = self.storage_node.get_pg(pg_id)?;
-            let objects = pg.list_objects(&ListObjectsReq {
-                bucket: bucket_info.name.clone(),
-                prefix: None,
-                start_after: None,
-                start_at: None,
-                max_keys: u32::MAX,
-            })?;
-            drop(pg);
-
-            for object in objects.objects {
-                let Some(record) = object.into_live() else {
-                    continue;
-                };
-                let tags = match record.tags.as_deref() {
-                    Some(tags_xml) => Coordinator::parse_serialized_tag_set(tags_xml)?,
-                    None => Vec::new(),
-                };
-                let Some(expiration) = Coordinator::evaluate_current_object_lifecycle_expiration(
-                    &config,
-                    record.key.as_str(),
-                    &tags,
-                    record.size,
-                    record.last_modified,
-                ) else {
-                    continue;
-                };
-                if expiration.expiry_time_millis <= now_millis {
-                    candidates.push((record.key, record.version_id));
-                }
+        let objects = self
+            .storage_node
+            .list_all_objects_for_bucket(&bucket_info.name)
+            .map_err(Coordinator::map_object_pg_action_error)?;
+        for object in objects {
+            let Some(record) = object.into_live() else {
+                continue;
+            };
+            let tags = match record.tags.as_deref() {
+                Some(tags_xml) => Coordinator::parse_serialized_tag_set(tags_xml)?,
+                None => Vec::new(),
+            };
+            let Some(expiration) = Coordinator::evaluate_current_object_lifecycle_expiration(
+                &config,
+                record.key.as_str(),
+                &tags,
+                record.size,
+                record.last_modified,
+            ) else {
+                continue;
+            };
+            if expiration.expiry_time_millis <= now_millis {
+                candidates.push((record.key, record.version_id));
             }
-
-            Ok::<(), ServerError>(())
-        })?;
+        }
 
         for (key, version_id) in candidates {
             if self.expire_current_object_if_due(&bucket_info.name, &key, version_id, now_millis)? {
@@ -318,25 +303,15 @@ impl ReadRuntime {
         bucket: &BucketName,
     ) -> Result<u64, ServerError> {
         let mut candidates = Vec::new();
-        self.pg_topology.for_each_pg(|pg_id| {
-            let pg = self.storage_node.get_pg(pg_id)?;
-            let uploads = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                bucket: bucket.clone(),
-                prefix: None,
-                key_marker: None,
-                upload_id_marker: None,
-                max_uploads: u32::MAX,
-            })?;
-            drop(pg);
-
-            for upload in uploads.uploads {
-                if upload.state == UploadState::Aborting {
-                    candidates.push((upload.key, upload.upload_id));
-                }
+        let uploads = self
+            .storage_node
+            .list_all_multipart_uploads_for_bucket(bucket)
+            .map_err(Coordinator::map_object_pg_action_error)?;
+        for upload in uploads {
+            if upload.state == UploadState::Aborting {
+                candidates.push((upload.key, upload.upload_id));
             }
-
-            Ok::<(), ServerError>(())
-        })?;
+        }
 
         let mut finished = 0u64;
         for (key, upload_id) in candidates {
@@ -358,41 +333,29 @@ impl ReadRuntime {
         };
 
         let mut candidate_keys = Vec::new();
-        self.pg_topology.for_each_pg(|pg_id| {
-            let pg = self.storage_node.get_pg(pg_id)?;
-            let versions = pg.list_object_versions(&ListObjectVersionsReq {
-                bucket: bucket_info.name.clone(),
-                prefix: None,
-                key_marker: None,
-                version_id_marker: None,
-                max_keys: u32::MAX,
-            })?;
-            drop(pg);
-
-            let mut group_start = 0usize;
-            while group_start < versions.versions.len() {
-                let key = versions.versions[group_start].key().clone();
-                let mut group_end = group_start + 1;
-                while group_end < versions.versions.len()
-                    && versions.versions[group_end].key() == &key
-                {
-                    group_end += 1;
-                }
-
-                if !Coordinator::evaluate_due_noncurrent_version_expirations(
-                    &config,
-                    &versions.versions[group_start..group_end],
-                    now_millis,
-                )?
-                .is_empty()
-                {
-                    candidate_keys.push(key);
-                }
-                group_start = group_end;
+        let versions = self
+            .storage_node
+            .list_all_object_versions_for_bucket(&bucket_info.name)
+            .map_err(Coordinator::map_object_pg_action_error)?;
+        let mut group_start = 0usize;
+        while group_start < versions.len() {
+            let key = versions[group_start].key().clone();
+            let mut group_end = group_start + 1;
+            while group_end < versions.len() && versions[group_end].key() == &key {
+                group_end += 1;
             }
 
-            Ok::<(), ServerError>(())
-        })?;
+            if !Coordinator::evaluate_due_noncurrent_version_expirations(
+                &config,
+                &versions[group_start..group_end],
+                now_millis,
+            )?
+            .is_empty()
+            {
+                candidate_keys.push(key);
+            }
+            group_start = group_end;
+        }
 
         for key in candidate_keys {
             stats.expired_noncurrent_versions +=
@@ -564,39 +527,27 @@ impl ReadRuntime {
         };
 
         let mut candidates = Vec::new();
-        self.pg_topology.for_each_pg(|pg_id| {
-            let pg = self.storage_node.get_pg(pg_id)?;
-            let versions = pg.list_object_versions(&ListObjectVersionsReq {
-                bucket: bucket_info.name.clone(),
-                prefix: None,
-                key_marker: None,
-                version_id_marker: None,
-                max_keys: u32::MAX,
-            })?;
-            drop(pg);
-
-            let mut group_start = 0usize;
-            while group_start < versions.versions.len() {
-                let key = versions.versions[group_start].key().clone();
-                let mut group_end = group_start + 1;
-                while group_end < versions.versions.len()
-                    && versions.versions[group_end].key() == &key
-                {
-                    group_end += 1;
-                }
-
-                if let Some(expiration) = Coordinator::evaluate_due_expired_delete_marker(
-                    &config,
-                    &versions.versions[group_start..group_end],
-                    now_millis,
-                ) {
-                    candidates.push((key, expiration.version_id));
-                }
-                group_start = group_end;
+        let versions = self
+            .storage_node
+            .list_all_object_versions_for_bucket(&bucket_info.name)
+            .map_err(Coordinator::map_object_pg_action_error)?;
+        let mut group_start = 0usize;
+        while group_start < versions.len() {
+            let key = versions[group_start].key().clone();
+            let mut group_end = group_start + 1;
+            while group_end < versions.len() && versions[group_end].key() == &key {
+                group_end += 1;
             }
 
-            Ok::<(), ServerError>(())
-        })?;
+            if let Some(expiration) = Coordinator::evaluate_due_expired_delete_marker(
+                &config,
+                &versions[group_start..group_end],
+                now_millis,
+            ) {
+                candidates.push((key, expiration.version_id));
+            }
+            group_start = group_end;
+        }
 
         for (key, version_id) in candidates {
             if self.expire_delete_marker_if_due(&bucket_info.name, &key, version_id, now_millis)? {
@@ -665,36 +616,25 @@ impl ReadRuntime {
         };
 
         let mut candidates = Vec::new();
-        self.pg_topology.for_each_pg(|pg_id| {
-            let pg = self.storage_node.get_pg(pg_id)?;
-            let uploads = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                bucket: bucket_info.name.clone(),
-                prefix: None,
-                key_marker: None,
-                upload_id_marker: None,
-                max_uploads: u32::MAX,
-            })?;
-            drop(pg);
-
-            for upload in uploads.uploads {
-                if upload.state != UploadState::InProgress && upload.state != UploadState::Aborting
-                {
-                    continue;
-                }
-                let Some(headers) = Coordinator::evaluate_multipart_lifecycle_abort_headers(
-                    &config,
-                    upload.key.as_str(),
-                    upload.initiated_at,
-                ) else {
-                    continue;
-                };
-                if headers.abort_time_millis <= now_millis {
-                    candidates.push((upload.key, upload.upload_id));
-                }
+        let uploads = self
+            .storage_node
+            .list_all_multipart_uploads_for_bucket(&bucket_info.name)
+            .map_err(Coordinator::map_object_pg_action_error)?;
+        for upload in uploads {
+            if upload.state != UploadState::InProgress && upload.state != UploadState::Aborting {
+                continue;
             }
-
-            Ok::<(), ServerError>(())
-        })?;
+            let Some(headers) = Coordinator::evaluate_multipart_lifecycle_abort_headers(
+                &config,
+                upload.key.as_str(),
+                upload.initiated_at,
+            ) else {
+                continue;
+            };
+            if headers.abort_time_millis <= now_millis {
+                candidates.push((upload.key, upload.upload_id));
+            }
+        }
 
         for (key, upload_id) in candidates {
             if self.abort_multipart_upload_if_due(

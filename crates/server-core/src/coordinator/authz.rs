@@ -899,12 +899,18 @@ impl Coordinator {
             return Ok(None);
         }
 
-        let bucket_pg = self.get_bucket_pg_for(&bucket.name)?;
-        let tags = Self::load_bucket_subresource_from_pg(
-            &bucket_pg,
-            &bucket.name,
-            storage::BucketSubresourceKind::Tagging,
-        )?;
+        let tags = self
+            .storage_node
+            .get_bucket_subresource(&bucket.name, storage::BucketSubresourceKind::Tagging)
+            .map_err(|error| match error {
+                storage::BucketSnapshotLoadError::Store(error) => ServerError::Store(error),
+                storage::BucketSnapshotLoadError::Metadata(
+                    storage::MetadataError::BucketNotFound { name },
+                ) => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                storage::BucketSnapshotLoadError::Metadata(other) => ServerError::Metadata(other),
+            })?;
         match tags {
             Some(tags_xml) => Ok(Some(Self::parse_serialized_tag_set(&tags_xml)?)),
             None => Ok(Some(Vec::new())),

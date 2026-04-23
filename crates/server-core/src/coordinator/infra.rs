@@ -2,7 +2,9 @@
 use super::runtime::LifecycleSweepStats;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, MutexGuard, RwLock};
+use std::sync::{Arc, RwLock};
+#[cfg(test)]
+use std::sync::MutexGuard;
 
 use ec::{EcConfig, ErasureCodec};
 
@@ -171,8 +173,24 @@ impl Coordinator {
             });
         }
 
-        let bucket_pg = self.get_bucket_pg(name.as_str())?;
-        self.load_active_bucket_summary_from_pg(&bucket_pg, &name)
+        let info = self
+            .storage_node
+            .head_bucket_info(&name)
+            .map_err(|error| match error {
+                storage::BucketSnapshotLoadError::Store(error) => ServerError::Store(error),
+                storage::BucketSnapshotLoadError::Metadata(
+                    storage::MetadataError::BucketNotFound { name },
+                ) => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                storage::BucketSnapshotLoadError::Metadata(other) => ServerError::Metadata(other),
+            })?;
+        if info.state != BucketState::Active {
+            return Err(ServerError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(Self::bucket_summary(info))
     }
 
     pub(super) fn unchecked_active_bucket_summary_for(
@@ -188,8 +206,24 @@ impl Coordinator {
             });
         }
 
-        let bucket_pg = self.get_bucket_pg_for(name)?;
-        self.load_active_bucket_summary_from_pg(&bucket_pg, name)
+        let info = self
+            .storage_node
+            .head_bucket_info(name)
+            .map_err(|error| match error {
+                storage::BucketSnapshotLoadError::Store(error) => ServerError::Store(error),
+                storage::BucketSnapshotLoadError::Metadata(
+                    storage::MetadataError::BucketNotFound { name },
+                ) => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                storage::BucketSnapshotLoadError::Metadata(other) => ServerError::Metadata(other),
+            })?;
+        if info.state != BucketState::Active {
+            return Err(ServerError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(Self::bucket_summary(info))
     }
 
     pub(super) fn checked_active_bucket_summary_for(
@@ -361,6 +395,7 @@ impl Coordinator {
         &self.region
     }
 
+    #[cfg(test)]
     pub(super) fn bucket_pg_id_for(&self, bucket: &BucketName) -> u32 {
         self.pg_topology.bucket_pg_for(bucket)
     }
@@ -397,6 +432,7 @@ impl Coordinator {
         Ok(self.storage_node.get_pg(pg_id)?)
     }
 
+    #[cfg(test)]
     pub(super) fn get_bucket_pg_for(
         &self,
         bucket: &BucketName,
@@ -417,18 +453,4 @@ impl Coordinator {
         Ok(TwoPgGuards::new(meta_guard, shard_guard))
     }
 
-    pub(super) fn load_active_bucket_summary_from_pg(
-        &self,
-        bucket_pg: &storage::PgStore,
-        name: &BucketName,
-    ) -> Result<BucketSummary, ServerError> {
-        let info = storage::PgMetadataStore::head_bucket(bucket_pg, name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })?;
-        self.storage_node.upsert_bucket_fast_path((&info).into());
-        Ok(Self::bucket_summary(info))
-    }
 }

@@ -2436,6 +2436,12 @@ pub struct ListedBucketObjectVersions {
     pub next_version_id_marker: Option<VersionId>,
 }
 
+#[derive(Debug, Clone)]
+pub struct LifecycleSweepBuckets {
+    pub lifecycle_buckets: Vec<BucketInfo>,
+    pub aborting_buckets: Vec<BucketName>,
+}
+
 // ── Multipart upload types ─────────────────────────────────────────
 
 /// Multipart upload state machine.

@@ -1,5 +1,7 @@
 use super::*;
-use crate::{BucketInfo, ListObjectsReq, VersionId};
+use crate::{BucketInfo, LifecycleSweepBuckets, ListObjectsReq, VersionId};
+
+const INTERNAL_LIST_PAGE_SIZE: u32 = 1_000;
 
 #[derive(Clone)]
 enum ListObjectsPageStart {
@@ -38,6 +40,24 @@ impl VersionCursor {
 }
 
 impl SharedStorageNode {
+    pub fn list_lifecycle_sweep_buckets(&self) -> Result<LifecycleSweepBuckets, ObjectPgActionError> {
+        let mut lifecycle_buckets = Vec::new();
+        let mut aborting_buckets = Vec::new();
+        self.pg_topology.for_each_pg(|pg_id| {
+            let pg = self.get_pg(pg_id)?;
+            lifecycle_buckets.extend(pg.list_buckets_with_lifecycle()?);
+            aborting_buckets.extend(pg.list_buckets_with_aborting_multipart_uploads()?);
+            Ok::<(), ObjectPgActionError>(())
+        })?;
+        lifecycle_buckets.sort_by(|a, b| a.name.cmp(&b.name));
+        aborting_buckets.sort();
+        aborting_buckets.dedup();
+        Ok(LifecycleSweepBuckets {
+            lifecycle_buckets,
+            aborting_buckets,
+        })
+    }
+
     pub fn list_buckets_for_owner(
         &self,
         owner_canonical_id: &str,
@@ -51,6 +71,121 @@ impl SharedStorageNode {
         })?;
         buckets.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(buckets)
+    }
+
+    pub fn list_all_objects_for_bucket(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Vec<StoredObject>, ObjectPgActionError> {
+        let mut all_objects = Vec::new();
+        self.pg_topology.for_each_pg(|pg_id| {
+            let mut start_after = None;
+            loop {
+                let pg = self.get_pg(pg_id)?;
+                let resp = pg.list_objects(&ListObjectsReq {
+                    bucket: bucket.clone(),
+                    prefix: None,
+                    start_after: start_after.clone(),
+                    start_at: None,
+                    max_keys: INTERNAL_LIST_PAGE_SIZE,
+                })?;
+                drop(pg);
+                all_objects.extend(resp.objects);
+                if !resp.is_truncated {
+                    break;
+                }
+                start_after = resp.next_start_after;
+            }
+            Ok::<(), ObjectPgActionError>(())
+        })?;
+        all_objects.sort_by(|a, b| a.key().cmp(b.key()));
+        all_objects.dedup_by(|a, b| a.key() == b.key());
+        Ok(all_objects)
+    }
+
+    pub fn list_all_object_versions_for_bucket(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Vec<StoredObject>, ObjectPgActionError> {
+        let mut cursors = Vec::new();
+        self.pg_topology.for_each_pg(|pg_id| {
+            let mut key_marker = None;
+            let mut version_id_marker = None;
+            let mut versions = Vec::new();
+            loop {
+                let pg = self.get_pg(pg_id)?;
+                let resp = pg.list_object_versions(&ListObjectVersionsReq {
+                    bucket: bucket.clone(),
+                    prefix: None,
+                    key_marker: key_marker.clone(),
+                    version_id_marker,
+                    max_keys: INTERNAL_LIST_PAGE_SIZE,
+                })?;
+                drop(pg);
+                versions.extend(resp.versions);
+                if !resp.is_truncated {
+                    break;
+                }
+                key_marker = resp.next_key_marker;
+                version_id_marker = resp.next_version_id_marker;
+            }
+            cursors.push(VersionCursor {
+                versions,
+                next_index: 0,
+            });
+            Ok::<(), ObjectPgActionError>(())
+        })?;
+
+        let mut merged_versions = Vec::new();
+        while let Some((cursor_index, _)) = cursors
+            .iter()
+            .enumerate()
+            .filter_map(|(cursor_index, cursor)| cursor.current().map(|version| (cursor_index, version)))
+            .min_by(|(left_index, left), (right_index, right)| {
+                left.key()
+                    .cmp(right.key())
+                    .then_with(|| left_index.cmp(right_index))
+            })
+        {
+            merged_versions.push(cursors[cursor_index].pop_current());
+        }
+
+        Ok(merged_versions)
+    }
+
+    pub fn list_all_multipart_uploads_for_bucket(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Vec<MultipartUploadRecord>, ObjectPgActionError> {
+        let mut uploads = Vec::new();
+        self.pg_topology.for_each_pg(|pg_id| {
+            let mut key_marker = None;
+            let mut upload_id_marker = None;
+            loop {
+                let pg = self.get_pg(pg_id)?;
+                let resp = pg.list_multipart_uploads(&ListMultipartUploadsReq {
+                    bucket: bucket.clone(),
+                    prefix: None,
+                    key_marker: key_marker.clone(),
+                    upload_id_marker: upload_id_marker.clone(),
+                    max_uploads: INTERNAL_LIST_PAGE_SIZE,
+                })?;
+                drop(pg);
+                uploads.extend(resp.uploads);
+                if !resp.is_truncated {
+                    break;
+                }
+                key_marker = resp.next_key_marker;
+                upload_id_marker = resp.next_upload_id_marker;
+            }
+            Ok::<(), ObjectPgActionError>(())
+        })?;
+        uploads.sort_by(|a, b| {
+            a.key
+                .cmp(&b.key)
+                .then_with(|| a.upload_id.cmp(&b.upload_id))
+        });
+        Ok(uploads)
     }
 
     pub fn list_objects_for_bucket(

@@ -994,6 +994,7 @@ impl Coordinator {
             .map_err(Self::map_bucket_snapshot_load_error)
     }
 
+    #[cfg(test)]
     pub(super) fn load_bucket_subresource_from_pg(
         bucket_pg: &storage::PgStore,
         bucket: &BucketName,

@@ -1023,6 +1023,14 @@ These are not ordinary top-level request handlers, but they are still
 non-test coordinator code that exposes PG-shaped APIs or uses direct PG
 access:
 
+- completed in 9a so far:
+  - the old loaded-object helper family used by object tagging / ACL /
+    object-lock auth is now migrated onto storage-owned object metadata
+    transactions and remains only as test-only support code
+  - earlier 9a slices already moved several runtime / infra bucket-side and
+    multipart-order helper calls behind storage
+
+- remaining 9a scope:
 - `runtime.rs`
   - reclaim, finalize, and background processing helpers
   - bucket/object scan helpers used by runtime workflows
@@ -1033,10 +1041,6 @@ access:
   - helper-level direct PG access such as current-object lookup / mutation
     helpers that are now mostly implementation leftovers rather than
     intentional coordinator boundaries
-- object metadata auth helper surface
-  - the old loaded-object helper family used by object tagging / ACL /
-    object-lock auth is now migrated onto storage-owned object metadata
-    transactions and remains only as test-only support code
 - any remaining helper-level `get_pg(...)` / `lock_two_pgs(...)` use in
   non-test coordinator modules
 
@@ -1046,6 +1050,8 @@ Acceptance criteria for 9a:
   a storage-owned helper now exists
 - the old production loaded-object auth helper seam is closed; any remaining
   `LockedReadObject` / `ObjectPgGuards` usage is test-only
+- the earlier bucket-side / multipart-order internal helper migrations remain
+  on storage-owned helpers without reintroducing coordinator PG exposure
 - runtime/background code keeps direct PG access only where it is still a
   deliberate internal responsibility
 - the remaining coordinator PG uses are few, explicit, and explainable
