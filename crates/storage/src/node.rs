@@ -36,6 +36,7 @@ mod bucket_ops;
 mod listing_ops;
 mod multipart_ops;
 mod object_delete_ops;
+mod object_metadata_ops;
 mod object_read_ops;
 mod stream_ops;
 

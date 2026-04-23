@@ -11,9 +11,11 @@ use storage::{
 };
 
 use super::{
-    ActiveWriteEncryption, BucketSummary, Coordinator, LockedReadObject, ObjectPgGuards,
-    PreparedPutCommit, PutCommitRequest, SegmentPayloadRecord,
+    ActiveWriteEncryption, BucketSummary, Coordinator, PreparedPutCommit, PutCommitRequest,
+    SegmentPayloadRecord,
 };
+#[cfg(test)]
+use super::{LockedReadObject, ObjectPgGuards};
 use crate::conditional::{check_write_conditions, WriteCondition};
 use crate::error::ServerError;
 use crate::metadata_blob::MetadataBlob;
@@ -194,6 +196,7 @@ impl Coordinator {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn lookup_object_record(
         meta_pg: &storage::PgStore,
         bucket: &BucketName,
@@ -342,6 +345,7 @@ impl Coordinator {
     /// payload lease before this guard is released. Committed payload
     /// generations are immutable, and reclaim is lease-gated, so read-side
     /// paths no longer need to relock a synthetic shard PG.
+    #[cfg(test)]
     pub(super) fn lock_object_pgs_for_read_typed<'a>(
         &'a self,
         bucket: &BucketName,
@@ -355,111 +359,6 @@ impl Coordinator {
             record,
             pgs: ObjectPgGuards::new(meta_guard),
         })
-    }
-
-    fn multipart_part_payloads(
-        meta_pg: &storage::PgStore,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: VersionId,
-        part: &ObjectPartRecord,
-        encryption: &ObjectEncryption,
-    ) -> Result<Vec<SegmentPayloadRecord>, ServerError> {
-        if part.part_okh != [0u8; 16] {
-            return Ok(vec![SegmentPayloadRecord {
-                segment_index: 0,
-                size: part.size,
-                segment_crc64: None,
-                segment_okh: part.part_okh,
-                segment_vid: part.part_vid,
-                shard_pg_id: part.shard_pg_id,
-                ec_k: part.ec_k,
-                ec_m: part.ec_m,
-                encryption: encryption.clone(),
-            }]);
-        }
-
-        storage::PgMetadataStore::get_multipart_part_segments(
-            meta_pg,
-            bucket,
-            key,
-            version_id,
-            part.part_number,
-        )
-        .map(|segments| {
-            segments
-                .into_iter()
-                .map(|segment| SegmentPayloadRecord {
-                    segment_index: segment.segment_index,
-                    size: segment.size,
-                    segment_crc64: segment.segment_crc64,
-                    segment_okh: segment.segment_okh,
-                    segment_vid: segment.segment_vid,
-                    shard_pg_id: segment.shard_pg_id,
-                    ec_k: segment.ec_k,
-                    ec_m: segment.ec_m,
-                    encryption: encryption.clone(),
-                })
-                .collect()
-        })
-        .map_err(ServerError::Metadata)
-    }
-
-    pub(super) fn snapshot_multipart_parts(
-        meta_pg: &storage::PgStore,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: VersionId,
-        encryption: &ObjectEncryption,
-    ) -> Result<Vec<SnapshottedMultipartPart>, ServerError> {
-        let parts = storage::PgMetadataStore::get_object_parts(meta_pg, bucket, key, version_id)
-            .map_err(ServerError::Metadata)?;
-        let mut snapshotted = Vec::with_capacity(parts.len());
-        let mut object_offset_start = 0usize;
-        for part in parts {
-            let part_size = part.size as usize;
-            let segments =
-                Self::multipart_part_payloads(meta_pg, bucket, key, version_id, &part, encryption)?;
-            snapshotted.push(SnapshottedMultipartPart {
-                record: part,
-                object_offset_start,
-                segments,
-            });
-            object_offset_start += part_size;
-        }
-        Ok(snapshotted)
-    }
-
-    pub(super) fn snapshot_multipart_parts_overlapping_range(
-        meta_pg: &storage::PgStore,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: VersionId,
-        encryption: &ObjectEncryption,
-        start: u64,
-        end_exclusive: u64,
-    ) -> Result<Vec<SnapshottedMultipartPart>, ServerError> {
-        let parts = storage::PgMetadataStore::get_object_parts_overlapping_range(
-            meta_pg,
-            bucket,
-            key,
-            version_id,
-            start,
-            end_exclusive,
-        )
-        .map_err(ServerError::Metadata)?;
-        let mut snapshotted = Vec::with_capacity(parts.len());
-        for part in parts {
-            let segments = Self::multipart_part_payloads(
-                meta_pg, bucket, key, version_id, &part.part, encryption,
-            )?;
-            snapshotted.push(SnapshottedMultipartPart {
-                record: part.part,
-                object_offset_start: part.object_offset_start as usize,
-                segments,
-            });
-        }
-        Ok(snapshotted)
     }
 
     pub(super) fn snapshot_overwritten_null_version_payload(

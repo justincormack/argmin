@@ -1,17 +1,24 @@
+#![cfg_attr(test, allow(dead_code))]
+
 use std::sync::Arc;
 
 use auth::BucketPolicy;
 use checksum::MultipartChecksumConfig;
 
 use super::authz_types::{ActiveWriteEncryption, AuthorizedPutObjectWrite, ValidatedBucket};
-use super::pg_guards::{LockedReadObject, ObjectPgGuards};
 use super::request_types::{CreateBucketAcl, Requester};
-use super::response_types::{BucketSummary, GetBucketAclResult, GetObjectAclResult};
+use super::response_types::{BucketSummary, GetBucketAclResult};
+#[cfg(test)]
+use super::pg_guards::{LockedReadObject, ObjectPgGuards};
+#[cfg(test)]
+use super::response_types::GetObjectAclResult;
 use crate::sse::SseCustomerWriteContext;
 use s3_types::{
     AclGrants, BucketLifecycleConfiguration, BucketVersioningState, CanonicalUserId,
-    LegalHoldStatus, ObjectRetention, StoredLegalHoldStatus, VersionId,
+    VersionId,
 };
+#[cfg(test)]
+use s3_types::{LegalHoldStatus, ObjectRetention, StoredLegalHoldStatus};
 use storage::BucketObjectOwnership;
 use storage::{
     BucketEncryptionConfig, BucketName, BucketObjectLockConfig, BucketOwnershipControls,
@@ -177,6 +184,7 @@ pub(super) struct AuthorizedPutBucketAcl {
     pub(super) public_write: bool,
 }
 
+#[cfg(test)]
 pub(super) struct AuthorizedObjectTagsAccess<'a> {
     pub(super) bucket: BucketName,
     pub(super) key: ObjectKey,
@@ -184,6 +192,7 @@ pub(super) struct AuthorizedObjectTagsAccess<'a> {
     pub(super) pgs: ObjectPgGuards<'a>,
 }
 
+#[cfg(test)]
 pub(super) struct AuthorizedPutObjectRetention<'a> {
     pub(super) bucket: BucketName,
     pub(super) key: ObjectKey,
@@ -192,10 +201,12 @@ pub(super) struct AuthorizedPutObjectRetention<'a> {
     pub(super) pgs: ObjectPgGuards<'a>,
 }
 
+#[cfg(test)]
 pub(super) struct AuthorizedGetObjectRetention {
     pub(super) retention: Option<ObjectRetention>,
 }
 
+#[cfg(test)]
 pub(super) struct AuthorizedPutObjectLegalHold<'a> {
     pub(super) bucket: BucketName,
     pub(super) key: ObjectKey,
@@ -204,10 +215,12 @@ pub(super) struct AuthorizedPutObjectLegalHold<'a> {
     pub(super) pgs: ObjectPgGuards<'a>,
 }
 
+#[cfg(test)]
 pub(super) struct AuthorizedGetObjectLegalHold {
     pub(super) legal_hold: Option<LegalHoldStatus>,
 }
 
+#[cfg(test)]
 pub(super) struct AuthorizedPutObjectAclUpdate<'a> {
     pub(super) bucket: BucketName,
     pub(super) key: ObjectKey,
@@ -218,14 +231,16 @@ pub(super) struct AuthorizedPutObjectAclUpdate<'a> {
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 pub(super) struct AuthorizedGetObjectAcl {
     pub(super) result: GetObjectAclResult,
 }
 
-pub(super) struct AuthorizedObjectRead<'a> {
-    pub(super) locked: LockedReadObject<'a>,
+pub(super) struct AuthorizedObjectRead {
+    pub(super) snapshot: ObjectReadSnapshot,
 }
 
+#[cfg(test)]
 pub(super) struct LoadedObjectState<'a> {
     pub(super) bucket_info: ValidatedBucket,
     pub(super) bucket_policy: Option<Arc<BucketPolicy>>,
@@ -350,6 +365,7 @@ pub(super) enum AuthorizedDeleteObject {
     },
 }
 
+#[cfg(test)]
 impl std::fmt::Debug for AuthorizedObjectTagsAccess<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthorizedObjectTagsAccess")
@@ -360,6 +376,7 @@ impl std::fmt::Debug for AuthorizedObjectTagsAccess<'_> {
     }
 }
 
+#[cfg(test)]
 impl std::fmt::Debug for AuthorizedPutObjectRetention<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthorizedPutObjectRetention")
@@ -371,6 +388,7 @@ impl std::fmt::Debug for AuthorizedPutObjectRetention<'_> {
     }
 }
 
+#[cfg(test)]
 impl std::fmt::Debug for AuthorizedPutObjectLegalHold<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthorizedPutObjectLegalHold")
@@ -382,6 +400,7 @@ impl std::fmt::Debug for AuthorizedPutObjectLegalHold<'_> {
     }
 }
 
+#[cfg(test)]
 impl std::fmt::Debug for AuthorizedPutObjectAclUpdate<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthorizedPutObjectAclUpdate")
@@ -394,7 +413,7 @@ impl std::fmt::Debug for AuthorizedPutObjectAclUpdate<'_> {
     }
 }
 
-impl std::fmt::Debug for AuthorizedObjectRead<'_> {
+impl std::fmt::Debug for AuthorizedObjectRead {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthorizedObjectRead")
             .finish_non_exhaustive()

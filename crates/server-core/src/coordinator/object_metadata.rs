@@ -4,53 +4,49 @@ use s3_types::{
 };
 use storage::{BucketName, ObjectKey, ObjectLockState};
 
+use super::authz::BucketPolicyAccess;
 use super::{
-    AuthorizedPutObjectAclUpdate, BucketSummary, Coordinator, GetObjectAclResult,
-    ObjectVersionRequest, PutObjectAclInput, PutObjectAclRequest, PutObjectLegalHoldRequest,
-    PutObjectRetentionRequest, PutObjectTagsRequest, TRACE_TARGET,
+    BucketSummary, Coordinator, GetObjectAclResult, ObjectVersionRequest, PutObjectAclInput,
+    PutObjectAclRequest, PutObjectLegalHoldRequest, PutObjectRetentionRequest,
+    PutObjectTagsRequest, TRACE_TARGET,
 };
 use crate::error::ServerError;
 
+struct ObjectMetadataPolicyContext {
+    bucket_info: BucketSummary,
+    bucket_policy: Option<std::sync::Arc<auth::BucketPolicy>>,
+    bucket_tags: Option<Vec<(String, String)>>,
+}
+
 impl Coordinator {
-    fn persist_locked_object_acl(
+    fn load_object_metadata_policy_context(
+        &self,
         bucket: &BucketName,
-        key: &ObjectKey,
-        meta_pg: &storage::PgStore,
-        version_id: VersionId,
-        acl_grants: AclGrants,
-        public_read: bool,
-    ) -> Result<VersionId, ServerError> {
-        storage::PgMetadataStore::put_object_acl(
-            meta_pg,
-            bucket,
-            key,
-            version_id,
-            &acl_grants,
-            public_read,
-        )
-        .map_err(|e| match e {
-            storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            },
-            storage::MetadataError::MethodNotAllowedOnDeleteMarker => ServerError::MethodNotAllowed,
-            other => ServerError::Metadata(other),
-        })?;
-        Ok(version_id)
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<ObjectMetadataPolicyContext, ServerError> {
+        let bucket = self.load_bucket_handle_for_object_policy_read(bucket, expected_bucket_owner)?;
+        let bucket_info = bucket.bucket().clone();
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let bucket_tags = if bucket_policy.is_some() {
+            Self::loaded_bucket_tags_for_policy(&bucket)?
+        } else {
+            None
+        };
+        Ok(ObjectMetadataPolicyContext {
+            bucket_info,
+            bucket_policy,
+            bucket_tags,
+        })
     }
 
-    fn apply_authorized_object_acl_update(
-        &self,
-        authorized: &AuthorizedPutObjectAclUpdate<'_>,
-    ) -> Result<VersionId, ServerError> {
-        Self::persist_locked_object_acl(
-            &authorized.bucket,
-            &authorized.key,
-            authorized.pgs.meta(),
-            authorized.version_id,
-            authorized.acl_grants.clone(),
-            authorized.public_read,
-        )
+    fn map_object_metadata_access_error(
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        can_discover_missing: bool,
+        error: storage::ObjectPgActionError,
+    ) -> ServerError {
+        Self::map_object_read_snapshot_error(bucket, key, version_id, can_discover_missing, error)
     }
 
     pub(super) fn ensure_object_lock_bucket(bucket: &BucketSummary) -> Result<(), ServerError> {
@@ -276,15 +272,45 @@ impl Coordinator {
             req.object.key(),
             req.tags.len()
         );
-        let authorized = self.authorize_put_object_tags(req)?;
-        storage::PgMetadataStore::put_object_tags(
-            authorized.pgs.meta(),
-            &authorized.bucket,
-            &authorized.key,
-            authorized.version_id,
-            req.tags,
-        )
-        .map_err(ServerError::Metadata)
+        let bucket = req.object.bucket_name_typed();
+        let key = req.object.key_typed();
+        let ObjectMetadataPolicyContext {
+            bucket_info,
+            bucket_policy,
+            bucket_tags,
+        } = self.load_object_metadata_policy_context(bucket, req.object.expected_bucket_owner())?;
+        let can_discover_missing =
+            Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
+        self.storage_node
+            .put_object_tags_if(bucket, key, req.object.version_id, req.tags, |stored| {
+                if !self.requester_can_manage_object_tags_with_bucket_policy(
+                    BucketPolicyAccess {
+                        requester: req.object.requester(),
+                        bucket: &bucket_info,
+                        bucket_tags: bucket_tags.as_deref(),
+                        policy: bucket_policy.as_deref(),
+                    },
+                    stored,
+                    Self::put_object_tagging_policy_action(req.object.version_id),
+                    Some(req.tags),
+                )? {
+                    return Err(ServerError::AccessDenied);
+                }
+                if stored.is_delete_marker() {
+                    return Err(ServerError::MethodNotAllowed);
+                }
+                Ok(stored.version_id())
+            })
+            .map_err(|error| {
+                Self::map_object_metadata_access_error(
+                    bucket,
+                    key,
+                    req.object.version_id,
+                    can_discover_missing,
+                    error,
+                )
+            })??;
+        Ok(())
     }
 
     pub fn put_object_retention(
@@ -301,18 +327,55 @@ impl Coordinator {
             req.retention.mode,
             req.bypass_governance
         );
-        let authorized = self.authorize_put_object_retention(req)?;
-        storage::PgMetadataStore::put_object_retention(
-            authorized.pgs.meta(),
-            &authorized.bucket,
-            &authorized.key,
-            authorized.version_id,
-            authorized.retention,
-        )
-        .map_err(|e| match e {
-            storage::MetadataError::MethodNotAllowedOnDeleteMarker => ServerError::MethodNotAllowed,
-            other => ServerError::Metadata(other),
-        })
+        let bucket = req.object.bucket_name_typed();
+        let key = req.object.key_typed();
+        let ObjectMetadataPolicyContext {
+            bucket_info,
+            bucket_policy,
+            bucket_tags,
+        } = self.load_object_metadata_policy_context(bucket, req.object.expected_bucket_owner())?;
+        let can_discover_missing =
+            Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
+        self.storage_node
+            .put_object_retention_if(bucket, key, req.object.version_id, req.retention, |stored| {
+                if !self.requester_can_manage_object_lock_with_bucket_policy(
+                    req.object.requester(),
+                    &bucket_info,
+                    bucket_tags.as_deref(),
+                    stored,
+                    auth::PolicyAction::PutObjectRetention,
+                    bucket_policy.as_deref(),
+                )? {
+                    return Err(ServerError::AccessDenied);
+                }
+                Self::ensure_object_lock_bucket(&bucket_info)?;
+                let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+                let can_bypass_governance = self
+                    .requester_can_bypass_governance_retention_with_bucket_policy(
+                        req.object.requester(),
+                        &bucket_info,
+                        bucket_tags.as_deref(),
+                        stored,
+                        bucket_policy.as_deref(),
+                    )?;
+                Self::validate_retention_update(
+                    live.object_lock.retention,
+                    req.retention,
+                    req.bypass_governance,
+                    can_bypass_governance,
+                )?;
+                Ok(live.version_id)
+            })
+            .map_err(|error| {
+                Self::map_object_metadata_access_error(
+                    bucket,
+                    key,
+                    req.object.version_id,
+                    can_discover_missing,
+                    error,
+                )
+            })??;
+        Ok(())
     }
 
     pub fn get_object_retention(
@@ -327,8 +390,40 @@ impl Coordinator {
             req.object.key,
             req.version_id
         );
-        let authorized = self.authorize_get_object_retention(req)?;
-        Ok(authorized.retention)
+        let bucket = req.object.bucket_name_typed();
+        let key = req.object.key_typed();
+        let ObjectMetadataPolicyContext {
+            bucket_info,
+            bucket_policy,
+            bucket_tags,
+        } = self.load_object_metadata_policy_context(bucket, req.expected_bucket_owner())?;
+        let can_discover_missing =
+            Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
+        self.storage_node
+            .get_object_retention_if(bucket, key, req.version_id, |stored| {
+                if !self.requester_can_manage_object_lock_with_bucket_policy(
+                    req.object.requester(),
+                    &bucket_info,
+                    bucket_tags.as_deref(),
+                    stored,
+                    auth::PolicyAction::GetObjectRetention,
+                    bucket_policy.as_deref(),
+                )? {
+                    return Err(ServerError::AccessDenied);
+                }
+                Self::ensure_object_lock_bucket(&bucket_info)?;
+                let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+                Ok(live.object_lock.retention)
+            })
+            .map_err(|error| {
+                Self::map_object_metadata_access_error(
+                    bucket,
+                    key,
+                    req.version_id,
+                    can_discover_missing,
+                    error,
+                )
+            })?
     }
 
     pub fn put_object_legal_hold(
@@ -344,18 +439,42 @@ impl Coordinator {
             req.object.version_id,
             req.legal_hold
         );
-        let authorized = self.authorize_put_object_legal_hold(req)?;
-        storage::PgMetadataStore::put_object_legal_hold(
-            authorized.pgs.meta(),
-            &authorized.bucket,
-            &authorized.key,
-            authorized.version_id,
-            authorized.legal_hold,
-        )
-        .map_err(|e| match e {
-            storage::MetadataError::MethodNotAllowedOnDeleteMarker => ServerError::MethodNotAllowed,
-            other => ServerError::Metadata(other),
-        })
+        let bucket = req.object.bucket_name_typed();
+        let key = req.object.key_typed();
+        let ObjectMetadataPolicyContext {
+            bucket_info,
+            bucket_policy,
+            bucket_tags,
+        } = self.load_object_metadata_policy_context(bucket, req.object.expected_bucket_owner())?;
+        let can_discover_missing =
+            Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
+        let legal_hold = StoredLegalHoldStatus::from_legal_hold_status(Some(req.legal_hold));
+        self.storage_node
+            .put_object_legal_hold_if(bucket, key, req.object.version_id, legal_hold, |stored| {
+                if !self.requester_can_manage_object_lock_with_bucket_policy(
+                    req.object.requester(),
+                    &bucket_info,
+                    bucket_tags.as_deref(),
+                    stored,
+                    auth::PolicyAction::PutObjectLegalHold,
+                    bucket_policy.as_deref(),
+                )? {
+                    return Err(ServerError::AccessDenied);
+                }
+                Self::ensure_object_lock_bucket(&bucket_info)?;
+                let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+                Ok(live.version_id)
+            })
+            .map_err(|error| {
+                Self::map_object_metadata_access_error(
+                    bucket,
+                    key,
+                    req.object.version_id,
+                    can_discover_missing,
+                    error,
+                )
+            })??;
+        Ok(())
     }
 
     pub fn get_object_legal_hold(
@@ -370,8 +489,40 @@ impl Coordinator {
             req.object.key,
             req.version_id
         );
-        let authorized = self.authorize_get_object_legal_hold(req)?;
-        Ok(authorized.legal_hold)
+        let bucket = req.object.bucket_name_typed();
+        let key = req.object.key_typed();
+        let ObjectMetadataPolicyContext {
+            bucket_info,
+            bucket_policy,
+            bucket_tags,
+        } = self.load_object_metadata_policy_context(bucket, req.expected_bucket_owner())?;
+        let can_discover_missing =
+            Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
+        self.storage_node
+            .get_object_legal_hold_if(bucket, key, req.version_id, |stored| {
+                if !self.requester_can_manage_object_lock_with_bucket_policy(
+                    req.object.requester(),
+                    &bucket_info,
+                    bucket_tags.as_deref(),
+                    stored,
+                    auth::PolicyAction::GetObjectLegalHold,
+                    bucket_policy.as_deref(),
+                )? {
+                    return Err(ServerError::AccessDenied);
+                }
+                Self::ensure_object_lock_bucket(&bucket_info)?;
+                let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+                Ok(live.object_lock.legal_hold.as_legal_hold_status())
+            })
+            .map_err(|error| {
+                Self::map_object_metadata_access_error(
+                    bucket,
+                    key,
+                    req.version_id,
+                    can_discover_missing,
+                    error,
+                )
+            })?
     }
 
     pub fn get_object_tags(
@@ -385,14 +536,44 @@ impl Coordinator {
             req.object.bucket_name(),
             req.object.key
         );
-        let authorized = self.authorize_get_object_tags(req)?;
-        storage::PgMetadataStore::get_object_tags(
-            authorized.pgs.meta(),
-            &authorized.bucket,
-            &authorized.key,
-            authorized.version_id,
-        )
-        .map_err(ServerError::Metadata)
+        let bucket = req.object.bucket_name_typed();
+        let key = req.object.key_typed();
+        let ObjectMetadataPolicyContext {
+            bucket_info,
+            bucket_policy,
+            bucket_tags,
+        } = self.load_object_metadata_policy_context(bucket, req.expected_bucket_owner())?;
+        let can_discover_missing =
+            Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
+        self.storage_node
+            .get_object_tags_if(bucket, key, req.version_id, |stored| {
+                if !self.requester_can_manage_object_tags_with_bucket_policy(
+                    BucketPolicyAccess {
+                        requester: req.object.requester(),
+                        bucket: &bucket_info,
+                        bucket_tags: bucket_tags.as_deref(),
+                        policy: bucket_policy.as_deref(),
+                    },
+                    stored,
+                    Self::get_object_tagging_policy_action(req.version_id),
+                    None,
+                )? {
+                    return Err(ServerError::AccessDenied);
+                }
+                if stored.is_delete_marker() {
+                    return Err(ServerError::MethodNotAllowed);
+                }
+                Ok(stored.version_id())
+            })
+            .map_err(|error| {
+                Self::map_object_metadata_access_error(
+                    bucket,
+                    key,
+                    req.version_id,
+                    can_discover_missing,
+                    error,
+                )
+            })?
     }
 
     pub fn delete_object_tags(&self, req: &ObjectVersionRequest<'_>) -> Result<(), ServerError> {
@@ -403,14 +584,45 @@ impl Coordinator {
             req.object.bucket_name(),
             req.object.key
         );
-        let authorized = self.authorize_delete_object_tags(req)?;
-        storage::PgMetadataStore::delete_object_tags(
-            authorized.pgs.meta(),
-            &authorized.bucket,
-            &authorized.key,
-            authorized.version_id,
-        )
-        .map_err(ServerError::Metadata)
+        let bucket = req.object.bucket_name_typed();
+        let key = req.object.key_typed();
+        let ObjectMetadataPolicyContext {
+            bucket_info,
+            bucket_policy,
+            bucket_tags,
+        } = self.load_object_metadata_policy_context(bucket, req.expected_bucket_owner())?;
+        let can_discover_missing =
+            Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
+        self.storage_node
+            .delete_object_tags_if(bucket, key, req.version_id, |stored| {
+                if !self.requester_can_manage_object_tags_with_bucket_policy(
+                    BucketPolicyAccess {
+                        requester: req.object.requester(),
+                        bucket: &bucket_info,
+                        bucket_tags: bucket_tags.as_deref(),
+                        policy: bucket_policy.as_deref(),
+                    },
+                    stored,
+                    Self::delete_object_tagging_policy_action(req.version_id),
+                    None,
+                )? {
+                    return Err(ServerError::AccessDenied);
+                }
+                if stored.is_delete_marker() {
+                    return Err(ServerError::MethodNotAllowed);
+                }
+                Ok(stored.version_id())
+            })
+            .map_err(|error| {
+                Self::map_object_metadata_access_error(
+                    bucket,
+                    key,
+                    req.version_id,
+                    can_discover_missing,
+                    error,
+                )
+            })??;
+        Ok(())
     }
 
     pub fn get_object_acl(
@@ -425,8 +637,60 @@ impl Coordinator {
             req.object.key,
             req.version_id
         );
-        let authorized = self.authorize_get_object_acl(req)?;
-        Ok(authorized.result)
+        let bucket = req.object.bucket_name_typed();
+        let key = req.object.key_typed();
+        let ObjectMetadataPolicyContext {
+            bucket_info,
+            bucket_policy,
+            bucket_tags,
+        } = self.load_object_metadata_policy_context(bucket, req.expected_bucket_owner())?;
+        let can_discover_missing =
+            Self::requester_can_discover_missing_object_acl(req.object.requester(), &bucket_info);
+        self.storage_node
+            .load_object_if(bucket, key, req.version_id, |stored| {
+                if !self.requester_can_read_object_acl_with_bucket_policy(
+                    req.object.requester(),
+                    &bucket_info,
+                    bucket_tags.as_deref(),
+                    stored,
+                    Self::get_object_acl_policy_action(req.version_id),
+                    bucket_policy.as_deref(),
+                )? {
+                    return Err(ServerError::AccessDenied);
+                }
+                let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+                let result = if Self::is_bucket_owner_enforced(
+                    bucket_info.ownership_controls.as_ref(),
+                ) {
+                    let owner = Self::bucket_owner_identity(&bucket_info);
+                    GetObjectAclResult {
+                        owner_principal: owner.principal,
+                        owner_canonical_id: owner.canonical_id.clone(),
+                        acl_grants: AclGrants::new(vec![s3_types::AclGrant::new(
+                            s3_types::AclGrantee::CanonicalUser(owner.canonical_id),
+                            s3_types::AclPermission::FullControl,
+                        )]),
+                        version_id: live.version_id,
+                    }
+                } else {
+                    GetObjectAclResult {
+                        owner_principal: live.owner.principal.clone(),
+                        owner_canonical_id: live.owner.canonical_id.clone(),
+                        acl_grants: live.acl_grants.clone(),
+                        version_id: live.version_id,
+                    }
+                };
+                Ok(result)
+            })
+            .map_err(|error| {
+                Self::map_object_metadata_access_error(
+                    bucket,
+                    key,
+                    req.version_id,
+                    can_discover_missing,
+                    error,
+                )
+            })?
     }
 
     pub fn put_object_acl(&self, req: &PutObjectAclRequest<'_>) -> Result<VersionId, ServerError> {
@@ -442,7 +706,65 @@ impl Coordinator {
                 PutObjectAclInput::Grants(_) => "grants",
             }
         );
-        let authorized = self.authorize_put_object_acl(req)?;
-        self.apply_authorized_object_acl_update(&authorized)
+        if req.object.requester().is_anonymous() {
+            return Err(ServerError::AnonymousApiAccessDenied);
+        }
+        let bucket = req.object.bucket_name_typed();
+        let key = req.object.key_typed();
+        let ObjectMetadataPolicyContext {
+            bucket_info,
+            bucket_policy,
+            bucket_tags,
+        } = self.load_object_metadata_policy_context(bucket, req.object.expected_bucket_owner())?;
+        let can_discover_missing =
+            Self::requester_can_discover_missing_object_acl(req.object.requester(), &bucket_info);
+        let policy_context = req.authorization_policy_context()?;
+        self.storage_node
+            .put_object_acl_if(bucket, key, req.object.version_id, |stored| {
+                if !self.requester_can_write_object_acl_with_bucket_policy(
+                    BucketPolicyAccess {
+                        requester: req.object.requester(),
+                        bucket: &bucket_info,
+                        bucket_tags: bucket_tags.as_deref(),
+                        policy: bucket_policy.as_deref(),
+                    },
+                    stored,
+                    Self::put_object_acl_policy_action(req.object.version_id),
+                    policy_context,
+                )? {
+                    return Err(ServerError::AccessDenied);
+                }
+                if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_ref()) {
+                    return Err(ServerError::AccessControlListNotSupported);
+                }
+                let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+                let acl_grants = match &req.acl {
+                    PutObjectAclInput::Canned(acl) => {
+                        Self::ensure_put_object_acl_supported(&bucket_info, *acl)?;
+                        Self::object_acl_grants_for_write(&bucket_info, &live.owner, *acl)
+                    }
+                    PutObjectAclInput::Grants(acl_grants) => {
+                        Self::ensure_supported_object_acl_grants(acl_grants)?;
+                        acl_grants.clone()
+                    }
+                };
+                let public_read = Self::acl_grants_public_read(&acl_grants);
+                if Self::blocks_public_acls(bucket_info.public_access_block.as_ref())
+                    && (Self::acl_grants_grant_public_read(&acl_grants)
+                        || Self::acl_grants_grant_public_write(&acl_grants))
+                {
+                    return Err(ServerError::AccessDenied);
+                }
+                Ok((live.version_id, acl_grants, public_read))
+            })
+            .map_err(|error| {
+                Self::map_object_metadata_access_error(
+                    bucket,
+                    key,
+                    req.object.version_id,
+                    can_discover_missing,
+                    error,
+                )
+            })?
     }
 }

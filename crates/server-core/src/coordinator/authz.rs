@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 use s3_types::{
     aws_account_id_from_principal, AclGrant, AclGrantee, AclGrants, AclPermission,
-    BucketVersioningState, CanonicalUserId, LifecycleConfigError, StoredLegalHoldStatus, VersionId,
+    BucketVersioningState, CanonicalUserId, LifecycleConfigError, VersionId,
 };
+#[cfg(test)]
+use s3_types::StoredLegalHoldStatus;
 use storage::{
     BucketName, BucketObjectLockConfig, BucketObjectOwnership, BucketOwnershipControls,
     BucketState, ManagedEncryptionAlgorithm, MultipartUploadRecord, ObjectKey,
@@ -20,22 +22,27 @@ use super::authz_results::{
     AuthorizedGetBucketEncryption, AuthorizedGetBucketLocation,
     AuthorizedGetBucketObjectLockConfiguration, AuthorizedGetBucketOwnershipControls,
     AuthorizedGetBucketPolicyStatus, AuthorizedGetBucketPublicAccessBlock,
-    AuthorizedGetBucketVersioning, AuthorizedGetObjectAcl, AuthorizedGetObjectLegalHold,
-    AuthorizedGetObjectRetention, AuthorizedHeadBucket, AuthorizedListBuckets,
+    AuthorizedGetBucketVersioning, AuthorizedHeadBucket, AuthorizedListBuckets,
     AuthorizedListMultipartUploads, AuthorizedListObjectVersions, AuthorizedListObjectsV2,
-    AuthorizedMultipartPartWrite, AuthorizedObjectRead, AuthorizedObjectTagsAccess,
+    AuthorizedMultipartPartWrite, AuthorizedObjectRead,
     AuthorizedPutBucketAbac, AuthorizedPutBucketAcl, AuthorizedPutBucketEncryption,
     AuthorizedPutBucketLifecycle, AuthorizedPutBucketObjectLockConfiguration,
     AuthorizedPutBucketOwnershipControls, AuthorizedPutBucketPolicy,
-    AuthorizedPutBucketPublicAccessBlock, AuthorizedPutBucketVersioning,
-    AuthorizedPutObjectAclUpdate, AuthorizedPutObjectLegalHold, AuthorizedPutObjectRetention,
-    AuthorizedUploadPartCopy, LoadedObjectState,
+    AuthorizedPutBucketPublicAccessBlock, AuthorizedPutBucketVersioning, AuthorizedUploadPartCopy,
+};
+#[cfg(test)]
+use super::authz_results::{
+    AuthorizedGetObjectAcl, AuthorizedGetObjectLegalHold, AuthorizedGetObjectRetention,
+    AuthorizedObjectTagsAccess, AuthorizedPutObjectAclUpdate, AuthorizedPutObjectLegalHold,
+    AuthorizedPutObjectRetention, LoadedObjectState,
 };
 use super::authz_types::{AuthorizedPutObjectWrite, AuthorizedPutObjectWriteAcl, ValidatedBucket};
 use super::bucket_handles::{
     BucketHandleLoader, BucketHandleRequest, LoadedBucketHandle, LoadedBucketValue,
-    LoadedObjectHandle,
 };
+#[cfg(test)]
+use super::bucket_handles::LoadedObjectHandle;
+#[cfg(test)]
 use super::pg_guards::LockedReadObject;
 #[cfg(test)]
 use super::request_types::ListPartsRequest;
@@ -50,15 +57,22 @@ use super::request_types::{
     ObjectVersionRequest, PutBucketAbacRequest, PutBucketAclInput, PutBucketAclRequest,
     PutBucketConfigRequest, PutBucketEncryptionRequest, PutBucketObjectLockConfigurationRequest,
     PutBucketOwnershipControlsRequest, PutBucketPolicyRequest, PutBucketPublicAccessBlockRequest,
-    PutBucketVersioningRequest, PutObjectAcl, PutObjectAclInput, PutObjectAclRequest,
-    PutObjectLegalHoldRequest, PutObjectPolicyContext, PutObjectRetentionRequest,
-    PutObjectTagsRequest, PutObjectWriteAcl, Requester, TaggingDirective, UploadPartCopyRequest,
+    PutBucketVersioningRequest, PutObjectAcl, PutObjectPolicyContext, PutObjectWriteAcl,
+    Requester, TaggingDirective, UploadPartCopyRequest,
 };
-use super::response_types::{BucketSummary, GetBucketAclResult, GetObjectAclResult};
+#[cfg(test)]
+use super::request_types::{
+    PutObjectAclInput, PutObjectAclRequest, PutObjectLegalHoldRequest,
+    PutObjectRetentionRequest, PutObjectTagsRequest,
+};
+use super::response_types::{BucketSummary, GetBucketAclResult};
+#[cfg(test)]
+use super::response_types::GetObjectAclResult;
 use super::{read_rwlock_unpoisoned, write_rwlock_unpoisoned, Coordinator};
 use crate::error::ServerError;
 use crate::sse::{SseCustomerRequest, SseCustomerSegmentScope};
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 enum ObjectBucketPolicyRequirement {
     Required,
@@ -68,7 +82,9 @@ enum ObjectBucketPolicyRequirement {
 enum MissingObjectDiscovery {
     ReadBucket,
     ReadObjectAttributes,
+    #[cfg(test)]
     BucketAdmin,
+    #[cfg(test)]
     ObjectAcl,
 }
 
@@ -99,10 +115,12 @@ impl MissingObjectDiscovery {
                     coord, access, key, version_id,
                 )
             }
+            #[cfg(test)]
             Self::BucketAdmin => Ok(Coordinator::requester_can_bucket_owner_account_admin(
                 access.requester,
                 access.bucket,
             )),
+            #[cfg(test)]
             Self::ObjectAcl => Ok(Coordinator::requester_can_discover_missing_object_acl(
                 access.requester,
                 access.bucket,
@@ -163,6 +181,8 @@ pub(super) struct CachedBucketPolicy {
     pub(super) policy: Arc<auth::BucketPolicy>,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub(super) enum ObjectAclAuthorization<'a> {
     ReadWithPolicy(auth::PolicyAction),
     WriteWithPolicy {
@@ -759,7 +779,7 @@ impl Coordinator {
         self.cached_bucket_policy_with_locked_bucket_pg(bucket, &bucket_pg)
     }
 
-    fn cached_bucket_policy_for_loaded_handle(
+    pub(super) fn cached_bucket_policy_for_loaded_handle(
         &self,
         bucket: &LoadedBucketHandle,
     ) -> Result<Option<Arc<auth::BucketPolicy>>, ServerError> {
@@ -891,7 +911,7 @@ impl Coordinator {
         }
     }
 
-    fn loaded_bucket_tags_for_policy(
+    pub(super) fn loaded_bucket_tags_for_policy(
         bucket: &LoadedBucketHandle,
     ) -> Result<Option<Vec<(String, String)>>, ServerError> {
         match bucket.tags() {
@@ -1631,7 +1651,7 @@ impl Coordinator {
         self.load_bucket_handle_for_bucket_read(req, BucketHandleRequest::new())
     }
 
-    fn load_bucket_handle_for_object_policy_read(
+    pub(super) fn load_bucket_handle_for_object_policy_read(
         &self,
         bucket: &BucketName,
         expected_bucket_owner: Option<&str>,
@@ -2276,6 +2296,8 @@ impl Coordinator {
         acl_grants == &expected
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn authorize_put_object_tags<'a>(
         &'a self,
         req: &PutObjectTagsRequest<'_>,
@@ -2299,6 +2321,7 @@ impl Coordinator {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn authorize_get_object_tags<'a>(
         &'a self,
         req: &ObjectVersionRequest<'_>,
@@ -2321,6 +2344,8 @@ impl Coordinator {
         })
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn authorize_delete_object_tags<'a>(
         &'a self,
         req: &ObjectVersionRequest<'_>,
@@ -2344,6 +2369,7 @@ impl Coordinator {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn authorize_get_object_acl(
         &self,
         req: &ObjectVersionRequest<'_>,
@@ -2378,6 +2404,8 @@ impl Coordinator {
         Ok(AuthorizedGetObjectAcl { result })
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn authorize_put_object_acl<'a>(
         &'a self,
         req: &PutObjectAclRequest<'_>,
@@ -2435,6 +2463,7 @@ impl Coordinator {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn authorize_put_object_retention<'a>(
         &'a self,
         req: &PutObjectRetentionRequest<'_>,
@@ -2481,6 +2510,7 @@ impl Coordinator {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn authorize_get_object_retention(
         &self,
         req: &ObjectVersionRequest<'_>,
@@ -2495,6 +2525,7 @@ impl Coordinator {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn authorize_put_object_legal_hold<'a>(
         &'a self,
         req: &PutObjectLegalHoldRequest<'_>,
@@ -2524,6 +2555,7 @@ impl Coordinator {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn authorize_get_object_legal_hold(
         &self,
         req: &ObjectVersionRequest<'_>,
@@ -4279,6 +4311,7 @@ impl Coordinator {
         Ok(())
     }
 
+    #[cfg(test)]
     fn load_locked_object_state_from_loaded_bucket<'a>(
         &'a self,
         requester: &Requester,
@@ -4488,7 +4521,7 @@ impl Coordinator {
         Ok(outcome.snapshot)
     }
 
-    fn map_object_read_snapshot_error(
+    pub(super) fn map_object_read_snapshot_error(
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,
@@ -4520,6 +4553,7 @@ impl Coordinator {
         }
     }
 
+    #[cfg(test)]
     fn ensure_loaded_object_tagging_allowed(
         &self,
         requester: &Requester,
@@ -4544,6 +4578,8 @@ impl Coordinator {
         }
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn authorize_object_tagging_access<'a>(
         &'a self,
         object: &ObjectVersionRequest<'_>,
@@ -4575,6 +4611,7 @@ impl Coordinator {
         Ok(loaded.locked)
     }
 
+    #[cfg(test)]
     fn authorize_object_tagging_read<'a>(
         &'a self,
         object: &ObjectVersionRequest<'_>,
@@ -4605,6 +4642,7 @@ impl Coordinator {
         Ok(loaded.locked)
     }
 
+    #[cfg(test)]
     fn ensure_loaded_object_acl_allowed(
         &self,
         requester: &Requester,
@@ -4643,6 +4681,8 @@ impl Coordinator {
         }
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn authorize_object_acl_access<'a>(
         &'a self,
         requester: &Requester,
@@ -4668,6 +4708,7 @@ impl Coordinator {
         Ok(loaded)
     }
 
+    #[cfg(test)]
     fn authorize_object_acl_read<'a>(
         &'a self,
         req: &ObjectVersionRequest<'_>,
@@ -4697,6 +4738,7 @@ impl Coordinator {
         Ok(loaded)
     }
 
+    #[cfg(test)]
     fn ensure_loaded_object_lock_allowed(
         &self,
         requester: &Requester,
@@ -4717,6 +4759,7 @@ impl Coordinator {
         }
     }
 
+    #[cfg(test)]
     fn authorize_object_lock_access<'a>(
         &'a self,
         requester: &Requester,
@@ -4743,6 +4786,7 @@ impl Coordinator {
         Ok(loaded)
     }
 
+    #[cfg(test)]
     fn authorize_object_lock_read<'a>(
         &'a self,
         req: &ObjectVersionRequest<'_>,

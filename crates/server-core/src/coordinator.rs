@@ -49,6 +49,7 @@ use self::payload::encode_parity_scratch_len;
 #[cfg(test)]
 use self::payload::SharedPayloadBuffer;
 use self::payload::{EncodeScratchPool, PayloadBufferPool};
+#[cfg(test)]
 use self::pg_guards::{LockedReadObject, ObjectPgGuards};
 use self::read_core::{
     segment_payloads_from_object_segments, ReadObjectContext, SegmentPayloadRecord,

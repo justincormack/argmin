@@ -1137,7 +1137,7 @@ fn authorize_get_object_bucket_policy_existing_tag_controls_access() {
             cond: NO_READ,
         })
         .unwrap();
-    assert!(matches!(authorized.locked.record, StoredObject::Live(_)));
+    assert!(matches!(authorized.snapshot.stored, StoredObject::Live(_)));
 }
 
 #[test]

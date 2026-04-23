@@ -22,6 +22,18 @@ pub(super) struct CachedBucketLifecycle {
 }
 
 impl Coordinator {
+    #[cfg(test)]
+    pub(super) fn requested_version_is_current_live(
+        meta_pg: &storage::PgStore,
+        bucket: &str,
+        key: &str,
+        requested_version_id: Option<VersionId>,
+        resolved_version_id: VersionId,
+    ) -> Result<bool, ServerError> {
+        let _ = (meta_pg, bucket, key, resolved_version_id);
+        Ok(requested_version_id.is_none())
+    }
+
     pub(super) fn cached_bucket_lifecycle(
         &self,
         bucket: &BucketSummary,
@@ -209,20 +221,6 @@ impl Coordinator {
             key,
             initiated_at,
         ))
-    }
-
-    pub(super) fn requested_version_is_current_live(
-        meta_pg: &storage::PgStore,
-        bucket: &str,
-        key: &str,
-        requested_version_id: Option<VersionId>,
-        resolved_version_id: VersionId,
-    ) -> Result<bool, ServerError> {
-        if requested_version_id.is_none() {
-            return Ok(true);
-        }
-        let _ = (meta_pg, bucket, key, resolved_version_id);
-        Ok(false)
     }
 
     pub(super) fn evaluate_current_object_lifecycle_expiration(

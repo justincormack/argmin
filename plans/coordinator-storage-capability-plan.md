@@ -1033,6 +1033,10 @@ access:
   - helper-level direct PG access such as current-object lookup / mutation
     helpers that are now mostly implementation leftovers rather than
     intentional coordinator boundaries
+- object metadata auth helper surface
+  - the old loaded-object helper family used by object tagging / ACL /
+    object-lock auth is now migrated onto storage-owned object metadata
+    transactions and remains only as test-only support code
 - any remaining helper-level `get_pg(...)` / `lock_two_pgs(...)` use in
   non-test coordinator modules
 
@@ -1040,6 +1044,8 @@ Acceptance criteria for 9a:
 
 - non-test coordinator helpers no longer expose obsolete PG-shaped APIs where
   a storage-owned helper now exists
+- the old production loaded-object auth helper seam is closed; any remaining
+  `LockedReadObject` / `ObjectPgGuards` usage is test-only
 - runtime/background code keeps direct PG access only where it is still a
   deliberate internal responsibility
 - the remaining coordinator PG uses are few, explicit, and explainable
