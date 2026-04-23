@@ -983,6 +983,43 @@ Initial migrated slice:
 Once the migrated families no longer depend on PG-shaped APIs, remove the
 remaining coordinator-visible PG access where possible.
 
+This is now explicitly a closeout phase, not the next migration phase.
+There are still production request-path seams that need dedicated migration
+work before phase 9 can honestly collapse the remaining coordinator PG
+surface.
+
+Remaining production request-path PG seams before phase 9:
+
+- Phase 4b bucket-wide listing / iteration paths are still coordinator-PG
+  shaped:
+  - `ListObjects`
+  - `ListObjectsV2`
+  - `ListObjectVersions`
+  - these still fan out across PGs from coordinator in `listing.rs`
+- bucket mutation / admin / config execution paths still have coordinator-side
+  bucket PG usage after auth migration:
+  - auth is on bucket handles
+  - but the actual metadata write/apply paths in `bucket.rs` still reopen
+    bucket PGs from coordinator
+- plain streaming helpers still have coordinator-visible PG usage in
+  `streaming.rs`:
+  - stream session encryption/load helpers
+  - append / cleanup paths
+  - these are still production write-path seams, not just tests
+- object delete still has remaining direct coordinator PG access in
+  `delete.rs`
+- authz still has coordinator-visible bucket PG fallback loads in `authz.rs`
+  for bucket policy / bucket tag resolution
+  - some of this overlaps with the fast-path and freshness review in phase 10
+  - but until that review is completed, these remain production coordinator PG
+    seams rather than “cleanup already done”
+
+So the intended order from here is:
+
+1. finish the remaining production request-path migrations above
+2. then use phase 9 to remove the leftover coordinator PG surface that should
+   be obsolete once those paths are migrated
+
 Expected end state:
 
 - no normal request path in `server-core` calls `storage_node.get_pg(...)`
