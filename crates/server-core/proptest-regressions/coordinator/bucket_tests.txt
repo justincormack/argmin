@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0762e3292d1c408785f426a82a79ef3ddbb3cf68e1778a11db91eb4b56b29248 # shrinks to (keys, ops, sweep_selector) = (["t", "w__-w-9_", "x0-"], [SetVersioning(Disabled), PutLive { key: "w__-w-9_", size: 0 }, PutLive { key: "t", size: 2 }, SetVersioning(Disabled), PutLive { key: "t", size: 4 }], 179)
