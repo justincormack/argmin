@@ -20,7 +20,7 @@ use crate::sse::SseCustomerRequest;
 impl Coordinator {
     /// Put an object, using a direct single-segment commit when possible.
     pub fn put_object(&self, req: &PutObjectRequest<'_>) -> Result<PutObjectResult, ServerError> {
-        let authorized = self.authorize_put_object_write(&AuthorizePutObjectRequest {
+        let authorize_req = AuthorizePutObjectRequest {
             object: ObjectRequest::new(
                 req.object.bucket.name_typed().clone(),
                 req.object.key_typed().clone(),
@@ -32,7 +32,30 @@ impl Coordinator {
             object_lock: req.object_lock,
             tags: req.tags,
             encryption: req.encryption,
-        })?;
+        };
+        if req.data.len() > INTERNAL_SEGMENT_SIZE {
+            let prepared = self.begin_stream_put(&authorize_req)?;
+            let result = self.put_large_object_from_authorized_write_with_session(
+                &AuthorizedPutObjectCommitRequest {
+                    data: req.data,
+                    metadata: req.metadata,
+                    system_metadata: req.system_metadata,
+                    cond: req.cond,
+                },
+                &prepared.authorized_write,
+                &prepared.session_id,
+            );
+            if result.is_err() {
+                let _ = self.abort_stream_put_for(
+                    prepared.authorized_write.bucket_typed(),
+                    prepared.authorized_write.key_typed(),
+                    &prepared.session_id,
+                );
+            }
+            return result;
+        }
+
+        let authorized = self.authorize_put_object_write(&authorize_req)?;
         self.put_object_from_authorized_write(
             &AuthorizedPutObjectCommitRequest {
                 data: req.data,
@@ -69,31 +92,11 @@ impl Coordinator {
 
         if req.data.len() > INTERNAL_SEGMENT_SIZE {
             let session_id = self.create_stream_put_session_for_authorized_write(authorized)?;
-            let write_encryption = &authorized.write_encryption;
-            let result = (|| {
-                for (idx, chunk) in req.data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
-                    let chunk_storage = write_encryption.encrypt_segment(idx as u32, chunk)?;
-                    self.append_stream_segment_for(
-                        authorized.bucket_typed(),
-                        authorized.key_typed(),
-                        &session_id,
-                        idx as u32,
-                        &chunk_storage,
-                    )?;
-                }
-                self.finalize_stream_put_from_authorized_write(
-                    &AuthorizedFinalizeStreamPutRequest {
-                        session_id: &session_id,
-                        crc64: object_crc64,
-                        total_size: req.data.len() as u64,
-                        metadata_blob: req.metadata,
-                        system_metadata: req.system_metadata,
-                        write_encryption: write_encryption.as_ref(),
-                        cond: req.cond,
-                    },
-                    authorized,
-                )
-            })();
+            let result = self.put_large_object_from_authorized_write_with_session(
+                req,
+                authorized,
+                &session_id,
+            );
             if result.is_err() {
                 let _ = self.abort_stream_put_for(
                     authorized.bucket_typed(),
@@ -268,6 +271,38 @@ impl Coordinator {
                 lifecycle_expiration,
             })
         })
+    }
+
+    fn put_large_object_from_authorized_write_with_session(
+        &self,
+        req: &AuthorizedPutObjectCommitRequest<'_>,
+        authorized: &AuthorizedPutObjectWrite,
+        session_id: &SessionId,
+    ) -> Result<PutObjectResult, ServerError> {
+        let object_crc64 = checksum::crc64::checksum(req.data);
+        let write_encryption = &authorized.write_encryption;
+        for (idx, chunk) in req.data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
+            let chunk_storage = write_encryption.encrypt_segment(idx as u32, chunk)?;
+            self.append_stream_segment_for(
+                authorized.bucket_typed(),
+                authorized.key_typed(),
+                session_id,
+                idx as u32,
+                &chunk_storage,
+            )?;
+        }
+        self.finalize_stream_put_from_authorized_write(
+            &AuthorizedFinalizeStreamPutRequest {
+                session_id,
+                crc64: object_crc64,
+                total_size: req.data.len() as u64,
+                metadata_blob: req.metadata,
+                system_metadata: req.system_metadata,
+                write_encryption: write_encryption.as_ref(),
+                cond: req.cond,
+            },
+            authorized,
+        )
     }
 
     pub fn begin_stream_put(

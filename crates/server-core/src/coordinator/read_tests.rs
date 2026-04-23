@@ -471,6 +471,7 @@ fn buffered_put_writes_object_segments() {
         assert_eq!(segments[1].size, INTERNAL_SEGMENT_SIZE as u64);
         assert_eq!(segments[2].segment_index, 2);
         assert_eq!(segments[2].size, 123);
+        assert!(pg.list_all_stream_uploads().unwrap().is_empty());
     }
 
     let get = coord
