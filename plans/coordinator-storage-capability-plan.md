@@ -609,6 +609,26 @@ So phase 4d is not “repair one helper”; it is the point where the write-side
 interface becomes operation-shaped enough that coordinator can no longer use
 PGs incorrectly by construction.
 
+This suggests a broader transactional pattern too:
+
+- when an operation's authorization depends on mutable object/upload state that
+  must stay coherent with the following storage action, storage should own a
+  single transaction-shaped primitive
+- the coordinator should pass a pure semantic/auth closure into that primitive
+  rather than performing one storage lookup for auth and a second storage call
+  for the follow-on action
+- that primitive should:
+  - acquire the relevant PG or reservation once
+  - load and validate the mutable state needed for auth
+  - invoke the coordinator-provided pure auth/semantic closure
+  - if authorized, perform the follow-on read/write action under the same
+    storage-owned critical section
+  - return only pure result data to coordinator
+
+This is not required for every operation. Bucket-only reads that consume an
+already loaded bucket handle do not need it. It is required when splitting auth
+and storage work would otherwise introduce a mutable-state TOCTOU gap.
+
 Covered surface:
 
 - ordinary single-object write/delete paths already migrated in phases 4 and 4c
@@ -628,6 +648,9 @@ Acceptance criteria:
 - coordinator still does not see bucket PGs or reservation mechanics directly
 - migrated write paths do not return or retain bucket-side PG guards outside
   the storage-owned write action boundary
+- state-coupled object/upload operations use a storage-owned transactional
+  primitive with a pure coordinator auth closure where needed, rather than
+  separate pre-auth and post-auth storage calls over mutable state
 
 Verification focus:
 
@@ -808,9 +831,13 @@ Phase 7 status:
 - `ListParts` now matches the same coordinator/storage boundary rule for the
   multipart management read path:
   - coordinator no longer receives or returns a metadata PG guard
-  - multipart upload lookup and part listing stay inside a storage-owned
-    object-PG helper
   - the coordinator-facing auth result for this path is pure data only
+  - however, this is not yet final:
+    - the current split between upload lookup for auth and part listing after
+      auth reintroduces a mutable upload-state race
+    - `ListParts` needs to move to the stronger transaction-shaped pattern
+      where storage holds the object-PG step once, invokes a pure auth closure,
+      and then lists parts under that same storage-owned critical section
 - `AbortMultipartUpload` now matches the same rule for the multipart cleanup
   path:
   - coordinator no longer performs multipart metadata PG orchestration
@@ -825,13 +852,16 @@ Phase 7 status:
     PG guards is only partially migrated and must be redesigned so storage owns
     the protected write action end to end
   - so the phase-7 surface is now mixed:
-    - `BeginStreamPart`, `UploadPart`, `ListParts`, `AbortMultipartUpload`,
+    - `BeginStreamPart`, `UploadPart`, `AbortMultipartUpload`,
       and `CompleteMultipartUpload` now have corrected storage-owned
       object-PG boundaries on their normal request path
+    - `ListParts` still needs the stronger transaction/auth-closure shape
+      before it is final
     - `CreateMultipartUpload` remains reservation-lifetime-rework pending,
       not final
 - remaining obvious phase-7 surface:
   - `CreateMultipartUpload`
+  - `ListParts` transaction/auth-closure rework
   - streaming `PutObject`
   - remaining multipart/session management flows
 
