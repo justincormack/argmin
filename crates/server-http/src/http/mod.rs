@@ -3840,11 +3840,9 @@ impl HttpFrontend {
             ctx.bucket(),
             ctx.key()
         );
-        let prepared = self
-            .coordinator
-            .begin_stream_put(&ctx.authorize_request())?;
-        ctx.replace_authorized_write(prepared.authorized_write);
-        Ok(prepared.session_id)
+        ctx.with_authorized_write(|authorized_write| {
+            self.coordinator.begin_stream_put_session(authorized_write)
+        })
     }
 
     /// Append a segment to a streaming session.
@@ -4382,15 +4380,6 @@ impl StreamingPutContext {
 
     fn key(&self) -> &ObjectKey {
         &self.authorize.object.key
-    }
-
-    fn authorize_request(&self) -> AuthorizePutObjectRequest<'_> {
-        self.authorize
-            .as_authorize_request(self.sse_customer.as_ref())
-    }
-
-    fn replace_authorized_write(&self, authorized_write: AuthorizedPutObjectWrite) {
-        *self.authorized_write.write().unwrap() = authorized_write;
     }
 
     fn with_authorized_write<T>(&self, f: impl FnOnce(&AuthorizedPutObjectWrite) -> T) -> T {
@@ -9112,6 +9101,40 @@ mod tests {
             .prepare_streaming_put(&req, "mybucket", "mykey", false)
             .unwrap();
         assert_eq!(ctx.key().as_str(), "mykey");
+    }
+
+    #[test]
+    fn start_streaming_put_session_uses_prepare_authorization_result() {
+        let tmp = test_util::tempdir();
+        let mut fe = setup_frontend(tmp.path());
+        fe.credentials.add(
+            TEST_SIGV4_ACCESS_KEY.to_string(),
+            SecretKey::new(TEST_SIGV4_SECRET.to_string()),
+        );
+        create_sigv4_test_bucket(&fe.coordinator, "mybucket", false);
+
+        let body = b"hello world".to_vec();
+        let req = signed_v4_put_req(&body, vec![]);
+        let ctx = fe
+            .prepare_streaming_put(&req, "mybucket", "mykey", false)
+            .unwrap();
+
+        fe.coordinator
+            .put_bucket_policy(&crate::coordinator::PutBucketPolicyRequest {
+                bucket: crate::coordinator::BucketRequest::new(
+                    test_bucket_name("mybucket"),
+                    crate::coordinator::test_helpers::requester(TEST_SIGV4_ACCESS_KEY),
+                    None,
+                ),
+                config: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"AKID"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::mybucket/*"}]}"#,
+                confirm_remove_self_bucket_access: false,
+            })
+            .unwrap();
+
+        let session_id = fe.start_streaming_put_session(&ctx).unwrap();
+        fe.coordinator
+            .abort_stream_put_session(ctx.bucket(), ctx.key(), &session_id)
+            .unwrap();
     }
 
     #[test]
