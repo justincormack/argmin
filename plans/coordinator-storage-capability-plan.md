@@ -957,6 +957,13 @@ external S3 semantics. The main questions are:
   when fast-path metadata is warm
   - for example, when they require a true policy snapshot rather than a cache
     hint
+- how fast-path freshness should be handled for newly written bucket policy and
+  other bucket metadata that can affect authorization immediately
+  - in particular, whether object reads may ever trust a warm
+    `bucket_policy_present == false` fast-path entry after `PutBucketPolicy`
+    has stored a new policy
+  - and whether local behavior should remain immediate here or be made
+    intentionally async only if that matches AWS and is explicitly modeled
 - whether any existing fast-path reads should be narrowed because they weaken
   the request-scoped snapshot contract
 
@@ -964,6 +971,7 @@ This review should cover at least:
 
 - ordinary object reads
 - bucket-policy-dependent reads
+- the open fast-path freshness issue tracked in `security/codex-1bf5cee`
 - bucket ABAC-enabled paths
 - bucket-only read/admin paths that now consistently require the same
   subresources
@@ -977,6 +985,9 @@ Acceptance criteria:
   snapshot guarantees established by the handle model
 - any request family that cannot preserve those guarantees is documented as
   requiring a real bucket snapshot load
+- the policy-freshness issue for object reads after `PutBucketPolicy` is
+  resolved and pinned by tests, either by removing the stale-cache window or by
+  deliberately modeling AWS-compatible asynchronous behavior
 
 ## Special Cases
 

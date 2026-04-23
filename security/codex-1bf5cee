@@ -1,0 +1,180 @@
+Fast-path cache can briefly bypass newly added bucket policy
+Link: https://chatgpt.com/codex/cloud/security/findings/9f930a0ae7f481918597cf6545cb2312?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium (attack path: medium)
+Status: open
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 1bf5cee
+Author: justin@specialbusservice.com
+Created: 22/04/2026, 13:32:38
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced a race condition where object reads can bypass a newly added bucket policy until the fast-path cache is updated.
+The commit changes load_bucket_handle_for_object_policy_read to return a LoadedBucketHandle based solely on the in-memory fast-path cache when bucket_policy_present is false. Because put_bucket_policy writes the policy to storage and only afterward updates the fast-path cache, there is a TOCTOU window where object read requests (GetObject/HeadObject/GetObjectAttributes) can still use the stale fast-path entry and skip loading the newly stored policy. During this window, access is decided by ACLs alone, potentially allowing reads that the new policy should deny.
+
+# Current assessment
+Reviewed against the current tree on 23/04/2026. The finding remains valid.
+
+The specific fast-path shortcut is still present:
+
+- `load_bucket_handle_for_object_policy_read(...)` still returns a synthetic
+  loaded bucket handle when the bucket fast path says
+  `bucket_policy_present == false`
+- `cached_bucket_policy_for_loaded_handle(...)` still treats that handle as
+  having no policy and returns `None`
+- `put_bucket_policy(...)` still writes the policy to storage before refreshing
+  the bucket fast-path entry
+
+So there is still a stale-cache window where object reads can authorize from
+ACLs alone immediately after a newly added deny policy is stored.
+
+This is now considered a fast-path correctness issue rather than a storage
+boundary issue. Resolution is deferred to Phase 10 of
+`plans/coordinator-storage-capability-plan.md`, which now explicitly covers
+fast-path freshness for bucket-policy-dependent object reads and the decision
+whether this local behavior should be immediate or intentionally async to match
+AWS.
+
+# Validation
+## Rubric
+- [x] Build server-core in debug and run a targeted PoC test to check object read behavior with stale fast-path cache.
+- [x] Verify `load_bucket_handle_for_object_policy_read` early-returns when `bucket_policy_present` is false (authz.rs:1673-1705).
+- [x] Verify `cached_bucket_policy_for_loaded_handle` returns `None` when `bucket_policy_present` is false (authz.rs:733-760).
+- [x] Verify `authorize_object_read` uses `load_bucket_handle_for_object_policy_read` (authz.rs:4517-4538).
+- [x] Verify `put_bucket_policy` writes to storage before fast-path update (bucket.rs:764-789).
+## Report
+Built the debug test target (`cargo test -p server-core --no-run`). Added a targeted PoC test `object_read_denied_policy_can_be_bypassed_when_fast_path_is_stale` in `core_tests.rs` (lines 4896-4934) that: creates a bucket/object, warms the fast-path, installs an explicit deny policy, confirms `HeadObject` is denied when policy is present, then forces the fast-path cache to `bucket_policy_present=false` via `update_bucket_fast_path_if_present` and retries the read. Running `cargo test -p server-core object_read_denied_policy_can_be_bypassed_when_fast_path_is_stale -- --nocapture` panics with `expected AccessDenied with stale fast-path, got Ok(HeadObjectResult { ... size: 4 ... })`, showing the read succeeds despite the deny policy (test output in artifact). Code evidence: `load_bucket_handle_for_object_policy_read` returns early when fast-path says no policy (authz.rs:1673-1705), and `authorize_object_read` uses this loader (authz.rs:4517-4538). `cached_bucket_policy_for_loaded_handle` also short-circuits to `None` when `bucket_policy_present` is false (authz.rs:733-760), so the policy is never loaded. `put_bucket_policy` writes the policy then updates the fast-path cache (bucket.rs:764-789), creating the stale-cache window. Valgrind was not installed; ASan attempt failed due to non-nightly compiler. Debugger attempt used lldb to run the failing test (same panic, no stack since process exited).
+
+# Evidence
+/workspace/argmin/crates/server-core/src/coordinator/authz.rs (L1673 to 1704)
+  Note: New fast-path early return skips loading policy from storage when cached bucket_policy_present is false, enabling stale policy decisions.
+```
+    fn load_bucket_handle_for_object_policy_read(
+        &self,
+        bucket: &BucketName,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<LoadedBucketHandle, ServerError> {
+        let request = BucketHandleRequest::new()
+            .requiring_policy_view()
+            .requiring_bucket_tags_if_abac_enabled();
+
+        if let Some(info) = self.storage_node.get_bucket_fast_path(bucket) {
+            if info.state != BucketState::Active {
+                return Err(ServerError::BucketNotFound {
+                    name: bucket.to_string(),
+                });
+            }
+
+            let bucket_info = Self::validate_expected_bucket_owner(
+                Self::bucket_summary_fast(info),
+                expected_bucket_owner,
+            )?
+            .into_inner();
+
+            if !bucket_info.bucket_policy_present {
+                return Ok(LoadedBucketHandle::new(
+                    bucket_info,
+                    request,
+                    LoadedBucketValue::NotRequested,
+                    LoadedBucketValue::NotRequested,
+                    LoadedBucketValue::NotRequested,
+                    LoadedBucketValue::NotRequested,
+                ));
+            }
+```
+
+/workspace/argmin/crates/server-core/src/coordinator/authz.rs (L4517 to 4538)
+  Note: Object read authorization relies on load_bucket_handle_for_object_policy_read, so reads inherit the fast-path policy skip.
+```
+    fn authorize_object_read<'a>(
+        &'a self,
+        requester: &Requester,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        expected_bucket_owner: Option<&str>,
+        policy_action: auth::PolicyAction,
+    ) -> Result<LockedReadObject<'a>, ServerError> {
+        let bucket =
+            self.load_bucket_handle_for_object_policy_read(bucket, expected_bucket_owner)?;
+        let object = match version_id {
+            Some(version_id) => bucket.load_object_version(key.clone(), version_id),
+            None => bucket.load_object(key.clone()),
+        };
+        let loaded = self.load_locked_object_state_from_loaded_bucket(
+            requester,
+            &object,
+            ObjectBucketPolicyRequirement::Required,
+            MissingObjectDiscovery::ReadBucket,
+        )?;
+        self.ensure_loaded_object_read_allowed(requester, &loaded, policy_action)?;
+```
+
+/workspace/argmin/crates/server-core/src/coordinator/bucket.rs (L764 to 789)
+  Note: Bucket policy is written to storage before the fast-path cache is updated, creating a window where reads can see stale cache data.
+```
+    pub fn put_bucket_policy(&self, req: &PutBucketPolicyRequest<'_>) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_bucket_policy",
+            "bucket={:?} bytes={}",
+            req.bucket.name,
+            req.config.len()
+        );
+        let authorized = self.authorize_put_bucket_policy(req)?;
+        self.store_bucket_subresource(
+            &authorized.bucket,
+            storage::PutBucketSubresource {
+                kind: storage::BucketSubresourceKind::Policy,
+                body: &authorized.body,
+                aux: storage::BucketSubresourceAux::policy(authorized.policy_is_public),
+            },
+        )?;
+        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
+        let info = storage::PgMetadataStore::head_bucket_raw(&*bucket_pg, &authorized.bucket)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        self.storage_node.upsert_bucket_fast_path((&info).into());
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Impact is meaningful (unauthorized object read) but bounded to a short TOCTOU window and requires concurrent policy updates and favorable ACL conditions. This keeps severity at medium rather than high/critical despite remote reachability.
+## Likelihood
+high - Exploitation requires racing a narrow window during policy updates and depends on ACLs or prior access; an attacker can spam reads to increase the chance but timing is still constrained. | Remote network vector
+## Impact
+medium - During the stale-cache window, reads can succeed even though a newly added bucket policy should deny them, exposing object data to unauthorized access.
+## Assumptions
+- Deployment exposes the HTTP listener to potential attackers (ARGMIN_LISTEN_ADDR may be non-loopback or behind a reverse proxy).
+- A bucket policy is newly added to deny reads that were previously allowed by ACLs (e.g., public-read) or by existing credentials.
+- An attacker can send GetObject/HeadObject/GetObjectAttributes requests during the short window after policy write but before fast-path cache update.
+- No additional external controls (e.g., network allowlists) prevent the attacker from reaching the service.
+- Bucket exists with object data
+- Bucket policy is newly added or changed to deny reads
+- Fast-path cache still indicates bucket_policy_present=false
+- Attacker can issue object read requests during the TOCTOU window
+- ACLs or existing credentials would otherwise allow read
+## Path
+[n1] GetObject/HeadObject -> [n2] load_bucket_handle_for_object_policy_read -> [n3] fast-path says no policy -> [n4] ACL-only decision -> [n5] object read allowed
+## Path evidence
+- `crates/server-core/src/coordinator/authz.rs:1663-1704` - Early return when fast-path cache indicates bucket_policy_present=false, skipping policy load for object reads.
+- `crates/server-core/src/coordinator/authz.rs:733-760` - cached_bucket_policy_for_loaded_handle returns None when bucket_policy_present is false, preventing policy evaluation.
+- `crates/server-core/src/coordinator/authz.rs:4517-4538` - authorize_object_read relies on load_bucket_handle_for_object_policy_read for object read authorization.
+- `crates/server-core/src/coordinator/bucket.rs:764-789` - put_bucket_policy writes policy to storage before updating the fast-path cache, creating a window for stale cache reads.
+## Narrative
+Object reads use load_bucket_handle_for_object_policy_read, which returns early when the fast-path cache says bucket_policy_present=false, skipping policy loading. cached_bucket_policy_for_loaded_handle also returns None when bucket_policy_present is false, ensuring no policy is evaluated. put_bucket_policy writes the policy to storage and only then updates the fast-path cache, creating a TOCTOU window where reads can observe a stale cache entry and be authorized by ACLs alone. The validation report describes a PoC test that forces a stale fast-path entry and observes a successful HeadObject despite a deny policy, indicating a real authorization bypass window. This is reachable through normal S3 object-read APIs when a policy is newly added or modified.
+## Controls
+- SigV4 authentication
+- Bucket ACLs and bucket policies
+- Fast-path cache for bucket metadata
+## Blindspots
+- No deployment manifests or runtime configuration were found; actual network exposure (public vs internal) is unknown.
+- Static analysis only; the exact duration of the cache-staleness window and operational mitigations are not measurable here.
