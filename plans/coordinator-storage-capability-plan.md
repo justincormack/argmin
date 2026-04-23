@@ -504,6 +504,8 @@ Current state after phase 4:
 
 - ordinary single-object write/delete request paths use write-scoped bucket
   handles
+- the read-side phase-4 work remains complete; the open follow-up is on the
+  write/delete side only
 - but the coordinator still owns part of the write-side storage mechanism:
   - `with_bucket_write_handle_for(...)` still acquires bucket write
     reservations
@@ -568,6 +570,7 @@ Questions to re-check:
 Re-review status:
 
 - reopened
+- this reopen applies only to the single-object write/delete half of phase 4
 - ordinary single-object write/delete flow now avoids coordinator-visible
   bucket PG access on the migrated bucket side
 - write-side reservation handling is not yet correct for the migrated
@@ -635,7 +638,8 @@ Covered surface:
   `with_bucket_write_handle_for(...)` or otherwise split bucket-auth work from
   the later protected write action
 - concretely, that means:
-  - the single-object write/delete production paths from phase 4 / 4c
+  - the single-object write/delete production paths from the write half of
+    phase 4 / 4c
   - bucket mutation/admin/config writes from phase 5
   - `DeleteBucket` revalidation in phase 6 against the corrected exclusion
     contract
@@ -646,7 +650,7 @@ Covered surface:
 Not in scope:
 
 - read-only phases 1-3
-- the bucket-read half of phase 4
+- the completed read side of phase 4
 - multipart paths already moved to storage-owned transactional boundaries in
   phase 7, unless a specific remaining production path is found to still
   depend on the older helper
