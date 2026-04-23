@@ -1,13 +1,12 @@
 use checksum::{ChecksumAlgorithm, ChecksumBytes, ChecksumType, MultipartChecksumConfig};
-use s3_types::{BucketVersioningState, VersionId};
 use storage::traits::{PgMetadataStore, ShardStore};
 use storage::{
-    BucketName, CommitMultipartReq, CreateMultipartUploadReq, CreateStreamUploadReq, EcShape,
-    FinalizeStreamPartOutcome, GenerationId, ListMultipartUploadsReq, MultipartPartRecord,
-    MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, ObjectPartRecord,
-    PreparedStreamPartCommit, SerializedMetadataBlob, SerializedSystemMetadataBlob,
-    SerializedTagSet, SessionId, ShardKey, StreamUploadPartSnapshot, StreamUploadState,
-    StreamUploadTarget, UploadId, UploadState, UPLOAD_ID_ALPHABET, UPLOAD_ID_LEN,
+    BucketName, CreateMultipartUploadReq, CreateStreamUploadReq, FinalizeStreamPartOutcome,
+    GenerationId, ListMultipartUploadsReq, MultipartPartRecord, MultipartPartSegmentRecord,
+    MultipartUploadRecord, ObjectKey, PreparedStreamPartCommit, SerializedMetadataBlob,
+    SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardKey,
+    StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
+    UPLOAD_ID_ALPHABET, UPLOAD_ID_LEN,
 };
 
 use super::authz_results::{
@@ -283,26 +282,20 @@ impl Coordinator {
         let _completion_guard = self.storage_node.lock_multipart_completion_bucket(&bucket);
         let completion_order =
             self.next_completed_multipart_upload_order_for_bucket_name(&bucket)?;
-        let meta_pg_id = self.object_pg_id_for(&bucket, &key);
-        self.storage_node
-            .load_in_progress_multipart_upload_for_completion(&bucket, &key, &upload_id)
+        let completion_preflight = self
+            .storage_node
+            .load_multipart_completion_preflight(&bucket, &key, &upload_id)
             .map_err(Coordinator::map_object_pg_action_error)?;
-        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
 
         if !req.cond.is_empty() {
-            let existing_etag =
-                match storage::PgMetadataStore::get_object_meta(&*meta_pg, &bucket, &key) {
-                    Ok(stored) => stored.as_live().map(|record| record.etag.format()),
-                    Err(storage::MetadataError::ObjectNotFound) => None,
-                    Err(e) => return Err(ServerError::Metadata(e)),
-                };
+            let existing_etag = completion_preflight.existing_etag.as_deref();
             if matches!(req.cond, WriteCondition::IfMatch(_)) && existing_etag.is_none() {
                 return Err(ServerError::ObjectNotFound {
                     bucket: bucket.to_string(),
                     key: key.to_string(),
                 });
             }
-            check_write_conditions(req.cond, existing_etag.as_deref())?;
+            check_write_conditions(req.cond, existing_etag)?;
         }
         if parts.is_empty() {
             return Err(ServerError::InvalidRequest {
@@ -323,11 +316,24 @@ impl Coordinator {
             }
         }
 
+        let requested_part_numbers: Vec<u32> = parts.iter().map(|part| part.part_number).collect();
+        let completion_snapshot = self
+            .storage_node
+            .load_multipart_completion_snapshot(&bucket, &key, &upload_id, &requested_part_numbers)
+            .map_err(|error| match error {
+                storage::ObjectPgActionError::Metadata(storage::MetadataError::PartNotFound {
+                    part_number,
+                    ..
+                }) => ServerError::InvalidPart { part_number },
+                other => Coordinator::map_object_pg_action_error(other),
+            })?;
+
         let checksum_algo = upload.checksum.map(MultipartChecksumConfig::algorithm);
         let checksum_type = upload.checksum.map(MultipartChecksumConfig::checksum_type);
 
-        let mut part_records: Vec<MultipartPartRecord> = Vec::with_capacity(parts.len());
-        for cp in parts {
+        let mut part_records: Vec<MultipartPartRecord> =
+            Vec::with_capacity(completion_snapshot.part_records.len());
+        for (cp, part) in parts.iter().zip(completion_snapshot.part_records) {
             if let (Some(upload_algo), Some(ChecksumType::Composite), None) =
                 (checksum_algo, checksum_type, cp.checksum.as_ref())
             {
@@ -336,15 +342,6 @@ impl Coordinator {
                     part_number: cp.part_number,
                 });
             }
-            let part = match meta_pg.get_multipart_part(&upload_id, cp.part_number) {
-                Ok(p) => p,
-                Err(storage::MetadataError::PartNotFound { .. }) => {
-                    return Err(ServerError::InvalidPart {
-                        part_number: cp.part_number,
-                    });
-                }
-                Err(e) => return Err(ServerError::Metadata(e)),
-            };
 
             let stored_etag = etag_bytes_to_crc64(&part.etag)
                 .map(format_etag)
@@ -397,18 +394,6 @@ impl Coordinator {
                 }
             }
         }
-
-        let version_id = if bucket_info.versioning == BucketVersioningState::Enabled {
-            storage::PgMetadataStore::next_version_id(&*meta_pg, &bucket, &key)?
-        } else {
-            VersionId::Null
-        };
-        let generation_id = storage::PgMetadataStore::next_generation_id(&*meta_pg, &bucket, &key)?;
-        let stale_payload = if version_id.is_null() {
-            Self::snapshot_overwritten_null_version_payload(&meta_pg, &bucket, &key)?
-        } else {
-            None
-        };
 
         let part_etags: Vec<&[u8]> = part_records.iter().map(|p| p.etag.as_slice()).collect();
         let (etag_bytes_vec, etag_str) = compute_multipart_etag(&part_etags);
@@ -612,96 +597,36 @@ impl Coordinator {
             Self::prepare_stored_system_metadata(&system_metadata, &multipart_write_encryption)?;
         let managed_encryption = final_encryption.managed_encryption_algorithm();
 
-        let obj_req = CommitMultipartReq {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            version_id,
-            owner: upload.owner.clone(),
-            acl_grants: upload.acl_grants.clone(),
-            public_read: upload.public_read,
-            generation_id,
-            size: total_size,
-            etag_crc64,
-            ec: EcShape { k: 0, m: 0 },
-            tags: upload.tags.clone(),
-            metadata_blob: Some(upload.metadata_blob.clone()),
-            system_metadata_blob: Some(system_metadata_bytes),
-            object_lock: Self::resolve_new_object_lock_state(&bucket_info, upload.object_lock)?,
-            encryption: final_encryption,
-        };
-
-        let object_parts: Vec<ObjectPartRecord> = part_records
-            .iter()
-            .map(|p| {
-                let shard_pg_id = self.shard_pg_id_raw(
-                    &format!("mpu/{}", p.upload_id),
-                    &format!("{}/{}", p.part_number, p.generation),
-                    p.part_vid.get(),
-                );
-                ObjectPartRecord {
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    version_id,
-                    part_number: p.part_number,
-                    size: p.size,
-                    etag: p.etag.clone(),
-                    etag_kind: p.etag_kind,
-                    part_okh: p.part_okh,
-                    part_vid: p.part_vid,
-                    ec_k: p.ec_k,
-                    ec_m: p.ec_m,
-                    shard_pg_id,
-                    checksum: p.checksum.clone(),
-                }
-            })
-            .collect();
-
-        drop(meta_pg);
-
         #[cfg(test)]
         maybe_run_multipart_complete_pre_commit_hook(bucket.as_str(), key.as_str());
 
-        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-        meta_pg
-            .complete_multipart_commit(&upload_id, completion_order, &obj_req, &object_parts)
-            .map_err(ServerError::Metadata)?;
-        let stored = storage::PgMetadataStore::get_object_meta(&*meta_pg, &bucket, &key)
-            .map_err(ServerError::Metadata)?;
-        let live_record = stored.as_live().ok_or_else(|| ServerError::InternalError {
-            reason: format!(
-                "stored object {} / {} is not live immediately after CompleteMultipartUpload",
-                bucket, key
-            ),
-        })?;
-        let lifecycle_tags = live_record.tags.clone();
-        let lifecycle_size = live_record.size;
-        let lifecycle_last_modified = live_record.last_modified;
+        let completion_outcome = self
+            .storage_node
+            .complete_multipart_upload_commit(storage::CompleteMultipartCommitRequest {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                upload_id: upload_id.clone(),
+                completion_order,
+                versioning: bucket_info.versioning,
+                owner: upload.owner.clone(),
+                acl_grants: upload.acl_grants.clone(),
+                public_read: upload.public_read,
+                size: total_size,
+                etag_crc64,
+                tags: upload.tags.clone(),
+                metadata_blob: Some(upload.metadata_blob.clone()),
+                system_metadata_blob: Some(system_metadata_bytes),
+                object_lock: Self::resolve_new_object_lock_state(&bucket_info, upload.object_lock)?,
+                encryption: final_encryption,
+                part_records: part_records.clone(),
+            })
+            .map_err(Coordinator::map_object_pg_action_error)?;
+        let version_id = completion_outcome.version_id;
+        let stale_payload = completion_outcome.stale_payload.map(StaleObjectPayload::from);
+        let lifecycle_tags = completion_outcome.live_tags;
+        let lifecycle_size = completion_outcome.live_size;
+        let lifecycle_last_modified = completion_outcome.live_last_modified;
 
-        if let Some(ref payload) = stale_payload {
-            match payload {
-                StaleObjectPayload::Multipart {
-                    generation_id,
-                    parts,
-                    streaming_segments,
-                } => {
-                    Self::enqueue_multipart_reclaim(
-                        &meta_pg,
-                        &bucket,
-                        &key,
-                        *generation_id,
-                        parts,
-                        streaming_segments,
-                    )?;
-                }
-                StaleObjectPayload::Segments { .. } => {
-                    Self::delete_stale_object_payload_metadata(
-                        &meta_pg, &bucket, &key, version_id, payload,
-                    )?;
-                }
-            }
-        }
-
-        drop(meta_pg);
         self.prune_completed_multipart_uploads_for_bucket_with_limit(
             bucket.as_str(),
             COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT,

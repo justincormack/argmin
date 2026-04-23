@@ -2412,6 +2412,59 @@ pub struct MultipartPartRecord {
     pub checksum: Option<ChecksumBytes>,
 }
 
+#[derive(Debug, Clone)]
+pub struct MultipartCompletionSnapshot {
+    pub existing_etag: Option<String>,
+    pub part_records: Vec<MultipartPartRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MultipartCompletionPreflight {
+    pub existing_etag: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CompletedMultipartStalePayload {
+    Segments {
+        generation_id: GenerationId,
+        segments: Vec<ObjectSegmentRecord>,
+    },
+    Multipart {
+        generation_id: GenerationId,
+        parts: Vec<ObjectPartRecord>,
+        streaming_segments: Vec<MultipartPartSegmentRecord>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct CompleteMultipartCommitRequest {
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub upload_id: UploadId,
+    pub completion_order: u64,
+    pub versioning: BucketVersioningState,
+    pub owner: OwnerIdentity,
+    pub acl_grants: AclGrants,
+    pub public_read: bool,
+    pub size: u64,
+    pub etag_crc64: [u8; 8],
+    pub tags: Option<SerializedTagSet>,
+    pub metadata_blob: Option<SerializedMetadataBlob>,
+    pub system_metadata_blob: Option<SerializedSystemMetadataBlob>,
+    pub object_lock: ObjectLockState,
+    pub encryption: ObjectEncryption,
+    pub part_records: Vec<MultipartPartRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompleteMultipartCommitOutcome {
+    pub version_id: VersionId,
+    pub stale_payload: Option<CompletedMultipartStalePayload>,
+    pub live_tags: Option<SerializedTagSet>,
+    pub live_size: u64,
+    pub live_last_modified: u64,
+}
+
 /// Committed part record in the object manifest.
 #[derive(Debug, Clone)]
 pub struct ObjectPartRecord {

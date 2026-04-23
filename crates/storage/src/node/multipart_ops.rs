@@ -1,6 +1,28 @@
 use super::*;
+use crate::clock::current_time_millis;
+use crate::types::{
+    CompleteMultipartCommitRequest, CompleteMultipartCommitOutcome, CompletedMultipartStalePayload,
+    EcShape, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
+    MultipartReclaimRecord, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, StoredObject,
+    VersionId,
+};
 
 impl SharedStorageNode {
+    pub(super) fn load_in_progress_multipart_upload_from_object_pg(
+        pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, crate::error::MetadataError> {
+        let upload = Self::load_multipart_upload_from_object_pg(pg, bucket, key, upload_id)?;
+        if upload.state != UploadState::InProgress {
+            return Err(crate::error::MetadataError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+        Ok(upload)
+    }
+
     pub(super) fn load_multipart_upload_from_object_pg(
         pg: &PgStore,
         bucket: &BucketName,
@@ -62,14 +84,318 @@ impl SharedStorageNode {
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
         let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
-        let upload = Self::load_multipart_upload_from_object_pg(&pg, bucket, key, upload_id)?;
-        if upload.state != UploadState::InProgress {
-            return Err(crate::error::MetadataError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            }
-            .into());
+        Ok(Self::load_in_progress_multipart_upload_from_object_pg(
+            &pg, bucket, key, upload_id,
+        )?)
+    }
+
+    pub fn load_multipart_completion_snapshot(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        requested_part_numbers: &[u32],
+    ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError> {
+        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        let _upload =
+            Self::load_in_progress_multipart_upload_from_object_pg(&pg, bucket, key, upload_id)?;
+        let existing_etag = match PgMetadataStore::get_object_meta(&*pg, bucket, key) {
+            Ok(stored) => stored.as_live().map(|record| record.etag.format()),
+            Err(crate::error::MetadataError::ObjectNotFound) => None,
+            Err(other) => return Err(other.into()),
+        };
+        let mut part_records = Vec::with_capacity(requested_part_numbers.len());
+        for &part_number in requested_part_numbers {
+            part_records.push(pg.get_multipart_part(upload_id, part_number)?);
         }
-        Ok(upload)
+        Ok(MultipartCompletionSnapshot {
+            existing_etag,
+            part_records,
+        })
+    }
+
+    pub fn load_multipart_completion_preflight(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<MultipartCompletionPreflight, ObjectPgActionError> {
+        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        let _upload =
+            Self::load_in_progress_multipart_upload_from_object_pg(&pg, bucket, key, upload_id)?;
+        let existing_etag = match PgMetadataStore::get_object_meta(&*pg, bucket, key) {
+            Ok(stored) => stored.as_live().map(|record| record.etag.format()),
+            Err(crate::error::MetadataError::ObjectNotFound) => None,
+            Err(other) => return Err(other.into()),
+        };
+        Ok(MultipartCompletionPreflight { existing_etag })
+    }
+
+    fn snapshot_overwritten_null_version_payload_from_pg(
+        pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Option<CompletedMultipartStalePayload>, ObjectPgActionError> {
+        let stored = match PgMetadataStore::get_object_version(pg, bucket, key, VersionId::Null) {
+            Ok(stored) => stored,
+            Err(crate::error::MetadataError::ObjectNotFound) => return Ok(None),
+            Err(other) => return Err(other.into()),
+        };
+        let record = match stored {
+            StoredObject::Live(record) => record,
+            StoredObject::DeleteMarker(_) => return Ok(None),
+        };
+
+        match record.layout {
+            ObjectLayout::MultipartManifest { .. } => {
+                let parts = PgMetadataStore::get_object_parts(pg, bucket, key, VersionId::Null)?;
+                let mut streaming_segments = Vec::new();
+                for part in &parts {
+                    if part.part_okh == [0u8; 16] {
+                        let segments = PgMetadataStore::get_multipart_part_segments(
+                            pg,
+                            bucket,
+                            key,
+                            VersionId::Null,
+                            part.part_number,
+                        )?;
+                        streaming_segments.extend(segments);
+                    }
+                }
+                Ok(Some(CompletedMultipartStalePayload::Multipart {
+                    generation_id: record.generation_id,
+                    parts,
+                    streaming_segments,
+                }))
+            }
+            ObjectLayout::Standard => {
+                let segments = PgMetadataStore::get_object_segments(pg, bucket, key, VersionId::Null)?;
+                Ok(Some(CompletedMultipartStalePayload::Segments {
+                    generation_id: record.generation_id,
+                    segments,
+                }))
+            }
+        }
+    }
+
+    fn enqueue_object_segments_reclaim_from_pg(
+        pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        segments: &[ObjectSegmentRecord],
+    ) -> Result<(), ObjectPgActionError> {
+        pg.put_object_segments_reclaim(&crate::types::ObjectSegmentsReclaimRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            created_at: current_time_millis(),
+            segments: segments
+                .iter()
+                .map(|segment| crate::types::ObjectSegmentsReclaimSegmentRecord {
+                    segment_index: segment.segment_index,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    shard_pg_id: segment.shard_pg_id,
+                    ec: EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
+                })
+                .collect(),
+        })?;
+        Ok(())
+    }
+
+    fn enqueue_multipart_reclaim_from_pg(
+        pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        parts: &[ObjectPartRecord],
+        streaming_segments: &[MultipartPartSegmentRecord],
+    ) -> Result<(), ObjectPgActionError> {
+        use std::collections::BTreeMap;
+
+        let mut segments_by_part: BTreeMap<u32, Vec<MultipartReclaimPartSegmentRecord>> =
+            BTreeMap::new();
+        for segment in streaming_segments {
+            segments_by_part
+                .entry(segment.part_number)
+                .or_default()
+                .push(MultipartReclaimPartSegmentRecord {
+                    part_number: segment.part_number,
+                    segment_index: segment.segment_index,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    shard_pg_id: segment.shard_pg_id,
+                    ec: EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
+                });
+        }
+
+        pg.put_multipart_reclaim(&MultipartReclaimRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            created_at: current_time_millis(),
+            parts: parts
+                .iter()
+                .map(|part| {
+                    if part.part_okh == [0u8; 16] {
+                        MultipartReclaimPartRecord::Segments {
+                            part_number: part.part_number,
+                            segments: segments_by_part.remove(&part.part_number).unwrap_or_default(),
+                        }
+                    } else {
+                        MultipartReclaimPartRecord::ShardSet {
+                            part_number: part.part_number,
+                            part_okh: part.part_okh,
+                            part_vid: part.part_vid,
+                            shard_pg_id: part.shard_pg_id,
+                            ec: EcShape {
+                                k: part.ec_k,
+                                m: part.ec_m,
+                            },
+                        }
+                    }
+                })
+                .collect(),
+        })?;
+        Ok(())
+    }
+
+    fn finalize_completed_multipart_stale_payload_metadata_from_pg(
+        pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        payload: &CompletedMultipartStalePayload,
+    ) -> Result<(), ObjectPgActionError> {
+        match payload {
+            CompletedMultipartStalePayload::Segments {
+                generation_id,
+                segments,
+            } => {
+                Self::enqueue_object_segments_reclaim_from_pg(
+                    pg,
+                    bucket,
+                    key,
+                    *generation_id,
+                    segments,
+                )?;
+                PgMetadataStore::delete_object_segments(pg, bucket, key, version_id)?;
+            }
+            CompletedMultipartStalePayload::Multipart {
+                generation_id,
+                parts,
+                streaming_segments,
+            } => {
+                Self::enqueue_multipart_reclaim_from_pg(
+                    pg,
+                    bucket,
+                    key,
+                    *generation_id,
+                    parts,
+                    streaming_segments,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn complete_multipart_upload_commit(
+        &self,
+        req: CompleteMultipartCommitRequest,
+    ) -> Result<CompleteMultipartCommitOutcome, ObjectPgActionError> {
+        let pg = self.get_pg(self.pg_topology.object_pg_for(&req.bucket, &req.key))?;
+        let version_id = if req.versioning == crate::types::BucketVersioningState::Enabled {
+            PgMetadataStore::next_version_id(&*pg, &req.bucket, &req.key)?
+        } else {
+            VersionId::Null
+        };
+        let generation_id = PgMetadataStore::next_generation_id(&*pg, &req.bucket, &req.key)?;
+        let stale_payload = if version_id.is_null() {
+            Self::snapshot_overwritten_null_version_payload_from_pg(&pg, &req.bucket, &req.key)?
+        } else {
+            None
+        };
+
+        let object_parts: Vec<ObjectPartRecord> = req
+            .part_records
+            .iter()
+            .map(|part| {
+                let shard_pg_id = self.pg_topology.shard_pg(
+                    format!("mpu/{}", part.upload_id).as_str(),
+                    format!("{}/{}", part.part_number, part.generation).as_str(),
+                    part.part_vid.get(),
+                );
+                ObjectPartRecord {
+                    bucket: req.bucket.clone(),
+                    key: req.key.clone(),
+                    version_id,
+                    part_number: part.part_number,
+                    size: part.size,
+                    etag: part.etag.clone(),
+                    etag_kind: part.etag_kind,
+                    part_okh: part.part_okh,
+                    part_vid: part.part_vid,
+                    ec_k: part.ec_k,
+                    ec_m: part.ec_m,
+                    shard_pg_id,
+                    checksum: part.checksum.clone(),
+                }
+            })
+            .collect();
+
+        pg.complete_multipart_commit(
+            &req.upload_id,
+            req.completion_order,
+            &crate::types::CommitMultipartReq {
+                bucket: req.bucket.clone(),
+                key: req.key.clone(),
+                version_id,
+                owner: req.owner,
+                acl_grants: req.acl_grants,
+                public_read: req.public_read,
+                generation_id,
+                size: req.size,
+                etag_crc64: req.etag_crc64,
+                ec: EcShape { k: 0, m: 0 },
+                tags: req.tags,
+                metadata_blob: req.metadata_blob,
+                system_metadata_blob: req.system_metadata_blob,
+                object_lock: req.object_lock,
+                encryption: req.encryption,
+            },
+            &object_parts,
+        )?;
+
+        if let Some(ref payload) = stale_payload {
+            Self::finalize_completed_multipart_stale_payload_metadata_from_pg(
+                &pg,
+                &req.bucket,
+                &req.key,
+                version_id,
+                payload,
+            )?;
+        }
+
+        let stored = PgMetadataStore::get_object_meta(&*pg, &req.bucket, &req.key)?;
+        let live_record = stored.as_live().ok_or_else(|| crate::error::MetadataError::Db {
+            context: "completed multipart object missing live record",
+            source: rusqlite::Error::QueryReturnedNoRows,
+        })?;
+
+        Ok(CompleteMultipartCommitOutcome {
+            version_id,
+            stale_payload,
+            live_tags: live_record.tags.clone(),
+            live_size: live_record.size,
+            live_last_modified: live_record.last_modified,
+        })
     }
 
     pub fn finalize_upload_part_stream<T, E>(

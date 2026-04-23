@@ -797,6 +797,14 @@ Phase 7 status:
   - coordinator no longer receives or returns a metadata PG guard for this path
   - multipart upload lookup and stream-session creation stay inside the
     storage-owned object-PG step
+- `CompleteMultipartUpload` now matches the same corrected boundary rule for
+  the multipart completion path:
+  - coordinator no longer drives metadata-PG preparation or manifest commit
+    directly
+  - requested-part snapshot loading and final multipart manifest commit are
+    storage-owned object-PG operations
+  - version/generation allocation and stale-payload metadata cleanup now stay
+    inside the storage-owned completion commit step
 - `ListParts` now matches the same coordinator/storage boundary rule for the
   multipart management read path:
   - coordinator no longer receives or returns a metadata PG guard
@@ -811,18 +819,19 @@ Phase 7 status:
   - the normal request path no longer carries abort-specific PG/shard deletion
     mechanics in `runtime.rs`
 - follow-up required on migrated slice:
-  - `CreateMultipartUpload` and `CompleteMultipartUpload` still need to move
-    from the current write-scoped snapshot boundary to the phase-4d
-    write-scoped action boundary
+  - `CreateMultipartUpload` still needs to move from the current write-scoped
+    snapshot boundary to the phase-4d write-scoped action boundary
   - any migrated multipart/session path that still returns coordinator-visible
     PG guards is only partially migrated and must be redesigned so storage owns
     the protected write action end to end
   - so the phase-7 surface is now mixed:
-    - `BeginStreamPart` is the first corrected proving slice
-    - the rest of the migrated surface is still
-      reservation-lifetime-rework pending, not final
+    - `BeginStreamPart`, `UploadPart`, `ListParts`, `AbortMultipartUpload`,
+      and `CompleteMultipartUpload` now have corrected storage-owned
+      object-PG boundaries on their normal request path
+    - `CreateMultipartUpload` remains reservation-lifetime-rework pending,
+      not final
 - remaining obvious phase-7 surface:
-  - `UploadPart`
+  - `CreateMultipartUpload`
   - streaming `PutObject`
   - remaining multipart/session management flows
 

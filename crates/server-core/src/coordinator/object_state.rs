@@ -42,6 +42,29 @@ pub(super) enum StaleObjectPayload {
     },
 }
 
+impl From<storage::CompletedMultipartStalePayload> for StaleObjectPayload {
+    fn from(value: storage::CompletedMultipartStalePayload) -> Self {
+        match value {
+            storage::CompletedMultipartStalePayload::Segments {
+                generation_id,
+                segments,
+            } => Self::Segments {
+                generation_id,
+                segments,
+            },
+            storage::CompletedMultipartStalePayload::Multipart {
+                generation_id,
+                parts,
+                streaming_segments,
+            } => Self::Multipart {
+                generation_id,
+                parts,
+                streaming_segments,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DeletedLiveObjectKind {
     Segments,

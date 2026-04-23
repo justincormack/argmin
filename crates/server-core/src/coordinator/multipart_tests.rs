@@ -2895,6 +2895,44 @@ fn abort_multipart_upload_success() {
 }
 
 #[test]
+fn complete_multipart_upload_rejects_non_in_progress_upload() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let (upload_id, parts) = create_upload_with_parts(&coord, "bucket", "key", &[(1, b"part1")]);
+
+    let meta_pg_id = coord.object_pg_id("bucket", "key");
+    let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+    pg.set_upload_state(&upload_id, UploadState::Completing)
+        .unwrap();
+    drop(pg);
+
+    let err = coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &parts,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::NoSuchUpload { .. }),
+        "expected NoSuchUpload, got {err:?}"
+    );
+}
+
+#[test]
 fn abort_multipart_upload_reclaims_uploaded_and_streamed_part_shards() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());

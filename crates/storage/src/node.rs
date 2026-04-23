@@ -20,9 +20,10 @@ use crate::types::{
     BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind,
     CreateStreamUploadReq, FinalizeStreamPartOutcome, GenerationId, ListMultipartUploadsReq,
     ListObjectVersionsReq, ListPartsReq, ListedMultipartParts, LoadedBucketSubresource,
-    MultipartPartRecord, MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey,
-    PreparedStreamPartCommit, SessionId, ShardKey, StreamUploadPartSnapshot, StreamUploadState,
-    StreamUploadTarget, UploadId, UploadState, WriteAck,
+    MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
+    MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, PreparedStreamPartCommit,
+    SessionId, ShardKey, StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget,
+    UploadId, UploadState, WriteAck,
 };
 
 const TRACE_TARGET: &str = "storage";
