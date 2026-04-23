@@ -192,22 +192,25 @@ impl SharedStorageNode {
         }
     }
 
-    pub fn with_bucket_write_snapshot<T, E>(
+    pub(super) fn with_bucket_write_reservation_snapshot<T, E>(
         &self,
         bucket: &BucketName,
         request: BucketSnapshotRequest,
-        action: impl FnOnce(BucketSnapshot) -> Result<T, E>,
+        action: impl FnOnce(BucketSnapshot) -> Result<Result<T, E>, BucketSnapshotLoadError>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
         loop {
             let pg_id = self.pg_topology.bucket_pg_for(bucket);
             let bucket_pg = self.get_pg(pg_id)?;
             match PgMetadataStore::acquire_bucket_write_reservation(&*bucket_pg, bucket) {
                 Ok(_info) => {
-                    let snapshot = Self::load_bucket_snapshot_from_pg(&bucket_pg, bucket, request)?;
-                    drop(bucket_pg);
-                    let result = action(snapshot);
+                    let result = (|| {
+                        let snapshot =
+                            Self::load_bucket_snapshot_from_pg(&bucket_pg, bucket, request)?;
+                        drop(bucket_pg);
+                        action(snapshot)
+                    })();
                     let release_result = self.release_bucket_write_reservation(bucket);
-                    return Self::finish_bucket_write_snapshot(result, release_result);
+                    return Self::finish_bucket_write_snapshot_operation(result, release_result);
                 }
                 Err(crate::error::MetadataError::BucketWriteDraining) => {
                     drop(bucket_pg);
@@ -216,6 +219,17 @@ impl SharedStorageNode {
                 Err(other) => return Err(other.into()),
             }
         }
+    }
+
+    pub fn with_bucket_write_snapshot<T, E>(
+        &self,
+        bucket: &BucketName,
+        request: BucketSnapshotRequest,
+        action: impl FnOnce(BucketSnapshot) -> Result<T, E>,
+    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        self.with_bucket_write_reservation_snapshot(bucket, request, |snapshot| {
+            Ok(action(snapshot))
+        })
     }
 
     pub fn load_bucket_snapshot_pair(
@@ -356,15 +370,17 @@ impl SharedStorageNode {
         Ok(())
     }
 
-    pub(super) fn finish_bucket_write_snapshot<T, E>(
-        result: Result<T, E>,
+    pub(super) fn finish_bucket_write_snapshot_operation<T, E>(
+        result: Result<Result<T, E>, BucketSnapshotLoadError>,
         release_result: Result<(), BucketSnapshotLoadError>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
         match (result, release_result) {
-            (Ok(value), Ok(())) => Ok(Ok(value)),
-            (Ok(_), Err(err)) => Err(err),
-            (Err(err), Ok(())) => Ok(Err(err)),
-            (Err(err), Err(_)) => Ok(Err(err)),
+            (Ok(Ok(value)), Ok(())) => Ok(Ok(value)),
+            (Ok(Ok(_)), Err(err)) => Err(err),
+            (Ok(Err(err)), Ok(())) => Ok(Err(err)),
+            (Ok(Err(err)), Err(_)) => Ok(Err(err)),
+            (Err(err), Ok(())) => Err(err),
+            (Err(err), Err(_)) => Err(err),
         }
     }
 }

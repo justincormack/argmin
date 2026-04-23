@@ -1074,13 +1074,90 @@ mod tests {
     }
 
     #[test]
-    fn finish_bucket_write_snapshot_preserves_action_error_over_release_error() {
-        let result = SharedStorageNode::finish_bucket_write_snapshot::<(), &'static str>(
-            Err("action failed"),
+    fn finish_bucket_write_snapshot_operation_preserves_action_error_over_release_error() {
+        let result = SharedStorageNode::finish_bucket_write_snapshot_operation::<(), &'static str>(
+            Ok(Err("action failed")),
             Err(crate::error::MetadataError::BucketWriteDraining.into()),
         )
         .unwrap();
         assert_eq!(result, Err("action failed"));
+    }
+
+    #[test]
+    fn create_multipart_upload_releases_bucket_write_reservation_on_error() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
+        let key = ObjectKey::try_from("key").unwrap();
+
+        let result = node.create_multipart_upload(&bucket, &key, Default::default(), |_, _| {
+            Ok::<_, ()>((
+                (),
+                crate::types::CreateMultipartUploadReq {
+                    upload_id: crate::tests::multipart_upload_id("upload"),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    tags: None,
+                    metadata_blob: vec![].into(),
+                    system_metadata_blob: crate::types::SerializedSystemMetadataBlob::default(),
+                    initiator: None,
+                    owner: crate::types::OwnerIdentity::new(
+                        "o".repeat(300),
+                        s3_types::CanonicalUserId::from_principal("owner"),
+                    ),
+                    acl_grants: s3_types::AclGrants::default(),
+                    public_read: false,
+                    object_lock: crate::types::ObjectLockState::default(),
+                    checksum: None,
+                    encryption: crate::types::ObjectEncryption::default(),
+                },
+            ))
+        });
+        assert!(result.is_err());
+
+        let bucket_pg = node
+            .get_pg(node.pg_topology().bucket_pg_for(&bucket))
+            .unwrap();
+        let raw = bucket_pg.head_bucket_raw(&bucket).unwrap();
+        assert_eq!(raw.active_write_reservations, 0);
+    }
+
+    #[test]
+    fn create_put_object_stream_session_releases_bucket_write_reservation_on_error() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
+        let key = ObjectKey::try_from("key").unwrap();
+        let session_id = crate::tests::stream_session_id("session");
+
+        node.create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            crate::types::ObjectEncryption::default(),
+        )
+        .unwrap();
+
+        let result =
+            node.create_put_object_stream_session(&bucket, &key, Default::default(), |_, _| {
+                Ok::<_, ()>((
+                    (),
+                    crate::types::CreateStreamUploadReq {
+                        session_id: session_id.clone(),
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        target: crate::types::StreamUploadTarget::PutObject,
+                        encryption: crate::types::ObjectEncryption::default(),
+                    },
+                ))
+            });
+        assert!(result.is_err());
+
+        let bucket_pg = node
+            .get_pg(node.pg_topology().bucket_pg_for(&bucket))
+            .unwrap();
+        let raw = bucket_pg.head_bucket_raw(&bucket).unwrap();
+        assert_eq!(raw.active_write_reservations, 0);
     }
 
     #[test]
