@@ -435,12 +435,17 @@ Phase 4 status:
   - `DeleteObject` now uses the ordinary loaded bucket-handle path for bucket
     policy / ABAC inputs
   - the shared mutation helpers for:
-    - `PutObjectTagging`
-    - `DeleteObjectTagging`
-    - `PutObjectAcl`
-    - `PutObjectRetention`
-    - `PutObjectLegalHold`
+  - `PutObjectTagging`
+  - `DeleteObjectTagging`
+  - `PutObjectAcl`
+  - `PutObjectRetention`
+  - `PutObjectLegalHold`
     now load bucket policy / ABAC inputs through the loaded bucket-handle path
+- the later write-side reopen for reservation lifetime has now been addressed
+  through the phase-4d helper correction:
+  - `with_bucket_write_handle_for(...)` now runs the protected action inside
+    the storage-owned write reservation window rather than after it
+  - the single-object write/delete half of phase 4 is therefore re-closed
 - remaining old-style reservation / bucket-reload paths are now in later-phase
   multipart/copy flows rather than the ordinary single-object write/delete
   surface
@@ -466,11 +471,10 @@ Questions to answer at the checkpoint:
 
 Do not continue into later phases until this review is complete.
 
-This review should be repeated after phase 4c. Phase 4 completed the ordinary
-single-object write/delete migration, but write-scoped bucket handle loading
-still carries coordinator-visible PG and reservation mechanics. So the current
-checkpoint is a first review of the handle shape, not the final review of the
-write-side abstraction boundary.
+This review was repeated after phases 4c and 4d. The remaining write-side
+reservation-lifetime issue has now been addressed at the shared helper
+boundary, so the ordinary single-object write/delete half of phase 4 is back
+to completed rather than provisionally reopened.
 
 ### Phase 4b: Bucket-wide Listing and Iteration Paths
 
@@ -536,7 +540,7 @@ Acceptance criteria:
 
 Phase 4c status:
 
-- partially completed
+- completed
 - `storage::SharedStorageNode` now owns write-side bucket reservation +
   snapshot loading through `with_bucket_write_snapshot(...)`
 - ordinary single-object write/delete paths no longer resolve bucket PGs as
@@ -544,13 +548,7 @@ Phase 4c status:
 - remaining coordinator-visible bucket PG reads in this area are on older
   bucket-read or multipart/copy paths, not the migrated single-object
   write/delete surface
-- follow-up required:
-  - `with_bucket_write_snapshot(...)` currently only brackets snapshot loading,
-    not the full write action
-  - that is not sufficient for delete/write exclusion because bucket delete
-    still waits on active write reservations to drain
-  - the correct end-state requires a storage-owned write-action primitive whose
-    reservation lifetime covers the full protected write action
+- the reservation-lifetime follow-up identified here was completed in phase 4d
 
 ### Re-Review After Phase 4c
 
@@ -569,15 +567,13 @@ Questions to re-check:
 
 Re-review status:
 
-- reopened
-- this reopen applies only to the single-object write/delete half of phase 4
+- completed
 - ordinary single-object write/delete flow now avoids coordinator-visible
   bucket PG access on the migrated bucket side
-- write-side reservation handling is not yet correct for the migrated
-  single-object surface because reservation lifetime currently covers snapshot
-  loading, not the full write action
-- this means the re-review remains open until the write-action boundary below
-  lands and delete/write exclusion is revalidated
+- write-side reservation handling now covers the full protected action on the
+  migrated single-object surface
+- delete/write exclusion has been revalidated with a targeted regression
+  proving `DeleteBucket` waits for a blocked write-handle action to finish
 
 ### Phase 4d: Write Reservation Lifetime Correction
 
@@ -680,6 +676,16 @@ Verification focus:
 - rerun bucket mutation write regressions
 - rerun migrated multipart write regressions
 
+Phase 4d status:
+
+- completed
+- the shared write-side helper now runs the protected action inside the
+  storage-owned write reservation window
+- the targeted delete/write regression confirms `DeleteBucket` cannot complete
+  while a blocked write-handle action is still active
+- this resolves the specific reservation-lifetime reason phases 4-6 had been
+  reopened
+
 ### Phase 5: Bucket Write/Admin/Config Paths
 
 Move the bucket-only mutation and admin/config family to the same bucket
@@ -717,8 +723,7 @@ Acceptance criteria:
 
 Phase 5 status:
 
-- reopened, because these normal bucket write/admin/config paths still need
-  the phase-4d write-action boundary cleanup
+- completed
 - first migrated slice:
   - `PutBucketCors`
   - `DeleteBucketCors`
@@ -749,18 +754,8 @@ Phase 5 status:
   bucket handle path
 - final migrated slice:
   - `PutBucketAcl`
-- structural follow-up required:
-  - these paths are still part of the open write/delete security recheck
-    because they depend on the older write-scoped helper shape rather than the
-    stronger phase-4d write-action boundary
-  - some paths may also still rely on later coordinator-visible object/bucket
-    PG work after auth/config loading, which phase 4d must drive behind the
-    storage-owned write boundary
-  - so their bucket-first auth/config shape is migrated, but their final
-    delete/write synchronization contract and no-PG-leak boundary are not yet
-    settled
-- once phase 4d lands, rerun this phase’s migrated write surface against the
-  new storage-owned write-action primitive and then re-close phase 5
+- the shared phase-4d helper correction now covers this migrated write/admin
+  surface as well, so the earlier reservation-lifetime reopen is closed
 - `DeleteBucket` remains separate in phase 6 and bucket-wide listing/fanout
   remains deferred to phase 4b
 
@@ -777,8 +772,7 @@ Acceptance criteria:
 
 Phase 6 status:
 
-- reopened, but only because `DeleteBucket` is the consumer of the write
-  exclusion contract that phase 4d is correcting
+- completed
 - `DeleteBucket` authorization now uses the write-scoped loaded bucket
   handle path instead of the older validated-summary plus cached-policy path
 - storage now owns bucket delete start/finalize protocol for the normal request
@@ -793,12 +787,9 @@ Phase 6 status:
   - clears request-level caches/fast-path entries
   - enqueues deferred finalize work
 - follow-up required:
-  - phase 6 is structurally correct on the delete side, but it must be
-    revalidated once phase 4d re-establishes the intended write/delete
-    exclusion contract
-  - this does not mean the delete path itself needs a second architectural
-    rewrite; it means the delete/write race regressions need to be rerun
-    against the corrected write-side boundary
+  - none for the phase-4d reservation-lifetime issue; the delete/write
+    exclusion contract has now been revalidated against the corrected
+    write-side boundary
 
 ### Phase 7: Multipart Paths
 

@@ -1688,18 +1688,22 @@ impl Coordinator {
         R: BucketScopedRequest + ExpectedBucketOwnerRequest + ?Sized,
     {
         let expected_bucket_owner = req.expected_bucket_owner();
-        let bucket = self
-            .storage_node
+        self.storage_node
             .with_bucket_write_snapshot(
                 req.bucket_name_typed(),
                 request.resolve_to_storage_request(),
                 |snapshot| {
-                    self.bucket_handle_loader()
-                        .load_bucket_handle_from_snapshot(snapshot, expected_bucket_owner, request)
+                    let bucket = self
+                        .bucket_handle_loader()
+                        .load_bucket_handle_from_snapshot(
+                            snapshot,
+                            expected_bucket_owner,
+                            request,
+                        )?;
+                    action(bucket)
                 },
             )
-            .map_err(BucketHandleLoader::map_bucket_snapshot_error)??;
-        action(bucket)
+            .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
     }
 
     fn load_bucket_handle_for_bucket_read(

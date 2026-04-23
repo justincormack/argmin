@@ -2,10 +2,11 @@ use super::test_helpers::{self, UploadPartRequest};
 use super::test_support::*;
 use super::*;
 use crate::conditional::{DeleteCondition, SpecificEtag, WriteCondition};
+use crate::coordinator::bucket_handles::BucketHandleRequest;
 use crate::sse::SSE_CUSTOMER_ALGORITHM;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
@@ -1290,6 +1291,66 @@ fn create_multipart_upload_does_not_wait_for_bucket_lock() {
         "create_multipart_upload should succeed without waiting on bucket lock: {res:?}"
     );
     handle.join().unwrap();
+}
+
+#[test]
+fn delete_bucket_waits_for_bucket_write_handle_action() {
+    let tmp = test_util::tempdir();
+    let coord = Arc::new(setup_coordinator_with_pg_count(tmp.path(), 1));
+    let requester = test_requester();
+
+    coord
+        .create_bucket(&CreateBucketRequest {
+            name: trusted_bucket_name("bucket"),
+            requester: requester.clone(),
+            acl: CreateBucketAcl::DefaultPrivate,
+            namespace: BucketNamespace::Global,
+            ownership: BucketObjectOwnership::BucketOwnerEnforced,
+            object_lock_enabled: false,
+        })
+        .unwrap();
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (delete_tx, delete_rx) = mpsc::channel();
+
+    let write_coord = Arc::clone(&coord);
+    let write_request = object_request("bucket", "key", requester.clone());
+    let write_thread = thread::spawn(move || {
+        write_coord.with_bucket_write_handle_for(
+            &write_request,
+            BucketHandleRequest::new(),
+            |_bucket| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok::<_, ServerError>(())
+            },
+        )
+    });
+
+    started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    let delete_coord = Arc::clone(&coord);
+    let delete_request = BucketRequest {
+        name: trusted_bucket_name("bucket"),
+        requester: requester.clone(),
+        expected_bucket_owner: None,
+    };
+    let delete_thread = thread::spawn(move || {
+        let result = delete_coord.delete_bucket(&delete_request);
+        delete_tx.send(result).unwrap();
+    });
+
+    assert!(delete_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+    release_tx.send(()).unwrap();
+
+    write_thread.join().unwrap().unwrap();
+    delete_thread.join().unwrap();
+    delete_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .unwrap();
 }
 
 #[test]
