@@ -1,0 +1,119 @@
+Multipart create can leak bucket write reservations on DB errors
+Link: https://chatgpt.com/codex/cloud/security/findings/619b44147eec8191a0d6a82b32cc80e1?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: low (attack path: low)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: bd031dc
+Author: justin@specialbusservice.com
+Created: 23/04/2026, 11:10:30
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: the new storage boundary for create-multipart uses fallible `?` calls between reservation acquisition and release, allowing early-return paths that skip releasing the bucket write reservation.
+The commit introduces `SharedStorageNode::create_multipart_upload`, which acquires a bucket write reservation and then performs snapshot loading, existing-object lookup, and multipart row creation. Several of these steps use `?` (including the DB insert and fetch) before the reservation is released. If any of those operations fails (e.g., metadata DB error, disk-full insert failure, corrupted row), the function returns early and never calls `release_bucket_write_reservation`. This leaks `active_write_reservations`, which can prevent bucket write drains and deletions from completing, resulting in a persistent availability issue for that bucket. A malicious client can attempt to trigger metadata errors (e.g., oversized or malformed metadata/tags that violate DB constraints) to cause this leak repeatedly.
+
+# Validation
+## Rubric
+- [x] Locate reservation acquisition and confirm fallible `?` operations occur before release in create_multipart_upload (multipart_ops.rs:64-89).
+- [x] Identify a realistic error trigger (owner_principal length constraint in schema.rs:82-88).
+- [x] Build a PoC that forces the DB error during create_multipart_upload (reservation_leak.rs:31-56).
+- [x] Observe leaked `active_write_reservations` after the error (reservation_leak.rs:58-67; test output shows 1).
+- [x] Confirm the error path exits before release_bucket_write_reservation is called (multipart_ops.rs:69-89).
+## Report
+Built the storage crate tests and wrote a focused integration test to exercise the error path. In `SharedStorageNode::create_multipart_upload`, the bucket write reservation is acquired (multipart_ops.rs:64-68) and multiple fallible `?` calls occur before the release at the end (multipart_ops.rs:69-89). The multipart uploads table enforces `owner_principal` length 1–256 (schema.rs:82-88), so a long principal can trigger a DB error mid-function. The PoC test (crates/storage/tests/reservation_leak.rs:31-67) uses a 300‑byte principal to force `object_pg.create_multipart_upload` to fail and then checks `active_write_reservations`. Running `cargo test -p storage create_multipart_upload_error_leaks_reservation -- --nocapture` panics with `active_write_reservations after error: 1` and an assertion failure showing left=1 right=0, confirming the reservation leak (see test_output.txt).
+
+# Evidence
+/workspace/argmin/crates/storage/src/node/multipart_ops.rs (L64 to 89)
+  Note: Bucket write reservation is acquired, but fallible `?` calls (snapshot/object lookup and DB insert/fetch) occur before `release_bucket_write_reservation`, so errors can return early and leak the reservation.
+```
+        loop {
+            let pg_id = self.pg_topology.bucket_pg_for(bucket);
+            let bucket_pg = self.get_pg(pg_id)?;
+            match PgMetadataStore::acquire_bucket_write_reservation(&*bucket_pg, bucket) {
+                Ok(_info) => {
+                    let snapshot = Self::load_bucket_snapshot_from_pg(&bucket_pg, bucket, request)?;
+                    drop(bucket_pg);
+
+                    let object_pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+                    let existing_object =
+                        Self::load_existing_live_object_from_object_pg(&object_pg, bucket, key)?;
+                    let result = match action(snapshot, existing_object) {
+                        Ok((value, create)) => {
+                            object_pg.create_multipart_upload(&create)?;
+                            let upload = object_pg.get_multipart_upload(&create.upload_id)?;
+                            Ok(CreateMultipartUploadOutcome {
+                                value,
+                                initiated_at: upload.initiated_at,
+                            })
+                        }
+                        Err(error) => Err(error),
+                    };
+                    drop(object_pg);
+
+                    let release_result = self.release_bucket_write_reservation(bucket);
+                    return Self::finish_bucket_write_snapshot(result, release_result);
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+The bug is a real reservation leak, but impact is limited to availability (bucket drain/delete) and exploitation requires authenticated access plus a DB/storage error in a narrow window. No data exposure or auth bypass is shown. Therefore, low severity is appropriate.
+## Likelihood
+high - Requires authenticated access plus a storage/DB error during the reservation window; the PoC trigger (overlong principal) is blocked by access key length limits, so reliable attacker-triggered errors are less straightforward. | Remote network vector
+## Impact
+low - Leaked write reservations can prevent bucket write drain/delete from completing, causing a persistent availability issue for that bucket without affecting confidentiality or integrity.
+## Assumptions
+- Service is deployed with ARGMIN_LISTEN_ADDR bound to a non-localhost interface (otherwise only local attackers).
+- Attacker has valid S3 credentials and permission to create multipart uploads on the target bucket.
+- A storage/metadata DB error can be triggered during multipart creation (e.g., storage failure or constraint violation).
+- Valid S3 credentials
+- Authorization to CreateMultipartUpload on target bucket
+- Error occurs after reservation acquisition (DB/storage error)
+## Path
+HTTP CreateMultipartUpload
+  -> Coordinator::create_multipart_upload
+  -> acquire bucket write reservation
+  -> error before release
+  -> active_write_reservations leak
+  -> bucket write drain/delete blocked
+## Path evidence
+- `crates/storage/src/node/multipart_ops.rs:64-89` - Reservation acquired, multiple fallible ? calls before release; release only at end.
+- `crates/storage/src/node/bucket_ops.rs:14-43` - Bucket write drain waits until active_write_reservations == 0; leaked reservations block drain/delete.
+- `crates/storage/src/pg_store.rs:2435-2474` - active_write_reservations increment/decrement in DB; missing release leaves counter nonzero.
+- `crates/server-http/src/http/mod.rs:2563-2641` - HTTP CreateMultipartUpload handler that reaches coordinator with attacker-controlled metadata/tags.
+- `crates/server-core/src/coordinator/multipart.rs:182-246` - Coordinator authorizes and calls storage_node.create_multipart_upload.
+- `crates/storage/src/schema.rs:72-88` - Multipart uploads table enforces owner_principal length constraint (possible DB error source).
+- `crates/auth/src/credential.rs:124-140` - SigV4 credential parsing caps access_key_id length, limiting principal length in normal requests.
+- `crates/argmin-s3/src/config.rs:25-65` - listen_addr default 127.0.0.1:9000 and secrets configured via env.
+## Narrative
+The HTTP CreateMultipartUpload path dispatches to Coordinator::create_multipart_upload, which calls SharedStorageNode::create_multipart_upload. That function acquires a bucket write reservation, then performs multiple fallible operations (snapshot load, object lookup, DB insert/fetch) before releasing the reservation; any error on those ? calls returns early and skips release. Active write reservations gate bucket write drain/delete, so a leaked reservation can block those operations indefinitely. The validation PoC used an oversized owner_principal to force a DB constraint error; however, normal SigV4 parsing limits access_key_id length to 128, so that specific trigger is not reachable via standard auth. Still, any metadata DB error in this window (e.g., storage failure) can leak the reservation. Impact is limited to bucket availability (drain/delete), with no data exposure or auth bypass.
+## Controls
+- SigV4 authentication and authorization checks for CreateMultipartUpload
+- Header size validation for request metadata
+- Bucket/object ACL enforcement in coordinator
+## Blindspots
+- No runtime validation of error triggers beyond described PoC; unknown if attacker-controlled inputs can reliably cause DB errors in production.
+- No deployment manifests to confirm external exposure or operational cleanup for leaked reservations.
+
+# Fix
+Fixed in commit `3b2af18` (`Fix storage write reservation release on error`).
+
+The repair did two things:
+- introduced a shared storage wrapper in `crates/storage/src/node/bucket_ops.rs` that brackets bucket write reservation acquire/load/action/release and guarantees release on all success and error paths while preserving operation errors over release noise
+- moved both affected helpers onto that wrapper:
+  - `SharedStorageNode::create_multipart_upload(...)` in `crates/storage/src/node/multipart_ops.rs`
+  - `SharedStorageNode::create_put_object_stream_session(...)` in `crates/storage/src/node/stream_ops.rs`
+
+So the issue was not limited to multipart create; the same manual reservation pattern had also been copied into the plain streamed `PutObject` session-create path, and both are now covered by the same release-safe helper.
+
+Regression coverage added in `crates/storage/src/node.rs`:
+- `create_multipart_upload_releases_bucket_write_reservation_on_error`
+- `create_put_object_stream_session_releases_bucket_write_reservation_on_error`
+- `finish_bucket_write_snapshot_operation_preserves_action_error_over_release_error`
+
+Verification on the fixed tree:
+- `cargo test --workspace --no-fail-fast`
+- `cargo clippy --all-targets --all-features -- -D warnings`
