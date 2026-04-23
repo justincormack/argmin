@@ -631,11 +631,25 @@ and storage work would otherwise introduce a mutable-state TOCTOU gap.
 
 Covered surface:
 
-- ordinary single-object write/delete paths already migrated in phases 4 and 4c
-- bucket mutation/admin/config writes migrated in phase 5
-- multipart/session write paths migrated in phase 7
-- any later write-side request family that currently uses
-  `with_bucket_write_handle_for(...)`
+- the remaining normal production write/delete paths that still rely on
+  `with_bucket_write_handle_for(...)` or otherwise split bucket-auth work from
+  the later protected write action
+- concretely, that means:
+  - the single-object write/delete production paths from phase 4 / 4c
+  - bucket mutation/admin/config writes from phase 5
+  - `DeleteBucket` revalidation in phase 6 against the corrected exclusion
+    contract
+  - plain streamed `PutObject` in phase 7b
+  - any later write-side request family that still uses
+    `with_bucket_write_handle_for(...)`
+
+Not in scope:
+
+- read-only phases 1-3
+- the bucket-read half of phase 4
+- multipart paths already moved to storage-owned transactional boundaries in
+  phase 7, unless a specific remaining production path is found to still
+  depend on the older helper
 
 Acceptance criteria:
 
@@ -699,7 +713,8 @@ Acceptance criteria:
 
 Phase 5 status:
 
-- reopened
+- reopened, because these normal bucket write/admin/config paths still need
+  the phase-4d write-action boundary cleanup
 - first migrated slice:
   - `PutBucketCors`
   - `DeleteBucketCors`
@@ -731,8 +746,9 @@ Phase 5 status:
 - final migrated slice:
   - `PutBucketAcl`
 - structural follow-up required:
-  - these paths currently depend on the phase-4c write-scoped snapshot loader
-    rather than the stronger phase-4d write-scoped action boundary
+  - these paths are still part of the open write/delete security recheck
+    because they depend on the older write-scoped helper shape rather than the
+    stronger phase-4d write-action boundary
   - some paths may also still rely on later coordinator-visible object/bucket
     PG work after auth/config loading, which phase 4d must drive behind the
     storage-owned write boundary
@@ -757,7 +773,8 @@ Acceptance criteria:
 
 Phase 6 status:
 
-- reopened
+- reopened, but only because `DeleteBucket` is the consumer of the write
+  exclusion contract that phase 4d is correcting
 - `DeleteBucket` authorization now uses the write-scoped loaded bucket
   handle path instead of the older validated-summary plus cached-policy path
 - storage now owns bucket delete start/finalize protocol for the normal request
@@ -772,14 +789,12 @@ Phase 6 status:
   - clears request-level caches/fast-path entries
   - enqueues deferred finalize work
 - follow-up required:
-  - phase 6 is structurally correct on the delete side, but it is directly
-    affected by the reopened write-reservation lifetime issue because delete
-    still waits for active write reservations to drain
-  - phase 6 cannot be treated as fully settled until phase 4d re-establishes
-    the intended reservation/write exclusion contract and delete/write race
-    regressions are rerun
-  - phase 6 should be re-reviewed specifically against migrated write paths
-    that previously returned or held PG guards across the delete/write boundary
+  - phase 6 is structurally correct on the delete side, but it must be
+    revalidated once phase 4d re-establishes the intended write/delete
+    exclusion contract
+  - this does not mean the delete path itself needs a second architectural
+    rewrite; it means the delete/write race regressions need to be rerun
+    against the corrected write-side boundary
 
 ### Phase 7: Multipart Paths
 
@@ -851,16 +866,21 @@ Phase 7 status:
   - coordinator contributes a pure auth/semantic closure over the loaded
     bucket handle and existing live object
 - follow-up required on migrated slice:
-  - any migrated multipart/session path that still returns coordinator-visible
-    PG guards is only partially migrated and must be redesigned so storage owns
-    the protected write action end to end
-  - the intended multipart surface is now covered:
-    - `CreateMultipartUpload`, `BeginStreamPart`, `UploadPart`,
-      `ListParts`, `AbortMultipartUpload`, and `CompleteMultipartUpload`
-      now have corrected storage-owned object-PG boundaries on their normal
-      request path
-  - any newly discovered multipart/session helper outside that set should be
-    treated as a regression against this phase
+- any migrated multipart/session path that still returns coordinator-visible
+  PG guards is only partially migrated and must be redesigned so storage owns
+  the protected write action end to end
+- the intended multipart surface is now covered:
+  - `CreateMultipartUpload`, `BeginStreamPart`, `UploadPart`,
+    `ListParts`, `AbortMultipartUpload`, and `CompleteMultipartUpload`
+    now have corrected storage-owned object-PG boundaries on their normal
+    request path
+- any newly discovered multipart/session helper outside that set should be
+  treated as a regression against this phase
+- the remaining write/delete security issue has already been addressed on the
+  multipart surface by moving these paths onto storage-owned transactional
+  boundaries
+- only a newly discovered multipart production path still using the older
+  helper shape would justify reopening part of phase 7
 
 ### Phase 7b: Plain Streaming PutObject Path
 
