@@ -2581,6 +2581,12 @@ pub struct ListMultipartUploadsResp {
     pub next_upload_id_marker: Option<UploadId>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ListedBucketMultipartUploads {
+    pub uploads: Vec<MultipartUploadRecord>,
+    pub hit_record_cap: bool,
+}
+
 /// Request to list parts of a multipart upload.
 pub struct ListPartsReq {
     pub upload_id: UploadId,
@@ -2742,10 +2748,7 @@ pub struct PreparedStreamPartCommit<T> {
 #[derive(Debug)]
 pub struct FinalizeStreamPartOutcome<T> {
     pub value: T,
-    pub upload: MultipartUploadRecord,
-    pub generation: u32,
     pub last_modified: u64,
-    pub displaced_segments: Vec<MultipartPartSegmentRecord>,
 }
 
 /// Committed segment record for a normal PutObject.

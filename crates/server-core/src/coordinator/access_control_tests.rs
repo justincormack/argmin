@@ -3642,6 +3642,114 @@ fn begin_stream_part_bucket_policy_and_abac_same_pg_completes_without_deadlock()
 }
 
 #[test]
+fn finalize_stream_part_reupload_same_pg_completes_without_deadlock() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_with_pg_count(tmp.path(), 1);
+    coord
+        .create_bucket_for_owner("owner-a", "bucket", false)
+        .unwrap();
+
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(
+                "bucket",
+                "key",
+                test_helpers::requester("owner-a"),
+                None,
+            ),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let res = (|| -> Result<(String, String), ServerError> {
+            let session_a = coord
+                .begin_stream_part(&BeginStreamPartRequest {
+                    upload: multipart_object_request_with_expected_owner(
+                        "bucket",
+                        "key",
+                        &upload.upload_id,
+                        test_helpers::requester("owner-a"),
+                        None,
+                    ),
+                    part_number: 1,
+                    policy_context: PutObjectPolicyContext::default(),
+                    sse_customer: None,
+                })?
+                .session_id;
+            let data_a = b"streamed-reupload-a";
+            coord
+                .append_plaintext_stream_segment_for_test("bucket", "key", &session_a, 0, data_a)?;
+            let result_a = coord.finalize_stream_part(FinalizeStreamPartRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload.upload_id,
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                session_id: &session_a,
+                part_number: 1,
+                crc64: checksum::crc64::checksum(data_a),
+                total_size: data_a.len() as u64,
+                claimed_checksum: None,
+                computed_checksum: None,
+            })?;
+
+            let session_b = coord
+                .begin_stream_part(&BeginStreamPartRequest {
+                    upload: multipart_object_request_with_expected_owner(
+                        "bucket",
+                        "key",
+                        &upload.upload_id,
+                        test_helpers::requester("owner-a"),
+                        None,
+                    ),
+                    part_number: 1,
+                    policy_context: PutObjectPolicyContext::default(),
+                    sse_customer: None,
+                })?
+                .session_id;
+            let data_b = b"streamed-reupload-b";
+            coord
+                .append_plaintext_stream_segment_for_test("bucket", "key", &session_b, 0, data_b)?;
+            let result_b = coord.finalize_stream_part(FinalizeStreamPartRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload.upload_id,
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                session_id: &session_b,
+                part_number: 1,
+                crc64: checksum::crc64::checksum(data_b),
+                total_size: data_b.len() as u64,
+                claimed_checksum: None,
+                computed_checksum: None,
+            })?;
+            Ok((result_a.etag.to_string(), result_b.etag.to_string()))
+        })();
+        tx.send(res).unwrap();
+    });
+
+    let (etag_a, etag_b) = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("finalize_stream_part reupload should not self-deadlock on same-pg topology")
+        .unwrap();
+    assert_ne!(etag_a, etag_b);
+    handle.join().unwrap();
+}
+
+#[test]
 fn begin_stream_put_bucket_policy_and_abac_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator_with_pg_count(tmp.path(), 1);

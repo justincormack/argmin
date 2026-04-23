@@ -1,13 +1,13 @@
 use checksum::{ChecksumAlgorithm, ChecksumType};
 use s3_types::{BucketVersioningState, VersionId};
-use storage::traits::{PgMetadataStore, ShardStore};
+use storage::traits::PgMetadataStore;
 use storage::{
     BucketName, EcShape, GenerationId, LiveObjectRecord, MultipartPartSegmentRecord,
     MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
     ObjectEncryption, ObjectKey, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord,
     ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity,
     PutDeleteMarkerReq, PutObjectReq, SerializedMetadataBlob, SerializedSystemMetadataBlob,
-    SerializedTagSet, ShardKey, StoredObject,
+    SerializedTagSet, StoredObject,
 };
 
 use super::{
@@ -849,38 +849,5 @@ impl Coordinator {
                 parts,
             })
             .map_err(ServerError::Metadata)
-    }
-
-    pub(super) fn delete_segment_shards_generic(
-        &self,
-        segments: &[MultipartPartSegmentRecord],
-    ) -> Result<(), ServerError> {
-        for segment in segments {
-            self.delete_segment_shard_set(
-                segment.shard_pg_id,
-                &segment.segment_okh,
-                segment.segment_vid,
-                segment.ec_k,
-                segment.ec_m,
-            )?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn delete_segment_shard_set(
-        &self,
-        shard_pg_id: u32,
-        segment_okh: &[u8; 16],
-        segment_vid: GenerationId,
-        ec_k: u8,
-        ec_m: u8,
-    ) -> Result<(), ServerError> {
-        let pg = self.storage_node.get_pg(shard_pg_id)?;
-        let total = ec_k as usize + ec_m as usize;
-        for i in 0..total {
-            let shard_key = ShardKey::new(segment_okh, segment_vid.get(), i as u8);
-            pg.delete_shard(&shard_key)?;
-        }
-        Ok(())
     }
 }

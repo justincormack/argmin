@@ -1,12 +1,10 @@
 use checksum::{ChecksumAlgorithm, ChecksumBytes, ChecksumType, MultipartChecksumConfig};
-use storage::traits::{PgMetadataStore, ShardStore};
 use storage::{
     BucketName, CreateMultipartUploadOutcome, CreateMultipartUploadReq, FinalizeStreamPartOutcome,
-    GenerationId, ListMultipartUploadsReq, MultipartPartRecord, MultipartPartSegmentRecord,
-    MultipartUploadRecord, ObjectKey, PreparedStreamPartCommit, SerializedMetadataBlob,
-    SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardKey, StreamUploadPartSnapshot,
-    StreamUploadState, StreamUploadTarget, UploadId, UploadState, UPLOAD_ID_ALPHABET,
-    UPLOAD_ID_LEN,
+    GenerationId, MultipartPartRecord, MultipartPartSegmentRecord, ObjectKey,
+    PreparedStreamPartCommit, SerializedMetadataBlob, SerializedSystemMetadataBlob,
+    SerializedTagSet, SessionId, StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget,
+    UploadId, UploadState, UPLOAD_ID_ALPHABET, UPLOAD_ID_LEN,
 };
 
 use super::authz_results::{
@@ -35,7 +33,6 @@ use crate::checksum_claim::ChecksumClaim;
 use crate::conditional::{check_write_conditions, WriteCondition};
 use crate::error::ServerError;
 use crate::etag::{compute_multipart_etag, crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag};
-use crate::pg::part_key_hash;
 use crate::system_metadata::SystemMetadata;
 
 impl Coordinator {
@@ -791,27 +788,20 @@ impl Coordinator {
             });
         }
 
-        let mut all_uploads: Vec<MultipartUploadRecord> = Vec::new();
-        let mut hit_record_cap = false;
-        self.pg_topology.for_each_pg(|pg_id| {
-            if hit_record_cap {
-                return Ok::<(), ServerError>(());
-            }
-            let pg = self.storage_node.get_pg(pg_id)?;
-            let resp = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                bucket: bucket.clone(),
-                prefix: optional_list_object_key(prefix)?,
-                key_marker: optional_list_object_key(key_marker)?,
-                upload_id_marker: upload_id_marker.cloned(),
-                max_uploads: max_uploads.saturating_add(1),
-            })?;
-            all_uploads.extend(resp.uploads);
-            if all_uploads.len() >= MAX_LIST_RECORDS {
-                all_uploads.truncate(MAX_LIST_RECORDS);
-                hit_record_cap = true;
-            }
-            Ok::<(), ServerError>(())
-        })?;
+        let storage::ListedBucketMultipartUploads {
+            uploads: mut all_uploads,
+            hit_record_cap,
+        } = self
+            .storage_node
+            .list_multipart_uploads_for_bucket(
+                &bucket,
+                optional_list_object_key(prefix)?.as_ref(),
+                optional_list_object_key(key_marker)?.as_ref(),
+                upload_id_marker,
+                MAX_LIST_RECORDS,
+                max_uploads,
+            )
+            .map_err(Self::map_object_pg_action_error)?;
 
         all_uploads.sort_by(|a, b| {
             a.key
@@ -887,9 +877,6 @@ impl Coordinator {
         let computed_checksum = req.computed_checksum;
         let FinalizeStreamPartOutcome {
             value: result,
-            upload: _,
-            generation,
-            displaced_segments,
             ..
         } = self
             .storage_node
@@ -1065,29 +1052,6 @@ impl Coordinator {
                 },
             )
             .map_err(Self::map_object_pg_action_error)??;
-
-        if generation > 0 {
-            let old_gen = generation - 1;
-            let old_okh = part_key_hash(upload_id, part_number, old_gen);
-            let old_vid =
-                GenerationId::new(u64::from(old_gen) + 1).expect("old generation must be nonzero");
-            let old_shard_pg_id = self.shard_pg_id_raw(
-                &format!("mpu/{upload_id}"),
-                &format!("{part_number}/{old_gen}"),
-                old_vid.get(),
-            );
-            if let Ok(old_pg) = self.storage_node.get_pg(old_shard_pg_id) {
-                let k = self.ec_config.data_shards as usize;
-                let m = self.ec_config.parity_shards as usize;
-                for i in 0..(k + m) {
-                    let old_key = ShardKey::new(&old_okh, old_vid.get(), i as u8);
-                    let _ = old_pg.delete_shard(&old_key);
-                }
-            }
-            if !displaced_segments.is_empty() {
-                let _ = self.delete_segment_shards_generic(&displaced_segments);
-            }
-        }
 
         Ok(result)
     }

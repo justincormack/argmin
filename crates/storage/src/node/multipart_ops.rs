@@ -8,6 +8,20 @@ use crate::types::{
 };
 
 impl SharedStorageNode {
+    fn multipart_part_shard_pg_id(
+        &self,
+        upload_id: &UploadId,
+        part_number: u32,
+        generation: u32,
+        part_vid: GenerationId,
+    ) -> u32 {
+        self.pg_topology.shard_pg(
+            format!("mpu/{upload_id}").as_str(),
+            format!("{part_number}/{generation}").as_str(),
+            part_vid.get(),
+        )
+    }
+
     pub(super) fn load_existing_live_object_from_object_pg(
         pg: &PgStore,
         bucket: &BucketName,
@@ -396,10 +410,11 @@ impl SharedStorageNode {
             .part_records
             .iter()
             .map(|part| {
-                let shard_pg_id = self.pg_topology.shard_pg(
-                    format!("mpu/{}", part.upload_id).as_str(),
-                    format!("{}/{}", part.part_number, part.generation).as_str(),
-                    part.part_vid.get(),
+                let shard_pg_id = self.multipart_part_shard_pg_id(
+                    &part.upload_id,
+                    part.part_number,
+                    part.generation,
+                    part.part_vid,
                 );
                 ObjectPartRecord {
                     bucket: req.bucket.clone(),
@@ -478,35 +493,58 @@ impl SharedStorageNode {
         part_number: u32,
         action: impl FnOnce(StreamUploadPartSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, ObjectPgActionError> {
-        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
-        let session = pg.get_stream_upload(session_id)?;
-        Self::validate_upload_part_stream_session(&session, bucket, key, upload_id, part_number)?;
-        let upload = Self::load_multipart_upload_from_object_pg(&pg, bucket, key, upload_id)?;
-        let existing_part_generation = match pg.get_multipart_part(upload_id, part_number) {
-            Ok(existing) => Some(existing.generation),
-            Err(crate::error::MetadataError::PartNotFound { .. }) => None,
-            Err(other) => return Err(other.into()),
-        };
-        let staging_segments = pg.list_stream_segments(session_id)?;
-        match action(StreamUploadPartSnapshot {
-            session,
-            upload: upload.clone(),
-            existing_part_generation,
-            staging_segments,
-        }) {
-            Ok(prepared) => {
-                let displaced_segments =
-                    pg.commit_stream_part(session_id, &prepared.part, &prepared.segments)?;
-                Ok(Ok(FinalizeStreamPartOutcome {
-                    value: prepared.value,
-                    upload,
-                    generation: prepared.part.generation,
-                    last_modified: prepared.part.last_modified,
-                    displaced_segments,
-                }))
+        let (result, cleanup) = {
+            let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+            let session = pg.get_stream_upload(session_id)?;
+            Self::validate_upload_part_stream_session(
+                &session,
+                bucket,
+                key,
+                upload_id,
+                part_number,
+            )?;
+            let upload = Self::load_multipart_upload_from_object_pg(&pg, bucket, key, upload_id)?;
+            let existing_part = match pg.get_multipart_part(upload_id, part_number) {
+                Ok(existing) => Some(existing),
+                Err(crate::error::MetadataError::PartNotFound { .. }) => None,
+                Err(other) => return Err(other.into()),
+            };
+            let existing_part_generation = existing_part.as_ref().map(|part| part.generation);
+            let staging_segments = pg.list_stream_segments(session_id)?;
+            match action(StreamUploadPartSnapshot {
+                session,
+                upload: upload.clone(),
+                existing_part_generation,
+                staging_segments,
+            }) {
+                Ok(prepared) => {
+                    let displaced_segments =
+                        pg.commit_stream_part(session_id, &prepared.part, &prepared.segments)?;
+                    let cleanup = (!displaced_segments.is_empty()
+                        || existing_part
+                            .as_ref()
+                            .is_some_and(|part| part.part_okh != [0u8; 16]))
+                    .then_some((existing_part, displaced_segments));
+                    (
+                        Ok(Ok(FinalizeStreamPartOutcome {
+                            value: prepared.value,
+                            last_modified: prepared.part.last_modified,
+                        })),
+                        cleanup,
+                    )
+                }
+                Err(error) => (Ok(Err(error)), None),
             }
-            Err(error) => Ok(Err(error)),
+        };
+
+        if let Some((existing_part, displaced_segments)) = cleanup {
+            self.delete_replaced_upload_part_best_effort(
+                existing_part.as_ref(),
+                &displaced_segments,
+            );
         }
+
+        result
     }
 
     pub fn load_in_progress_multipart_upload_for_listing(
@@ -519,6 +557,42 @@ impl SharedStorageNode {
         Ok(Self::load_in_progress_multipart_upload_from_object_pg(
             &pg, bucket, key, upload_id,
         )?)
+    }
+
+    pub fn list_multipart_uploads_for_bucket(
+        &self,
+        bucket: &BucketName,
+        prefix: Option<&ObjectKey>,
+        key_marker: Option<&ObjectKey>,
+        upload_id_marker: Option<&UploadId>,
+        record_cap: usize,
+        max_uploads: u32,
+    ) -> Result<ListedBucketMultipartUploads, ObjectPgActionError> {
+        let mut uploads = Vec::new();
+        let mut hit_record_cap = false;
+        self.pg_topology.for_each_pg(|pg_id| {
+            if hit_record_cap {
+                return Ok::<(), ObjectPgActionError>(());
+            }
+            let pg = self.get_pg(pg_id)?;
+            let resp = pg.list_multipart_uploads(&ListMultipartUploadsReq {
+                bucket: bucket.clone(),
+                prefix: prefix.cloned(),
+                key_marker: key_marker.cloned(),
+                upload_id_marker: upload_id_marker.cloned(),
+                max_uploads: max_uploads.saturating_add(1),
+            })?;
+            uploads.extend(resp.uploads);
+            if uploads.len() >= record_cap {
+                uploads.truncate(record_cap);
+                hit_record_cap = true;
+            }
+            Ok::<(), ObjectPgActionError>(())
+        })?;
+        Ok(ListedBucketMultipartUploads {
+            uploads,
+            hit_record_cap,
+        })
     }
 
     pub fn list_multipart_parts_for_upload<E, F>(
@@ -614,12 +688,11 @@ impl SharedStorageNode {
             if part.part_okh == [0u8; 16] {
                 continue;
             }
-            let multipart_bucket = format!("mpu/{}", part.upload_id);
-            let multipart_key = format!("{}/{}", part.part_number, part.generation);
-            let shard_pg_id = self.pg_topology.shard_pg(
-                multipart_bucket.as_str(),
-                multipart_key.as_str(),
-                part.part_vid.get(),
+            let shard_pg_id = self.multipart_part_shard_pg_id(
+                &part.upload_id,
+                part.part_number,
+                part.generation,
+                part.part_vid,
             );
             let Ok(shard_pg) = self.get_pg(shard_pg_id) else {
                 continue;
@@ -630,6 +703,30 @@ impl SharedStorageNode {
                 let _ = shard_pg.delete_shard(&shard_key);
             }
         }
+    }
+
+    fn delete_replaced_upload_part_best_effort(
+        &self,
+        existing_part: Option<&MultipartPartRecord>,
+        displaced_segments: &[MultipartPartSegmentRecord],
+    ) {
+        if let Some(existing_part) = existing_part.filter(|part| part.part_okh != [0u8; 16]) {
+            let shard_pg_id = self.multipart_part_shard_pg_id(
+                &existing_part.upload_id,
+                existing_part.part_number,
+                existing_part.generation,
+                existing_part.part_vid,
+            );
+            let _ = self.delete_segment_shard_set(
+                shard_pg_id,
+                &existing_part.part_okh,
+                existing_part.part_vid,
+                existing_part.ec_k,
+                existing_part.ec_m,
+            );
+        }
+
+        let _ = self.delete_streaming_segment_shards(displaced_segments);
     }
 
     pub fn abort_multipart_upload(
