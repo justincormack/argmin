@@ -119,7 +119,7 @@ impl SharedStorageNode {
         Ok(result)
     }
 
-    pub fn load_in_progress_multipart_upload_for_completion(
+    pub fn load_in_progress_multipart_upload(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,

@@ -937,6 +937,8 @@ Phase 7b status:
 
 ### Phase 8: Copy / UploadPartCopy Dual-Bucket Flows
 
+Status: in progress
+
 Copy requires two top-level bucket capabilities and is the main two-bucket
 request family.
 
@@ -952,6 +954,11 @@ Acceptance criteria:
   handles
 - dual-bucket ordering is hidden behind the storage handle layer, not open
   coded in request handlers
+
+Initial migrated slice:
+
+- `UploadPartCopy` destination multipart-upload lookup now uses the storage-owned
+  in-progress upload loader instead of coordinator-side object-PG lookup
 
 ### Phase 9: Remove Coordinator PG Surface
 
