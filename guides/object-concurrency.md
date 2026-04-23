@@ -73,6 +73,7 @@ Do not open-code this pattern in object paths:
 - `get_pg(meta)` then `get_pg(shard)`
 - manual lock-order branching
 - ad-hoc relock/retry loops
+- open-coded `acquire_bucket_write_reservation(...)` / `release_bucket_write_reservation(...)` pairs in migrated production paths; use a shared storage wrapper that owns acquire, snapshot load, protected action, and release
 - lock-holding network reads in streaming paths
 - shard-file visibility that bypasses metadata publication
 - shard-file writes while holding a PG mutex unless the code is intentionally changing the write visibility model
@@ -95,6 +96,9 @@ Do not open-code this pattern in object paths:
   with retries/recovery.
 - Without a dedicated multipart-completion serialization point, concurrent completes in one bucket can publish tombstones out of order and immediately prune the wrong just-completed upload.
 - Without taking the multipart-completion lock before bucket/object PG locks, same-PG bucket/object paths can self-deadlock during completion-order allocation.
+- Without shared reservation wrappers and explicit error-path review, fallible
+  operations can leak bucket write reservations or release the wrong error
+  shape.
 
 ## PR Checklist (Object Paths)
 
@@ -113,7 +117,14 @@ Do not open-code this pattern in object paths:
 9. For bucket+object mixed operations, is lock order explicit and ascending by PG ID?
 10. For `CompleteMultipartUpload`, is tombstone publication serialized with `lock_multipart_completion_bucket(...)`, with completion order allocated inside that critical section before any relevant PG lock is taken?
 11. For bounded completed-upload retention, does prune order come from the durable bucket-global completion order rather than timestamp or upload-ID tie breakers?
-12. Did you run:
+12. If this change touches reservations, drains, guards, or storage critical sections:
+   - is acquisition and release owned by a shared helper rather than open-coded?
+   - does every fallible path (`?`, early return, closure error) still release?
+   - does the protected action run inside the intended reservation/critical-section lifetime?
+   - if both the action and release fail, does the action error still win?
+   - did you grep for sibling helpers with the same acquire/release pattern?
+   - did you add a regression for release-on-error and, where relevant, “blocked action holds off conflicting work” behavior?
+13. Did you run:
    - `cargo clippy --workspace -- -D warnings`
    - `cargo test -p server-http --lib`
    - `cargo test -p s3-tests`
