@@ -1004,42 +1004,67 @@ Initial migrated slice:
 Once the migrated families no longer depend on PG-shaped APIs, remove the
 remaining coordinator-visible PG access where possible.
 
-This is now explicitly a closeout phase, not the next migration phase.
-There are still production request-path seams that need dedicated migration
-work before phase 9 can honestly collapse the remaining coordinator PG
-surface.
+This is now a true closeout phase. The main request-family migrations that
+used to block it have been completed:
 
-Remaining production request-path PG seams before phase 9:
+- listing / iteration request paths
+- bucket execution / mutation paths
+- multipart paths
+- plain streamed `PutObject`
+- copy / `UploadPartCopy`
+- object delete execution paths
+- the remaining normal production authz fallback in `UploadPartCopy`
 
-- Phase 4b bucket-wide listing / iteration paths are still coordinator-PG
-  shaped:
-  - `ListObjects`
-  - `ListObjectsV2`
-  - `ListObjectVersions`
-  - these still fan out across PGs from coordinator in `listing.rs`
-- bucket mutation / admin / config execution paths still have coordinator-side
-  bucket PG usage after auth migration:
-  - auth is on bucket handles
-  - but the actual metadata write/apply paths in `bucket.rs` still reopen
-    bucket PGs from coordinator
-- plain streaming helpers still have coordinator-visible PG usage in
-  `streaming.rs`:
-  - stream session encryption/load helpers
-  - append / cleanup paths
-  - these are still production write-path seams, not just tests
-- object delete still has remaining direct coordinator PG access in
-  `delete.rs`
-- authz still has coordinator-visible bucket PG fallback loads in `authz.rs`
-  for bucket policy / bucket tag resolution
-  - some of this overlaps with the fast-path and freshness review in phase 10
-  - but until that review is completed, these remain production coordinator PG
-    seams rather than “cleanup already done”
+What remains here is narrower and should be treated as two buckets of work.
 
-So the intended order from here is:
+Phase 9a: internal/runtime/helper cleanup
 
-1. finish the remaining production request-path migrations above
-2. then use phase 9 to remove the leftover coordinator PG surface that should
-   be obsolete once those paths are migrated
+These are not ordinary top-level request handlers, but they are still
+non-test coordinator code that exposes PG-shaped APIs or uses direct PG
+access:
+
+- `runtime.rs`
+  - reclaim, finalize, and background processing helpers
+  - bucket/object scan helpers used by runtime workflows
+- `infra.rs`
+  - generic coordinator PG helper surface
+  - request-family migrations have made parts of this obsolete
+- `object_state.rs`
+  - helper-level direct PG access such as current-object lookup / mutation
+    helpers that are now mostly implementation leftovers rather than
+    intentional coordinator boundaries
+- any remaining helper-level `get_pg(...)` / `lock_two_pgs(...)` use in
+  non-test coordinator modules
+
+Acceptance criteria for 9a:
+
+- non-test coordinator helpers no longer expose obsolete PG-shaped APIs where
+  a storage-owned helper now exists
+- runtime/background code keeps direct PG access only where it is still a
+  deliberate internal responsibility
+- the remaining coordinator PG uses are few, explicit, and explainable
+
+Phase 9b: test/helper cleanup audit
+
+There are still many direct PG references in tests and test-only helpers.
+Those are lower priority, but should be audited deliberately once the
+non-test internal surface is settled.
+
+This includes:
+
+- direct metadata/shard PG inspection in coordinator tests
+- trace/stateful/property tests that intentionally inspect raw PG state
+- test-only helpers such as:
+  - test bucket ABAC toggles
+  - test bucket policy cache inspection
+
+Acceptance criteria for 9b:
+
+- direct PG use remains only in tests that genuinely need raw-state
+  inspection or fault injection
+- accidental test dependence on coordinator PG helpers is reduced where a
+  clearer storage/test helper exists
+- any remaining test-only coordinator PG helpers are explicit and justified
 
 Expected end state:
 
