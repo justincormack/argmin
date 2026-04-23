@@ -2895,6 +2895,123 @@ fn abort_multipart_upload_success() {
 }
 
 #[test]
+fn abort_multipart_upload_reclaims_uploaded_and_streamed_part_shards() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let create = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    test_helpers::upload_part(
+        &coord,
+        &UploadPartRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &create.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number: 1,
+            data: b"part1",
+            claimed_checksum: None,
+            sse_customer: None,
+        },
+    )
+    .unwrap();
+
+    let session = begin_stream_part_test(&coord, "bucket", "key", &create.upload_id, 2).unwrap();
+    let streamed_part = b"stream-part";
+    coord
+        .append_plaintext_stream_segment_for_test(
+            "bucket",
+            "key",
+            &session.session_id,
+            0,
+            streamed_part,
+        )
+        .unwrap();
+    coord
+        .finalize_stream_part(FinalizeStreamPartRequest {
+            upload: multipart_object_request("bucket", "key", &create.upload_id, test_requester()),
+            session_id: &session.session_id,
+            part_number: 2,
+            crc64: checksum::crc64::checksum(streamed_part),
+            total_size: streamed_part.len() as u64,
+            claimed_checksum: None,
+            computed_checksum: None,
+        })
+        .unwrap();
+
+    let meta_pg = coord
+        .storage_node
+        .get_pg(coord.object_pg_id("bucket", "key"))
+        .unwrap();
+    let uploaded_part =
+        storage::traits::PgMetadataStore::get_multipart_part(&*meta_pg, &create.upload_id, 1)
+            .unwrap();
+    let streamed_segments =
+        storage::traits::PgMetadataStore::get_all_multipart_part_segments_for_upload(
+            &*meta_pg,
+            &create.upload_id,
+        )
+        .unwrap();
+    assert!(!streamed_segments.is_empty());
+    drop(meta_pg);
+
+    coord
+        .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+            "bucket",
+            "key",
+            &create.upload_id,
+            test_requester(),
+            None,
+        ))
+        .unwrap();
+
+    assert_shard_set_deleted(
+        &coord,
+        coord.shard_pg_id_raw(
+            &format!("mpu/{}", create.upload_id),
+            &format!("{}/{}", uploaded_part.part_number, uploaded_part.generation),
+            uploaded_part.part_vid.get(),
+        ),
+        &uploaded_part.part_okh,
+        uploaded_part.part_vid,
+        EcShape {
+            k: uploaded_part.ec_k,
+            m: uploaded_part.ec_m,
+        },
+    );
+    for segment in streamed_segments {
+        assert_shard_set_deleted(
+            &coord,
+            segment.shard_pg_id,
+            &segment.segment_okh,
+            segment.segment_vid,
+            EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            },
+        );
+    }
+}
+
+#[test]
 fn abort_multipart_upload_nonexistent() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());

@@ -788,6 +788,7 @@ Phase 7 status:
   - `CompleteMultipartUpload`
   - `BeginStreamPart`
   - `ListParts`
+  - `AbortMultipartUpload`
 - these now use the write-scoped bucket handle path for bucket policy / ABAC
   inputs instead of the older reservation-only summary path
 - `BeginStreamPart` is now the first multipart/session write path moved onto
@@ -802,6 +803,13 @@ Phase 7 status:
   - multipart upload lookup and part listing stay inside a storage-owned
     object-PG helper
   - the coordinator-facing auth result for this path is pure data only
+- `AbortMultipartUpload` now matches the same rule for the multipart cleanup
+  path:
+  - coordinator no longer performs multipart metadata PG orchestration
+  - shard cleanup and multipart metadata deletion are owned by a single
+    storage-side abort operation
+  - the normal request path no longer carries abort-specific PG/shard deletion
+    mechanics in `runtime.rs`
 - follow-up required on migrated slice:
   - `CreateMultipartUpload` and `CompleteMultipartUpload` still need to move
     from the current write-scoped snapshot boundary to the phase-4d
@@ -815,7 +823,6 @@ Phase 7 status:
       reservation-lifetime-rework pending, not final
 - remaining obvious phase-7 surface:
   - `UploadPart`
-  - `AbortMultipartUpload`
   - streaming `PutObject`
   - remaining multipart/session management flows
 

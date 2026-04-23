@@ -8,9 +8,8 @@ use s3_types::{BucketLifecycleConfiguration, BucketVersioningState};
 use storage::traits::{PgMetadataStore, ShardStore};
 use storage::{
     BucketInfo, BucketName, EcShape, GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq,
-    ListObjectsReq, MultipartPartSegmentRecord, MultipartReclaimPartRecord, ObjectEncryption,
-    ObjectKey, OwnerIdentity, ShardKey, SharedStorageNode, StoredObject, UploadId, UploadState,
-    VersionId,
+    ListObjectsReq, MultipartReclaimPartRecord, ObjectEncryption, ObjectKey, OwnerIdentity,
+    ShardKey, SharedStorageNode, StoredObject, UploadId, UploadState, VersionId,
 };
 
 use super::payload::{PooledPayloadBuffer, SharedPayloadBuffer};
@@ -775,79 +774,9 @@ impl ReadRuntime {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<bool, ServerError> {
-        let Some(prepared) = self
-            .storage_node
-            .prepare_abort_multipart_upload(bucket, key, upload_id)
-            .map_err(Coordinator::map_object_pg_action_error)?
-        else {
-            return Ok(false);
-        };
-
-        for part in &prepared.parts {
-            if part.part_okh == [0u8; 16] {
-                continue;
-            }
-            let multipart_bucket = format!("mpu/{upload_id}");
-            let multipart_key = format!("{}/{}", part.part_number, part.generation);
-            let shard_pg_id = self.pg_topology.shard_pg(
-                multipart_bucket.as_str(),
-                multipart_key.as_str(),
-                part.part_vid.get(),
-            );
-            if let Ok(shard_pg) = self.storage_node.get_pg(shard_pg_id) {
-                let total = part.ec_k as usize + part.ec_m as usize;
-                for i in 0..total {
-                    let shard_key = ShardKey::new(&part.part_okh, part.part_vid.get(), i as u8);
-                    let _ = shard_pg.delete_shard(&shard_key);
-                }
-            }
-        }
-
-        if !prepared.streaming_segments.is_empty() {
-            self.delete_segment_shards_generic(&prepared.streaming_segments)?;
-        }
-
         self.storage_node
-            .finish_abort_multipart_upload(
-                bucket,
-                key,
-                upload_id,
-                !prepared.streaming_segments.is_empty(),
-            )
+            .abort_multipart_upload(bucket, key, upload_id)
             .map_err(Coordinator::map_object_pg_action_error)
-    }
-
-    fn delete_segment_shards_generic(
-        &self,
-        segments: &[MultipartPartSegmentRecord],
-    ) -> Result<(), ServerError> {
-        for segment in segments {
-            self.delete_segment_shard_set(
-                segment.shard_pg_id,
-                &segment.segment_okh,
-                segment.segment_vid,
-                segment.ec_k,
-                segment.ec_m,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn delete_segment_shard_set(
-        &self,
-        shard_pg_id: u32,
-        segment_okh: &[u8; 16],
-        segment_vid: GenerationId,
-        ec_k: u8,
-        ec_m: u8,
-    ) -> Result<(), ServerError> {
-        let pg = self.storage_node.get_pg(shard_pg_id)?;
-        let total = ec_k as usize + ec_m as usize;
-        for i in 0..total {
-            let shard_key = ShardKey::new(segment_okh, segment_vid.get(), i as u8);
-            pg.delete_shard(&shard_key)?;
-        }
-        Ok(())
     }
 
     pub(super) fn acquire_object_payload_lease_for(

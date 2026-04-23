@@ -2391,12 +2391,6 @@ pub enum AbortMultipartUploadLookup {
     Completed(CompletedMultipartUploadRecord),
 }
 
-#[derive(Debug, Clone)]
-pub struct PreparedAbortMultipartUpload {
-    pub parts: Vec<MultipartPartRecord>,
-    pub streaming_segments: Vec<MultipartPartSegmentRecord>,
-}
-
 /// In-progress multipart part record.
 #[derive(Debug, Clone)]
 pub struct MultipartPartRecord {
