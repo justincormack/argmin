@@ -19,12 +19,13 @@ use crate::types::{
     AbortMultipartUploadLookup, BucketFastPathInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
     BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind,
     CreateStreamUploadReq, FinalizeStreamPartOutcome, GenerationId, ListMultipartUploadsReq,
-    ListObjectVersionsReq, ListPartsReq, ListedBucketMultipartUploads, ListedMultipartParts,
-    LoadedBucketSubresource, MultipartCompletionPreflight, MultipartCompletionSnapshot,
-    MultipartPartRecord, MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey,
-    ObjectReadSnapshot, ObjectReadSnapshotOutcome, PreparedStreamPartCommit, SessionId, ShardKey,
-    StoredObject, StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget, UploadId,
-    UploadState, WriteAck,
+    ListObjectVersionsReq, ListPartsReq, ListedBucketMultipartUploads, ListedBucketObjectVersions,
+    ListedBucketObjects, ListedMultipartParts, LoadedBucketSubresource,
+    MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
+    MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, ObjectReadSnapshot,
+    ObjectReadSnapshotOutcome, PreparedStreamPartCommit, SessionId, ShardKey, StoredObject,
+    StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
+    WriteAck,
 };
 
 const TRACE_TARGET: &str = "storage";
@@ -32,6 +33,7 @@ const RAPIDHASH_SECRETS: RapidSecrets = RapidSecrets::seed(0);
 const LOCK_WAIT_EVENT_THRESHOLD_US: u128 = 1_000;
 
 mod bucket_ops;
+mod listing_ops;
 mod multipart_ops;
 mod object_read_ops;
 mod stream_ops;
