@@ -3600,9 +3600,36 @@ impl Coordinator {
 
         match (bucket_info.versioning, request_version_id) {
             (BucketVersioningState::Disabled, _) => {
-                let locked = match self.lock_object_pgs_for_read_typed(bucket, key, None) {
-                    Ok(locked) => locked,
-                    Err(ServerError::ObjectNotFound { .. }) => {
+                match self
+                    .storage_node
+                    .load_object_if(bucket, key, None, |stored| {
+                        if !self.requester_can_delete_object_with_bucket_policy(
+                            BucketPolicyAccess {
+                                requester,
+                                bucket: &bucket_info,
+                                bucket_tags: bucket_tags.as_deref(),
+                                policy: bucket_policy.as_deref(),
+                            },
+                            key_str,
+                            Some(stored),
+                            Self::delete_object_policy_action(None),
+                        )? {
+                            return Err(ServerError::AccessDenied);
+                        }
+                        Ok(())
+                    }) {
+                    Ok(Ok(())) => Ok(AuthorizedDeleteObject::UnversionedDelete {
+                        bucket: object.bucket_name_typed().clone(),
+                        key: object.key_typed().clone(),
+                        requester: requester.clone(),
+                        bucket_info,
+                        bucket_policy,
+                        bucket_tags,
+                    }),
+                    Ok(Err(error)) => Err(error),
+                    Err(storage::ObjectPgActionError::Metadata(
+                        storage::MetadataError::ObjectNotFound,
+                    )) => {
                         if !self.requester_can_delete_object_with_bucket_policy(
                             BucketPolicyAccess {
                                 requester,
@@ -3616,52 +3643,68 @@ impl Coordinator {
                         )? {
                             return Err(ServerError::AccessDenied);
                         }
-                        return Ok(AuthorizedDeleteObject::UnversionedDelete {
+                        Ok(AuthorizedDeleteObject::UnversionedDelete {
                             bucket: object.bucket_name_typed().clone(),
                             key: object.key_typed().clone(),
                             requester: requester.clone(),
                             bucket_info,
                             bucket_policy,
                             bucket_tags,
-                        });
+                        })
                     }
-                    Err(other) => return Err(other),
-                };
-
-                if !self.requester_can_delete_object_with_bucket_policy(
-                    BucketPolicyAccess {
-                        requester,
-                        bucket: &bucket_info,
-                        bucket_tags: bucket_tags.as_deref(),
-                        policy: bucket_policy.as_deref(),
-                    },
-                    key_str,
-                    Some(&locked.record),
-                    Self::delete_object_policy_action(None),
-                )? {
-                    return Err(ServerError::AccessDenied);
+                    Err(other) => Err(Self::map_object_pg_action_error(other)),
                 }
-
-                drop(locked);
-                Ok(AuthorizedDeleteObject::UnversionedDelete {
-                    bucket: object.bucket_name_typed().clone(),
-                    key: object.key_typed().clone(),
-                    requester: requester.clone(),
-                    bucket_info,
-                    bucket_policy,
-                    bucket_tags,
-                })
             }
             (_, Some(version_id)) => {
-                let locked = match self.lock_object_pgs_for_read_typed(
-                    bucket,
-                    key,
-                    Some(version_id),
-                ) {
-                    Ok(locked) => locked,
-                    Err(
-                        ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. },
-                    ) => {
+                match self
+                    .storage_node
+                    .load_object_if(bucket, key, Some(version_id), |stored| {
+                        if !self.requester_can_delete_object_with_bucket_policy(
+                            BucketPolicyAccess {
+                                requester,
+                                bucket: &bucket_info,
+                                bucket_tags: bucket_tags.as_deref(),
+                                policy: bucket_policy.as_deref(),
+                            },
+                            key_str,
+                            Some(stored),
+                            Self::delete_object_policy_action(Some(version_id)),
+                        )? {
+                            return Err(ServerError::AccessDenied);
+                        }
+
+                        if let StoredObject::Live(record) = stored {
+                            let can_bypass_governance = self
+                                .requester_can_bypass_governance_retention_with_bucket_policy(
+                                    requester,
+                                    &bucket_info,
+                                    bucket_tags.as_deref(),
+                                    stored,
+                                    bucket_policy.as_deref(),
+                                )?;
+                            Self::validate_delete_against_object_lock(
+                                record.object_lock,
+                                bypass_governance,
+                                can_bypass_governance,
+                                Self::current_unix_seconds()?,
+                            )?;
+                        }
+                        Ok(())
+                    }) {
+                    Ok(Ok(())) => Ok(AuthorizedDeleteObject::SpecificVersion {
+                        bucket: object.bucket_name_typed().clone(),
+                        key: object.key_typed().clone(),
+                        version_id,
+                        requester: requester.clone(),
+                        bucket_info,
+                        bucket_policy,
+                        bucket_tags,
+                        bypass_governance,
+                    }),
+                    Ok(Err(error)) => Err(error),
+                    Err(storage::ObjectPgActionError::Metadata(
+                        storage::MetadataError::ObjectNotFound,
+                    )) => {
                         if !self.requester_can_delete_object_with_bucket_policy(
                             BucketPolicyAccess {
                                 requester,
@@ -3687,59 +3730,17 @@ impl Coordinator {
                         {
                             return Err(ServerError::AccessDenied);
                         }
-                        return Ok(AuthorizedDeleteObject::SpecificVersionMissing { version_id });
+                        Ok(AuthorizedDeleteObject::SpecificVersionMissing { version_id })
                     }
-                    Err(other) => return Err(other),
-                };
-
-                if !self.requester_can_delete_object_with_bucket_policy(
-                    BucketPolicyAccess {
-                        requester,
-                        bucket: &bucket_info,
-                        bucket_tags: bucket_tags.as_deref(),
-                        policy: bucket_policy.as_deref(),
-                    },
-                    key_str,
-                    Some(&locked.record),
-                    Self::delete_object_policy_action(Some(version_id)),
-                )? {
-                    return Err(ServerError::AccessDenied);
+                    Err(other) => Err(Self::map_object_pg_action_error(other)),
                 }
-
-                if let StoredObject::Live(record) = &locked.record {
-                    let can_bypass_governance = self
-                        .requester_can_bypass_governance_retention_with_bucket_policy(
-                            requester,
-                            &bucket_info,
-                            bucket_tags.as_deref(),
-                            &locked.record,
-                            bucket_policy.as_deref(),
-                        )?;
-                    Self::validate_delete_against_object_lock(
-                        record.object_lock,
-                        bypass_governance,
-                        can_bypass_governance,
-                        Self::current_unix_seconds()?,
-                    )?;
-                }
-
-                drop(locked);
-                Ok(AuthorizedDeleteObject::SpecificVersion {
-                    bucket: object.bucket_name_typed().clone(),
-                    key: object.key_typed().clone(),
-                    version_id,
-                    requester: requester.clone(),
-                    bucket_info,
-                    bucket_policy,
-                    bucket_tags,
-                    bypass_governance,
-                })
             }
             (_, None) => {
                 let owner =
                     Self::effective_object_owner(&bucket_info, requester, PutObjectAcl::None);
-                match self.lock_object_pgs_for_read_typed(bucket, key, None) {
-                    Ok(locked) => {
+                match self
+                    .storage_node
+                    .load_object_if(bucket, key, None, |stored| {
                         if !self.requester_can_delete_object_with_bucket_policy(
                             BucketPolicyAccess {
                                 requester,
@@ -3748,23 +3749,26 @@ impl Coordinator {
                                 policy: bucket_policy.as_deref(),
                             },
                             key_str,
-                            Some(&locked.record),
+                            Some(stored),
                             Self::delete_object_policy_action(None),
                         )? {
                             return Err(ServerError::AccessDenied);
                         }
-                        drop(locked);
-                        Ok(AuthorizedDeleteObject::CurrentDeleteMarkerInsert {
-                            bucket: object.bucket_name_typed().clone(),
-                            key: object.key_typed().clone(),
-                            owner,
-                            requester: requester.clone(),
-                            bucket_info,
-                            bucket_policy,
-                            bucket_tags,
-                        })
-                    }
-                    Err(ServerError::ObjectNotFound { .. }) => {
+                        Ok(())
+                    }) {
+                    Ok(Ok(())) => Ok(AuthorizedDeleteObject::CurrentDeleteMarkerInsert {
+                        bucket: object.bucket_name_typed().clone(),
+                        key: object.key_typed().clone(),
+                        owner,
+                        requester: requester.clone(),
+                        bucket_info,
+                        bucket_policy,
+                        bucket_tags,
+                    }),
+                    Ok(Err(error)) => Err(error),
+                    Err(storage::ObjectPgActionError::Metadata(
+                        storage::MetadataError::ObjectNotFound,
+                    )) => {
                         if !self.requester_can_delete_object_with_bucket_policy(
                             BucketPolicyAccess {
                                 requester,
@@ -3788,7 +3792,7 @@ impl Coordinator {
                             bucket_tags,
                         })
                     }
-                    Err(other) => Err(other),
+                    Err(other) => Err(Self::map_object_pg_action_error(other)),
                 }
             }
         }

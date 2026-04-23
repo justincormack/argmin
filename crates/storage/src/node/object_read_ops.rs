@@ -2,6 +2,21 @@ use super::*;
 use crate::{ObjectLayout, VersionId};
 
 impl SharedStorageNode {
+    pub fn load_object_if<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        action: impl FnOnce(&StoredObject) -> Result<T, E>,
+    ) -> Result<Result<T, E>, ObjectPgActionError> {
+        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        let stored = match version_id {
+            Some(version_id) => PgMetadataStore::get_object_version(&*pg, bucket, key, version_id)?,
+            None => PgMetadataStore::get_object_meta(&*pg, bucket, key)?,
+        };
+        Ok(action(&stored))
+    }
+
     pub fn load_existing_live_object(
         &self,
         bucket: &BucketName,
