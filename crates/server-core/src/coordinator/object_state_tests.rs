@@ -4170,6 +4170,158 @@ fn delete_specific_version_rechecks_object_lock_state_at_execution() {
 }
 
 #[test]
+fn delete_unversioned_rechecks_current_object_at_execution() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    let requester = test_helpers::requester("owner-a");
+
+    coord
+        .create_bucket(&CreateBucketRequest {
+            name: trusted_bucket_name("bucket"),
+            requester: Requester::authenticated(AccountIdentity::from_principal("owner-a")),
+            namespace: BucketNamespace::Global,
+            acl: CreateBucketAcl::DefaultPrivate,
+            ownership: BucketObjectOwnership::ObjectWriter,
+            object_lock_enabled: false,
+        })
+        .unwrap();
+
+    let put = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", requester.clone(), None),
+            data: b"data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let cond = crate::conditional::DeleteCondition::IfMatch(put.etag.clone().into());
+    let authorized = coord
+        .authorize_delete_object(&DeleteObjectRequest {
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                requester.clone(),
+                None,
+            ),
+            bypass_governance: false,
+            cond: &cond,
+        })
+        .unwrap();
+
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", requester, None),
+            data: b"new-data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let err = coord
+        .apply_authorized_delete_object(authorized, &cond)
+        .unwrap_err();
+    assert!(matches!(err, ServerError::PreconditionFailed));
+}
+
+#[test]
+fn delete_current_marker_insert_rechecks_current_object_at_execution() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    let requester = test_helpers::requester("owner-a");
+
+    coord
+        .create_bucket(&CreateBucketRequest {
+            name: trusted_bucket_name("bucket"),
+            requester: Requester::authenticated(AccountIdentity::from_principal("owner-a")),
+            namespace: BucketNamespace::Global,
+            acl: CreateBucketAcl::DefaultPrivate,
+            ownership: BucketObjectOwnership::ObjectWriter,
+            object_lock_enabled: false,
+        })
+        .unwrap();
+    put_bucket_versioning_test(
+        &coord,
+        "bucket",
+        BucketVersioningState::Enabled,
+        requester.clone(),
+        None,
+    )
+    .unwrap();
+
+    let put = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", requester.clone(), None),
+            data: b"data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let cond = crate::conditional::DeleteCondition::IfMatch(put.etag.clone().into());
+    let authorized = coord
+        .authorize_delete_object(&DeleteObjectRequest {
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                requester.clone(),
+                None,
+            ),
+            bypass_governance: false,
+            cond: &cond,
+        })
+        .unwrap();
+
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", requester, None),
+            data: b"new-data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let err = coord
+        .apply_authorized_delete_object(authorized, &cond)
+        .unwrap_err();
+    assert!(matches!(err, ServerError::PreconditionFailed));
+}
+
+#[test]
 fn delete_object_missing_version_with_bypass_requires_bucket_policy_bypass() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());

@@ -2357,6 +2357,28 @@ pub struct DeleteSpecificObjectVersionOutcome<T> {
     pub deleted: DeletedSpecificObjectVersion,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletedCurrentObject {
+    Missing,
+    DeleteMarker,
+    Live {
+        generation_id: GenerationId,
+        layout: ObjectLayout,
+    },
+}
+
+#[derive(Debug)]
+pub struct DeleteCurrentObjectOutcome<T> {
+    pub value: T,
+    pub deleted: DeletedCurrentObject,
+}
+
+#[derive(Debug)]
+pub struct InsertCurrentDeleteMarkerOutcome<T> {
+    pub value: T,
+    pub version_id: VersionId,
+}
+
 /// Request to list objects in a PG.
 pub struct ListObjectsReq {
     pub bucket: BucketName,

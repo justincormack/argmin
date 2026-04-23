@@ -9,7 +9,7 @@ use super::{
 };
 use super::{
     AuthorizedDeleteObject, Coordinator, DeleteError, DeleteObjectRequest, DeleteObjectResult,
-    DeleteObjectsRequest, DeleteObjectsResult, DeletedObject, LockedReadObject, TRACE_TARGET,
+    DeleteObjectsRequest, DeleteObjectsResult, DeletedObject, TRACE_TARGET,
 };
 use crate::conditional::{check_delete_conditions, DeleteCondition};
 use crate::error::ServerError;
@@ -17,58 +17,78 @@ use crate::error::ServerError;
 impl Coordinator {
     pub(super) fn apply_authorized_delete_object(
         &self,
-        authorized: AuthorizedDeleteObject<'_>,
+        authorized: AuthorizedDeleteObject,
         cond: &DeleteCondition,
     ) -> Result<DeleteObjectResult, ServerError> {
         match authorized {
-            AuthorizedDeleteObject::UnversionedMissing => {
-                if !cond.is_empty() {
-                    return Err(ServerError::PreconditionFailed);
-                }
-                Ok(DeleteObjectResult {
-                    version_id: VersionId::Null,
-                    delete_marker: false,
-                })
-            }
-            AuthorizedDeleteObject::UnversionedStored {
+            AuthorizedDeleteObject::UnversionedDelete {
                 bucket,
                 key,
-                stored,
-                pgs,
+                requester,
+                bucket_info,
+                bucket_policy,
+                bucket_tags,
             } => {
-                let StoredObject::Live(record) = stored else {
-                    return Ok(DeleteObjectResult {
-                        version_id: VersionId::Null,
-                        delete_marker: false,
-                    });
-                };
-
-                if !cond.is_empty() {
-                    let etag_str = record.etag.format();
-                    check_delete_conditions(cond, &etag_str)?;
-                }
-
-                let meta_pg = pgs.meta();
-                let reclaim =
-                    Self::permanently_delete_live_object_locked(meta_pg, &bucket, &key, &record)?;
-                drop(pgs);
-                #[cfg(test)]
-                match record.layout {
-                    ObjectLayout::MultipartManifest { .. } => {
-                        maybe_run_multipart_delete_metadata_hook(bucket.as_str(), key.as_str());
-                    }
-                    ObjectLayout::Standard => {
-                        maybe_run_object_segments_delete_metadata_hook(
-                            bucket.as_str(),
+                let deleted = self
+                    .storage_node
+                    .delete_current_object_if(&bucket, &key, |stored| -> Result<(), ServerError> {
+                        if !self.requester_can_delete_object_with_bucket_policy(
+                            crate::coordinator::authz::BucketPolicyAccess {
+                                requester: &requester,
+                                bucket: &bucket_info,
+                                bucket_tags: bucket_tags.as_deref(),
+                                policy: bucket_policy.as_deref(),
+                            },
                             key.as_str(),
-                        );
+                            stored,
+                            Self::delete_object_policy_action(None),
+                        )? {
+                            return Err(ServerError::AccessDenied);
+                        }
+
+                        if !cond.is_empty() {
+                            let record = match stored {
+                                Some(StoredObject::Live(record)) => record,
+                                _ => return Err(ServerError::PreconditionFailed),
+                            };
+                            let etag_str = record.etag.format();
+                            check_delete_conditions(cond, &etag_str)?;
+                        }
+                        Ok(())
+                    })
+                    .map_err(|error| match error {
+                        storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
+                        storage::ObjectPgActionError::InvalidRequest { reason } => {
+                            ServerError::InvalidRequest { reason }
+                        }
+                        storage::ObjectPgActionError::Metadata(error) => {
+                            ServerError::Metadata(error)
+                        }
+                    })??;
+
+                if let storage::DeletedCurrentObject::Live {
+                    generation_id,
+                    layout,
+                } = deleted.deleted
+                {
+                    #[cfg(test)]
+                    match layout {
+                        ObjectLayout::MultipartManifest { .. } => {
+                            maybe_run_multipart_delete_metadata_hook(bucket.as_str(), key.as_str());
+                        }
+                        ObjectLayout::Standard => {
+                            maybe_run_object_segments_delete_metadata_hook(
+                                bucket.as_str(),
+                                key.as_str(),
+                            );
+                        }
                     }
-                }
-                if let Some(reclaim) = reclaim {
+                    #[cfg(not(test))]
+                    let _ = layout;
                     self.read_runtime().enqueue_object_payload_reclaim_for(
                         &bucket,
                         &key,
-                        reclaim.generation_id,
+                        generation_id,
                     );
                 }
 
@@ -214,52 +234,54 @@ impl Coordinator {
                 bucket,
                 key,
                 owner,
-                current,
+                requester,
+                bucket_info,
+                bucket_policy,
+                bucket_tags,
             } => {
-                let marker_vid = match current {
-                    Some(LockedReadObject {
-                        record: stored,
-                        pgs,
-                    }) => {
-                        if !cond.is_empty() {
-                            let record = match stored {
-                                StoredObject::Live(record) => record,
-                                StoredObject::DeleteMarker(_) => {
-                                    return Err(ServerError::PreconditionFailed);
-                                }
-                            };
-                            let etag_str = record.etag.format();
-                            check_delete_conditions(cond, &etag_str)?;
+                let marker = self
+                    .storage_node
+                    .insert_current_delete_marker_if(
+                        &bucket,
+                        &key,
+                        owner,
+                        |stored| -> Result<(), ServerError> {
+                            if !self.requester_can_delete_object_with_bucket_policy(
+                                crate::coordinator::authz::BucketPolicyAccess {
+                                    requester: &requester,
+                                    bucket: &bucket_info,
+                                    bucket_tags: bucket_tags.as_deref(),
+                                    policy: bucket_policy.as_deref(),
+                                },
+                                key.as_str(),
+                                stored,
+                                Self::delete_object_policy_action(None),
+                            )? {
+                                return Err(ServerError::AccessDenied);
+                            }
+                            if !cond.is_empty() {
+                                let record = match stored {
+                                    Some(StoredObject::Live(record)) => record,
+                                    _ => return Err(ServerError::PreconditionFailed),
+                                };
+                                let etag_str = record.etag.format();
+                                check_delete_conditions(cond, &etag_str)?;
+                            }
+                            Ok(())
+                        },
+                    )
+                    .map_err(|error| match error {
+                        storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
+                        storage::ObjectPgActionError::InvalidRequest { reason } => {
+                            ServerError::InvalidRequest { reason }
                         }
-
-                        let meta_pg = pgs.meta();
-                        let marker_vid =
-                            storage::PgMetadataStore::next_version_id(meta_pg, &bucket, &key)?;
-                        Self::put_delete_marker_locked(meta_pg, &bucket, &key, marker_vid, owner)?;
-                        marker_vid
-                    }
-                    None => {
-                        if !cond.is_empty() {
-                            return Err(ServerError::PreconditionFailed);
+                        storage::ObjectPgActionError::Metadata(error) => {
+                            ServerError::Metadata(error)
                         }
-                        self.storage_node
-                            .insert_current_delete_marker(&bucket, &key, owner)
-                            .map_err(|error| match error {
-                                storage::ObjectPgActionError::Store(error) => {
-                                    ServerError::Store(error)
-                                }
-                                storage::ObjectPgActionError::InvalidRequest { reason } => {
-                                    ServerError::InvalidRequest { reason }
-                                }
-                                storage::ObjectPgActionError::Metadata(error) => {
-                                    ServerError::Metadata(error)
-                                }
-                            })?
-                    }
-                };
+                    })??;
 
                 Ok(DeleteObjectResult {
-                    version_id: marker_vid,
+                    version_id: marker.version_id,
                     delete_marker: true,
                 })
             }

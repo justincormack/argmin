@@ -16,7 +16,7 @@ use storage::BucketObjectOwnership;
 use storage::{
     BucketEncryptionConfig, BucketName, BucketObjectLockConfig, BucketOwnershipControls,
     EffectiveBucketEncryptionConfig, MultipartUploadRecord, ObjectKey, ObjectLockState,
-    ObjectReadSnapshot, OwnerIdentity, PublicAccessBlockConfig, StoredObject, UploadId,
+    ObjectReadSnapshot, OwnerIdentity, PublicAccessBlockConfig, UploadId,
 };
 
 #[derive(Debug)]
@@ -317,13 +317,14 @@ pub(super) struct AuthorizedListBuckets {
     pub(super) owner_canonical_id: CanonicalUserId,
 }
 
-pub(super) enum AuthorizedDeleteObject<'a> {
-    UnversionedMissing,
-    UnversionedStored {
+pub(super) enum AuthorizedDeleteObject {
+    UnversionedDelete {
         bucket: BucketName,
         key: ObjectKey,
-        stored: StoredObject,
-        pgs: ObjectPgGuards<'a>,
+        requester: Requester,
+        bucket_info: ValidatedBucket,
+        bucket_policy: Option<Arc<BucketPolicy>>,
+        bucket_tags: Option<Vec<(String, String)>>,
     },
     SpecificVersionMissing {
         version_id: VersionId,
@@ -342,7 +343,10 @@ pub(super) enum AuthorizedDeleteObject<'a> {
         bucket: BucketName,
         key: ObjectKey,
         owner: OwnerIdentity,
-        current: Option<LockedReadObject<'a>>,
+        requester: Requester,
+        bucket_info: ValidatedBucket,
+        bucket_policy: Option<Arc<BucketPolicy>>,
+        bucket_tags: Option<Vec<(String, String)>>,
     },
 }
 
@@ -425,12 +429,11 @@ impl std::fmt::Debug for AuthorizedUploadPartCopy {
     }
 }
 
-impl std::fmt::Debug for AuthorizedDeleteObject<'_> {
+impl std::fmt::Debug for AuthorizedDeleteObject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnversionedMissing => f.write_str("AuthorizedDeleteObject::UnversionedMissing"),
-            Self::UnversionedStored { bucket, key, .. } => f
-                .debug_struct("AuthorizedDeleteObject::UnversionedStored")
+            Self::UnversionedDelete { bucket, key, .. } => f
+                .debug_struct("AuthorizedDeleteObject::UnversionedDelete")
                 .field("bucket", bucket)
                 .field("key", key)
                 .finish_non_exhaustive(),

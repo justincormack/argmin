@@ -3616,11 +3616,11 @@ impl Coordinator {
         })
     }
 
-    fn authorize_delete_object_impl<'a>(
-        &'a self,
+    fn authorize_delete_object_impl(
+        &self,
         object: &ObjectVersionRequest<'_>,
         bypass_governance: bool,
-    ) -> Result<AuthorizedDeleteObject<'a>, ServerError> {
+    ) -> Result<AuthorizedDeleteObject, ServerError> {
         let bucket = object.bucket_name_typed();
         let key = object.key_typed();
         let key_str = key.as_str();
@@ -3650,7 +3650,14 @@ impl Coordinator {
                         )? {
                             return Err(ServerError::AccessDenied);
                         }
-                        return Ok(AuthorizedDeleteObject::UnversionedMissing);
+                        return Ok(AuthorizedDeleteObject::UnversionedDelete {
+                            bucket: object.bucket_name_typed().clone(),
+                            key: object.key_typed().clone(),
+                            requester: requester.clone(),
+                            bucket_info,
+                            bucket_policy,
+                            bucket_tags,
+                        });
                     }
                     Err(other) => return Err(other),
                 };
@@ -3669,15 +3676,14 @@ impl Coordinator {
                     return Err(ServerError::AccessDenied);
                 }
 
-                let LockedReadObject {
-                    record: stored,
-                    pgs,
-                } = locked;
-                Ok(AuthorizedDeleteObject::UnversionedStored {
+                drop(locked);
+                Ok(AuthorizedDeleteObject::UnversionedDelete {
                     bucket: object.bucket_name_typed().clone(),
                     key: object.key_typed().clone(),
-                    stored,
-                    pgs,
+                    requester: requester.clone(),
+                    bucket_info,
+                    bucket_policy,
+                    bucket_tags,
                 })
             }
             (_, Some(version_id)) => {
@@ -3781,11 +3787,15 @@ impl Coordinator {
                         )? {
                             return Err(ServerError::AccessDenied);
                         }
+                        drop(locked);
                         Ok(AuthorizedDeleteObject::CurrentDeleteMarkerInsert {
                             bucket: object.bucket_name_typed().clone(),
                             key: object.key_typed().clone(),
                             owner,
-                            current: Some(locked),
+                            requester: requester.clone(),
+                            bucket_info,
+                            bucket_policy,
+                            bucket_tags,
                         })
                     }
                     Err(ServerError::ObjectNotFound { .. }) => {
@@ -3806,7 +3816,10 @@ impl Coordinator {
                             bucket: object.bucket_name_typed().clone(),
                             key: object.key_typed().clone(),
                             owner,
-                            current: None,
+                            requester: requester.clone(),
+                            bucket_info,
+                            bucket_policy,
+                            bucket_tags,
                         })
                     }
                     Err(other) => Err(other),
@@ -3815,18 +3828,18 @@ impl Coordinator {
         }
     }
 
-    pub(super) fn authorize_delete_object<'a>(
-        &'a self,
+    pub(super) fn authorize_delete_object(
+        &self,
         req: &DeleteObjectRequest<'_>,
-    ) -> Result<AuthorizedDeleteObject<'a>, ServerError> {
+    ) -> Result<AuthorizedDeleteObject, ServerError> {
         self.authorize_delete_object_impl(&req.object, req.bypass_governance)
     }
 
-    pub(super) fn authorize_delete_objects_entry<'a>(
-        &'a self,
+    pub(super) fn authorize_delete_objects_entry(
+        &self,
         req: &DeleteObjectsRequest<'_>,
         entry: &DeleteEntry,
-    ) -> Result<AuthorizedDeleteObject<'a>, ServerError> {
+    ) -> Result<AuthorizedDeleteObject, ServerError> {
         let object = ObjectVersionRequest::from_object(
             ObjectRequest::new(
                 req.bucket.name_typed().clone(),

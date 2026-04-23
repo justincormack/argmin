@@ -1,7 +1,8 @@
 use super::*;
 use crate::clock::current_time_millis;
 use crate::types::{
-    DeleteSpecificObjectVersionOutcome, DeletedSpecificObjectVersion, EcShape, LiveObjectRecord,
+    DeleteCurrentObjectOutcome, DeleteSpecificObjectVersionOutcome, DeletedCurrentObject,
+    DeletedSpecificObjectVersion, EcShape, InsertCurrentDeleteMarkerOutcome, LiveObjectRecord,
     MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
     MultipartReclaimRecord, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord,
     ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity,
@@ -101,7 +102,7 @@ impl SharedStorageNode {
         })
     }
 
-    fn delete_live_object_version_from_pg(
+    fn delete_live_object_from_pg(
         meta_pg: &PgStore,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -153,7 +154,11 @@ impl SharedStorageNode {
             PgMetadataStore::delete_object_segments(meta_pg, bucket, key, record.version_id)?;
         }
 
-        PgMetadataStore::delete_object_version(meta_pg, bucket, key, record.version_id)?;
+        if record.version_id.is_null() {
+            PgMetadataStore::delete_object_meta(meta_pg, bucket, key)?;
+        } else {
+            PgMetadataStore::delete_object_version(meta_pg, bucket, key, record.version_id)?;
+        }
         Ok(DeletedSpecificObjectVersion::Live {
             generation_id: record.generation_id,
             layout: record.layout,
@@ -186,20 +191,72 @@ impl SharedStorageNode {
                 DeletedSpecificObjectVersion::DeleteMarker
             }
             Some(StoredObject::Live(record)) => {
-                Self::delete_live_object_version_from_pg(&meta_pg, bucket, key, record)?
+                Self::delete_live_object_from_pg(&meta_pg, bucket, key, record)?
             }
         };
 
         Ok(Ok(DeleteSpecificObjectVersionOutcome { value, deleted }))
     }
 
-    pub fn insert_current_delete_marker(
+    pub fn delete_current_object_if<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        action: impl FnOnce(Option<&StoredObject>) -> Result<T, E>,
+    ) -> Result<Result<DeleteCurrentObjectOutcome<T>, E>, ObjectPgActionError> {
+        let meta_pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        let stored = match PgMetadataStore::get_object_meta(&*meta_pg, bucket, key) {
+            Ok(stored) => Some(stored),
+            Err(crate::error::MetadataError::ObjectNotFound) => None,
+            Err(other) => return Err(other.into()),
+        };
+
+        let value = match action(stored.as_ref()) {
+            Ok(value) => value,
+            Err(error) => return Ok(Err(error)),
+        };
+
+        let deleted = match stored.as_ref() {
+            None => DeletedCurrentObject::Missing,
+            Some(StoredObject::DeleteMarker(_)) => DeletedCurrentObject::DeleteMarker,
+            Some(StoredObject::Live(record)) => {
+                let deleted = Self::delete_live_object_from_pg(&meta_pg, bucket, key, record)?;
+                match deleted {
+                    DeletedSpecificObjectVersion::Missing => DeletedCurrentObject::Missing,
+                    DeletedSpecificObjectVersion::DeleteMarker => {
+                        DeletedCurrentObject::DeleteMarker
+                    }
+                    DeletedSpecificObjectVersion::Live {
+                        generation_id,
+                        layout,
+                    } => DeletedCurrentObject::Live {
+                        generation_id,
+                        layout,
+                    },
+                }
+            }
+        };
+
+        Ok(Ok(DeleteCurrentObjectOutcome { value, deleted }))
+    }
+
+    pub fn insert_current_delete_marker_if<T, E>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         owner: OwnerIdentity,
-    ) -> Result<VersionId, ObjectPgActionError> {
+        action: impl FnOnce(Option<&StoredObject>) -> Result<T, E>,
+    ) -> Result<Result<InsertCurrentDeleteMarkerOutcome<T>, E>, ObjectPgActionError> {
         let meta_pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        let stored = match PgMetadataStore::get_object_meta(&*meta_pg, bucket, key) {
+            Ok(stored) => Some(stored),
+            Err(crate::error::MetadataError::ObjectNotFound) => None,
+            Err(other) => return Err(other.into()),
+        };
+        let value = match action(stored.as_ref()) {
+            Ok(value) => value,
+            Err(error) => return Ok(Err(error)),
+        };
         let marker_vid = PgMetadataStore::next_version_id(&*meta_pg, bucket, key)?;
         meta_pg.put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
             bucket: bucket.clone(),
@@ -207,6 +264,9 @@ impl SharedStorageNode {
             version_id: marker_vid,
             owner,
         }))?;
-        Ok(marker_vid)
+        Ok(Ok(InsertCurrentDeleteMarkerOutcome {
+            value,
+            version_id: marker_vid,
+        }))
     }
 }
