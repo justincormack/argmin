@@ -1,7 +1,7 @@
 use storage::traits::PgMetadataStore;
 use storage::{
-    BucketName, CommitStreamPutReq, CreateStreamUploadReq, EcShape, GenerationId, ObjectKey,
-    ObjectLayout, ObjectSegmentRecord, PutLiveObjectReq, SessionId, ShardKey, StreamUploadState,
+    BucketName, CreateStreamUploadReq, EcShape, GenerationId, ObjectKey, ObjectLayout,
+    ObjectSegmentRecord, PutLiveObjectReq, SessionId, ShardKey, StreamPutFinalizeSnapshot,
     StreamUploadTarget,
 };
 
@@ -462,7 +462,6 @@ impl Coordinator {
             req.session_id,
             req.total_size
         );
-        let bucket = req.object.bucket_name();
         let key = req.object.key();
         let session_id = req.session_id;
         let crc64 = req.crc64;
@@ -476,154 +475,100 @@ impl Coordinator {
             Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
             let resolved_object_lock =
                 Self::resolve_new_object_lock_state(&bucket_info, req.requested_object_lock)?;
-
-            let meta_pg_id =
-                self.object_pg_id_for(req.object.bucket_name_typed(), req.object.key_typed());
-            let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
-
-            let session = meta_guard.get_stream_upload(session_id)?;
-            if session.state != StreamUploadState::InProgress {
-                return Err(ServerError::InvalidRequest {
-                    reason: "stream session is not in progress".to_string(),
-                });
-            }
-            if session.bucket != *req.object.bucket_name_typed()
-                || session.key != *req.object.key_typed()
-            {
-                return Err(ServerError::InvalidRequest {
-                    reason: "session bucket/key mismatch".to_string(),
-                });
-            }
-            if session.target != StreamUploadTarget::PutObject {
-                return Err(ServerError::InvalidRequest {
-                    reason: "session is not a PutObject session".to_string(),
-                });
-            }
-            let write_encryption =
-                ActiveWriteEncryption::from_stored_and_active(&session.encryption, req.write_encryption)?;
-            let system_metadata = Self::object_system_metadata_with_default_checksum(
-                req.system_metadata,
-                &write_encryption,
-                crc64,
-            );
-
-            let prepared = self.prepare_put_commit_locked(
-                &meta_guard,
-                &bucket_info,
-                &PutCommitRequest {
-                    bucket: req.object.bucket_name_typed(),
-                    key: req.object.key_typed(),
-                    metadata_blob,
-                    system_metadata: &system_metadata,
-                    write_encryption: &write_encryption,
-                    tags,
-                    cond,
-                },
-            )?;
-            let owner =
-                Self::effective_put_object_owner(&bucket_info, req.object.requester(), &req.acl);
-            let acl_grants =
-                Self::object_acl_grants_for_put_object(&bucket_info, &owner, &req.acl);
-
-            let staging_segments = meta_guard
-                .list_stream_segments(session_id)
-                .map_err(ServerError::Metadata)?;
-            let segments_total: u64 = staging_segments.iter().map(|segment| segment.size).sum();
-            if segments_total != total_size {
-                return Err(ServerError::InvalidRequest {
-                    reason: format!(
-                        "total_size mismatch: caller passed {total_size} but staged segments sum to {segments_total}"
-                    ),
-                });
-            }
-            let committed_segments: Vec<ObjectSegmentRecord> = staging_segments
-                .iter()
-                .map(|segment| ObjectSegmentRecord {
-                    bucket: req.object.bucket_name_typed().clone(),
-                    key: req.object.key_typed().clone(),
-                    version_id: prepared.version_id,
-                    segment_index: segment.segment_index,
-                    size: segment.size,
-                    segment_crc64: segment.segment_crc64,
-                    segment_okh: segment.segment_okh,
-                    segment_vid: segment.segment_vid,
-                    shard_pg_id: segment.shard_pg_id,
-                    ec_k: segment.ec_k,
-                    ec_m: segment.ec_m,
-                })
-                .collect();
-
-            meta_guard
-                .commit_stream_put(
+            let outcome = self
+                .storage_node
+                .finalize_put_object_stream(
+                    req.object.bucket_name_typed(),
+                    req.object.key_typed(),
                     session_id,
-                    &CommitStreamPutReq {
-                        bucket: req.object.bucket_name_typed().clone(),
-                        key: req.object.key_typed().clone(),
-                        version_id: prepared.version_id,
-                        owner,
-                        acl_grants: acl_grants.clone(),
-                        public_read: Self::acl_grants_public_read(&acl_grants),
-                        generation_id: prepared.generation_id,
-                        size: total_size,
-                        etag_crc64: crc64,
-                        ec: EcShape {
-                            k: self.ec_config.data_shards,
-                            m: self.ec_config.parity_shards,
-                        },
-                        object_lock: resolved_object_lock,
-                        encryption: prepared.encryption.clone(),
-                        tags: prepared.tags.clone(),
-                        metadata_blob: Some(prepared.metadata_blob.clone()),
-                        system_metadata_blob: Some(prepared.system_metadata_blob.clone()),
-                    },
-                    &committed_segments,
-                )
-                .map_err(ServerError::Metadata)?;
-            Self::finalize_put_commit_metadata_locked(
-                &meta_guard,
-                req.object.bucket_name_typed(),
-                req.object.key_typed(),
-                prepared.version_id,
-                prepared.stale_payload.as_ref(),
-            )?;
-            let stored = storage::PgMetadataStore::get_object_meta(
-                &*meta_guard,
-                req.object.bucket_name_typed(),
-                req.object.key_typed(),
-            )
-            .map_err(ServerError::Metadata)?;
-            let live_record = stored.as_live().ok_or_else(|| ServerError::InternalError {
-                reason: format!(
-                    "stored object {} / {} is not live immediately after streaming PutObject",
-                    bucket, key
-                ),
-            })?;
-            let lifecycle_tags = live_record.tags.clone();
-            let lifecycle_size = live_record.size;
-            let lifecycle_last_modified = live_record.last_modified;
+                    total_size,
+                    |snapshot: StreamPutFinalizeSnapshot| {
+                        let write_encryption = ActiveWriteEncryption::from_stored_and_active(
+                            &snapshot.session.encryption,
+                            req.write_encryption,
+                        )?;
+                        let system_metadata = Self::object_system_metadata_with_default_checksum(
+                            req.system_metadata,
+                            &write_encryption,
+                            crc64,
+                        );
+                        if !cond.is_empty() {
+                            if matches!(cond, crate::conditional::WriteCondition::IfMatch(_))
+                                && snapshot.existing_etag.is_none()
+                            {
+                                return Err(ServerError::ObjectNotFound {
+                                    bucket: req.object.bucket_name().to_string(),
+                                    key: req.object.key().to_string(),
+                                });
+                            }
+                            crate::conditional::check_write_conditions(
+                                cond,
+                                snapshot.existing_etag.as_deref(),
+                            )?;
+                        }
+                        let metadata_blob =
+                            storage::SerializedMetadataBlob::from(metadata_blob.serialize()?);
+                        let (system_metadata_blob, encryption) =
+                            Self::prepare_stored_system_metadata(
+                                &system_metadata,
+                                &write_encryption,
+                            )?;
+                        let owner = Self::effective_put_object_owner(
+                            &bucket_info,
+                            req.object.requester(),
+                            &req.acl,
+                        );
+                        let acl_grants =
+                            Self::object_acl_grants_for_put_object(&bucket_info, &owner, &req.acl);
 
-            drop(meta_guard);
+                        Ok(storage::PreparedStreamPutCommit {
+                            value: system_metadata,
+                            versioning: bucket_info.versioning,
+                            ec: EcShape {
+                                k: self.ec_config.data_shards,
+                                m: self.ec_config.parity_shards,
+                            },
+                            owner,
+                            acl_grants: acl_grants.clone(),
+                            public_read: Self::acl_grants_public_read(&acl_grants),
+                            size: total_size,
+                            etag_crc64: crc64,
+                            tags: tags.map(storage::SerializedTagSet::from),
+                            metadata_blob,
+                            system_metadata_blob,
+                            object_lock: resolved_object_lock,
+                            encryption,
+                        })
+                    },
+                )
+                .map_err(|error| match error {
+                    storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
+                    storage::ObjectPgActionError::InvalidRequest { reason } => {
+                        ServerError::InvalidRequest { reason }
+                    }
+                    storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
+                })??;
             let lifecycle_expiration = self
                 .current_object_write_lifecycle_expiration_for_loaded_bucket(
                     &bucket_handle,
                     key,
-                    lifecycle_tags.as_deref(),
-                    lifecycle_size,
-                    lifecycle_last_modified,
+                    outcome.live_tags.as_deref(),
+                    outcome.live_size,
+                    outcome.live_last_modified,
                 )?;
-            if let Some(ref payload) = prepared.stale_payload {
-                self.delete_stale_object_payload(
+            if let Some(generation_id) = outcome.stale_generation_id {
+                self.read_runtime().enqueue_object_payload_reclaim_for(
                     req.object.bucket_name_typed(),
                     req.object.key_typed(),
-                    payload,
+                    generation_id,
                 );
             }
 
             Ok(PutObjectResult {
                 etag: format_etag(crc64),
-                version_id: prepared.version_id,
-                system_metadata,
-                managed_encryption: prepared.encryption.managed_encryption_algorithm(),
+                version_id: outcome.version_id,
+                system_metadata: outcome.value,
+                managed_encryption: outcome.encryption.managed_encryption_algorithm(),
                 lifecycle_expiration,
             })
         })

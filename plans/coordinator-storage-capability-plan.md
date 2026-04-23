@@ -899,13 +899,17 @@ Acceptance criteria:
 
 Phase 7b status:
 
-- in progress
+- completed
 - first migrated slice:
   - `BeginStreamPut`
 - second migrated slice:
   - large-body public `PutObject` entry
 - third migrated slice:
   - HTTP streamed `PutObject` session creation path
+- fourth migrated slice:
+  - stream-put finalize path
+- fifth migrated slice:
+  - stream-put abort / scavenging paths
 - `BeginStreamPut` now follows the same corrected transactional pattern as the
   multipart session paths:
   - storage owns the bucket write reservation, bucket snapshot load,
@@ -920,9 +924,15 @@ Phase 7b status:
 - the HTTP streamed `PutObject` entry now reaches the same corrected session
   creation helper instead of creating its session through a coordinator-owned
   object-PG path
-- remaining 7b surface:
-  - stream-put finalize path
-  - stream-put abort / scavenging path
+- the stream-put finalize path now runs through a storage-owned object-PG
+  transaction:
+  - storage loads the stream session and current ETag
+  - coordinator contributes a pure semantic closure
+  - storage commits the stream put and performs stale-payload metadata cleanup
+- the stream-put abort and stale-session scavenging paths now use storage-owned
+  stream-session helpers instead of coordinator-visible object-PG access
+- any newly discovered plain stream-put path outside this set is now a
+  regression against the completed phase
 
 ### Phase 8: Copy / UploadPartCopy Dual-Bucket Flows
 

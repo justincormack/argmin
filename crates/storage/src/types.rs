@@ -2293,6 +2293,40 @@ pub struct CommitStreamPutReq {
     pub encryption: ObjectEncryption,
 }
 
+#[derive(Debug, Clone)]
+pub struct StreamPutFinalizeSnapshot {
+    pub session: StreamUploadRecord,
+    pub existing_etag: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedStreamPutCommit<T> {
+    pub value: T,
+    pub versioning: BucketVersioningState,
+    pub ec: EcShape,
+    pub owner: OwnerIdentity,
+    pub acl_grants: AclGrants,
+    pub public_read: bool,
+    pub size: u64,
+    pub etag_crc64: u64,
+    pub tags: Option<SerializedTagSet>,
+    pub metadata_blob: SerializedMetadataBlob,
+    pub system_metadata_blob: SerializedSystemMetadataBlob,
+    pub object_lock: ObjectLockState,
+    pub encryption: ObjectEncryption,
+}
+
+#[derive(Debug, Clone)]
+pub struct FinalizeStreamPutOutcome<T> {
+    pub value: T,
+    pub version_id: VersionId,
+    pub encryption: ObjectEncryption,
+    pub live_tags: Option<SerializedTagSet>,
+    pub live_size: u64,
+    pub live_last_modified: u64,
+    pub stale_generation_id: Option<GenerationId>,
+}
+
 /// Request to list objects in a PG.
 pub struct ListObjectsReq {
     pub bucket: BucketName,

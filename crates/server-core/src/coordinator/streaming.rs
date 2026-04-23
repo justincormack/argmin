@@ -712,42 +712,15 @@ impl Coordinator {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<(), ServerError> {
-        let meta_pg_id = self.object_pg_id_for(bucket, key);
-        let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
-
-        let session = meta_guard.get_stream_upload(session_id)?;
-        if session.bucket != *bucket || session.key != *key {
-            return Err(ServerError::InvalidRequest {
-                reason: "session bucket/key mismatch".to_string(),
-            });
-        }
-
-        let staging_segments = meta_guard
-            .list_stream_segments(session_id)
-            .map_err(ServerError::Metadata)?;
-
-        meta_guard
-            .set_stream_upload_state(session_id, StreamUploadState::Aborted)
-            .map_err(ServerError::Metadata)?;
-        meta_guard
-            .delete_stream_upload(session_id)
-            .map_err(ServerError::Metadata)?;
-
-        drop(meta_guard);
-
-        for segment in &staging_segments {
-            if let Ok(shard_guard) = self.storage_node.get_pg(segment.shard_pg_id) {
-                let k = segment.ec_k as usize;
-                let m = segment.ec_m as usize;
-                for i in 0..(k + m) {
-                    let shard_key =
-                        ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
-                    let _ = shard_guard.delete_shard(&shard_key);
+        self.storage_node
+            .abort_stream_upload_session(bucket, key, session_id)
+            .map_err(|error| match error {
+                storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
+                storage::ObjectPgActionError::InvalidRequest { reason } => {
+                    ServerError::InvalidRequest { reason }
                 }
-            }
-        }
-
-        Ok(())
+                storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
+            })
     }
 
     #[cfg(test)]
@@ -772,30 +745,15 @@ impl Coordinator {
         let cutoff = now.saturating_sub(max_age_ms);
         let mut count = 0;
 
-        let _ = self.pg_topology.for_each_pg(|pg_id| {
-            let pg = match self.storage_node.get_pg(pg_id) {
-                Ok(pg) => pg,
-                Err(_) => return Ok::<(), ()>(()),
-            };
-
-            let sessions = match pg.list_all_stream_uploads() {
-                Ok(s) => s,
-                Err(_) => return Ok::<(), ()>(()),
-            };
-
-            drop(pg);
-
-            for session in sessions {
-                if session.created_at < cutoff
-                    && self
-                        .abort_stream_put_for(&session.bucket, &session.key, &session.session_id)
-                        .is_ok()
-                {
-                    count += 1;
-                }
+        for session in self.storage_node.list_all_stream_uploads_best_effort() {
+            if session.created_at < cutoff
+                && self
+                    .abort_stream_put_for(&session.bucket, &session.key, &session.session_id)
+                    .is_ok()
+            {
+                count += 1;
             }
-            Ok::<(), ()>(())
-        });
+        }
 
         count
     }
