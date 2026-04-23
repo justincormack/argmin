@@ -921,9 +921,9 @@ Phase 7b status:
 - the public large-body `PutObject` path now reuses that same corrected
   `BeginStreamPut` entry instead of creating its stream session through the
   older coordinator-side helper
-- the HTTP streamed `PutObject` entry now reaches the same corrected session
-  creation helper instead of creating its session through a coordinator-owned
-  object-PG path
+- the HTTP streamed `PutObject` entry now reuses the corrected
+  `BeginStreamPut` transaction instead of authorizing first and then creating
+  its session through a separate later path
 - the stream-put finalize path now runs through a storage-owned object-PG
   transaction:
   - storage loads the stream session and current ETag

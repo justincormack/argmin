@@ -11,7 +11,7 @@ pub mod xml;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, RwLock},
     task::{Context, Poll},
 };
 
@@ -3772,46 +3772,47 @@ impl HttpFrontend {
         }
 
         let requester = Self::requester_from_auth(&auth);
-        let acl =
-            put_object_write_acl_from_components(req.header("x-amz-acl"), acl_grants.as_ref());
-        let request_encryption = crate::coordinator::WriteEncryptionRequest::from_request_parts(
-            sse_customer_request.as_ref(),
+        let expected_bucket_owner_owned = expected_bucket_owner(req).map(str::to_string);
+        let acl_header = req.header("x-amz-acl").map(str::to_string);
+        let authorize = StreamingPutAuthorizeRequest {
+            object: StreamObjectAuthorizeBinding {
+                bucket: parse_bucket_name(bucket)?,
+                key: parse_object_key(key)?,
+                requester,
+                expected_bucket_owner: expected_bucket_owner_owned,
+            },
+            acl_header: acl_header.clone(),
+            acl_grants,
+            policy_context: PutObjectPolicyContextOwned {
+                copy_source: None,
+                metadata_directive: None,
+                canned_acl: parse_put_object_acl(acl_header.as_deref())
+                    .policy_condition_value()
+                    .map(str::to_string),
+                managed_encryption,
+                sse_customer_algorithm: sse_customer_request
+                    .as_ref()
+                    .map(|request| request.algorithm().to_string()),
+                grant_headers: PutObjectGrantHeadersOwned {
+                    grant_read: req.header("x-amz-grant-read").map(str::to_string),
+                    grant_write: req.header("x-amz-grant-write").map(str::to_string),
+                    grant_read_acp: req.header("x-amz-grant-read-acp").map(str::to_string),
+                    grant_write_acp: req.header("x-amz-grant-write-acp").map(str::to_string),
+                    grant_full_control: req.header("x-amz-grant-full-control").map(str::to_string),
+                },
+                request_object_tags_xml: inline_tags_xml.clone(),
+            },
+            object_lock,
+            tags_xml: inline_tags_xml.clone(),
             managed_encryption,
-        );
-        let authorized_write =
-            self.coordinator
-                .prepare_put_object_write(&AuthorizePutObjectRequest {
-                    object: object_request(
-                        &parse_bucket_name(bucket)?,
-                        key,
-                        requester.clone(),
-                        expected_bucket_owner(req),
-                    )?,
-                    acl: acl.clone(),
-                    policy_context: put_object_policy_context_from_request_fields(
-                        inline_tags_xml.as_deref(),
-                        None,
-                        None,
-                        parse_put_object_acl(req.header("x-amz-acl")).policy_condition_value(),
-                        managed_encryption,
-                        sse_customer_request
-                            .as_ref()
-                            .map(SseCustomerRequest::algorithm),
-                        PutObjectGrantHeaders {
-                            grant_read: req.header("x-amz-grant-read"),
-                            grant_write: req.header("x-amz-grant-write"),
-                            grant_read_acp: req.header("x-amz-grant-read-acp"),
-                            grant_write_acp: req.header("x-amz-grant-write-acp"),
-                            grant_full_control: req.header("x-amz-grant-full-control"),
-                        },
-                    ),
-                    object_lock,
-                    tags: inline_tags_xml.as_deref(),
-                    encryption: request_encryption,
-                })?;
+        };
+        let authorized_write = self.coordinator.prepare_put_object_write(
+            &authorize.as_authorize_request(sse_customer_request.as_ref()),
+        )?;
 
         Ok(StreamingPutContext {
             trace: current_trace_context(),
+            authorize,
             metadata_blob,
             system_metadata,
             cond,
@@ -3820,7 +3821,7 @@ impl HttpFrontend {
                 response_headers: ChecksumResponseHeaders(checksum_response),
             },
             sse_customer: sse_customer_request,
-            authorized_write,
+            authorized_write: RwLock::new(authorized_write),
             streaming_signing: auth.streaming,
         })
     }
@@ -3839,8 +3840,11 @@ impl HttpFrontend {
             ctx.bucket(),
             ctx.key()
         );
-        self.coordinator
-            .begin_stream_put_session(&ctx.authorized_write)
+        let prepared = self
+            .coordinator
+            .begin_stream_put(&ctx.authorize_request())?;
+        ctx.replace_authorized_write(prepared.authorized_write);
+        Ok(prepared.session_id)
     }
 
     /// Append a segment to a streaming session.
@@ -3862,8 +3866,8 @@ impl HttpFrontend {
             data.len()
         );
         self.coordinator.append_stream_put_data(
-            ctx.authorized_write.bucket_typed(),
-            ctx.authorized_write.key_typed(),
+            ctx.bucket(),
+            ctx.key(),
             session_id,
             segment_index,
             data,
@@ -3890,15 +3894,17 @@ impl HttpFrontend {
         );
         let metadata_blob = Self::merged_streaming_put_metadata_blob(ctx, trailer_checksums);
         let system_metadata = Self::merged_streaming_put_system_metadata(ctx, trailer_checksums);
-        let result = self.coordinator.commit_put_object_write(
-            &crate::coordinator::AuthorizedPutObjectCommitRequest {
-                data,
-                metadata: &metadata_blob,
-                system_metadata: &system_metadata,
-                cond: &ctx.cond,
-            },
-            &ctx.authorized_write,
-        )?;
+        let result = ctx.with_authorized_write(|authorized_write| {
+            self.coordinator.commit_put_object_write(
+                &crate::coordinator::AuthorizedPutObjectCommitRequest {
+                    data,
+                    metadata: &metadata_blob,
+                    system_metadata: &system_metadata,
+                    cond: &ctx.cond,
+                },
+                authorized_write,
+            )
+        })?;
 
         let mut resp = S3Response::put_object(&result);
         apply_sse_customer_write_response_headers(&mut resp, ctx.sse_customer.as_ref());
@@ -3931,19 +3937,21 @@ impl HttpFrontend {
         );
         let metadata_blob = Self::merged_streaming_put_metadata_blob(ctx, trailer_checksums);
         let system_metadata = Self::merged_streaming_put_system_metadata(ctx, trailer_checksums);
-        let result = self.coordinator.finalize_authorized_stream_put(
-            &crate::coordinator::AuthorizedFinalizeStreamPutRequest {
-                session_id,
-                crc64,
-                total_size,
-                metadata_blob: &metadata_blob,
-                system_metadata: &system_metadata,
-                write_encryption: crate::coordinator::ActiveWriteEncryptionRef::None,
-                cond: &ctx.cond,
-            },
-            &ctx.authorized_write,
-            ctx.sse_customer.as_ref(),
-        )?;
+        let result = ctx.with_authorized_write(|authorized_write| {
+            self.coordinator.finalize_authorized_stream_put(
+                &crate::coordinator::AuthorizedFinalizeStreamPutRequest {
+                    session_id,
+                    crc64,
+                    total_size,
+                    metadata_blob: &metadata_blob,
+                    system_metadata: &system_metadata,
+                    write_encryption: crate::coordinator::ActiveWriteEncryptionRef::None,
+                    cond: &ctx.cond,
+                },
+                authorized_write,
+                ctx.sse_customer.as_ref(),
+            )
+        })?;
 
         let mut resp = S3Response::put_object(&result);
         apply_sse_customer_write_response_headers(&mut resp, ctx.sse_customer.as_ref());
@@ -4235,14 +4243,54 @@ struct StreamingPartChecksumContract {
 /// Created by `prepare_streaming_put`, used across async/blocking boundaries.
 struct StreamingPutContext {
     trace: observability::TraceContext,
+    authorize: StreamingPutAuthorizeRequest,
     metadata_blob: crate::metadata_blob::MetadataBlob,
     system_metadata: SystemMetadata,
     cond: crate::conditional::WriteCondition,
     checksum: StreamingPutChecksumContract,
     sse_customer: Option<SseCustomerRequest>,
-    authorized_write: AuthorizedPutObjectWrite,
+    authorized_write: RwLock<AuthorizedPutObjectWrite>,
     /// Signing context for aws-chunked modes, None for unsigned/plain.
     streaming_signing: Option<auth::StreamingSigningContext>,
+}
+
+#[derive(Clone)]
+struct StreamingPutAuthorizeRequest {
+    object: StreamObjectAuthorizeBinding,
+    acl_header: Option<String>,
+    acl_grants: Option<s3_types::AclGrants>,
+    policy_context: PutObjectPolicyContextOwned,
+    object_lock: storage::ObjectLockState,
+    tags_xml: Option<String>,
+    managed_encryption: Option<storage::ManagedEncryptionAlgorithm>,
+}
+
+#[derive(Clone)]
+struct StreamObjectAuthorizeBinding {
+    bucket: BucketName,
+    key: ObjectKey,
+    requester: crate::coordinator::Requester,
+    expected_bucket_owner: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct PutObjectGrantHeadersOwned {
+    grant_read: Option<String>,
+    grant_write: Option<String>,
+    grant_read_acp: Option<String>,
+    grant_write_acp: Option<String>,
+    grant_full_control: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct PutObjectPolicyContextOwned {
+    copy_source: Option<String>,
+    metadata_directive: Option<String>,
+    canned_acl: Option<String>,
+    managed_encryption: Option<ManagedEncryptionAlgorithm>,
+    sse_customer_algorithm: Option<String>,
+    grant_headers: PutObjectGrantHeadersOwned,
+    request_object_tags_xml: Option<String>,
 }
 
 /// Context for an in-progress streaming `PostObject`.
@@ -4329,11 +4377,72 @@ impl StreamPartBinding {
 
 impl StreamingPutContext {
     fn bucket(&self) -> &BucketName {
-        self.authorized_write.bucket_typed()
+        &self.authorize.object.bucket
     }
 
     fn key(&self) -> &ObjectKey {
-        self.authorized_write.key_typed()
+        &self.authorize.object.key
+    }
+
+    fn authorize_request(&self) -> AuthorizePutObjectRequest<'_> {
+        self.authorize
+            .as_authorize_request(self.sse_customer.as_ref())
+    }
+
+    fn replace_authorized_write(&self, authorized_write: AuthorizedPutObjectWrite) {
+        *self.authorized_write.write().unwrap() = authorized_write;
+    }
+
+    fn with_authorized_write<T>(&self, f: impl FnOnce(&AuthorizedPutObjectWrite) -> T) -> T {
+        let guard = self.authorized_write.read().unwrap();
+        f(&guard)
+    }
+}
+
+impl StreamingPutAuthorizeRequest {
+    fn as_authorize_request<'a>(
+        &'a self,
+        sse_customer: Option<&'a SseCustomerRequest>,
+    ) -> AuthorizePutObjectRequest<'a> {
+        AuthorizePutObjectRequest {
+            object: ObjectRequest::new(
+                self.object.bucket.clone(),
+                self.object.key.clone(),
+                self.object.requester.clone(),
+                self.object.expected_bucket_owner.as_deref(),
+            ),
+            acl: put_object_write_acl_from_components(
+                self.acl_header.as_deref(),
+                self.acl_grants.as_ref(),
+            ),
+            policy_context: self.policy_context.as_borrowed(),
+            object_lock: self.object_lock,
+            tags: self.tags_xml.as_deref(),
+            encryption: crate::coordinator::WriteEncryptionRequest::from_request_parts(
+                sse_customer,
+                self.managed_encryption,
+            ),
+        }
+    }
+}
+
+impl PutObjectPolicyContextOwned {
+    fn as_borrowed(&self) -> crate::coordinator::PutObjectPolicyContext<'_> {
+        put_object_policy_context_from_request_fields(
+            self.request_object_tags_xml.as_deref(),
+            self.copy_source.as_deref(),
+            self.metadata_directive.as_deref(),
+            self.canned_acl.as_deref(),
+            self.managed_encryption,
+            self.sse_customer_algorithm.as_deref(),
+            PutObjectGrantHeaders {
+                grant_read: self.grant_headers.grant_read.as_deref(),
+                grant_write: self.grant_headers.grant_write.as_deref(),
+                grant_read_acp: self.grant_headers.grant_read_acp.as_deref(),
+                grant_write_acp: self.grant_headers.grant_write_acp.as_deref(),
+                grant_full_control: self.grant_headers.grant_full_control.as_deref(),
+            },
+        )
     }
 }
 
