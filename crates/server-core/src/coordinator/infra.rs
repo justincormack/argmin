@@ -22,7 +22,7 @@ use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
 use storage::GenerationId;
 use storage::{
     BucketFastPathInfo, BucketInfo, BucketName, BucketState, ObjectKey, ReclaimWorkItem, SessionId,
-    SharedStorageNode, UploadId,
+    SharedStorageNode,
 };
 
 impl Coordinator {
@@ -83,49 +83,27 @@ impl Coordinator {
         &self,
         bucket: &BucketName,
     ) -> Result<u64, ServerError> {
-        let bucket_pg = self.get_bucket_pg_for(bucket)?;
-        bucket_pg
+        self.storage_node
             .next_completed_multipart_upload_order_for_bucket(bucket)
             .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                storage::BucketSnapshotLoadError::Store(error) => ServerError::Store(error),
+                storage::BucketSnapshotLoadError::Metadata(
+                    storage::MetadataError::BucketNotFound { name },
+                ) => ServerError::BucketNotFound {
                     name: name.to_string(),
                 },
-                other => ServerError::Metadata(other),
+                storage::BucketSnapshotLoadError::Metadata(other) => ServerError::Metadata(other),
             })
     }
 
     pub(super) fn prune_completed_multipart_uploads_for_bucket_with_limit(
         &self,
-        bucket: &str,
+        bucket: &BucketName,
         keep: usize,
     ) -> Result<(), ServerError> {
-        let mut uploads: Vec<(u32, UploadId, u64)> = Vec::new();
-        self.pg_topology.for_each_pg(|pg_id| {
-            let pg = self
-                .storage_node
-                .get_pg(pg_id)
-                .map_err(ServerError::Store)?;
-            let local = pg
-                .list_completed_multipart_uploads_for_bucket(bucket)
-                .map_err(ServerError::Metadata)?;
-            uploads.extend(
-                local
-                    .into_iter()
-                    .map(|(upload_id, completion_order)| (pg_id, upload_id, completion_order)),
-            );
-            Ok::<(), ServerError>(())
-        })?;
-
-        uploads.sort_by_key(|entry| std::cmp::Reverse(entry.2));
-        for (pg_id, upload_id, _) in uploads.into_iter().skip(keep) {
-            let pg = self
-                .storage_node
-                .get_pg(pg_id)
-                .map_err(ServerError::Store)?;
-            pg.delete_completed_multipart_upload(&upload_id)
-                .map_err(ServerError::Metadata)?;
-        }
-        Ok(())
+        self.storage_node
+            .prune_completed_multipart_uploads_for_bucket_with_limit(bucket, keep)
+            .map_err(Coordinator::map_object_pg_action_error)
     }
 
     pub(super) fn bucket_summary(info: BucketInfo) -> BucketSummary {

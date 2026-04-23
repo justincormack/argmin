@@ -8,6 +8,39 @@ use crate::types::{
 };
 
 impl SharedStorageNode {
+    pub fn next_completed_multipart_upload_order_for_bucket(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<u64, BucketSnapshotLoadError> {
+        let bucket_pg = self.get_pg(self.pg_topology.bucket_pg_for(bucket))?;
+        Ok(bucket_pg.next_completed_multipart_upload_order_for_bucket(bucket)?)
+    }
+
+    pub fn prune_completed_multipart_uploads_for_bucket_with_limit(
+        &self,
+        bucket: &BucketName,
+        keep: usize,
+    ) -> Result<(), ObjectPgActionError> {
+        let mut uploads: Vec<(u32, UploadId, u64)> = Vec::new();
+        self.pg_topology.for_each_pg(|pg_id| {
+            let pg = self.get_pg(pg_id)?;
+            let local = pg.list_completed_multipart_uploads_for_bucket(bucket.as_str())?;
+            uploads.extend(
+                local
+                    .into_iter()
+                    .map(|(upload_id, completion_order)| (pg_id, upload_id, completion_order)),
+            );
+            Ok::<(), ObjectPgActionError>(())
+        })?;
+
+        uploads.sort_by_key(|entry| std::cmp::Reverse(entry.2));
+        for (pg_id, upload_id, _) in uploads.into_iter().skip(keep) {
+            let pg = self.get_pg(pg_id)?;
+            pg.delete_completed_multipart_upload(&upload_id)?;
+        }
+        Ok(())
+    }
+
     fn multipart_part_shard_pg_id(
         &self,
         upload_id: &UploadId,
@@ -20,19 +53,6 @@ impl SharedStorageNode {
             format!("{part_number}/{generation}").as_str(),
             part_vid.get(),
         )
-    }
-
-    pub(super) fn load_existing_live_object_from_object_pg(
-        pg: &PgStore,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<Option<StoredObject>, crate::error::MetadataError> {
-        match PgMetadataStore::get_object_meta(pg, bucket, key) {
-            Ok(StoredObject::Live(object)) => Ok(Some(StoredObject::Live(object))),
-            Ok(StoredObject::DeleteMarker(_))
-            | Err(crate::error::MetadataError::ObjectNotFound) => Ok(None),
-            Err(error) => Err(error),
-        }
     }
 
     pub(super) fn load_in_progress_multipart_upload_from_object_pg(

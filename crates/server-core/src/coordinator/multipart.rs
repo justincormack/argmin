@@ -621,7 +621,7 @@ impl Coordinator {
         let lifecycle_last_modified = completion_outcome.live_last_modified;
 
         self.prune_completed_multipart_uploads_for_bucket_with_limit(
-            bucket.as_str(),
+            &bucket,
             COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT,
         )?;
         let lifecycle_expiration = self.current_object_write_lifecycle_expiration(

@@ -3524,10 +3524,10 @@ impl Coordinator {
             .requiring_policy_view()
             .requiring_bucket_tags_if_abac_enabled();
         self.with_bucket_write_handle_for(&req.object, request, |bucket| {
-            let existing_object = self.put_target_existing_live_object(
-                req.object.bucket.name_typed(),
-                req.object.key_typed(),
-            )?;
+            let existing_object = self
+                .storage_node
+                .load_existing_live_object(req.object.bucket.name_typed(), req.object.key_typed())
+                .map_err(Self::map_object_pg_action_error)?;
             self.authorize_put_object_write_with_existing_object(
                 req,
                 &bucket,
@@ -3954,10 +3954,10 @@ impl Coordinator {
             .requiring_policy_view()
             .requiring_bucket_tags_if_abac_enabled();
         self.with_bucket_write_handle_for(&req.object, request, |bucket| {
-            let existing_object = self.put_target_existing_live_object(
-                req.object.bucket.name_typed(),
-                req.object.key_typed(),
-            )?;
+            let existing_object = self
+                .storage_node
+                .load_existing_live_object(req.object.bucket.name_typed(), req.object.key_typed())
+                .map_err(Self::map_object_pg_action_error)?;
             self.authorize_create_multipart_upload_with_existing_object(
                 req,
                 &bucket,

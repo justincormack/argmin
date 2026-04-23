@@ -2,6 +2,45 @@ use super::*;
 use crate::{ObjectLayout, VersionId};
 
 impl SharedStorageNode {
+    pub fn load_existing_live_object(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Option<StoredObject>, ObjectPgActionError> {
+        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        Ok(Self::load_existing_live_object_from_object_pg(
+            &pg, bucket, key,
+        )?)
+    }
+
+    pub fn payload_reclaim_exists(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<bool, ObjectPgActionError> {
+        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        Ok(PgMetadataStore::payload_reclaim_exists(
+            &*pg,
+            bucket,
+            key,
+            generation_id,
+        )?)
+    }
+
+    pub(super) fn load_existing_live_object_from_object_pg(
+        pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Option<StoredObject>, crate::error::MetadataError> {
+        match PgMetadataStore::get_object_meta(pg, bucket, key) {
+            Ok(StoredObject::Live(object)) => Ok(Some(StoredObject::Live(object))),
+            Ok(StoredObject::DeleteMarker(_))
+            | Err(crate::error::MetadataError::ObjectNotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn load_object_read_snapshot_if<T, E>(
         &self,
         bucket: &BucketName,

@@ -194,22 +194,6 @@ impl Coordinator {
         Ok(())
     }
 
-    pub(super) fn put_target_existing_live_object(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<Option<StoredObject>, ServerError> {
-        let meta_pg_id = self.object_pg_id_for(bucket, key);
-        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-        match storage::PgMetadataStore::get_object_meta(&*meta_pg, bucket, key) {
-            Ok(object @ StoredObject::Live(_)) => Ok(Some(object)),
-            Ok(StoredObject::DeleteMarker(_)) | Err(storage::MetadataError::ObjectNotFound) => {
-                Ok(None)
-            }
-            Err(err) => Err(ServerError::Metadata(err)),
-        }
-    }
-
     pub(super) fn lookup_object_record(
         meta_pg: &storage::PgStore,
         bucket: &BucketName,

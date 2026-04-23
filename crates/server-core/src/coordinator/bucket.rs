@@ -25,6 +25,21 @@ use super::{
 use crate::error::ServerError;
 
 impl Coordinator {
+    fn map_bucket_snapshot_load_error(err: storage::BucketSnapshotLoadError) -> ServerError {
+        match err {
+            storage::BucketSnapshotLoadError::Store(other) => ServerError::Store(other),
+            storage::BucketSnapshotLoadError::Metadata(storage::MetadataError::BucketNotEmpty) => {
+                ServerError::BucketNotEmpty
+            }
+            storage::BucketSnapshotLoadError::Metadata(
+                storage::MetadataError::BucketNotFound { name },
+            ) => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            storage::BucketSnapshotLoadError::Metadata(other) => ServerError::Metadata(other),
+        }
+    }
+
     fn refresh_bucket_fast_path_if_present(&self, info: &storage::BucketInfo) {
         self.storage_node
             .update_bucket_fast_path_if_present(&info.name, |cached| {
@@ -231,12 +246,8 @@ impl Coordinator {
                 versioning: initial_versioning,
                 object_lock: initial_object_lock,
             })
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })? {
+            .map_err(Self::map_bucket_snapshot_load_error)?
+        {
             storage::node::BucketCreateAttemptOutcome::Created(info) => {
                 self.storage_node.upsert_bucket_fast_path((&info).into());
                 Ok(BucketCreateOutcome::Created)
@@ -364,15 +375,12 @@ impl Coordinator {
             .storage_node
             .put_bucket_versioning_and_load_info(&authorized.bucket, authorized.state)
             .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
+                storage::BucketSnapshotLoadError::Metadata(
+                    storage::MetadataError::InvalidVersioningTransition { from, to },
+                ) => ServerError::InvalidRequest {
+                    reason: format!("invalid versioning transition from {from:?} to {to:?}"),
                 },
-                storage::MetadataError::InvalidVersioningTransition { from, to } => {
-                    ServerError::InvalidRequest {
-                        reason: format!("invalid versioning transition from {from:?} to {to:?}"),
-                    }
-                }
-                other => ServerError::Metadata(other),
+                other => Self::map_bucket_snapshot_load_error(other),
             })?;
         self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
@@ -419,12 +427,7 @@ impl Coordinator {
         let info = self
             .storage_node
             .put_bucket_object_lock_and_load_info(&authorized.bucket, authorized.config)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+            .map_err(Self::map_bucket_snapshot_load_error)?;
         self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
@@ -458,12 +461,7 @@ impl Coordinator {
         let info = self
             .storage_node
             .put_bucket_encryption_and_load_info(&authorized.bucket, authorized.config)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+            .map_err(Self::map_bucket_snapshot_load_error)?;
         self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
@@ -496,12 +494,7 @@ impl Coordinator {
                 &authorized.bucket,
                 BucketEncryptionConfig::default(),
             )
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+            .map_err(Self::map_bucket_snapshot_load_error)?;
         self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
@@ -662,12 +655,7 @@ impl Coordinator {
         let info = self
             .storage_node
             .put_bucket_abac_enabled_and_load_info(&authorized.bucket, authorized.enabled)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+            .map_err(Self::map_bucket_snapshot_load_error)?;
         self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
@@ -820,12 +808,7 @@ impl Coordinator {
         let info = self
             .storage_node
             .put_bucket_public_access_block_and_load_info(&authorized.bucket, authorized.config)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+            .map_err(Self::map_bucket_snapshot_load_error)?;
         self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
@@ -858,12 +841,7 @@ impl Coordinator {
         let info = self
             .storage_node
             .delete_bucket_public_access_block_and_load_info(&authorized.bucket)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+            .map_err(Self::map_bucket_snapshot_load_error)?;
         self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
@@ -883,12 +861,7 @@ impl Coordinator {
         let info = self
             .storage_node
             .put_bucket_ownership_controls_and_load_info(&authorized.bucket, authorized.config)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+            .map_err(Self::map_bucket_snapshot_load_error)?;
         self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
@@ -921,12 +894,7 @@ impl Coordinator {
         let info = self
             .storage_node
             .delete_bucket_ownership_controls_and_load_info(&authorized.bucket)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+            .map_err(Self::map_bucket_snapshot_load_error)?;
         self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
@@ -979,12 +947,7 @@ impl Coordinator {
                 authorized.public_read,
                 authorized.public_write,
             )
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+            .map_err(Self::map_bucket_snapshot_load_error)?;
         self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
@@ -1010,12 +973,7 @@ impl Coordinator {
     ) -> Result<storage::BucketInfo, ServerError> {
         self.storage_node
             .put_bucket_subresource_and_load_info(name, req)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })
+            .map_err(Self::map_bucket_snapshot_load_error)
     }
 
     pub(super) fn load_authorized_bucket_subresource(
@@ -1024,12 +982,7 @@ impl Coordinator {
     ) -> Result<Option<String>, ServerError> {
         self.storage_node
             .get_bucket_subresource(&authorized.bucket, authorized.kind)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })
+            .map_err(Self::map_bucket_snapshot_load_error)
     }
 
     fn remove_authorized_bucket_subresource(
@@ -1038,12 +991,7 @@ impl Coordinator {
     ) -> Result<storage::BucketInfo, ServerError> {
         self.storage_node
             .delete_bucket_subresource_and_load_info(&authorized.bucket, authorized.kind)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })
+            .map_err(Self::map_bucket_snapshot_load_error)
     }
 
     pub(super) fn load_bucket_subresource_from_pg(

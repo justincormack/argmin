@@ -10,7 +10,7 @@ impl SharedStorageNode {
     pub fn create_bucket_with_config_and_load_info(
         &self,
         config: &CreateBucketConfig<'_>,
-    ) -> Result<BucketCreateAttemptOutcome, crate::error::MetadataError> {
+    ) -> Result<BucketCreateAttemptOutcome, BucketSnapshotLoadError> {
         let bucket = BucketName::try_from(config.name).map_err(|reason| {
             crate::error::MetadataError::InvalidBucketName {
                 reason: reason.to_string(),
@@ -18,9 +18,7 @@ impl SharedStorageNode {
         })?;
         let _bucket_guard = self.lock_bucket(&bucket);
         let pg_id = self.pg_topology.bucket_pg_for(&bucket);
-        let bucket_pg = self
-            .get_pg(pg_id)
-            .expect("bucket PG derived from topology must exist");
+        let bucket_pg = self.get_pg(pg_id)?;
         match bucket_pg.create_bucket_with_config(config) {
             Ok(()) => Ok(BucketCreateAttemptOutcome::Created(
                 bucket_pg.head_bucket(&bucket)?,
@@ -28,7 +26,7 @@ impl SharedStorageNode {
             Err(crate::error::MetadataError::BucketAlreadyExists) => Ok(
                 BucketCreateAttemptOutcome::Exists(bucket_pg.head_bucket_raw(&bucket)?),
             ),
-            Err(other) => Err(other),
+            Err(other) => Err(other.into()),
         }
     }
 
@@ -36,13 +34,11 @@ impl SharedStorageNode {
         &self,
         bucket: &BucketName,
         mutate: impl FnOnce(&PgStore, &BucketName) -> Result<(), crate::error::MetadataError>,
-    ) -> Result<BucketInfo, crate::error::MetadataError> {
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         let pg_id = self.pg_topology.bucket_pg_for(bucket);
-        let bucket_pg = self
-            .get_pg(pg_id)
-            .expect("bucket PG derived from topology must exist");
+        let bucket_pg = self.get_pg(pg_id)?;
         mutate(&bucket_pg, bucket)?;
-        bucket_pg.head_bucket_raw(bucket)
+        Ok(bucket_pg.head_bucket_raw(bucket)?)
     }
 
     pub fn load_bucket_snapshot(
@@ -155,7 +151,7 @@ impl SharedStorageNode {
         &self,
         bucket: &BucketName,
         state: BucketVersioningState,
-    ) -> Result<BucketInfo, crate::error::MetadataError> {
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
             PgMetadataStore::put_bucket_versioning(bucket_pg, bucket, state)
         })
@@ -165,7 +161,7 @@ impl SharedStorageNode {
         &self,
         bucket: &BucketName,
         config: BucketObjectLockConfig,
-    ) -> Result<BucketInfo, crate::error::MetadataError> {
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
             PgMetadataStore::put_bucket_object_lock(bucket_pg, bucket, config)
         })
@@ -175,7 +171,7 @@ impl SharedStorageNode {
         &self,
         bucket: &BucketName,
         config: BucketEncryptionConfig,
-    ) -> Result<BucketInfo, crate::error::MetadataError> {
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
             PgMetadataStore::put_bucket_encryption(bucket_pg, bucket, config)
         })
@@ -185,7 +181,7 @@ impl SharedStorageNode {
         &self,
         bucket: &BucketName,
         config: PublicAccessBlockConfig,
-    ) -> Result<BucketInfo, crate::error::MetadataError> {
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
             PgMetadataStore::put_bucket_public_access_block(bucket_pg, bucket, config)
         })
@@ -194,7 +190,7 @@ impl SharedStorageNode {
     pub fn delete_bucket_public_access_block_and_load_info(
         &self,
         bucket: &BucketName,
-    ) -> Result<BucketInfo, crate::error::MetadataError> {
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
             PgMetadataStore::delete_bucket_public_access_block(bucket_pg, bucket)
         })
@@ -204,7 +200,7 @@ impl SharedStorageNode {
         &self,
         bucket: &BucketName,
         config: BucketOwnershipControls,
-    ) -> Result<BucketInfo, crate::error::MetadataError> {
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
             PgMetadataStore::put_bucket_ownership_controls(bucket_pg, bucket, config)
         })
@@ -213,7 +209,7 @@ impl SharedStorageNode {
     pub fn delete_bucket_ownership_controls_and_load_info(
         &self,
         bucket: &BucketName,
-    ) -> Result<BucketInfo, crate::error::MetadataError> {
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
             PgMetadataStore::delete_bucket_ownership_controls(bucket_pg, bucket)
         })
@@ -223,7 +219,7 @@ impl SharedStorageNode {
         &self,
         bucket: &BucketName,
         enabled: bool,
-    ) -> Result<BucketInfo, crate::error::MetadataError> {
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
             PgMetadataStore::put_bucket_abac_enabled(bucket_pg, bucket, enabled)
         })
@@ -235,7 +231,7 @@ impl SharedStorageNode {
         acl_grants: &AclGrants,
         public_read: bool,
         public_write: bool,
-    ) -> Result<BucketInfo, crate::error::MetadataError> {
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
             PgMetadataStore::put_bucket_acl(
                 bucket_pg,
@@ -251,7 +247,7 @@ impl SharedStorageNode {
         &self,
         bucket: &BucketName,
         req: PutBucketSubresource<'_>,
-    ) -> Result<BucketInfo, crate::error::MetadataError> {
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
             PgMetadataStore::put_bucket_subresource(bucket_pg, bucket, req)
         })
@@ -261,23 +257,31 @@ impl SharedStorageNode {
         &self,
         bucket: &BucketName,
         kind: BucketSubresourceKind,
-    ) -> Result<BucketInfo, crate::error::MetadataError> {
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
             PgMetadataStore::delete_bucket_subresource(bucket_pg, bucket, kind)
         })
+    }
+
+    pub fn head_bucket_info(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        let bucket_pg = self.get_pg(self.pg_topology.bucket_pg_for(bucket))?;
+        Ok(PgMetadataStore::head_bucket(&*bucket_pg, bucket)?)
     }
 
     pub fn get_bucket_subresource(
         &self,
         bucket: &BucketName,
         kind: BucketSubresourceKind,
-    ) -> Result<Option<String>, crate::error::MetadataError> {
+    ) -> Result<Option<String>, BucketSnapshotLoadError> {
         let pg_id = self.pg_topology.bucket_pg_for(bucket);
-        let bucket_pg = self
-            .get_pg(pg_id)
-            .expect("bucket PG derived from topology must exist");
-        PgMetadataStore::get_bucket_subresource(&*bucket_pg, bucket, kind)
-            .map(|stored| stored.map(|stored| stored.body))
+        let bucket_pg = self.get_pg(pg_id)?;
+        Ok(
+            PgMetadataStore::get_bucket_subresource(&*bucket_pg, bucket, kind)?
+                .map(|stored| stored.body),
+        )
     }
 
     pub fn try_finalize_bucket_delete(

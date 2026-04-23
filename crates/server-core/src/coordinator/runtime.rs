@@ -129,17 +129,33 @@ impl LifecycleSweeper {
 }
 
 impl ReadRuntime {
+    fn map_bucket_snapshot_error(error: storage::BucketSnapshotLoadError) -> ServerError {
+        match error {
+            storage::BucketSnapshotLoadError::Store(error) => ServerError::Store(error),
+            storage::BucketSnapshotLoadError::Metadata(
+                storage::MetadataError::BucketNotFound { name },
+            ) => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            storage::BucketSnapshotLoadError::Metadata(error) => ServerError::Metadata(error),
+        }
+    }
+
     pub(super) fn object_payload_reclaim_exists_for(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<bool, ServerError> {
-        let meta_pg = self
-            .storage_node
-            .get_pg(self.pg_topology.object_pg(bucket.as_str(), key.as_str()))?;
-        storage::PgMetadataStore::payload_reclaim_exists(&*meta_pg, bucket, key, generation_id)
-            .map_err(ServerError::Metadata)
+        self.storage_node
+            .payload_reclaim_exists(bucket, key, generation_id)
+            .map_err(|error| match error {
+                storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
+                storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
+                storage::ObjectPgActionError::InvalidRequest { reason } => {
+                    ServerError::InvalidRequest { reason }
+                }
+            })
     }
 
     pub(super) fn enqueue_object_payload_reclaim_for(
@@ -178,22 +194,10 @@ impl ReadRuntime {
             return Ok(None);
         }
 
-        let bucket_pg = self
+        let raw_config = self
             .storage_node
-            .get_pg(self.pg_topology.bucket_pg_for(&bucket_info.name))?;
-        let raw_config = storage::PgMetadataStore::get_bucket_subresource(
-            &*bucket_pg,
-            &bucket_info.name,
-            storage::BucketSubresourceKind::Lifecycle,
-        )
-        .map(|stored| stored.map(|stored| stored.body))
-        .map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })?;
-        drop(bucket_pg);
+            .get_bucket_subresource(&bucket_info.name, storage::BucketSubresourceKind::Lifecycle)
+            .map_err(Self::map_bucket_snapshot_error)?;
 
         raw_config
             .map(|config_xml| {
@@ -406,15 +410,13 @@ impl ReadRuntime {
         now_millis: u64,
     ) -> Result<bool, ServerError> {
         let _bucket_guard = self.storage_node.lock_bucket(bucket);
-        let bucket_pg = self
-            .storage_node
-            .get_pg(self.pg_topology.bucket_pg_for(bucket))?;
-        let bucket_info = match storage::PgMetadataStore::head_bucket(&*bucket_pg, bucket) {
+        let bucket_info = match self.storage_node.head_bucket_info(bucket) {
             Ok(info) => info,
-            Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(false),
-            Err(error) => return Err(ServerError::Metadata(error)),
+            Err(storage::BucketSnapshotLoadError::Metadata(
+                storage::MetadataError::BucketNotFound { .. },
+            )) => return Ok(false),
+            Err(error) => return Err(Self::map_bucket_snapshot_error(error)),
         };
-        drop(bucket_pg);
 
         let Some(config) = self.lifecycle_config_for_bucket_info(&bucket_info)? else {
             return Ok(false);
@@ -485,15 +487,13 @@ impl ReadRuntime {
         now_millis: u64,
     ) -> Result<u64, ServerError> {
         let _bucket_guard = self.storage_node.lock_bucket(bucket);
-        let bucket_pg = self
-            .storage_node
-            .get_pg(self.pg_topology.bucket_pg_for(bucket))?;
-        let bucket_info = match storage::PgMetadataStore::head_bucket(&*bucket_pg, bucket) {
+        let bucket_info = match self.storage_node.head_bucket_info(bucket) {
             Ok(info) => info,
-            Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(0),
-            Err(error) => return Err(ServerError::Metadata(error)),
+            Err(storage::BucketSnapshotLoadError::Metadata(
+                storage::MetadataError::BucketNotFound { .. },
+            )) => return Ok(0),
+            Err(error) => return Err(Self::map_bucket_snapshot_error(error)),
         };
-        drop(bucket_pg);
 
         let Some(config) = self.lifecycle_config_for_bucket_info(&bucket_info)? else {
             return Ok(0);
@@ -615,15 +615,13 @@ impl ReadRuntime {
         now_millis: u64,
     ) -> Result<bool, ServerError> {
         let _bucket_guard = self.storage_node.lock_bucket(bucket);
-        let bucket_pg = self
-            .storage_node
-            .get_pg(self.pg_topology.bucket_pg_for(bucket))?;
-        let bucket_info = match storage::PgMetadataStore::head_bucket(&*bucket_pg, bucket) {
+        let bucket_info = match self.storage_node.head_bucket_info(bucket) {
             Ok(info) => info,
-            Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(false),
-            Err(error) => return Err(ServerError::Metadata(error)),
+            Err(storage::BucketSnapshotLoadError::Metadata(
+                storage::MetadataError::BucketNotFound { .. },
+            )) => return Ok(false),
+            Err(error) => return Err(Self::map_bucket_snapshot_error(error)),
         };
-        drop(bucket_pg);
 
         let Some(config) = self.lifecycle_config_for_bucket_info(&bucket_info)? else {
             return Ok(false);
@@ -720,15 +718,13 @@ impl ReadRuntime {
         now_millis: u64,
     ) -> Result<bool, ServerError> {
         let _bucket_guard = self.storage_node.lock_bucket(bucket);
-        let bucket_pg = self
-            .storage_node
-            .get_pg(self.pg_topology.bucket_pg_for(bucket))?;
-        let bucket_info = match storage::PgMetadataStore::head_bucket(&*bucket_pg, bucket) {
+        let bucket_info = match self.storage_node.head_bucket_info(bucket) {
             Ok(info) => info,
-            Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(false),
-            Err(error) => return Err(ServerError::Metadata(error)),
+            Err(storage::BucketSnapshotLoadError::Metadata(
+                storage::MetadataError::BucketNotFound { .. },
+            )) => return Ok(false),
+            Err(error) => return Err(Self::map_bucket_snapshot_error(error)),
         };
-        drop(bucket_pg);
 
         let meta_pg_id = self.pg_topology.object_pg_for(bucket, key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;

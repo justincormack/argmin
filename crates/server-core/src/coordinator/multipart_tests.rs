@@ -3469,7 +3469,7 @@ fn completed_multipart_tombstone_prune_limit_is_global_across_object_pgs() {
         .unwrap();
 
     coord
-        .prune_completed_multipart_uploads_for_bucket_with_limit("bucket", 1)
+        .prune_completed_multipart_uploads_for_bucket_with_limit(&trusted_bucket_name("bucket"), 1)
         .unwrap();
 
     let err = coord
