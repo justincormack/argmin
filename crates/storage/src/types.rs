@@ -2327,6 +2327,20 @@ pub struct FinalizeStreamPutOutcome<T> {
     pub stale_generation_id: Option<GenerationId>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ObjectReadSnapshot {
+    pub stored: StoredObject,
+    pub object_segments: Vec<ObjectSegmentRecord>,
+    pub multipart_parts: Vec<ObjectPartRecord>,
+    pub multipart_part_segments: Vec<MultipartPartSegmentRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectReadSnapshotOutcome<T> {
+    pub value: T,
+    pub snapshot: ObjectReadSnapshot,
+}
+
 /// Request to list objects in a PG.
 pub struct ListObjectsReq {
     pub bucket: BucketName,

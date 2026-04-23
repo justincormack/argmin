@@ -1,13 +1,17 @@
 use checksum::MultipartChecksumConfig;
-use storage::{ObjectEncryption, ObjectLayout, SerializedTagSet, StoredObject};
+use storage::{
+    BucketName, ObjectEncryption, ObjectKey, ObjectLayout, SerializedTagSet, StoredObject,
+};
 
 #[cfg(test)]
 use super::maybe_run_multipart_snapshot_hook;
+use super::read_core::{
+    segment_payloads_from_object_segments, snapshotted_multipart_parts_from_storage,
+};
 use super::{
-    segment_payloads_from_object_segments, AuthorizedCopyObject,
-    AuthorizedFinalizeStreamPutRequest, AuthorizedMultipartPartWrite, AuthorizedUploadPartCopy,
-    AuthorizedWriteTags, BeginStreamPartResult, ChecksumClaim, Coordinator, CopyObjectRequest,
-    CopyObjectResult, FinalizeStreamPartRequest, LockedReadObject, MetadataDirective,
+    AuthorizedCopyObject, AuthorizedFinalizeStreamPutRequest, AuthorizedMultipartPartWrite,
+    AuthorizedUploadPartCopy, AuthorizedWriteTags, BeginStreamPartResult, ChecksumClaim,
+    Coordinator, CopyObjectRequest, CopyObjectResult, FinalizeStreamPartRequest, MetadataDirective,
     MultipartObjectRequest, ReadHandle, ReadObjectContext, StreamingChecksumAccumulator,
     TaggingDirective, UploadPartCopyRequest, UploadPartCopyResult, WriteEncryptionRequest,
     INTERNAL_SEGMENT_SIZE, MAX_OBJECT_SIZE, TRACE_TARGET,
@@ -16,6 +20,134 @@ use crate::conditional::check_copy_source_conditions;
 use crate::error::ServerError;
 
 impl Coordinator {
+    fn copy_source_snapshot_to_read_handle(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        snapshot: storage::ObjectReadSnapshot,
+        source_sse_customer: Option<&crate::sse::SseCustomerRequest>,
+    ) -> Result<ReadHandle, ServerError> {
+        let storage::ObjectReadSnapshot {
+            stored,
+            object_segments,
+            multipart_parts,
+            multipart_part_segments,
+        } = snapshot;
+        let src_record = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+        match src_record.layout {
+            ObjectLayout::MultipartManifest { .. } => {
+                if src_record.size == 0 {
+                    #[cfg(test)]
+                    maybe_run_multipart_snapshot_hook(bucket.as_str(), key.as_str());
+                    Ok(ReadHandle::from_buffered_bytes(Vec::new()))
+                } else {
+                    let obj_parts = snapshotted_multipart_parts_from_storage(
+                        multipart_parts,
+                        multipart_part_segments,
+                        &src_record.encryption,
+                    );
+                    let body = ReadHandle::from_multipart(
+                        self.read_runtime(),
+                        bucket,
+                        key,
+                        src_record.generation_id,
+                        obj_parts,
+                        src_record.size as usize,
+                        source_sse_customer.cloned(),
+                    );
+                    #[cfg(test)]
+                    maybe_run_multipart_snapshot_hook(bucket.as_str(), key.as_str());
+                    Ok(body)
+                }
+            }
+            ObjectLayout::Standard => {
+                if src_record.size == 0 {
+                    Ok(ReadHandle::from_buffered_bytes(Vec::new()))
+                } else {
+                    Ok(ReadHandle::from_segments(
+                        ReadObjectContext {
+                            runtime: self.read_runtime(),
+                            bucket,
+                            key,
+                            generation_id: src_record.generation_id,
+                            sse_customer_request: source_sse_customer.cloned(),
+                        },
+                        segment_payloads_from_object_segments(
+                            object_segments,
+                            src_record.encryption.clone(),
+                        ),
+                        src_record.size as usize,
+                        Some(src_record.etag.crc64()),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn copy_source_snapshot_to_range_read_handle(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        snapshot: storage::ObjectReadSnapshot,
+        read_start: usize,
+        read_end: usize,
+        source_sse_customer: Option<&crate::sse::SseCustomerRequest>,
+    ) -> Result<ReadHandle, ServerError> {
+        let storage::ObjectReadSnapshot {
+            stored,
+            object_segments,
+            multipart_parts,
+            multipart_part_segments,
+        } = snapshot;
+        let src_record = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+        match src_record.layout {
+            ObjectLayout::MultipartManifest { .. } => {
+                if src_record.size == 0 {
+                    Ok(ReadHandle::from_buffered_bytes(Vec::new()))
+                } else {
+                    let obj_parts = snapshotted_multipart_parts_from_storage(
+                        multipart_parts,
+                        multipart_part_segments,
+                        &src_record.encryption,
+                    );
+                    let body = ReadHandle::from_multipart_range(
+                        self.read_runtime(),
+                        bucket,
+                        key,
+                        src_record.generation_id,
+                        obj_parts,
+                        (read_start, read_end),
+                        source_sse_customer.cloned(),
+                    );
+                    #[cfg(test)]
+                    maybe_run_multipart_snapshot_hook(bucket.as_str(), key.as_str());
+                    Ok(body)
+                }
+            }
+            ObjectLayout::Standard => {
+                if src_record.size == 0 {
+                    Ok(ReadHandle::from_buffered_bytes(Vec::new()))
+                } else {
+                    Ok(ReadHandle::from_segments_range(
+                        ReadObjectContext {
+                            runtime: self.read_runtime(),
+                            bucket,
+                            key,
+                            generation_id: src_record.generation_id,
+                            sse_customer_request: source_sse_customer.cloned(),
+                        },
+                        segment_payloads_from_object_segments(
+                            object_segments,
+                            src_record.encryption.clone(),
+                        ),
+                        read_start,
+                        read_end,
+                    ))
+                }
+            }
+        }
+    }
+
     /// Copy an object from one location to another.
     ///
     /// Supports conditional headers on both source and destination,
@@ -47,16 +179,13 @@ impl Coordinator {
             .as_ref()
             .map(|ctx| ctx.request().response_headers());
         let AuthorizedCopyObject {
-            source:
-                LockedReadObject {
-                    record: src_stored,
-                    pgs,
-                },
+            source: source_snapshot,
             destination: dst_authorized,
         } = self.authorize_copy_object(req)?;
 
         let (src_metadata, src_system_metadata, src_tags, mut source_body) = {
-            let src_record = match src_stored {
+            let src_stored = source_snapshot.stored.clone();
+            let src_record = match &src_stored {
                 StoredObject::Live(r) => r,
                 StoredObject::DeleteMarker(_) => {
                     return if src_version_id.is_some() {
@@ -114,93 +243,26 @@ impl Coordinator {
                 });
             }
 
-            if matches!(src_record.layout, ObjectLayout::MultipartManifest { .. }) {
-                let meta_pg = pgs.meta();
-                let obj_parts = Self::snapshot_multipart_parts(
-                    meta_pg,
-                    &req.source.bucket,
-                    &req.source.key,
-                    src_record.version_id,
-                    &src_record.encryption,
-                )?;
-                let body = if src_record.size == 0 {
-                    drop(pgs);
-                    #[cfg(test)]
-                    maybe_run_multipart_snapshot_hook(src_bucket, src_key);
-                    ReadHandle::from_buffered_bytes(Vec::new())
-                } else {
-                    let body = ReadHandle::from_multipart(
-                        self.read_runtime(),
-                        &req.source.bucket,
-                        &req.source.key,
-                        src_record.generation_id,
-                        obj_parts,
-                        src_record.size as usize,
-                        source_sse_customer.cloned(),
-                    );
-                    drop(pgs);
-                    #[cfg(test)]
-                    maybe_run_multipart_snapshot_hook(src_bucket, src_key);
-                    body
-                };
+            let body = self.copy_source_snapshot_to_read_handle(
+                &req.source.bucket,
+                &req.source.key,
+                source_snapshot,
+                source_sse_customer,
+            )?;
 
-                let metadata = Self::deserialize_user_metadata(src_record.metadata_blob.as_ref())?;
-                let system_metadata = self.deserialize_visible_system_metadata(
-                    src_record.system_metadata_blob.as_ref(),
-                    &src_record.encryption,
-                    source_sse_customer,
-                )?;
+            let src_metadata = Self::deserialize_user_metadata(src_record.metadata_blob.as_ref())?;
+            let src_system_metadata = self.deserialize_visible_system_metadata(
+                src_record.system_metadata_blob.as_ref(),
+                &src_record.encryption,
+                source_sse_customer,
+            )?;
 
-                (metadata, system_metadata, src_record.tags.clone(), body)
-            } else {
-                let src_etag_crc = src_record.etag.crc64();
-                let meta_pg = pgs.meta();
-                let segments = storage::PgMetadataStore::get_object_segments(
-                    meta_pg,
-                    &req.source.bucket,
-                    &req.source.key,
-                    src_record.version_id,
-                )
-                .map_err(ServerError::Metadata)?;
-
-                let body = if src_record.size == 0 {
-                    drop(pgs);
-                    ReadHandle::from_buffered_bytes(Vec::new())
-                } else {
-                    let body = ReadHandle::from_segments(
-                        ReadObjectContext {
-                            runtime: self.read_runtime(),
-                            bucket: &req.source.bucket,
-                            key: &req.source.key,
-                            generation_id: src_record.generation_id,
-                            sse_customer_request: source_sse_customer.cloned(),
-                        },
-                        segment_payloads_from_object_segments(
-                            segments,
-                            src_record.encryption.clone(),
-                        ),
-                        src_record.size as usize,
-                        Some(src_etag_crc),
-                    );
-                    drop(pgs);
-                    body
-                };
-
-                let src_metadata =
-                    Self::deserialize_user_metadata(src_record.metadata_blob.as_ref())?;
-                let src_system_metadata = self.deserialize_visible_system_metadata(
-                    src_record.system_metadata_blob.as_ref(),
-                    &src_record.encryption,
-                    source_sse_customer,
-                )?;
-
-                (
-                    src_metadata,
-                    src_system_metadata,
-                    src_record.tags.clone(),
-                    body,
-                )
-            }
+            (
+                src_metadata,
+                src_system_metadata,
+                src_record.tags.clone(),
+                body,
+            )
         };
 
         let metadata_blob = match directive {
@@ -359,12 +421,9 @@ impl Coordinator {
         };
 
         let mut source_body = {
-            let LockedReadObject {
-                record: src_stored,
-                pgs,
-            } = source;
+            let src_stored = source.stored.clone();
 
-            let src_record = match src_stored {
+            let src_record = match &src_stored {
                 StoredObject::Live(r) => r,
                 StoredObject::DeleteMarker(_) => {
                     return if src_version_id.is_some() {
@@ -410,56 +469,14 @@ impl Coordinator {
                 });
             }
 
-            if source_size == 0 {
-                drop(pgs);
-                ReadHandle::from_buffered_bytes(Vec::new())
-            } else if matches!(src_record.layout, ObjectLayout::MultipartManifest { .. }) {
-                let meta_pg = pgs.meta();
-                let obj_parts = Self::snapshot_multipart_parts(
-                    meta_pg,
-                    &req.source.bucket,
-                    &req.source.key,
-                    src_record.version_id,
-                    &src_record.encryption,
-                )?;
-                let body = ReadHandle::from_multipart_range(
-                    self.read_runtime(),
-                    &req.source.bucket,
-                    &req.source.key,
-                    src_record.generation_id,
-                    obj_parts,
-                    (read_start as usize, read_end as usize),
-                    source_sse_customer.cloned(),
-                );
-                drop(pgs);
-                #[cfg(test)]
-                maybe_run_multipart_snapshot_hook(src_bucket, src_key);
-                body
-            } else {
-                let meta_pg = pgs.meta();
-                let segments = storage::PgMetadataStore::get_object_segments(
-                    meta_pg,
-                    &req.source.bucket,
-                    &req.source.key,
-                    src_record.version_id,
-                )
-                .map_err(ServerError::Metadata)?;
-
-                let body = ReadHandle::from_segments_range(
-                    ReadObjectContext {
-                        runtime: self.read_runtime(),
-                        bucket: &req.source.bucket,
-                        key: &req.source.key,
-                        generation_id: src_record.generation_id,
-                        sse_customer_request: source_sse_customer.cloned(),
-                    },
-                    segment_payloads_from_object_segments(segments, src_record.encryption.clone()),
-                    read_start as usize,
-                    read_end as usize,
-                );
-                drop(pgs);
-                body
-            }
+            self.copy_source_snapshot_to_range_read_handle(
+                &req.source.bucket,
+                &req.source.key,
+                source,
+                read_start as usize,
+                read_end as usize,
+                source_sse_customer,
+            )?
         };
 
         let AuthorizedMultipartPartWrite {

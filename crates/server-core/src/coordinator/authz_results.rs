@@ -16,7 +16,7 @@ use storage::BucketObjectOwnership;
 use storage::{
     BucketEncryptionConfig, BucketName, BucketObjectLockConfig, BucketOwnershipControls,
     EffectiveBucketEncryptionConfig, MultipartUploadRecord, ObjectKey, ObjectLockState,
-    OwnerIdentity, PublicAccessBlockConfig, StoredObject, UploadId,
+    ObjectReadSnapshot, OwnerIdentity, PublicAccessBlockConfig, StoredObject, UploadId,
 };
 
 #[derive(Debug)]
@@ -234,8 +234,8 @@ pub(super) struct LoadedObjectState<'a> {
     pub(super) locked: LockedReadObject<'a>,
 }
 
-pub(super) struct AuthorizedCopyObject<'a> {
-    pub(super) source: LockedReadObject<'a>,
+pub(super) struct AuthorizedCopyObject {
+    pub(super) source: ObjectReadSnapshot,
     pub(super) destination: AuthorizedPutObjectWrite,
 }
 
@@ -273,8 +273,8 @@ pub(super) struct AuthorizedMultipartPartWrite {
     pub(super) sse_customer: Option<SseCustomerWriteContext>,
 }
 
-pub(super) struct AuthorizedUploadPartCopy<'a> {
-    pub(super) source: LockedReadObject<'a>,
+pub(super) struct AuthorizedUploadPartCopy {
+    pub(super) source: ObjectReadSnapshot,
     pub(super) destination: AuthorizedMultipartPartWrite,
 }
 
@@ -395,7 +395,7 @@ impl std::fmt::Debug for AuthorizedObjectRead<'_> {
     }
 }
 
-impl std::fmt::Debug for AuthorizedCopyObject<'_> {
+impl std::fmt::Debug for AuthorizedCopyObject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthorizedCopyObject")
             .field("destination", &self.destination)
@@ -415,7 +415,7 @@ impl std::fmt::Debug for AuthorizedBeginStreamPart {
     }
 }
 
-impl std::fmt::Debug for AuthorizedUploadPartCopy<'_> {
+impl std::fmt::Debug for AuthorizedUploadPartCopy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthorizedUploadPartCopy")
             .field("destination", &self.destination)

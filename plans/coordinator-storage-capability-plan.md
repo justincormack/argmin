@@ -937,7 +937,7 @@ Phase 7b status:
 
 ### Phase 8: Copy / UploadPartCopy Dual-Bucket Flows
 
-Status: in progress
+Status: completed
 
 Copy requires two top-level bucket capabilities and is the main two-bucket
 request family.
@@ -959,12 +959,24 @@ Initial migrated slice:
 
 - `UploadPartCopy` destination multipart-upload lookup now uses the storage-owned
   in-progress upload loader instead of coordinator-side object-PG lookup
+- `CopyObject` and `UploadPartCopy` source reads now use a storage-owned
+  object-read snapshot transaction:
+  - storage loads the source object/version under one object-PG hold
+  - coordinator contributes a pure auth closure over the loaded `StoredObject`
+  - if authorized, storage snapshots source segments / multipart part metadata
+    and returns pure source data instead of coordinator-held source PG guards
 - `UploadPartCopy` destination stream-session creation now uses a storage-owned
   helper, and the finalize path carries part `last_modified` through the shared
   finalize result instead of rereading multipart metadata from coordinator
 - `CopyObject` now reuses the existing stream-put finalize outcome for
   destination `last_modified` and lifecycle data instead of reopening
   destination object metadata from coordinator after finalize
+- phase-8 surface now covered:
+  - `CopyObject`
+  - `UploadPartCopy`
+- any newly discovered production copy-family helper outside that set which
+  still reopens source or destination metadata through coordinator-visible PG
+  access should be treated as a regression against the completed phase
 
 ### Phase 9: Remove Coordinator PG Surface
 

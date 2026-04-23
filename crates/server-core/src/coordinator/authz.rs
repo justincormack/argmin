@@ -103,16 +103,6 @@ impl MissingObjectDiscovery {
     }
 }
 
-struct ObjectStateLoadRequest<'a> {
-    requester: &'a Requester,
-    bucket: &'a BucketName,
-    key: &'a ObjectKey,
-    version_id: Option<VersionId>,
-    expected_bucket_owner: Option<&'a str>,
-    policy_requirement: ObjectBucketPolicyRequirement,
-    missing_discovery: MissingObjectDiscovery,
-}
-
 enum ObjectPolicyTarget<'a> {
     Existing(&'a StoredObject),
     MissingKey(&'a str),
@@ -171,6 +161,22 @@ pub(super) enum ObjectAclAuthorization<'a> {
         action: auth::PolicyAction,
         policy_context: PutObjectPolicyContext<'a>,
     },
+}
+
+#[derive(Clone, Copy)]
+enum ExistingObjectTagsMode {
+    Available,
+    Unavailable,
+}
+
+struct CopySourceReadSnapshotRequest<'a> {
+    requester: &'a Requester,
+    bucket: &'a BucketName,
+    key: &'a ObjectKey,
+    version_id: Option<VersionId>,
+    expected_bucket_owner: Option<&'a str>,
+    policy_action: auth::PolicyAction,
+    existing_object_tags_mode: ExistingObjectTagsMode,
 }
 
 impl Coordinator {
@@ -925,11 +931,11 @@ impl Coordinator {
             .unwrap_or_default())
     }
 
-    pub(super) fn bucket_policy_decision_for_object(
+    fn bucket_policy_decision_for_object(
         &self,
         request: BucketPolicyRequestContext<'_>,
         object: &StoredObject,
-        existing_object_tags_available: bool,
+        existing_object_tags_mode: ExistingObjectTagsMode,
     ) -> Result<auth::PolicyEvaluation, ServerError> {
         let Some(policy) = request.policy else {
             return Ok(auth::PolicyEvaluation::NoMatch);
@@ -971,7 +977,9 @@ impl Coordinator {
             object.key().as_str(),
             request.requester.principal_opt(),
             request.requester.canonical_user_id(),
-            if existing_tags_required && existing_object_tags_available {
+            if existing_tags_required
+                && matches!(existing_object_tags_mode, ExistingObjectTagsMode::Available)
+            {
                 auth::bucket_policy::ExistingObjectTags::Available(&existing_tags)
             } else {
                 auth::bucket_policy::ExistingObjectTags::Unavailable
@@ -1278,7 +1286,11 @@ impl Coordinator {
     where
         F: FnOnce() -> bool,
     {
-        let decision = self.bucket_policy_decision_for_object(request, object, true)?;
+        let decision = self.bucket_policy_decision_for_object(
+            request,
+            object,
+            ExistingObjectTagsMode::Available,
+        )?;
         Ok(Self::bucket_policy_allows_with_fallback(
             request.requester,
             request.bucket,
@@ -1296,7 +1308,11 @@ impl Coordinator {
     where
         F: FnOnce() -> bool,
     {
-        let decision = self.bucket_policy_decision_for_object(request, object, false)?;
+        let decision = self.bucket_policy_decision_for_object(
+            request,
+            object,
+            ExistingObjectTagsMode::Unavailable,
+        )?;
         Ok(Self::bucket_policy_allows_with_fallback(
             request.requester,
             request.bucket,
@@ -1329,9 +1345,11 @@ impl Coordinator {
         target: ObjectPolicyTarget<'_>,
     ) -> Result<auth::PolicyEvaluation, ServerError> {
         match target {
-            ObjectPolicyTarget::Existing(object) => {
-                self.bucket_policy_decision_for_object(request, object, true)
-            }
+            ObjectPolicyTarget::Existing(object) => self.bucket_policy_decision_for_object(
+                request,
+                object,
+                ExistingObjectTagsMode::Available,
+            ),
             ObjectPolicyTarget::MissingKey(key) => {
                 self.bucket_policy_decision_for_key(request, key)
             }
@@ -3843,10 +3861,10 @@ impl Coordinator {
         self.authorize_delete_object_impl(&object, req.bypass_governance)
     }
 
-    pub(super) fn authorize_copy_object<'a>(
-        &'a self,
+    pub(super) fn authorize_copy_object(
+        &self,
         req: &CopyObjectRequest<'_>,
-    ) -> Result<AuthorizedCopyObject<'a>, ServerError> {
+    ) -> Result<AuthorizedCopyObject, ServerError> {
         let src_version_id = req.source.version_id;
         let requester = &req.destination.bucket.requester;
         let acl = req.acl.clone();
@@ -3898,14 +3916,15 @@ impl Coordinator {
             tags: request_object_tags_xml,
             encryption: req.destination_encryption,
         })?;
-        let source = self.authorize_object_read_without_existing_tags(
+        let source = self.authorize_copy_source_read_snapshot(CopySourceReadSnapshotRequest {
             requester,
-            &req.source.bucket,
-            &req.source.key,
-            src_version_id,
-            req.source.expected_bucket_owner(),
-            Self::get_object_policy_action(src_version_id),
-        )?;
+            bucket: &req.source.bucket,
+            key: &req.source.key,
+            version_id: src_version_id,
+            expected_bucket_owner: req.source.expected_bucket_owner(),
+            policy_action: Self::get_object_policy_action(src_version_id),
+            existing_object_tags_mode: ExistingObjectTagsMode::Unavailable,
+        })?;
 
         Ok(AuthorizedCopyObject {
             source,
@@ -3990,10 +4009,10 @@ impl Coordinator {
         })
     }
 
-    pub(super) fn authorize_upload_part_copy<'a>(
-        &'a self,
+    pub(super) fn authorize_upload_part_copy(
+        &self,
         req: &UploadPartCopyRequest<'_>,
-    ) -> Result<AuthorizedUploadPartCopy<'a>, ServerError> {
+    ) -> Result<AuthorizedUploadPartCopy, ServerError> {
         let src_version_id = req.source.version_id;
         let dst_bucket = req.upload.bucket_name_typed();
         let dst_key = req.upload.key_typed();
@@ -4048,14 +4067,15 @@ impl Coordinator {
             true,
         )?;
 
-        let source = self.authorize_object_read(
+        let source = self.authorize_copy_source_read_snapshot(CopySourceReadSnapshotRequest {
             requester,
-            &req.source.bucket,
-            &req.source.key,
-            src_version_id,
-            req.source.expected_bucket_owner(),
-            Self::get_object_policy_action(src_version_id),
-        )?;
+            bucket: &req.source.bucket,
+            key: &req.source.key,
+            version_id: src_version_id,
+            expected_bucket_owner: req.source.expected_bucket_owner(),
+            policy_action: Self::get_object_policy_action(src_version_id),
+            existing_object_tags_mode: ExistingObjectTagsMode::Available,
+        })?;
         Ok(AuthorizedUploadPartCopy {
             source,
             destination: AuthorizedMultipartPartWrite {
@@ -4278,132 +4298,6 @@ impl Coordinator {
         Ok(())
     }
 
-    fn load_locked_object_state<'a>(
-        &'a self,
-        req: ObjectStateLoadRequest<'_>,
-    ) -> Result<LoadedObjectState<'a>, ServerError> {
-        let fast_bucket_info = match self.storage_node.get_bucket_fast_path(req.bucket) {
-            Some(info) if info.state == BucketState::Active => {
-                Some(Self::validate_expected_bucket_owner(
-                    Self::bucket_summary_fast(info),
-                    req.expected_bucket_owner,
-                )?)
-            }
-            Some(_) => {
-                return Err(ServerError::BucketNotFound {
-                    name: req.bucket.to_string(),
-                });
-            }
-            None => None,
-        };
-        let fresh_bucket_policy = match req.policy_requirement {
-            ObjectBucketPolicyRequirement::Required => fast_bucket_info
-                .as_ref()
-                .and_then(|bucket_info| self.cached_bucket_policy_if_fresh(bucket_info)),
-        };
-        let need_ordered_bucket_load = fast_bucket_info.is_none()
-            || matches!(
-                req.policy_requirement,
-                ObjectBucketPolicyRequirement::Required
-            ) && fast_bucket_info.as_ref().is_some_and(|bucket_info| {
-                bucket_info.bucket_policy_present && fresh_bucket_policy.is_none()
-            });
-
-        if need_ordered_bucket_load {
-            let guards = self.lock_bucket_and_object_pgs_for(req.bucket, req.key)?;
-            let bucket_info = match fast_bucket_info {
-                Some(bucket_info) => bucket_info,
-                None => Self::validate_expected_bucket_owner(
-                    self.load_active_bucket_summary_from_pg(guards.bucket(), req.bucket)?,
-                    req.expected_bucket_owner,
-                )?,
-            };
-            let bucket_policy = match req.policy_requirement {
-                ObjectBucketPolicyRequirement::Required => {
-                    self.cached_bucket_policy_with_locked_bucket_pg(&bucket_info, guards.bucket())?
-                }
-            };
-            let bucket_tags = match bucket_policy.as_deref() {
-                Some(policy) => Self::preload_bucket_tags_from_loaded_bucket_pg(
-                    &bucket_info,
-                    policy,
-                    guards.bucket(),
-                )?,
-                None => None,
-            };
-            let can_discover_missing = req.missing_discovery.requester_can_discover_missing(
-                self,
-                BucketPolicyAccess {
-                    requester: req.requester,
-                    bucket: &bucket_info,
-                    bucket_tags: bucket_tags.as_deref(),
-                    policy: bucket_policy.as_deref(),
-                },
-                req.key.as_str(),
-                req.version_id,
-            )?;
-            let record = match Self::lookup_object_record(
-                guards.object(),
-                req.bucket,
-                req.key,
-                req.version_id,
-            ) {
-                Ok(record) => record,
-                Err(ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. })
-                    if !can_discover_missing =>
-                {
-                    return Err(ServerError::AccessDenied);
-                }
-                Err(other) => return Err(other),
-            };
-
-            return Ok(LoadedObjectState {
-                bucket_info,
-                bucket_policy,
-                bucket_tags,
-                locked: LockedReadObject {
-                    record,
-                    pgs: guards.into_object_guards(),
-                },
-            });
-        }
-
-        let bucket_info = fast_bucket_info.expect("ordered load handles missing bucket fast path");
-        let bucket_policy = match req.policy_requirement {
-            ObjectBucketPolicyRequirement::Required => fresh_bucket_policy,
-        };
-        let bucket_tags =
-            self.preload_bucket_tags_for_policy(&bucket_info, bucket_policy.as_deref())?;
-        let can_discover_missing = req.missing_discovery.requester_can_discover_missing(
-            self,
-            BucketPolicyAccess {
-                requester: req.requester,
-                bucket: &bucket_info,
-                bucket_tags: bucket_tags.as_deref(),
-                policy: bucket_policy.as_deref(),
-            },
-            req.key.as_str(),
-            req.version_id,
-        )?;
-        let locked = match self.lock_object_pgs_for_read_typed(req.bucket, req.key, req.version_id)
-        {
-            Ok(locked) => locked,
-            Err(ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. })
-                if !can_discover_missing =>
-            {
-                return Err(ServerError::AccessDenied);
-            }
-            Err(other) => return Err(other),
-        };
-
-        Ok(LoadedObjectState {
-            bucket_info,
-            bucket_policy,
-            bucket_tags,
-            locked,
-        })
-    }
-
     fn load_locked_object_state_from_loaded_bucket<'a>(
         &'a self,
         requester: &Requester,
@@ -4462,36 +4356,22 @@ impl Coordinator {
         loaded: &LoadedObjectState<'_>,
         policy_action: auth::PolicyAction,
     ) -> Result<(), ServerError> {
-        self.ensure_loaded_object_read_allowed_with_existing_tag_availability(
+        self.ensure_loaded_object_read_allowed_for_existing_tags(
             requester,
             loaded,
             policy_action,
-            true,
+            ExistingObjectTagsMode::Available,
         )
     }
 
-    fn ensure_loaded_object_read_allowed_without_existing_tags(
+    fn ensure_loaded_object_read_allowed_for_existing_tags(
         &self,
         requester: &Requester,
         loaded: &LoadedObjectState<'_>,
         policy_action: auth::PolicyAction,
+        existing_object_tags_mode: ExistingObjectTagsMode,
     ) -> Result<(), ServerError> {
-        self.ensure_loaded_object_read_allowed_with_existing_tag_availability(
-            requester,
-            loaded,
-            policy_action,
-            false,
-        )
-    }
-
-    fn ensure_loaded_object_read_allowed_with_existing_tag_availability(
-        &self,
-        requester: &Requester,
-        loaded: &LoadedObjectState<'_>,
-        policy_action: auth::PolicyAction,
-        existing_object_tags_available: bool,
-    ) -> Result<(), ServerError> {
-        let allowed = if existing_object_tags_available {
+        let allowed = if matches!(existing_object_tags_mode, ExistingObjectTagsMode::Available) {
             self.requester_can_read_object_with_bucket_policy(
                 requester,
                 &loaded.bucket_info,
@@ -4564,30 +4444,109 @@ impl Coordinator {
         Ok(loaded.locked)
     }
 
-    fn authorize_object_read_without_existing_tags<'a>(
-        &'a self,
-        requester: &Requester,
+    fn authorize_copy_source_read_snapshot(
+        &self,
+        req: CopySourceReadSnapshotRequest<'_>,
+    ) -> Result<storage::ObjectReadSnapshot, ServerError> {
+        let bucket =
+            self.load_bucket_handle_for_object_policy_read(req.bucket, req.expected_bucket_owner)?;
+        let bucket_info = ValidatedBucket(bucket.bucket().clone());
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let bucket_tags = if bucket_policy.is_some() {
+            Self::loaded_bucket_tags_for_policy(&bucket)?
+        } else {
+            None
+        };
+        let can_discover_missing = MissingObjectDiscovery::ReadBucket
+            .requester_can_discover_missing(
+                self,
+                BucketPolicyAccess {
+                    requester: req.requester,
+                    bucket: &bucket_info,
+                    bucket_tags: bucket_tags.as_deref(),
+                    policy: bucket_policy.as_deref(),
+                },
+                req.key.as_str(),
+                req.version_id,
+            )?;
+        let outcome = self
+            .storage_node
+            .load_object_read_snapshot_if(
+                &bucket.bucket().name,
+                req.key,
+                req.version_id,
+                |stored| {
+                    let allowed = if matches!(
+                        req.existing_object_tags_mode,
+                        ExistingObjectTagsMode::Available
+                    ) {
+                        self.requester_can_read_object_with_bucket_policy(
+                            req.requester,
+                            &bucket_info,
+                            bucket_tags.as_deref(),
+                            stored,
+                            req.policy_action,
+                            bucket_policy.as_deref(),
+                        )?
+                    } else {
+                        self.requester_can_read_object_without_existing_tags_with_bucket_policy(
+                            req.requester,
+                            &bucket_info,
+                            bucket_tags.as_deref(),
+                            stored,
+                            req.policy_action,
+                            bucket_policy.as_deref(),
+                        )?
+                    };
+                    if allowed {
+                        Ok(())
+                    } else {
+                        Err(ServerError::AccessDenied)
+                    }
+                },
+            )
+            .map_err(|error| {
+                Self::map_copy_source_snapshot_error(
+                    &bucket.bucket().name,
+                    req.key,
+                    req.version_id,
+                    can_discover_missing,
+                    error,
+                )
+            })??;
+        Ok(outcome.snapshot)
+    }
+
+    fn map_copy_source_snapshot_error(
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,
-        expected_bucket_owner: Option<&str>,
-        policy_action: auth::PolicyAction,
-    ) -> Result<LockedReadObject<'a>, ServerError> {
-        let loaded = self.load_locked_object_state(ObjectStateLoadRequest {
-            requester,
-            bucket,
-            key,
-            version_id,
-            expected_bucket_owner,
-            policy_requirement: ObjectBucketPolicyRequirement::Required,
-            missing_discovery: MissingObjectDiscovery::ReadBucket,
-        })?;
-        self.ensure_loaded_object_read_allowed_without_existing_tags(
-            requester,
-            &loaded,
-            policy_action,
-        )?;
-        Ok(loaded.locked)
+        can_discover_missing: bool,
+        error: storage::ObjectPgActionError,
+    ) -> ServerError {
+        match error {
+            storage::ObjectPgActionError::Metadata(storage::MetadataError::ObjectNotFound) => {
+                if !can_discover_missing {
+                    ServerError::AccessDenied
+                } else if let Some(version_id) = version_id {
+                    ServerError::VersionNotFound {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        version_id: version_id.to_string(),
+                    }
+                } else {
+                    ServerError::ObjectNotFound {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                    }
+                }
+            }
+            storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
+            storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
+            storage::ObjectPgActionError::InvalidRequest { reason } => {
+                ServerError::InvalidRequest { reason }
+            }
+        }
     }
 
     fn ensure_loaded_object_tagging_allowed(

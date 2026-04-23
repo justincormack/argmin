@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use ec::{EcConfig, ErasureCodec};
 use storage::{
-    BucketName, GenerationId, ObjectEncryption, ObjectKey, ObjectSegmentRecord, SharedStorageNode,
+    BucketName, GenerationId, MultipartPartSegmentRecord, ObjectEncryption, ObjectKey,
+    ObjectPartRecord, ObjectSegmentRecord, SharedStorageNode,
 };
 
 use super::object_state::SnapshottedMultipartPart;
@@ -444,4 +445,64 @@ pub(super) fn segment_payloads_from_object_segments(
             encryption: encryption.clone(),
         })
         .collect()
+}
+
+pub(super) fn snapshotted_multipart_parts_from_storage(
+    parts: Vec<ObjectPartRecord>,
+    multipart_part_segments: Vec<MultipartPartSegmentRecord>,
+    encryption: &ObjectEncryption,
+) -> Vec<SnapshottedMultipartPart> {
+    use std::collections::BTreeMap;
+
+    let mut segments_by_part: BTreeMap<u32, Vec<MultipartPartSegmentRecord>> = BTreeMap::new();
+    for segment in multipart_part_segments {
+        segments_by_part
+            .entry(segment.part_number)
+            .or_default()
+            .push(segment);
+    }
+
+    let mut snapshotted = Vec::with_capacity(parts.len());
+    let mut object_offset_start = 0usize;
+    for part in parts {
+        let part_size = part.size as usize;
+        let segments = if part.part_okh != [0u8; 16] {
+            vec![SegmentPayloadRecord {
+                segment_index: 0,
+                size: part.size,
+                segment_crc64: None,
+                segment_okh: part.part_okh,
+                segment_vid: part.part_vid,
+                shard_pg_id: part.shard_pg_id,
+                ec_k: part.ec_k,
+                ec_m: part.ec_m,
+                encryption: encryption.clone(),
+            }]
+        } else {
+            segments_by_part
+                .remove(&part.part_number)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|segment| SegmentPayloadRecord {
+                    segment_index: segment.segment_index,
+                    size: segment.size,
+                    segment_crc64: segment.segment_crc64,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    shard_pg_id: segment.shard_pg_id,
+                    ec_k: segment.ec_k,
+                    ec_m: segment.ec_m,
+                    encryption: encryption.clone(),
+                })
+                .collect()
+        };
+        snapshotted.push(SnapshottedMultipartPart {
+            record: part,
+            object_offset_start,
+            segments,
+        });
+        object_offset_start += part_size;
+    }
+
+    snapshotted
 }

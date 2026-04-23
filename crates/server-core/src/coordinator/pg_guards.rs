@@ -20,44 +20,6 @@ impl<'a> ObjectPgGuards<'a> {
     }
 }
 
-/// Ordered bucket/object PG guards for mixed metadata loads.
-///
-/// The underlying storage helper acquires the physical PG mutexes in ascending
-/// PG ID order, but returns them in logical bucket/object order so call sites
-/// cannot accidentally swap roles.
-pub(super) struct BucketObjectPgGuards<'a> {
-    bucket: MutexGuard<'a, storage::PgStore>,
-    object: Option<MutexGuard<'a, storage::PgStore>>,
-}
-
-impl<'a> BucketObjectPgGuards<'a> {
-    pub(super) fn new(
-        bucket: MutexGuard<'a, storage::PgStore>,
-        object: Option<MutexGuard<'a, storage::PgStore>>,
-    ) -> Self {
-        Self { bucket, object }
-    }
-
-    pub(super) fn bucket(&self) -> &storage::PgStore {
-        &self.bucket
-    }
-
-    pub(super) fn object(&self) -> &storage::PgStore {
-        match self.object.as_ref() {
-            Some(object) => object,
-            None => &self.bucket,
-        }
-    }
-
-    pub(super) fn into_object_guards(self) -> ObjectPgGuards<'a> {
-        let Self { bucket, object } = self;
-        match object {
-            Some(object) => ObjectPgGuards::new(object),
-            None => ObjectPgGuards::new(bucket),
-        }
-    }
-}
-
 /// Ordered metadata/shard PG guards for object write publication.
 ///
 /// The helper keeps logical meta/shard roles explicit even when both roles map

@@ -8,7 +8,7 @@ use ec::{EcConfig, ErasureCodec};
 
 use super::authz_types::{AuthorizedPutObjectWrite, ValidatedBucket};
 use super::payload::{EncodeScratchPool, PayloadBufferPool};
-use super::pg_guards::{BucketObjectPgGuards, TwoPgGuards};
+use super::pg_guards::TwoPgGuards;
 use super::read_core::ReadRuntime;
 use super::request_types::AuthorizePutObjectRequest;
 use super::response_types::BucketSummary;
@@ -425,21 +425,6 @@ impl Coordinator {
     ) -> Result<MutexGuard<'_, storage::PgStore>, ServerError> {
         let pg_id = self.bucket_pg_id_for(bucket);
         Ok(self.storage_node.get_pg(pg_id)?)
-    }
-
-    pub(super) fn lock_bucket_and_object_pgs_for(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<BucketObjectPgGuards<'_>, ServerError> {
-        let (bucket_guard, object_guard) = self
-            .storage_node
-            .lock_two_pgs(
-                self.bucket_pg_id_for(bucket),
-                self.object_pg_id_for(bucket, key),
-            )
-            .map_err(ServerError::Store)?;
-        Ok(BucketObjectPgGuards::new(bucket_guard, object_guard))
     }
 
     pub(super) fn lock_object_pgs_for_write_ids(
