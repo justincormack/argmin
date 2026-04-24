@@ -1197,12 +1197,55 @@ bucket fast path and decide which parts of the bucket-first handle model should
 participate in it.
 
 This phase is about cache contents and cache usage policy, not about changing
-external S3 semantics. The main questions are:
+external S3 semantics. The review should start from the actual hot paths and
+from modern AWS bucket authorization/configuration patterns, rather than from
+the full legacy bucket summary surface.
 
-- whether additional bucket state should live in the fast path for correctness
-  or performance
+Current guidance for this phase:
+
+- the cache must become explicitly bounded
+  - the current unbounded `HashMap<BucketName, BucketFastPathInfo>` is not an
+    acceptable end state
+  - the first target should be a fixed-entry bounded cache with deterministic
+    eviction, most likely recency-based
+- fast-path design should be driven by the hottest request families first
+  - highest priority:
+    - `GetObject`
+    - `HeadObject`
+  - second priority:
+    - `PutObject`
+    - `CreateMultipartUpload`
+    - `UploadPart`
+    - `CompleteMultipartUpload`
+  - lower-frequency bucket/admin operations do not need to shape the cache
+    contract and can continue forcing full bucket snapshot loads if needed
+- the high-performance path should prioritize modern AWS auth/config behavior
+  - in-scope fast-path candidates:
+    - bucket active state and expected-owner checks
+    - bucket policy state
+    - bucket ABAC enablement and any bucket-tag state needed when ABAC is
+      active
+    - Public Access Block
+    - bucket-owner ownership controls
+    - versioning
+    - lifecycle presence/generation where hot paths need it
+    - encryption defaults
+    - object-lock configuration where the request family needs it
+  - explicitly de-prioritized for fast-path optimization:
+    - ACL-grant-heavy behavior
+    - public-read/public-write ACL-derived shortcuts
+  - legacy ACL behavior must still be correct, but it does not need to define
+    the primary low-latency path
+
+The main questions are:
+
+- whether the current cache payload should be narrowed and re-centered around a
+  bounded "bucket execution context" for hot modern paths, rather than the
+  broader ACL-heavy bucket summary it currently resembles
+- which additional bucket state should live in the fast path for correctness or
+  performance on those hot paths
   - especially bucket tags when bucket ABAC is enabled
-  - and any other bucket subresources that migrated request families now need
+  - and any other bucket subresources that hot request families now need
     repeatedly
 - which request families should be allowed to satisfy their bucket-handle load
   from warm fast-path state
@@ -1222,22 +1265,30 @@ external S3 semantics. The main questions are:
 
 This review should cover at least:
 
-- ordinary object reads
+- ordinary object reads and heads
+- hot write and multipart initiation/commit paths
 - bucket-policy-dependent reads
 - the open fast-path freshness issue tracked in `security/codex-1bf5cee`
 - bucket ABAC-enabled paths
+- modern ownership-controls/Public Access Block configurations
+- legacy ACL-dependent paths, specifically to decide where full bucket snapshot
+  fallback is the right tradeoff
 - bucket-only read/admin paths that now consistently require the same
-  subresources
+  subresources, but only after the hot object paths are settled
 
 Acceptance criteria:
 
+- the cache is explicitly bounded rather than unbounded
 - the intended post-refactor fast-path contract is written down explicitly
-- any additional bucket state added to the fast path is justified and pinned by
-  tests
+- the intended hot-path priority order is written down explicitly
+- any additional bucket state added to the fast path is justified by hot-path
+  need and pinned by tests
 - any request family that uses the fast path preserves the request-scoped
   snapshot guarantees established by the handle model
 - any request family that cannot preserve those guarantees is documented as
   requiring a real bucket snapshot load
+- the cache contents are justified primarily by modern auth/config behavior
+  rather than by legacy ACL convenience
 - the policy-freshness issue for object reads after `PutBucketPolicy` is
   resolved and pinned by tests, either by removing the stale-cache window or by
   deliberately modeling AWS-compatible asynchronous behavior
