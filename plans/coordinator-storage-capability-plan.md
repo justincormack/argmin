@@ -1028,6 +1028,8 @@ non-test coordinator code that exposes PG-shaped APIs or uses direct PG
 access:
 
 - status: in progress
+  - updated to completed after the final production storage-synchronization
+    slice moved multipart completion serialization into storage
 
 - completed in 9a:
   - the old loaded-object helper family used by object tagging / ACL /
@@ -1048,21 +1050,20 @@ access:
   - the direct one-segment `PutObject` fast path now publishes through a
     storage-owned commit helper rather than coordinator `lock_two_pgs(...)`
     choreography
+  - lifecycle runtime bucket locking now happens entirely inside storage-owned
+    lifecycle transaction helpers
+  - multipart completion ordering, serialization, and completed-upload prune
+    bookkeeping now happen inside storage-owned multipart completion helpers
 
 - remaining non-test coordinator PG use still to remove before 9a is done:
-  - `runtime.rs`
-    - lifecycle runtime still uses the storage-owned bucket stripe lock for
-      coordination in:
-      - current-object expiration
-      - noncurrent-version expiration
-      - expired delete-marker deletion
-      - multipart abort finishing
-    - those bucket-scoped serialized transactions should move fully into
-      storage so coordinator no longer calls `lock_bucket(...)` itself
-  - any remaining non-test coordinator helper that still exposes storage
-    synchronization internals such as `lock_bucket(...)`,
-    `lock_multipart_completion_bucket(...)`, `get_pg(...)`,
-    `lock_two_pgs(...)`, or bucket/object PG guards
+  - none
+  - audit result:
+    - non-test `server-core` no longer calls `lock_bucket(...)`,
+      `lock_multipart_completion_bucket(...)`, `get_pg(...)`, or
+      `lock_two_pgs(...)`
+    - the remaining `PgStore` / `MutexGuard<PgStore>` / `get_pg(...)` helper
+      references in coordinator are `#[cfg(test)]` only and are queued for
+      phase 9b
 
 - 9a exit criterion:
   - non-test `server-core` code no longer performs PG operations directly
@@ -1073,6 +1074,13 @@ access:
   - after that, the remaining storage-topology / locking references are
     test-only and are removed in phase 9b before the boundary is considered
     complete
+
+Phase 9a status:
+
+- completed
+- the remaining work to reach the final boundary is phase 9b test/helper
+  cleanup so `storage` no longer exports PG-shaped APIs to `server-core` test
+  code either
 
 Acceptance criteria for 9a:
 
