@@ -38,6 +38,30 @@ cargo test -p s3-local-tests
 cargo test -p s3-diff-tests --test response_shape
 ```
 
+## Deterministic Unit Tests
+
+Unit tests, property tests, and local crate-level harnesses must be fully
+deterministic.
+
+That means:
+
+- do not use wait-and-timeout polling in unit tests or local test harnesses
+- do not spawn helper threads and then "hope" they reply within some small
+  timeout
+- do not use sleeps as a substitute for correct test coordination
+
+If a local/unit test needs to observe queued work, background state, or
+concurrent transitions, the harness must expose a deterministic mechanism for
+doing so directly. Prefer explicit hooks, direct queue inspection/pop helpers,
+barriers, or other fully controlled synchronization. A test that can fail
+because the machine is busy is a broken test harness.
+
+The exception is external compatibility/integration coverage where the system
+under test is AWS or another remote S3 endpoint. In those cases, bounded
+eventual checks are correct because AWS control-plane convergence is part of
+the real behavior being modeled. That is acceptable in `crates/s3-tests` and
+similar external suites, but not in ordinary unit/property tests.
+
 ## Local Deep Tracing
 
 Deep tracing is now a non-default local/test-only facility. Production builds
