@@ -270,9 +270,6 @@ impl Coordinator {
         let parts = req.parts;
         let claimed_checksum = req.claimed_checksum;
         let expected_object_size = req.expected_object_size;
-        let _completion_guard = self.storage_node.lock_multipart_completion_bucket(&bucket);
-        let completion_order =
-            self.next_completed_multipart_upload_order_for_bucket_name(&bucket)?;
         let completion_preflight = self
             .storage_node
             .load_multipart_completion_preflight(&bucket, &key, &upload_id)
@@ -593,24 +590,29 @@ impl Coordinator {
 
         let completion_outcome = self
             .storage_node
-            .complete_multipart_upload_commit(storage::CompleteMultipartCommitRequest {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                upload_id: upload_id.clone(),
-                completion_order,
-                versioning: bucket_info.versioning,
-                owner: upload.owner.clone(),
-                acl_grants: upload.acl_grants.clone(),
-                public_read: upload.public_read,
-                size: total_size,
-                etag_crc64,
-                tags: upload.tags.clone(),
-                metadata_blob: Some(upload.metadata_blob.clone()),
-                system_metadata_blob: Some(system_metadata_bytes),
-                object_lock: Self::resolve_new_object_lock_state(&bucket_info, upload.object_lock)?,
-                encryption: final_encryption,
-                part_records: part_records.clone(),
-            })
+            .complete_multipart_upload_commit_serialized(
+                storage::CompleteMultipartCommitRequest {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    upload_id: upload_id.clone(),
+                    versioning: bucket_info.versioning,
+                    owner: upload.owner.clone(),
+                    acl_grants: upload.acl_grants.clone(),
+                    public_read: upload.public_read,
+                    size: total_size,
+                    etag_crc64,
+                    tags: upload.tags.clone(),
+                    metadata_blob: Some(upload.metadata_blob.clone()),
+                    system_metadata_blob: Some(system_metadata_bytes),
+                    object_lock: Self::resolve_new_object_lock_state(
+                        &bucket_info,
+                        upload.object_lock,
+                    )?,
+                    encryption: final_encryption,
+                    part_records: part_records.clone(),
+                },
+                COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT,
+            )
             .map_err(Coordinator::map_object_pg_action_error)?;
         let version_id = completion_outcome.version_id;
         let stale_payload = completion_outcome
@@ -620,10 +622,6 @@ impl Coordinator {
         let lifecycle_size = completion_outcome.live_size;
         let lifecycle_last_modified = completion_outcome.live_last_modified;
 
-        self.prune_completed_multipart_uploads_for_bucket_with_limit(
-            &bucket,
-            COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT,
-        )?;
         let lifecycle_expiration = self.current_object_write_lifecycle_expiration(
             &bucket_info,
             key.as_str(),

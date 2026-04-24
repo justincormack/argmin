@@ -409,9 +409,10 @@ impl SharedStorageNode {
         Ok(())
     }
 
-    pub fn complete_multipart_upload_commit(
+    fn complete_multipart_upload_commit_with_order(
         &self,
         req: CompleteMultipartCommitRequest,
+        completion_order: u64,
     ) -> Result<CompleteMultipartCommitOutcome, ObjectPgActionError> {
         let pg = self.get_pg(self.pg_topology.object_pg_for(&req.bucket, &req.key))?;
         let version_id = if req.versioning == crate::types::BucketVersioningState::Enabled {
@@ -456,7 +457,7 @@ impl SharedStorageNode {
 
         pg.complete_multipart_commit(
             &req.upload_id,
-            req.completion_order,
+            completion_order,
             &crate::types::CommitMultipartReq {
                 bucket: req.bucket.clone(),
                 key: req.key.clone(),
@@ -502,6 +503,27 @@ impl SharedStorageNode {
             live_size: live_record.size,
             live_last_modified: live_record.last_modified,
         })
+    }
+
+    pub fn complete_multipart_upload_commit_serialized(
+        &self,
+        req: CompleteMultipartCommitRequest,
+        keep_completed_uploads: usize,
+    ) -> Result<CompleteMultipartCommitOutcome, ObjectPgActionError> {
+        let bucket = req.bucket.clone();
+        let _completion_guard = self.lock_multipart_completion_bucket(&req.bucket);
+        let completion_order = self
+            .next_completed_multipart_upload_order_for_bucket(&req.bucket)
+            .map_err(|error| match error {
+                BucketSnapshotLoadError::Store(error) => ObjectPgActionError::Store(error),
+                BucketSnapshotLoadError::Metadata(error) => ObjectPgActionError::Metadata(error),
+            })?;
+        let outcome = self.complete_multipart_upload_commit_with_order(req, completion_order)?;
+        self.prune_completed_multipart_uploads_for_bucket_with_limit(
+            &bucket,
+            keep_completed_uploads,
+        )?;
+        Ok(outcome)
     }
 
     pub fn finalize_upload_part_stream<T, E>(

@@ -82,23 +82,7 @@ impl Coordinator {
         self.authorize_put_object_write(req)
     }
 
-    pub(super) fn next_completed_multipart_upload_order_for_bucket_name(
-        &self,
-        bucket: &BucketName,
-    ) -> Result<u64, ServerError> {
-        self.storage_node
-            .next_completed_multipart_upload_order_for_bucket(bucket)
-            .map_err(|e| match e {
-                storage::BucketSnapshotLoadError::Store(error) => ServerError::Store(error),
-                storage::BucketSnapshotLoadError::Metadata(
-                    storage::MetadataError::BucketNotFound { name },
-                ) => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                storage::BucketSnapshotLoadError::Metadata(other) => ServerError::Metadata(other),
-            })
-    }
-
+    #[cfg(test)]
     pub(super) fn prune_completed_multipart_uploads_for_bucket_with_limit(
         &self,
         bucket: &BucketName,

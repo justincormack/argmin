@@ -2607,7 +2607,6 @@ pub struct CompleteMultipartCommitRequest {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub upload_id: UploadId,
-    pub completion_order: u64,
     pub versioning: BucketVersioningState,
     pub owner: OwnerIdentity,
     pub acl_grants: AclGrants,
