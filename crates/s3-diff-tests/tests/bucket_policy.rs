@@ -4,6 +4,7 @@ use std::time::Duration;
 use auth::bucket_policy::{
     parse_bucket_policy, BucketPolicy, PolicyAction, PolicyEvaluation, PolicyRequest, PolicyTag,
 };
+use s3_diff_tests::require_external_diff_test_env;
 use s3_tests::{
     aws_sdk_s3::{
         error::ProvideErrorMetadata,
@@ -204,7 +205,7 @@ struct DiffEnv {
 
 impl DiffEnv {
     async fn setup() -> Option<Self> {
-        std::env::var_os("S3_TEST_ENDPOINT")?;
+        require_external_diff_test_env();
 
         let _ = &*CTX;
         let external_region = CTX.region().to_string();

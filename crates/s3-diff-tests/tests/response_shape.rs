@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use s3_diff_tests::require_external_diff_test_env;
 use s3_tests::{
     aws_sdk_s3::{
         self,
@@ -73,7 +74,7 @@ struct ComparisonEnv {
 
 impl ComparisonEnv {
     async fn setup() -> Option<Self> {
-        std::env::var_os("S3_TEST_ENDPOINT")?;
+        require_external_diff_test_env();
 
         let _ = &*CTX;
         let external_region = CTX.region().to_string();

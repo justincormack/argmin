@@ -3,9 +3,18 @@ name = "s3-diff-tests"
 version = "0.1.0"
 edition = "2021"
 publish = false
+autotests = false
 
 [features]
 deep-tracing = ["s3-tests/deep-tracing"]
+
+[[test]]
+name = "bucket_policy"
+path = "tests/bucket_policy.rs"
+
+[[test]]
+name = "response_shape"
+path = "tests/response_shape.rs"
 
 [dependencies]
 s3-tests = { path = "../s3-tests" }

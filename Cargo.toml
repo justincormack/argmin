@@ -13,7 +13,7 @@ members = [
     "crates/argmin-s3",
     "crates/test-util",
     "crates/s3-tests",
-    "crates/s3-diff-tests",
     "crates/s3-http-tests",
     "crates/s3-local-tests",
 ]
+exclude = ["crates/s3-diff-tests"]
