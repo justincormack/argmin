@@ -2,13 +2,26 @@ use super::*;
 use crate::clock::current_time_millis;
 use crate::types::{
     DeleteCurrentObjectOutcome, DeleteSpecificObjectVersionOutcome, DeletedCurrentObject,
-    DeletedSpecificObjectVersion, EcShape, InsertCurrentDeleteMarkerOutcome, LiveObjectRecord,
-    MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
-    MultipartReclaimRecord, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord,
-    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity,
-    PutDeleteMarkerReq, PutObjectReq,
+    DeletedSpecificObjectVersion, EcShape, ExpireCurrentObjectOutcome,
+    InsertCurrentDeleteMarkerOutcome, LiveObjectRecord, MultipartPartSegmentRecord,
+    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
+    ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
+    ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PutDeleteMarkerReq, PutObjectReq,
 };
-use s3_types::VersionId;
+use s3_types::{BucketVersioningState, VersionId};
+use std::collections::HashSet;
+
+enum StaleObjectPayload {
+    Segments {
+        generation_id: GenerationId,
+        segments: Vec<ObjectSegmentRecord>,
+    },
+    Multipart {
+        generation_id: GenerationId,
+        parts: Vec<ObjectPartRecord>,
+        streaming_segments: Vec<MultipartPartSegmentRecord>,
+    },
+}
 
 impl SharedStorageNode {
     fn enqueue_object_segments_reclaim(
@@ -165,6 +178,132 @@ impl SharedStorageNode {
         })
     }
 
+    fn snapshot_overwritten_null_version_payload(
+        meta_pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Option<StaleObjectPayload>, crate::error::MetadataError> {
+        let stored =
+            match PgMetadataStore::get_object_version(meta_pg, bucket, key, VersionId::Null) {
+                Ok(stored) => stored,
+                Err(crate::error::MetadataError::ObjectNotFound) => return Ok(None),
+                Err(other) => return Err(other),
+            };
+        let record = match stored {
+            StoredObject::Live(record) => record,
+            StoredObject::DeleteMarker(_) => return Ok(None),
+        };
+
+        match record.layout {
+            ObjectLayout::MultipartManifest { .. } => {
+                let parts =
+                    PgMetadataStore::get_object_parts(meta_pg, bucket, key, VersionId::Null)?;
+                let mut streaming_segments = Vec::new();
+                for part in &parts {
+                    if part.part_okh == [0u8; 16] {
+                        let segments = PgMetadataStore::get_multipart_part_segments(
+                            meta_pg,
+                            bucket,
+                            key,
+                            VersionId::Null,
+                            part.part_number,
+                        )?;
+                        streaming_segments.extend(segments);
+                    }
+                }
+                Ok(Some(StaleObjectPayload::Multipart {
+                    generation_id: record.generation_id,
+                    parts,
+                    streaming_segments,
+                }))
+            }
+            ObjectLayout::Standard => {
+                let segments =
+                    PgMetadataStore::get_object_segments(meta_pg, bucket, key, VersionId::Null)?;
+                Ok(Some(StaleObjectPayload::Segments {
+                    generation_id: record.generation_id,
+                    segments,
+                }))
+            }
+        }
+    }
+
+    fn delete_stale_object_payload_metadata(
+        meta_pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        payload: &StaleObjectPayload,
+    ) -> Result<(), crate::error::MetadataError> {
+        match payload {
+            StaleObjectPayload::Segments {
+                generation_id,
+                segments,
+            } => {
+                Self::enqueue_object_segments_reclaim(
+                    meta_pg,
+                    bucket,
+                    key,
+                    *generation_id,
+                    segments,
+                )?;
+                PgMetadataStore::delete_object_segments(meta_pg, bucket, key, version_id)?;
+            }
+            StaleObjectPayload::Multipart {
+                generation_id,
+                parts,
+                streaming_segments,
+            } => {
+                Self::enqueue_multipart_reclaim(
+                    meta_pg,
+                    bucket,
+                    key,
+                    *generation_id,
+                    parts,
+                    streaming_segments,
+                )?;
+                if !streaming_segments.is_empty() {
+                    PgMetadataStore::delete_multipart_part_segments(
+                        meta_pg, bucket, key, version_id,
+                    )?;
+                }
+                PgMetadataStore::delete_object_parts(meta_pg, bucket, key, version_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn expire_current_live_suspended_from_pg(
+        meta_pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        owner: OwnerIdentity,
+    ) -> Result<ExpireCurrentObjectOutcome, crate::error::MetadataError> {
+        let stale_payload = Self::snapshot_overwritten_null_version_payload(meta_pg, bucket, key)?;
+        meta_pg.put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::Null,
+            owner,
+        }))?;
+        let reclaim_generation_id = stale_payload.as_ref().map(|payload| match payload {
+            StaleObjectPayload::Segments { generation_id, .. }
+            | StaleObjectPayload::Multipart { generation_id, .. } => *generation_id,
+        });
+        if let Some(payload) = stale_payload.as_ref() {
+            Self::delete_stale_object_payload_metadata(
+                meta_pg,
+                bucket,
+                key,
+                VersionId::Null,
+                payload,
+            )?;
+        }
+        Ok(ExpireCurrentObjectOutcome {
+            reclaim_generation_id,
+        })
+    }
+
     pub fn delete_specific_object_version_if<T, E>(
         &self,
         bucket: &BucketName,
@@ -268,5 +407,126 @@ impl SharedStorageNode {
             value,
             version_id: marker_vid,
         }))
+    }
+
+    pub fn expire_current_object_if<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        expected_version_id: VersionId,
+        versioning: BucketVersioningState,
+        owner: OwnerIdentity,
+        should_expire: impl FnOnce(&LiveObjectRecord) -> Result<bool, E>,
+    ) -> Result<Result<Option<ExpireCurrentObjectOutcome>, E>, ObjectPgActionError> {
+        let meta_pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        let stored = match PgMetadataStore::get_object_meta(&*meta_pg, bucket, key) {
+            Ok(stored) => stored,
+            Err(crate::error::MetadataError::ObjectNotFound) => return Ok(Ok(None)),
+            Err(other) => return Err(other.into()),
+        };
+        let record = match stored {
+            StoredObject::Live(record) if record.version_id == expected_version_id => record,
+            _ => return Ok(Ok(None)),
+        };
+
+        let should_expire = match should_expire(&record) {
+            Ok(should_expire) => should_expire,
+            Err(error) => return Ok(Err(error)),
+        };
+        if !should_expire {
+            return Ok(Ok(None));
+        }
+
+        let outcome = match versioning {
+            BucketVersioningState::Disabled => {
+                let deleted = Self::delete_live_object_from_pg(&meta_pg, bucket, key, &record)?;
+                let reclaim_generation_id = match deleted {
+                    DeletedSpecificObjectVersion::Live { generation_id, .. } => Some(generation_id),
+                    DeletedSpecificObjectVersion::Missing
+                    | DeletedSpecificObjectVersion::DeleteMarker => None,
+                };
+                ExpireCurrentObjectOutcome {
+                    reclaim_generation_id,
+                }
+            }
+            BucketVersioningState::Enabled => {
+                let marker_vid = PgMetadataStore::next_version_id(&*meta_pg, bucket, key)?;
+                meta_pg.put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: marker_vid,
+                    owner,
+                }))?;
+                ExpireCurrentObjectOutcome {
+                    reclaim_generation_id: None,
+                }
+            }
+            BucketVersioningState::Suspended => {
+                Self::expire_current_live_suspended_from_pg(&meta_pg, bucket, key, owner)?
+            }
+        };
+
+        Ok(Ok(Some(outcome)))
+    }
+
+    pub fn delete_noncurrent_live_versions_if<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        select_versions: impl FnOnce(&[StoredObject]) -> Result<HashSet<VersionId>, E>,
+    ) -> Result<Result<Vec<GenerationId>, E>, ObjectPgActionError> {
+        let meta_pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        let versions = match PgMetadataStore::list_object_versions_for_key(&*meta_pg, bucket, key) {
+            Ok(versions) => versions,
+            Err(crate::error::MetadataError::ObjectNotFound) => return Ok(Ok(Vec::new())),
+            Err(other) => return Err(other.into()),
+        };
+        let due_version_ids = match select_versions(&versions) {
+            Ok(version_ids) => version_ids,
+            Err(error) => return Ok(Err(error)),
+        };
+        if due_version_ids.is_empty() {
+            return Ok(Ok(Vec::new()));
+        }
+
+        let mut reclaimed_generation_ids = Vec::new();
+        for stored in versions {
+            let Some(record) = stored.into_live() else {
+                continue;
+            };
+            if !due_version_ids.contains(&record.version_id) {
+                continue;
+            }
+            let deleted = Self::delete_live_object_from_pg(&meta_pg, bucket, key, &record)?;
+            if let DeletedSpecificObjectVersion::Live { generation_id, .. } = deleted {
+                reclaimed_generation_ids.push(generation_id);
+            }
+        }
+
+        Ok(Ok(reclaimed_generation_ids))
+    }
+
+    pub fn delete_expired_delete_marker_if<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        expected_version_id: VersionId,
+        should_delete: impl FnOnce(&[StoredObject]) -> Result<bool, E>,
+    ) -> Result<Result<bool, E>, ObjectPgActionError> {
+        let meta_pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        let versions = match PgMetadataStore::list_object_versions_for_key(&*meta_pg, bucket, key) {
+            Ok(versions) => versions,
+            Err(crate::error::MetadataError::ObjectNotFound) => return Ok(Ok(false)),
+            Err(other) => return Err(other.into()),
+        };
+        let should_delete = match should_delete(&versions) {
+            Ok(should_delete) => should_delete,
+            Err(error) => return Ok(Err(error)),
+        };
+        if !should_delete {
+            return Ok(Ok(false));
+        }
+        PgMetadataStore::delete_object_version(&*meta_pg, bucket, key, expected_version_id)?;
+        Ok(Ok(true))
     }
 }

@@ -2,11 +2,10 @@ use checksum::{ChecksumAlgorithm, ChecksumType};
 use s3_types::{BucketVersioningState, VersionId};
 use storage::traits::PgMetadataStore;
 use storage::{
-    BucketName, EcShape, GenerationId, LiveObjectRecord, MultipartPartSegmentRecord,
-    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
-    ObjectEncryption, ObjectKey, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord,
-    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity,
-    PutDeleteMarkerReq, PutObjectReq, SerializedMetadataBlob, SerializedSystemMetadataBlob,
+    BucketName, EcShape, GenerationId, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
+    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, ObjectEncryption, ObjectKey,
+    ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
+    ObjectSegmentsReclaimSegmentRecord, SerializedMetadataBlob, SerializedSystemMetadataBlob,
     SerializedTagSet, StoredObject,
 };
 
@@ -65,18 +64,6 @@ impl From<storage::CompletedMultipartStalePayload> for StaleObjectPayload {
             },
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DeletedLiveObjectKind {
-    Segments,
-    Multipart,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct DeletedLiveObjectReclaim {
-    pub(super) generation_id: GenerationId,
-    pub(super) kind: DeletedLiveObjectKind,
 }
 
 impl Coordinator {
@@ -471,156 +458,6 @@ impl Coordinator {
                     .map_err(ServerError::Metadata)
             }
         }
-    }
-
-    fn reclaim_info_for_stale_payload(payload: &StaleObjectPayload) -> DeletedLiveObjectReclaim {
-        match payload {
-            StaleObjectPayload::Segments { generation_id, .. } => DeletedLiveObjectReclaim {
-                generation_id: *generation_id,
-                kind: DeletedLiveObjectKind::Segments,
-            },
-            StaleObjectPayload::Multipart { generation_id, .. } => DeletedLiveObjectReclaim {
-                generation_id: *generation_id,
-                kind: DeletedLiveObjectKind::Multipart,
-            },
-        }
-    }
-
-    pub(super) fn permanently_delete_live_object_locked(
-        meta_pg: &storage::PgStore,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        record: &LiveObjectRecord,
-    ) -> Result<Option<DeletedLiveObjectReclaim>, ServerError> {
-        let reclaim = if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
-            let obj_parts =
-                storage::PgMetadataStore::get_object_parts(meta_pg, bucket, key, record.version_id)
-                    .map_err(ServerError::Metadata)?;
-            let mut streaming_segments: Vec<MultipartPartSegmentRecord> = Vec::new();
-            for part in &obj_parts {
-                if part.part_okh == [0u8; 16] {
-                    let segments = storage::PgMetadataStore::get_multipart_part_segments(
-                        meta_pg,
-                        bucket,
-                        key,
-                        record.version_id,
-                        part.part_number,
-                    )
-                    .map_err(ServerError::Metadata)?;
-                    streaming_segments.extend(segments);
-                }
-            }
-            Self::enqueue_multipart_reclaim(
-                meta_pg,
-                bucket,
-                key,
-                record.generation_id,
-                &obj_parts,
-                &streaming_segments,
-            )?;
-            if !streaming_segments.is_empty() {
-                storage::PgMetadataStore::delete_multipart_part_segments(
-                    meta_pg,
-                    bucket,
-                    key,
-                    record.version_id,
-                )
-                .map_err(ServerError::Metadata)?;
-            }
-            storage::PgMetadataStore::delete_object_parts(meta_pg, bucket, key, record.version_id)?;
-            Some(DeletedLiveObjectReclaim {
-                generation_id: record.generation_id,
-                kind: DeletedLiveObjectKind::Multipart,
-            })
-        } else {
-            let segments = storage::PgMetadataStore::get_object_segments(
-                meta_pg,
-                bucket,
-                key,
-                record.version_id,
-            )
-            .map_err(ServerError::Metadata)?;
-            Self::enqueue_object_segments_reclaim(
-                meta_pg,
-                bucket,
-                key,
-                record.generation_id,
-                &segments,
-            )?;
-            storage::PgMetadataStore::delete_object_segments(
-                meta_pg,
-                bucket,
-                key,
-                record.version_id,
-            )
-            .map_err(ServerError::Metadata)?;
-            Some(DeletedLiveObjectReclaim {
-                generation_id: record.generation_id,
-                kind: DeletedLiveObjectKind::Segments,
-            })
-        };
-
-        if record.version_id.is_null() {
-            storage::PgMetadataStore::delete_object_meta(meta_pg, bucket, key)?;
-        } else {
-            storage::PgMetadataStore::delete_object_version(
-                meta_pg,
-                bucket,
-                key,
-                record.version_id,
-            )
-            .map_err(ServerError::Metadata)?;
-        }
-
-        Ok(reclaim)
-    }
-
-    pub(super) fn put_delete_marker_locked(
-        meta_pg: &storage::PgStore,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: VersionId,
-        owner: OwnerIdentity,
-    ) -> Result<(), ServerError> {
-        meta_pg
-            .put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                version_id,
-                owner,
-            }))
-            .map_err(ServerError::Metadata)
-    }
-
-    pub(super) fn expire_current_live_suspended_locked(
-        meta_pg: &storage::PgStore,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        record: &LiveObjectRecord,
-        owner: OwnerIdentity,
-    ) -> Result<Option<DeletedLiveObjectReclaim>, ServerError> {
-        let stale_payload = if record.version_id.is_null() {
-            Self::snapshot_overwritten_null_version_payload(meta_pg, bucket, key)?
-        } else {
-            None
-        };
-
-        Self::put_delete_marker_locked(meta_pg, bucket, key, VersionId::Null, owner)?;
-
-        let reclaim = stale_payload
-            .as_ref()
-            .map(Self::reclaim_info_for_stale_payload);
-        if let Some(payload) = stale_payload.as_ref() {
-            Self::delete_stale_object_payload_metadata(
-                meta_pg,
-                bucket,
-                key,
-                VersionId::Null,
-                payload,
-            )?;
-        }
-
-        Ok(reclaim)
     }
 
     pub(super) fn delete_stale_object_payload(

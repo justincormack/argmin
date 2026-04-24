@@ -1,15 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use ec::{EcConfig, ErasureCodec};
-use s3_types::{BucketLifecycleConfiguration, BucketVersioningState};
-use storage::traits::{PgMetadataStore, ShardStore};
+use s3_types::BucketLifecycleConfiguration;
+use storage::traits::ShardStore;
 use storage::{
     BucketInfo, BucketName, EcShape, GenerationId, MultipartReclaimPartRecord, ObjectEncryption,
-    ObjectKey, OwnerIdentity, ShardKey, SharedStorageNode, StoredObject, UploadId, UploadState,
-    VersionId,
+    ObjectKey, OwnerIdentity, ShardKey, SharedStorageNode, UploadId, UploadState, VersionId,
 };
 
 use super::payload::{PooledPayloadBuffer, SharedPayloadBuffer};
@@ -42,6 +42,7 @@ pub(super) struct ReclaimSweeper {
 
 pub(super) struct LifecycleSweeper {
     pub(super) stop: Arc<AtomicBool>,
+    pub(super) wake: Arc<(Mutex<bool>, Condvar)>,
     pub(super) handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -67,6 +68,8 @@ impl Drop for ReclaimSweeper {
 impl Drop for LifecycleSweeper {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        *lock_mutex_unpoisoned(&self.wake.0) = true;
+        self.wake.1.notify_all();
         if let Some(handle) = lock_mutex_unpoisoned(&self.handle).take() {
             let _ = handle.join();
         }
@@ -95,8 +98,10 @@ impl LifecycleSweeper {
 
     fn spawn(runtime: ReadRuntime) -> Result<Arc<Self>, ServerError> {
         let stop = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new((Mutex::new(false), Condvar::new()));
         let sweeper = Arc::new(Self {
             stop: Arc::clone(&stop),
+            wake: Arc::clone(&wake),
             handle: Mutex::new(None),
         });
         let handle = std::thread::Builder::new()
@@ -104,12 +109,21 @@ impl LifecycleSweeper {
             .spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
                     let _ = runtime.run_lifecycle_sweep_at(Coordinator::now_millis());
-                    let mut remaining = LIFECYCLE_SWEEP_INTERVAL_MILLIS;
-                    while remaining > 0 && !stop.load(Ordering::SeqCst) {
-                        let step = remaining.min(100);
-                        std::thread::sleep(std::time::Duration::from_millis(step));
-                        remaining -= step;
+                    if stop.load(Ordering::SeqCst) {
+                        break;
                     }
+                    let stop_guard = lock_mutex_unpoisoned(&wake.0);
+                    if *stop_guard {
+                        break;
+                    }
+                    let _ = wake
+                        .1
+                        .wait_timeout_while(
+                            stop_guard,
+                            Duration::from_millis(LIFECYCLE_SWEEP_INTERVAL_MILLIS),
+                            |stop_requested| !*stop_requested,
+                        )
+                        .unwrap_or_else(|e| e.into_inner());
                 }
             })
             .map_err(|e| ServerError::InternalError {
@@ -123,6 +137,7 @@ impl LifecycleSweeper {
     pub(super) fn disabled() -> Arc<Self> {
         Arc::new(Self {
             stop: Arc::new(AtomicBool::new(true)),
+            wake: Arc::new((Mutex::new(true), Condvar::new())),
             handle: Mutex::new(None),
         })
     }
@@ -385,60 +400,44 @@ impl ReadRuntime {
             return Ok(false);
         };
 
-        let meta_pg = self
-            .storage_node
-            .get_pg(self.pg_topology.object_pg_for(bucket, key))?;
-        let stored = match storage::PgMetadataStore::get_object_meta(&*meta_pg, bucket, key) {
-            Ok(stored) => stored,
-            Err(storage::MetadataError::ObjectNotFound) => return Ok(false),
-            Err(error) => return Err(ServerError::Metadata(error)),
-        };
-        let record = match stored {
-            StoredObject::Live(record) => record,
-            StoredObject::DeleteMarker(_) => return Ok(false),
-        };
-        if record.version_id != expected_version_id {
-            return Ok(false);
-        }
-
-        let tags = match record.tags.as_deref() {
-            Some(tags_xml) => Coordinator::parse_serialized_tag_set(tags_xml)?,
-            None => Vec::new(),
-        };
-        let Some(expiration) = Coordinator::evaluate_current_object_lifecycle_expiration(
-            &config,
-            key.as_str(),
-            &tags,
-            record.size,
-            record.last_modified,
-        ) else {
-            return Ok(false);
-        };
-        if expiration.expiry_time_millis > now_millis {
-            return Ok(false);
-        }
-
         let owner = OwnerIdentity::new(
             bucket_info.owner_principal.clone(),
             bucket_info.owner_canonical_id.clone(),
         );
-        let reclaim = match bucket_info.versioning {
-            BucketVersioningState::Disabled => {
-                Coordinator::permanently_delete_live_object_locked(&meta_pg, bucket, key, &record)?
-            }
-            BucketVersioningState::Enabled => {
-                let marker_vid = storage::PgMetadataStore::next_version_id(&*meta_pg, bucket, key)?;
-                Coordinator::put_delete_marker_locked(&meta_pg, bucket, key, marker_vid, owner)?;
-                None
-            }
-            BucketVersioningState::Suspended => Coordinator::expire_current_live_suspended_locked(
-                &meta_pg, bucket, key, &record, owner,
-            )?,
-        };
+        let outcome = self
+            .storage_node
+            .expire_current_object_if(
+                bucket,
+                key,
+                expected_version_id,
+                bucket_info.versioning,
+                owner,
+                |record| {
+                    let tags = match record.tags.as_deref() {
+                        Some(tags_xml) => Coordinator::parse_serialized_tag_set(tags_xml)?,
+                        None => Vec::new(),
+                    };
+                    let Some(expiration) =
+                        Coordinator::evaluate_current_object_lifecycle_expiration(
+                            &config,
+                            key.as_str(),
+                            &tags,
+                            record.size,
+                            record.last_modified,
+                        )
+                    else {
+                        return Ok::<bool, ServerError>(false);
+                    };
+                    Ok::<bool, ServerError>(expiration.expiry_time_millis <= now_millis)
+                },
+            )
+            .map_err(Coordinator::map_object_pg_action_error)??;
 
-        drop(meta_pg);
-        if let Some(reclaim) = reclaim {
-            self.enqueue_object_payload_reclaim_for(bucket, key, reclaim.generation_id);
+        let Some(outcome) = outcome else {
+            return Ok(false);
+        };
+        if let Some(generation_id) = outcome.reclaim_generation_id {
+            self.enqueue_object_payload_reclaim_for(bucket, key, generation_id);
         }
         Ok(true)
     }
@@ -462,58 +461,42 @@ impl ReadRuntime {
             return Ok(0);
         };
 
-        let meta_pg = self
-            .storage_node
-            .get_pg(self.pg_topology.object_pg_for(bucket, key))?;
-        let versions =
-            storage::PgMetadataStore::list_object_versions_for_key(&*meta_pg, bucket, key)?;
-        let due_versions = Coordinator::evaluate_due_noncurrent_version_expirations(
-            &config, &versions, now_millis,
-        )?;
-        if due_versions.is_empty() {
-            return Ok(0);
-        }
-
         let current_unix_seconds = Coordinator::current_unix_seconds()?;
-        let mut deleted = 0u64;
-        let mut reclaims = Vec::new();
-        let due_version_ids: HashSet<VersionId> = due_versions
-            .iter()
-            .map(|candidate| candidate.version_id)
-            .collect();
+        let reclaimed_generation_ids = self
+            .storage_node
+            .delete_noncurrent_live_versions_if(bucket, key, |versions| {
+                let due_versions = Coordinator::evaluate_due_noncurrent_version_expirations(
+                    &config, versions, now_millis,
+                )?;
+                let due_version_ids = due_versions
+                    .iter()
+                    .map(|candidate| candidate.version_id)
+                    .collect::<HashSet<_>>();
 
-        for stored in versions {
-            let Some(record) = stored.into_live() else {
-                continue;
-            };
-            if !due_version_ids.contains(&record.version_id) {
-                continue;
-            }
-            if Coordinator::validate_delete_against_object_lock(
-                record.object_lock,
-                false,
-                false,
-                current_unix_seconds,
-            )
-            .is_err()
-            {
-                continue;
-            }
+                let eligible_version_ids = versions
+                    .iter()
+                    .filter_map(|stored| stored.as_live())
+                    .filter(|record| due_version_ids.contains(&record.version_id))
+                    .filter(|record| {
+                        Coordinator::validate_delete_against_object_lock(
+                            record.object_lock,
+                            false,
+                            false,
+                            current_unix_seconds,
+                        )
+                        .is_ok()
+                    })
+                    .map(|record| record.version_id)
+                    .collect();
+                Ok::<HashSet<VersionId>, ServerError>(eligible_version_ids)
+            })
+            .map_err(Coordinator::map_object_pg_action_error)??;
 
-            if let Some(reclaim) =
-                Coordinator::permanently_delete_live_object_locked(&meta_pg, bucket, key, &record)?
-            {
-                reclaims.push(reclaim);
-            }
-            deleted += 1;
+        for generation_id in &reclaimed_generation_ids {
+            self.enqueue_object_payload_reclaim_for(bucket, key, *generation_id);
         }
 
-        drop(meta_pg);
-        for reclaim in reclaims {
-            self.enqueue_object_payload_reclaim_for(bucket, key, reclaim.generation_id);
-        }
-
-        Ok(deleted)
+        Ok(reclaimed_generation_ids.len() as u64)
     }
 
     fn expire_due_delete_markers_for_bucket(
@@ -578,31 +561,16 @@ impl ReadRuntime {
             return Ok(false);
         };
 
-        let meta_pg = self
-            .storage_node
-            .get_pg(self.pg_topology.object_pg_for(bucket, key))?;
-        let versions =
-            match storage::PgMetadataStore::list_object_versions_for_key(&*meta_pg, bucket, key) {
-                Ok(versions) => versions,
-                Err(storage::MetadataError::ObjectNotFound) => return Ok(false),
-                Err(error) => return Err(ServerError::Metadata(error)),
-            };
-        let Some(expiration) =
-            Coordinator::evaluate_due_expired_delete_marker(&config, &versions, now_millis)
-        else {
-            return Ok(false);
-        };
-        if expiration.version_id != expected_version_id {
-            return Ok(false);
-        }
-
-        storage::PgMetadataStore::delete_object_version(
-            &*meta_pg,
-            bucket,
-            key,
-            expected_version_id,
-        )?;
-        Ok(true)
+        self.storage_node
+            .delete_expired_delete_marker_if(bucket, key, expected_version_id, |versions| {
+                let Some(expiration) =
+                    Coordinator::evaluate_due_expired_delete_marker(&config, versions, now_millis)
+                else {
+                    return Ok::<bool, ServerError>(false);
+                };
+                Ok::<bool, ServerError>(expiration.version_id == expected_version_id)
+            })
+            .map_err(Coordinator::map_object_pg_action_error)?
     }
 
     fn abort_due_multipart_uploads_for_bucket(
@@ -666,19 +634,18 @@ impl ReadRuntime {
             Err(error) => return Err(Self::map_bucket_snapshot_error(error)),
         };
 
-        let meta_pg_id = self.pg_topology.object_pg_for(bucket, key);
-        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-        let upload = match meta_pg.get_multipart_upload(upload_id) {
+        let upload = match self
+            .storage_node
+            .load_multipart_upload(bucket, key, upload_id)
+        {
             Ok(upload) => upload,
-            Err(storage::MetadataError::NoSuchUpload { .. }) => return Ok(false),
-            Err(error) => return Err(ServerError::Metadata(error)),
+            Err(storage::BucketSnapshotLoadError::Metadata(
+                storage::MetadataError::NoSuchUpload { .. },
+            )) => return Ok(false),
+            Err(error) => return Err(Self::map_bucket_snapshot_error(error)),
         };
-        if upload.bucket != *bucket || upload.key != *key {
-            return Ok(false);
-        }
 
         if upload.state == UploadState::Aborting {
-            drop(meta_pg);
             return self.abort_multipart_upload_internal_for(bucket, key, upload_id);
         }
         if upload.state != UploadState::InProgress {
@@ -700,7 +667,6 @@ impl ReadRuntime {
             return Ok(false);
         }
 
-        drop(meta_pg);
         self.abort_multipart_upload_internal_for(bucket, key, upload_id)
     }
 

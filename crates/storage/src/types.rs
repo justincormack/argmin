@@ -2387,6 +2387,11 @@ pub struct InsertCurrentDeleteMarkerOutcome<T> {
     pub version_id: VersionId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpireCurrentObjectOutcome {
+    pub reclaim_generation_id: Option<GenerationId>,
+}
+
 /// Request to list objects in a PG.
 pub struct ListObjectsReq {
     pub bucket: BucketName,
