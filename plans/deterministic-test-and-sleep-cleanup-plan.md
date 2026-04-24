@@ -21,7 +21,7 @@ correctness and maintainability issue, but it is the same bad pattern family.
 
 ## Status
 
-Status: planned.
+Status: in progress.
 
 ## Goals
 
@@ -38,6 +38,8 @@ Status: planned.
 - broad refactors unrelated to deterministic coordination
 
 ## Phase 1: Clear Local Test Violations
+
+Status: completed.
 
 Prioritize the direct local-test violations first.
 
@@ -56,7 +58,18 @@ Prioritize the direct local-test violations first.
 3. Keep any new helper narrowly scoped to test-only code when it exists only
    to support deterministic verification.
 
+### Completed Scope
+
+- `crates/server-core/src/coordinator/multipart_stateful_tests.rs`
+- `crates/server-core/src/coordinator/test_support.rs`
+- `crates/storage/src/node.rs` test helpers
+
+Direct local timing waits in these areas were replaced with deterministic
+state inspection, direct queue access, or test-only hooks.
+
 ## Phase 2: Replace Timeout-Based Deadlock Tests With Deterministic Harnesses
+
+Status: completed.
 
 These are more involved because many of them are trying to prove "does not
 deadlock" or "does block until released" with helper threads and timeouts.
@@ -75,7 +88,40 @@ deadlock" or "does block until released" with helper threads and timeouts.
 3. Replace positive timeout assertions like "reply within 1s" with explicit
    release plus join/receive after the harness knows the worker is ready.
 
+### Completed Scope
+
+- `crates/server-core/src/coordinator/core_tests.rs`
+- `crates/server-core/src/coordinator/access_control_tests.rs`
+
+The same-PG lock/deadlock coverage now uses explicit deterministic probes at
+the real sensitive seams instead of helper threads plus `recv_timeout(...)`.
+
+### Rescan Result
+
+A repo-wide rescan of local `server-core` and `storage` tests no longer finds
+remaining `recv_timeout(...)` or sleep-based waits in those harnesses.
+
+### Notes From Cleanup
+
+- Background lifecycle sweepers were a repeated hidden source of flakiness in
+  supposedly unrelated tests. Several same-PG and lifecycle-sensitive tests had
+  to switch to no-sweeper coordinator setup so the explicit test actor was the
+  only actor mutating state.
+- A coarse “request started” or “bucket handle loaded” hook is not enough for
+  deadlock/non-blocking tests. The harness must probe the actual late-sensitive
+  seam, otherwise regressions merely move from “timeout” to “hang forever”.
+- Deterministic deadlock tests work better when they fail with explicit probe
+  errors like “would block before X” rather than depending on elapsed time.
+- Test-only hooks must stay test-only. One intermediate version exposed hook
+  installation in normal builds, which widened production surface
+  unnecessarily; these hooks were moved behind test-only gating.
+- Shared-storage concurrency tests also need background workers disabled when
+  those workers can acquire the same PG/lock surface being probed, otherwise
+  the probe catches unrelated interference instead of the targeted regression.
+
 ## Phase 3: Remove Production Sleep Loops
+
+Status: next.
 
 Production sleeps are not a test flake issue, but they are still the wrong
 pattern.
@@ -93,13 +139,14 @@ pattern.
 3. Add focused regressions around the intended coordination so the new code
    does not regress back to timing-based behavior.
 
+### Current Known Loops
+
+- `crates/storage/src/node/bucket_ops.rs:65`
+- `crates/storage/src/node/bucket_ops.rs:84`
+- `crates/storage/src/node/bucket_ops.rs:422`
+
 ## Order
 
 Recommended order:
 
-1. `multipart_stateful_tests.rs`
-2. `test_support.rs`
-3. `storage/src/node.rs` test helpers
-4. `access_control_tests.rs`
-5. `core_tests.rs`
-6. production sleep-loop cleanup in `storage/src/node/bucket_ops.rs`
+1. production sleep-loop cleanup in `storage/src/node/bucket_ops.rs`
