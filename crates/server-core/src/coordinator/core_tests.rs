@@ -1260,6 +1260,7 @@ fn put_object_does_not_wait_for_bucket_lock() {
             after_loaded: Some(Arc::new(move || {
                 let _ = event_tx.send(LockWaitEvent::Progress);
             })),
+            ..BucketWriteHandleTestHooks::default()
         });
     let (tx, rx) = mpsc::channel();
     let handle = thread::spawn(move || {
@@ -1330,6 +1331,7 @@ fn create_multipart_upload_does_not_wait_for_bucket_lock() {
             after_loaded: Some(Arc::new(move || {
                 let _ = event_tx.send(LockWaitEvent::Progress);
             })),
+            ..BucketWriteHandleTestHooks::default()
         });
     let (tx, rx) = mpsc::channel();
     let handle = thread::spawn(move || {
@@ -1857,6 +1859,7 @@ fn complete_multipart_upload_does_not_wait_for_bucket_lock() {
             after_loaded: Some(Arc::new(move || {
                 let _ = event_tx.send(LockWaitEvent::Progress);
             })),
+            ..BucketWriteHandleTestHooks::default()
         });
     let (tx, rx) = mpsc::channel();
     let handle = thread::spawn(move || {
@@ -2023,10 +2026,15 @@ fn complete_multipart_upload_does_not_deadlock_when_bucket_policy_shares_pg() {
         tx.send(res).unwrap();
     });
 
-    assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
+    let event = event_rx.recv().unwrap();
     let res = rx
         .recv()
         .expect("complete_multipart_upload should not deadlock on bucket policy lookup");
+    assert_eq!(
+        event,
+        LockWaitEvent::Progress,
+        "complete_multipart_upload returned before the expected progress point: {res:?}"
+    );
     assert!(
         res.is_ok(),
         "complete_multipart_upload should succeed when bucket policy shares the metadata PG: {res:?}"

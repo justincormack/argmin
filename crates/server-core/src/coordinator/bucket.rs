@@ -10,7 +10,7 @@ use storage::{
 };
 
 #[cfg(test)]
-use super::trusted_bucket_name;
+use super::{should_probe_bucket_mutation_write, trusted_bucket_name};
 use super::{
     AuthorizedBucketSubresourceDelete, AuthorizedBucketSubresourceGet,
     AuthorizedBucketSubresourcePut, AuthorizedDeleteBucket, AuthorizedHeadBucket,
@@ -748,6 +748,19 @@ impl Coordinator {
             req.config.len()
         );
         let authorized = self.authorize_put_bucket_lifecycle(req)?;
+        #[cfg(test)]
+        if should_probe_bucket_mutation_write(authorized.bucket.as_str()) {
+            let bucket_pg_ready = self
+                .storage_node
+                .try_probe_bucket_pg_available(&authorized.bucket)
+                .map_err(Self::map_bucket_snapshot_load_error)?;
+            if !bucket_pg_ready {
+                return Err(ServerError::InternalError {
+                    reason: "test probe: bucket pg still locked before put_bucket_lifecycle write"
+                        .to_string(),
+                });
+            }
+        }
         let info = self.store_bucket_subresource(
             &authorized.bucket,
             storage::PutBucketSubresource {
@@ -939,6 +952,19 @@ impl Coordinator {
         &self,
         authorized: &AuthorizedPutBucketAcl,
     ) -> Result<(), ServerError> {
+        #[cfg(test)]
+        if should_probe_bucket_mutation_write(authorized.bucket.as_str()) {
+            let bucket_pg_ready = self
+                .storage_node
+                .try_probe_bucket_pg_available(&authorized.bucket)
+                .map_err(Self::map_bucket_snapshot_load_error)?;
+            if !bucket_pg_ready {
+                return Err(ServerError::InternalError {
+                    reason: "test probe: bucket pg still locked before put_bucket_acl write"
+                        .to_string(),
+                });
+            }
+        }
         let info = self
             .storage_node
             .put_bucket_acl_and_load_info(

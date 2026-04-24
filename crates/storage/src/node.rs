@@ -476,6 +476,45 @@ impl SharedStorageNode {
         }
     }
 
+    #[cfg(feature = "test-hooks")]
+    pub fn try_probe_bucket_pg_available(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        let pg_id = self.pg_topology.bucket_pg_for(bucket);
+        let Some(pg) = self.stores.get(&pg_id) else {
+            return Err(StoreError::PgNotFound { pg_id }.into());
+        };
+        match pg.try_lock() {
+            Ok(_guard) => Ok(true),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(false),
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                drop(error.into_inner());
+                Ok(true)
+            }
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn try_probe_object_pg_available(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<bool, ObjectPgActionError> {
+        let pg_id = self.pg_topology.object_pg_for(bucket, key);
+        let Some(pg) = self.stores.get(&pg_id) else {
+            return Err(StoreError::PgNotFound { pg_id }.into());
+        };
+        match pg.try_lock() {
+            Ok(_guard) => Ok(true),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(false),
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                drop(error.into_inner());
+                Ok(true)
+            }
+        }
+    }
+
     /// Lock a bucket-scoped stripe mutex used to serialize multipart
     /// completion publication order across coordinators.
     pub fn lock_multipart_completion_bucket(&self, bucket: &BucketName) -> BucketLockGuard<'_> {

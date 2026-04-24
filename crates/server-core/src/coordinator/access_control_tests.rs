@@ -2,9 +2,67 @@ use super::test_helpers::{self, UploadPartRequest};
 use super::test_support::*;
 use super::*;
 use crate::coordinator::authz::BucketPolicyRequestContext;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
+
+#[derive(Debug, PartialEq, Eq)]
+enum SamePgProgressEvent {
+    Progress,
+    CompletedEarly,
+}
+
+fn run_same_pg_bucket_write_handle_progress_test<T: Send + 'static>(
+    bucket: &str,
+    action: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let (event_tx, event_rx) = mpsc::channel();
+    let progress_seen = Arc::new(AtomicBool::new(false));
+    let event_tx_hook = event_tx.clone();
+    let progress_seen_hook = Arc::clone(&progress_seen);
+    let _hook_guard = install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+        bucket: Some(bucket.to_string()),
+        after_loaded: Some(Arc::new(move || {
+            progress_seen_hook.store(true, Ordering::SeqCst);
+            let _ = event_tx_hook.send(SamePgProgressEvent::Progress);
+        })),
+        ..BucketWriteHandleTestHooks::default()
+    });
+    let (tx, rx) = mpsc::channel();
+    let event_tx_complete = event_tx.clone();
+    let progress_seen_complete = Arc::clone(&progress_seen);
+    let handle = thread::spawn(move || {
+        let res = action();
+        if !progress_seen_complete.load(Ordering::SeqCst) {
+            let _ = event_tx_complete.send(SamePgProgressEvent::CompletedEarly);
+        }
+        tx.send(res).unwrap();
+    });
+
+    assert_eq!(event_rx.recv().unwrap(), SamePgProgressEvent::Progress);
+    let res = rx.recv().unwrap();
+    handle.join().unwrap();
+    res
+}
+
+fn run_same_pg_probe_test<T>(
+    bucket: &str,
+    mut hooks: BucketWriteHandleTestHooks,
+    action: impl FnOnce() -> T,
+) -> T {
+    let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    hooks.bucket = Some(bucket.to_string());
+    let _hook_guard = install_bucket_write_handle_test_hooks(hooks);
+    action()
+}
 
 #[test]
 fn put_object_rejects_non_owner_requester() {
@@ -3388,13 +3446,14 @@ fn bucket_lifecycle_cache_invalidates_across_coordinators_on_replace() {
 #[test]
 fn put_object_bucket_lifecycle_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator_with_pg_count(tmp.path(), 1);
+    let bucket = "bucket-put-lifecycle-same-pg";
+    let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
     coord
-        .create_bucket_for_owner("owner-a", "bucket", false)
+        .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
     put_bucket_versioning_test(
         &coord,
-        "bucket",
+        bucket,
         BucketVersioningState::Enabled,
         test_helpers::requester("owner-a"),
         None,
@@ -3402,7 +3461,7 @@ fn put_object_bucket_lifecycle_same_pg_completes_without_deadlock() {
     .unwrap();
     put_bucket_versioning_test(
         &coord,
-        "bucket",
+        bucket,
         BucketVersioningState::Suspended,
         test_helpers::requester("owner-a"),
         None,
@@ -3410,7 +3469,7 @@ fn put_object_bucket_lifecycle_same_pg_completes_without_deadlock() {
     .unwrap();
     put_bucket_lifecycle_test(
         &coord,
-        "bucket",
+        bucket,
         "<LifecycleConfiguration>\
             <Rule>\
                 <ID>expire-soon</ID>\
@@ -3424,99 +3483,103 @@ fn put_object_bucket_lifecycle_same_pg_completes_without_deadlock() {
     )
     .unwrap();
 
-    let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let res = test_helpers::put_object(
-            &coord,
-            &PutObjectRequest {
-                encryption: WriteEncryptionRequest::none(),
-                policy_context: PutObjectPolicyContext::default(),
-                object_lock: ObjectLockState::default(),
-                object: object_request_with_expected_owner(
-                    "bucket",
-                    "logs/key",
-                    test_helpers::requester("owner-a"),
-                    None,
-                ),
-                data: b"data",
-                metadata: &MetadataBlob::new(),
-                system_metadata: &SystemMetadata::EMPTY,
-                tags: None,
-                cond: NO_WRITE,
-                acl: NO_PUT_OBJECT_ACL.into(),
-            },
-        );
-        tx.send(res.map(|result| result.version_id)).unwrap();
-    });
-
-    let version_id = rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("put_object with bucket lifecycle should not self-deadlock")
-        .unwrap();
+    let version_id = run_same_pg_probe_test(
+        bucket,
+        BucketWriteHandleTestHooks {
+            probe_direct_put_commit: true,
+            ..BucketWriteHandleTestHooks::default()
+        },
+        move || {
+            test_helpers::put_object(
+                &coord,
+                &PutObjectRequest {
+                    encryption: WriteEncryptionRequest::none(),
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
+                    object: object_request_with_expected_owner(
+                        bucket,
+                        "logs/key",
+                        test_helpers::requester("owner-a"),
+                        None,
+                    ),
+                    data: b"data",
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    tags: None,
+                    cond: NO_WRITE,
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                },
+            )
+            .map(|result| result.version_id)
+        },
+    )
+    .unwrap();
     assert_eq!(version_id, VersionId::Null);
-    handle.join().unwrap();
 }
 
 #[test]
 fn put_object_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator_with_pg_count(tmp.path(), 1);
+    let bucket = "bucket-put-policy-same-pg";
+    let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
     coord
-        .create_bucket_for_owner("owner-a", "bucket", false)
+        .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
     put_bucket_policy_test(
         &coord,
-        "bucket",
-        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"owner-a"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        bucket,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"owner-a"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket-put-policy-same-pg/*"}]}"#,
         test_helpers::requester("owner-a"),
         None,
     )
     .unwrap();
-    coord.clear_bucket_policy_cache(&trusted_bucket_name("bucket"));
+    coord.clear_bucket_policy_cache(&trusted_bucket_name(bucket));
 
-    let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let res = test_helpers::put_object(
-            &coord,
-            &PutObjectRequest {
-                encryption: WriteEncryptionRequest::none(),
-                policy_context: PutObjectPolicyContext::default(),
-                object_lock: ObjectLockState::default(),
-                object: object_request_with_expected_owner(
-                    "bucket",
-                    "key",
-                    test_helpers::requester("owner-a"),
-                    None,
-                ),
-                data: b"data",
-                metadata: &MetadataBlob::new(),
-                system_metadata: &SystemMetadata::EMPTY,
-                tags: None,
-                cond: NO_WRITE,
-                acl: NO_PUT_OBJECT_ACL.into(),
-            },
-        );
-        tx.send(res.map(|result| result.version_id)).unwrap();
-    });
-
-    let version_id = rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("put_object with bucket policy should not self-deadlock")
-        .unwrap();
+    let version_id = run_same_pg_probe_test(
+        bucket,
+        BucketWriteHandleTestHooks {
+            probe_direct_put_commit: true,
+            ..BucketWriteHandleTestHooks::default()
+        },
+        move || {
+            test_helpers::put_object(
+                &coord,
+                &PutObjectRequest {
+                    encryption: WriteEncryptionRequest::none(),
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
+                    object: object_request_with_expected_owner(
+                        bucket,
+                        "key",
+                        test_helpers::requester("owner-a"),
+                        None,
+                    ),
+                    data: b"data",
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    tags: None,
+                    cond: NO_WRITE,
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                },
+            )
+            .map(|result| result.version_id)
+        },
+    )
+    .unwrap();
     assert_eq!(version_id, VersionId::Null);
-    handle.join().unwrap();
 }
 
 #[test]
 fn create_multipart_upload_bucket_lifecycle_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator_with_pg_count(tmp.path(), 1);
+    let bucket = "bucket-create-mpu-lifecycle-same-pg";
+    let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
     coord
-        .create_bucket_for_owner("owner-a", "bucket", false)
+        .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
     put_bucket_lifecycle_test(
         &coord,
-        "bucket",
+        bucket,
         "<LifecycleConfiguration>\
             <Rule>\
                 <ID>abort-mpu</ID>\
@@ -3530,47 +3593,42 @@ fn create_multipart_upload_bucket_lifecycle_same_pg_completes_without_deadlock()
     )
     .unwrap();
 
-    let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let res = coord.create_multipart_upload(&CreateMultipartUploadRequest {
-            object: object_request_with_expected_owner(
-                "bucket",
-                "logs/key",
-                test_helpers::requester("owner-a"),
-                None,
-            ),
-            metadata: &MetadataBlob::new(),
-            system_metadata: &SystemMetadata::EMPTY,
-            tags: None,
-            checksum: None,
-            acl: NO_PUT_OBJECT_ACL.into(),
-            encryption: WriteEncryptionRequest::none(),
-            object_lock: ObjectLockState::default(),
-            policy_context: PutObjectPolicyContext::default(),
-        });
-        tx.send(res.map(|result| result.lifecycle_abort.is_some()))
-            .unwrap();
-    });
-
-    let has_abort_header = rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("create_multipart_upload with bucket lifecycle should not self-deadlock")
-        .unwrap();
+    let has_abort_header = run_same_pg_bucket_write_handle_progress_test(bucket, move || {
+        coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request_with_expected_owner(
+                    bucket,
+                    "logs/key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+                acl: NO_PUT_OBJECT_ACL.into(),
+                encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .map(|result| result.lifecycle_abort.is_some())
+    })
+    .unwrap();
     assert!(has_abort_header);
-    handle.join().unwrap();
 }
 
 #[test]
 fn begin_stream_part_bucket_policy_and_abac_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator_with_pg_count(tmp.path(), 1);
+    let bucket = "bucket-begin-part-policy-abac-same-pg";
+    let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
     coord
-        .create_bucket_for_owner("111122223333", "bucket", false)
+        .create_bucket_for_owner("111122223333", bucket, false)
         .unwrap();
     coord
         .put_bucket_tags(&PutBucketConfigRequest {
             bucket: bucket_request_with_expected_owner(
-                "bucket",
+                bucket,
                 test_helpers::requester("111122223333"),
                 None,
             ),
@@ -3581,7 +3639,7 @@ fn begin_stream_part_bucket_policy_and_abac_same_pg_completes_without_deadlock()
     coord
         .put_bucket_abac(&PutBucketAbacRequest {
             bucket: bucket_request_with_expected_owner(
-                "bucket",
+                bucket,
                 test_helpers::requester("111122223333"),
                 None,
             ),
@@ -3590,8 +3648,8 @@ fn begin_stream_part_bucket_policy_and_abac_same_pg_completes_without_deadlock()
         .unwrap();
     put_bucket_policy_test(
         &coord,
-        "bucket",
-        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:BucketTag/security":"public"}}}]}"#,
+        bucket,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket-begin-part-policy-abac-same-pg/*","Condition":{"StringEquals":{"s3:BucketTag/security":"public"}}}]}"#,
         test_helpers::requester("111122223333"),
         None,
     )
@@ -3599,7 +3657,7 @@ fn begin_stream_part_bucket_policy_and_abac_same_pg_completes_without_deadlock()
     let upload = coord
         .create_multipart_upload(&CreateMultipartUploadRequest {
             object: object_request_with_expected_owner(
-                "bucket",
+                bucket,
                 "key",
                 test_helpers::requester("444455556666"),
                 None,
@@ -3615,36 +3673,37 @@ fn begin_stream_part_bucket_policy_and_abac_same_pg_completes_without_deadlock()
         })
         .unwrap();
 
-    let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let res = coord.begin_stream_part(&BeginStreamPartRequest {
-            upload: multipart_object_request_with_expected_owner(
-                "bucket",
-                "key",
-                &upload.upload_id,
-                test_helpers::requester("444455556666"),
-                None,
-            ),
-            part_number: 1,
-            policy_context: PutObjectPolicyContext::default(),
-            sse_customer: None,
-        });
-        tx.send(res.map(|result| result.checksum_algorithm))
-            .unwrap();
-    });
-
-    let checksum_algorithm = rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("begin_stream_part should not self-deadlock on same-pg bucket policy/abac state")
-        .unwrap();
+    let checksum_algorithm = run_same_pg_probe_test(
+        bucket,
+        BucketWriteHandleTestHooks {
+            probe_begin_stream_part_session: true,
+            ..BucketWriteHandleTestHooks::default()
+        },
+        move || {
+            coord
+                .begin_stream_part(&BeginStreamPartRequest {
+                    upload: multipart_object_request_with_expected_owner(
+                        bucket,
+                        "key",
+                        &upload.upload_id,
+                        test_helpers::requester("444455556666"),
+                        None,
+                    ),
+                    part_number: 1,
+                    policy_context: PutObjectPolicyContext::default(),
+                    sse_customer: None,
+                })
+                .map(|result| result.checksum_algorithm)
+        },
+    )
+    .unwrap();
     assert_eq!(checksum_algorithm, None);
-    handle.join().unwrap();
 }
 
 #[test]
 fn finalize_stream_part_reupload_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator_with_pg_count(tmp.path(), 1);
+    let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
     coord
         .create_bucket_for_owner("owner-a", "bucket", false)
         .unwrap();
@@ -3752,14 +3811,15 @@ fn finalize_stream_part_reupload_same_pg_completes_without_deadlock() {
 #[test]
 fn begin_stream_put_bucket_policy_and_abac_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator_with_pg_count(tmp.path(), 1);
+    let bucket = "bucket-begin-put-policy-abac-same-pg";
+    let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
     coord
-        .create_bucket_for_owner("111122223333", "bucket", false)
+        .create_bucket_for_owner("111122223333", bucket, false)
         .unwrap();
     coord
         .put_bucket_tags(&PutBucketConfigRequest {
             bucket: bucket_request_with_expected_owner(
-                "bucket",
+                bucket,
                 test_helpers::requester("111122223333"),
                 None,
             ),
@@ -3770,7 +3830,7 @@ fn begin_stream_put_bucket_policy_and_abac_same_pg_completes_without_deadlock() 
     coord
         .put_bucket_abac(&PutBucketAbacRequest {
             bucket: bucket_request_with_expected_owner(
-                "bucket",
+                bucket,
                 test_helpers::requester("111122223333"),
                 None,
             ),
@@ -3779,49 +3839,45 @@ fn begin_stream_put_bucket_policy_and_abac_same_pg_completes_without_deadlock() 
         .unwrap();
     put_bucket_policy_test(
         &coord,
-        "bucket",
-        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:BucketTag/security":"public"}}}]}"#,
+        bucket,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket-begin-put-policy-abac-same-pg/*","Condition":{"StringEquals":{"s3:BucketTag/security":"public"}}}]}"#,
         test_helpers::requester("111122223333"),
         None,
     )
     .unwrap();
 
-    let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let res = coord.begin_stream_put(&AuthorizePutObjectRequest {
-            object: object_request_with_expected_owner(
-                "bucket",
-                "key",
-                test_helpers::requester("444455556666"),
-                None,
-            ),
-            acl: NO_PUT_OBJECT_ACL.into(),
-            policy_context: PutObjectPolicyContext::default(),
-            object_lock: ObjectLockState::default(),
-            tags: None,
-            encryption: WriteEncryptionRequest::none(),
-        });
-        tx.send(res.map(|prepared| prepared.session_id)).unwrap();
-    });
-
-    let session_id = rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("begin_stream_put should not self-deadlock on same-pg bucket policy/abac state")
-        .unwrap();
+    let session_id = run_same_pg_bucket_write_handle_progress_test(bucket, move || {
+        coord
+            .begin_stream_put(&AuthorizePutObjectRequest {
+                object: object_request_with_expected_owner(
+                    bucket,
+                    "key",
+                    test_helpers::requester("444455556666"),
+                    None,
+                ),
+                acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                tags: None,
+                encryption: WriteEncryptionRequest::none(),
+            })
+            .map(|prepared| prepared.session_id)
+    })
+    .unwrap();
     assert_eq!(session_id.as_str().len(), storage::SESSION_ID_LEN);
-    handle.join().unwrap();
 }
 
 #[test]
 fn finalize_stream_put_bucket_lifecycle_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator_with_pg_count(tmp.path(), 1);
+    let bucket = "bucket-finalize-put-lifecycle-same-pg";
+    let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
     coord
-        .create_bucket_for_owner("owner-a", "bucket", false)
+        .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
     put_bucket_lifecycle_test(
         &coord,
-        "bucket",
+        bucket,
         "<LifecycleConfiguration>\
             <Rule>\
                 <ID>expire-soon</ID>\
@@ -3837,7 +3893,7 @@ fn finalize_stream_put_bucket_lifecycle_same_pg_completes_without_deadlock() {
 
     let session_id = begin_stream_put_with_authorized_request_test(
         &coord,
-        object_request("bucket", "logs/key", test_helpers::requester("owner-a")),
+        object_request(bucket, "logs/key", test_helpers::requester("owner-a")),
         NO_PUT_OBJECT_ACL.into(),
         PutObjectPolicyContext::default(),
         WriteEncryptionRequest::none(),
@@ -3846,7 +3902,7 @@ fn finalize_stream_put_bucket_lifecycle_same_pg_completes_without_deadlock() {
     .unwrap();
     coord
         .append_stream_put_data(
-            &trusted_bucket_name("bucket"),
+            &trusted_bucket_name(bucket),
             &trusted_object_key("logs/key"),
             &session_id,
             0,
@@ -3855,56 +3911,64 @@ fn finalize_stream_put_bucket_lifecycle_same_pg_completes_without_deadlock() {
         )
         .unwrap();
 
-    let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let res = coord.finalize_stream_put(&FinalizeStreamPutRequest {
-            object: object_request("bucket", "logs/key", test_helpers::requester("owner-a")),
-            session_id: &session_id,
-            crc64: checksum::crc64::checksum(b"data"),
-            total_size: 4,
-            metadata_blob: &MetadataBlob::new(),
-            system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
-            tags: None,
-            cond: NO_WRITE,
-            acl: NO_PUT_OBJECT_ACL.into(),
-            policy_context: PutObjectPolicyContext::default(),
-            requested_object_lock: ObjectLockState::default(),
-        });
-        tx.send(res.map(|result| result.version_id)).unwrap();
-    });
-
-    let version_id = rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("finalize_stream_put with bucket lifecycle should not self-deadlock")
-        .unwrap();
+    let version_id = run_same_pg_probe_test(
+        bucket,
+        BucketWriteHandleTestHooks {
+            probe_finalize_stream_put_commit: true,
+            ..BucketWriteHandleTestHooks::default()
+        },
+        move || {
+            coord
+                .finalize_stream_put(&FinalizeStreamPutRequest {
+                    object: object_request(bucket, "logs/key", test_helpers::requester("owner-a")),
+                    session_id: &session_id,
+                    crc64: checksum::crc64::checksum(b"data"),
+                    total_size: 4,
+                    metadata_blob: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    write_encryption: ActiveWriteEncryptionRef::None,
+                    tags: None,
+                    cond: NO_WRITE,
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                    policy_context: PutObjectPolicyContext::default(),
+                    requested_object_lock: ObjectLockState::default(),
+                })
+                .map(|result| result.version_id)
+        },
+    )
+    .unwrap();
     assert_eq!(version_id, VersionId::Null);
-    handle.join().unwrap();
 }
 
 #[test]
 fn put_bucket_lifecycle_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator_with_pg_count(tmp.path(), 1);
+    let bucket = "bucket-put-lifecycle-policy-same-pg";
+    let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
     coord
-        .create_bucket_for_owner("owner-a", "bucket", false)
+        .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
     put_bucket_policy_test(
         &coord,
-        "bucket",
-        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"owner-a"},"Action":"s3:PutLifecycleConfiguration","Resource":"arn:aws:s3:::bucket"}]}"#,
+        bucket,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"owner-a"},"Action":"s3:PutLifecycleConfiguration","Resource":"arn:aws:s3:::bucket-put-lifecycle-policy-same-pg"}]}"#,
         test_helpers::requester("owner-a"),
         None,
     )
     .unwrap();
-    coord.clear_bucket_policy_cache(&trusted_bucket_name("bucket"));
+    coord.clear_bucket_policy_cache(&trusted_bucket_name(bucket));
 
-    let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let res = put_bucket_lifecycle_test(
-            &coord,
-            "bucket",
-            "<LifecycleConfiguration>\
+    run_same_pg_probe_test(
+        bucket,
+        BucketWriteHandleTestHooks {
+            probe_bucket_mutation_write: true,
+            ..BucketWriteHandleTestHooks::default()
+        },
+        move || {
+            put_bucket_lifecycle_test(
+                &coord,
+                bucket,
+                "<LifecycleConfiguration>\
                 <Rule>\
                     <ID>expire</ID>\
                     <Filter><Prefix>logs/</Prefix></Filter>\
@@ -3912,59 +3976,57 @@ fn put_bucket_lifecycle_bucket_policy_same_pg_completes_without_deadlock() {
                     <Expiration><Days>3</Days></Expiration>\
                 </Rule>\
             </LifecycleConfiguration>",
-            test_helpers::requester("owner-a"),
-            None,
-        );
-        tx.send(res).unwrap();
-    });
-
-    rx.recv_timeout(Duration::from_secs(1))
-        .expect("put_bucket_lifecycle with bucket policy should not self-deadlock")
-        .unwrap();
-    handle.join().unwrap();
+                test_helpers::requester("owner-a"),
+                None,
+            )
+        },
+    )
+    .unwrap();
 }
 
 #[test]
 fn put_bucket_acl_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator_with_pg_count(tmp.path(), 1);
+    let bucket = "bucket-put-acl-policy-same-pg";
+    let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
     coord
-        .create_bucket_for_owner("owner-a", "bucket", false)
+        .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
     put_bucket_policy_test(
         &coord,
-        "bucket",
-        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"owner-a"},"Action":"s3:PutBucketAcl","Resource":"arn:aws:s3:::bucket"}]}"#,
+        bucket,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"owner-a"},"Action":"s3:PutBucketAcl","Resource":"arn:aws:s3:::bucket-put-acl-policy-same-pg"}]}"#,
         test_helpers::requester("owner-a"),
         None,
     )
     .unwrap();
-    coord.clear_bucket_policy_cache(&trusted_bucket_name("bucket"));
+    coord.clear_bucket_policy_cache(&trusted_bucket_name(bucket));
 
-    let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let res = coord.put_bucket_acl(&PutBucketAclRequest {
-            bucket: bucket_request_with_expected_owner(
-                "bucket",
-                test_helpers::requester("owner-a"),
-                None,
-            ),
-            acl: PutBucketAclInput::Canned(BucketAcl::Private),
-            policy_context: PutObjectPolicyContext::default(),
-        });
-        tx.send(res).unwrap();
-    });
-
-    rx.recv_timeout(Duration::from_secs(1))
-        .expect("put_bucket_acl with bucket policy should not self-deadlock")
-        .unwrap();
-    handle.join().unwrap();
+    run_same_pg_probe_test(
+        bucket,
+        BucketWriteHandleTestHooks {
+            probe_bucket_mutation_write: true,
+            ..BucketWriteHandleTestHooks::default()
+        },
+        move || {
+            coord.put_bucket_acl(&PutBucketAclRequest {
+                bucket: bucket_request_with_expected_owner(
+                    bucket,
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                acl: PutBucketAclInput::Canned(BucketAcl::Private),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+        },
+    )
+    .unwrap();
 }
 
 #[test]
 fn get_object_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
-    let (admin, reader) = setup_coordinators_with_single_pg(tmp.path());
+    let (admin, reader) = setup_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
     admin
         .create_bucket_for_owner("owner-a", "bucket", false)
         .unwrap();
@@ -4022,7 +4084,7 @@ fn get_object_bucket_policy_same_pg_completes_without_deadlock() {
 #[test]
 fn get_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
-    let (admin, reader) = setup_coordinators_with_single_pg(tmp.path());
+    let (admin, reader) = setup_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
     admin
         .create_bucket_for_owner("owner-a", "bucket", false)
         .unwrap();
@@ -4083,7 +4145,7 @@ fn get_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
 #[test]
 fn put_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator_with_pg_count(tmp.path(), 1);
+    let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
     coord
         .create_bucket_for_owner("owner-a", "bucket", false)
         .unwrap();
@@ -4141,7 +4203,7 @@ fn put_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
 #[test]
 fn get_object_retention_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
-    let (admin, reader) = setup_coordinators_with_single_pg(tmp.path());
+    let (admin, reader) = setup_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
     let owner_requester = test_helpers::requester("owner-a");
 
     admin
@@ -4224,7 +4286,7 @@ fn get_object_retention_bucket_policy_same_pg_completes_without_deadlock() {
 #[test]
 fn delete_object_object_lock_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
-    let (admin, deleter) = setup_coordinators_with_single_pg(tmp.path());
+    let (admin, deleter) = setup_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
     let owner_requester = test_helpers::requester("owner-a");
 
     admin

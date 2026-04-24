@@ -116,6 +116,24 @@ pub(crate) fn setup_coordinator_with_pg_count(dir: &Path, pg_count: u32) -> Coor
     .unwrap()
 }
 
+pub(crate) fn setup_coordinator_with_pg_count_without_lifecycle_sweeper(
+    dir: &Path,
+    pg_count: u32,
+) -> Coordinator {
+    let pg_ids: Vec<u32> = (0..pg_count).collect();
+    let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
+    let ec_config = EcConfig::default();
+    Coordinator::new_with_lifecycle_sweeper_factory(
+        storage_node,
+        ec_config,
+        "us-east-1".to_string(),
+        None,
+        Some(test_sse_s3_provider()),
+        |_, _| Ok(LifecycleSweeper::disabled()),
+    )
+    .unwrap()
+}
+
 pub(crate) fn setup_coordinator_without_managed_key_provider(dir: &Path) -> Coordinator {
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
@@ -179,8 +197,22 @@ pub(crate) fn setup_coordinators_with_pg_count(
     )
 }
 
-pub(crate) fn setup_coordinators_with_single_pg(dir: &Path) -> (Coordinator, Coordinator) {
-    setup_coordinators_with_pg_count(dir, 1)
+pub(crate) fn setup_coordinators_with_pg_count_without_lifecycle_sweeper(
+    dir: &Path,
+    pg_count: u32,
+) -> (Coordinator, Coordinator) {
+    let pg_ids: Vec<u32> = (0..pg_count).collect();
+    let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
+    (
+        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node)),
+        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(storage_node),
+    )
+}
+
+pub(crate) fn setup_coordinators_with_single_pg_without_lifecycle_sweeper(
+    dir: &Path,
+) -> (Coordinator, Coordinator) {
+    setup_coordinators_with_pg_count_without_lifecycle_sweeper(dir, 1)
 }
 
 pub(crate) fn setup_coordinator_with_sse_c(dir: &Path) -> Coordinator {

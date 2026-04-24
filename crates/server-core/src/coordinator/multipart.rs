@@ -13,8 +13,6 @@ use super::authz_results::{
 };
 use super::bucket_handles::{BucketHandleLoader, BucketHandleRequest};
 #[cfg(test)]
-use super::maybe_run_bucket_write_handle_loaded_hook;
-#[cfg(test)]
 use super::maybe_run_multipart_complete_pre_commit_hook;
 use super::object_state::StaleObjectPayload;
 use super::request_types::{
@@ -31,6 +29,8 @@ use super::{
     COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT, MAX_LIST_RECORDS, MAX_PARTS, MIN_PART_SIZE,
     TRACE_TARGET,
 };
+#[cfg(test)]
+use super::{maybe_run_bucket_write_handle_loaded_hook, should_probe_begin_stream_part_session};
 use crate::checksum_claim::ChecksumClaim;
 use crate::conditional::{check_write_conditions, WriteCondition};
 use crate::error::ServerError;
@@ -109,6 +109,27 @@ impl Coordinator {
                             expected_bucket_owner,
                             request,
                         )?;
+                    #[cfg(test)]
+                    maybe_run_bucket_write_handle_loaded_hook(
+                        req.upload.bucket_name_typed().as_str(),
+                    );
+                    #[cfg(test)]
+                    if should_probe_begin_stream_part_session(req.upload.bucket_name()) {
+                        let object_pg_ready = self
+                            .storage_node
+                            .try_probe_object_pg_available(
+                                req.upload.bucket_name_typed(),
+                                req.upload.key_typed(),
+                            )
+                            .map_err(Coordinator::map_object_pg_action_error)?;
+                        if !object_pg_ready {
+                            return Err(ServerError::InternalError {
+                                reason:
+                                    "test probe: object pg still locked before begin_stream_part session"
+                                        .to_string(),
+                            });
+                        }
+                    }
                     self.storage_node
                         .begin_upload_part_stream_session(
                             req.upload.bucket_name_typed(),

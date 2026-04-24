@@ -31,6 +31,10 @@ pub(super) static BUCKET_POLICY_LOAD_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock
 pub(super) struct BucketWriteHandleTestHooks {
     pub(super) bucket: Option<String>,
     pub(super) after_loaded: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub(super) probe_direct_put_commit: bool,
+    pub(super) probe_begin_stream_part_session: bool,
+    pub(super) probe_finalize_stream_put_commit: bool,
+    pub(super) probe_bucket_mutation_write: bool,
 }
 
 pub(super) static BUCKET_WRITE_HANDLE_TEST_HOOKS: OnceLock<Mutex<BucketWriteHandleTestHooks>> =
@@ -261,6 +265,35 @@ pub(super) fn maybe_run_bucket_write_handle_loaded_hook(bucket: &str) {
             hook();
         }
     }
+}
+
+fn bucket_write_handle_test_hooks_for(bucket: &str) -> BucketWriteHandleTestHooks {
+    let hooks = BUCKET_WRITE_HANDLE_TEST_HOOKS
+        .get_or_init(|| Mutex::new(BucketWriteHandleTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks.bucket.as_ref().is_some_and(|target| target == bucket) {
+        hooks
+    } else {
+        BucketWriteHandleTestHooks::default()
+    }
+}
+
+pub(super) fn should_probe_direct_put_commit(bucket: &str) -> bool {
+    bucket_write_handle_test_hooks_for(bucket).probe_direct_put_commit
+}
+
+pub(super) fn should_probe_begin_stream_part_session(bucket: &str) -> bool {
+    bucket_write_handle_test_hooks_for(bucket).probe_begin_stream_part_session
+}
+
+pub(super) fn should_probe_finalize_stream_put_commit(bucket: &str) -> bool {
+    bucket_write_handle_test_hooks_for(bucket).probe_finalize_stream_put_commit
+}
+
+pub(super) fn should_probe_bucket_mutation_write(bucket: &str) -> bool {
+    bucket_write_handle_test_hooks_for(bucket).probe_bucket_mutation_write
 }
 
 pub(super) fn should_probe_multipart_complete_auth_lookup(bucket: &str, key: &str) -> bool {

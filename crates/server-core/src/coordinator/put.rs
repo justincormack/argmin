@@ -4,6 +4,11 @@ use storage::{
 };
 
 use super::bucket_handles::{BucketHandleLoader, BucketHandleRequest};
+#[cfg(test)]
+use super::{
+    maybe_run_bucket_write_handle_loaded_hook, should_probe_direct_put_commit,
+    should_probe_finalize_stream_put_commit,
+};
 use super::{
     ActiveWriteEncryption, AuthorizePutObjectRequest, AuthorizedFinalizeStreamPutRequest,
     AuthorizedPutObjectCommitRequest, AuthorizedPutObjectWrite, AuthorizedWriteTags, Coordinator,
@@ -176,6 +181,22 @@ impl Coordinator {
                 segment_vid,
                 shard_pg_id,
             };
+            #[cfg(test)]
+            if should_probe_direct_put_commit(authorized.bucket()) {
+                let object_pg_ready = self
+                    .storage_node
+                    .try_probe_object_pg_available(
+                        authorized.bucket_typed(),
+                        authorized.key_typed(),
+                    )
+                    .map_err(Coordinator::map_object_pg_action_error)?;
+                if !object_pg_ready {
+                    return Err(ServerError::InternalError {
+                        reason: "test probe: object pg still locked before direct put commit"
+                            .to_string(),
+                    });
+                }
+            }
             let outcome = self
                 .storage_node
                 .commit_direct_put_object(&commit_req, &written_shard_acks, |snapshot| {
@@ -274,6 +295,10 @@ impl Coordinator {
                             req.object.expected_bucket_owner(),
                             request,
                         )?;
+                    #[cfg(test)]
+                    maybe_run_bucket_write_handle_loaded_hook(
+                        req.object.bucket.name_typed().as_str(),
+                    );
                     let authorized_write = self.authorize_put_object_write_with_existing_object(
                         req,
                         &bucket,
@@ -423,6 +448,23 @@ impl Coordinator {
             Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
             let resolved_object_lock =
                 Self::resolve_new_object_lock_state(&bucket_info, req.requested_object_lock)?;
+            #[cfg(test)]
+            if should_probe_finalize_stream_put_commit(req.object.bucket_name()) {
+                let object_pg_ready = self
+                    .storage_node
+                    .try_probe_object_pg_available(
+                        req.object.bucket_name_typed(),
+                        req.object.key_typed(),
+                    )
+                    .map_err(Coordinator::map_object_pg_action_error)?;
+                if !object_pg_ready {
+                    return Err(ServerError::InternalError {
+                        reason:
+                            "test probe: object pg still locked before finalize_stream_put commit"
+                                .to_string(),
+                    });
+                }
+            }
             let outcome = self
                 .storage_node
                 .finalize_put_object_stream(
