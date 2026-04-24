@@ -3,6 +3,7 @@ use super::test_topology::*;
 use super::*;
 use crate::conditional::ReadCondition;
 use crate::metadata_blob::MetadataBlob;
+use crate::pg::PgTopology;
 use crate::sse::ManagedWrappingKeyConfig;
 use crate::system_metadata::SystemMetadata;
 use ec::EcConfig;

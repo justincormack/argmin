@@ -8,10 +8,10 @@ use storage::{
 
 use super::object_state::SnapshottedMultipartPart;
 use super::payload::{PayloadBufferPool, SharedPayloadBuffer};
-#[cfg(test)]
-use super::PgTopology;
 use super::TRACE_TARGET;
 use crate::error::ServerError;
+#[cfg(test)]
+use crate::pg::PgTopology;
 use crate::sse::{SseCustomerRequest, SseCustomerValidatorConfig, StaticManagedKeyProvider};
 
 #[derive(Debug, Clone)]

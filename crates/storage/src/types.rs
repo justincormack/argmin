@@ -2323,6 +2323,12 @@ pub struct WrittenShardAck {
 }
 
 #[derive(Debug, Clone)]
+pub struct DirectPutWrittenSegment {
+    pub shard_pg_id: u32,
+    pub written_shards: Vec<WrittenShardAck>,
+}
+
+#[derive(Debug, Clone)]
 pub struct CommitDirectPutObjectReq {
     pub bucket: BucketName,
     pub key: ObjectKey,

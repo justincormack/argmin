@@ -14,8 +14,10 @@ use super::response_types::BucketSummary;
 use super::runtime::{LifecycleSweeper, ReclaimSweeper};
 #[cfg(test)]
 use super::trusted_bucket_name;
-use super::{Coordinator, PgTopology};
+use super::Coordinator;
 use crate::error::ServerError;
+#[cfg(test)]
+use crate::pg::PgTopology;
 use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
 use storage::{
     BucketFastPathInfo, BucketInfo, BucketName, BucketState, ReclaimWorkItem, SessionId,
@@ -274,6 +276,7 @@ impl Coordinator {
         ) -> Result<Arc<LifecycleSweeper>, ServerError>,
     {
         let ec_codec = Arc::new(ErasureCodec::new(ec_config)?);
+        #[cfg(test)]
         let pg_topology = PgTopology::new(storage_node.pg_ids()).map_err(|reason| {
             ServerError::InternalError {
                 reason: reason.to_string(),
@@ -321,7 +324,6 @@ impl Coordinator {
             storage_node,
             bucket_policy_cache: RwLock::new(HashMap::new()),
             bucket_lifecycle_cache: RwLock::new(HashMap::new()),
-            pg_topology,
             ec_codec,
             ec_config,
             encode_scratch_pool: EncodeScratchPool::new(ec_config),
@@ -344,7 +346,8 @@ impl Coordinator {
             ec_codec: Arc::clone(&self.ec_codec),
             ec_config: self.ec_config,
             #[cfg(test)]
-            pg_topology: self.pg_topology.clone(),
+            pg_topology: PgTopology::new(self.storage_node.pg_ids())
+                .expect("coordinator storage node should expose a valid PG topology"),
             payload_buffer_pool: Arc::clone(&self.payload_buffer_pool),
             sse_c_validator: self.sse_c_validator.clone(),
             managed_key_provider: self.managed_key_provider.clone(),
@@ -374,9 +377,5 @@ impl Coordinator {
 
     pub fn region(&self) -> &str {
         &self.region
-    }
-
-    pub(super) fn shard_pg_id_raw(&self, bucket: &str, key: &str, generation: u64) -> u32 {
-        self.pg_topology.shard_pg(bucket, key, generation)
     }
 }

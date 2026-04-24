@@ -1050,6 +1050,9 @@ access:
   - the direct one-segment `PutObject` fast path now publishes through a
     storage-owned commit helper rather than coordinator `lock_two_pgs(...)`
     choreography
+  - the direct one-segment `PutObject` staging-segment shard placement and
+    durable shard-file write now go through a storage-owned helper rather than
+    coordinator `shard_pg_id_raw(...)` topology calculation
   - lifecycle runtime bucket locking now happens entirely inside storage-owned
     lifecycle transaction helpers
   - multipart completion ordering, serialization, and completed-upload prune

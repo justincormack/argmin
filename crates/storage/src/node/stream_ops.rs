@@ -1,9 +1,9 @@
 use super::*;
 use crate::{
     BucketVersioningState, CommitDirectPutObjectReq, CommitStreamPutReq, DirectPutCommitSnapshot,
-    EcShape, FinalizeDirectPutObjectOutcome, FinalizeStreamPutOutcome, MultipartReclaimPartRecord,
-    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, ObjectEtag, ObjectLayout,
-    ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
+    DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, FinalizeStreamPutOutcome,
+    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
+    ObjectEtag, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
     ObjectSegmentsReclaimSegmentRecord, PrepareStreamUploadSegmentAppendReq,
     PreparedStreamPutCommit, PutLiveObjectReq, StreamPutFinalizeSnapshot, StreamUploadRecord,
     StreamUploadSegmentRecord, VersionId, WrittenShardAck,
@@ -23,6 +23,37 @@ enum StaleObjectPayloadMetadata {
 }
 
 impl SharedStorageNode {
+    pub fn write_direct_put_segment_shards(
+        &self,
+        transient_segment_id: &SessionId,
+        segment_index: u32,
+        segment_vid: GenerationId,
+        segment_okh: &[u8; 16],
+        shard_payloads: &[&[u8]],
+    ) -> Result<DirectPutWrittenSegment, StoreError> {
+        let shard_pg_id = self.pg_topology.shard_pg(
+            &format!("segment/{}", transient_segment_id.as_str()),
+            &segment_index.to_string(),
+            segment_vid.get(),
+        );
+        let mut shard_batch: Vec<(ShardKey, &[u8])> = Vec::with_capacity(shard_payloads.len());
+        for (shard_index, shard_payload) in shard_payloads.iter().enumerate() {
+            shard_batch.push((
+                ShardKey::new(segment_okh, segment_vid.get(), shard_index as u8),
+                *shard_payload,
+            ));
+        }
+        let written_shards = self
+            .write_shard_files(shard_pg_id, &shard_batch)?
+            .into_iter()
+            .map(|(key, ack)| WrittenShardAck { key, ack })
+            .collect();
+        Ok(DirectPutWrittenSegment {
+            shard_pg_id,
+            written_shards,
+        })
+    }
+
     pub fn commit_direct_put_object<E>(
         &self,
         req: &CommitDirectPutObjectReq,

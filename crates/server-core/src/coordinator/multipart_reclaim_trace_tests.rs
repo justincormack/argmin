@@ -1,4 +1,5 @@
 use super::*;
+use crate::pg::PgTopology;
 use ec::EcConfig;
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestCaseResult};

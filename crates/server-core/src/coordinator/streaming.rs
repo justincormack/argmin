@@ -419,13 +419,11 @@ impl Coordinator {
         }
     }
 
-    pub(super) fn write_segment_shards(
+    pub(super) fn with_erasure_coded_shard_payloads<T>(
         &self,
-        shard_pg_id: u32,
-        segment_okh: &[u8; 16],
-        segment_vid: GenerationId,
         data: &[u8],
-    ) -> Result<Vec<WrittenShard>, ServerError> {
+        action: impl FnOnce(&[&[u8]]) -> Result<T, ServerError>,
+    ) -> Result<T, ServerError> {
         let k = self.ec_config.data_shards as usize;
         let m = self.ec_config.parity_shards as usize;
         let remainder = data.len() % k;
@@ -443,7 +441,7 @@ impl Coordinator {
         let data_shards: Vec<&[u8]> = (0..k)
             .map(|i| &shard_source[i * shard_size..(i + 1) * shard_size])
             .collect();
-        let written_shards = if shard_size == 0 {
+        if shard_size == 0 {
             let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| Vec::new()).collect();
             let mut parity_refs: Vec<&mut [u8]> = parity_bufs
                 .iter_mut()
@@ -451,24 +449,10 @@ impl Coordinator {
                 .collect();
             self.ec_codec.encode(&data_shards, &mut parity_refs)?;
 
-            let mut shard_batch: Vec<(ShardKey, &[u8])> = Vec::with_capacity(k + m);
-            for (i, shard_data) in data_shards.iter().enumerate() {
-                shard_batch.push((
-                    ShardKey::new(segment_okh, segment_vid.get(), i as u8),
-                    *shard_data,
-                ));
-            }
-            for (parity_index, shard_data) in parity_bufs.iter().enumerate() {
-                shard_batch.push((
-                    ShardKey::new(segment_okh, segment_vid.get(), (k + parity_index) as u8),
-                    shard_data.as_slice(),
-                ));
-            }
-            self.storage_node
-                .write_shard_files(shard_pg_id, &shard_batch)?
-                .into_iter()
-                .map(|(key, ack)| WrittenShard { key, ack })
-                .collect()
+            let mut shard_payloads: Vec<&[u8]> = Vec::with_capacity(k + m);
+            shard_payloads.extend(data_shards.iter().copied());
+            shard_payloads.extend(parity_bufs.iter().map(std::vec::Vec::as_slice));
+            action(&shard_payloads)
         } else {
             let parity_len =
                 m.checked_mul(shard_size)
@@ -482,27 +466,35 @@ impl Coordinator {
                 self.ec_codec.encode(&data_shards, &mut parity_refs)?;
             }
             let parity = scratch.as_slice(parity_len);
-            let mut shard_batch: Vec<(ShardKey, &[u8])> = Vec::with_capacity(k + m);
-            for (i, shard_data) in data_shards.iter().enumerate() {
+            let mut shard_payloads: Vec<&[u8]> = Vec::with_capacity(k + m);
+            shard_payloads.extend(data_shards.iter().copied());
+            shard_payloads.extend(parity.chunks_exact(shard_size));
+            action(&shard_payloads)
+        }
+    }
+
+    pub(super) fn write_segment_shards(
+        &self,
+        shard_pg_id: u32,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        data: &[u8],
+    ) -> Result<Vec<WrittenShard>, ServerError> {
+        self.with_erasure_coded_shard_payloads(data, |shard_payloads| {
+            let mut shard_batch: Vec<(ShardKey, &[u8])> = Vec::with_capacity(shard_payloads.len());
+            for (shard_index, shard_payload) in shard_payloads.iter().enumerate() {
                 shard_batch.push((
-                    ShardKey::new(segment_okh, segment_vid.get(), i as u8),
-                    *shard_data,
+                    ShardKey::new(segment_okh, segment_vid.get(), shard_index as u8),
+                    *shard_payload,
                 ));
             }
-            for (parity_index, shard_data) in parity.chunks_exact(shard_size).enumerate() {
-                shard_batch.push((
-                    ShardKey::new(segment_okh, segment_vid.get(), (k + parity_index) as u8),
-                    shard_data,
-                ));
-            }
-            self.storage_node
+            Ok(self
+                .storage_node
                 .write_shard_files(shard_pg_id, &shard_batch)?
                 .into_iter()
                 .map(|(key, ack)| WrittenShard { key, ack })
-                .collect()
-        };
-
-        Ok(written_shards)
+                .collect())
+        })
     }
 
     pub(super) fn append_stream_segment_for(

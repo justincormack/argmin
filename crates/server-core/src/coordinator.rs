@@ -142,7 +142,6 @@ use crate::etag::format_etag;
 use crate::metadata_blob::MetadataBlob;
 #[cfg(test)]
 use crate::pg::object_key_hash;
-use crate::pg::PgTopology;
 #[cfg(test)]
 use crate::sse::SSE_C_SEGMENT_TAG_LEN;
 use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
@@ -179,7 +178,6 @@ pub struct Coordinator {
     storage_node: Arc<SharedStorageNode>,
     bucket_policy_cache: RwLock<HashMap<BucketName, CachedBucketPolicy>>,
     bucket_lifecycle_cache: RwLock<HashMap<BucketName, CachedBucketLifecycle>>,
-    pg_topology: PgTopology,
     ec_codec: Arc<ErasureCodec>,
     ec_config: EcConfig,
     encode_scratch_pool: EncodeScratchPool,

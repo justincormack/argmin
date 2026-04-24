@@ -1,6 +1,6 @@
 use storage::{
     BucketName, CommitDirectPutObjectReq, CreateStreamUploadReq, EcShape, GenerationId, ObjectKey,
-    SessionId, StreamPutFinalizeSnapshot, StreamUploadTarget, WrittenShardAck,
+    SessionId, StreamPutFinalizeSnapshot, StreamUploadTarget,
 };
 
 use super::bucket_handles::{BucketHandleLoader, BucketHandleRequest};
@@ -128,15 +128,18 @@ impl Coordinator {
             let segment_index = 0;
             let segment_okh = stream_segment_key_hash(&transient_segment_id, segment_index);
             let segment_vid = GenerationId::MIN;
-            let shard_pg_id = self.shard_pg_id_raw(
-                &format!("segment/{}", transient_segment_id.as_str()),
-                &segment_index.to_string(),
-                segment_vid.get(),
-            );
             let storage_bytes = write_encryption.encrypt_segment(segment_index, req.data)?;
 
-            let written_shards =
-                self.write_segment_shards(shard_pg_id, &segment_okh, segment_vid, &storage_bytes)?;
+            let written_segment =
+                self.with_erasure_coded_shard_payloads(&storage_bytes, |shard_payloads| {
+                    Ok(self.storage_node.write_direct_put_segment_shards(
+                        &transient_segment_id,
+                        segment_index,
+                        segment_vid,
+                        &segment_okh,
+                        shard_payloads,
+                    )?)
+                })?;
 
             let system_metadata = Self::object_system_metadata_with_default_checksum(
                 req.system_metadata,
@@ -150,13 +153,6 @@ impl Coordinator {
             let (system_metadata_blob, encryption) =
                 Self::prepare_stored_system_metadata(&system_metadata, write_encryption)?;
             let metadata_blob = storage::SerializedMetadataBlob::from(req.metadata.serialize()?);
-            let written_shard_acks: Vec<WrittenShardAck> = written_shards
-                .iter()
-                .map(|written| WrittenShardAck {
-                    key: written.key.clone(),
-                    ack: written.ack,
-                })
-                .collect();
             let commit_req = CommitDirectPutObjectReq {
                 bucket: authorized.bucket_typed().clone(),
                 key: authorized.key_typed().clone(),
@@ -179,7 +175,7 @@ impl Coordinator {
                 segment_crc64: Some(checksum::crc64::checksum(&storage_bytes)),
                 segment_okh,
                 segment_vid,
-                shard_pg_id,
+                shard_pg_id: written_segment.shard_pg_id,
             };
             #[cfg(test)]
             if should_probe_direct_put_commit(authorized.bucket()) {
@@ -199,21 +195,25 @@ impl Coordinator {
             }
             let outcome = self
                 .storage_node
-                .commit_direct_put_object(&commit_req, &written_shard_acks, |snapshot| {
-                    if matches!(req.cond, crate::conditional::WriteCondition::IfMatch(_))
-                        && snapshot.existing_etag.is_none()
-                    {
-                        return Err(ServerError::ObjectNotFound {
-                            bucket: authorized.bucket().to_string(),
-                            key: authorized.key().to_string(),
-                        });
-                    }
-                    crate::conditional::check_write_conditions(
-                        req.cond,
-                        snapshot.existing_etag.as_deref(),
-                    )?;
-                    Ok(())
-                })
+                .commit_direct_put_object(
+                    &commit_req,
+                    &written_segment.written_shards,
+                    |snapshot| {
+                        if matches!(req.cond, crate::conditional::WriteCondition::IfMatch(_))
+                            && snapshot.existing_etag.is_none()
+                        {
+                            return Err(ServerError::ObjectNotFound {
+                                bucket: authorized.bucket().to_string(),
+                                key: authorized.key().to_string(),
+                            });
+                        }
+                        crate::conditional::check_write_conditions(
+                            req.cond,
+                            snapshot.existing_etag.as_deref(),
+                        )?;
+                        Ok(())
+                    },
+                )
                 .map_err(Coordinator::map_object_pg_action_error)??;
             let lifecycle_expiration = self
                 .current_object_write_lifecycle_expiration_for_loaded_bucket(
