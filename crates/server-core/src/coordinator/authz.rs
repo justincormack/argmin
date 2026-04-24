@@ -43,6 +43,8 @@ use super::bucket_handles::{
     BucketHandleLoader, BucketHandleRequest, LoadedBucketHandle, LoadedBucketValue,
 };
 #[cfg(test)]
+use super::maybe_run_bucket_policy_storage_load_hook;
+#[cfg(test)]
 use super::pg_guards::LockedReadObject;
 #[cfg(test)]
 use super::request_types::ListPartsRequest;
@@ -1691,6 +1693,8 @@ impl Coordinator {
             }
         }
 
+        #[cfg(test)]
+        maybe_run_bucket_policy_storage_load_hook(bucket.as_str());
         self.bucket_handle_loader()
             .load_bucket(bucket, expected_bucket_owner, request)
     }

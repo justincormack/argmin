@@ -1577,6 +1577,18 @@ fn head_object_waits_for_bucket_pg_when_bucket_policy_is_present() {
         })
         .unwrap();
 
+    let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let reached_storage_load = Arc::new(Barrier::new(2));
+    let reached_storage_load_hook = Arc::clone(&reached_storage_load);
+    let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
+        bucket: Some("bucket".to_string()),
+        before_storage_load: Some(Arc::new(move || {
+            reached_storage_load_hook.wait();
+        })),
+    });
     let bucket_pg = admin.get_bucket_pg("bucket").unwrap();
     let (tx, rx) = mpsc::channel();
     let handle = thread::spawn(move || {
@@ -1594,12 +1606,10 @@ fn head_object_waits_for_bucket_pg_when_bucket_policy_is_present() {
         tx.send(res).unwrap();
     });
 
-    assert!(
-        rx.recv_timeout(Duration::from_millis(200)).is_err(),
-        "head_object with bucket policy should wait on bucket pg to load a policy snapshot"
-    );
+    reached_storage_load.wait();
+    assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
     drop(bucket_pg);
-    let head = rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+    let head = rx.recv().unwrap().unwrap();
     assert_eq!(head.size, 4);
     handle.join().unwrap();
 }

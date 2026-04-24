@@ -16,6 +16,16 @@ pub(super) static RECLAMATION_TEST_HOOKS: OnceLock<Mutex<ReclamationTestHooks>> 
 pub(super) static RECLAMATION_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Default, Clone)]
+pub(super) struct BucketPolicyLoadTestHooks {
+    pub(super) bucket: Option<String>,
+    pub(super) before_storage_load: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+pub(super) static BUCKET_POLICY_LOAD_TEST_HOOKS: OnceLock<Mutex<BucketPolicyLoadTestHooks>> =
+    OnceLock::new();
+pub(super) static BUCKET_POLICY_LOAD_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[derive(Default, Clone)]
 pub(super) struct StreamAppendTestHooks {
     pub(super) target: Option<(String, u32)>,
     pub(super) after_prepare: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -37,11 +47,21 @@ impl Drop for ReclamationTestHookGuard {
 
 pub(super) struct StreamAppendTestHookGuard;
 
+pub(super) struct BucketPolicyLoadTestHookGuard;
+
 impl Drop for StreamAppendTestHookGuard {
     fn drop(&mut self) {
         let hooks =
             STREAM_APPEND_TEST_HOOKS.get_or_init(|| Mutex::new(StreamAppendTestHooks::default()));
         *hooks.lock().unwrap() = StreamAppendTestHooks::default();
+    }
+}
+
+impl Drop for BucketPolicyLoadTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = BUCKET_POLICY_LOAD_TEST_HOOKS
+            .get_or_init(|| Mutex::new(BucketPolicyLoadTestHooks::default()));
+        *hooks.lock().unwrap() = BucketPolicyLoadTestHooks::default();
     }
 }
 
@@ -60,6 +80,15 @@ pub(super) fn install_stream_append_test_hooks(
         STREAM_APPEND_TEST_HOOKS.get_or_init(|| Mutex::new(StreamAppendTestHooks::default()));
     *slot.lock().unwrap() = hooks;
     StreamAppendTestHookGuard
+}
+
+pub(super) fn install_bucket_policy_load_test_hooks(
+    hooks: BucketPolicyLoadTestHooks,
+) -> BucketPolicyLoadTestHookGuard {
+    let slot = BUCKET_POLICY_LOAD_TEST_HOOKS
+        .get_or_init(|| Mutex::new(BucketPolicyLoadTestHooks::default()));
+    *slot.lock().unwrap() = hooks;
+    BucketPolicyLoadTestHookGuard
 }
 
 pub(super) fn maybe_run_multipart_snapshot_hook(bucket: &str, key: &str) {
@@ -159,6 +188,19 @@ pub(super) fn maybe_run_object_segments_delete_metadata_hook(bucket: &str, key: 
         .is_some_and(|(b, k)| b == bucket && k == key)
     {
         if let Some(hook) = hooks.after_object_segments_delete_metadata {
+            hook();
+        }
+    }
+}
+
+pub(super) fn maybe_run_bucket_policy_storage_load_hook(bucket: &str) {
+    let hooks = BUCKET_POLICY_LOAD_TEST_HOOKS
+        .get_or_init(|| Mutex::new(BucketPolicyLoadTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks.bucket.as_ref().is_some_and(|target| target == bucket) {
+        if let Some(hook) = hooks.before_storage_load {
             hook();
         }
     }
