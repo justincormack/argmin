@@ -2,8 +2,6 @@
 use super::runtime::LifecycleSweepStats;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-#[cfg(test)]
-use std::sync::MutexGuard;
 use std::sync::{Arc, RwLock};
 
 use ec::{EcConfig, ErasureCodec};
@@ -381,18 +379,8 @@ impl Coordinator {
     }
 
     #[cfg(test)]
-    pub(super) fn bucket_pg_id_for(&self, bucket: &BucketName) -> u32 {
-        self.pg_topology.bucket_pg_for(bucket)
-    }
-
-    #[cfg(test)]
     pub(super) fn object_pg_id_for(&self, bucket: &BucketName, key: &ObjectKey) -> u32 {
         self.pg_topology.object_pg_for(bucket, key)
-    }
-
-    #[cfg(test)]
-    pub(super) fn bucket_pg_id(&self, bucket: &str) -> u32 {
-        self.bucket_pg_id_for(&trusted_bucket_name(bucket))
     }
 
     #[cfg(test)]
@@ -402,23 +390,5 @@ impl Coordinator {
 
     pub(super) fn shard_pg_id_raw(&self, bucket: &str, key: &str, generation: u64) -> u32 {
         self.pg_topology.shard_pg(bucket, key, generation)
-    }
-
-    #[cfg(test)]
-    pub(super) fn get_bucket_pg(
-        &self,
-        bucket: &str,
-    ) -> Result<MutexGuard<'_, storage::PgStore>, ServerError> {
-        let pg_id = self.bucket_pg_id(bucket);
-        Ok(self.storage_node.get_pg(pg_id)?)
-    }
-
-    #[cfg(test)]
-    pub(super) fn get_bucket_pg_for(
-        &self,
-        bucket: &BucketName,
-    ) -> Result<MutexGuard<'_, storage::PgStore>, ServerError> {
-        let pg_id = self.bucket_pg_id_for(bucket);
-        Ok(self.storage_node.get_pg(pg_id)?)
     }
 }

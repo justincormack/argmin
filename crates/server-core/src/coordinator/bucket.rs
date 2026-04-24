@@ -184,19 +184,11 @@ impl Coordinator {
         enabled: bool,
     ) -> Result<(), ServerError> {
         let bucket = trusted_bucket_name(name);
-        let bucket_pg = self.get_bucket_pg_for(&bucket)?;
-        storage::PgMetadataStore::put_bucket_abac_enabled(&*bucket_pg, &bucket, enabled).map_err(
-            |e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            },
-        )?;
-        self.storage_node
-            .update_bucket_fast_path_if_present(&bucket, |info| {
-                info.bucket_abac_enabled = enabled;
-            });
+        let info = self
+            .storage_node
+            .put_bucket_abac_enabled_and_load_info(&bucket, enabled)
+            .map_err(Self::map_bucket_snapshot_load_error)?;
+        self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
 
@@ -1018,21 +1010,5 @@ impl Coordinator {
         self.storage_node
             .delete_bucket_subresource_and_load_info(&authorized.bucket, authorized.kind)
             .map_err(Self::map_bucket_snapshot_load_error)
-    }
-
-    #[cfg(test)]
-    pub(super) fn load_bucket_subresource_from_pg(
-        bucket_pg: &storage::PgStore,
-        bucket: &BucketName,
-        kind: storage::BucketSubresourceKind,
-    ) -> Result<Option<String>, ServerError> {
-        storage::PgMetadataStore::get_bucket_subresource(bucket_pg, bucket, kind)
-            .map(|stored| stored.map(|stored| stored.body))
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })
     }
 }

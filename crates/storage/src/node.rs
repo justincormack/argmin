@@ -63,7 +63,19 @@ pub struct BucketLockGuard<'a> {
     guard: MutexGuard<'a, ()>,
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct BucketPgTestGuard<'a> {
+    guard: MutexGuard<'a, PgStore>,
+}
+
 impl Drop for BucketLockGuard<'_> {
+    fn drop(&mut self) {
+        let _ = &self.guard;
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for BucketPgTestGuard<'_> {
     fn drop(&mut self) {
         let _ = &self.guard;
     }
@@ -737,6 +749,16 @@ impl SharedStorageNode {
             Err(StoreError::NotFound) => Ok(false),
             Err(other) => Err(other),
         }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_lock_bucket_pg(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketPgTestGuard<'_>, StoreError> {
+        let pg_id = self.test_bucket_pg_id_for(bucket);
+        let guard = self.get_pg(pg_id)?;
+        Ok(BucketPgTestGuard { guard })
     }
 
     /// Lock a bucket-scoped stripe mutex used to serialize multipart

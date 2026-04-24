@@ -781,8 +781,40 @@ impl Coordinator {
             return Ok(Some(cached));
         }
 
-        let bucket_pg = self.get_bucket_pg_for(&bucket.name)?;
-        self.cached_bucket_policy_with_locked_bucket_pg(bucket, &bucket_pg)
+        let raw_policy = self
+            .storage_node
+            .get_bucket_subresource(&bucket.name, storage::BucketSubresourceKind::Policy)
+            .map_err(|error| match error {
+                storage::BucketSnapshotLoadError::Store(other) => ServerError::Store(other),
+                storage::BucketSnapshotLoadError::Metadata(
+                    storage::MetadataError::BucketNotFound { name },
+                ) => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                storage::BucketSnapshotLoadError::Metadata(other) => ServerError::Metadata(other),
+            })?;
+        let parsed_policy = match raw_policy {
+            Some(policy) => Arc::new(auth::parse_bucket_policy(&policy).map_err(|e| {
+                ServerError::InternalError {
+                    reason: format!(
+                        "stored bucket policy for {} failed to parse at request time: {}",
+                        bucket.name,
+                        e.reason()
+                    ),
+                }
+            })?),
+            None => {
+                self.clear_bucket_policy_cache(&bucket.name);
+                return Ok(None);
+            }
+        };
+
+        self.cache_bucket_policy(
+            &bucket.name,
+            bucket.bucket_policy_generation,
+            Arc::clone(&parsed_policy),
+        );
+        Ok(Some(parsed_policy))
     }
 
     pub(super) fn cached_bucket_policy_for_loaded_handle(
@@ -836,49 +868,6 @@ impl Coordinator {
             .get(&bucket.name)
             .cloned()?;
         (cached.generation == bucket.bucket_policy_generation).then_some(cached.policy)
-    }
-
-    #[cfg(test)]
-    pub(super) fn cached_bucket_policy_with_locked_bucket_pg(
-        &self,
-        bucket: &BucketSummary,
-        bucket_pg: &storage::PgStore,
-    ) -> Result<Option<Arc<auth::BucketPolicy>>, ServerError> {
-        if !bucket.bucket_policy_present {
-            return Ok(None);
-        }
-
-        if let Some(cached) = self.cached_bucket_policy_if_fresh(bucket) {
-            return Ok(Some(cached));
-        }
-
-        let raw_policy = Self::load_bucket_subresource_from_pg(
-            bucket_pg,
-            &bucket.name,
-            storage::BucketSubresourceKind::Policy,
-        )?;
-        let parsed_policy = match raw_policy {
-            Some(policy) => Arc::new(auth::parse_bucket_policy(&policy).map_err(|e| {
-                ServerError::InternalError {
-                    reason: format!(
-                        "stored bucket policy for {} failed to parse at request time: {}",
-                        bucket.name,
-                        e.reason()
-                    ),
-                }
-            })?),
-            None => {
-                self.clear_bucket_policy_cache(&bucket.name);
-                return Ok(None);
-            }
-        };
-
-        self.cache_bucket_policy(
-            &bucket.name,
-            bucket.bucket_policy_generation,
-            Arc::clone(&parsed_policy),
-        );
-        Ok(Some(parsed_policy))
     }
 
     pub(super) fn cache_bucket_policy(

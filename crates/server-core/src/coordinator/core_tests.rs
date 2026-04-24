@@ -1591,7 +1591,9 @@ fn head_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
             let _ = event_tx.send(LockWaitEvent::Progress);
         })),
     });
-    let bucket_pg = admin.get_bucket_pg(bucket).unwrap();
+    let bucket_pg = storage_node
+        .test_lock_bucket_pg(&trusted_bucket_name(bucket))
+        .unwrap();
     let (tx, rx) = mpsc::channel();
     let handle = thread::spawn(move || {
         let res = reader.head_object(&GetObjectRequest {
@@ -1685,7 +1687,9 @@ fn head_object_waits_for_bucket_pg_when_bucket_policy_is_present() {
         })),
         after_policy_fast_path_hit: None,
     });
-    let bucket_pg = admin.get_bucket_pg(bucket).unwrap();
+    let bucket_pg = storage_node
+        .test_lock_bucket_pg(&trusted_bucket_name(bucket))
+        .unwrap();
     let (tx, rx) = mpsc::channel();
     let handle = thread::spawn(move || {
         let res = reader.head_object(&GetObjectRequest {
@@ -1771,7 +1775,9 @@ fn delete_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
             let _ = event_tx.send(LockWaitEvent::Progress);
         })),
     });
-    let bucket_pg = admin.get_bucket_pg(bucket).unwrap();
+    let bucket_pg = storage_node
+        .test_lock_bucket_pg(&trusted_bucket_name(bucket))
+        .unwrap();
     let (tx, rx) = mpsc::channel();
     let key_for_delete = key.clone();
     let handle = thread::spawn(move || {
@@ -1977,10 +1983,14 @@ fn complete_multipart_upload_does_not_deadlock_when_bucket_policy_shares_pg() {
     .unwrap();
     admin.clear_bucket_policy_cache(&trusted_bucket_name(bucket));
 
-    let bucket_pg_id = admin.bucket_pg_id(bucket);
+    let bucket_pg_id = storage_node.test_bucket_pg_id_for(&trusted_bucket_name(bucket));
     let key = (0..1024)
         .map(|i| format!("same-pg-{i}"))
-        .find(|candidate| admin.object_pg_id(bucket, candidate) == bucket_pg_id)
+        .find(|candidate| {
+            storage_node
+                .test_object_pg_id_for(&trusted_bucket_name(bucket), &trusted_object_key(candidate))
+                == bucket_pg_id
+        })
         .expect("expected to find a key whose object PG matches the bucket PG");
 
     let (upload_id, parts) = create_upload_with_parts(&admin, bucket, &key, &[(1, b"part")]);
