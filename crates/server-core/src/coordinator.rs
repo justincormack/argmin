@@ -19,13 +19,9 @@ use s3_types::{
 #[cfg(test)]
 use storage::traits::PgMetadataStore;
 #[cfg(test)]
-use storage::traits::ShardStore;
-#[cfg(test)]
 use storage::ObjectEncryption;
 #[cfg(test)]
 use storage::ObjectLockState;
-#[cfg(test)]
-use storage::PutLiveObjectReq;
 #[cfg(test)]
 use storage::SimplePayloadReclaimRecord;
 #[cfg(test)]

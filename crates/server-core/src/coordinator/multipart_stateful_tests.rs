@@ -560,7 +560,11 @@ fn run_stream_duplicate_segment_race_invariant_test(pg_count: u32, require_cross
 
     let staged = admin
         .storage_node
-        .test_list_stream_segments(&trusted_bucket_name("bucket"), &trusted_object_key(&key), &session_id)
+        .test_list_stream_segments(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key(&key),
+            &session_id,
+        )
         .unwrap();
     assert_eq!(
         staged.len(),

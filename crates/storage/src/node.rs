@@ -29,9 +29,10 @@ use crate::types::{
     MultipartCompletionSnapshot, MultipartPartRecord, MultipartPartSegmentRecord,
     MultipartUploadRecord, ObjectKey, ObjectPartRecord, ObjectReadSnapshot,
     ObjectReadSnapshotOutcome, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
-    PayloadReclaimRoot, PreparedStreamPartCommit, SessionId, ShardKey, SimplePayloadReclaimRecord,
-    StoredObject, StreamUploadPartSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
-    StreamUploadState, StreamUploadTarget, UploadId, UploadState, WriteAck,
+    PayloadReclaimRoot, PreparedStreamPartCommit, PutLiveObjectReq, SessionId, ShardKey,
+    SimplePayloadReclaimRecord, StoredObject, StreamUploadPartSnapshot, StreamUploadRecord,
+    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
+    WriteAck,
 };
 
 const TRACE_TARGET: &str = "storage";
@@ -675,6 +676,48 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_replace_live_object_segments(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        segments: &[ObjectSegmentRecord],
+    ) -> Result<(), ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        let live = match pg.get_object_meta(bucket, key)? {
+            StoredObject::Live(record) => record,
+            StoredObject::DeleteMarker(_) => return Err(StoreError::NotFound.into()),
+        };
+        assert_eq!(
+            live.version_id, version_id,
+            "test_replace_live_object_segments called for non-current live version"
+        );
+        pg.put_object_with_segments(
+            &PutLiveObjectReq {
+                bucket: live.bucket,
+                key: live.key,
+                version_id: live.version_id,
+                owner: live.owner,
+                acl_grants: live.acl_grants,
+                public_read: live.public_read,
+                generation_id: live.generation_id,
+                size: live.size,
+                etag: live.etag,
+                ec: live.ec,
+                layout: live.layout,
+                tags: live.tags,
+                metadata_blob: live.metadata_blob,
+                system_metadata_blob: live.system_metadata_blob,
+                object_lock: live.object_lock,
+                encryption: live.encryption,
+            },
+            segments,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_get_object_parts(
         &self,
         bucket: &BucketName,
@@ -684,6 +727,20 @@ impl SharedStorageNode {
         let pg_id = self.test_object_pg_id_for(bucket, key);
         let pg = self.get_pg(pg_id)?;
         Ok(pg.get_object_parts(bucket, key, version_id)?)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_replace_object_parts(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        parts: &[ObjectPartRecord],
+    ) -> Result<(), ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        pg.delete_object_parts(bucket, key, version_id)?;
+        Ok(pg.commit_object_parts(parts)?)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -878,6 +935,37 @@ impl SharedStorageNode {
             Err(StoreError::NotFound) => Ok(false),
             Err(other) => Err(other),
         }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_register_written_shards(
+        &self,
+        pg_id: u32,
+        written_shards: &[(ShardKey, WriteAck)],
+    ) -> Result<(), StoreError> {
+        let pg = self.get_pg(pg_id)?;
+        let batch: Vec<(&ShardKey, WriteAck)> = written_shards
+            .iter()
+            .map(|(key, ack)| {
+                (
+                    key,
+                    WriteAck {
+                        crc64: ack.crc64,
+                        stored_size: ack.stored_size,
+                    },
+                )
+            })
+            .collect();
+        pg.register_written_shards_batch(&batch)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_delete_shards(&self, pg_id: u32, keys: &[ShardKey]) -> Result<(), StoreError> {
+        let pg = self.get_pg(pg_id)?;
+        for key in keys {
+            let _ = pg.delete_shard(key);
+        }
+        Ok(())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

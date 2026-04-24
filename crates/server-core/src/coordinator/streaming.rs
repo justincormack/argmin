@@ -1,5 +1,3 @@
-#[cfg(test)]
-use storage::traits::ShardStore;
 use storage::{
     BucketName, EcShape, GenerationId, ManagedEncryptionAlgorithm, ObjectEncryption, ObjectKey,
     PrepareStreamUploadSegmentAppendReq, SessionId, ShardKey, StreamUploadTarget,
@@ -505,16 +503,6 @@ impl Coordinator {
         };
 
         Ok(written_shards)
-    }
-
-    #[cfg(test)]
-    pub(super) fn cleanup_written_shards_locked(
-        shard_pg: &storage::PgStore,
-        written_shards: &[WrittenShard],
-    ) {
-        for written in written_shards {
-            let _ = shard_pg.delete_shard(&written.key);
-        }
     }
 
     pub(super) fn append_stream_segment_for(

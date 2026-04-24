@@ -5071,10 +5071,9 @@ fn read_multipart_range_detects_incomplete_manifest() {
     let result = create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1), (2, part2)]);
 
     // Get the real manifest, then replace with only part 2 (gap: part 1 missing).
-    let meta_pg_id = coord.object_pg_id("bucket", "key");
-    let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-    let real_parts = pg
-        .get_object_parts(
+    let real_parts = coord
+        .storage_node
+        .test_get_object_parts(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             result.version_id,
@@ -5082,14 +5081,15 @@ fn read_multipart_range_detects_incomplete_manifest() {
         .unwrap();
     assert_eq!(real_parts.len(), 2);
     let part2_record = real_parts[1].clone(); // real part 2 with valid shards
-    pg.delete_object_parts(
-        &trusted_bucket_name("bucket"),
-        &trusted_object_key("key"),
-        result.version_id,
-    )
-    .unwrap();
-    pg.commit_object_parts(&[part2_record]).unwrap();
-    drop(pg);
+    coord
+        .storage_node
+        .test_replace_object_parts(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            result.version_id,
+            &[part2_record],
+        )
+        .unwrap();
 
     let err = coord
         .get_object(&GetObjectRequest {
@@ -5966,12 +5966,9 @@ fn sse_c_checksum_metadata_is_not_stored_in_cleartext() {
     .unwrap();
 
     {
-        let meta_pg = coord
+        let record = coord
             .storage_node
-            .get_pg(coord.object_pg_id("bucket", "obj"))
-            .unwrap();
-        let record = meta_pg
-            .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("obj"))
+            .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("obj"))
             .unwrap();
         let live = record.as_live().unwrap();
         let stored_system =
@@ -6462,12 +6459,13 @@ fn sse_c_multipart_parts_with_same_plaintext_use_distinct_nonce_scopes() {
         .unwrap();
     }
 
-    let meta_pg = coord
+    let segments = coord
         .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
-        .unwrap();
-    let segments = meta_pg
-        .get_all_multipart_part_segments_for_upload(&upload.upload_id)
+        .test_get_all_multipart_part_segments_for_upload(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &upload.upload_id,
+        )
         .unwrap();
     let part1: Vec<_> = segments
         .iter()
@@ -7209,10 +7207,9 @@ fn stream_put_delete_eventually_reclaims_segment_shards() {
         .unwrap();
 
     let (generation_id, segments) = {
-        let meta_pg_id = coord.object_pg_id("bucket", "key");
-        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-        let generation_id = match pg
-            .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+        let generation_id = match coord
+            .storage_node
+            .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
             .unwrap()
         {
             StoredObject::Live(record) => record.generation_id,
@@ -7220,8 +7217,9 @@ fn stream_put_delete_eventually_reclaims_segment_shards() {
                 panic!("expected live streamed object, got {other:?}")
             }
         };
-        let segments = pg
-            .get_object_segments(
+        let segments = coord
+            .storage_node
+            .test_get_object_segments(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
                 result.version_id,
@@ -7676,45 +7674,67 @@ fn stream_segment_cleanup_only_deletes_matching_segment_vid() {
     let loser_shards = coord
         .write_segment_shards(loser_pg_id, &segment_okh, loser_vid, b"loser-data")
         .unwrap();
-    let winner_batch: Vec<(&ShardKey, storage::WriteAck)> = winner_shards
+    let winner_batch: Vec<(ShardKey, storage::WriteAck)> = winner_shards
         .iter()
-        .map(|written| (&written.key, written.ack))
+        .map(|written| {
+            (
+                written.key.clone(),
+                storage::WriteAck {
+                    crc64: written.ack.crc64,
+                    stored_size: written.ack.stored_size,
+                },
+            )
+        })
         .collect();
-    let loser_batch: Vec<(&ShardKey, storage::WriteAck)> = loser_shards
+    let loser_batch: Vec<(ShardKey, storage::WriteAck)> = loser_shards
         .iter()
-        .map(|written| (&written.key, written.ack))
+        .map(|written| {
+            (
+                written.key.clone(),
+                storage::WriteAck {
+                    crc64: written.ack.crc64,
+                    stored_size: written.ack.stored_size,
+                },
+            )
+        })
         .collect();
     coord
         .storage_node
-        .get_pg(winner_pg_id)
-        .unwrap()
-        .register_written_shards_batch(&winner_batch)
+        .test_register_written_shards(winner_pg_id, &winner_batch)
         .unwrap();
     coord
         .storage_node
-        .get_pg(loser_pg_id)
-        .unwrap()
-        .register_written_shards_batch(&loser_batch)
+        .test_register_written_shards(loser_pg_id, &loser_batch)
         .unwrap();
 
-    let loser_pg = coord.storage_node.get_pg(loser_pg_id).unwrap();
-    Coordinator::cleanup_written_shards_locked(&loser_pg, &loser_shards);
-    drop(loser_pg);
+    coord
+        .storage_node
+        .test_delete_shards(
+            loser_pg_id,
+            &loser_shards
+                .iter()
+                .map(|written| written.key.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
 
-    let winner_pg = coord.storage_node.get_pg(winner_pg_id).unwrap();
     for written in &winner_shards {
         assert!(
-            winner_pg.read_shard(&written.key).is_ok(),
+            coord
+                .storage_node
+                .test_shard_exists(winner_pg_id, &written.key)
+                .unwrap(),
             "winner shard {:?} should remain after loser cleanup",
             written.key
         );
     }
-    drop(winner_pg);
 
-    let loser_pg = coord.storage_node.get_pg(loser_pg_id).unwrap();
     for written in &loser_shards {
         assert!(
-            loser_pg.read_shard(&written.key).is_err(),
+            !coord
+                .storage_node
+                .test_shard_exists(loser_pg_id, &written.key)
+                .unwrap(),
             "loser shard {:?} should be deleted by cleanup",
             written.key
         );
@@ -8459,18 +8479,10 @@ fn get_object_rejects_bad_segment_crc64() {
     )
     .unwrap();
 
-    let meta_pg_id = coord.object_pg_id("bucket", "bad-segment-crc");
     {
-        let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-        let record = meta_pg
-            .get_object_meta(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("bad-segment-crc"),
-            )
-            .unwrap();
-        let live = record.as_live().unwrap();
-        let mut segments = meta_pg
-            .get_object_segments(
+        let mut segments = coord
+            .storage_node
+            .test_get_object_segments(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("bad-segment-crc"),
                 put.version_id,
@@ -8479,26 +8491,12 @@ fn get_object_rejects_bad_segment_crc64() {
         assert_eq!(segments.len(), 1);
         segments[0].segment_crc64 = Some(segments[0].segment_crc64.unwrap() ^ 1);
 
-        meta_pg
-            .put_object_with_segments(
-                &PutLiveObjectReq {
-                    bucket: live.bucket.clone(),
-                    key: live.key.clone(),
-                    version_id: live.version_id,
-                    owner: live.owner.clone(),
-                    acl_grants: live.acl_grants.clone(),
-                    public_read: live.public_read,
-                    generation_id: live.generation_id,
-                    size: live.size,
-                    etag: live.etag,
-                    ec: live.ec,
-                    layout: live.layout,
-                    tags: live.tags.clone(),
-                    metadata_blob: live.metadata_blob.clone(),
-                    system_metadata_blob: live.system_metadata_blob.clone(),
-                    object_lock: ObjectLockState::default(),
-                    encryption: storage::ObjectEncryption::None,
-                },
+        coord
+            .storage_node
+            .test_replace_live_object_segments(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("bad-segment-crc"),
+                put.version_id,
                 &segments,
             )
             .unwrap();
