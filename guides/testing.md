@@ -34,8 +34,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 # Local-only S3 behavior tests.
 cargo test -p s3-local-tests
 
+# AWS-backed compatibility tests.
+./scripts/aws-tests
+
 # Differential AWS-vs-local response-shape tests.
-cargo test -p s3-diff-tests --test response_shape
+./scripts/diff-tests --test response_shape
 ```
 
 ## Deterministic Unit Tests
@@ -61,6 +64,56 @@ under test is AWS or another remote S3 endpoint. In those cases, bounded
 eventual checks are correct because AWS control-plane convergence is part of
 the real behavior being modeled. That is acceptable in `crates/s3-tests` and
 similar external suites, but not in ordinary unit/property tests.
+
+## External Test Scripts
+
+For external AWS-backed workflows, prefer the wrapper scripts under
+`./scripts/` rather than reconstructing long `cargo test` commands by hand.
+
+- `./scripts/aws-tests`
+  - runs the external `s3-tests` suite
+  - loads AWS credentials from `.env`
+  - sets the required `S3_TEST_*` variables
+  - forwards extra arguments to `cargo test -p s3-tests`
+- `./scripts/diff-tests`
+  - runs the standalone AWS-vs-local `s3-diff-tests` suite
+  - loads AWS credentials from `.env`
+  - sets the required `S3_TEST_*` variables
+  - forwards extra arguments to `cargo test --manifest-path crates/s3-diff-tests/Cargo.toml`
+- `./scripts/cleanup`
+  - cleans up leftover external test buckets
+  - loads the primary AWS credentials from `.env`
+  - uses the same AWS user as `./scripts/aws-tests`
+
+All three accept `--region`, and `aws-tests` / `diff-tests` also accept
+additional `cargo test` selectors and `-- --nocapture` style test-binary
+arguments.
+
+### `.env` Naming
+
+The repository now uses role-based test configuration names in `.env`:
+
+- `TEST_AWS_PRIMARY_ACCESS_KEY`
+- `TEST_AWS_PRIMARY_SECRET_KEY`
+- `TEST_AWS_PRIMARY_ACCOUNT_ID`
+- `TEST_AWS_ALT_ACCESS_KEY`
+- `TEST_AWS_ALT_SECRET_KEY`
+- `TEST_AWS_ALT_ACCOUNT_ID`
+- `TEST_AWS_OWNER_ROOT_ACCESS_KEY`
+- `TEST_AWS_OWNER_ROOT_SECRET_KEY`
+- `TEST_AWS_SECOND_ACCESS_KEY`
+- `TEST_AWS_SECOND_SECRET_KEY`
+- `TEST_S3_REGION`
+- `TEST_S3_BUCKET_PREFIX`
+- `TEST_S3_TIMEOUT_SECS`
+- optional `TEST_S3_ENDPOINT`
+
+`PRIMARY` is the main AWS test user, `ALT` is a user from a different AWS
+account, `OWNER_ROOT` is the root credential for the primary account, and
+`SECOND` is the optional same-account constrained user. The wrapper scripts map
+these `.env` values to the `S3_TEST_*` variables expected by the Rust test
+harnesses, and `./scripts/cleanup` maps the primary pair to the standard AWS
+CLI credential variables when it invokes `aws`.
 
 ## Local Deep Tracing
 
@@ -118,8 +171,9 @@ silently skipping coverage.
 
 ### Required environment variables
 
-Use `eval "$(grep = .env)"` to read `.env` without exporting `AWS_ACCESS_KEY`
-and `AWS_SECRET_KEY` into the process environment.
+The wrapper scripts above load `.env` directly. If you need to construct a
+manual command, use the `TEST_AWS_*` and `TEST_S3_*` names from `.env` as the
+source values that you map into `S3_TEST_*`.
 
 The external `s3-tests` harness hard-fails if any of these are missing:
 
@@ -152,39 +206,20 @@ Targeted non-root test binaries can still be run without them.
 Recommended command:
 
 ```bash
-eval "$(grep = .env)" && \
-S3_TEST_ENDPOINT=https://s3.us-east-1.amazonaws.com \
-S3_TEST_ACCESS_KEY="$AWS_ACCESS_KEY" \
-S3_TEST_SECRET_KEY="$AWS_SECRET_KEY" \
-S3_TEST_ACCOUNT_ID="$AWS_ACCOUNT_ID" \
-S3_TEST_OWNER_ROOT_ACCESS_KEY="$AWS_OWNER_ROOT_ACCESS_KEY" \
-S3_TEST_OWNER_ROOT_SECRET_KEY="$AWS_OWNER_ROOT_SECRET_KEY" \
-S3_TEST_ALT_ACCESS_KEY="$AWS_ALT_ACCESS_KEY" \
-S3_TEST_ALT_SECRET_KEY="$AWS_ALT_SECRET_KEY" \
-S3_TEST_ALT_ACCOUNT_ID="$AWS_ALT_ACCOUNT_ID" \
-S3_TEST_REGION=us-east-1 \
-S3_TEST_BUCKET_PREFIX=claude-s3- \
-S3_TEST_TIMEOUT_SECS=30 \
-cargo test -p s3-tests --no-fail-fast
+./scripts/aws-tests
 ```
 
 Privileged bucket-policy root-principal coverage:
 
 ```bash
-eval "$(grep = .env)" && \
-S3_TEST_ENDPOINT=https://s3.us-east-1.amazonaws.com \
-S3_TEST_ACCESS_KEY="$AWS_ACCESS_KEY" \
-S3_TEST_SECRET_KEY="$AWS_SECRET_KEY" \
-S3_TEST_ACCOUNT_ID="$AWS_ACCOUNT_ID" \
-S3_TEST_OWNER_ROOT_ACCESS_KEY="$AWS_OWNER_ROOT_ACCESS_KEY" \
-S3_TEST_OWNER_ROOT_SECRET_KEY="$AWS_OWNER_ROOT_SECRET_KEY" \
-S3_TEST_ALT_ACCESS_KEY="$AWS_ALT_ACCESS_KEY" \
-S3_TEST_ALT_SECRET_KEY="$AWS_ALT_SECRET_KEY" \
-S3_TEST_ALT_ACCOUNT_ID="$AWS_ALT_ACCOUNT_ID" \
-S3_TEST_REGION=us-east-1 \
-S3_TEST_BUCKET_PREFIX=claude-s3- \
-S3_TEST_TIMEOUT_SECS=30 \
-cargo test -p s3-tests --test bucket_policy_root -- --nocapture
+./scripts/aws-tests --test bucket_policy_root -- --nocapture
+```
+
+You can override the region or forward any normal `cargo test` selectors:
+
+```bash
+./scripts/aws-tests --region us-west-2 --test versioning -- --nocapture
+./scripts/aws-tests object_lock
 ```
 
 When `S3_TEST_ENDPOINT` is set, `s3-tests` defaults to a 30 second client
@@ -276,11 +311,11 @@ Recommended command:
 ```bash
 eval "$(grep = .env)" && \
 S3_TEST_ENDPOINT=https://s3.us-east-1.amazonaws.com \
-S3_TEST_ACCESS_KEY="$AWS_ACCESS_KEY" \
-S3_TEST_SECRET_KEY="$AWS_SECRET_KEY" \
-S3_TEST_REGION=us-east-1 \
-S3_TEST_BUCKET_PREFIX=claude-s3- \
-S3_TEST_TIMEOUT_SECS=30 \
+S3_TEST_ACCESS_KEY="$TEST_AWS_PRIMARY_ACCESS_KEY" \
+S3_TEST_SECRET_KEY="$TEST_AWS_PRIMARY_SECRET_KEY" \
+S3_TEST_REGION="${TEST_S3_REGION:-us-east-1}" \
+S3_TEST_BUCKET_PREFIX="${TEST_S3_BUCKET_PREFIX:-claude-s3-}" \
+S3_TEST_TIMEOUT_SECS="${TEST_S3_TIMEOUT_SECS:-30}" \
 cargo test -p s3-http-tests --no-fail-fast
 ```
 
@@ -298,22 +333,26 @@ This is different from the other dedicated test crates:
 - it always needs the full AWS-backed `s3-tests` environment, including both
   AWS credential sets and the bucket prefix, because the local response is
   only half of the comparison
+- it is outside the main workspace so normal workspace test runs do not include
+  it
+- `cargo test --manifest-path crates/s3-diff-tests/Cargo.toml` is expected to
+  fail fast if the external AWS comparison environment is incomplete
+
+Missing external AWS comparison configuration is a hard failure rather than a
+silent skip.
 
 Recommended command:
 
 ```bash
-eval "$(grep = .env)" && \
-S3_TEST_ENDPOINT=https://s3.us-east-1.amazonaws.com \
-S3_TEST_ACCESS_KEY="$AWS_ACCESS_KEY" \
-S3_TEST_SECRET_KEY="$AWS_SECRET_KEY" \
-S3_TEST_ACCOUNT_ID="$AWS_ACCOUNT_ID" \
-S3_TEST_ALT_ACCESS_KEY="$AWS_ALT_ACCESS_KEY" \
-S3_TEST_ALT_SECRET_KEY="$AWS_ALT_SECRET_KEY" \
-S3_TEST_ALT_ACCOUNT_ID="$AWS_ALT_ACCOUNT_ID" \
-S3_TEST_REGION=us-east-1 \
-S3_TEST_BUCKET_PREFIX=claude-s3- \
-S3_TEST_TIMEOUT_SECS=30 \
-cargo test -p s3-diff-tests --test response_shape -- --nocapture
+./scripts/diff-tests --test response_shape -- --nocapture
+```
+
+Like `./scripts/aws-tests`, this wrapper accepts region overrides and forwards
+additional `cargo test` selection arguments:
+
+```bash
+./scripts/diff-tests --region us-west-2 --test bucket_policy -- --nocapture
+./scripts/diff-tests response_shape
 ```
 
 ### Local-only tests
@@ -345,9 +384,19 @@ It currently:
 - attempts to disable legal holds and bypass governance retention
 - deletes the bucket once it is empty
 
-The script requires `aws`, `jq`, and AWS credentials in the environment that
-are allowed to delete those buckets and objects. It is intended as an
+The script requires `aws`, `jq`, and the primary AWS credentials in `.env`.
+It exports `TEST_AWS_PRIMARY_ACCESS_KEY` / `TEST_AWS_PRIMARY_SECRET_KEY` as
+standard AWS CLI variables,
+so it uses the same user as `./scripts/aws-tests`. It is intended as an
 after-failure cleanup tool, not part of the normal test invocation.
+
+Examples:
+
+```bash
+./scripts/cleanup
+./scripts/cleanup --bucket-prefix claude-s3-
+./scripts/cleanup --region us-west-2
+```
 
 ### Cross-account requirements
 

@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/_external-s3-test-env.sh
+source "$ROOT/scripts/_external-s3-test-env.sh"
+
+usage() {
+    cat <<'EOF'
+Usage: ./scripts/aws-tests [options] [cargo test args...]
+
+Run the external AWS-backed `s3-tests` suite using credentials from `.env`.
+Extra arguments are passed directly to `cargo test -p s3-tests`.
+
+Options:
+  --region REGION         Override `S3_TEST_REGION` (default: TEST_S3_REGION or us-east-1)
+  --endpoint URL          Override `S3_TEST_ENDPOINT` (default: TEST_S3_ENDPOINT or derived from region)
+  --bucket-prefix PREFIX  Override `S3_TEST_BUCKET_PREFIX` (default: TEST_S3_BUCKET_PREFIX or claude-s3-)
+  --timeout-secs SECS     Override `S3_TEST_TIMEOUT_SECS` (default: TEST_S3_TIMEOUT_SECS or 30)
+  --dotenv PATH           Read AWS variables from a different env file
+  -h, --help              Show this help
+
+Examples:
+  ./scripts/aws-tests
+  ./scripts/aws-tests --test versioning -- --nocapture
+  ./scripts/aws-tests --region us-west-2 --test object_lock
+EOF
+}
+
+region=""
+endpoint=""
+bucket_prefix=""
+timeout_secs=""
+dotenv_path="$ROOT/.env"
+cargo_args=()
+
+while (($#)); do
+    case "$1" in
+        --region)
+            [[ $# -ge 2 ]] || external_s3_test_die "--region requires a value"
+            region="$2"
+            shift 2
+            ;;
+        --endpoint)
+            [[ $# -ge 2 ]] || external_s3_test_die "--endpoint requires a value"
+            endpoint="$2"
+            shift 2
+            ;;
+        --bucket-prefix)
+            [[ $# -ge 2 ]] || external_s3_test_die "--bucket-prefix requires a value"
+            bucket_prefix="$2"
+            shift 2
+            ;;
+        --timeout-secs)
+            [[ $# -ge 2 ]] || external_s3_test_die "--timeout-secs requires a value"
+            timeout_secs="$2"
+            shift 2
+            ;;
+        --dotenv)
+            [[ $# -ge 2 ]] || external_s3_test_die "--dotenv requires a value"
+            dotenv_path="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            cargo_args+=("$@")
+            break
+            ;;
+        *)
+            cargo_args+=("$1")
+            shift
+            ;;
+    esac
+done
+
+cd "$ROOT"
+external_s3_test_load_dotenv "$dotenv_path"
+region="${region:-${TEST_S3_REGION:-us-east-1}}"
+bucket_prefix="${bucket_prefix:-${TEST_S3_BUCKET_PREFIX:-claude-s3-}}"
+timeout_secs="${timeout_secs:-${TEST_S3_TIMEOUT_SECS:-30}}"
+endpoint="${endpoint:-${TEST_S3_ENDPOINT:-}}"
+endpoint="${endpoint:-$(external_s3_test_default_endpoint "$region")}"
+external_s3_test_export_common_env "$region" "$endpoint" "$bucket_prefix" "$timeout_secs"
+
+cmd=(cargo test -p s3-tests --no-fail-fast)
+cmd+=("${cargo_args[@]}")
+
+external_s3_test_print_command "external s3-tests" "${cmd[@]}"
+exec "${cmd[@]}"

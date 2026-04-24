@@ -53,57 +53,27 @@ symptom and leave the real cause hidden.
 
 ## Running tests against AWS
 
-AWS credentials are in `.env` (not committed) with `AWS_ACCESS_KEY`,
-`AWS_SECRET_KEY`, `AWS_ACCOUNT_ID`, `AWS_ALT_ACCESS_KEY`,
-`AWS_ALT_SECRET_KEY`, `AWS_ALT_ACCOUNT_ID`, `AWS_OWNER_ROOT_ACCESS_KEY`, and
-`AWS_OWNER_ROOT_SECRET_KEY`.
+AWS credentials are in `.env` (not committed) with
+`TEST_AWS_PRIMARY_ACCESS_KEY`, `TEST_AWS_PRIMARY_SECRET_KEY`,
+`TEST_AWS_PRIMARY_ACCOUNT_ID`, `TEST_AWS_ALT_ACCESS_KEY`,
+`TEST_AWS_ALT_SECRET_KEY`, `TEST_AWS_ALT_ACCOUNT_ID`,
+`TEST_AWS_OWNER_ROOT_ACCESS_KEY`, and `TEST_AWS_OWNER_ROOT_SECRET_KEY`.
 
 The external `s3-tests` harness now requires all of the primary and alternate
 credentials/account IDs and hard-fails if the alternate credentials are not a
 different AWS account. Buckets must be prefixed `claude-s3-`.
 
 ```bash
-eval "$(grep = .env)" && \
-S3_TEST_ENDPOINT=https://s3.us-east-1.amazonaws.com \
-S3_TEST_ACCESS_KEY="$AWS_ACCESS_KEY" \
-S3_TEST_SECRET_KEY="$AWS_SECRET_KEY" \
-S3_TEST_ACCOUNT_ID="$AWS_ACCOUNT_ID" \
-S3_TEST_OWNER_ROOT_ACCESS_KEY="$AWS_OWNER_ROOT_ACCESS_KEY" \
-S3_TEST_OWNER_ROOT_SECRET_KEY="$AWS_OWNER_ROOT_SECRET_KEY" \
-S3_TEST_ALT_ACCESS_KEY="$AWS_ALT_ACCESS_KEY" \
-S3_TEST_ALT_SECRET_KEY="$AWS_ALT_SECRET_KEY" \
-S3_TEST_ALT_ACCOUNT_ID="$AWS_ALT_ACCOUNT_ID" \
-S3_TEST_REGION=us-east-1 \
-S3_TEST_BUCKET_PREFIX=claude-s3- \
-S3_TEST_TIMEOUT_SECS=30 \
-cargo test -p s3-tests --no-fail-fast
+./scripts/aws-tests
 ```
 
 The dedicated `bucket_policy_root` AWS suite also requires
-`AWS_OWNER_ROOT_ACCESS_KEY` and `AWS_OWNER_ROOT_SECRET_KEY`, which must belong
+`TEST_AWS_OWNER_ROOT_ACCESS_KEY` and `TEST_AWS_OWNER_ROOT_SECRET_KEY`, which must belong
 to the same AWS account as the primary credentials:
 
 ```bash
-eval "$(grep = .env)" && \
-S3_TEST_ENDPOINT=https://s3.us-east-1.amazonaws.com \
-S3_TEST_ACCESS_KEY="$AWS_ACCESS_KEY" \
-S3_TEST_SECRET_KEY="$AWS_SECRET_KEY" \
-S3_TEST_ACCOUNT_ID="$AWS_ACCOUNT_ID" \
-S3_TEST_OWNER_ROOT_ACCESS_KEY="$AWS_OWNER_ROOT_ACCESS_KEY" \
-S3_TEST_OWNER_ROOT_SECRET_KEY="$AWS_OWNER_ROOT_SECRET_KEY" \
-S3_TEST_ALT_ACCESS_KEY="$AWS_ALT_ACCESS_KEY" \
-S3_TEST_ALT_SECRET_KEY="$AWS_ALT_SECRET_KEY" \
-S3_TEST_ALT_ACCOUNT_ID="$AWS_ALT_ACCOUNT_ID" \
-S3_TEST_REGION=us-east-1 \
-S3_TEST_BUCKET_PREFIX=claude-s3- \
-S3_TEST_TIMEOUT_SECS=30 \
-cargo test -p s3-tests --test bucket_policy_root -- --nocapture
+./scripts/aws-tests --test bucket_policy_root -- --nocapture
 ```
-
-**Important:** Do NOT use `set -a && source .env` — exporting `AWS_ACCESS_KEY` and
-`AWS_SECRET_KEY` into the environment interferes with the AWS Rust SDK's credential
-resolution, causing `AuthorizationHeaderMalformed` errors. Use `eval "$(grep = .env)"`
-instead to read the values without exporting them.
 
 See [`guides/testing.md`](guides/testing.md)
 for the committed IAM policy, required account-level S3 Block Public Access

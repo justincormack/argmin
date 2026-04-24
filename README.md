@@ -190,18 +190,7 @@ cargo test --workspace
 To run `s3-tests` against an external endpoint such as AWS S3:
 
 ```bash
-eval "$(grep = .env)" && \
-S3_TEST_ENDPOINT=https://s3.us-east-1.amazonaws.com \
-S3_TEST_ACCESS_KEY="$AWS_ACCESS_KEY" \
-S3_TEST_SECRET_KEY="$AWS_SECRET_KEY" \
-S3_TEST_ACCOUNT_ID="$AWS_ACCOUNT_ID" \
-S3_TEST_ALT_ACCESS_KEY="$AWS_ALT_ACCESS_KEY" \
-S3_TEST_ALT_SECRET_KEY="$AWS_ALT_SECRET_KEY" \
-S3_TEST_ALT_ACCOUNT_ID="$AWS_ALT_ACCOUNT_ID" \
-S3_TEST_REGION=us-east-1 \
-S3_TEST_BUCKET_PREFIX=claude-s3- \
-S3_TEST_TIMEOUT_SECS=30 \
-cargo test -p s3-tests --no-fail-fast
+./scripts/aws-tests
 ```
 
 External `s3-tests` runs now fail fast if the alternate credentials, account

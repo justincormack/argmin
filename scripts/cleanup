@@ -1,6 +1,90 @@
-#!/bin/sh
+#!/usr/bin/env bash
 
-set -eu
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/_external-s3-test-env.sh
+source "$ROOT/scripts/_external-s3-test-env.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: ./scripts/cleanup [options]
+
+Delete leftover AWS-backed test buckets using the primary credentials from
+`.env` (`TEST_AWS_PRIMARY_ACCESS_KEY` / `TEST_AWS_PRIMARY_SECRET_KEY`).
+
+Options:
+  --region REGION         Override AWS region for API calls (default: TEST_S3_REGION or us-east-1)
+  --endpoint URL          Override the S3 endpoint URL (default: TEST_S3_ENDPOINT if set)
+  --bucket-prefix PREFIX  Only clean buckets with this prefix (default: TEST_S3_BUCKET_PREFIX or claude-s3-)
+  --dotenv PATH           Read AWS variables from a different env file
+  -h, --help              Show this help
+
+Examples:
+  ./scripts/cleanup
+  ./scripts/cleanup --bucket-prefix claude-s3-
+  ./scripts/cleanup --region us-west-2
+EOF
+}
+
+region=""
+endpoint=""
+bucket_prefix=""
+dotenv_path="$ROOT/.env"
+
+while (($#)); do
+  case "$1" in
+    --region)
+      [[ $# -ge 2 ]] || external_s3_test_die "--region requires a value"
+      region="$2"
+      shift 2
+      ;;
+    --endpoint)
+      [[ $# -ge 2 ]] || external_s3_test_die "--endpoint requires a value"
+      endpoint="$2"
+      shift 2
+      ;;
+    --bucket-prefix)
+      [[ $# -ge 2 ]] || external_s3_test_die "--bucket-prefix requires a value"
+      bucket_prefix="$2"
+      shift 2
+      ;;
+    --dotenv)
+      [[ $# -ge 2 ]] || external_s3_test_die "--dotenv requires a value"
+      dotenv_path="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      external_s3_test_die "unknown argument: $1"
+      ;;
+  esac
+done
+
+cd "$ROOT"
+external_s3_test_load_dotenv "$dotenv_path"
+region="${region:-${TEST_S3_REGION:-us-east-1}}"
+bucket_prefix="${bucket_prefix:-${TEST_S3_BUCKET_PREFIX:-claude-s3-}}"
+endpoint="${endpoint:-${TEST_S3_ENDPOINT:-}}"
+external_s3_test_require_shell_var TEST_AWS_PRIMARY_ACCESS_KEY
+external_s3_test_require_shell_var TEST_AWS_PRIMARY_SECRET_KEY
+
+export AWS_ACCESS_KEY_ID="$TEST_AWS_PRIMARY_ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="$TEST_AWS_PRIMARY_SECRET_KEY"
+export AWS_DEFAULT_REGION="$region"
+export AWS_REGION="$region"
+export AWS_PAGER=""
+
+aws_s3api() {
+  if [[ -n "$endpoint" ]]; then
+    aws --endpoint-url "$endpoint" s3api "$@"
+  else
+    aws s3api "$@"
+  fi
+}
 
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT INT TERM
@@ -13,7 +97,7 @@ disable_legal_hold() {
   [ -n "$version_id" ] || return 0
   [ "$version_id" != "null" ] || return 0
 
-  aws s3api put-object-legal-hold \
+  aws_s3api put-object-legal-hold \
     --bucket "$bucket" \
     --key "$key" \
     --version-id "$version_id" \
@@ -30,27 +114,27 @@ delete_version() {
     return 1
   fi
 
-  aws s3api delete-object \
+  aws_s3api delete-object \
     --bucket "$bucket" \
     --key "$key" \
     --version-id "$version_id" \
     --bypass-governance-retention \
     >/dev/null 2>&1 && return 0
 
-  aws s3api delete-object \
+  aws_s3api delete-object \
     --bucket "$bucket" \
     --key "$key" \
     --version-id "$version_id" \
     >/dev/null 2>&1 && return 0
 
   if [ "$version_id" = "null" ]; then
-    aws s3api delete-object \
+    aws_s3api delete-object \
       --bucket "$bucket" \
       --key "$key" \
       --bypass-governance-retention \
       >/dev/null 2>&1 && return 0
 
-    aws s3api delete-object \
+    aws_s3api delete-object \
       --bucket "$bucket" \
       --key "$key" \
       >/dev/null 2>&1 && return 0
@@ -64,7 +148,7 @@ delete_marker() {
   key=$2
   version_id=$3
 
-  aws s3api delete-object \
+  aws_s3api delete-object \
     --bucket "$bucket" \
     --key "$key" \
     --version-id "$version_id" \
@@ -75,22 +159,22 @@ delete_current_object() {
   bucket=$1
   key=$2
 
-  aws s3api delete-object \
+  aws_s3api delete-object \
     --bucket "$bucket" \
     --key "$key" \
     --bypass-governance-retention \
     >/dev/null 2>&1 && return 0
 
-  aws s3api delete-object \
+  aws_s3api delete-object \
     --bucket "$bucket" \
     --key "$key" \
     >/dev/null 2>&1
 }
 
 bucketlist="$tmpdir/bucketlist"
-aws s3api list-buckets --query 'Buckets[].Name' --output text \
+aws_s3api list-buckets --query 'Buckets[].Name' --output text \
   | tr '\t' '\n' \
-  | grep '^claude-s3-' > "$bucketlist" || true
+  | grep "^$bucket_prefix" > "$bucketlist" || true
 
 echo "$(grep -c . "$bucketlist" 2>/dev/null || true) buckets to go..."
 
@@ -105,7 +189,7 @@ do
   object_rows="$tmpdir/$bucket-object-rows.txt"
   bucket_failed=0
 
-  aws s3api list-object-versions \
+  aws_s3api list-object-versions \
     --bucket "$bucket" \
     --output json \
     > "$versions_file"
@@ -129,7 +213,7 @@ do
 
       if ! delete_version "$bucket" "$key" "$version_id"; then
         retention_mode=$(
-          aws s3api get-object-retention \
+          aws_s3api get-object-retention \
             --bucket "$bucket" \
             --key "$key" \
             --version-id "$version_id" \
@@ -165,7 +249,7 @@ do
     done < "$marker_rows"
   fi
 
-  aws s3api list-objects-v2 \
+  aws_s3api list-objects-v2 \
     --bucket "$bucket" \
     --output json \
     > "$objects_file"
@@ -185,7 +269,7 @@ do
     fi
   done < "$object_rows"
 
-  if [ "$bucket_failed" -eq 0 ] && aws s3api delete-bucket --bucket "$bucket" >/dev/null 2>&1; then
+  if [ "$bucket_failed" -eq 0 ] && aws_s3api delete-bucket --bucket "$bucket" >/dev/null 2>&1; then
     echo "Deleted $bucket"
   else
     echo "Skipped deleting $bucket" >&2
