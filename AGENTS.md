@@ -87,6 +87,10 @@ Always run tests after making changes and make sure they still pass. Review your
 is clear, correct and secure. Always run `cargo fmt` after making any edits. Aim to make illegal states
 unrepresnetable versus having checks.
 
+Do not split a coherent change into a "fix" commit and a later "actual change" commit. If review feedback
+changes an uncommitted slice, commit the whole corrected slice together. Never commit a fix before the change
+it fixes, and always verify the worktree is in the intended committed state before saying a chunk is committed.
+
 ## Diary
 
 We keep a diary os the work we did. This is a historical record, so only append to it. We will update this at
