@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use ec::{EcConfig, ErasureCodec};
 use s3_types::BucketLifecycleConfiguration;
-use storage::traits::ShardStore;
 use storage::{
     BucketInfo, BucketName, GenerationId, ObjectEncryption, ObjectKey, OwnerIdentity, ShardKey,
     SharedStorageNode, UploadId, UploadState, VersionId,
@@ -800,7 +799,7 @@ impl ReadRuntime {
             return Ok(buf.into_shared());
         }
 
-        self.read_segment_payload_locked(
+        self.read_segment_payload_recovery(
             segment,
             part_number,
             sse_customer_request,
@@ -859,7 +858,7 @@ impl ReadRuntime {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn read_segment_payload_locked(
+    fn read_segment_payload_recovery(
         &self,
         segment: &SegmentPayloadRecord,
         part_number: Option<u32>,
@@ -869,37 +868,13 @@ impl ReadRuntime {
         padded: usize,
         shard_size: usize,
     ) -> Result<PooledPayloadBuffer, ServerError> {
-        let pg = self.storage_node.get_pg(segment.shard_pg_id)?;
-
-        let mut all_shards = vec![None; k + m];
-        let mut present_count = 0;
-
-        let read_shard = |i: usize,
-                          all_shards: &mut [Option<Vec<u8>>],
-                          present_count: &mut usize| {
-            let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
-            if let Ok(sd) = pg.read_shard(&shard_key) {
-                all_shards[i] = Some(sd.data);
-                *present_count += 1;
-            }
-        };
-
-        for i in 0..k {
-            read_shard(i, &mut all_shards, &mut present_count);
-        }
-
-        if present_count < k {
-            for i in k..(k + m) {
-                if present_count >= k {
-                    break;
-                }
-                read_shard(i, &mut all_shards, &mut present_count);
-            }
-        }
-
-        if present_count < k {
-            return Err(ServerError::Store(storage::StoreError::NotFound));
-        }
+        let all_shards = self.storage_node.load_segment_shards_for_recovery(
+            segment.shard_pg_id,
+            &segment.segment_okh,
+            segment.segment_vid,
+            segment.ec_k,
+            segment.ec_m,
+        )?;
 
         let mut recovered = None;
         let mut recovered_ranges = vec![None; k];

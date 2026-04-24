@@ -544,6 +544,61 @@ impl SharedStorageNode {
         }
     }
 
+    /// Load enough live shards for a segment to support recovery while keeping
+    /// PG access, shard status checks, and quarantine handling internal to
+    /// storage.
+    pub fn load_segment_shards_for_recovery(
+        &self,
+        shard_pg_id: u32,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        ec_k: u8,
+        ec_m: u8,
+    ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "SharedStorageNode::load_segment_shards_for_recovery",
+            "pg_id={} segment_vid={} k={} m={}",
+            shard_pg_id,
+            segment_vid.get(),
+            ec_k,
+            ec_m
+        );
+        let pg = self.get_pg(shard_pg_id)?;
+        let k = ec_k as usize;
+        let m = ec_m as usize;
+        let mut all_shards = vec![None; k + m];
+        let mut present_count = 0usize;
+
+        let read_shard =
+            |i: usize, all_shards: &mut [Option<Vec<u8>>], present_count: &mut usize| {
+                let shard_key = ShardKey::new(segment_okh, segment_vid.get(), i as u8);
+                if let Ok(sd) = pg.read_shard(&shard_key) {
+                    all_shards[i] = Some(sd.data);
+                    *present_count += 1;
+                }
+            };
+
+        for i in 0..k {
+            read_shard(i, &mut all_shards, &mut present_count);
+        }
+
+        if present_count < k {
+            for i in k..(k + m) {
+                if present_count >= k {
+                    break;
+                }
+                read_shard(i, &mut all_shards, &mut present_count);
+            }
+        }
+
+        if present_count < k {
+            return Err(StoreError::NotFound);
+        }
+
+        Ok(all_shards)
+    }
+
     /// Acquire an in-memory lease on an object payload generation.
     pub fn acquire_object_payload_lease(
         &self,
