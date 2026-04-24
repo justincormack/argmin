@@ -1899,8 +1899,10 @@ fn complete_multipart_upload_waits_for_multipart_completion_lock() {
     let bucket = "bucket-complete-waits-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let completer = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let admin =
+        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
+    let completer =
+        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
@@ -1966,8 +1968,10 @@ fn complete_multipart_upload_does_not_deadlock_when_bucket_policy_shares_pg() {
     let bucket = "bucket-complete-same-pg";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let completer = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let admin =
+        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
+    let completer =
+        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
 
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
