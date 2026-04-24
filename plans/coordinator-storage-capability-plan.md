@@ -1242,6 +1242,56 @@ Acceptance criteria:
   resolved and pinned by tests, either by removing the stale-cache window or by
   deliberately modeling AWS-compatible asynchronous behavior
 
+### Phase 11: Data-Plane EC and Shard IO Ownership
+
+After the request-shape and test-boundary work, there is still one remaining
+storage concern visible above the storage boundary: coordinator/runtime code
+still owns erasure-coding and shard file IO for the data path.
+
+Current remaining seam:
+
+- write side:
+  - coordinator still performs EC encode for streaming/direct segment writes
+  - coordinator still calls storage shard file write helpers directly
+- read side:
+  - read runtime still owns EC decode / reconstruction behavior
+  - storage still exposes direct shard file read helpers used by the read path
+
+Target direction:
+
+- storage owns segment shard placement, EC encode, shard-file durability, and
+  metadata publication for writes
+- storage owns healthy shard reads, degraded reconstruction, quarantine-aware
+  retry/fallback behavior, and returns reconstructed segment payload bytes to
+  coordinator/runtime
+- coordinator no longer needs to hold `ErasureCodec` / EC configuration for
+  shard IO paths; it should request object/segment payload actions, not manage
+  shard math directly
+
+Likely execution order:
+
+1. write path migration
+   - move streaming segment EC encode + shard file write behind storage-owned
+     helpers
+   - remove coordinator calls to `write_shard_files(...)`
+2. read path migration
+   - move healthy shard-file reads and degraded reconstruction behind
+     storage-owned segment payload helpers
+   - remove coordinator/runtime calls to `read_shard_file(...)`
+3. cleanup
+   - remove remaining coordinator EC/runtime data-path plumbing that only
+     exists to support shard IO
+   - tighten storage exports again once those helpers are internal
+
+Acceptance criteria:
+
+- coordinator no longer directly encodes EC shards for data-path writes
+- coordinator/runtime no longer directly reads shard files for data-path reads
+- data-path shard placement, shard durability, and degraded reconstruction are
+  owned by storage
+- any remaining shard file helper exports are explicit, justified, and not
+  used by normal request paths
+
 ## Special Cases
 
 Not every operation has the same access pattern. The plan should treat these
