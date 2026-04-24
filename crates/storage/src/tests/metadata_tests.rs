@@ -3650,6 +3650,9 @@ fn mpu_commit_object_parts_commit_failure_via_lock_contention() {
     let db_path = pg_dir.join("metadata.db");
     let blocker = rusqlite::Connection::open(&db_path).unwrap();
     blocker
+        .busy_timeout(std::time::Duration::from_millis(0))
+        .unwrap();
+    blocker
         .execute_batch("BEGIN; SELECT * FROM object_parts;")
         .unwrap();
 

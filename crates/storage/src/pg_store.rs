@@ -105,6 +105,11 @@ impl PgStore {
             context: "init pg schema",
             source: e,
         })?;
+        conn.busy_timeout(std::time::Duration::from_millis(0))
+            .map_err(|e| StoreError::Db {
+                context: "configure pg database busy timeout",
+                source: e,
+            })?;
 
         // Clean up any orphaned temp files from previous crashes.
         if let Ok(entries) = fs::read_dir(&tmp_dir) {
