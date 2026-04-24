@@ -2696,7 +2696,7 @@ fn lifecycle_sweep_skips_object_locked_noncurrent_version() {
 #[test]
 fn deleting_current_version_clears_repromoted_version_noncurrent_timestamp_for_lifecycle() {
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator(tmp.path());
+    let coord = setup_coordinator_without_lifecycle_sweeper(tmp.path());
     let metadata = MetadataBlob::default();
     let system_metadata = SystemMetadata::default();
     coord
