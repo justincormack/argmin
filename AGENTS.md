@@ -90,6 +90,9 @@ unrepresnetable versus having checks.
 Do not split a coherent change into a "fix" commit and a later "actual change" commit. If review feedback
 changes an uncommitted slice, commit the whole corrected slice together. Never commit a fix before the change
 it fixes, and always verify the worktree is in the intended committed state before saying a chunk is committed.
+After every commit, check that the expected commit exists and that the worktree state matches what you think it is.
+Normally this means verifying the tree is clean before reporting success. Do not start new work from an unexpectedly
+dirty tree; stop and resolve it first. Only proceed with a dirty tree when that state is intentional and explicit.
 
 ## Diary
 
