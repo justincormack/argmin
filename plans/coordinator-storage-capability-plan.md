@@ -1112,6 +1112,90 @@ This includes:
   - test bucket ABAC toggles
   - test bucket policy cache inspection
 
+Audit summary:
+
+- the remaining surface is entirely test-only, but it is still broad
+- current direct references are concentrated in:
+  - `multipart_tests.rs`
+  - `core_tests.rs`
+  - `multipart_stateful_tests.rs`
+  - `bucket_tests.rs`
+  - `multipart_reclaim_trace_tests.rs`
+- there is also a smaller but important coordinator test-helper seam in:
+  - `infra.rs`
+  - `object_state.rs`
+  - `pg_guards.rs`
+  - `authz.rs`
+  - `bucket.rs`
+
+The remaining uses fall into four categories:
+
+1. topology-selection helpers
+   - tests that intentionally choose same-PG vs cross-PG keys using:
+     - `bucket_pg_id`
+     - `object_pg_id`
+     - `shard_pg_id`
+     - `pg_topology`
+2. white-box metadata inspection/mutation
+   - tests opening metadata PGs directly to inspect uploads, versions,
+     stream sessions, reclaim roots, or lifecycle state
+3. white-box shard inspection
+   - tests opening shard PGs directly to assert shard existence, deletion,
+     corruption cleanup, or reclaim outcomes
+4. locking / contention probes
+   - tests that directly acquire bucket locks, multipart completion locks,
+     or raw bucket PGs to force same-PG / blocked-path scenarios
+
+Expected migration direction:
+
+- do not preserve coordinator-visible PG helpers under new names
+- instead, move all remaining white-box inspection behind storage-owned,
+  test-only helpers
+- preserve explicit test determinism and blocking probes, but keep them
+  storage-owned and test-only rather than exposing raw PG guards again
+
+Likely helper families needed in `storage`:
+
+- metadata inspection helpers
+  - load object record / object version
+  - load multipart upload
+  - list multipart uploads / list parts
+  - list stream sessions / stream segments
+  - inspect reclaim roots and payload reclaim state
+- shard inspection helpers
+  - assert shard existence / deletion
+  - inspect shard status for a bucket/key/generation without exposing raw PGs
+- topology test helpers
+  - find same-PG vs cross-PG bucket/object/shard placements for deterministic
+    test setup
+- locking / probe helpers
+  - retain narrow test hooks and try-probe APIs for same-PG and lock-wait
+    tests instead of acquiring raw PG guards from coordinator
+
+Recommended execution order:
+
+1. remove the coordinator test-helper seam first
+   - replace test-only `bucket_pg_id`, `object_pg_id`, `shard_pg_id`,
+     `get_bucket_pg`, `get_bucket_pg_for`, and `lock_object_pgs_for_read_typed`
+     with storage-owned test helpers
+   - delete `LockedReadObject` / `ObjectPgGuards` once no tests depend on them
+2. add storage-owned inspection helpers for the dominant white-box patterns
+   - enough to convert `multipart_tests.rs`, `bucket_tests.rs`, `read_tests.rs`,
+     and the remaining `core_tests.rs` raw-PG assertions
+3. convert the dense stateful / trace suites
+   - `multipart_stateful_tests.rs`
+   - `multipart_trace_tests.rs`
+   - `multipart_reclaim_trace_tests.rs`
+4. rescan and remove any remaining PG exports from `storage`
+
+Sizing assessment:
+
+- this is medium-sized work, not a tiny cleanup
+- the production-path refactor is already done, so this is primarily harness
+  and white-box test migration rather than another architecture rewrite
+- likely shape: a small sequence of coherent commits rather than one very
+  large change
+
 Acceptance criteria for 9b:
 
 - direct PG use no longer appears in `server-core` tests or test helpers
