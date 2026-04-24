@@ -120,7 +120,35 @@ pub(crate) fn stream_put_session_has_cross_pg_segments(
     session_id: &SessionId,
 ) -> bool {
     let meta_pg_id = object_pg_id(coord, bucket, key);
-    let first_vid_pg = coord.shard_pg_id_raw(&format!("segment/{}", session_id.as_str()), "0", 1);
-    let second_vid_pg = coord.shard_pg_id_raw(&format!("segment/{}", session_id.as_str()), "0", 2);
+    let first_vid_pg = stream_segment_shard_pg_id(coord, session_id, 0, 1);
+    let second_vid_pg = stream_segment_shard_pg_id(coord, session_id, 0, 2);
     first_vid_pg != meta_pg_id || second_vid_pg != meta_pg_id
+}
+
+pub(crate) fn stream_segment_shard_pg_id(
+    coord: &Coordinator,
+    session_id: &SessionId,
+    segment_index: u32,
+    generation: u64,
+) -> u32 {
+    coord.storage_node.test_stream_segment_shard_pg_id_for(
+        session_id,
+        segment_index,
+        GenerationId::new(generation).unwrap(),
+    )
+}
+
+pub(crate) fn multipart_part_shard_pg_id(
+    coord: &Coordinator,
+    upload_id: &UploadId,
+    part_number: u32,
+    generation: u32,
+    part_vid: GenerationId,
+) -> u32 {
+    coord.storage_node.test_multipart_part_shard_pg_id_for(
+        upload_id,
+        part_number,
+        generation,
+        part_vid,
+    )
 }

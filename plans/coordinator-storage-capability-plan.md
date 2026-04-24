@@ -1099,52 +1099,16 @@ Acceptance criteria for 9a:
 
 Phase 9b: test/helper cleanup audit
 
-There are still many direct PG references in tests and test-only helpers.
-Those are lower priority than production-path cleanup, but they are still part
-of the required end state because the storage/coordinator boundary is not
-finished until PG exports disappear completely.
+Phase 9b started with broad direct PG use in coordinator tests and test-only
+helpers. That surface has now been migrated onto storage-owned helpers and
+explicit storage-owned test probes.
 
-This includes:
-
-- direct metadata/shard PG inspection in coordinator tests
-- trace/stateful/property tests that intentionally inspect raw PG state
-- test-only helpers such as:
-  - test bucket ABAC toggles
-  - test bucket policy cache inspection
-
-Audit summary:
-
-- the remaining surface is entirely test-only, but it is still broad
-- current direct references are concentrated in:
-  - `multipart_tests.rs`
-  - `core_tests.rs`
-  - `multipart_stateful_tests.rs`
-  - `bucket_tests.rs`
-  - `multipart_reclaim_trace_tests.rs`
-- there is also a smaller but important coordinator test-helper seam in:
-  - `infra.rs`
-  - `object_state.rs`
-  - `pg_guards.rs`
-  - `authz.rs`
-  - `bucket.rs`
-
-The remaining uses fall into four categories:
+Original remaining use categories:
 
 1. topology-selection helpers
-   - tests that intentionally choose same-PG vs cross-PG keys using:
-     - `bucket_pg_id`
-     - `object_pg_id`
-     - `shard_pg_id`
-     - `pg_topology`
 2. white-box metadata inspection/mutation
-   - tests opening metadata PGs directly to inspect uploads, versions,
-     stream sessions, reclaim roots, or lifecycle state
 3. white-box shard inspection
-   - tests opening shard PGs directly to assert shard existence, deletion,
-     corruption cleanup, or reclaim outcomes
 4. locking / contention probes
-   - tests that directly acquire bucket locks, multipart completion locks,
-     or raw bucket PGs to force same-PG / blocked-path scenarios
 
 Expected migration direction:
 
@@ -1159,18 +1123,19 @@ Expected migration direction:
 
 Current topology-helper structure:
 
-- the remaining storage-owned topology queries are now intentionally
+- the remaining storage-owned topology queries are intentionally
   concentrated behind `coordinator/test_topology.rs`
-- normal test files should call intent-shaped helpers from that module, such
-  as:
+- normal test files call intent-shaped helpers from that module, such as:
   - same-PG vs cross-PG key selection
   - meta-PG vs shard-PG path selection
-  - stream-session cross-PG predicates
-- this is an intermediate containment step:
-  - it removes scattered PG-awareness from the test surface
-  - it makes the remaining topology coupling explicit and reviewable
-  - it leaves one clear place to replace raw PG-id comparisons with more
-    abstract storage-owned topology selectors later if desired
+  - stream-session and multipart-part shard-placement predicates
+- this is the accepted 9b containment shape:
+  - there is no scattered PG arithmetic across `server-core` tests anymore
+  - coordinator test files no longer call direct PG helpers or raw shard PG
+    arithmetic themselves
+  - if we later want a stricter abstraction, `test_topology.rs` is the single
+    place to replace PG-id comparisons with higher-level storage-owned
+    selectors
 
 Likely helper families needed in `storage`:
 
@@ -1190,40 +1155,26 @@ Likely helper families needed in `storage`:
   - retain narrow test hooks and try-probe APIs for same-PG and lock-wait
     tests instead of acquiring raw PG guards from coordinator
 
-Recommended execution order:
-
-1. remove the coordinator test-helper seam first
-   - replace test-only `bucket_pg_id`, `object_pg_id`, `shard_pg_id`,
-     `get_bucket_pg`, `get_bucket_pg_for`, and `lock_object_pgs_for_read_typed`
-     with storage-owned test helpers
-   - delete `LockedReadObject` / `ObjectPgGuards` once no tests depend on them
-2. add storage-owned inspection helpers for the dominant white-box patterns
-   - enough to convert `multipart_tests.rs`, `bucket_tests.rs`, `read_tests.rs`,
-     and the remaining `core_tests.rs` raw-PG assertions
-3. convert the dense stateful / trace suites
-   - `multipart_stateful_tests.rs`
-   - `multipart_trace_tests.rs`
-   - `multipart_reclaim_trace_tests.rs`
-4. rescan and remove any remaining PG exports from `storage`
-
-Sizing assessment:
-
-- this is medium-sized work, not a tiny cleanup
-- the production-path refactor is already done, so this is primarily harness
-  and white-box test migration rather than another architecture rewrite
-- likely shape: a small sequence of coherent commits rather than one very
-  large change
-
 Acceptance criteria for 9b:
 
 - direct PG use no longer appears in `server-core` tests or test helpers
 - tests that currently inspect raw PG state use storage-owned inspection
   helpers or other deterministic higher-level harnesses instead
-- PG-shaped APIs are no longer exported from `storage` for coordinator/test use
-  inspection or fault injection
-- accidental test dependence on coordinator PG helpers is reduced where a
-  clearer storage/test helper exists
-- any remaining test-only coordinator PG helpers are explicit and justified
+- coordinator-owned PG helper seams (`pg_guards.rs`, raw `get_bucket_pg(...)`,
+  `object_pg_id_for(...)`, `bucket_pg_id_for(...)`, etc.) are removed
+- any remaining topology-aware setup is explicit, centralized, and storage-
+  owned via `coordinator/test_topology.rs`
+
+Phase 9b status:
+
+- completed
+- resulting shape:
+  - direct PG access is gone from `server-core` tests and test helpers
+  - white-box metadata/shard inspection now goes through storage-owned
+    test helpers
+  - locking/blocking probes are storage-owned narrow test seams
+  - topology-aware setup is centralized in `coordinator/test_topology.rs`
+    rather than scattered through test files
 
 Expected end state:
 

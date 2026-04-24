@@ -3097,10 +3097,12 @@ fn abort_multipart_upload_reclaims_uploaded_and_streamed_part_shards() {
 
     assert_shard_set_deleted(
         &coord,
-        coord.shard_pg_id_raw(
-            &format!("mpu/{}", create.upload_id),
-            &format!("{}/{}", uploaded_part.part_number, uploaded_part.generation),
-            uploaded_part.part_vid.get(),
+        multipart_part_shard_pg_id(
+            &coord,
+            &create.upload_id,
+            uploaded_part.part_number,
+            uploaded_part.generation,
+            uploaded_part.part_vid,
         ),
         &uploaded_part.part_okh,
         uploaded_part.part_vid,
@@ -7650,16 +7652,8 @@ fn stream_segment_cleanup_only_deletes_matching_segment_vid() {
     let segment_okh = crate::pg::stream_segment_key_hash(&session_id, 0);
     let winner_vid = GenerationId::new(1).unwrap();
     let loser_vid = GenerationId::new(2).unwrap();
-    let winner_pg_id = coord.shard_pg_id_raw(
-        &format!("segment/{}", session_id.as_str()),
-        "0",
-        winner_vid.get(),
-    );
-    let loser_pg_id = coord.shard_pg_id_raw(
-        &format!("segment/{}", session_id.as_str()),
-        "0",
-        loser_vid.get(),
-    );
+    let winner_pg_id = stream_segment_shard_pg_id(&coord, &session_id, 0, winner_vid.get());
+    let loser_pg_id = stream_segment_shard_pg_id(&coord, &session_id, 0, loser_vid.get());
     let winner_shards = coord
         .write_segment_shards(winner_pg_id, &segment_okh, winner_vid, b"winner-data")
         .unwrap();
