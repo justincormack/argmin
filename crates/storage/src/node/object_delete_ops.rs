@@ -548,7 +548,7 @@ impl SharedStorageNode {
         }))
     }
 
-    pub fn expire_current_object_if<E>(
+    fn expire_current_object_from_object_pg_if<E>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -608,7 +608,37 @@ impl SharedStorageNode {
         Ok(Ok(Some(outcome)))
     }
 
-    pub fn delete_noncurrent_live_versions_if<E>(
+    pub fn expire_current_object_if_due<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        expected_version_id: VersionId,
+        should_expire: impl FnOnce(Option<&str>, &LiveObjectRecord) -> Result<bool, E>,
+    ) -> Result<Result<Option<ExpireCurrentObjectOutcome>, E>, ObjectPgActionError> {
+        let Some((_bucket_guard, bucket_info, raw_lifecycle)) =
+            self.lock_bucket_and_load_lifecycle_context(bucket)?
+        else {
+            return Ok(Ok(None));
+        };
+        if raw_lifecycle.is_none() {
+            return Ok(Ok(None));
+        }
+
+        let owner = OwnerIdentity::new(
+            bucket_info.owner_principal.clone(),
+            bucket_info.owner_canonical_id.clone(),
+        );
+        self.expire_current_object_from_object_pg_if(
+            bucket,
+            key,
+            expected_version_id,
+            bucket_info.versioning,
+            owner,
+            |record| should_expire(raw_lifecycle.as_deref(), record),
+        )
+    }
+
+    fn delete_noncurrent_live_versions_from_object_pg_if<E>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -645,7 +675,27 @@ impl SharedStorageNode {
         Ok(Ok(reclaimed_generation_ids))
     }
 
-    pub fn delete_expired_delete_marker_if<E>(
+    pub fn delete_noncurrent_live_versions_if_due<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        select_versions: impl FnOnce(Option<&str>, &[StoredObject]) -> Result<HashSet<VersionId>, E>,
+    ) -> Result<Result<Vec<GenerationId>, E>, ObjectPgActionError> {
+        let Some((_bucket_guard, _bucket_info, raw_lifecycle)) =
+            self.lock_bucket_and_load_lifecycle_context(bucket)?
+        else {
+            return Ok(Ok(Vec::new()));
+        };
+        if raw_lifecycle.is_none() {
+            return Ok(Ok(Vec::new()));
+        }
+
+        self.delete_noncurrent_live_versions_from_object_pg_if(bucket, key, |versions| {
+            select_versions(raw_lifecycle.as_deref(), versions)
+        })
+    }
+
+    fn delete_expired_delete_marker_from_object_pg_if<E>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -667,5 +717,29 @@ impl SharedStorageNode {
         }
         PgMetadataStore::delete_object_version(&*meta_pg, bucket, key, expected_version_id)?;
         Ok(Ok(true))
+    }
+
+    pub fn delete_expired_delete_marker_if_due<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        expected_version_id: VersionId,
+        should_delete: impl FnOnce(Option<&str>, &[StoredObject]) -> Result<bool, E>,
+    ) -> Result<Result<bool, E>, ObjectPgActionError> {
+        let Some((_bucket_guard, _bucket_info, raw_lifecycle)) =
+            self.lock_bucket_and_load_lifecycle_context(bucket)?
+        else {
+            return Ok(Ok(false));
+        };
+        if raw_lifecycle.is_none() {
+            return Ok(Ok(false));
+        }
+
+        self.delete_expired_delete_marker_from_object_pg_if(
+            bucket,
+            key,
+            expected_version_id,
+            |versions| should_delete(raw_lifecycle.as_deref(), versions),
+        )
     }
 }

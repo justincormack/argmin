@@ -1041,26 +1041,38 @@ access:
     exposure
   - lifecycle runtime fanout/mutation flows now go through storage-owned
     bucket/object helpers rather than coordinator PG orchestration
+  - runtime reclaim helpers now go through storage-owned reclaim operations
+    rather than coordinator metadata/shard PG access
+  - runtime shard-recovery reads now go through storage-owned recovery-load
+    helpers rather than coordinator shard PG access
+  - the direct one-segment `PutObject` fast path now publishes through a
+    storage-owned commit helper rather than coordinator `lock_two_pgs(...)`
+    choreography
 
 - remaining non-test coordinator PG use still to remove before 9a is done:
   - `runtime.rs`
-    - reclaim helpers still use direct metadata/shard PG access
-    - low-level segment/shard read internals still use direct PG access
     - lifecycle runtime still uses the storage-owned bucket stripe lock for
-      coordination, and that lock usage should be reviewed as part of the
-      final storage-owned runtime surface
-  - `infra.rs` / `put.rs`
-    - the direct one-segment `PutObject` fast path still uses
-      `lock_object_pgs_for_write_ids(...)`
-  - any remaining non-test coordinator helper that still exposes
-    `get_pg(...)`, `lock_two_pgs(...)`, or bucket/object PG guards
+      coordination in:
+      - current-object expiration
+      - noncurrent-version expiration
+      - expired delete-marker deletion
+      - multipart abort finishing
+    - those bucket-scoped serialized transactions should move fully into
+      storage so coordinator no longer calls `lock_bucket(...)` itself
+  - any remaining non-test coordinator helper that still exposes storage
+    synchronization internals such as `lock_bucket(...)`,
+    `lock_multipart_completion_bucket(...)`, `get_pg(...)`,
+    `lock_two_pgs(...)`, or bucket/object PG guards
 
 - 9a exit criterion:
   - non-test `server-core` code no longer performs PG operations directly
+  - non-test `server-core` code no longer calls storage-owned synchronization
+    primitives such as `lock_bucket(...)` directly
   - coordinator/runtime/internal flows must reach storage-owned helpers
-    instead of calling PG APIs themselves
-  - after that, the remaining PG references are test-only and are removed in
-    phase 9b before the boundary is considered complete
+    instead of calling PG APIs or bucket-scoped lock APIs themselves
+  - after that, the remaining storage-topology / locking references are
+    test-only and are removed in phase 9b before the boundary is considered
+    complete
 
 Acceptance criteria for 9a:
 
@@ -1072,8 +1084,10 @@ Acceptance criteria for 9a:
   on storage-owned helpers without reintroducing coordinator PG exposure
 - runtime/background code no longer keeps direct PG access in coordinator;
   any required locking or topology decisions are storage-owned
-- the remaining coordinator PG uses are only test-only references that are
-  explicitly queued for removal in phase 9b
+- runtime/background code no longer calls storage-owned bucket locking
+  directly; bucket-scoped serialized lifecycle operations are storage-owned
+- the remaining coordinator storage-topology / locking references are only
+  test-only references that are explicitly queued for removal in phase 9b
 
 Phase 9b: test/helper cleanup audit
 

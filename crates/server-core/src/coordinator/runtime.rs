@@ -7,8 +7,8 @@ use std::time::Duration;
 use ec::{EcConfig, ErasureCodec};
 use s3_types::BucketLifecycleConfiguration;
 use storage::{
-    BucketInfo, BucketName, GenerationId, ObjectEncryption, ObjectKey, OwnerIdentity, ShardKey,
-    SharedStorageNode, UploadId, UploadState, VersionId,
+    BucketInfo, BucketName, GenerationId, ObjectEncryption, ObjectKey, ShardKey, SharedStorageNode,
+    UploadId, UploadState, VersionId,
 };
 
 use super::payload::{PooledPayloadBuffer, SharedPayloadBuffer};
@@ -213,13 +213,19 @@ impl ReadRuntime {
             .get_bucket_subresource(&bucket_info.name, storage::BucketSubresourceKind::Lifecycle)
             .map_err(Self::map_bucket_snapshot_error)?;
 
+        Self::parse_lifecycle_config(bucket_info.name.as_str(), raw_config.as_deref())
+    }
+
+    fn parse_lifecycle_config(
+        bucket: &str,
+        raw_config: Option<&str>,
+    ) -> Result<Option<Arc<BucketLifecycleConfiguration>>, ServerError> {
         raw_config
             .map(|config_xml| {
                 s3_types::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(
                     |error| ServerError::InternalError {
                         reason: format!(
-                            "stored lifecycle configuration for {} failed to parse at sweep time: {error}",
-                            bucket_info.name
+                            "stored lifecycle configuration for {bucket} failed to parse at sweep time: {error}",
                         ),
                     },
                 )
@@ -386,32 +392,18 @@ impl ReadRuntime {
         expected_version_id: VersionId,
         now_millis: u64,
     ) -> Result<bool, ServerError> {
-        let _bucket_guard = self.storage_node.lock_bucket(bucket);
-        let bucket_info = match self.storage_node.head_bucket_info(bucket) {
-            Ok(info) => info,
-            Err(storage::BucketSnapshotLoadError::Metadata(
-                storage::MetadataError::BucketNotFound { .. },
-            )) => return Ok(false),
-            Err(error) => return Err(Self::map_bucket_snapshot_error(error)),
-        };
-
-        let Some(config) = self.lifecycle_config_for_bucket_info(&bucket_info)? else {
-            return Ok(false);
-        };
-
-        let owner = OwnerIdentity::new(
-            bucket_info.owner_principal.clone(),
-            bucket_info.owner_canonical_id.clone(),
-        );
         let outcome = self
             .storage_node
-            .expire_current_object_if(
+            .expire_current_object_if_due(
                 bucket,
                 key,
                 expected_version_id,
-                bucket_info.versioning,
-                owner,
-                |record| {
+                |raw_lifecycle, record| {
+                    let Some(config) =
+                        Self::parse_lifecycle_config(bucket.as_str(), raw_lifecycle)?
+                    else {
+                        return Ok::<bool, ServerError>(false);
+                    };
                     let tags = match record.tags.as_deref() {
                         Some(tags_xml) => Coordinator::parse_serialized_tag_set(tags_xml)?,
                         None => Vec::new(),
@@ -447,23 +439,14 @@ impl ReadRuntime {
         key: &ObjectKey,
         now_millis: u64,
     ) -> Result<u64, ServerError> {
-        let _bucket_guard = self.storage_node.lock_bucket(bucket);
-        let bucket_info = match self.storage_node.head_bucket_info(bucket) {
-            Ok(info) => info,
-            Err(storage::BucketSnapshotLoadError::Metadata(
-                storage::MetadataError::BucketNotFound { .. },
-            )) => return Ok(0),
-            Err(error) => return Err(Self::map_bucket_snapshot_error(error)),
-        };
-
-        let Some(config) = self.lifecycle_config_for_bucket_info(&bucket_info)? else {
-            return Ok(0);
-        };
-
         let current_unix_seconds = Coordinator::current_unix_seconds()?;
         let reclaimed_generation_ids = self
             .storage_node
-            .delete_noncurrent_live_versions_if(bucket, key, |versions| {
+            .delete_noncurrent_live_versions_if_due(bucket, key, |raw_lifecycle, versions| {
+                let Some(config) = Self::parse_lifecycle_config(bucket.as_str(), raw_lifecycle)?
+                else {
+                    return Ok::<HashSet<VersionId>, ServerError>(HashSet::new());
+                };
                 let due_versions = Coordinator::evaluate_due_noncurrent_version_expirations(
                     &config, versions, now_millis,
                 )?;
@@ -547,28 +530,25 @@ impl ReadRuntime {
         expected_version_id: VersionId,
         now_millis: u64,
     ) -> Result<bool, ServerError> {
-        let _bucket_guard = self.storage_node.lock_bucket(bucket);
-        let bucket_info = match self.storage_node.head_bucket_info(bucket) {
-            Ok(info) => info,
-            Err(storage::BucketSnapshotLoadError::Metadata(
-                storage::MetadataError::BucketNotFound { .. },
-            )) => return Ok(false),
-            Err(error) => return Err(Self::map_bucket_snapshot_error(error)),
-        };
-
-        let Some(config) = self.lifecycle_config_for_bucket_info(&bucket_info)? else {
-            return Ok(false);
-        };
-
         self.storage_node
-            .delete_expired_delete_marker_if(bucket, key, expected_version_id, |versions| {
-                let Some(expiration) =
-                    Coordinator::evaluate_due_expired_delete_marker(&config, versions, now_millis)
-                else {
-                    return Ok::<bool, ServerError>(false);
-                };
-                Ok::<bool, ServerError>(expiration.version_id == expected_version_id)
-            })
+            .delete_expired_delete_marker_if_due(
+                bucket,
+                key,
+                expected_version_id,
+                |raw_lifecycle, versions| {
+                    let Some(config) =
+                        Self::parse_lifecycle_config(bucket.as_str(), raw_lifecycle)?
+                    else {
+                        return Ok::<bool, ServerError>(false);
+                    };
+                    let Some(expiration) = Coordinator::evaluate_due_expired_delete_marker(
+                        &config, versions, now_millis,
+                    ) else {
+                        return Ok::<bool, ServerError>(false);
+                    };
+                    Ok::<bool, ServerError>(expiration.version_id == expected_version_id)
+                },
+            )
             .map_err(Coordinator::map_object_pg_action_error)?
     }
 
@@ -636,49 +616,23 @@ impl ReadRuntime {
                 )),
             );
         }
-        let _bucket_guard = self.storage_node.lock_bucket(bucket);
-        let bucket_info = match self.storage_node.head_bucket_info(bucket) {
-            Ok(info) => info,
-            Err(storage::BucketSnapshotLoadError::Metadata(
-                storage::MetadataError::BucketNotFound { .. },
-            )) => return Ok(false),
-            Err(error) => return Err(Self::map_bucket_snapshot_error(error)),
-        };
+        self.storage_node
+            .abort_multipart_upload_if_due(bucket, key, upload_id, |raw_lifecycle, upload| {
+                let Some(config) = Self::parse_lifecycle_config(bucket.as_str(), raw_lifecycle)?
+                else {
+                    return Ok::<bool, ServerError>(false);
+                };
 
-        let upload = match self
-            .storage_node
-            .load_multipart_upload(bucket, key, upload_id)
-        {
-            Ok(upload) => upload,
-            Err(storage::BucketSnapshotLoadError::Metadata(
-                storage::MetadataError::NoSuchUpload { .. },
-            )) => return Ok(false),
-            Err(error) => return Err(Self::map_bucket_snapshot_error(error)),
-        };
-
-        if upload.state == UploadState::Aborting {
-            return self.abort_multipart_upload_internal_for(bucket, key, upload_id);
-        }
-        if upload.state != UploadState::InProgress {
-            return Ok(false);
-        }
-
-        let Some(config) = self.lifecycle_config_for_bucket_info(&bucket_info)? else {
-            return Ok(false);
-        };
-
-        let Some(headers) = Coordinator::evaluate_multipart_lifecycle_abort_headers(
-            &config,
-            key.as_str(),
-            upload.initiated_at,
-        ) else {
-            return Ok(false);
-        };
-        if headers.abort_time_millis > now_millis {
-            return Ok(false);
-        }
-
-        self.abort_multipart_upload_internal_for(bucket, key, upload_id)
+                let Some(headers) = Coordinator::evaluate_multipart_lifecycle_abort_headers(
+                    &config,
+                    key.as_str(),
+                    upload.initiated_at,
+                ) else {
+                    return Ok::<bool, ServerError>(false);
+                };
+                Ok::<bool, ServerError>(headers.abort_time_millis <= now_millis)
+            })
+            .map_err(Coordinator::map_object_pg_action_error)?
     }
 
     pub(super) fn abort_multipart_upload_internal_for(

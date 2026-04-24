@@ -798,6 +798,50 @@ impl SharedStorageNode {
         }
     }
 
+    pub fn abort_multipart_upload_if_due<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        should_abort: impl FnOnce(Option<&str>, &MultipartUploadRecord) -> Result<bool, E>,
+    ) -> Result<Result<bool, E>, ObjectPgActionError> {
+        let Some((_bucket_guard, _bucket_info, raw_lifecycle)) =
+            self.lock_bucket_and_load_lifecycle_context(bucket)?
+        else {
+            return Ok(Ok(false));
+        };
+
+        let upload = match self.load_multipart_upload(bucket, key, upload_id) {
+            Ok(upload) => upload,
+            Err(crate::error::BucketSnapshotLoadError::Metadata(
+                crate::error::MetadataError::NoSuchUpload { .. },
+            )) => return Ok(Ok(false)),
+            Err(crate::error::BucketSnapshotLoadError::Store(error)) => {
+                return Err(error.into());
+            }
+            Err(crate::error::BucketSnapshotLoadError::Metadata(error)) => {
+                return Err(error.into());
+            }
+        };
+
+        if upload.state == UploadState::Aborting {
+            return self.abort_multipart_upload(bucket, key, upload_id).map(Ok);
+        }
+        if upload.state != UploadState::InProgress || raw_lifecycle.is_none() {
+            return Ok(Ok(false));
+        }
+
+        let should_abort = match should_abort(raw_lifecycle.as_deref(), &upload) {
+            Ok(should_abort) => should_abort,
+            Err(error) => return Ok(Err(error)),
+        };
+        if !should_abort {
+            return Ok(Ok(false));
+        }
+
+        self.abort_multipart_upload(bucket, key, upload_id).map(Ok)
+    }
+
     pub(super) fn validate_upload_part_stream_session(
         session: &crate::StreamUploadRecord,
         bucket: &BucketName,
