@@ -2827,7 +2827,7 @@ fn deleting_current_version_clears_repromoted_version_noncurrent_timestamp_for_l
 #[test]
 fn lifecycle_sweep_expires_explicit_expired_object_delete_marker() {
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator(tmp.path());
+    let coord = setup_coordinator_without_lifecycle_sweeper(tmp.path());
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
