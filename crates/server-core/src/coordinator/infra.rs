@@ -13,12 +13,10 @@ use super::request_types::AuthorizePutObjectRequest;
 use super::response_types::BucketSummary;
 use super::runtime::{LifecycleSweeper, ReclaimSweeper};
 #[cfg(test)]
-use super::{trusted_bucket_name, trusted_object_key};
+use super::trusted_bucket_name;
 use super::{Coordinator, PgTopology};
 use crate::error::ServerError;
 use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
-#[cfg(test)]
-use storage::ObjectKey;
 use storage::{
     BucketFastPathInfo, BucketInfo, BucketName, BucketState, ReclaimWorkItem, SessionId,
     SharedStorageNode,
@@ -376,16 +374,6 @@ impl Coordinator {
 
     pub fn region(&self) -> &str {
         &self.region
-    }
-
-    #[cfg(test)]
-    pub(super) fn object_pg_id_for(&self, bucket: &BucketName, key: &ObjectKey) -> u32 {
-        self.pg_topology.object_pg_for(bucket, key)
-    }
-
-    #[cfg(test)]
-    pub(super) fn object_pg_id(&self, bucket: &str, key: &str) -> u32 {
-        self.object_pg_id_for(&trusted_bucket_name(bucket), &trusted_object_key(key))
     }
 
     pub(super) fn shard_pg_id_raw(&self, bucket: &str, key: &str, generation: u64) -> u32 {

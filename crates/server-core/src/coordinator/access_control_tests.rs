@@ -2586,11 +2586,14 @@ fn multipart_upload_managed_encryption_policy_context_enables_upload_part_copy_w
 
     let bucket = coord.unchecked_active_bucket_summary("dst").unwrap();
     let policy = coord.cached_bucket_policy(&bucket).unwrap();
-    let meta_pg = coord
+    let upload = coord
         .storage_node
-        .get_pg(coord.object_pg_id("dst", "copied"))
+        .test_get_multipart_upload(
+            &trusted_bucket_name("dst"),
+            &trusted_object_key("copied"),
+            &upload.upload_id,
+        )
         .unwrap();
-    let upload = meta_pg.get_multipart_upload(&upload.upload_id).unwrap();
     let requester = test_helpers::requester("other-user");
     let base_context = PutObjectPolicyContext::new(Some("src/public/foo"), None, None);
 
@@ -7055,11 +7058,14 @@ fn multipart_upload_managed_encryption_policy_context_enables_complete_multipart
 
     let bucket = coord.unchecked_active_bucket_summary("bucket").unwrap();
     let policy = coord.cached_bucket_policy(&bucket).unwrap();
-    let meta_pg = coord
+    let upload = coord
         .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
+        .test_get_multipart_upload(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &upload.upload_id,
+        )
         .unwrap();
-    let upload = meta_pg.get_multipart_upload(&upload.upload_id).unwrap();
     let requester = test_helpers::requester("other-user");
 
     assert!(!coord

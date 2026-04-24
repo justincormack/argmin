@@ -9,8 +9,6 @@ use storage::{
 };
 
 use super::{ActiveWriteEncryption, Coordinator, SegmentPayloadRecord};
-#[cfg(test)]
-use super::{LockedReadObject, ObjectPgGuards};
 use crate::error::ServerError;
 use crate::metadata_blob::MetadataBlob;
 use crate::sse::{
@@ -77,28 +75,36 @@ impl Coordinator {
 
     #[cfg(test)]
     pub(super) fn lookup_object_record(
-        meta_pg: &storage::PgStore,
+        &self,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,
     ) -> Result<StoredObject, ServerError> {
         match version_id {
-            Some(vid) => storage::PgMetadataStore::get_object_version(meta_pg, bucket, key, vid),
-            None => storage::PgMetadataStore::get_object_meta(meta_pg, bucket, key),
+            Some(vid) => self.storage_node.test_get_object_version(bucket, key, vid),
+            None => self.storage_node.test_get_object_meta(bucket, key),
         }
         .map_err(|e| match e {
-            storage::MetadataError::ObjectNotFound if version_id.is_some() => {
+            storage::ObjectPgActionError::Metadata(storage::MetadataError::ObjectNotFound)
+                if version_id.is_some() =>
+            {
                 ServerError::VersionNotFound {
                     bucket: bucket.to_string(),
                     key: key.to_string(),
                     version_id: version_id.unwrap().to_string(),
                 }
             }
-            storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            },
-            other => ServerError::Metadata(other),
+            storage::ObjectPgActionError::Metadata(storage::MetadataError::ObjectNotFound) => {
+                ServerError::ObjectNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                }
+            }
+            storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
+            storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
+            storage::ObjectPgActionError::InvalidRequest { reason } => {
+                ServerError::InvalidRequest { reason }
+            }
         })
     }
 
@@ -215,29 +221,6 @@ impl Coordinator {
             ObjectEncryption::None => {}
         }
         Ok(system_metadata)
-    }
-
-    /// Lock metadata PG for a consistent object read/delete view.
-    ///
-    /// Latest-version readers snapshot object metadata while holding the metadata
-    /// PG lock, then construct `ReadHandle`s that acquire a generation-scoped
-    /// payload lease before this guard is released. Committed payload
-    /// generations are immutable, and reclaim is lease-gated, so read-side
-    /// paths no longer need to relock a synthetic shard PG.
-    #[cfg(test)]
-    pub(super) fn lock_object_pgs_for_read_typed<'a>(
-        &'a self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<VersionId>,
-    ) -> Result<LockedReadObject<'a>, ServerError> {
-        let meta_pg_id = self.object_pg_id_for(bucket, key);
-        let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
-        let record = Self::lookup_object_record(&meta_guard, bucket, key, version_id)?;
-        Ok(LockedReadObject {
-            record,
-            pgs: ObjectPgGuards::new(meta_guard),
-        })
     }
 
     pub(super) fn delete_stale_object_payload(

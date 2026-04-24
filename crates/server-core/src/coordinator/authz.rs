@@ -43,8 +43,6 @@ use super::bucket_handles::{
     BucketHandleLoader, BucketHandleRequest, LoadedBucketHandle, LoadedBucketValue,
 };
 #[cfg(test)]
-use super::pg_guards::LockedReadObject;
-#[cfg(test)]
 use super::request_types::ListPartsRequest;
 use super::request_types::{
     authorization_policy_context_for_put_object_write_acl, AuthorizePutObjectRequest,
@@ -2305,14 +2303,11 @@ impl Coordinator {
 
     #[cfg(test)]
     #[allow(dead_code)]
-    pub(super) fn authorize_put_object_tags<'a>(
-        &'a self,
+    pub(super) fn authorize_put_object_tags(
+        &self,
         req: &PutObjectTagsRequest<'_>,
-    ) -> Result<AuthorizedObjectTagsAccess<'a>, ServerError> {
-        let LockedReadObject {
-            record: stored,
-            pgs,
-        } = self.authorize_object_tagging_access(
+    ) -> Result<AuthorizedObjectTagsAccess, ServerError> {
+        let stored = self.authorize_object_tagging_access(
             &req.object,
             Self::put_object_tagging_policy_action(req.object.version_id),
             Some(req.tags),
@@ -2324,19 +2319,15 @@ impl Coordinator {
             bucket: req.object.bucket_name_typed().clone(),
             key: req.object.key_typed().clone(),
             version_id: stored.version_id(),
-            pgs,
         })
     }
 
     #[cfg(test)]
-    pub(super) fn authorize_get_object_tags<'a>(
-        &'a self,
+    pub(super) fn authorize_get_object_tags(
+        &self,
         req: &ObjectVersionRequest<'_>,
-    ) -> Result<AuthorizedObjectTagsAccess<'a>, ServerError> {
-        let LockedReadObject {
-            record: stored,
-            pgs,
-        } = self.authorize_object_tagging_read(
+    ) -> Result<AuthorizedObjectTagsAccess, ServerError> {
+        let stored = self.authorize_object_tagging_read(
             req,
             Self::get_object_tagging_policy_action(req.version_id),
         )?;
@@ -2347,20 +2338,16 @@ impl Coordinator {
             bucket: req.object.bucket_name_typed().clone(),
             key: req.object.key_typed().clone(),
             version_id: stored.version_id(),
-            pgs,
         })
     }
 
     #[cfg(test)]
     #[allow(dead_code)]
-    pub(super) fn authorize_delete_object_tags<'a>(
-        &'a self,
+    pub(super) fn authorize_delete_object_tags(
+        &self,
         req: &ObjectVersionRequest<'_>,
-    ) -> Result<AuthorizedObjectTagsAccess<'a>, ServerError> {
-        let LockedReadObject {
-            record: stored,
-            pgs,
-        } = self.authorize_object_tagging_access(
+    ) -> Result<AuthorizedObjectTagsAccess, ServerError> {
+        let stored = self.authorize_object_tagging_access(
             req,
             Self::delete_object_tagging_policy_action(req.version_id),
             None,
@@ -2372,7 +2359,6 @@ impl Coordinator {
             bucket: req.object.bucket_name_typed().clone(),
             key: req.object.key_typed().clone(),
             version_id: stored.version_id(),
-            pgs,
         })
     }
 
@@ -2383,11 +2369,10 @@ impl Coordinator {
     ) -> Result<AuthorizedGetObjectAcl, ServerError> {
         let LoadedObjectState {
             bucket_info,
-            locked,
+            record: stored,
             ..
         } = self
             .authorize_object_acl_read(req, Self::get_object_acl_policy_action(req.version_id))?;
-        let LockedReadObject { record: stored, .. } = locked;
         let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
         let result = if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_ref()) {
             let owner = Self::bucket_owner_identity(&bucket_info);
@@ -2413,16 +2398,16 @@ impl Coordinator {
 
     #[cfg(test)]
     #[allow(dead_code)]
-    pub(super) fn authorize_put_object_acl<'a>(
-        &'a self,
+    pub(super) fn authorize_put_object_acl(
+        &self,
         req: &PutObjectAclRequest<'_>,
-    ) -> Result<AuthorizedPutObjectAclUpdate<'a>, ServerError> {
+    ) -> Result<AuthorizedPutObjectAclUpdate, ServerError> {
         if req.object.requester().is_anonymous() {
             return Err(ServerError::AnonymousApiAccessDenied);
         }
         let LoadedObjectState {
             bucket_info,
-            locked,
+            record: stored,
             ..
         } = self.authorize_object_acl_access(
             req.object.requester(),
@@ -2438,10 +2423,6 @@ impl Coordinator {
         if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_ref()) {
             return Err(ServerError::AccessControlListNotSupported);
         }
-        let LockedReadObject {
-            record: stored,
-            pgs,
-        } = locked;
         let acl_grants = match &req.acl {
             PutObjectAclInput::Canned(acl) => {
                 Self::ensure_put_object_acl_supported(&bucket_info, *acl)?;
@@ -2466,24 +2447,19 @@ impl Coordinator {
             version_id: stored.version_id(),
             acl_grants,
             public_read,
-            pgs,
         })
     }
 
     #[cfg(test)]
-    pub(super) fn authorize_put_object_retention<'a>(
-        &'a self,
+    pub(super) fn authorize_put_object_retention(
+        &self,
         req: &PutObjectRetentionRequest<'_>,
-    ) -> Result<AuthorizedPutObjectRetention<'a>, ServerError> {
+    ) -> Result<AuthorizedPutObjectRetention, ServerError> {
         let LoadedObjectState {
             bucket_info,
             bucket_policy,
             bucket_tags,
-            locked:
-                LockedReadObject {
-                    record: stored,
-                    pgs,
-                },
+            record: stored,
             ..
         } = self.authorize_object_lock_access(
             req.object.requester(),
@@ -2513,7 +2489,6 @@ impl Coordinator {
             key: req.object.key_typed().clone(),
             version_id: live.version_id,
             retention: req.retention,
-            pgs,
         })
     }
 
@@ -2522,10 +2497,8 @@ impl Coordinator {
         &self,
         req: &ObjectVersionRequest<'_>,
     ) -> Result<AuthorizedGetObjectRetention, ServerError> {
-        let LoadedObjectState {
-            locked: LockedReadObject { record: stored, .. },
-            ..
-        } = self.authorize_object_lock_read(req, auth::PolicyAction::GetObjectRetention)?;
+        let LoadedObjectState { record: stored, .. } =
+            self.authorize_object_lock_read(req, auth::PolicyAction::GetObjectRetention)?;
         let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
         Ok(AuthorizedGetObjectRetention {
             retention: live.object_lock.retention,
@@ -2533,18 +2506,11 @@ impl Coordinator {
     }
 
     #[cfg(test)]
-    pub(super) fn authorize_put_object_legal_hold<'a>(
-        &'a self,
+    pub(super) fn authorize_put_object_legal_hold(
+        &self,
         req: &PutObjectLegalHoldRequest<'_>,
-    ) -> Result<AuthorizedPutObjectLegalHold<'a>, ServerError> {
-        let LoadedObjectState {
-            locked:
-                LockedReadObject {
-                    record: stored,
-                    pgs,
-                },
-            ..
-        } = self.authorize_object_lock_access(
+    ) -> Result<AuthorizedPutObjectLegalHold, ServerError> {
+        let LoadedObjectState { record: stored, .. } = self.authorize_object_lock_access(
             req.object.requester(),
             req.object.bucket_name_typed(),
             req.object.key_typed(),
@@ -2558,7 +2524,6 @@ impl Coordinator {
             key: req.object.key_typed().clone(),
             version_id: live.version_id,
             legal_hold: StoredLegalHoldStatus::from_legal_hold_status(Some(req.legal_hold)),
-            pgs,
         })
     }
 
@@ -2567,10 +2532,8 @@ impl Coordinator {
         &self,
         req: &ObjectVersionRequest<'_>,
     ) -> Result<AuthorizedGetObjectLegalHold, ServerError> {
-        let LoadedObjectState {
-            locked: LockedReadObject { record: stored, .. },
-            ..
-        } = self.authorize_object_lock_read(req, auth::PolicyAction::GetObjectLegalHold)?;
+        let LoadedObjectState { record: stored, .. } =
+            self.authorize_object_lock_read(req, auth::PolicyAction::GetObjectLegalHold)?;
         let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
         Ok(AuthorizedGetObjectLegalHold {
             legal_hold: live.object_lock.legal_hold.as_legal_hold_status(),
@@ -4349,13 +4312,13 @@ impl Coordinator {
     }
 
     #[cfg(test)]
-    fn load_locked_object_state_from_loaded_bucket<'a>(
-        &'a self,
+    fn load_locked_object_state_from_loaded_bucket(
+        &self,
         requester: &Requester,
         object: &LoadedObjectHandle<'_>,
         policy_requirement: ObjectBucketPolicyRequirement,
         missing_discovery: MissingObjectDiscovery,
-    ) -> Result<LoadedObjectState<'a>, ServerError> {
+    ) -> Result<LoadedObjectState, ServerError> {
         let bucket = object.bucket();
         let bucket_info = ValidatedBucket(bucket.bucket().clone());
         let bucket_policy = match policy_requirement {
@@ -4379,12 +4342,12 @@ impl Coordinator {
             object.key().as_str(),
             object.version_id(),
         )?;
-        let locked = match self.lock_object_pgs_for_read_typed(
+        let record = match self.lookup_object_record(
             &bucket.bucket().name,
             object.key(),
             object.version_id(),
         ) {
-            Ok(locked) => locked,
+            Ok(record) => record,
             Err(ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. })
                 if !can_discover_missing =>
             {
@@ -4397,7 +4360,7 @@ impl Coordinator {
             bucket_info,
             bucket_policy,
             bucket_tags,
-            locked,
+            record,
         })
     }
 
@@ -4615,7 +4578,7 @@ impl Coordinator {
     fn ensure_loaded_object_tagging_allowed(
         &self,
         requester: &Requester,
-        loaded: &LoadedObjectState<'_>,
+        loaded: &LoadedObjectState,
         policy_action: auth::PolicyAction,
         request_object_tags_xml: Option<&str>,
     ) -> Result<(), ServerError> {
@@ -4626,7 +4589,7 @@ impl Coordinator {
                 bucket_tags: loaded.bucket_tags.as_deref(),
                 policy: loaded.bucket_policy.as_deref(),
             },
-            &loaded.locked.record,
+            &loaded.record,
             policy_action,
             request_object_tags_xml,
         )? {
@@ -4638,12 +4601,12 @@ impl Coordinator {
 
     #[cfg(test)]
     #[allow(dead_code)]
-    fn authorize_object_tagging_access<'a>(
-        &'a self,
+    fn authorize_object_tagging_access(
+        &self,
         object: &ObjectVersionRequest<'_>,
         policy_action: auth::PolicyAction,
         request_object_tags_xml: Option<&str>,
-    ) -> Result<LockedReadObject<'a>, ServerError> {
+    ) -> Result<StoredObject, ServerError> {
         let bucket = self.load_bucket_handle_for_object_policy_read(
             object.object.bucket_name_typed(),
             object.expected_bucket_owner(),
@@ -4666,15 +4629,15 @@ impl Coordinator {
             policy_action,
             request_object_tags_xml,
         )?;
-        Ok(loaded.locked)
+        Ok(loaded.record)
     }
 
     #[cfg(test)]
-    fn authorize_object_tagging_read<'a>(
-        &'a self,
+    fn authorize_object_tagging_read(
+        &self,
         object: &ObjectVersionRequest<'_>,
         policy_action: auth::PolicyAction,
-    ) -> Result<LockedReadObject<'a>, ServerError> {
+    ) -> Result<StoredObject, ServerError> {
         let bucket = self.load_bucket_handle_for_object_policy_read(
             object.object.bucket_name_typed(),
             object.expected_bucket_owner(),
@@ -4697,14 +4660,14 @@ impl Coordinator {
             policy_action,
             None,
         )?;
-        Ok(loaded.locked)
+        Ok(loaded.record)
     }
 
     #[cfg(test)]
     fn ensure_loaded_object_acl_allowed(
         &self,
         requester: &Requester,
-        loaded: &LoadedObjectState<'_>,
+        loaded: &LoadedObjectState,
         authorization: ObjectAclAuthorization<'_>,
     ) -> Result<(), ServerError> {
         let allowed = match authorization {
@@ -4718,7 +4681,7 @@ impl Coordinator {
                     bucket_tags: loaded.bucket_tags.as_deref(),
                     policy: loaded.bucket_policy.as_deref(),
                 },
-                &loaded.locked.record,
+                &loaded.record,
                 policy_action,
                 policy_context,
             )?,
@@ -4727,7 +4690,7 @@ impl Coordinator {
                     requester,
                     &loaded.bucket_info,
                     loaded.bucket_tags.as_deref(),
-                    &loaded.locked.record,
+                    &loaded.record,
                     policy_action,
                     loaded.bucket_policy.as_deref(),
                 )?,
@@ -4741,15 +4704,15 @@ impl Coordinator {
 
     #[cfg(test)]
     #[allow(dead_code)]
-    fn authorize_object_acl_access<'a>(
-        &'a self,
+    fn authorize_object_acl_access(
+        &self,
         requester: &Requester,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,
         authorization: ObjectAclAuthorization<'_>,
         expected_bucket_owner: Option<&str>,
-    ) -> Result<LoadedObjectState<'a>, ServerError> {
+    ) -> Result<LoadedObjectState, ServerError> {
         let bucket =
             self.load_bucket_handle_for_object_policy_read(bucket, expected_bucket_owner)?;
         let loaded_object = match version_id {
@@ -4767,11 +4730,11 @@ impl Coordinator {
     }
 
     #[cfg(test)]
-    fn authorize_object_acl_read<'a>(
-        &'a self,
+    fn authorize_object_acl_read(
+        &self,
         req: &ObjectVersionRequest<'_>,
         policy_action: auth::PolicyAction,
-    ) -> Result<LoadedObjectState<'a>, ServerError> {
+    ) -> Result<LoadedObjectState, ServerError> {
         let bucket = self.load_bucket_handle_for_object_policy_read(
             req.object.bucket_name_typed(),
             req.expected_bucket_owner(),
@@ -4800,14 +4763,14 @@ impl Coordinator {
     fn ensure_loaded_object_lock_allowed(
         &self,
         requester: &Requester,
-        loaded: &LoadedObjectState<'_>,
+        loaded: &LoadedObjectState,
         policy_action: auth::PolicyAction,
     ) -> Result<(), ServerError> {
         if self.requester_can_manage_object_lock_with_bucket_policy(
             requester,
             &loaded.bucket_info,
             loaded.bucket_tags.as_deref(),
-            &loaded.locked.record,
+            &loaded.record,
             policy_action,
             loaded.bucket_policy.as_deref(),
         )? {
@@ -4818,15 +4781,15 @@ impl Coordinator {
     }
 
     #[cfg(test)]
-    fn authorize_object_lock_access<'a>(
-        &'a self,
+    fn authorize_object_lock_access(
+        &self,
         requester: &Requester,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,
         policy_action: auth::PolicyAction,
         expected_bucket_owner: Option<&str>,
-    ) -> Result<LoadedObjectState<'a>, ServerError> {
+    ) -> Result<LoadedObjectState, ServerError> {
         let bucket =
             self.load_bucket_handle_for_object_policy_read(bucket, expected_bucket_owner)?;
         let loaded_object = match version_id {
@@ -4845,11 +4808,11 @@ impl Coordinator {
     }
 
     #[cfg(test)]
-    fn authorize_object_lock_read<'a>(
-        &'a self,
+    fn authorize_object_lock_read(
+        &self,
         req: &ObjectVersionRequest<'_>,
         policy_action: auth::PolicyAction,
-    ) -> Result<LoadedObjectState<'a>, ServerError> {
+    ) -> Result<LoadedObjectState, ServerError> {
         let bucket = self.load_bucket_handle_for_object_policy_read(
             req.object.bucket_name_typed(),
             req.expected_bucket_owner(),

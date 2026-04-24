@@ -992,15 +992,15 @@ impl SameKeyUploadHarness {
         match op {
             SameKeyUploadTraceOp::CreateUpload => {
                 let create = create_basic_multipart_upload(&self.coord, TRACE_BUCKET, TRACE_KEY);
-                let meta_pg = self
+                let upload = self
                     .coord
                     .storage_node
-                    .get_pg(self.coord.object_pg_id_for(
+                    .test_get_multipart_upload(
                         &trusted_bucket_name(TRACE_BUCKET),
                         &trusted_object_key(TRACE_KEY),
-                    ))
+                        &create.upload_id,
+                    )
                     .unwrap();
-                let upload = meta_pg.get_multipart_upload(&create.upload_id).unwrap();
                 let payload = format!("trace-part-{}", self.next_payload_id).into_bytes();
                 self.next_payload_id = self.next_payload_id.wrapping_add(1);
                 self.uploads.push(SameKeyUploadEntry {
@@ -1215,22 +1215,15 @@ impl SameKeyUploadHarness {
     }
 
     fn active_session_count(&self) -> usize {
-        let mut count = 0usize;
         self.coord
-            .pg_topology
-            .for_each_pg(|pg_id| {
-                let pg = self.coord.storage_node.get_pg(pg_id)?;
-                count += pg
-                    .list_all_stream_uploads()?
-                    .into_iter()
-                    .filter(|session| {
-                        session.bucket.as_str() == TRACE_BUCKET && session.key.as_str() == TRACE_KEY
-                    })
-                    .count();
-                Ok::<(), ServerError>(())
+            .storage_node
+            .test_list_all_stream_uploads()
+            .unwrap()
+            .into_iter()
+            .filter(|session| {
+                session.bucket.as_str() == TRACE_BUCKET && session.key.as_str() == TRACE_KEY
             })
-            .unwrap();
-        count
+            .count()
     }
 }
 
@@ -1460,22 +1453,15 @@ impl MultipartHeadTailHarness {
     }
 
     fn active_session_count(&self) -> usize {
-        let mut count = 0usize;
         self.coord
-            .pg_topology
-            .for_each_pg(|pg_id| {
-                let pg = self.coord.storage_node.get_pg(pg_id)?;
-                count += pg
-                    .list_all_stream_uploads()?
-                    .into_iter()
-                    .filter(|session| {
-                        session.bucket.as_str() == TRACE_BUCKET && session.key.as_str() == TRACE_KEY
-                    })
-                    .count();
-                Ok::<(), ServerError>(())
+            .storage_node
+            .test_list_all_stream_uploads()
+            .unwrap()
+            .into_iter()
+            .filter(|session| {
+                session.bucket.as_str() == TRACE_BUCKET && session.key.as_str() == TRACE_KEY
             })
-            .unwrap();
-        count
+            .count()
     }
 }
 
@@ -1627,46 +1613,25 @@ impl MultipartTraceHarness {
     }
 
     fn active_session_count(&self) -> usize {
-        let mut count = 0usize;
         self.coord
-            .pg_topology
-            .for_each_pg(|pg_id| {
-                let pg = self.coord.storage_node.get_pg(pg_id)?;
-                count += pg
-                    .list_all_stream_uploads()?
-                    .into_iter()
-                    .filter(|session| {
-                        session.bucket.as_str() == TRACE_BUCKET && session.key.as_str() == TRACE_KEY
-                    })
-                    .count();
-                Ok::<(), ServerError>(())
+            .storage_node
+            .test_list_all_stream_uploads()
+            .unwrap()
+            .into_iter()
+            .filter(|session| {
+                session.bucket.as_str() == TRACE_BUCKET && session.key.as_str() == TRACE_KEY
             })
-            .unwrap();
-        count
+            .count()
     }
 
     fn pending_upload_count(&self) -> usize {
-        let mut count = 0usize;
         self.coord
-            .pg_topology
-            .for_each_pg(|pg_id| {
-                let pg = self.coord.storage_node.get_pg(pg_id)?;
-                count += pg
-                    .list_multipart_uploads(&storage::ListMultipartUploadsReq {
-                        bucket: trusted_bucket_name(TRACE_BUCKET),
-                        prefix: None,
-                        key_marker: None,
-                        upload_id_marker: None,
-                        max_uploads: u32::MAX,
-                    })?
-                    .uploads
-                    .into_iter()
-                    .filter(|upload| upload.key.as_str() == TRACE_KEY)
-                    .count();
-                Ok::<(), ServerError>(())
-            })
-            .unwrap();
-        count
+            .storage_node
+            .test_list_multipart_uploads_for_bucket(&trusted_bucket_name(TRACE_BUCKET))
+            .unwrap()
+            .into_iter()
+            .filter(|upload| upload.key.as_str() == TRACE_KEY)
+            .count()
     }
 }
 

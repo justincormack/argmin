@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use storage::{
     MultipartReclaimPartRecord, MultipartReclaimRecord, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, PgMetadataStore, ReclaimWorkItem, SharedStorageNode,
+    ObjectSegmentsReclaimSegmentRecord, ReclaimWorkItem, SharedStorageNode,
     SimplePayloadReclaimRecord,
 };
 
@@ -40,29 +40,9 @@ fn make_test_read_runtime(dir: &Path) -> ReadRuntime {
 }
 
 fn seed_deleting_bucket(runtime: &ReadRuntime) {
-    let bucket_pg = runtime
+    runtime
         .storage_node
-        .get_pg(
-            runtime
-                .pg_topology
-                .bucket_pg_for(&trusted_bucket_name(TRACE_BUCKET)),
-        )
-        .unwrap();
-    bucket_pg
-        .create_bucket(
-            &trusted_bucket_name(TRACE_BUCKET),
-            "default-owner",
-            &CanonicalUserId::from_principal("default-owner"),
-            &AclGrants::default(),
-            false,
-            false,
-        )
-        .unwrap();
-    bucket_pg
-        .begin_bucket_write_drain(&trusted_bucket_name(TRACE_BUCKET))
-        .unwrap();
-    bucket_pg
-        .mark_bucket_deleting(&trusted_bucket_name(TRACE_BUCKET))
+        .test_create_deleting_bucket(&trusted_bucket_name(TRACE_BUCKET))
         .unwrap();
 }
 
@@ -797,21 +777,23 @@ impl ReclaimTraceHarness {
         use ReclaimTraceOp::*;
         match op {
             SeedMetadata => {
-                let meta_pg = self
-                    .runtime
+                self.runtime
                     .storage_node
-                    .get_pg(self.runtime.pg_topology.object_pg(TRACE_BUCKET, TRACE_KEY))
-                    .map_err(|err| TestCaseError::fail(format!("get_pg failed: {err:?}")))?;
-                meta_pg
-                    .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
-                        bucket: trusted_bucket_name(TRACE_BUCKET),
-                        key: trusted_object_key(TRACE_KEY),
-                        generation_id: trace_generation_id(),
-                        ec: EcShape { k: 4, m: 2 },
-                        created_at: 1,
-                    })
+                    .test_put_simple_payload_reclaim(
+                        &trusted_bucket_name(TRACE_BUCKET),
+                        &trusted_object_key(TRACE_KEY),
+                        &SimplePayloadReclaimRecord {
+                            bucket: trusted_bucket_name(TRACE_BUCKET),
+                            key: trusted_object_key(TRACE_KEY),
+                            generation_id: trace_generation_id(),
+                            ec: EcShape { k: 4, m: 2 },
+                            created_at: 1,
+                        },
+                    )
                     .map_err(|err| {
-                        TestCaseError::fail(format!("put_simple_payload_reclaim failed: {err:?}"))
+                        TestCaseError::fail(format!(
+                            "test_put_simple_payload_reclaim failed: {err:?}"
+                        ))
                     })?;
             }
             AcquireLease => {
@@ -895,18 +877,14 @@ impl ReclaimTraceHarness {
     }
 
     fn metadata_exists(&self) -> bool {
-        let meta_pg = self
-            .runtime
+        self.runtime
             .storage_node
-            .get_pg(self.runtime.pg_topology.object_pg(TRACE_BUCKET, TRACE_KEY))
-            .unwrap();
-        PgMetadataStore::payload_reclaim_exists(
-            &*meta_pg,
-            &trusted_bucket_name(TRACE_BUCKET),
-            &trusted_object_key(TRACE_KEY),
-            trace_generation_id(),
-        )
-        .unwrap()
+            .test_payload_reclaim_exists(
+                &trusted_bucket_name(TRACE_BUCKET),
+                &trusted_object_key(TRACE_KEY),
+                trace_generation_id(),
+            )
+            .unwrap()
     }
 
     fn lease_count(&self) -> usize {
@@ -1014,96 +992,94 @@ impl ReclaimKindTraceHarness {
     }
 
     fn seed_simple_metadata(&self) -> TestCaseResult {
-        let meta_pg = self
-            .runtime
+        self.runtime
             .storage_node
-            .get_pg(self.runtime.pg_topology.object_pg(TRACE_BUCKET, TRACE_KEY))
-            .map_err(|err| TestCaseError::fail(format!("get_pg failed: {err:?}")))?;
-        meta_pg
-            .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
-                bucket: trusted_bucket_name(TRACE_BUCKET),
-                key: trusted_object_key(TRACE_KEY),
-                generation_id: trace_generation_id(),
-                ec: EcShape { k: 4, m: 2 },
-                created_at: 1,
-            })
+            .test_put_simple_payload_reclaim(
+                &trusted_bucket_name(TRACE_BUCKET),
+                &trusted_object_key(TRACE_KEY),
+                &SimplePayloadReclaimRecord {
+                    bucket: trusted_bucket_name(TRACE_BUCKET),
+                    key: trusted_object_key(TRACE_KEY),
+                    generation_id: trace_generation_id(),
+                    ec: EcShape { k: 4, m: 2 },
+                    created_at: 1,
+                },
+            )
             .map_err(|err| {
-                TestCaseError::fail(format!("put_simple_payload_reclaim failed: {err:?}"))
+                TestCaseError::fail(format!("test_put_simple_payload_reclaim failed: {err:?}"))
             })?;
         Ok(())
     }
 
     fn seed_segments_metadata(&self) -> TestCaseResult {
-        let meta_pg = self
-            .runtime
+        self.runtime
             .storage_node
-            .get_pg(self.runtime.pg_topology.object_pg(TRACE_BUCKET, TRACE_KEY))
-            .map_err(|err| TestCaseError::fail(format!("get_pg failed: {err:?}")))?;
-        meta_pg
-            .put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
-                bucket: trusted_bucket_name(TRACE_BUCKET),
-                key: trusted_object_key(TRACE_KEY),
-                generation_id: trace_generation_id(),
-                created_at: 1,
-                segments: vec![ObjectSegmentsReclaimSegmentRecord {
-                    segment_index: 0,
-                    segment_okh: object_key_hash(TRACE_BUCKET, TRACE_KEY),
-                    segment_vid: trace_generation_id(),
-                    shard_pg_id: self.runtime.pg_topology.shard_pg(
-                        TRACE_BUCKET,
-                        TRACE_KEY,
-                        trace_generation_id().get(),
-                    ),
-                    ec: EcShape { k: 4, m: 2 },
-                }],
-            })
+            .test_put_object_segments_reclaim(
+                &trusted_bucket_name(TRACE_BUCKET),
+                &trusted_object_key(TRACE_KEY),
+                &ObjectSegmentsReclaimRecord {
+                    bucket: trusted_bucket_name(TRACE_BUCKET),
+                    key: trusted_object_key(TRACE_KEY),
+                    generation_id: trace_generation_id(),
+                    created_at: 1,
+                    segments: vec![ObjectSegmentsReclaimSegmentRecord {
+                        segment_index: 0,
+                        segment_okh: object_key_hash(TRACE_BUCKET, TRACE_KEY),
+                        segment_vid: trace_generation_id(),
+                        shard_pg_id: self.runtime.pg_topology.shard_pg(
+                            TRACE_BUCKET,
+                            TRACE_KEY,
+                            trace_generation_id().get(),
+                        ),
+                        ec: EcShape { k: 4, m: 2 },
+                    }],
+                },
+            )
             .map_err(|err| {
-                TestCaseError::fail(format!("put_object_segments_reclaim failed: {err:?}"))
+                TestCaseError::fail(format!("test_put_object_segments_reclaim failed: {err:?}"))
             })?;
         Ok(())
     }
 
     fn seed_multipart_metadata(&self) -> TestCaseResult {
-        let meta_pg = self
-            .runtime
+        self.runtime
             .storage_node
-            .get_pg(self.runtime.pg_topology.object_pg(TRACE_BUCKET, TRACE_KEY))
-            .map_err(|err| TestCaseError::fail(format!("get_pg failed: {err:?}")))?;
-        meta_pg
-            .put_multipart_reclaim(&MultipartReclaimRecord {
-                bucket: trusted_bucket_name(TRACE_BUCKET),
-                key: trusted_object_key(TRACE_KEY),
-                generation_id: trace_generation_id(),
-                created_at: 1,
-                parts: vec![MultipartReclaimPartRecord::ShardSet {
-                    part_number: 1,
-                    part_okh: object_key_hash(TRACE_BUCKET, TRACE_KEY),
-                    part_vid: trace_generation_id(),
-                    shard_pg_id: self.runtime.pg_topology.shard_pg(
-                        TRACE_BUCKET,
-                        TRACE_KEY,
-                        trace_generation_id().get(),
-                    ),
-                    ec: EcShape { k: 4, m: 2 },
-                }],
-            })
-            .map_err(|err| TestCaseError::fail(format!("put_multipart_reclaim failed: {err:?}")))?;
+            .test_put_multipart_reclaim(
+                &trusted_bucket_name(TRACE_BUCKET),
+                &trusted_object_key(TRACE_KEY),
+                &MultipartReclaimRecord {
+                    bucket: trusted_bucket_name(TRACE_BUCKET),
+                    key: trusted_object_key(TRACE_KEY),
+                    generation_id: trace_generation_id(),
+                    created_at: 1,
+                    parts: vec![MultipartReclaimPartRecord::ShardSet {
+                        part_number: 1,
+                        part_okh: object_key_hash(TRACE_BUCKET, TRACE_KEY),
+                        part_vid: trace_generation_id(),
+                        shard_pg_id: self.runtime.pg_topology.shard_pg(
+                            TRACE_BUCKET,
+                            TRACE_KEY,
+                            trace_generation_id().get(),
+                        ),
+                        ec: EcShape { k: 4, m: 2 },
+                    }],
+                },
+            )
+            .map_err(|err| {
+                TestCaseError::fail(format!("test_put_multipart_reclaim failed: {err:?}"))
+            })?;
         Ok(())
     }
 
     fn metadata_exists(&self) -> bool {
-        let meta_pg = self
-            .runtime
+        self.runtime
             .storage_node
-            .get_pg(self.runtime.pg_topology.object_pg(TRACE_BUCKET, TRACE_KEY))
-            .unwrap();
-        PgMetadataStore::payload_reclaim_exists(
-            &*meta_pg,
-            &trusted_bucket_name(TRACE_BUCKET),
-            &trusted_object_key(TRACE_KEY),
-            trace_generation_id(),
-        )
-        .unwrap()
+            .test_payload_reclaim_exists(
+                &trusted_bucket_name(TRACE_BUCKET),
+                &trusted_object_key(TRACE_KEY),
+                trace_generation_id(),
+            )
+            .unwrap()
     }
 
     fn lease_count(&self) -> usize {
@@ -1235,24 +1211,24 @@ impl TwoGenerationReclaimTraceHarness {
     }
 
     fn seed_metadata_for(&self, generation: TraceGeneration) -> TestCaseResult {
-        let meta_pg = self
-            .runtime
+        self.runtime
             .storage_node
-            .get_pg(self.runtime.pg_topology.object_pg(TRACE_BUCKET, TRACE_KEY))
-            .map_err(|err| TestCaseError::fail(format!("get_pg failed: {err:?}")))?;
-        meta_pg
-            .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
-                bucket: trusted_bucket_name(TRACE_BUCKET),
-                key: trusted_object_key(TRACE_KEY),
-                generation_id: generation.generation_id(),
-                ec: EcShape { k: 4, m: 2 },
-                created_at: match generation {
-                    TraceGeneration::Old => 1,
-                    TraceGeneration::New => 2,
+            .test_put_simple_payload_reclaim(
+                &trusted_bucket_name(TRACE_BUCKET),
+                &trusted_object_key(TRACE_KEY),
+                &SimplePayloadReclaimRecord {
+                    bucket: trusted_bucket_name(TRACE_BUCKET),
+                    key: trusted_object_key(TRACE_KEY),
+                    generation_id: generation.generation_id(),
+                    ec: EcShape { k: 4, m: 2 },
+                    created_at: match generation {
+                        TraceGeneration::Old => 1,
+                        TraceGeneration::New => 2,
+                    },
                 },
-            })
+            )
             .map_err(|err| {
-                TestCaseError::fail(format!("put_simple_payload_reclaim failed: {err:?}"))
+                TestCaseError::fail(format!("test_put_simple_payload_reclaim failed: {err:?}"))
             })?;
         Ok(())
     }
@@ -1289,18 +1265,14 @@ impl TwoGenerationReclaimTraceHarness {
     }
 
     fn metadata_exists(&self, generation: TraceGeneration) -> bool {
-        let meta_pg = self
-            .runtime
+        self.runtime
             .storage_node
-            .get_pg(self.runtime.pg_topology.object_pg(TRACE_BUCKET, TRACE_KEY))
-            .unwrap();
-        PgMetadataStore::payload_reclaim_exists(
-            &*meta_pg,
-            &trusted_bucket_name(TRACE_BUCKET),
-            &trusted_object_key(TRACE_KEY),
-            generation.generation_id(),
-        )
-        .unwrap()
+            .test_payload_reclaim_exists(
+                &trusted_bucket_name(TRACE_BUCKET),
+                &trusted_object_key(TRACE_KEY),
+                generation.generation_id(),
+            )
+            .unwrap()
     }
 
     fn lease_count(&self, generation: TraceGeneration) -> usize {
@@ -1316,16 +1288,10 @@ impl TwoGenerationReclaimTraceHarness {
     }
 
     fn bucket_exists(&self) -> bool {
-        let bucket_pg = self
-            .runtime
+        self.runtime
             .storage_node
-            .get_pg(
-                self.runtime
-                    .pg_topology
-                    .bucket_pg_for(&trusted_bucket_name(TRACE_BUCKET)),
-            )
-            .unwrap();
-        PgMetadataStore::head_bucket_raw(&*bucket_pg, &trusted_bucket_name(TRACE_BUCKET)).is_ok()
+            .test_head_bucket_raw(&trusted_bucket_name(TRACE_BUCKET))
+            .is_ok()
     }
 }
 
@@ -1433,24 +1399,24 @@ impl TwoKeyReclaimTraceHarness {
     }
 
     fn seed_metadata_for(&self, key: TraceKey) -> TestCaseResult {
-        let meta_pg = self
-            .runtime
+        self.runtime
             .storage_node
-            .get_pg(self.runtime.pg_topology.object_pg(TRACE_BUCKET, key.key()))
-            .map_err(|err| TestCaseError::fail(format!("get_pg failed: {err:?}")))?;
-        meta_pg
-            .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
-                bucket: trusted_bucket_name(TRACE_BUCKET),
-                key: trusted_object_key(key.key()),
-                generation_id: trace_generation_id(),
-                ec: EcShape { k: 4, m: 2 },
-                created_at: match key {
-                    TraceKey::A => 1,
-                    TraceKey::B => 2,
+            .test_put_simple_payload_reclaim(
+                &trusted_bucket_name(TRACE_BUCKET),
+                &trusted_object_key(key.key()),
+                &SimplePayloadReclaimRecord {
+                    bucket: trusted_bucket_name(TRACE_BUCKET),
+                    key: trusted_object_key(key.key()),
+                    generation_id: trace_generation_id(),
+                    ec: EcShape { k: 4, m: 2 },
+                    created_at: match key {
+                        TraceKey::A => 1,
+                        TraceKey::B => 2,
+                    },
                 },
-            })
+            )
             .map_err(|err| {
-                TestCaseError::fail(format!("put_simple_payload_reclaim failed: {err:?}"))
+                TestCaseError::fail(format!("test_put_simple_payload_reclaim failed: {err:?}"))
             })?;
         Ok(())
     }
@@ -1487,18 +1453,14 @@ impl TwoKeyReclaimTraceHarness {
     }
 
     fn metadata_exists(&self, key: TraceKey) -> bool {
-        let meta_pg = self
-            .runtime
+        self.runtime
             .storage_node
-            .get_pg(self.runtime.pg_topology.object_pg(TRACE_BUCKET, key.key()))
-            .unwrap();
-        PgMetadataStore::payload_reclaim_exists(
-            &*meta_pg,
-            &trusted_bucket_name(TRACE_BUCKET),
-            &trusted_object_key(key.key()),
-            trace_generation_id(),
-        )
-        .unwrap()
+            .test_payload_reclaim_exists(
+                &trusted_bucket_name(TRACE_BUCKET),
+                &trusted_object_key(key.key()),
+                trace_generation_id(),
+            )
+            .unwrap()
     }
 
     fn lease_count(&self, key: TraceKey) -> usize {
@@ -1514,16 +1476,10 @@ impl TwoKeyReclaimTraceHarness {
     }
 
     fn bucket_exists(&self) -> bool {
-        let bucket_pg = self
-            .runtime
+        self.runtime
             .storage_node
-            .get_pg(
-                self.runtime
-                    .pg_topology
-                    .bucket_pg_for(&trusted_bucket_name(TRACE_BUCKET)),
-            )
-            .unwrap();
-        PgMetadataStore::head_bucket_raw(&*bucket_pg, &trusted_bucket_name(TRACE_BUCKET)).is_ok()
+            .test_head_bucket_raw(&trusted_bucket_name(TRACE_BUCKET))
+            .is_ok()
     }
 }
 

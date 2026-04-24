@@ -17,8 +17,6 @@ use s3_types::{
     StoredLegalHoldStatus, VersionId,
 };
 #[cfg(test)]
-use storage::traits::PgMetadataStore;
-#[cfg(test)]
 use storage::ObjectEncryption;
 #[cfg(test)]
 use storage::ObjectLockState;
@@ -45,8 +43,6 @@ use self::payload::encode_parity_scratch_len;
 #[cfg(test)]
 use self::payload::SharedPayloadBuffer;
 use self::payload::{EncodeScratchPool, PayloadBufferPool};
-#[cfg(test)]
-use self::pg_guards::{LockedReadObject, ObjectPgGuards};
 use self::read_core::{
     segment_payloads_from_object_segments, ReadObjectContext, SegmentPayloadRecord,
 };
@@ -326,7 +322,6 @@ mod object_state;
 #[cfg(test)]
 mod object_state_tests;
 mod payload;
-mod pg_guards;
 mod put;
 mod read;
 mod read_core;

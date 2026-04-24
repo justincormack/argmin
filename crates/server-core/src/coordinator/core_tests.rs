@@ -410,11 +410,14 @@ fn create_multipart_upload_bucket_owner_preferred_promotes_bucket_owner_with_ful
         })
         .unwrap();
 
-    let meta_pg = coord
+    let upload_record = coord
         .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
+        .test_get_multipart_upload(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &upload.upload_id,
+        )
         .unwrap();
-    let upload_record = meta_pg.get_multipart_upload(&upload.upload_id).unwrap();
     assert_eq!(
         upload_record.initiator,
         Some(OwnerIdentity::new(
@@ -901,7 +904,9 @@ fn list_object_versions_paginates_across_pgs() {
     ) -> String {
         for index in 0..10_000 {
             let key = format!("{prefix}-{index:04}");
-            let pg_id = coord.object_pg_id(bucket, &key);
+            let pg_id = coord
+                .storage_node
+                .test_object_pg_id_for(&trusted_bucket_name(bucket), &trusted_object_key(&key));
             if !excluded_pg_ids.contains(&pg_id) {
                 return key;
             }
@@ -928,9 +933,13 @@ fn list_object_versions_paginates_across_pgs() {
     .unwrap();
 
     let key_a = key_for_prefix_on_distinct_pg(&coord, "bucket", "a", &[]);
-    let pg_a = coord.object_pg_id("bucket", &key_a);
+    let pg_a = coord
+        .storage_node
+        .test_object_pg_id_for(&trusted_bucket_name("bucket"), &trusted_object_key(&key_a));
     let key_b = key_for_prefix_on_distinct_pg(&coord, "bucket", "b", &[pg_a]);
-    let pg_b = coord.object_pg_id("bucket", &key_b);
+    let pg_b = coord
+        .storage_node
+        .test_object_pg_id_for(&trusted_bucket_name("bucket"), &trusted_object_key(&key_b));
     let key_c = key_for_prefix_on_distinct_pg(&coord, "bucket", "c", &[pg_a, pg_b]);
 
     let older_a = test_helpers::put_object(

@@ -11,7 +11,9 @@ use std::time::Instant;
 
 use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
 #[cfg(any(test, feature = "test-hooks"))]
-use s3_types::VersionId;
+use s3_types::{
+    AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId, VersionId,
+};
 
 use crate::error::{
     BucketSnapshotLoadError, BucketWriteDrainError, ObjectPgActionError, StoreError,
@@ -22,12 +24,12 @@ use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 use crate::types::{
     AbortMultipartUploadLookup, BucketFastPathInfo, BucketInfo, BucketName, BucketSnapshot,
     BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState,
-    BucketSubresourceKind, CreateStreamUploadReq, FinalizeStreamPartOutcome, GenerationId,
-    ListMultipartUploadsReq, ListObjectVersionsReq, ListPartsReq, ListPartsResp,
+    BucketSubresourceKind, CreateBucketConfig, CreateStreamUploadReq, FinalizeStreamPartOutcome,
+    GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq, ListPartsReq, ListPartsResp,
     ListedBucketMultipartUploads, ListedBucketObjectVersions, ListedBucketObjects,
     ListedMultipartParts, LoadedBucketSubresource, MultipartCompletionPreflight,
     MultipartCompletionSnapshot, MultipartPartRecord, MultipartPartSegmentRecord,
-    MultipartUploadRecord, ObjectKey, ObjectPartRecord, ObjectReadSnapshot,
+    MultipartReclaimRecord, MultipartUploadRecord, ObjectKey, ObjectPartRecord, ObjectReadSnapshot,
     ObjectReadSnapshotOutcome, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
     PayloadReclaimRoot, PreparedStreamPartCommit, PutLiveObjectReq, SessionId, ShardKey,
     SimplePayloadReclaimRecord, StoredObject, StreamUploadPartSnapshot, StreamUploadRecord,
@@ -792,6 +794,30 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_put_object_segments_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reclaim: &ObjectSegmentsReclaimRecord,
+    ) -> Result<(), ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        Ok(pg.put_object_segments_reclaim(reclaim)?)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_put_multipart_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reclaim: &MultipartReclaimRecord,
+    ) -> Result<(), ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        Ok(pg.put_multipart_reclaim(reclaim)?)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_payload_reclaim_exists(
         &self,
         bucket: &BucketName,
@@ -843,6 +869,35 @@ impl SharedStorageNode {
                 context: "force became_noncurrent_at in test helper",
                 source,
             })?;
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_create_deleting_bucket(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<(), BucketWriteDrainError> {
+        let owner_canonical_id = CanonicalUserId::from_principal("default-owner");
+        let acl_grants = AclGrants::default();
+        let create = CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: "default-owner",
+            owner_canonical_id: &owner_canonical_id,
+            acl_grants: &acl_grants,
+            public_read: false,
+            public_write: false,
+            versioning: BucketVersioningState::Disabled,
+            object_lock: BucketObjectLockConfig::default(),
+        };
+        let _ = self
+            .create_bucket_with_config_and_load_info(&create)
+            .map_err(|err| match err {
+                BucketSnapshotLoadError::Store(err) => BucketWriteDrainError::Store(err),
+                BucketSnapshotLoadError::Metadata(err) => BucketWriteDrainError::Metadata(err),
+            })?;
+        let drain = self.begin_bucket_write_drain(bucket)?;
+        self.mark_bucket_deleting(bucket)?;
+        drain.persist();
         Ok(())
     }
 

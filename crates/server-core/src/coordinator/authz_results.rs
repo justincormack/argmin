@@ -6,8 +6,6 @@ use auth::BucketPolicy;
 use checksum::MultipartChecksumConfig;
 
 use super::authz_types::{ActiveWriteEncryption, AuthorizedPutObjectWrite, ValidatedBucket};
-#[cfg(test)]
-use super::pg_guards::{LockedReadObject, ObjectPgGuards};
 use super::request_types::{CreateBucketAcl, Requester};
 #[cfg(test)]
 use super::response_types::GetObjectAclResult;
@@ -184,20 +182,18 @@ pub(super) struct AuthorizedPutBucketAcl {
 }
 
 #[cfg(test)]
-pub(super) struct AuthorizedObjectTagsAccess<'a> {
+pub(super) struct AuthorizedObjectTagsAccess {
     pub(super) bucket: BucketName,
     pub(super) key: ObjectKey,
     pub(super) version_id: VersionId,
-    pub(super) pgs: ObjectPgGuards<'a>,
 }
 
 #[cfg(test)]
-pub(super) struct AuthorizedPutObjectRetention<'a> {
+pub(super) struct AuthorizedPutObjectRetention {
     pub(super) bucket: BucketName,
     pub(super) key: ObjectKey,
     pub(super) version_id: VersionId,
     pub(super) retention: ObjectRetention,
-    pub(super) pgs: ObjectPgGuards<'a>,
 }
 
 #[cfg(test)]
@@ -206,12 +202,11 @@ pub(super) struct AuthorizedGetObjectRetention {
 }
 
 #[cfg(test)]
-pub(super) struct AuthorizedPutObjectLegalHold<'a> {
+pub(super) struct AuthorizedPutObjectLegalHold {
     pub(super) bucket: BucketName,
     pub(super) key: ObjectKey,
     pub(super) version_id: VersionId,
     pub(super) legal_hold: StoredLegalHoldStatus,
-    pub(super) pgs: ObjectPgGuards<'a>,
 }
 
 #[cfg(test)]
@@ -220,13 +215,12 @@ pub(super) struct AuthorizedGetObjectLegalHold {
 }
 
 #[cfg(test)]
-pub(super) struct AuthorizedPutObjectAclUpdate<'a> {
+pub(super) struct AuthorizedPutObjectAclUpdate {
     pub(super) bucket: BucketName,
     pub(super) key: ObjectKey,
     pub(super) version_id: VersionId,
     pub(super) acl_grants: AclGrants,
     pub(super) public_read: bool,
-    pub(super) pgs: ObjectPgGuards<'a>,
 }
 
 #[derive(Debug)]
@@ -240,11 +234,11 @@ pub(super) struct AuthorizedObjectRead {
 }
 
 #[cfg(test)]
-pub(super) struct LoadedObjectState<'a> {
+pub(super) struct LoadedObjectState {
     pub(super) bucket_info: ValidatedBucket,
     pub(super) bucket_policy: Option<Arc<BucketPolicy>>,
     pub(super) bucket_tags: Option<Vec<(String, String)>>,
-    pub(super) locked: LockedReadObject<'a>,
+    pub(super) record: storage::StoredObject,
 }
 
 pub(super) struct AuthorizedCopyObject {
@@ -365,7 +359,7 @@ pub(super) enum AuthorizedDeleteObject {
 }
 
 #[cfg(test)]
-impl std::fmt::Debug for AuthorizedObjectTagsAccess<'_> {
+impl std::fmt::Debug for AuthorizedObjectTagsAccess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthorizedObjectTagsAccess")
             .field("bucket", &self.bucket)
@@ -376,7 +370,7 @@ impl std::fmt::Debug for AuthorizedObjectTagsAccess<'_> {
 }
 
 #[cfg(test)]
-impl std::fmt::Debug for AuthorizedPutObjectRetention<'_> {
+impl std::fmt::Debug for AuthorizedPutObjectRetention {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthorizedPutObjectRetention")
             .field("bucket", &self.bucket)
@@ -388,7 +382,7 @@ impl std::fmt::Debug for AuthorizedPutObjectRetention<'_> {
 }
 
 #[cfg(test)]
-impl std::fmt::Debug for AuthorizedPutObjectLegalHold<'_> {
+impl std::fmt::Debug for AuthorizedPutObjectLegalHold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthorizedPutObjectLegalHold")
             .field("bucket", &self.bucket)
@@ -400,7 +394,7 @@ impl std::fmt::Debug for AuthorizedPutObjectLegalHold<'_> {
 }
 
 #[cfg(test)]
-impl std::fmt::Debug for AuthorizedPutObjectAclUpdate<'_> {
+impl std::fmt::Debug for AuthorizedPutObjectAclUpdate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthorizedPutObjectAclUpdate")
             .field("bucket", &self.bucket)
