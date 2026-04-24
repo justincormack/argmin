@@ -9095,10 +9095,51 @@ fn authz_model_phase3_get_object_missing_matrix() {
     run_missing_matrix("phase 3", Action::GetObject);
 }
 
-#[test]
-fn authz_model_phase3_get_object_attributes_missing_matrix() {
-    run_missing_matrix("phase 3", Action::GetObjectAttributes);
+macro_rules! phase3_get_object_attributes_missing_matrix_shards {
+    ($($name:ident => $index:expr),* $(,)?) => {
+        $(
+            #[test]
+            fn $name() {
+                run_missing_matrix_shard("phase 3", Action::GetObjectAttributes, $index, 32);
+            }
+        )*
+    };
 }
+
+phase3_get_object_attributes_missing_matrix_shards!(
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_00 => 0,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_01 => 1,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_02 => 2,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_03 => 3,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_04 => 4,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_05 => 5,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_06 => 6,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_07 => 7,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_08 => 8,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_09 => 9,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_10 => 10,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_11 => 11,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_12 => 12,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_13 => 13,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_14 => 14,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_15 => 15,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_16 => 16,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_17 => 17,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_18 => 18,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_19 => 19,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_20 => 20,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_21 => 21,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_22 => 22,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_23 => 23,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_24 => 24,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_25 => 25,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_26 => 26,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_27 => 27,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_28 => 28,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_29 => 29,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_30 => 30,
+    authz_model_phase3_get_object_attributes_missing_matrix_shard_31 => 31,
+);
 
 #[test]
 fn authz_model_phase3_get_object_acl_missing_matrix() {
@@ -9853,6 +9894,47 @@ fn run_missing_matrix(phase: &str, action: Action) {
             "{phase} authz model mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
         );
     }
+}
+
+fn run_missing_matrix_shard(phase: &str, action: Action, shard_index: usize, shard_count: usize) {
+    assert!(
+        shard_count > 0,
+        "missing-matrix shard count must be non-zero"
+    );
+    assert!(
+        shard_index < shard_count,
+        "missing-matrix shard index {shard_index} out of range for shard count {shard_count}"
+    );
+    let scenarios = MissingScenario::missing_scenarios(action);
+    assert!(
+        !scenarios.is_empty(),
+        "{phase} matrix unexpectedly produced no scenarios for {action}"
+    );
+    let harness = MatrixHarness::new();
+    let mut shard_len = 0usize;
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        if index % shard_count != shard_index {
+            continue;
+        }
+        shard_len += 1;
+        let bucket = bucket_name_for(action, index);
+        let expected = scenario.expected_outcome();
+        let actual = to_missing_outcome(harness.run_missing(&bucket, scenario), scenario.target);
+        assert_eq!(
+            actual, expected,
+            "{phase} authz model mismatch\nshard: {}/{}\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}",
+            shard_index + 1,
+            shard_count
+        );
+    }
+
+    assert!(
+        shard_len > 0,
+        "{phase} matrix shard {}/{} unexpectedly produced no scenarios for {action}",
+        shard_index + 1,
+        shard_count
+    );
 }
 
 fn run_phase4_write_matrix(action: WriteAction) {
