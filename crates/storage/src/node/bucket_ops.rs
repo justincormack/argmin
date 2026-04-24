@@ -87,6 +87,7 @@ impl SharedStorageNode {
 
     pub fn begin_bucket_delete(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
         let drain = self.begin_bucket_write_drain(bucket)?;
+        super::maybe_run_after_begin_bucket_delete_drain_hook(bucket);
 
         let mut bucket_not_empty = false;
         self.pg_topology.for_each_pg(|pg_id| {

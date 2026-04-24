@@ -152,6 +152,21 @@ pub(crate) fn setup_coordinator_with_shared_storage(
     .unwrap()
 }
 
+pub(crate) fn setup_coordinator_with_shared_storage_without_lifecycle_sweeper(
+    storage_node: Arc<SharedStorageNode>,
+) -> Coordinator {
+    let ec_config = EcConfig::default();
+    Coordinator::new_with_lifecycle_sweeper_factory(
+        storage_node,
+        ec_config,
+        "us-east-1".to_string(),
+        None,
+        Some(test_sse_s3_provider()),
+        |_, _| Ok(LifecycleSweeper::disabled()),
+    )
+    .unwrap()
+}
+
 pub(crate) fn setup_coordinators_with_pg_count(
     dir: &Path,
     pg_count: u32,

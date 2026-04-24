@@ -43,8 +43,6 @@ use super::bucket_handles::{
     BucketHandleLoader, BucketHandleRequest, LoadedBucketHandle, LoadedBucketValue,
 };
 #[cfg(test)]
-use super::maybe_run_bucket_policy_storage_load_hook;
-#[cfg(test)]
 use super::pg_guards::LockedReadObject;
 #[cfg(test)]
 use super::request_types::ListPartsRequest;
@@ -70,6 +68,11 @@ use super::request_types::{
 #[cfg(test)]
 use super::response_types::GetObjectAclResult;
 use super::response_types::{BucketSummary, GetBucketAclResult};
+#[cfg(test)]
+use super::{
+    maybe_run_bucket_policy_fast_path_hook, maybe_run_bucket_policy_storage_load_hook,
+    maybe_run_bucket_write_handle_loaded_hook, should_probe_multipart_complete_auth_lookup,
+};
 use super::{read_rwlock_unpoisoned, write_rwlock_unpoisoned, Coordinator};
 use crate::error::ServerError;
 use crate::sse::{SseCustomerRequest, SseCustomerSegmentScope};
@@ -1682,6 +1685,8 @@ impl Coordinator {
             .into_inner();
 
             if !bucket_info.bucket_policy_present {
+                #[cfg(test)]
+                maybe_run_bucket_policy_fast_path_hook(bucket.as_str());
                 return Ok(LoadedBucketHandle::new(
                     bucket_info,
                     request,
@@ -1721,6 +1726,8 @@ impl Coordinator {
                             expected_bucket_owner,
                             request,
                         )?;
+                    #[cfg(test)]
+                    maybe_run_bucket_write_handle_loaded_hook(req.bucket_name_typed().as_str());
                     action(bucket)
                 },
             )
@@ -4201,6 +4208,23 @@ impl Coordinator {
             let bucket_info = ValidatedBucket(bucket_handle.bucket().clone());
             let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket_handle)?;
             let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket_handle)?;
+            #[cfg(test)]
+            let upload =
+                if should_probe_multipart_complete_auth_lookup(bucket.as_str(), key.as_str()) {
+                    self.storage_node
+                        .try_load_in_progress_multipart_upload(bucket, key, upload_id)
+                        .map_err(Self::map_object_pg_action_error)
+                        .and_then(|upload| {
+                            upload.ok_or_else(|| ServerError::InternalError {
+                                reason: "multipart complete auth lookup would block".to_string(),
+                            })
+                        })?
+                } else {
+                    self.storage_node
+                        .load_in_progress_multipart_upload(bucket, key, upload_id)
+                        .map_err(Self::map_object_pg_action_error)?
+                };
+            #[cfg(not(test))]
             let upload = self
                 .storage_node
                 .load_in_progress_multipart_upload(bucket, key, upload_id)

@@ -5,6 +5,7 @@ use storage::SessionId;
 #[derive(Default, Clone)]
 pub(super) struct ReclamationTestHooks {
     pub(super) target: Option<(String, String)>,
+    pub(super) probe_multipart_complete_auth_lookup: bool,
     pub(super) after_multipart_snapshot: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_multipart_delete_metadata: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_multipart_complete_pre_commit: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -19,11 +20,22 @@ pub(super) static RECLAMATION_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new()
 pub(super) struct BucketPolicyLoadTestHooks {
     pub(super) bucket: Option<String>,
     pub(super) before_storage_load: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub(super) after_policy_fast_path_hit: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 pub(super) static BUCKET_POLICY_LOAD_TEST_HOOKS: OnceLock<Mutex<BucketPolicyLoadTestHooks>> =
     OnceLock::new();
 pub(super) static BUCKET_POLICY_LOAD_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[derive(Default, Clone)]
+pub(super) struct BucketWriteHandleTestHooks {
+    pub(super) bucket: Option<String>,
+    pub(super) after_loaded: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+pub(super) static BUCKET_WRITE_HANDLE_TEST_HOOKS: OnceLock<Mutex<BucketWriteHandleTestHooks>> =
+    OnceLock::new();
+pub(super) static BUCKET_WRITE_HANDLE_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Default, Clone)]
 pub(super) struct StreamAppendTestHooks {
@@ -49,6 +61,8 @@ pub(super) struct StreamAppendTestHookGuard;
 
 pub(super) struct BucketPolicyLoadTestHookGuard;
 
+pub(super) struct BucketWriteHandleTestHookGuard;
+
 impl Drop for StreamAppendTestHookGuard {
     fn drop(&mut self) {
         let hooks =
@@ -62,6 +76,14 @@ impl Drop for BucketPolicyLoadTestHookGuard {
         let hooks = BUCKET_POLICY_LOAD_TEST_HOOKS
             .get_or_init(|| Mutex::new(BucketPolicyLoadTestHooks::default()));
         *hooks.lock().unwrap() = BucketPolicyLoadTestHooks::default();
+    }
+}
+
+impl Drop for BucketWriteHandleTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = BUCKET_WRITE_HANDLE_TEST_HOOKS
+            .get_or_init(|| Mutex::new(BucketWriteHandleTestHooks::default()));
+        *hooks.lock().unwrap() = BucketWriteHandleTestHooks::default();
     }
 }
 
@@ -89,6 +111,15 @@ pub(super) fn install_bucket_policy_load_test_hooks(
         .get_or_init(|| Mutex::new(BucketPolicyLoadTestHooks::default()));
     *slot.lock().unwrap() = hooks;
     BucketPolicyLoadTestHookGuard
+}
+
+pub(super) fn install_bucket_write_handle_test_hooks(
+    hooks: BucketWriteHandleTestHooks,
+) -> BucketWriteHandleTestHookGuard {
+    let slot = BUCKET_WRITE_HANDLE_TEST_HOOKS
+        .get_or_init(|| Mutex::new(BucketWriteHandleTestHooks::default()));
+    *slot.lock().unwrap() = hooks;
+    BucketWriteHandleTestHookGuard
 }
 
 pub(super) fn maybe_run_multipart_snapshot_hook(bucket: &str, key: &str) {
@@ -204,4 +235,43 @@ pub(super) fn maybe_run_bucket_policy_storage_load_hook(bucket: &str) {
             hook();
         }
     }
+}
+
+pub(super) fn maybe_run_bucket_policy_fast_path_hook(bucket: &str) {
+    let hooks = BUCKET_POLICY_LOAD_TEST_HOOKS
+        .get_or_init(|| Mutex::new(BucketPolicyLoadTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks.bucket.as_ref().is_some_and(|target| target == bucket) {
+        if let Some(hook) = hooks.after_policy_fast_path_hit {
+            hook();
+        }
+    }
+}
+
+pub(super) fn maybe_run_bucket_write_handle_loaded_hook(bucket: &str) {
+    let hooks = BUCKET_WRITE_HANDLE_TEST_HOOKS
+        .get_or_init(|| Mutex::new(BucketWriteHandleTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks.bucket.as_ref().is_some_and(|target| target == bucket) {
+        if let Some(hook) = hooks.after_loaded {
+            hook();
+        }
+    }
+}
+
+pub(super) fn should_probe_multipart_complete_auth_lookup(bucket: &str, key: &str) -> bool {
+    let hooks = RECLAMATION_TEST_HOOKS
+        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    hooks.probe_multipart_complete_auth_lookup
+        && hooks
+            .target
+            .as_ref()
+            .is_some_and(|(b, k)| b == bucket && k == key)
 }

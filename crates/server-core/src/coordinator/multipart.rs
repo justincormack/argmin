@@ -13,6 +13,8 @@ use super::authz_results::{
 };
 use super::bucket_handles::{BucketHandleLoader, BucketHandleRequest};
 #[cfg(test)]
+use super::maybe_run_bucket_write_handle_loaded_hook;
+#[cfg(test)]
 use super::maybe_run_multipart_complete_pre_commit_hook;
 use super::object_state::StaleObjectPayload;
 use super::request_types::{
@@ -197,6 +199,10 @@ impl Coordinator {
                             expected_bucket_owner,
                             request,
                         )?;
+                    #[cfg(test)]
+                    maybe_run_bucket_write_handle_loaded_hook(
+                        req.object.bucket.name_typed().as_str(),
+                    );
                     let authorized = self.authorize_create_multipart_upload_with_existing_object(
                         req,
                         &bucket_handle,

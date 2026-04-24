@@ -189,6 +189,28 @@ impl SharedStorageNode {
         )?)
     }
 
+    #[cfg(feature = "test-hooks")]
+    pub fn try_load_in_progress_multipart_upload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<Option<MultipartUploadRecord>, ObjectPgActionError> {
+        let pg_id = self.pg_topology.object_pg_for(bucket, key);
+        let pg = match self.stores.get(&pg_id) {
+            Some(pg) => pg,
+            None => return Err(crate::error::StoreError::PgNotFound { pg_id }.into()),
+        };
+        let pg = match pg.try_lock() {
+            Ok(pg) => pg,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        Ok(Some(
+            Self::load_in_progress_multipart_upload_from_object_pg(&pg, bucket, key, upload_id)?,
+        ))
+    }
+
     pub fn load_multipart_completion_snapshot(
         &self,
         bucket: &BucketName,

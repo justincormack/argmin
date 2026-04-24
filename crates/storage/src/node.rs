@@ -86,7 +86,9 @@ pub struct BucketWriteDrainGuard<'a> {
 #[derive(Default, Clone)]
 pub struct BucketScopedTestHooks {
     pub target: Option<BucketName>,
+    pub before_bucket_lock_acquire: Option<Arc<dyn Fn() + Send + Sync>>,
     pub before_bucket_write_drain_wait: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub after_begin_bucket_delete_drain: Option<Arc<dyn Fn() + Send + Sync>>,
     pub before_multipart_completion_lock: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_multipart_completion_lock: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -132,12 +134,28 @@ fn maybe_run_bucket_scoped_test_hook(
 }
 
 #[cfg(feature = "test-hooks")]
+pub(super) fn maybe_run_before_bucket_lock_acquire_hook(bucket: &BucketName) {
+    maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.before_bucket_lock_acquire)
+}
+
+#[cfg(not(feature = "test-hooks"))]
+pub(super) fn maybe_run_before_bucket_lock_acquire_hook(_: &BucketName) {}
+
+#[cfg(feature = "test-hooks")]
 pub(super) fn maybe_run_bucket_write_drain_wait_hook(bucket: &BucketName) {
     maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.before_bucket_write_drain_wait)
 }
 
 #[cfg(not(feature = "test-hooks"))]
 pub(super) fn maybe_run_bucket_write_drain_wait_hook(_: &BucketName) {}
+
+#[cfg(feature = "test-hooks")]
+pub(super) fn maybe_run_after_begin_bucket_delete_drain_hook(bucket: &BucketName) {
+    maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.after_begin_bucket_delete_drain)
+}
+
+#[cfg(not(feature = "test-hooks"))]
+pub(super) fn maybe_run_after_begin_bucket_delete_drain_hook(_: &BucketName) {}
 
 #[cfg(feature = "test-hooks")]
 pub(super) fn maybe_run_before_multipart_completion_lock_hook(bucket: &BucketName) {
@@ -425,6 +443,7 @@ impl SharedStorageNode {
         );
         let idx = self.bucket_lock_index(bucket);
         let trace = observability::current_context();
+        maybe_run_before_bucket_lock_acquire_hook(bucket);
         let wait_started_at = Instant::now();
         let guard = self.bucket_locks[idx]
             .lock()

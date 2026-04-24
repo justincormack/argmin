@@ -8,10 +8,17 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
 use storage::{install_bucket_scoped_test_hooks, BucketScopedTestHooks};
 
 static STORAGE_TEST_HOOK_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[derive(Debug, PartialEq, Eq)]
+enum LockWaitEvent {
+    Progress,
+    UnexpectedBucketLock,
+    UnexpectedStorageLoad,
+    CompletedEarly,
+}
 
 #[test]
 fn lock_mutex_unpoisoned_recovers_after_panic() {
@@ -1218,15 +1225,42 @@ fn put_object_with_tags_allows_same_account_owner_account() {
 #[test]
 fn put_object_does_not_wait_for_bucket_lock() {
     let tmp = test_util::tempdir();
+    let bucket = "bucket-put-no-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let writer = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let admin =
+        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
+    let writer =
+        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
     admin
-        .create_bucket_for_owner("default-owner", "bucket", false)
+        .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
 
-    let guard = storage_node.lock_bucket(&trusted_bucket_name("bucket"));
+    let _storage_serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _write_handle_serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let guard = storage_node.lock_bucket(&trusted_bucket_name(bucket));
+    let (event_tx, event_rx) = mpsc::channel();
+    let event_tx_lock = event_tx.clone();
+    let _storage_hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
+        target: Some(trusted_bucket_name(bucket)),
+        before_bucket_lock_acquire: Some(Arc::new(move || {
+            let _ = event_tx_lock.send(LockWaitEvent::UnexpectedBucketLock);
+        })),
+        ..BucketScopedTestHooks::default()
+    });
+    let _write_handle_hook_guard =
+        install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+            bucket: Some(bucket.to_string()),
+            after_loaded: Some(Arc::new(move || {
+                let _ = event_tx.send(LockWaitEvent::Progress);
+            })),
+        });
     let (tx, rx) = mpsc::channel();
     let handle = thread::spawn(move || {
         let res = test_helpers::put_object(
@@ -1235,7 +1269,7 @@ fn put_object_does_not_wait_for_bucket_lock() {
                 encryption: WriteEncryptionRequest::none(),
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                object: object_request_with_expected_owner(bucket, "key", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
@@ -1248,8 +1282,9 @@ fn put_object_does_not_wait_for_bucket_lock() {
         tx.send(res).unwrap();
     });
 
-    let res = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
     drop(guard);
+    let res = rx.recv().unwrap();
     assert!(
         res.is_ok(),
         "put_object should succeed without waiting on bucket lock: {res:?}"
@@ -1260,20 +1295,47 @@ fn put_object_does_not_wait_for_bucket_lock() {
 #[test]
 fn create_multipart_upload_does_not_wait_for_bucket_lock() {
     let tmp = test_util::tempdir();
+    let bucket = "bucket-create-mpu-no-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let creator = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let admin =
+        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
+    let creator =
+        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
     admin
-        .create_bucket_for_owner("default-owner", "bucket", false)
+        .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
 
-    let guard = storage_node.lock_bucket(&trusted_bucket_name("bucket"));
+    let _storage_serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _write_handle_serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let guard = storage_node.lock_bucket(&trusted_bucket_name(bucket));
+    let (event_tx, event_rx) = mpsc::channel();
+    let event_tx_lock = event_tx.clone();
+    let _storage_hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
+        target: Some(trusted_bucket_name(bucket)),
+        before_bucket_lock_acquire: Some(Arc::new(move || {
+            let _ = event_tx_lock.send(LockWaitEvent::UnexpectedBucketLock);
+        })),
+        ..BucketScopedTestHooks::default()
+    });
+    let _write_handle_hook_guard =
+        install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+            bucket: Some(bucket.to_string()),
+            after_loaded: Some(Arc::new(move || {
+                let _ = event_tx.send(LockWaitEvent::Progress);
+            })),
+        });
     let (tx, rx) = mpsc::channel();
     let handle = thread::spawn(move || {
         let metadata = MetadataBlob::new();
         let res = creator.create_multipart_upload(&CreateMultipartUploadRequest {
-            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            object: object_request_with_expected_owner(bucket, "key", test_requester(), None),
             metadata: &metadata,
             system_metadata: &SystemMetadata::EMPTY,
             tags: None,
@@ -1287,8 +1349,9 @@ fn create_multipart_upload_does_not_wait_for_bucket_lock() {
         tx.send(res).unwrap();
     });
 
-    let res = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
     drop(guard);
+    let res = rx.recv().unwrap();
     assert!(
         res.is_ok(),
         "create_multipart_upload should succeed without waiting on bucket lock: {res:?}"
@@ -1299,12 +1362,13 @@ fn create_multipart_upload_does_not_wait_for_bucket_lock() {
 #[test]
 fn delete_bucket_waits_for_bucket_write_handle_action() {
     let tmp = test_util::tempdir();
+    let bucket = "bucket-delete-waits-handle";
     let coord = Arc::new(setup_coordinator_with_pg_count(tmp.path(), 1));
     let requester = test_requester();
 
     coord
         .create_bucket(&CreateBucketRequest {
-            name: trusted_bucket_name("bucket"),
+            name: trusted_bucket_name(bucket),
             requester: requester.clone(),
             acl: CreateBucketAcl::DefaultPrivate,
             namespace: BucketNamespace::Global,
@@ -1322,7 +1386,7 @@ fn delete_bucket_waits_for_bucket_write_handle_action() {
     let (drain_wait_tx, drain_wait_rx) = mpsc::channel();
     let (delete_tx, delete_rx) = mpsc::channel();
     let _hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
-        target: Some(trusted_bucket_name("bucket")),
+        target: Some(trusted_bucket_name(bucket)),
         before_bucket_write_drain_wait: Some(Arc::new(move || {
             let _ = drain_wait_tx.send(());
         })),
@@ -1330,7 +1394,7 @@ fn delete_bucket_waits_for_bucket_write_handle_action() {
     });
 
     let write_coord = Arc::clone(&coord);
-    let write_request = object_request("bucket", "key", requester.clone());
+    let write_request = object_request(bucket, "key", requester.clone());
     let write_thread = thread::spawn(move || {
         write_coord.with_bucket_write_handle_for(
             &write_request,
@@ -1347,7 +1411,7 @@ fn delete_bucket_waits_for_bucket_write_handle_action() {
 
     let delete_coord = Arc::clone(&coord);
     let delete_request = BucketRequest {
-        name: trusted_bucket_name("bucket"),
+        name: trusted_bucket_name(bucket),
         requester: requester.clone(),
         expected_bucket_owner: None,
     };
@@ -1372,23 +1436,43 @@ fn delete_bucket_waits_for_bucket_write_handle_action() {
 #[test]
 fn delete_bucket_does_not_wait_for_bucket_lock() {
     let tmp = test_util::tempdir();
+    let bucket = "bucket-delete-no-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let deleter = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let admin =
+        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
+    let deleter =
+        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
     admin
-        .create_bucket_for_owner("default-owner", "bucket", false)
+        .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
 
-    let guard = storage_node.lock_bucket(&trusted_bucket_name("bucket"));
+    let _storage_serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let guard = storage_node.lock_bucket(&trusted_bucket_name(bucket));
+    let (event_tx, event_rx) = mpsc::channel();
+    let event_tx_lock = event_tx.clone();
+    let _storage_hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
+        target: Some(trusted_bucket_name(bucket)),
+        before_bucket_lock_acquire: Some(Arc::new(move || {
+            let _ = event_tx_lock.send(LockWaitEvent::UnexpectedBucketLock);
+        })),
+        after_begin_bucket_delete_drain: Some(Arc::new(move || {
+            let _ = event_tx.send(LockWaitEvent::Progress);
+        })),
+        ..BucketScopedTestHooks::default()
+    });
     let (tx, rx) = mpsc::channel();
     let handle = thread::spawn(move || {
-        let res = delete_bucket_test(&deleter, "bucket");
+        let res = delete_bucket_test(&deleter, bucket);
         tx.send(res).unwrap();
     });
 
-    let res = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
     drop(guard);
+    let res = rx.recv().unwrap();
     assert!(
         res.is_ok(),
         "delete_bucket should succeed without waiting on bucket lock: {res:?}"
@@ -1456,22 +1540,23 @@ fn head_object_lazily_populates_bucket_fast_path() {
 #[test]
 fn head_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
     let tmp = test_util::tempdir();
+    let bucket = "bucket-head-fast-no-pg";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
     let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
     let reader = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
 
     admin
-        .create_bucket_for_owner("default-owner", "bucket", false)
+        .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
-    let key = find_key_with_object_pg_ne_bucket_pg(&admin, "bucket", "head-fast");
+    let key = find_key_with_object_pg_ne_bucket_pg(&admin, bucket, "head-fast");
     test_helpers::put_object(
         &admin,
         &PutObjectRequest {
             encryption: WriteEncryptionRequest::none(),
             policy_context: PutObjectPolicyContext::default(),
             object_lock: ObjectLockState::default(),
-            object: object_request_with_expected_owner("bucket", &key, test_requester(), None),
+            object: object_request_with_expected_owner(bucket, &key, test_requester(), None),
             data: b"data",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
@@ -1483,12 +1568,12 @@ fn head_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
     )
     .unwrap();
 
-    storage_node.remove_bucket_fast_path(&trusted_bucket_name("bucket"));
+    storage_node.remove_bucket_fast_path(&trusted_bucket_name(bucket));
     reader
         .head_object(&GetObjectRequest {
             sse_customer: None,
             object: object_version_request_with_expected_owner(
-                "bucket",
+                bucket,
                 &key,
                 None,
                 test_requester(),
@@ -1498,13 +1583,28 @@ fn head_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
         })
         .unwrap();
 
-    let bucket_pg = admin.get_bucket_pg("bucket").unwrap();
+    let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let (event_tx, event_rx) = mpsc::channel();
+    let event_tx_load = event_tx.clone();
+    let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
+        bucket: Some(bucket.to_string()),
+        before_storage_load: Some(Arc::new(move || {
+            let _ = event_tx_load.send(LockWaitEvent::UnexpectedStorageLoad);
+        })),
+        after_policy_fast_path_hit: Some(Arc::new(move || {
+            let _ = event_tx.send(LockWaitEvent::Progress);
+        })),
+    });
+    let bucket_pg = admin.get_bucket_pg(bucket).unwrap();
     let (tx, rx) = mpsc::channel();
     let handle = thread::spawn(move || {
         let res = reader.head_object(&GetObjectRequest {
             sse_customer: None,
             object: object_version_request_with_expected_owner(
-                "bucket",
+                bucket,
                 &key,
                 None,
                 test_requester(),
@@ -1515,8 +1615,9 @@ fn head_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
         tx.send(res).unwrap();
     });
 
+    assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
     let head = rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv()
         .expect("head_object should not block on bucket pg")
         .unwrap();
     drop(bucket_pg);
@@ -1527,31 +1628,32 @@ fn head_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
 #[test]
 fn head_object_waits_for_bucket_pg_when_bucket_policy_is_present() {
     let tmp = test_util::tempdir();
+    let bucket = "bucket-head-policy-wait";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
     let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
     let reader = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
 
     admin
-        .create_bucket_for_owner("default-owner", "bucket", false)
+        .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
     put_bucket_policy_test(
         &admin,
-        "bucket",
-        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        bucket,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket-head-policy-wait/*"}]}"#,
         test_requester(),
         None,
     )
     .unwrap();
 
-    let key = find_key_with_object_pg_ne_bucket_pg(&admin, "bucket", "head-policy-fast");
+    let key = find_key_with_object_pg_ne_bucket_pg(&admin, bucket, "head-policy-fast");
     test_helpers::put_object(
         &admin,
         &PutObjectRequest {
             encryption: WriteEncryptionRequest::none(),
             policy_context: PutObjectPolicyContext::default(),
             object_lock: ObjectLockState::default(),
-            object: object_request_with_expected_owner("bucket", &key, test_requester(), None),
+            object: object_request_with_expected_owner(bucket, &key, test_requester(), None),
             data: b"data",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
@@ -1562,12 +1664,12 @@ fn head_object_waits_for_bucket_pg_when_bucket_policy_is_present() {
     )
     .unwrap();
 
-    storage_node.remove_bucket_fast_path(&trusted_bucket_name("bucket"));
+    storage_node.remove_bucket_fast_path(&trusted_bucket_name(bucket));
     reader
         .head_object(&GetObjectRequest {
             sse_customer: None,
             object: object_version_request_with_expected_owner(
-                "bucket",
+                bucket,
                 &key,
                 None,
                 test_requester(),
@@ -1584,18 +1686,19 @@ fn head_object_waits_for_bucket_pg_when_bucket_policy_is_present() {
     let reached_storage_load = Arc::new(Barrier::new(2));
     let reached_storage_load_hook = Arc::clone(&reached_storage_load);
     let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
-        bucket: Some("bucket".to_string()),
+        bucket: Some(bucket.to_string()),
         before_storage_load: Some(Arc::new(move || {
             reached_storage_load_hook.wait();
         })),
+        after_policy_fast_path_hit: None,
     });
-    let bucket_pg = admin.get_bucket_pg("bucket").unwrap();
+    let bucket_pg = admin.get_bucket_pg(bucket).unwrap();
     let (tx, rx) = mpsc::channel();
     let handle = thread::spawn(move || {
         let res = reader.head_object(&GetObjectRequest {
             sse_customer: None,
             object: object_version_request_with_expected_owner(
-                "bucket",
+                bucket,
                 &key,
                 None,
                 test_requester(),
@@ -1617,22 +1720,23 @@ fn head_object_waits_for_bucket_pg_when_bucket_policy_is_present() {
 #[test]
 fn delete_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
     let tmp = test_util::tempdir();
+    let bucket = "bucket-delete-fast-no-pg";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
     let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
     let deleter = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
 
     admin
-        .create_bucket_for_owner("default-owner", "bucket", false)
+        .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
-    let key = find_key_with_object_pg_ne_bucket_pg(&admin, "bucket", "delete-fast");
+    let key = find_key_with_object_pg_ne_bucket_pg(&admin, bucket, "delete-fast");
     test_helpers::put_object(
         &admin,
         &PutObjectRequest {
             encryption: WriteEncryptionRequest::none(),
             policy_context: PutObjectPolicyContext::default(),
             object_lock: ObjectLockState::default(),
-            object: object_request_with_expected_owner("bucket", &key, test_requester(), None),
+            object: object_request_with_expected_owner(bucket, &key, test_requester(), None),
             data: b"data",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
@@ -1644,12 +1748,12 @@ fn delete_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
     )
     .unwrap();
 
-    storage_node.remove_bucket_fast_path(&trusted_bucket_name("bucket"));
+    storage_node.remove_bucket_fast_path(&trusted_bucket_name(bucket));
     admin
         .head_object(&GetObjectRequest {
             sse_customer: None,
             object: object_version_request_with_expected_owner(
-                "bucket",
+                bucket,
                 &key,
                 None,
                 test_requester(),
@@ -1659,12 +1763,27 @@ fn delete_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
         })
         .unwrap();
 
-    let bucket_pg = admin.get_bucket_pg("bucket").unwrap();
+    let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let (event_tx, event_rx) = mpsc::channel();
+    let event_tx_load = event_tx.clone();
+    let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
+        bucket: Some(bucket.to_string()),
+        before_storage_load: Some(Arc::new(move || {
+            let _ = event_tx_load.send(LockWaitEvent::UnexpectedStorageLoad);
+        })),
+        after_policy_fast_path_hit: Some(Arc::new(move || {
+            let _ = event_tx.send(LockWaitEvent::Progress);
+        })),
+    });
+    let bucket_pg = admin.get_bucket_pg(bucket).unwrap();
     let (tx, rx) = mpsc::channel();
     let key_for_delete = key.clone();
     let handle = thread::spawn(move || {
         let res = deleter.delete_object(&delete_object_request(
-            "bucket",
+            bucket,
             &key_for_delete,
             None,
             test_requester(),
@@ -1674,8 +1793,9 @@ fn delete_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
         tx.send(res).unwrap();
     });
 
+    assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
     let deleted = rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv()
         .expect("delete_object should not block on bucket pg")
         .unwrap();
     drop(bucket_pg);
@@ -1684,7 +1804,7 @@ fn delete_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
         admin.get_object(&GetObjectRequest {
             sse_customer: None,
             object: object_version_request_with_expected_owner(
-                "bucket",
+                bucket,
                 &key,
                 None,
                 test_requester(),
@@ -1700,22 +1820,49 @@ fn delete_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
 #[test]
 fn complete_multipart_upload_does_not_wait_for_bucket_lock() {
     let tmp = test_util::tempdir();
+    let bucket = "bucket-complete-no-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let completer = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let admin =
+        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
+    let completer =
+        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
     admin
-        .create_bucket_for_owner("default-owner", "bucket", false)
+        .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
 
-    let (upload_id, parts) = create_upload_with_parts(&admin, "bucket", "key", &[(1, b"part")]);
+    let (upload_id, parts) = create_upload_with_parts(&admin, bucket, "key", &[(1, b"part")]);
 
-    let guard = storage_node.lock_bucket(&trusted_bucket_name("bucket"));
+    let _storage_serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _write_handle_serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let guard = storage_node.lock_bucket(&trusted_bucket_name(bucket));
+    let (event_tx, event_rx) = mpsc::channel();
+    let event_tx_lock = event_tx.clone();
+    let _storage_hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
+        target: Some(trusted_bucket_name(bucket)),
+        before_bucket_lock_acquire: Some(Arc::new(move || {
+            let _ = event_tx_lock.send(LockWaitEvent::UnexpectedBucketLock);
+        })),
+        ..BucketScopedTestHooks::default()
+    });
+    let _write_handle_hook_guard =
+        install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+            bucket: Some(bucket.to_string()),
+            after_loaded: Some(Arc::new(move || {
+                let _ = event_tx.send(LockWaitEvent::Progress);
+            })),
+        });
     let (tx, rx) = mpsc::channel();
     let handle = thread::spawn(move || {
         let res = completer.complete_multipart_upload(&CompleteMultipartUploadRequest {
             upload: multipart_object_request_with_expected_owner(
-                "bucket",
+                bucket,
                 "key",
                 &upload_id,
                 test_requester(),
@@ -1733,8 +1880,9 @@ fn complete_multipart_upload_does_not_wait_for_bucket_lock() {
         tx.send(res).unwrap();
     });
 
-    let res = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
     drop(guard);
+    let res = rx.recv().unwrap();
     assert!(
         res.is_ok(),
         "complete_multipart_upload should succeed without waiting on bucket lock: {res:?}"
@@ -1745,15 +1893,16 @@ fn complete_multipart_upload_does_not_wait_for_bucket_lock() {
 #[test]
 fn complete_multipart_upload_waits_for_multipart_completion_lock() {
     let tmp = test_util::tempdir();
+    let bucket = "bucket-complete-waits-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
     let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
     let completer = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
     admin
-        .create_bucket_for_owner("default-owner", "bucket", false)
+        .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
 
-    let (upload_id, parts) = create_upload_with_parts(&admin, "bucket", "key", &[(1, b"part")]);
+    let (upload_id, parts) = create_upload_with_parts(&admin, bucket, "key", &[(1, b"part")]);
 
     let _serial = STORAGE_TEST_HOOK_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -1762,9 +1911,9 @@ fn complete_multipart_upload_waits_for_multipart_completion_lock() {
     let reached_before_lock = Arc::new(Barrier::new(2));
     let reached_before_lock_hook = Arc::clone(&reached_before_lock);
     let (acquired_lock_tx, acquired_lock_rx) = mpsc::channel();
-    let guard = storage_node.lock_multipart_completion_bucket(&trusted_bucket_name("bucket"));
+    let guard = storage_node.lock_multipart_completion_bucket(&trusted_bucket_name(bucket));
     let _hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
-        target: Some(trusted_bucket_name("bucket")),
+        target: Some(trusted_bucket_name(bucket)),
         before_multipart_completion_lock: Some(Arc::new(move || {
             reached_before_lock_hook.wait();
         })),
@@ -1777,7 +1926,7 @@ fn complete_multipart_upload_waits_for_multipart_completion_lock() {
     let handle = thread::spawn(move || {
         let res = completer.complete_multipart_upload(&CompleteMultipartUploadRequest {
             upload: multipart_object_request_with_expected_owner(
-                "bucket",
+                bucket,
                 "key",
                 &upload_id,
                 test_requester(),
@@ -1811,38 +1960,54 @@ fn complete_multipart_upload_waits_for_multipart_completion_lock() {
 #[test]
 fn complete_multipart_upload_does_not_deadlock_when_bucket_policy_shares_pg() {
     let tmp = test_util::tempdir();
+    let bucket = "bucket-complete-same-pg";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
     let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
     let completer = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
 
     admin
-        .create_bucket_for_owner("default-owner", "bucket", false)
+        .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
     put_bucket_policy_test(
         &admin,
-        "bucket",
-        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"default-owner"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        bucket,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"default-owner"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket-complete-same-pg/*"}]}"#,
         test_requester(),
         None,
     )
     .unwrap();
-    admin.clear_bucket_policy_cache(&trusted_bucket_name("bucket"));
+    admin.clear_bucket_policy_cache(&trusted_bucket_name(bucket));
 
-    let bucket_pg_id = admin.bucket_pg_id("bucket");
+    let bucket_pg_id = admin.bucket_pg_id(bucket);
     let key = (0..1024)
         .map(|i| format!("same-pg-{i}"))
-        .find(|candidate| admin.object_pg_id("bucket", candidate) == bucket_pg_id)
+        .find(|candidate| admin.object_pg_id(bucket, candidate) == bucket_pg_id)
         .expect("expected to find a key whose object PG matches the bucket PG");
 
-    let (upload_id, parts) = create_upload_with_parts(&admin, "bucket", &key, &[(1, b"part")]);
+    let (upload_id, parts) = create_upload_with_parts(&admin, bucket, &key, &[(1, b"part")]);
 
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let (event_tx, event_rx) = mpsc::channel();
+    let event_tx_hook = event_tx.clone();
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some((bucket.to_string(), key.clone())),
+        probe_multipart_complete_auth_lookup: true,
+        after_multipart_complete_pre_commit: Some(Arc::new(move || {
+            let _ = event_tx_hook.send(LockWaitEvent::Progress);
+        })),
+        ..ReclamationTestHooks::default()
+    });
     let (tx, rx) = mpsc::channel();
+    let event_tx_complete = event_tx.clone();
     let key_for_complete = key.clone();
     let handle = thread::spawn(move || {
         let res = completer.complete_multipart_upload(&CompleteMultipartUploadRequest {
             upload: multipart_object_request_with_expected_owner(
-                "bucket",
+                bucket,
                 &key_for_complete,
                 &upload_id,
                 test_requester(),
@@ -1854,11 +2019,13 @@ fn complete_multipart_upload_does_not_deadlock_when_bucket_policy_shares_pg() {
             cond: &WriteCondition::default(),
             sse_customer: None,
         });
+        let _ = event_tx_complete.send(LockWaitEvent::CompletedEarly);
         tx.send(res).unwrap();
     });
 
+    assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
     let res = rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv()
         .expect("complete_multipart_upload should not deadlock on bucket policy lookup");
     assert!(
         res.is_ok(),
