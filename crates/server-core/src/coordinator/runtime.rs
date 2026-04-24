@@ -8,8 +8,8 @@ use ec::{EcConfig, ErasureCodec};
 use s3_types::BucketLifecycleConfiguration;
 use storage::traits::ShardStore;
 use storage::{
-    BucketInfo, BucketName, EcShape, GenerationId, MultipartReclaimPartRecord, ObjectEncryption,
-    ObjectKey, OwnerIdentity, ShardKey, SharedStorageNode, UploadId, UploadState, VersionId,
+    BucketInfo, BucketName, GenerationId, ObjectEncryption, ObjectKey, OwnerIdentity, ShardKey,
+    SharedStorageNode, UploadId, UploadState, VersionId,
 };
 
 use super::payload::{PooledPayloadBuffer, SharedPayloadBuffer};
@@ -330,12 +330,7 @@ impl ReadRuntime {
 
         let mut finished = 0u64;
         for (key, upload_id) in candidates {
-            if self.abort_multipart_upload_internal_for(
-                bucket,
-                &key,
-                &upload_id,
-                "lifecycle-runtime",
-            )? {
+            if self.abort_multipart_upload_internal_for(bucket, &key, &upload_id)? {
                 finished += 1;
             }
         }
@@ -663,12 +658,7 @@ impl ReadRuntime {
         };
 
         if upload.state == UploadState::Aborting {
-            return self.abort_multipart_upload_internal_for(
-                bucket,
-                key,
-                upload_id,
-                "lifecycle-runtime",
-            );
+            return self.abort_multipart_upload_internal_for(bucket, key, upload_id);
         }
         if upload.state != UploadState::InProgress {
             return Ok(false);
@@ -689,7 +679,7 @@ impl ReadRuntime {
             return Ok(false);
         }
 
-        self.abort_multipart_upload_internal_for(bucket, key, upload_id, "lifecycle-runtime")
+        self.abort_multipart_upload_internal_for(bucket, key, upload_id)
     }
 
     pub(super) fn abort_multipart_upload_internal_for(
@@ -697,20 +687,7 @@ impl ReadRuntime {
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
-        _source: &'static str,
     ) -> Result<bool, ServerError> {
-        #[cfg(feature = "deep-tracing")]
-        if let Some(trace) = observability::current_context() {
-            let _ = observability::event_in_context(
-                &trace,
-                TRACE_TARGET,
-                "multipart_abort_execute",
-                Some(format_args!(
-                    "source={} bucket={:?} key={:?} upload_id={:?}",
-                    _source, bucket, key, upload_id
-                )),
-            );
-        }
         self.storage_node
             .abort_multipart_upload(bucket, key, upload_id)
             .map_err(Coordinator::map_object_pg_action_error)
@@ -752,181 +729,14 @@ impl ReadRuntime {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<(), ServerError> {
-        enum ReclaimPayload {
-            Simple(storage::SimplePayloadReclaimRecord),
-            Segments(storage::ObjectSegmentsReclaimRecord),
-            Multipart(storage::MultipartReclaimRecord),
-        }
-
-        let delete_ec_shards = |storage_node: &Arc<SharedStorageNode>,
-                                shard_pg_id: u32,
-                                okh: &[u8; 16],
-                                generation_id: GenerationId,
-                                ec: EcShape|
-         -> Result<(), ServerError> {
-            let shard_pg = storage_node.get_pg(shard_pg_id)?;
-            let total = ec.k as usize + ec.m as usize;
-            for i in 0..total {
-                let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
-                shard_pg.delete_shard(&shard_key)?;
-            }
-            Ok(())
-        };
-
-        if self
-            .storage_node
-            .object_payload_lease_count(bucket, key, generation_id)
-            != 0
-        {
-            return Ok(());
-        }
-
-        let meta_pg_id = self.pg_topology.object_pg(bucket.as_str(), key.as_str());
-        let reclaim = {
-            let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
-            let meta_pg: &storage::PgStore = &meta_guard;
-
-            if self
-                .storage_node
-                .object_payload_lease_count(bucket, key, generation_id)
-                != 0
-            {
-                return Ok(());
-            }
-
-            if let Some(reclaim) = storage::PgMetadataStore::get_simple_payload_reclaim(
-                meta_pg,
+        self.storage_node
+            .reclaim_object_payload_if_unleased(
                 bucket,
                 key,
                 generation_id,
-            )? {
-                Some(ReclaimPayload::Simple(reclaim))
-            } else if let Some(reclaim) = storage::PgMetadataStore::get_object_segments_reclaim(
-                meta_pg,
-                bucket,
-                key,
-                generation_id,
-            )? {
-                Some(ReclaimPayload::Segments(reclaim))
-            } else {
-                storage::PgMetadataStore::get_multipart_reclaim(
-                    meta_pg,
-                    bucket,
-                    key,
-                    generation_id,
-                )?
-                .map(ReclaimPayload::Multipart)
-            }
-        };
-
-        let Some(reclaim) = reclaim else {
-            return Ok(());
-        };
-
-        if self
-            .storage_node
-            .object_payload_lease_count(bucket, key, generation_id)
-            != 0
-        {
-            return Ok(());
-        }
-
-        match &reclaim {
-            ReclaimPayload::Simple(reclaim) => {
-                let shard_pg_id =
-                    self.pg_topology
-                        .shard_pg(bucket.as_str(), key.as_str(), generation_id.get());
-                let okh = object_key_hash(bucket.as_str(), key.as_str());
-                delete_ec_shards(
-                    &self.storage_node,
-                    shard_pg_id,
-                    &okh,
-                    generation_id,
-                    reclaim.ec,
-                )?;
-            }
-            ReclaimPayload::Segments(reclaim) => {
-                for segment in &reclaim.segments {
-                    delete_ec_shards(
-                        &self.storage_node,
-                        segment.shard_pg_id,
-                        &segment.segment_okh,
-                        segment.segment_vid,
-                        segment.ec,
-                    )?;
-                }
-            }
-            ReclaimPayload::Multipart(reclaim) => {
-                for part in &reclaim.parts {
-                    match part {
-                        MultipartReclaimPartRecord::ShardSet {
-                            part_okh,
-                            part_vid,
-                            shard_pg_id,
-                            ec,
-                            ..
-                        } => {
-                            delete_ec_shards(
-                                &self.storage_node,
-                                *shard_pg_id,
-                                part_okh,
-                                *part_vid,
-                                *ec,
-                            )?;
-                        }
-                        MultipartReclaimPartRecord::Segments { segments, .. } => {
-                            for segment in segments {
-                                delete_ec_shards(
-                                    &self.storage_node,
-                                    segment.shard_pg_id,
-                                    &segment.segment_okh,
-                                    segment.segment_vid,
-                                    segment.ec,
-                                )?;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
-        let meta_pg: &storage::PgStore = &meta_guard;
-        if self
-            .storage_node
-            .object_payload_lease_count(bucket, key, generation_id)
-            != 0
-        {
-            return Ok(());
-        }
-
-        match reclaim {
-            ReclaimPayload::Simple(_) => {
-                storage::PgMetadataStore::delete_simple_payload_reclaim(
-                    meta_pg,
-                    bucket,
-                    key,
-                    generation_id,
-                )?;
-            }
-            ReclaimPayload::Segments(_) => {
-                storage::PgMetadataStore::delete_object_segments_reclaim(
-                    meta_pg,
-                    bucket,
-                    key,
-                    generation_id,
-                )?;
-            }
-            ReclaimPayload::Multipart(_) => {
-                storage::PgMetadataStore::delete_multipart_reclaim(
-                    meta_pg,
-                    bucket,
-                    key,
-                    generation_id,
-                )?;
-            }
-        }
-        self.enqueue_bucket_delete_finalize_for(bucket);
+                object_key_hash(bucket.as_str(), key.as_str()),
+            )
+            .map_err(Coordinator::map_object_pg_action_error)?;
         Ok(())
     }
 

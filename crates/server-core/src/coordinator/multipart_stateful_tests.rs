@@ -205,6 +205,7 @@ fn make_test_read_runtime(dir: &Path) -> ReadRuntime {
         storage_node: Arc::new(SharedStorageNode::open(dir, &[0]).unwrap()),
         ec_codec: Arc::new(ErasureCodec::new(ec_config).unwrap()),
         ec_config,
+        #[cfg(test)]
         pg_topology: PgTopology::new(&[0]).unwrap(),
         payload_buffer_pool: PayloadBufferPool::new(ec_config),
         sse_c_validator: None,

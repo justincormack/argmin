@@ -24,6 +24,145 @@ enum StaleObjectPayload {
 }
 
 impl SharedStorageNode {
+    pub fn reclaim_object_payload_if_unleased(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        simple_object_key_hash: [u8; 16],
+    ) -> Result<bool, ObjectPgActionError> {
+        enum ReclaimPayload {
+            Simple(crate::types::SimplePayloadReclaimRecord),
+            Segments(ObjectSegmentsReclaimRecord),
+            Multipart(MultipartReclaimRecord),
+        }
+
+        let delete_ec_shards = |node: &SharedStorageNode,
+                                shard_pg_id: u32,
+                                okh: &[u8; 16],
+                                generation_id: GenerationId,
+                                ec: EcShape|
+         -> Result<(), ObjectPgActionError> {
+            let shard_pg = node.get_pg(shard_pg_id)?;
+            let total = ec.k as usize + ec.m as usize;
+            for i in 0..total {
+                let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
+                shard_pg.delete_shard(&shard_key)?;
+            }
+            Ok(())
+        };
+
+        if self.object_payload_lease_count(bucket, key, generation_id) != 0 {
+            return Ok(false);
+        }
+
+        let meta_pg_id = self.pg_topology.object_pg_for(bucket, key);
+        let reclaim = {
+            let meta_pg = self.get_pg(meta_pg_id)?;
+            if self.object_payload_lease_count(bucket, key, generation_id) != 0 {
+                return Ok(false);
+            }
+
+            if let Some(reclaim) =
+                PgMetadataStore::get_simple_payload_reclaim(&*meta_pg, bucket, key, generation_id)?
+            {
+                Some(ReclaimPayload::Simple(reclaim))
+            } else if let Some(reclaim) =
+                PgMetadataStore::get_object_segments_reclaim(&*meta_pg, bucket, key, generation_id)?
+            {
+                Some(ReclaimPayload::Segments(reclaim))
+            } else {
+                PgMetadataStore::get_multipart_reclaim(&*meta_pg, bucket, key, generation_id)?
+                    .map(ReclaimPayload::Multipart)
+            }
+        };
+
+        let Some(reclaim) = reclaim else {
+            return Ok(false);
+        };
+
+        if self.object_payload_lease_count(bucket, key, generation_id) != 0 {
+            return Ok(false);
+        }
+
+        match &reclaim {
+            ReclaimPayload::Simple(reclaim) => {
+                let shard_pg_id =
+                    self.pg_topology
+                        .shard_pg(bucket.as_str(), key.as_str(), generation_id.get());
+                delete_ec_shards(
+                    self,
+                    shard_pg_id,
+                    &simple_object_key_hash,
+                    generation_id,
+                    reclaim.ec,
+                )?;
+            }
+            ReclaimPayload::Segments(reclaim) => {
+                for segment in &reclaim.segments {
+                    delete_ec_shards(
+                        self,
+                        segment.shard_pg_id,
+                        &segment.segment_okh,
+                        segment.segment_vid,
+                        segment.ec,
+                    )?;
+                }
+            }
+            ReclaimPayload::Multipart(reclaim) => {
+                for part in &reclaim.parts {
+                    match part {
+                        MultipartReclaimPartRecord::ShardSet {
+                            part_okh,
+                            part_vid,
+                            shard_pg_id,
+                            ec,
+                            ..
+                        } => {
+                            delete_ec_shards(self, *shard_pg_id, part_okh, *part_vid, *ec)?;
+                        }
+                        MultipartReclaimPartRecord::Segments { segments, .. } => {
+                            for segment in segments {
+                                delete_ec_shards(
+                                    self,
+                                    segment.shard_pg_id,
+                                    &segment.segment_okh,
+                                    segment.segment_vid,
+                                    segment.ec,
+                                )?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let meta_pg = self.get_pg(meta_pg_id)?;
+        if self.object_payload_lease_count(bucket, key, generation_id) != 0 {
+            return Ok(false);
+        }
+
+        match reclaim {
+            ReclaimPayload::Simple(_) => PgMetadataStore::delete_simple_payload_reclaim(
+                &*meta_pg,
+                bucket,
+                key,
+                generation_id,
+            )?,
+            ReclaimPayload::Segments(_) => PgMetadataStore::delete_object_segments_reclaim(
+                &*meta_pg,
+                bucket,
+                key,
+                generation_id,
+            )?,
+            ReclaimPayload::Multipart(_) => {
+                PgMetadataStore::delete_multipart_reclaim(&*meta_pg, bucket, key, generation_id)?
+            }
+        }
+        self.enqueue_bucket_delete_finalize(bucket);
+        Ok(true)
+    }
+
     fn enqueue_object_segments_reclaim(
         meta_pg: &PgStore,
         bucket: &BucketName,

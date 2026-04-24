@@ -8,6 +8,7 @@ use storage::{
 
 use super::object_state::SnapshottedMultipartPart;
 use super::payload::{PayloadBufferPool, SharedPayloadBuffer};
+#[cfg(test)]
 use super::PgTopology;
 use super::TRACE_TARGET;
 use crate::error::ServerError;
@@ -25,6 +26,7 @@ pub(super) struct ReadRuntime {
     pub(super) storage_node: Arc<SharedStorageNode>,
     pub(super) ec_codec: Arc<ErasureCodec>,
     pub(super) ec_config: EcConfig,
+    #[cfg(test)]
     pub(super) pg_topology: PgTopology,
     pub(super) payload_buffer_pool: Arc<PayloadBufferPool>,
     pub(super) sse_c_validator: Option<SseCustomerValidatorConfig>,

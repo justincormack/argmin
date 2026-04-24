@@ -2,9 +2,9 @@
 use super::runtime::LifecycleSweepStats;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, RwLock};
 #[cfg(test)]
 use std::sync::MutexGuard;
+use std::sync::{Arc, RwLock};
 
 use ec::{EcConfig, ErasureCodec};
 
@@ -305,6 +305,7 @@ impl Coordinator {
             storage_node: Arc::clone(&storage_node),
             ec_codec: Arc::clone(&ec_codec),
             ec_config,
+            #[cfg(test)]
             pg_topology: pg_topology.clone(),
             payload_buffer_pool: Arc::clone(&payload_buffer_pool),
             sse_c_validator: sse_c_validator.clone(),
@@ -363,6 +364,7 @@ impl Coordinator {
             storage_node: Arc::clone(&self.storage_node),
             ec_codec: Arc::clone(&self.ec_codec),
             ec_config: self.ec_config,
+            #[cfg(test)]
             pg_topology: self.pg_topology.clone(),
             payload_buffer_pool: Arc::clone(&self.payload_buffer_pool),
             sse_c_validator: self.sse_c_validator.clone(),
@@ -452,5 +454,4 @@ impl Coordinator {
             .map_err(ServerError::Store)?;
         Ok(TwoPgGuards::new(meta_guard, shard_guard))
     }
-
 }
