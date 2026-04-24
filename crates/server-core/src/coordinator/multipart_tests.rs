@@ -3674,6 +3674,84 @@ fn upload_part_after_abort_rejected() {
     );
 }
 
+#[test]
+fn begin_stream_part_after_same_key_abort_stress_regression() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    for iteration in 0..512u32 {
+        let create_a = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+                acl: NO_PUT_OBJECT_ACL.into(),
+                encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .unwrap();
+
+        coord
+            .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &create_a.upload_id,
+                test_requester(),
+                None,
+            ))
+            .unwrap();
+
+        let create_b = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+                acl: NO_PUT_OBJECT_ACL.into(),
+                encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .unwrap();
+
+        let session = coord.begin_stream_part(&BeginStreamPartRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &create_b.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number: 2,
+            policy_context: PutObjectPolicyContext::default(),
+            sse_customer: None,
+        });
+        assert!(
+            session.is_ok(),
+            "iteration {iteration}: begin_stream_part after abort/create on same key failed for old upload {} and new upload {}: {session:?}",
+            create_a.upload_id,
+            create_b.upload_id,
+        );
+
+        coord
+            .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &create_b.upload_id,
+                test_requester(),
+                None,
+            ))
+            .unwrap();
+    }
+}
+
 // --- ListParts tests ---
 
 #[test]

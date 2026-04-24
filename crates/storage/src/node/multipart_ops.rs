@@ -793,7 +793,7 @@ impl SharedStorageNode {
         }
         match pg.delete_multipart_upload(upload_id) {
             Ok(()) => Ok(true),
-            Err(crate::error::MetadataError::NoSuchUpload { .. }) => Ok(false),
+            Err(crate::error::MetadataError::NoSuchUpload { .. }) => Ok(true),
             Err(error) => Err(error.into()),
         }
     }
