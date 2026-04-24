@@ -9177,13 +9177,83 @@ fn authz_model_phase4_begin_stream_put_write_matrix() {
 }
 
 #[test]
-fn authz_model_phase4_put_object_acl_matrix() {
-    run_phase4_acl_matrix(AclUpdateAction::PutObjectAcl);
+fn authz_model_phase4_put_object_acl_matrix_shard_00() {
+    run_phase4_acl_matrix_shard(AclUpdateAction::PutObjectAcl, 0, 8);
 }
 
 #[test]
-fn authz_model_phase4_put_object_version_acl_matrix() {
-    run_phase4_acl_matrix(AclUpdateAction::PutObjectVersionAcl);
+fn authz_model_phase4_put_object_acl_matrix_shard_01() {
+    run_phase4_acl_matrix_shard(AclUpdateAction::PutObjectAcl, 1, 8);
+}
+
+#[test]
+fn authz_model_phase4_put_object_acl_matrix_shard_02() {
+    run_phase4_acl_matrix_shard(AclUpdateAction::PutObjectAcl, 2, 8);
+}
+
+#[test]
+fn authz_model_phase4_put_object_acl_matrix_shard_03() {
+    run_phase4_acl_matrix_shard(AclUpdateAction::PutObjectAcl, 3, 8);
+}
+
+#[test]
+fn authz_model_phase4_put_object_acl_matrix_shard_04() {
+    run_phase4_acl_matrix_shard(AclUpdateAction::PutObjectAcl, 4, 8);
+}
+
+#[test]
+fn authz_model_phase4_put_object_acl_matrix_shard_05() {
+    run_phase4_acl_matrix_shard(AclUpdateAction::PutObjectAcl, 5, 8);
+}
+
+#[test]
+fn authz_model_phase4_put_object_acl_matrix_shard_06() {
+    run_phase4_acl_matrix_shard(AclUpdateAction::PutObjectAcl, 6, 8);
+}
+
+#[test]
+fn authz_model_phase4_put_object_acl_matrix_shard_07() {
+    run_phase4_acl_matrix_shard(AclUpdateAction::PutObjectAcl, 7, 8);
+}
+
+#[test]
+fn authz_model_phase4_put_object_version_acl_matrix_shard_00() {
+    run_phase4_acl_matrix_shard(AclUpdateAction::PutObjectVersionAcl, 0, 8);
+}
+
+#[test]
+fn authz_model_phase4_put_object_version_acl_matrix_shard_01() {
+    run_phase4_acl_matrix_shard(AclUpdateAction::PutObjectVersionAcl, 1, 8);
+}
+
+#[test]
+fn authz_model_phase4_put_object_version_acl_matrix_shard_02() {
+    run_phase4_acl_matrix_shard(AclUpdateAction::PutObjectVersionAcl, 2, 8);
+}
+
+#[test]
+fn authz_model_phase4_put_object_version_acl_matrix_shard_03() {
+    run_phase4_acl_matrix_shard(AclUpdateAction::PutObjectVersionAcl, 3, 8);
+}
+
+#[test]
+fn authz_model_phase4_put_object_version_acl_matrix_shard_04() {
+    run_phase4_acl_matrix_shard(AclUpdateAction::PutObjectVersionAcl, 4, 8);
+}
+
+#[test]
+fn authz_model_phase4_put_object_version_acl_matrix_shard_05() {
+    run_phase4_acl_matrix_shard(AclUpdateAction::PutObjectVersionAcl, 5, 8);
+}
+
+#[test]
+fn authz_model_phase4_put_object_version_acl_matrix_shard_06() {
+    run_phase4_acl_matrix_shard(AclUpdateAction::PutObjectVersionAcl, 6, 8);
+}
+
+#[test]
+fn authz_model_phase4_put_object_version_acl_matrix_shard_07() {
+    run_phase4_acl_matrix_shard(AclUpdateAction::PutObjectVersionAcl, 7, 8);
 }
 
 #[test]
@@ -9956,23 +10026,42 @@ fn run_phase4_write_matrix(action: WriteAction) {
     }
 }
 
-fn run_phase4_acl_matrix(action: AclUpdateAction) {
+fn run_phase4_acl_matrix_shard(action: AclUpdateAction, shard_index: usize, shard_count: usize) {
+    assert!(shard_count > 0, "phase 4 ACL shard count must be non-zero");
+    assert!(
+        shard_index < shard_count,
+        "phase 4 ACL shard index {shard_index} out of range for shard count {shard_count}"
+    );
     let scenarios = AclUpdateScenario::scenarios(action);
     assert!(
         !scenarios.is_empty(),
         "phase 4 matrix unexpectedly produced no scenarios for {action}"
     );
     let harness = Phase4Harness::new();
+    let mut shard_len = 0usize;
 
     for (index, scenario) in scenarios.into_iter().enumerate() {
+        if index % shard_count != shard_index {
+            continue;
+        }
+        shard_len += 1;
         let bucket = acl_bucket_name_for(action, index);
         let expected = scenario.expected_outcome();
         let actual = to_acl_outcome(harness.run_acl_update(&bucket, scenario));
         assert_eq!(
             actual, expected,
-            "phase 4 authz model mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
+            "phase 4 authz model mismatch\nshard: {}/{}\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}",
+            shard_index + 1,
+            shard_count
         );
     }
+
+    assert!(
+        shard_len > 0,
+        "phase 4 ACL shard {}/{} unexpectedly produced no scenarios for {action}",
+        shard_index + 1,
+        shard_count
+    );
 }
 
 fn run_phase9_bucket_matrix(action: BucketAction) {
