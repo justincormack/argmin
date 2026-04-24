@@ -99,6 +99,10 @@ The key rule is:
 - all bucket-derived decisions come from that handle
 - all object/multipart access is derived from it
 - PGs never appear in coordinator request logic
+- the final state of this plan is stronger than request-path cleanup alone:
+  PG operations must not be exported from `storage` to `server-core` at all;
+  storage topology and PG locking must be purely internal to `storage`, and
+  tests must use higher-level deterministic helpers rather than raw PG access
 
 ## Desired Properties
 
@@ -1023,26 +1027,40 @@ These are not ordinary top-level request handlers, but they are still
 non-test coordinator code that exposes PG-shaped APIs or uses direct PG
 access:
 
-- completed in 9a so far:
+- status: in progress
+
+- completed in 9a:
   - the old loaded-object helper family used by object tagging / ACL /
     object-lock auth is now migrated onto storage-owned object metadata
     transactions and remains only as test-only support code
   - earlier 9a slices already moved several runtime / infra bucket-side and
     multipart-order helper calls behind storage
+  - the remaining `object_state.rs` read-lock helper is now test-only
+  - the earlier bucket-side / multipart-order internal helper migrations
+    stayed on storage-owned helpers without reintroducing coordinator PG
+    exposure
+  - lifecycle runtime fanout/mutation flows now go through storage-owned
+    bucket/object helpers rather than coordinator PG orchestration
 
-- remaining 9a scope:
-- `runtime.rs`
-  - reclaim, finalize, and background processing helpers
-  - bucket/object scan helpers used by runtime workflows
-- `infra.rs`
-  - generic coordinator PG helper surface
-  - request-family migrations have made parts of this obsolete
-- `object_state.rs`
-  - helper-level direct PG access such as current-object lookup / mutation
-    helpers that are now mostly implementation leftovers rather than
-    intentional coordinator boundaries
-- any remaining helper-level `get_pg(...)` / `lock_two_pgs(...)` use in
-  non-test coordinator modules
+- remaining non-test coordinator PG use still to remove before 9a is done:
+  - `runtime.rs`
+    - reclaim helpers still use direct metadata/shard PG access
+    - low-level segment/shard read internals still use direct PG access
+    - lifecycle runtime still uses the storage-owned bucket stripe lock for
+      coordination, and that lock usage should be reviewed as part of the
+      final storage-owned runtime surface
+  - `infra.rs` / `put.rs`
+    - the direct one-segment `PutObject` fast path still uses
+      `lock_object_pgs_for_write_ids(...)`
+  - any remaining non-test coordinator helper that still exposes
+    `get_pg(...)`, `lock_two_pgs(...)`, or bucket/object PG guards
+
+- 9a exit criterion:
+  - non-test `server-core` code no longer performs PG operations directly
+  - coordinator/runtime/internal flows must reach storage-owned helpers
+    instead of calling PG APIs themselves
+  - after that, the remaining PG references are test-only and are removed in
+    phase 9b before the boundary is considered complete
 
 Acceptance criteria for 9a:
 
@@ -1052,15 +1070,17 @@ Acceptance criteria for 9a:
   `LockedReadObject` / `ObjectPgGuards` usage is test-only
 - the earlier bucket-side / multipart-order internal helper migrations remain
   on storage-owned helpers without reintroducing coordinator PG exposure
-- runtime/background code keeps direct PG access only where it is still a
-  deliberate internal responsibility
-- the remaining coordinator PG uses are few, explicit, and explainable
+- runtime/background code no longer keeps direct PG access in coordinator;
+  any required locking or topology decisions are storage-owned
+- the remaining coordinator PG uses are only test-only references that are
+  explicitly queued for removal in phase 9b
 
 Phase 9b: test/helper cleanup audit
 
 There are still many direct PG references in tests and test-only helpers.
-Those are lower priority, but should be audited deliberately once the
-non-test internal surface is settled.
+Those are lower priority than production-path cleanup, but they are still part
+of the required end state because the storage/coordinator boundary is not
+finished until PG exports disappear completely.
 
 This includes:
 
@@ -1072,7 +1092,10 @@ This includes:
 
 Acceptance criteria for 9b:
 
-- direct PG use remains only in tests that genuinely need raw-state
+- direct PG use no longer appears in `server-core` tests or test helpers
+- tests that currently inspect raw PG state use storage-owned inspection
+  helpers or other deterministic higher-level harnesses instead
+- PG-shaped APIs are no longer exported from `storage` for coordinator/test use
   inspection or fault injection
 - accidental test dependence on coordinator PG helpers is reduced where a
   clearer storage/test helper exists
