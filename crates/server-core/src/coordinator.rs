@@ -58,9 +58,7 @@ use self::read_core::{
 use self::read_core::{PayloadLease, ReadRuntime, SegmentListReader};
 pub use self::read_core::{ReadChunk, ReadHandle};
 pub use self::request_types::*;
-use self::request_types::{
-    AuthorizedWriteTags, BucketCreateOutcome, PreparedPutCommit, PutCommitRequest,
-};
+use self::request_types::{AuthorizedWriteTags, BucketCreateOutcome};
 pub use self::response_types::*;
 use self::response_types::{DeleteMarkerLifecycleExpiration, NoncurrentLifecycleExpiration};
 use self::runtime::{LifecycleSweeper, ReclaimSweeper};

@@ -1,7 +1,6 @@
 use checksum::{ChecksumAlgorithm, RawChecksum};
 
-use super::authz_types::{ActiveWriteEncryption, ActiveWriteEncryptionRef};
-use super::object_state::StaleObjectPayload;
+use super::authz_types::ActiveWriteEncryptionRef;
 use crate::checksum_claim::{ChecksumClaim, EncodedChecksumClaim};
 use crate::conditional::{DeleteCondition, ReadCondition, WriteCondition};
 use crate::error::ServerError;
@@ -16,9 +15,8 @@ use s3_types::{
 };
 use storage::{
     BucketEncryptionConfig, BucketName, BucketObjectOwnership, BucketOwnershipControls,
-    GenerationId, ManagedEncryptionAlgorithm, MultipartChecksumConfig, ObjectEncryption, ObjectKey,
-    ObjectLockState, PublicAccessBlockConfig, SerializedMetadataBlob, SerializedSystemMetadataBlob,
-    SerializedTagSet, SessionId, UploadId,
+    ManagedEncryptionAlgorithm, MultipartChecksumConfig, ObjectKey, ObjectLockState,
+    PublicAccessBlockConfig, SessionId, UploadId,
 };
 
 /// Metadata handling directive for `CopyObject`.
@@ -306,26 +304,6 @@ pub struct AuthorizePutObjectRequest<'a> {
     pub object_lock: ObjectLockState,
     pub tags: Option<&'a str>,
     pub encryption: WriteEncryptionRequest<'a>,
-}
-
-pub(super) struct PreparedPutCommit {
-    pub(super) version_id: VersionId,
-    pub(super) generation_id: GenerationId,
-    pub(super) tags: Option<SerializedTagSet>,
-    pub(super) metadata_blob: SerializedMetadataBlob,
-    pub(super) system_metadata_blob: SerializedSystemMetadataBlob,
-    pub(super) encryption: ObjectEncryption,
-    pub(super) stale_payload: Option<StaleObjectPayload>,
-}
-
-pub(super) struct PutCommitRequest<'a> {
-    pub(super) bucket: &'a BucketName,
-    pub(super) key: &'a ObjectKey,
-    pub(super) metadata_blob: &'a MetadataBlob,
-    pub(super) system_metadata: &'a SystemMetadata,
-    pub(super) write_encryption: &'a ActiveWriteEncryption,
-    pub(super) tags: Option<&'a str>,
-    pub(super) cond: &'a WriteCondition,
 }
 
 pub struct AuthorizedPutObjectCommitRequest<'a> {

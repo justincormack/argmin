@@ -1,21 +1,16 @@
 use checksum::{ChecksumAlgorithm, ChecksumType};
-use s3_types::{BucketVersioningState, VersionId};
-use storage::traits::PgMetadataStore;
+#[cfg(test)]
+use s3_types::VersionId;
+#[cfg(test)]
+use storage::StoredObject;
 use storage::{
-    BucketName, EcShape, GenerationId, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
-    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, ObjectEncryption, ObjectKey,
-    ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, SerializedMetadataBlob, SerializedSystemMetadataBlob,
-    SerializedTagSet, StoredObject,
+    BucketName, GenerationId, ObjectEncryption, ObjectKey, ObjectPartRecord,
+    SerializedMetadataBlob, SerializedSystemMetadataBlob,
 };
 
-use super::{
-    ActiveWriteEncryption, BucketSummary, Coordinator, PreparedPutCommit, PutCommitRequest,
-    SegmentPayloadRecord,
-};
+use super::{ActiveWriteEncryption, Coordinator, SegmentPayloadRecord};
 #[cfg(test)]
 use super::{LockedReadObject, ObjectPgGuards};
-use crate::conditional::{check_write_conditions, WriteCondition};
 use crate::error::ServerError;
 use crate::metadata_blob::MetadataBlob;
 use crate::sse::{
@@ -30,94 +25,23 @@ pub(super) struct SnapshottedMultipartPart {
     pub(super) segments: Vec<SegmentPayloadRecord>,
 }
 
-#[derive(Debug, Clone)]
-pub(super) enum StaleObjectPayload {
-    Segments {
-        generation_id: GenerationId,
-        segments: Vec<ObjectSegmentRecord>,
-    },
-    Multipart {
-        generation_id: GenerationId,
-        parts: Vec<ObjectPartRecord>,
-        streaming_segments: Vec<MultipartPartSegmentRecord>,
-    },
+#[derive(Debug, Clone, Copy)]
+pub(super) struct StaleObjectPayload {
+    pub(super) generation_id: GenerationId,
 }
 
 impl From<storage::CompletedMultipartStalePayload> for StaleObjectPayload {
     fn from(value: storage::CompletedMultipartStalePayload) -> Self {
         match value {
-            storage::CompletedMultipartStalePayload::Segments {
-                generation_id,
-                segments,
-            } => Self::Segments {
-                generation_id,
-                segments,
-            },
-            storage::CompletedMultipartStalePayload::Multipart {
-                generation_id,
-                parts,
-                streaming_segments,
-            } => Self::Multipart {
-                generation_id,
-                parts,
-                streaming_segments,
-            },
+            storage::CompletedMultipartStalePayload::Segments { generation_id, .. }
+            | storage::CompletedMultipartStalePayload::Multipart { generation_id, .. } => {
+                Self { generation_id }
+            }
         }
     }
 }
 
 impl Coordinator {
-    pub(super) fn prepare_put_commit_locked(
-        &self,
-        meta_pg: &storage::PgStore,
-        bucket_info: &BucketSummary,
-        req: &PutCommitRequest<'_>,
-    ) -> Result<PreparedPutCommit, ServerError> {
-        self.ensure_write_encryption_supported(&req.write_encryption.object_encryption())?;
-        let metadata_blob = SerializedMetadataBlob::from(req.metadata_blob.serialize()?);
-        let (system_metadata_blob, encryption) =
-            Self::prepare_stored_system_metadata(req.system_metadata, req.write_encryption)?;
-
-        if !req.cond.is_empty() {
-            let existing_etag =
-                match storage::PgMetadataStore::get_object_meta(meta_pg, req.bucket, req.key) {
-                    Ok(stored) => stored.as_live().map(|record| record.etag.format()),
-                    Err(storage::MetadataError::ObjectNotFound) => None,
-                    Err(e) => return Err(ServerError::Metadata(e)),
-                };
-            if matches!(req.cond, WriteCondition::IfMatch(_)) && existing_etag.is_none() {
-                return Err(ServerError::ObjectNotFound {
-                    bucket: req.bucket.to_string(),
-                    key: req.key.to_string(),
-                });
-            }
-            check_write_conditions(req.cond, existing_etag.as_deref())?;
-        }
-
-        let version_id = if bucket_info.versioning == BucketVersioningState::Enabled {
-            storage::PgMetadataStore::next_version_id(meta_pg, req.bucket, req.key)?
-        } else {
-            VersionId::Null
-        };
-        let generation_id =
-            storage::PgMetadataStore::next_generation_id(meta_pg, req.bucket, req.key)?;
-        let stale_payload = if version_id.is_null() {
-            Self::snapshot_overwritten_null_version_payload(meta_pg, req.bucket, req.key)?
-        } else {
-            None
-        };
-
-        Ok(PreparedPutCommit {
-            version_id,
-            generation_id,
-            tags: req.tags.map(SerializedTagSet::from),
-            metadata_blob,
-            system_metadata_blob,
-            encryption,
-            stale_payload,
-        })
-    }
-
     pub(super) fn object_system_metadata_with_default_checksum(
         system_metadata: &SystemMetadata,
         write_encryption: &ActiveWriteEncryption,
@@ -149,38 +73,6 @@ impl Coordinator {
             checksum,
         );
         system_metadata
-    }
-
-    pub(super) fn finalize_put_commit_metadata_locked(
-        meta_pg: &storage::PgStore,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: VersionId,
-        stale_payload: Option<&StaleObjectPayload>,
-    ) -> Result<(), ServerError> {
-        if let Some(payload) = stale_payload {
-            match payload {
-                StaleObjectPayload::Segments {
-                    generation_id,
-                    segments,
-                } => {
-                    Self::enqueue_object_segments_reclaim(
-                        meta_pg,
-                        bucket,
-                        key,
-                        *generation_id,
-                        segments,
-                    )?;
-                }
-                StaleObjectPayload::Multipart { .. } => {
-                    Self::delete_stale_object_payload_metadata(
-                        meta_pg, bucket, key, version_id, payload,
-                    )?;
-                }
-            }
-        }
-
-        Ok(())
     }
 
     #[cfg(test)]
@@ -348,226 +240,13 @@ impl Coordinator {
         })
     }
 
-    pub(super) fn snapshot_overwritten_null_version_payload(
-        meta_pg: &storage::PgStore,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<Option<StaleObjectPayload>, ServerError> {
-        let stored = match storage::PgMetadataStore::get_object_version(
-            meta_pg,
-            bucket,
-            key,
-            VersionId::Null,
-        ) {
-            Ok(stored) => stored,
-            Err(storage::MetadataError::ObjectNotFound) => return Ok(None),
-            Err(e) => return Err(ServerError::Metadata(e)),
-        };
-        let record = match stored {
-            StoredObject::Live(record) => record,
-            StoredObject::DeleteMarker(_) => return Ok(None),
-        };
-
-        match record.layout {
-            ObjectLayout::MultipartManifest { .. } => {
-                let parts = storage::PgMetadataStore::get_object_parts(
-                    meta_pg,
-                    bucket,
-                    key,
-                    VersionId::Null,
-                )
-                .map_err(ServerError::Metadata)?;
-                let mut streaming_segments = Vec::new();
-                for part in &parts {
-                    if part.part_okh == [0u8; 16] {
-                        let segments = storage::PgMetadataStore::get_multipart_part_segments(
-                            meta_pg,
-                            bucket,
-                            key,
-                            VersionId::Null,
-                            part.part_number,
-                        )
-                        .map_err(ServerError::Metadata)?;
-                        streaming_segments.extend(segments);
-                    }
-                }
-                Ok(Some(StaleObjectPayload::Multipart {
-                    generation_id: record.generation_id,
-                    parts,
-                    streaming_segments,
-                }))
-            }
-            ObjectLayout::Standard => {
-                let segments = storage::PgMetadataStore::get_object_segments(
-                    meta_pg,
-                    bucket,
-                    key,
-                    VersionId::Null,
-                )
-                .map_err(ServerError::Metadata)?;
-                Ok(Some(StaleObjectPayload::Segments {
-                    generation_id: record.generation_id,
-                    segments,
-                }))
-            }
-        }
-    }
-
-    pub(super) fn delete_stale_object_payload_metadata(
-        meta_pg: &storage::PgStore,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: VersionId,
-        payload: &StaleObjectPayload,
-    ) -> Result<(), ServerError> {
-        match payload {
-            StaleObjectPayload::Segments {
-                generation_id,
-                segments,
-            } => {
-                Self::enqueue_object_segments_reclaim(
-                    meta_pg,
-                    bucket,
-                    key,
-                    *generation_id,
-                    segments,
-                )?;
-                storage::PgMetadataStore::delete_object_segments(meta_pg, bucket, key, version_id)
-                    .map_err(ServerError::Metadata)
-            }
-            StaleObjectPayload::Multipart {
-                generation_id,
-                parts,
-                streaming_segments,
-            } => {
-                Self::enqueue_multipart_reclaim(
-                    meta_pg,
-                    bucket,
-                    key,
-                    *generation_id,
-                    parts,
-                    streaming_segments,
-                )?;
-                if !streaming_segments.is_empty() {
-                    storage::PgMetadataStore::delete_multipart_part_segments(
-                        meta_pg, bucket, key, version_id,
-                    )
-                    .map_err(ServerError::Metadata)?;
-                }
-                storage::PgMetadataStore::delete_object_parts(meta_pg, bucket, key, version_id)
-                    .map_err(ServerError::Metadata)
-            }
-        }
-    }
-
     pub(super) fn delete_stale_object_payload(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         payload: &StaleObjectPayload,
     ) {
-        match payload {
-            StaleObjectPayload::Segments { generation_id, .. } => self
-                .read_runtime()
-                .enqueue_object_payload_reclaim_for(bucket, key, *generation_id),
-            StaleObjectPayload::Multipart { generation_id, .. } => self
-                .read_runtime()
-                .enqueue_object_payload_reclaim_for(bucket, key, *generation_id),
-        }
-    }
-
-    pub(super) fn enqueue_object_segments_reclaim(
-        meta_pg: &storage::PgStore,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-        segments: &[ObjectSegmentRecord],
-    ) -> Result<(), ServerError> {
-        meta_pg
-            .put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                generation_id,
-                created_at: Self::now_millis(),
-                segments: segments
-                    .iter()
-                    .map(|segment| ObjectSegmentsReclaimSegmentRecord {
-                        segment_index: segment.segment_index,
-                        segment_okh: segment.segment_okh,
-                        segment_vid: segment.segment_vid,
-                        shard_pg_id: segment.shard_pg_id,
-                        ec: EcShape {
-                            k: segment.ec_k,
-                            m: segment.ec_m,
-                        },
-                    })
-                    .collect(),
-            })
-            .map_err(ServerError::Metadata)
-    }
-
-    pub(super) fn enqueue_multipart_reclaim(
-        meta_pg: &storage::PgStore,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-        parts: &[ObjectPartRecord],
-        streaming_segments: &[MultipartPartSegmentRecord],
-    ) -> Result<(), ServerError> {
-        use std::collections::BTreeMap;
-
-        let mut segments_by_part: BTreeMap<u32, Vec<MultipartReclaimPartSegmentRecord>> =
-            BTreeMap::new();
-        for segment in streaming_segments {
-            segments_by_part
-                .entry(segment.part_number)
-                .or_default()
-                .push(MultipartReclaimPartSegmentRecord {
-                    part_number: segment.part_number,
-                    segment_index: segment.segment_index,
-                    segment_okh: segment.segment_okh,
-                    segment_vid: segment.segment_vid,
-                    shard_pg_id: segment.shard_pg_id,
-                    ec: EcShape {
-                        k: segment.ec_k,
-                        m: segment.ec_m,
-                    },
-                });
-        }
-
-        let parts = parts
-            .iter()
-            .map(|part| {
-                if part.part_okh == [0u8; 16] {
-                    MultipartReclaimPartRecord::Segments {
-                        part_number: part.part_number,
-                        segments: segments_by_part
-                            .remove(&part.part_number)
-                            .unwrap_or_default(),
-                    }
-                } else {
-                    MultipartReclaimPartRecord::ShardSet {
-                        part_number: part.part_number,
-                        part_okh: part.part_okh,
-                        part_vid: part.part_vid,
-                        shard_pg_id: part.shard_pg_id,
-                        ec: EcShape {
-                            k: part.ec_k,
-                            m: part.ec_m,
-                        },
-                    }
-                }
-            })
-            .collect();
-
-        meta_pg
-            .put_multipart_reclaim(&MultipartReclaimRecord {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                generation_id,
-                created_at: Self::now_millis(),
-                parts,
-            })
-            .map_err(ServerError::Metadata)
+        self.read_runtime()
+            .enqueue_object_payload_reclaim_for(bucket, key, payload.generation_id);
     }
 }

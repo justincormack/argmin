@@ -1,16 +1,14 @@
-use storage::traits::PgMetadataStore;
 use storage::{
-    BucketName, CreateStreamUploadReq, EcShape, GenerationId, ObjectKey, ObjectLayout,
-    ObjectSegmentRecord, PutLiveObjectReq, SessionId, ShardKey, StreamPutFinalizeSnapshot,
-    StreamUploadTarget,
+    BucketName, CommitDirectPutObjectReq, CreateStreamUploadReq, EcShape, GenerationId, ObjectKey,
+    SessionId, StreamPutFinalizeSnapshot, StreamUploadTarget, WrittenShardAck,
 };
 
 use super::bucket_handles::{BucketHandleLoader, BucketHandleRequest};
 use super::{
     ActiveWriteEncryption, AuthorizePutObjectRequest, AuthorizedFinalizeStreamPutRequest,
     AuthorizedPutObjectCommitRequest, AuthorizedPutObjectWrite, AuthorizedWriteTags, Coordinator,
-    FinalizeStreamPutRequest, ObjectRequest, PreparedStreamPut, PutCommitRequest,
-    PutObjectPolicyContext, PutObjectRequest, PutObjectResult, INTERNAL_SEGMENT_SIZE, TRACE_TARGET,
+    FinalizeStreamPutRequest, ObjectRequest, PreparedStreamPut, PutObjectPolicyContext,
+    PutObjectRequest, PutObjectResult, INTERNAL_SEGMENT_SIZE, TRACE_TARGET,
 };
 use crate::error::ServerError;
 use crate::etag::format_etag;
@@ -135,140 +133,89 @@ impl Coordinator {
             let written_shards =
                 self.write_segment_shards(shard_pg_id, &segment_okh, segment_vid, &storage_bytes)?;
 
-            let meta_pg_id =
-                self.object_pg_id_for(authorized.bucket_typed(), authorized.key_typed());
-            let pgs = match self.lock_object_pgs_for_write_ids(meta_pg_id, shard_pg_id) {
-                Ok(pgs) => pgs,
-                Err(err) => {
-                    self.best_effort_delete_written_shards(shard_pg_id, &written_shards);
-                    return Err(err);
-                }
-            };
-            let meta_pg = pgs.meta();
-            let shard_pg = pgs.shard();
-            let shard_batch: Vec<(&ShardKey, storage::WriteAck)> = written_shards
-                .iter()
-                .map(|written| (&written.key, written.ack))
-                .collect();
             let system_metadata = Self::object_system_metadata_with_default_checksum(
                 req.system_metadata,
                 write_encryption,
                 object_crc64,
             );
-
-            let prepared = match self.prepare_put_commit_locked(
-                meta_pg,
-                &bucket_info,
-                &PutCommitRequest {
-                    bucket: authorized.bucket_typed(),
-                    key: authorized.key_typed(),
-                    metadata_blob: req.metadata,
-                    system_metadata: &system_metadata,
-                    write_encryption,
-                    tags: authorized.tags(),
-                    cond: req.cond,
-                },
-            ) {
-                Ok(prepared) => prepared,
-                Err(err) => {
-                    Self::cleanup_written_shards_locked(shard_pg, &written_shards);
-                    return Err(err);
-                }
-            };
             let owner =
                 Self::effective_put_object_owner(&bucket_info, authorized.requester(), &acl);
             let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &acl);
-
-            let segment_record = ObjectSegmentRecord {
+            let public_read = Self::acl_grants_public_read(&acl_grants);
+            let (system_metadata_blob, encryption) =
+                Self::prepare_stored_system_metadata(&system_metadata, write_encryption)?;
+            let metadata_blob = storage::SerializedMetadataBlob::from(req.metadata.serialize()?);
+            let written_shard_acks: Vec<WrittenShardAck> = written_shards
+                .iter()
+                .map(|written| WrittenShardAck {
+                    key: written.key.clone(),
+                    ack: written.ack,
+                })
+                .collect();
+            let commit_req = CommitDirectPutObjectReq {
                 bucket: authorized.bucket_typed().clone(),
                 key: authorized.key_typed().clone(),
-                version_id: prepared.version_id,
-                segment_index,
-                size: req.data.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(&storage_bytes)),
-                segment_okh,
-                segment_vid,
-                shard_pg_id,
-                ec_k: self.ec_config.data_shards,
-                ec_m: self.ec_config.parity_shards,
-            };
-            let live_req = PutLiveObjectReq {
-                bucket: authorized.bucket_typed().clone(),
-                key: authorized.key_typed().clone(),
-                version_id: prepared.version_id,
+                versioning: bucket_info.versioning,
                 owner,
-                acl_grants: acl_grants.clone(),
-                public_read: Self::acl_grants_public_read(&acl_grants),
-                generation_id: prepared.generation_id,
+                acl_grants,
+                public_read,
                 size: req.data.len() as u64,
-                etag: storage::ObjectEtag::single_part(object_crc64),
+                etag_crc64: object_crc64,
                 ec: EcShape {
                     k: self.ec_config.data_shards,
                     m: self.ec_config.parity_shards,
                 },
                 object_lock: resolved_object_lock,
-                encryption: prepared.encryption.clone(),
-                layout: ObjectLayout::Standard,
-                tags: prepared.tags.clone(),
-                metadata_blob: Some(prepared.metadata_blob.clone()),
-                system_metadata_blob: Some(prepared.system_metadata_blob.clone()),
+                encryption,
+                tags: authorized.tags().map(storage::SerializedTagSet::from),
+                metadata_blob,
+                system_metadata_blob,
+                segment_index,
+                segment_crc64: Some(checksum::crc64::checksum(&storage_bytes)),
+                segment_okh,
+                segment_vid,
+                shard_pg_id,
             };
-
-            if let Err(err) = shard_pg.register_written_shards_batch(&shard_batch) {
-                Self::cleanup_written_shards_locked(shard_pg, &written_shards);
-                return Err(ServerError::Store(err));
-            }
-            if let Err(err) = meta_pg.put_object_with_segments(&live_req, &[segment_record]) {
-                Self::cleanup_written_shards_locked(shard_pg, &written_shards);
-                return Err(ServerError::Metadata(err));
-            }
-            Self::finalize_put_commit_metadata_locked(
-                meta_pg,
-                authorized.bucket_typed(),
-                authorized.key_typed(),
-                prepared.version_id,
-                prepared.stale_payload.as_ref(),
-            )?;
-            let stored = storage::PgMetadataStore::get_object_meta(
-                meta_pg,
-                authorized.bucket_typed(),
-                authorized.key_typed(),
-            )
-            .map_err(ServerError::Metadata)?;
-            let live_record = stored.as_live().ok_or_else(|| ServerError::InternalError {
-                reason: format!(
-                    "stored object {} / {} is not live immediately after PutObject",
-                    authorized.bucket(),
-                    authorized.key()
-                ),
-            })?;
-            let lifecycle_tags = live_record.tags.clone();
-            let lifecycle_size = live_record.size;
-            let lifecycle_last_modified = live_record.last_modified;
-
-            drop(pgs);
+            let outcome = self
+                .storage_node
+                .commit_direct_put_object(&commit_req, &written_shard_acks, |snapshot| {
+                    if matches!(req.cond, crate::conditional::WriteCondition::IfMatch(_))
+                        && snapshot.existing_etag.is_none()
+                    {
+                        return Err(ServerError::ObjectNotFound {
+                            bucket: authorized.bucket().to_string(),
+                            key: authorized.key().to_string(),
+                        });
+                    }
+                    crate::conditional::check_write_conditions(
+                        req.cond,
+                        snapshot.existing_etag.as_deref(),
+                    )?;
+                    Ok(())
+                })
+                .map_err(Coordinator::map_object_pg_action_error)??;
             let lifecycle_expiration = self
                 .current_object_write_lifecycle_expiration_for_loaded_bucket(
                     &bucket_handle,
                     authorized.key(),
-                    lifecycle_tags.as_deref(),
-                    lifecycle_size,
-                    lifecycle_last_modified,
+                    outcome.live_tags.as_deref(),
+                    outcome.live_size,
+                    outcome.live_last_modified,
                 )?;
-            if let Some(ref payload) = prepared.stale_payload {
-                self.delete_stale_object_payload(
+            if let Some(generation_id) = outcome.stale_generation_id {
+                self.read_runtime().enqueue_object_payload_reclaim_for(
                     authorized.bucket_typed(),
                     authorized.key_typed(),
-                    payload,
+                    generation_id,
                 );
             }
 
             Ok(PutObjectResult {
                 etag: format_etag(object_crc64),
-                last_modified: lifecycle_last_modified,
-                version_id: prepared.version_id,
+                last_modified: outcome.live_last_modified,
+                version_id: outcome.version_id,
                 system_metadata,
-                managed_encryption: prepared.encryption.managed_encryption_algorithm(),
+                managed_encryption: outcome.encryption.managed_encryption_algorithm(),
                 lifecycle_expiration,
             })
         })

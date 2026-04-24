@@ -10,7 +10,6 @@ use ec::{EcConfig, ErasureCodec};
 
 use super::authz_types::{AuthorizedPutObjectWrite, ValidatedBucket};
 use super::payload::{EncodeScratchPool, PayloadBufferPool};
-use super::pg_guards::TwoPgGuards;
 use super::read_core::ReadRuntime;
 use super::request_types::AuthorizePutObjectRequest;
 use super::response_types::BucketSummary;
@@ -22,8 +21,10 @@ use crate::error::ServerError;
 use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
 #[cfg(test)]
 use storage::GenerationId;
+#[cfg(test)]
+use storage::ObjectKey;
 use storage::{
-    BucketFastPathInfo, BucketInfo, BucketName, BucketState, ObjectKey, ReclaimWorkItem, SessionId,
+    BucketFastPathInfo, BucketInfo, BucketName, BucketState, ReclaimWorkItem, SessionId,
     SharedStorageNode,
 };
 
@@ -402,6 +403,7 @@ impl Coordinator {
         self.pg_topology.bucket_pg_for(bucket)
     }
 
+    #[cfg(test)]
     pub(super) fn object_pg_id_for(&self, bucket: &BucketName, key: &ObjectKey) -> u32 {
         self.pg_topology.object_pg_for(bucket, key)
     }
@@ -441,17 +443,5 @@ impl Coordinator {
     ) -> Result<MutexGuard<'_, storage::PgStore>, ServerError> {
         let pg_id = self.bucket_pg_id_for(bucket);
         Ok(self.storage_node.get_pg(pg_id)?)
-    }
-
-    pub(super) fn lock_object_pgs_for_write_ids(
-        &self,
-        meta_pg_id: u32,
-        shard_pg_id: u32,
-    ) -> Result<TwoPgGuards<'_>, ServerError> {
-        let (meta_guard, shard_guard) = self
-            .storage_node
-            .lock_two_pgs(meta_pg_id, shard_pg_id)
-            .map_err(ServerError::Store)?;
-        Ok(TwoPgGuards::new(meta_guard, shard_guard))
     }
 }

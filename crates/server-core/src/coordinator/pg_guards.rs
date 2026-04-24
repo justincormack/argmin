@@ -1,5 +1,6 @@
 #![cfg_attr(test, allow(dead_code))]
 
+#[cfg(test)]
 use std::sync::MutexGuard;
 
 #[cfg(test)]
@@ -22,35 +23,6 @@ impl<'a> ObjectPgGuards<'a> {
 
     pub(super) fn meta(&self) -> &storage::PgStore {
         &self.meta
-    }
-}
-
-/// Ordered metadata/shard PG guards for object write publication.
-///
-/// The helper keeps logical meta/shard roles explicit even when both roles map
-/// to the same physical PG.
-pub(super) struct TwoPgGuards<'a> {
-    meta: MutexGuard<'a, storage::PgStore>,
-    shard: Option<MutexGuard<'a, storage::PgStore>>,
-}
-
-impl<'a> TwoPgGuards<'a> {
-    pub(super) fn new(
-        meta: MutexGuard<'a, storage::PgStore>,
-        shard: Option<MutexGuard<'a, storage::PgStore>>,
-    ) -> Self {
-        Self { meta, shard }
-    }
-
-    pub(super) fn meta(&self) -> &storage::PgStore {
-        &self.meta
-    }
-
-    pub(super) fn shard(&self) -> &storage::PgStore {
-        match self.shard.as_ref() {
-            Some(shard) => shard,
-            None => &self.meta,
-        }
     }
 }
 

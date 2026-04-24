@@ -1,3 +1,4 @@
+#[cfg(test)]
 use storage::traits::ShardStore;
 use storage::{
     BucketName, EcShape, GenerationId, ManagedEncryptionAlgorithm, ObjectEncryption, ObjectKey,
@@ -506,6 +507,7 @@ impl Coordinator {
         Ok(written_shards)
     }
 
+    #[cfg(test)]
     pub(super) fn cleanup_written_shards_locked(
         shard_pg: &storage::PgStore,
         written_shards: &[WrittenShard],
@@ -513,19 +515,6 @@ impl Coordinator {
         for written in written_shards {
             let _ = shard_pg.delete_shard(&written.key);
         }
-    }
-
-    pub(super) fn best_effort_delete_written_shards(
-        &self,
-        shard_pg_id: u32,
-        written_shards: &[WrittenShard],
-    ) {
-        let shard_keys: Vec<ShardKey> = written_shards
-            .iter()
-            .map(|written| written.key.clone())
-            .collect();
-        self.storage_node
-            .delete_shards_best_effort(shard_pg_id, &shard_keys);
     }
 
     pub(super) fn append_stream_segment_for(

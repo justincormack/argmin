@@ -1,11 +1,12 @@
 use super::*;
 use crate::{
-    BucketVersioningState, CommitStreamPutReq, EcShape, FinalizeStreamPutOutcome,
-    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
-    ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
+    BucketVersioningState, CommitDirectPutObjectReq, CommitStreamPutReq, DirectPutCommitSnapshot,
+    EcShape, FinalizeDirectPutObjectOutcome, FinalizeStreamPutOutcome, MultipartReclaimPartRecord,
+    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, ObjectEtag, ObjectLayout,
+    ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
     ObjectSegmentsReclaimSegmentRecord, PrepareStreamUploadSegmentAppendReq,
-    PreparedStreamPutCommit, StreamPutFinalizeSnapshot, StreamUploadRecord,
-    StreamUploadSegmentRecord, VersionId,
+    PreparedStreamPutCommit, PutLiveObjectReq, StreamPutFinalizeSnapshot, StreamUploadRecord,
+    StreamUploadSegmentRecord, VersionId, WrittenShardAck,
 };
 
 #[derive(Debug, Clone)]
@@ -22,6 +23,157 @@ enum StaleObjectPayloadMetadata {
 }
 
 impl SharedStorageNode {
+    pub fn commit_direct_put_object<E>(
+        &self,
+        req: &CommitDirectPutObjectReq,
+        written_shards: &[WrittenShardAck],
+        action: impl FnOnce(DirectPutCommitSnapshot) -> Result<(), E>,
+    ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, ObjectPgActionError> {
+        let meta_pg_id = self.pg_topology.object_pg_for(&req.bucket, &req.key);
+        let (meta_pg, shard_pg) = match self.lock_two_pgs(meta_pg_id, req.shard_pg_id) {
+            Ok(guards) => guards,
+            Err(error) => {
+                let shard_keys: Vec<ShardKey> = written_shards
+                    .iter()
+                    .map(|written| written.key.clone())
+                    .collect();
+                self.delete_shards_best_effort(req.shard_pg_id, &shard_keys);
+                return Err(ObjectPgActionError::Store(error));
+            }
+        };
+        let shard_pg = shard_pg.as_deref().unwrap_or(&meta_pg);
+        let shard_keys: Vec<ShardKey> = written_shards
+            .iter()
+            .map(|written| written.key.clone())
+            .collect();
+
+        let existing_etag = match PgMetadataStore::get_object_meta(&*meta_pg, &req.bucket, &req.key)
+        {
+            Ok(stored) => stored.as_live().map(|record| record.etag.format()),
+            Err(crate::error::MetadataError::ObjectNotFound) => None,
+            Err(other) => {
+                Self::cleanup_shards_locked(shard_pg, &shard_keys);
+                return Err(other.into());
+            }
+        };
+
+        if let Err(error) = action(DirectPutCommitSnapshot { existing_etag }) {
+            Self::cleanup_shards_locked(shard_pg, shard_keys.as_slice());
+            return Ok(Err(error));
+        }
+
+        let version_id = if req.versioning == BucketVersioningState::Enabled {
+            match PgMetadataStore::next_version_id(&*meta_pg, &req.bucket, &req.key) {
+                Ok(version_id) => version_id,
+                Err(error) => {
+                    Self::cleanup_shards_locked(shard_pg, shard_keys.as_slice());
+                    return Err(error.into());
+                }
+            }
+        } else {
+            VersionId::Null
+        };
+        let generation_id =
+            match PgMetadataStore::next_generation_id(&*meta_pg, &req.bucket, &req.key) {
+                Ok(generation_id) => generation_id,
+                Err(error) => {
+                    Self::cleanup_shards_locked(shard_pg, shard_keys.as_slice());
+                    return Err(error.into());
+                }
+            };
+        let stale_payload = if version_id.is_null() {
+            match Self::snapshot_overwritten_null_version_payload_from_object_pg(
+                &meta_pg,
+                &req.bucket,
+                &req.key,
+            ) {
+                Ok(stale_payload) => stale_payload,
+                Err(error) => {
+                    Self::cleanup_shards_locked(shard_pg, shard_keys.as_slice());
+                    return Err(error.into());
+                }
+            }
+        } else {
+            None
+        };
+
+        let shard_batch: Vec<(&ShardKey, WriteAck)> = written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect();
+        if let Err(err) = shard_pg.register_written_shards_batch(&shard_batch) {
+            Self::cleanup_shards_locked(shard_pg, shard_keys.as_slice());
+            return Err(err.into());
+        }
+
+        let segment_record = ObjectSegmentRecord {
+            bucket: req.bucket.clone(),
+            key: req.key.clone(),
+            version_id,
+            segment_index: req.segment_index,
+            size: req.size,
+            segment_crc64: req.segment_crc64,
+            segment_okh: req.segment_okh,
+            segment_vid: req.segment_vid,
+            shard_pg_id: req.shard_pg_id,
+            ec_k: req.ec.k,
+            ec_m: req.ec.m,
+        };
+        let live_req = PutLiveObjectReq {
+            bucket: req.bucket.clone(),
+            key: req.key.clone(),
+            version_id,
+            owner: req.owner.clone(),
+            acl_grants: req.acl_grants.clone(),
+            public_read: req.public_read,
+            generation_id,
+            size: req.size,
+            etag: ObjectEtag::single_part(req.etag_crc64),
+            ec: req.ec,
+            layout: ObjectLayout::Standard,
+            tags: req.tags.clone(),
+            metadata_blob: Some(req.metadata_blob.clone()),
+            system_metadata_blob: Some(req.system_metadata_blob.clone()),
+            object_lock: req.object_lock,
+            encryption: req.encryption.clone(),
+        };
+
+        if let Err(err) = meta_pg.put_object_with_segments(&live_req, &[segment_record]) {
+            Self::cleanup_shards_locked(shard_pg, shard_keys.as_slice());
+            return Err(err.into());
+        }
+        Self::finalize_stream_put_stale_payload_metadata(
+            &meta_pg,
+            &req.bucket,
+            &req.key,
+            version_id,
+            stale_payload.as_ref(),
+        )?;
+
+        let stored = PgMetadataStore::get_object_meta(&*meta_pg, &req.bucket, &req.key)?;
+        let live_record = stored
+            .as_live()
+            .ok_or_else(|| crate::error::MetadataError::Db {
+                context: "stored object missing live record after direct put",
+                source: rusqlite::Error::QueryReturnedNoRows,
+            })?;
+
+        Ok(Ok(FinalizeDirectPutObjectOutcome {
+            version_id,
+            encryption: req.encryption.clone(),
+            live_tags: live_record.tags.clone(),
+            live_size: live_record.size,
+            live_last_modified: live_record.last_modified,
+            stale_generation_id: stale_payload
+                .as_ref()
+                .map(|payload| match payload {
+                    StaleObjectPayloadMetadata::Segments { generation_id, .. }
+                    | StaleObjectPayloadMetadata::Multipart { generation_id, .. } => generation_id,
+                })
+                .copied(),
+        }))
+    }
+
     fn validate_stream_upload_session_binding(
         session: &StreamUploadRecord,
         bucket: &BucketName,
