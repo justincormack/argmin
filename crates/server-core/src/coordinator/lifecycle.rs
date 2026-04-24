@@ -24,13 +24,12 @@ pub(super) struct CachedBucketLifecycle {
 impl Coordinator {
     #[cfg(test)]
     pub(super) fn requested_version_is_current_live(
-        meta_pg: &storage::PgStore,
         bucket: &str,
         key: &str,
         requested_version_id: Option<VersionId>,
         resolved_version_id: VersionId,
     ) -> Result<bool, ServerError> {
-        let _ = (meta_pg, bucket, key, resolved_version_id);
+        let _ = (bucket, key, resolved_version_id);
         Ok(requested_version_id.is_none())
     }
 

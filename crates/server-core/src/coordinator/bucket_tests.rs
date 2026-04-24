@@ -1226,20 +1226,11 @@ fn requested_version_is_current_live_requires_implicit_current_request() {
         })
         .unwrap();
 
-    let meta_pg = coord
-        .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
-        .unwrap();
-    assert!(Coordinator::requested_version_is_current_live(
-        &meta_pg,
-        "bucket",
-        "key",
-        None,
-        put.version_id
-    )
-    .unwrap());
+    assert!(
+        Coordinator::requested_version_is_current_live("bucket", "key", None, put.version_id)
+            .unwrap()
+    );
     assert!(!Coordinator::requested_version_is_current_live(
-        &meta_pg,
         "bucket",
         "key",
         Some(put.version_id),
@@ -2483,19 +2474,17 @@ fn lifecycle_sweep_noncurrent_expiration_respects_newer_noncurrent_versions() {
     .unwrap();
 
     let (oldest_became_noncurrent_at, oldest_generation_id, middle_generation_id) = {
-        let meta_pg = coord
+        let oldest_record = coord
             .storage_node
-            .get_pg(coord.object_pg_id("bucket", "key"))
-            .unwrap();
-        let oldest_record = meta_pg
-            .get_object_version(
+            .test_get_object_version(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
                 oldest.version_id,
             )
             .unwrap();
-        let middle_record = meta_pg
-            .get_object_version(
+        let middle_record = coord
+            .storage_node
+            .test_get_object_version(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
                 middle.version_id,
@@ -2521,47 +2510,47 @@ fn lifecycle_sweep_noncurrent_expiration_respects_newer_noncurrent_versions() {
     assert_eq!(stats.expired_current_objects, 0);
     assert_eq!(stats.expired_noncurrent_versions, 1);
 
-    let meta_pg = coord
+    let latest = coord
         .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
-        .unwrap();
-    let latest = meta_pg
-        .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
         .unwrap();
     assert_eq!(latest.version_id(), current.version_id);
     assert!(matches!(
-        meta_pg.get_object_version(
+        coord.storage_node.test_get_object_version(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             oldest.version_id
         ),
-        Err(storage::MetadataError::ObjectNotFound)
+        Err(storage::ObjectPgActionError::Metadata(
+            storage::MetadataError::ObjectNotFound
+        ))
     ));
     assert!(matches!(
-        meta_pg.get_object_version(
+        coord.storage_node.test_get_object_version(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             middle.version_id
         ),
         Ok(StoredObject::Live(_))
     ));
-    assert!(meta_pg
-        .get_object_segments_reclaim(
+    assert!(coord
+        .storage_node
+        .test_get_object_segments_reclaim(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             oldest_generation_id
         )
         .unwrap()
         .is_some());
-    assert!(meta_pg
-        .get_object_segments_reclaim(
+    assert!(coord
+        .storage_node
+        .test_get_object_segments_reclaim(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             middle_generation_id
         )
         .unwrap()
         .is_none());
-    drop(meta_pg);
     drop(lease);
 }
 
@@ -2637,12 +2626,9 @@ fn lifecycle_sweep_skips_object_locked_noncurrent_version() {
     .unwrap();
 
     let became_noncurrent_at = {
-        let meta_pg = coord
+        let stored = coord
             .storage_node
-            .get_pg(coord.object_pg_id("bucket", "key"))
-            .unwrap();
-        let stored = meta_pg
-            .get_object_version(
+            .test_get_object_version(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
                 older.version_id,
@@ -2657,20 +2643,17 @@ fn lifecycle_sweep_skips_object_locked_noncurrent_version() {
     assert_eq!(stats.expired_current_objects, 0);
     assert_eq!(stats.expired_noncurrent_versions, 0);
 
-    let meta_pg = coord
-        .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
-        .unwrap();
     assert!(matches!(
-        meta_pg.get_object_version(
+        coord.storage_node.test_get_object_version(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             older.version_id
         ),
         Ok(StoredObject::Live(_))
     ));
-    let latest = meta_pg
-        .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+    let latest = coord
+        .storage_node
+        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
         .unwrap();
     assert_eq!(latest.version_id(), current.version_id);
 }
@@ -2734,18 +2717,15 @@ fn deleting_current_version_clears_repromoted_version_noncurrent_timestamp_for_l
     )
     .unwrap();
 
-    {
-        let meta_pg = coord
-            .storage_node
-            .get_pg(coord.object_pg_id("bucket", "key"))
-            .unwrap();
-        let sql = format!(
-            "UPDATE objects SET became_noncurrent_at = 1 \
-                 WHERE bucket = 'bucket' AND key = 'key' AND version_id = {}",
-            v1.version_id.to_u64()
-        );
-        meta_pg.connection().execute(&sql, []).unwrap();
-    }
+    coord
+        .storage_node
+        .test_force_became_noncurrent_at(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            v1.version_id,
+            1,
+        )
+        .unwrap();
 
     coord
         .delete_object(&delete_object_request(
@@ -2758,17 +2738,12 @@ fn deleting_current_version_clears_repromoted_version_noncurrent_timestamp_for_l
         ))
         .unwrap();
 
-    {
-        let meta_pg = coord
-            .storage_node
-            .get_pg(coord.object_pg_id("bucket", "key"))
-            .unwrap();
-        let current = meta_pg
-            .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-            .unwrap();
-        assert_eq!(current.version_id(), v1.version_id);
-        assert_eq!(current.as_live().unwrap().became_noncurrent_at, None);
-    }
+    let current = coord
+        .storage_node
+        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+        .unwrap();
+    assert_eq!(current.version_id(), v1.version_id);
+    assert_eq!(current.as_live().unwrap().became_noncurrent_at, None);
 
     test_helpers::put_object(
         &coord,
@@ -2792,12 +2767,8 @@ fn deleting_current_version_clears_repromoted_version_noncurrent_timestamp_for_l
     assert_eq!(stats.expired_current_objects, 0);
     assert_eq!(stats.expired_noncurrent_versions, 0);
 
-    let meta_pg = coord
-        .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
-        .unwrap();
     assert!(matches!(
-        meta_pg.get_object_version(
+        coord.storage_node.test_get_object_version(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             v1.version_id
@@ -2859,12 +2830,9 @@ fn lifecycle_sweep_expires_explicit_expired_object_delete_marker() {
     assert!(delete.delete_marker);
 
     let deadline = {
-        let meta_pg = coord
+        let stored = coord
             .storage_node
-            .get_pg(coord.object_pg_id("bucket", "key"))
-            .unwrap();
-        let stored = meta_pg
-            .get_object_version(
+            .test_get_object_version(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
                 put.version_id,
@@ -2880,15 +2848,14 @@ fn lifecycle_sweep_expires_explicit_expired_object_delete_marker() {
     assert_eq!(stats.expired_delete_markers, 1);
     assert_eq!(stats.aborted_multipart_uploads, 0);
 
-    let meta_pg = coord
-        .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
-        .unwrap();
     assert!(matches!(
-        meta_pg.get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key")),
-        Err(storage::MetadataError::ObjectNotFound)
+        coord
+            .storage_node
+            .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key")),
+        Err(storage::ObjectPgActionError::Metadata(
+            storage::MetadataError::ObjectNotFound
+        ))
     ));
-    drop(meta_pg);
     let versions = coord
         .list_object_versions(&ListObjectVersionsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
@@ -2954,19 +2921,17 @@ fn lifecycle_sweep_expires_delete_marker_after_expiration_days_deadline() {
     assert!(delete.delete_marker);
 
     let (noncurrent_deadline, marker_deadline) = {
-        let meta_pg = coord
+        let noncurrent = coord
             .storage_node
-            .get_pg(coord.object_pg_id("bucket", "key"))
-            .unwrap();
-        let noncurrent = meta_pg
-            .get_object_version(
+            .test_get_object_version(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
                 put.version_id,
             )
             .unwrap();
-        let marker = meta_pg
-            .get_object_version(
+        let marker = coord
+            .storage_node
+            .test_get_object_version(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
                 delete.version_id,
@@ -2986,28 +2951,24 @@ fn lifecycle_sweep_expires_delete_marker_after_expiration_days_deadline() {
     assert_eq!(first_stats.expired_noncurrent_versions, 1);
     assert_eq!(first_stats.expired_delete_markers, 0);
 
-    let meta_pg = coord
+    let current = coord
         .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
-        .unwrap();
-    let current = meta_pg
-        .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
         .unwrap();
     assert!(matches!(current, StoredObject::DeleteMarker(_)));
-    drop(meta_pg);
 
     let second_stats = coord.run_lifecycle_sweep_at(marker_deadline).unwrap();
     assert_eq!(second_stats.expired_noncurrent_versions, 0);
     assert_eq!(second_stats.expired_delete_markers, 1);
     assert_eq!(second_stats.aborted_multipart_uploads, 0);
 
-    let meta_pg = coord
-        .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
-        .unwrap();
     assert!(matches!(
-        meta_pg.get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key")),
-        Err(storage::MetadataError::ObjectNotFound)
+        coord
+            .storage_node
+            .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key")),
+        Err(storage::ObjectPgActionError::Metadata(
+            storage::MetadataError::ObjectNotFound
+        ))
     ));
 }
 

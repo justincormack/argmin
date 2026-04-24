@@ -653,6 +653,34 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_force_became_noncurrent_at(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        became_noncurrent_at: u64,
+    ) -> Result<(), ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        pg.connection()
+            .execute(
+                "UPDATE objects SET became_noncurrent_at = ?1 \
+                 WHERE bucket = ?2 AND key = ?3 AND version_id = ?4",
+                rusqlite::params![
+                    became_noncurrent_at,
+                    bucket.as_str(),
+                    key.as_str(),
+                    version_id.to_u64()
+                ],
+            )
+            .map_err(|source| crate::error::StoreError::Db {
+                context: "force became_noncurrent_at in test helper",
+                source,
+            })?;
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_get_all_multipart_part_segments_for_upload(
         &self,
         bucket: &BucketName,
