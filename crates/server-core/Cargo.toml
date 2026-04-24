@@ -27,4 +27,5 @@ deep-tracing = [
 
 [dev-dependencies]
 proptest = "1"
+storage = { path = "../storage", default-features = false, features = ["test-hooks"] }
 test-util = { path = "../test-util" }

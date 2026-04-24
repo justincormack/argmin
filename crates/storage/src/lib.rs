@@ -37,6 +37,10 @@ pub mod types;
 pub use error::{
     BucketSnapshotLoadError, BucketWriteDrainError, MetadataError, ObjectPgActionError, StoreError,
 };
+#[cfg(feature = "test-hooks")]
+pub use node::{
+    install_bucket_scoped_test_hooks, BucketScopedTestHookGuard, BucketScopedTestHooks,
+};
 pub use node::{
     BucketCreateAttemptOutcome, BucketDeleteFinalizeOutcome, BucketPairPgGuards,
     BucketWriteDrainGuard, LocalStorageNode, ReclaimWorkItem, SharedStorageNode,

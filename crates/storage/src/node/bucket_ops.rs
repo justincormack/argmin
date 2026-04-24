@@ -79,6 +79,7 @@ impl SharedStorageNode {
                     persisted: false,
                 });
             }
+            super::maybe_run_bucket_write_drain_wait_hook(bucket);
             drop(bucket_pg);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }

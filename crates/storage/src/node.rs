@@ -4,6 +4,8 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "test-hooks")]
+use std::sync::{Arc, OnceLock};
 use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
@@ -79,6 +81,79 @@ pub struct BucketWriteDrainGuard<'a> {
     bucket: BucketName,
     persisted: bool,
 }
+
+#[cfg(feature = "test-hooks")]
+#[derive(Default, Clone)]
+pub struct BucketScopedTestHooks {
+    pub target: Option<BucketName>,
+    pub before_bucket_write_drain_wait: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub before_multipart_completion_lock: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub after_multipart_completion_lock: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[cfg(feature = "test-hooks")]
+static BUCKET_SCOPED_TEST_HOOKS: OnceLock<Mutex<BucketScopedTestHooks>> = OnceLock::new();
+
+#[cfg(feature = "test-hooks")]
+pub struct BucketScopedTestHookGuard;
+
+#[cfg(feature = "test-hooks")]
+impl Drop for BucketScopedTestHookGuard {
+    fn drop(&mut self) {
+        let hooks =
+            BUCKET_SCOPED_TEST_HOOKS.get_or_init(|| Mutex::new(BucketScopedTestHooks::default()));
+        *hooks.lock().unwrap() = BucketScopedTestHooks::default();
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+pub fn install_bucket_scoped_test_hooks(hooks: BucketScopedTestHooks) -> BucketScopedTestHookGuard {
+    let slot =
+        BUCKET_SCOPED_TEST_HOOKS.get_or_init(|| Mutex::new(BucketScopedTestHooks::default()));
+    *slot.lock().unwrap() = hooks;
+    BucketScopedTestHookGuard
+}
+
+#[cfg(feature = "test-hooks")]
+fn maybe_run_bucket_scoped_test_hook(
+    bucket: &BucketName,
+    project: impl FnOnce(BucketScopedTestHooks) -> Option<Arc<dyn Fn() + Send + Sync>>,
+) {
+    let hooks = BUCKET_SCOPED_TEST_HOOKS
+        .get_or_init(|| Mutex::new(BucketScopedTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks.target.as_ref().is_some_and(|target| target == bucket) {
+        if let Some(hook) = project(hooks) {
+            hook();
+        }
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+pub(super) fn maybe_run_bucket_write_drain_wait_hook(bucket: &BucketName) {
+    maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.before_bucket_write_drain_wait)
+}
+
+#[cfg(not(feature = "test-hooks"))]
+pub(super) fn maybe_run_bucket_write_drain_wait_hook(_: &BucketName) {}
+
+#[cfg(feature = "test-hooks")]
+pub(super) fn maybe_run_before_multipart_completion_lock_hook(bucket: &BucketName) {
+    maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.before_multipart_completion_lock)
+}
+
+#[cfg(not(feature = "test-hooks"))]
+pub(super) fn maybe_run_before_multipart_completion_lock_hook(_: &BucketName) {}
+
+#[cfg(feature = "test-hooks")]
+pub(super) fn maybe_run_after_multipart_completion_lock_hook(bucket: &BucketName) {
+    maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.after_multipart_completion_lock)
+}
+
+#[cfg(not(feature = "test-hooks"))]
+pub(super) fn maybe_run_after_multipart_completion_lock_hook(_: &BucketName) {}
 
 impl BucketWriteDrainGuard<'_> {
     pub fn persist(mut self) {
@@ -393,10 +468,12 @@ impl SharedStorageNode {
         );
         let idx = self.bucket_lock_index(bucket);
         let trace = observability::current_context();
+        maybe_run_before_multipart_completion_lock_hook(bucket);
         let wait_started_at = Instant::now();
         let guard = self.multipart_completion_locks[idx]
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        maybe_run_after_multipart_completion_lock_hook(bucket);
         let wait_us = wait_started_at.elapsed().as_micros();
         if wait_us >= LOCK_WAIT_EVENT_THRESHOLD_US {
             if let Some(trace) = &trace {

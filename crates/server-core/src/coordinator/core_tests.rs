@@ -6,9 +6,12 @@ use crate::coordinator::bucket_handles::BucketHandleRequest;
 use crate::sse::SSE_CUSTOMER_ALGORITHM;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
+use storage::{install_bucket_scoped_test_hooks, BucketScopedTestHooks};
+
+static STORAGE_TEST_HOOK_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[test]
 fn lock_mutex_unpoisoned_recovers_after_panic() {
@@ -1310,9 +1313,21 @@ fn delete_bucket_waits_for_bucket_write_handle_action() {
         })
         .unwrap();
 
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
+    let (drain_wait_tx, drain_wait_rx) = mpsc::channel();
     let (delete_tx, delete_rx) = mpsc::channel();
+    let _hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
+        target: Some(trusted_bucket_name("bucket")),
+        before_bucket_write_drain_wait: Some(Arc::new(move || {
+            let _ = drain_wait_tx.send(());
+        })),
+        ..BucketScopedTestHooks::default()
+    });
 
     let write_coord = Arc::clone(&coord);
     let write_request = object_request("bucket", "key", requester.clone());
@@ -1328,7 +1343,7 @@ fn delete_bucket_waits_for_bucket_write_handle_action() {
         )
     });
 
-    started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    started_rx.recv().unwrap();
 
     let delete_coord = Arc::clone(&coord);
     let delete_request = BucketRequest {
@@ -1341,16 +1356,17 @@ fn delete_bucket_waits_for_bucket_write_handle_action() {
         delete_tx.send(result).unwrap();
     });
 
-    assert!(delete_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    drain_wait_rx.recv().unwrap();
+    assert!(matches!(
+        delete_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
 
     release_tx.send(()).unwrap();
 
     write_thread.join().unwrap().unwrap();
     delete_thread.join().unwrap();
-    delete_rx
-        .recv_timeout(Duration::from_secs(1))
-        .unwrap()
-        .unwrap();
+    delete_rx.recv().unwrap().unwrap();
 }
 
 #[test]
@@ -1729,7 +1745,24 @@ fn complete_multipart_upload_waits_for_multipart_completion_lock() {
 
     let (upload_id, parts) = create_upload_with_parts(&admin, "bucket", "key", &[(1, b"part")]);
 
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let reached_before_lock = Arc::new(Barrier::new(2));
+    let reached_before_lock_hook = Arc::clone(&reached_before_lock);
+    let (acquired_lock_tx, acquired_lock_rx) = mpsc::channel();
     let guard = storage_node.lock_multipart_completion_bucket(&trusted_bucket_name("bucket"));
+    let _hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
+        target: Some(trusted_bucket_name("bucket")),
+        before_multipart_completion_lock: Some(Arc::new(move || {
+            reached_before_lock_hook.wait();
+        })),
+        after_multipart_completion_lock: Some(Arc::new(move || {
+            let _ = acquired_lock_tx.send(());
+        })),
+        ..BucketScopedTestHooks::default()
+    });
     let (tx, rx) = mpsc::channel();
     let handle = thread::spawn(move || {
         let res = completer.complete_multipart_upload(&CompleteMultipartUploadRequest {
@@ -1749,15 +1782,15 @@ fn complete_multipart_upload_waits_for_multipart_completion_lock() {
         tx.send(res).unwrap();
     });
 
-    assert!(
-        matches!(
-            rx.recv_timeout(Duration::from_millis(200)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ),
-        "complete_multipart_upload should wait for multipart completion lock"
-    );
+    reached_before_lock.wait();
+    assert!(matches!(
+        acquired_lock_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
     drop(guard);
-    let res = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    acquired_lock_rx.recv().unwrap();
+    let res = rx.recv().unwrap();
     assert!(
         res.is_ok(),
         "complete_multipart_upload should succeed after multipart completion lock is released: {res:?}"
