@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
+#[cfg(test)]
+use s3_types::StoredLegalHoldStatus;
 use s3_types::{
     aws_account_id_from_principal, AclGrant, AclGrantee, AclGrants, AclPermission,
     BucketVersioningState, CanonicalUserId, LifecycleConfigError, VersionId,
 };
-#[cfg(test)]
-use s3_types::StoredLegalHoldStatus;
 use storage::{
     BucketName, BucketObjectLockConfig, BucketObjectOwnership, BucketOwnershipControls,
     BucketState, ManagedEncryptionAlgorithm, MultipartUploadRecord, ObjectKey,
@@ -24,11 +24,11 @@ use super::authz_results::{
     AuthorizedGetBucketPolicyStatus, AuthorizedGetBucketPublicAccessBlock,
     AuthorizedGetBucketVersioning, AuthorizedHeadBucket, AuthorizedListBuckets,
     AuthorizedListMultipartUploads, AuthorizedListObjectVersions, AuthorizedListObjectsV2,
-    AuthorizedMultipartPartWrite, AuthorizedObjectRead,
-    AuthorizedPutBucketAbac, AuthorizedPutBucketAcl, AuthorizedPutBucketEncryption,
-    AuthorizedPutBucketLifecycle, AuthorizedPutBucketObjectLockConfiguration,
-    AuthorizedPutBucketOwnershipControls, AuthorizedPutBucketPolicy,
-    AuthorizedPutBucketPublicAccessBlock, AuthorizedPutBucketVersioning, AuthorizedUploadPartCopy,
+    AuthorizedMultipartPartWrite, AuthorizedObjectRead, AuthorizedPutBucketAbac,
+    AuthorizedPutBucketAcl, AuthorizedPutBucketEncryption, AuthorizedPutBucketLifecycle,
+    AuthorizedPutBucketObjectLockConfiguration, AuthorizedPutBucketOwnershipControls,
+    AuthorizedPutBucketPolicy, AuthorizedPutBucketPublicAccessBlock, AuthorizedPutBucketVersioning,
+    AuthorizedUploadPartCopy,
 };
 #[cfg(test)]
 use super::authz_results::{
@@ -37,11 +37,11 @@ use super::authz_results::{
     AuthorizedPutObjectRetention, LoadedObjectState,
 };
 use super::authz_types::{AuthorizedPutObjectWrite, AuthorizedPutObjectWriteAcl, ValidatedBucket};
+#[cfg(test)]
+use super::bucket_handles::LoadedObjectHandle;
 use super::bucket_handles::{
     BucketHandleLoader, BucketHandleRequest, LoadedBucketHandle, LoadedBucketValue,
 };
-#[cfg(test)]
-use super::bucket_handles::LoadedObjectHandle;
 #[cfg(test)]
 use super::pg_guards::LockedReadObject;
 #[cfg(test)]
@@ -57,17 +57,17 @@ use super::request_types::{
     ObjectVersionRequest, PutBucketAbacRequest, PutBucketAclInput, PutBucketAclRequest,
     PutBucketConfigRequest, PutBucketEncryptionRequest, PutBucketObjectLockConfigurationRequest,
     PutBucketOwnershipControlsRequest, PutBucketPolicyRequest, PutBucketPublicAccessBlockRequest,
-    PutBucketVersioningRequest, PutObjectAcl, PutObjectPolicyContext, PutObjectWriteAcl,
-    Requester, TaggingDirective, UploadPartCopyRequest,
+    PutBucketVersioningRequest, PutObjectAcl, PutObjectPolicyContext, PutObjectWriteAcl, Requester,
+    TaggingDirective, UploadPartCopyRequest,
 };
 #[cfg(test)]
 use super::request_types::{
-    PutObjectAclInput, PutObjectAclRequest, PutObjectLegalHoldRequest,
-    PutObjectRetentionRequest, PutObjectTagsRequest,
+    PutObjectAclInput, PutObjectAclRequest, PutObjectLegalHoldRequest, PutObjectRetentionRequest,
+    PutObjectTagsRequest,
 };
-use super::response_types::{BucketSummary, GetBucketAclResult};
 #[cfg(test)]
 use super::response_types::GetObjectAclResult;
+use super::response_types::{BucketSummary, GetBucketAclResult};
 use super::{read_rwlock_unpoisoned, write_rwlock_unpoisoned, Coordinator};
 use crate::error::ServerError;
 use crate::sse::{SseCustomerRequest, SseCustomerSegmentScope};

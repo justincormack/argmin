@@ -24,7 +24,8 @@ impl Coordinator {
         bucket: &BucketName,
         expected_bucket_owner: Option<&str>,
     ) -> Result<ObjectMetadataPolicyContext, ServerError> {
-        let bucket = self.load_bucket_handle_for_object_policy_read(bucket, expected_bucket_owner)?;
+        let bucket =
+            self.load_bucket_handle_for_object_policy_read(bucket, expected_bucket_owner)?;
         let bucket_info = bucket.bucket().clone();
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
         let bucket_tags = if bucket_policy.is_some() {
@@ -337,35 +338,41 @@ impl Coordinator {
         let can_discover_missing =
             Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
         self.storage_node
-            .put_object_retention_if(bucket, key, req.object.version_id, req.retention, |stored| {
-                if !self.requester_can_manage_object_lock_with_bucket_policy(
-                    req.object.requester(),
-                    &bucket_info,
-                    bucket_tags.as_deref(),
-                    stored,
-                    auth::PolicyAction::PutObjectRetention,
-                    bucket_policy.as_deref(),
-                )? {
-                    return Err(ServerError::AccessDenied);
-                }
-                Self::ensure_object_lock_bucket(&bucket_info)?;
-                let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
-                let can_bypass_governance = self
-                    .requester_can_bypass_governance_retention_with_bucket_policy(
+            .put_object_retention_if(
+                bucket,
+                key,
+                req.object.version_id,
+                req.retention,
+                |stored| {
+                    if !self.requester_can_manage_object_lock_with_bucket_policy(
                         req.object.requester(),
                         &bucket_info,
                         bucket_tags.as_deref(),
                         stored,
+                        auth::PolicyAction::PutObjectRetention,
                         bucket_policy.as_deref(),
+                    )? {
+                        return Err(ServerError::AccessDenied);
+                    }
+                    Self::ensure_object_lock_bucket(&bucket_info)?;
+                    let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+                    let can_bypass_governance = self
+                        .requester_can_bypass_governance_retention_with_bucket_policy(
+                            req.object.requester(),
+                            &bucket_info,
+                            bucket_tags.as_deref(),
+                            stored,
+                            bucket_policy.as_deref(),
+                        )?;
+                    Self::validate_retention_update(
+                        live.object_lock.retention,
+                        req.retention,
+                        req.bypass_governance,
+                        can_bypass_governance,
                     )?;
-                Self::validate_retention_update(
-                    live.object_lock.retention,
-                    req.retention,
-                    req.bypass_governance,
-                    can_bypass_governance,
-                )?;
-                Ok(live.version_id)
-            })
+                    Ok(live.version_id)
+                },
+            )
             .map_err(|error| {
                 Self::map_object_metadata_access_error(
                     bucket,
@@ -659,27 +666,26 @@ impl Coordinator {
                     return Err(ServerError::AccessDenied);
                 }
                 let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
-                let result = if Self::is_bucket_owner_enforced(
-                    bucket_info.ownership_controls.as_ref(),
-                ) {
-                    let owner = Self::bucket_owner_identity(&bucket_info);
-                    GetObjectAclResult {
-                        owner_principal: owner.principal,
-                        owner_canonical_id: owner.canonical_id.clone(),
-                        acl_grants: AclGrants::new(vec![s3_types::AclGrant::new(
-                            s3_types::AclGrantee::CanonicalUser(owner.canonical_id),
-                            s3_types::AclPermission::FullControl,
-                        )]),
-                        version_id: live.version_id,
-                    }
-                } else {
-                    GetObjectAclResult {
-                        owner_principal: live.owner.principal.clone(),
-                        owner_canonical_id: live.owner.canonical_id.clone(),
-                        acl_grants: live.acl_grants.clone(),
-                        version_id: live.version_id,
-                    }
-                };
+                let result =
+                    if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_ref()) {
+                        let owner = Self::bucket_owner_identity(&bucket_info);
+                        GetObjectAclResult {
+                            owner_principal: owner.principal,
+                            owner_canonical_id: owner.canonical_id.clone(),
+                            acl_grants: AclGrants::new(vec![s3_types::AclGrant::new(
+                                s3_types::AclGrantee::CanonicalUser(owner.canonical_id),
+                                s3_types::AclPermission::FullControl,
+                            )]),
+                            version_id: live.version_id,
+                        }
+                    } else {
+                        GetObjectAclResult {
+                            owner_principal: live.owner.principal.clone(),
+                            owner_canonical_id: live.owner.canonical_id.clone(),
+                            acl_grants: live.acl_grants.clone(),
+                            version_id: live.version_id,
+                        }
+                    };
                 Ok(result)
             })
             .map_err(|error| {

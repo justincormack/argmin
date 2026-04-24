@@ -6,16 +6,15 @@ use auth::BucketPolicy;
 use checksum::MultipartChecksumConfig;
 
 use super::authz_types::{ActiveWriteEncryption, AuthorizedPutObjectWrite, ValidatedBucket};
-use super::request_types::{CreateBucketAcl, Requester};
-use super::response_types::{BucketSummary, GetBucketAclResult};
 #[cfg(test)]
 use super::pg_guards::{LockedReadObject, ObjectPgGuards};
+use super::request_types::{CreateBucketAcl, Requester};
 #[cfg(test)]
 use super::response_types::GetObjectAclResult;
+use super::response_types::{BucketSummary, GetBucketAclResult};
 use crate::sse::SseCustomerWriteContext;
 use s3_types::{
-    AclGrants, BucketLifecycleConfiguration, BucketVersioningState, CanonicalUserId,
-    VersionId,
+    AclGrants, BucketLifecycleConfiguration, BucketVersioningState, CanonicalUserId, VersionId,
 };
 #[cfg(test)]
 use s3_types::{LegalHoldStatus, ObjectRetention, StoredLegalHoldStatus};

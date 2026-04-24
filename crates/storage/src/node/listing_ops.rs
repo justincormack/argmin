@@ -40,7 +40,9 @@ impl VersionCursor {
 }
 
 impl SharedStorageNode {
-    pub fn list_lifecycle_sweep_buckets(&self) -> Result<LifecycleSweepBuckets, ObjectPgActionError> {
+    pub fn list_lifecycle_sweep_buckets(
+        &self,
+    ) -> Result<LifecycleSweepBuckets, ObjectPgActionError> {
         let mut lifecycle_buckets = Vec::new();
         let mut aborting_buckets = Vec::new();
         self.pg_topology.for_each_pg(|pg_id| {
@@ -140,7 +142,9 @@ impl SharedStorageNode {
         while let Some((cursor_index, _)) = cursors
             .iter()
             .enumerate()
-            .filter_map(|(cursor_index, cursor)| cursor.current().map(|version| (cursor_index, version)))
+            .filter_map(|(cursor_index, cursor)| {
+                cursor.current().map(|version| (cursor_index, version))
+            })
             .min_by(|(left_index, left), (right_index, right)| {
                 left.key()
                     .cmp(right.key())

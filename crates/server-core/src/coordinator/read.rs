@@ -409,19 +409,18 @@ impl Coordinator {
         let version_id = req.object.version_id;
         let part_number = req.part_number;
         let cond = req.cond;
-        let AuthorizedObjectRead { snapshot } = self.authorize_head_object_for_part(
-            &GetObjectRequest {
-            object: ObjectVersionRequest::new(
-                req.object.bucket_name_typed().clone(),
-                req.object.key_typed().clone(),
-                req.object.version_id,
-                req.object.requester().clone(),
-                req.expected_bucket_owner(),
-            ),
-            cond: req.cond,
-            sse_customer: req.sse_customer,
-        },
-        )?;
+        let AuthorizedObjectRead { snapshot } =
+            self.authorize_head_object_for_part(&GetObjectRequest {
+                object: ObjectVersionRequest::new(
+                    req.object.bucket_name_typed().clone(),
+                    req.object.key_typed().clone(),
+                    req.object.version_id,
+                    req.object.requester().clone(),
+                    req.expected_bucket_owner(),
+                ),
+                cond: req.cond,
+                sse_customer: req.sse_customer,
+            })?;
         let storage::ObjectReadSnapshot {
             stored,
             object_segments: _,

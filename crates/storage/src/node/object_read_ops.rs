@@ -105,12 +105,18 @@ impl SharedStorageNode {
                 (ObjectLayout::Standard, ObjectReadSnapshotMode::MultipartParts) => {
                     (Vec::new(), Vec::new(), Vec::new())
                 }
-                (ObjectLayout::MultipartManifest { .. }, ObjectReadSnapshotMode::MultipartParts) => (
+                (
+                    ObjectLayout::MultipartManifest { .. },
+                    ObjectReadSnapshotMode::MultipartParts,
+                ) => (
                     Vec::new(),
                     PgMetadataStore::get_object_parts(pg, bucket, key, record.version_id)?,
                     Vec::new(),
                 ),
-                (ObjectLayout::MultipartManifest { .. }, ObjectReadSnapshotMode::FullPayloadLayout) => {
+                (
+                    ObjectLayout::MultipartManifest { .. },
+                    ObjectReadSnapshotMode::FullPayloadLayout,
+                ) => {
                     let multipart_parts =
                         PgMetadataStore::get_object_parts(pg, bucket, key, record.version_id)?;
                     let mut multipart_part_segments = Vec::new();
@@ -129,9 +135,10 @@ impl SharedStorageNode {
                     }
                     (Vec::new(), multipart_parts, multipart_part_segments)
                 }
-                (ObjectLayout::MultipartManifest { .. }, ObjectReadSnapshotMode::StandardSegments) => {
-                    (Vec::new(), Vec::new(), Vec::new())
-                }
+                (
+                    ObjectLayout::MultipartManifest { .. },
+                    ObjectReadSnapshotMode::StandardSegments,
+                ) => (Vec::new(), Vec::new(), Vec::new()),
             },
         };
 
