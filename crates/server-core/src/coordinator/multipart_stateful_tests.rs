@@ -8,8 +8,8 @@ use ec::EcConfig;
 use std::path::Path;
 use std::sync::{Arc, Barrier, MutexGuard};
 use storage::{
-    MultipartPartSegmentRecord, MultipartUploadRecord, PayloadReclaimRoot, PgMetadataStore,
-    StreamUploadRecord, StreamUploadSegmentRecord,
+    MultipartPartSegmentRecord, MultipartUploadRecord, PayloadReclaimRoot, StreamUploadRecord,
+    StreamUploadSegmentRecord,
 };
 
 const NO_READ: &ReadCondition = &ReadCondition {
@@ -231,16 +231,10 @@ impl<'a> InvariantHarness<'a> {
     }
 
     fn active_stream_sessions(&self) -> Vec<StreamUploadRecord> {
-        let mut sessions = Vec::new();
         self.coord
-            .pg_topology
-            .for_each_pg(|pg_id| {
-                let pg = self.coord.storage_node.get_pg(pg_id)?;
-                sessions.extend(pg.list_all_stream_uploads()?);
-                Ok::<(), ServerError>(())
-            })
-            .unwrap();
-        sessions
+            .storage_node
+            .test_list_all_stream_uploads()
+            .unwrap()
     }
 
     fn active_stream_sessions_for(&self, bucket: &str, key: &str) -> Vec<StreamUploadRecord> {
@@ -255,49 +249,25 @@ impl<'a> InvariantHarness<'a> {
     fn pending_multipart_uploads_for(&self, bucket: &str, key: &str) -> Vec<MultipartUploadRecord> {
         let bucket_name = trusted_bucket_name(bucket);
         let key_name = trusted_object_key(key);
-        let mut uploads = Vec::new();
         self.coord
-            .pg_topology
-            .for_each_pg(|pg_id| {
-                let pg = self.coord.storage_node.get_pg(pg_id)?;
-                let listed = pg.list_multipart_uploads(&storage::ListMultipartUploadsReq {
-                    bucket: bucket_name.clone(),
-                    prefix: None,
-                    key_marker: None,
-                    upload_id_marker: None,
-                    max_uploads: u32::MAX,
-                })?;
-                uploads.extend(
-                    listed
-                        .uploads
-                        .into_iter()
-                        .filter(|upload| upload.key == key_name),
-                );
-                Ok::<(), ServerError>(())
-            })
-            .unwrap();
-        uploads
+            .storage_node
+            .test_list_multipart_uploads_for_bucket(&bucket_name)
+            .unwrap()
+            .into_iter()
+            .filter(|upload| upload.key == key_name)
+            .collect()
     }
 
     fn pending_reclaim_roots_for(&self, bucket: &str, key: &str) -> Vec<PayloadReclaimRoot> {
         let bucket_name = trusted_bucket_name(bucket);
         let key_name = trusted_object_key(key);
-        let mut roots = Vec::new();
         self.coord
-            .pg_topology
-            .for_each_pg(|pg_id| {
-                let pg = self.coord.storage_node.get_pg(pg_id)?;
-                if let Some(root) =
-                    PgMetadataStore::get_bucket_payload_reclaim_root(&*pg, &bucket_name)?
-                {
-                    if root.key == key_name {
-                        roots.push(root);
-                    }
-                }
-                Ok::<(), ServerError>(())
-            })
-            .unwrap();
-        roots
+            .storage_node
+            .test_list_bucket_payload_reclaim_roots(&bucket_name)
+            .unwrap()
+            .into_iter()
+            .filter(|root| root.key == key_name)
+            .collect()
     }
 
     fn multipart_part_segments(
@@ -306,10 +276,13 @@ impl<'a> InvariantHarness<'a> {
         key: &str,
         upload_id: &UploadId,
     ) -> Vec<MultipartPartSegmentRecord> {
-        let meta_pg_id = self.coord.object_pg_id(bucket, key);
-        let meta_pg = self.coord.storage_node.get_pg(meta_pg_id).unwrap();
-        meta_pg
-            .get_all_multipart_part_segments_for_upload(upload_id)
+        self.coord
+            .storage_node
+            .test_get_all_multipart_part_segments_for_upload(
+                &trusted_bucket_name(bucket),
+                &trusted_object_key(key),
+                upload_id,
+            )
             .unwrap()
     }
 
@@ -319,9 +292,14 @@ impl<'a> InvariantHarness<'a> {
         key: &str,
         upload_id: &UploadId,
     ) -> MultipartUploadRecord {
-        let meta_pg_id = self.coord.object_pg_id(bucket, key);
-        let meta_pg = self.coord.storage_node.get_pg(meta_pg_id).unwrap();
-        meta_pg.get_multipart_upload(upload_id).unwrap()
+        self.coord
+            .storage_node
+            .test_get_multipart_upload(
+                &trusted_bucket_name(bucket),
+                &trusted_object_key(key),
+                upload_id,
+            )
+            .unwrap()
     }
 
     fn stream_segments(
@@ -330,9 +308,14 @@ impl<'a> InvariantHarness<'a> {
         key: &str,
         session_id: &SessionId,
     ) -> Vec<StreamUploadSegmentRecord> {
-        let meta_pg_id = self.coord.object_pg_id(bucket, key);
-        let meta_pg = self.coord.storage_node.get_pg(meta_pg_id).unwrap();
-        meta_pg.list_stream_segments(session_id).unwrap()
+        self.coord
+            .storage_node
+            .test_list_stream_segments(
+                &trusted_bucket_name(bucket),
+                &trusted_object_key(key),
+                session_id,
+            )
+            .unwrap()
     }
 
     fn force_stream_session_created_at(
@@ -342,13 +325,13 @@ impl<'a> InvariantHarness<'a> {
         session_id: &SessionId,
         created_at: u64,
     ) {
-        let meta_pg_id = self.coord.object_pg_id(bucket, key);
-        let meta_pg = self.coord.storage_node.get_pg(meta_pg_id).unwrap();
-        meta_pg
-            .connection()
-            .execute(
-                "UPDATE stream_uploads SET created_at = ?1 WHERE session_id = ?2",
-                (created_at as i64, session_id.as_str()),
+        self.coord
+            .storage_node
+            .test_force_stream_upload_created_at(
+                &trusted_bucket_name(bucket),
+                &trusted_object_key(key),
+                session_id,
+                created_at,
             )
             .unwrap();
     }
@@ -385,12 +368,14 @@ fn assert_segment_shards_exist(
     phase: &str,
 ) {
     for segment in segments {
-        let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
         let total_shards = usize::from(segment.ec_k) + usize::from(segment.ec_m);
         for i in 0..total_shards {
             let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
             assert!(
-                shard_pg.read_shard(&shard_key).is_ok(),
+                coord
+                    .storage_node
+                    .test_shard_exists(segment.shard_pg_id, &shard_key)
+                    .unwrap(),
                 "{invariant}: shard {i} should exist {phase}"
             );
         }
@@ -404,12 +389,14 @@ fn assert_segment_shards_deleted(
     phase: &str,
 ) {
     for segment in segments {
-        let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
         let total_shards = usize::from(segment.ec_k) + usize::from(segment.ec_m);
         for i in 0..total_shards {
             let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
             assert!(
-                shard_pg.read_shard(&shard_key).is_err(),
+                !coord
+                    .storage_node
+                    .test_shard_exists(segment.shard_pg_id, &shard_key)
+                    .unwrap(),
                 "{invariant}: shard {i} should be deleted {phase}"
             );
         }
@@ -489,7 +476,9 @@ fn begin_stream_put_with_segment_path(
     for suffix in 0..256 {
         let key = format!("{key_prefix}-{suffix}");
         let session_id = begin_stream_put_test(coord, bucket, &key).unwrap();
-        let meta_pg_id = coord.object_pg_id(bucket, &key);
+        let meta_pg_id = coord
+            .storage_node
+            .test_object_pg_id_for(&trusted_bucket_name(bucket), &trusted_object_key(&key));
         let first_vid_pg =
             coord.shard_pg_id_raw(&format!("segment/{}", session_id.as_str()), "0", 1);
         let second_vid_pg =
@@ -522,7 +511,9 @@ fn run_stream_duplicate_segment_race_invariant_test(pg_count: u32, require_cross
 
     let (key, session_id) =
         begin_stream_put_with_segment_path(&admin, "bucket", "stream-race", require_cross_pg);
-    let meta_pg_id = admin.object_pg_id("bucket", &key);
+    let meta_pg_id = admin
+        .storage_node
+        .test_object_pg_id_for(&trusted_bucket_name("bucket"), &trusted_object_key(&key));
     let first_vid_pg = admin.shard_pg_id_raw(&format!("segment/{}", session_id.as_str()), "0", 1);
     let second_vid_pg = admin.shard_pg_id_raw(&format!("segment/{}", session_id.as_str()), "0", 2);
     if require_cross_pg {
@@ -567,8 +558,10 @@ fn run_stream_duplicate_segment_race_invariant_test(pg_count: u32, require_cross
         ),
     };
 
-    let meta_pg = admin.storage_node.get_pg(meta_pg_id).unwrap();
-    let staged = meta_pg.list_stream_segments(&session_id).unwrap();
+    let staged = admin
+        .storage_node
+        .test_list_stream_segments(&trusted_bucket_name("bucket"), &trusted_object_key(&key), &session_id)
+        .unwrap();
     assert_eq!(
         staged.len(),
         1,
@@ -583,8 +576,6 @@ fn run_stream_duplicate_segment_race_invariant_test(pg_count: u32, require_cross
             || staged[0].segment_vid == GenerationId::new(2).unwrap(),
         "{invariant}: expected the winner to retain one prepared payload generation"
     );
-    drop(meta_pg);
-
     admin
         .finalize_stream_put(&FinalizeStreamPutRequest {
             object: object_request("bucket", &key, test_requester()),
@@ -668,12 +659,14 @@ fn streamed_part_reupload_replaces_displaced_shards_without_orphans() {
         "{invariant}: expected exactly one committed segment set before reupload"
     );
     for segment in &segments_before {
-        let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
         let total_shards = usize::from(segment.ec_k) + usize::from(segment.ec_m);
         for i in 0..total_shards {
             let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
             assert!(
-                shard_pg.read_shard(&shard_key).is_ok(),
+                coord
+                    .storage_node
+                    .test_shard_exists(segment.shard_pg_id, &shard_key)
+                    .unwrap(),
                 "{invariant}: displaced shard {i} should exist before the reupload commits"
             );
         }
@@ -711,23 +704,27 @@ fn streamed_part_reupload_replaces_displaced_shards_without_orphans() {
     );
 
     for segment in &segments_before {
-        let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
         let total_shards = usize::from(segment.ec_k) + usize::from(segment.ec_m);
         for i in 0..total_shards {
             let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
             assert!(
-                shard_pg.read_shard(&shard_key).is_err(),
+                !coord
+                    .storage_node
+                    .test_shard_exists(segment.shard_pg_id, &shard_key)
+                    .unwrap(),
                 "{invariant}: displaced shard {i} should be deleted after the reupload commits"
             );
         }
     }
     for segment in &segments_after {
-        let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
         let total_shards = usize::from(segment.ec_k) + usize::from(segment.ec_m);
         for i in 0..total_shards {
             let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
             assert!(
-                shard_pg.read_shard(&shard_key).is_ok(),
+                coord
+                    .storage_node
+                    .test_shard_exists(segment.shard_pg_id, &shard_key)
+                    .unwrap(),
                 "{invariant}: current shard {i} should remain after reupload"
             );
         }
@@ -786,12 +783,14 @@ fn aborting_streamed_multipart_upload_cleans_committed_segments_and_shards() {
         "{invariant}: expected committed multipart segments before abort"
     );
     for segment in &segments_before {
-        let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
         let total_shards = usize::from(segment.ec_k) + usize::from(segment.ec_m);
         for i in 0..total_shards {
             let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
             assert!(
-                shard_pg.read_shard(&shard_key).is_ok(),
+                coord
+                    .storage_node
+                    .test_shard_exists(segment.shard_pg_id, &shard_key)
+                    .unwrap(),
                 "{invariant}: shard {i} should exist before abort"
             );
         }
@@ -816,12 +815,14 @@ fn aborting_streamed_multipart_upload_cleans_committed_segments_and_shards() {
     state.assert_no_active_stream_sessions_for("bucket", "key", invariant);
 
     for segment in &segments_before {
-        let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
         let total_shards = usize::from(segment.ec_k) + usize::from(segment.ec_m);
         for i in 0..total_shards {
             let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
             assert!(
-                shard_pg.read_shard(&shard_key).is_err(),
+                !coord
+                    .storage_node
+                    .test_shard_exists(segment.shard_pg_id, &shard_key)
+                    .unwrap(),
                 "{invariant}: shard {i} should be deleted after abort"
             );
         }
@@ -1003,11 +1004,15 @@ fn aborting_multipart_upload_rejects_late_list_parts_without_state_loss() {
     )
     .unwrap();
 
-    let meta_pg_id = coord.object_pg_id("bucket", "key");
-    let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-    pg.set_upload_state(&create.upload_id, UploadState::Aborting)
+    coord
+        .storage_node
+        .test_set_upload_state(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &create.upload_id,
+            UploadState::Aborting,
+        )
         .unwrap();
-    drop(pg);
 
     let err = coord
         .list_parts(&ListPartsRequest {
@@ -1042,11 +1047,15 @@ fn completing_multipart_upload_rejects_late_abort_without_state_loss() {
 
     let create = create_basic_multipart_upload(&coord, "bucket", "key");
 
-    let meta_pg_id = coord.object_pg_id("bucket", "key");
-    let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-    pg.set_upload_state(&create.upload_id, UploadState::Completing)
+    coord
+        .storage_node
+        .test_set_upload_state(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &create.upload_id,
+            UploadState::Completing,
+        )
         .unwrap();
-    drop(pg);
 
     let err = coord
         .abort_multipart_upload(&multipart_object_request(
@@ -1357,18 +1366,19 @@ fn final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists() {
     let generation_id = GenerationId::new(1).unwrap();
 
     {
-        let meta_pg = runtime
+        runtime
             .storage_node
-            .get_pg(runtime.pg_topology.object_pg("bucket", "key"))
-            .unwrap();
-        meta_pg
-            .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
-                bucket: trusted_bucket_name("bucket"),
-                key: trusted_object_key("key"),
-                generation_id,
-                ec: EcShape { k: 4, m: 2 },
-                created_at: 1,
-            })
+            .test_put_simple_payload_reclaim(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                &SimplePayloadReclaimRecord {
+                    bucket: trusted_bucket_name("bucket"),
+                    key: trusted_object_key("key"),
+                    generation_id,
+                    ec: EcShape { k: 4, m: 2 },
+                    created_at: 1,
+                },
+            )
             .unwrap();
     }
 
@@ -1394,21 +1404,17 @@ fn final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists() {
     runtime
         .try_reclaim_object_payload("bucket", "key", generation_id)
         .unwrap();
-    let meta_pg = runtime
-        .storage_node
-        .get_pg(runtime.pg_topology.object_pg("bucket", "key"))
-        .unwrap();
     assert!(
-        meta_pg
-            .payload_reclaim_exists(
+        runtime
+            .storage_node
+            .test_payload_reclaim_exists(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
-                generation_id
+                generation_id,
             )
             .unwrap(),
         "{invariant}: lease-gated reclaim retry should leave durable reclaim metadata in place"
     );
-    drop(meta_pg);
 
     drop(lease);
 
@@ -1432,16 +1438,13 @@ fn final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists() {
     runtime
         .try_reclaim_object_payload("bucket", "key", generation_id)
         .unwrap();
-    let meta_pg = runtime
-        .storage_node
-        .get_pg(runtime.pg_topology.object_pg("bucket", "key"))
-        .unwrap();
     assert!(
-        !meta_pg
-            .payload_reclaim_exists(
+        !runtime
+            .storage_node
+            .test_payload_reclaim_exists(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
-                generation_id
+                generation_id,
             )
             .unwrap(),
         "{invariant}: successful reclaim after the final lease drop should clear durable reclaim metadata"

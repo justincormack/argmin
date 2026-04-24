@@ -23,14 +23,15 @@ use crate::types::{
     AbortMultipartUploadLookup, BucketFastPathInfo, BucketInfo, BucketName, BucketSnapshot,
     BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState,
     BucketSubresourceKind, CreateStreamUploadReq, FinalizeStreamPartOutcome, GenerationId,
-    ListMultipartUploadsReq, ListObjectVersionsReq, ListPartsReq, ListedBucketMultipartUploads,
-    ListedBucketObjectVersions, ListedBucketObjects, ListedMultipartParts, LoadedBucketSubresource,
-    MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
-    MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, ObjectReadSnapshot,
+    ListMultipartUploadsReq, ListObjectVersionsReq, ListPartsReq, ListPartsResp,
+    ListedBucketMultipartUploads, ListedBucketObjectVersions, ListedBucketObjects,
+    ListedMultipartParts, LoadedBucketSubresource, MultipartCompletionPreflight,
+    MultipartCompletionSnapshot, MultipartPartRecord, MultipartPartSegmentRecord,
+    MultipartUploadRecord, ObjectKey, ObjectPartRecord, ObjectReadSnapshot,
     ObjectReadSnapshotOutcome, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
-    PreparedStreamPartCommit, SessionId, ShardKey, SimplePayloadReclaimRecord, StoredObject,
-    StreamUploadPartSnapshot, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
-    StreamUploadTarget, UploadId, UploadState, WriteAck,
+    PayloadReclaimRoot, PreparedStreamPartCommit, SessionId, ShardKey, SimplePayloadReclaimRecord,
+    StoredObject, StreamUploadPartSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
+    StreamUploadState, StreamUploadTarget, UploadId, UploadState, WriteAck,
 };
 
 const TRACE_TARGET: &str = "storage";
@@ -617,6 +618,51 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_get_multipart_part(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        part_number: u16,
+    ) -> Result<MultipartPartRecord, ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        Ok(pg.get_multipart_part(upload_id, u32::from(part_number))?)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_list_multipart_parts(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        req: &ListPartsReq,
+    ) -> Result<ListPartsResp, ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        Ok(pg.list_multipart_parts(req)?)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_list_multipart_uploads_for_bucket(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Vec<MultipartUploadRecord>, ObjectPgActionError> {
+        let mut uploads = Vec::new();
+        for &pg_id in &self.pg_id_list {
+            let pg = self.get_pg(pg_id)?;
+            let listed = pg.list_multipart_uploads(&ListMultipartUploadsReq {
+                bucket: bucket.clone(),
+                prefix: None,
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: u32::MAX,
+            })?;
+            uploads.extend(listed.uploads);
+        }
+        Ok(uploads)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_get_object_segments(
         &self,
         bucket: &BucketName,
@@ -626,6 +672,18 @@ impl SharedStorageNode {
         let pg_id = self.test_object_pg_id_for(bucket, key);
         let pg = self.get_pg(pg_id)?;
         Ok(pg.get_object_segments(bucket, key, version_id)?)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_get_object_parts(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<Vec<ObjectPartRecord>, ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        Ok(pg.get_object_parts(bucket, key, version_id)?)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -653,6 +711,18 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_get_simple_payload_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<Option<SimplePayloadReclaimRecord>, ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        Ok(pg.get_simple_payload_reclaim(bucket, key, generation_id)?)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_put_simple_payload_reclaim(
         &self,
         bucket: &BucketName,
@@ -662,6 +732,33 @@ impl SharedStorageNode {
         let pg_id = self.test_object_pg_id_for(bucket, key);
         let pg = self.get_pg(pg_id)?;
         Ok(pg.put_simple_payload_reclaim(reclaim)?)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_payload_reclaim_exists(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<bool, ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        Ok(pg.payload_reclaim_exists(bucket, key, generation_id)?)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_list_bucket_payload_reclaim_roots(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Vec<PayloadReclaimRoot>, ObjectPgActionError> {
+        let mut roots = Vec::new();
+        for &pg_id in &self.pg_id_list {
+            let pg = self.get_pg(pg_id)?;
+            if let Some(root) = PgMetadataStore::get_bucket_payload_reclaim_root(&*pg, bucket)? {
+                roots.push(root);
+            }
+        }
+        Ok(roots)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -730,6 +827,28 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_force_stream_upload_created_at(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        created_at: u64,
+    ) -> Result<(), ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        pg.connection()
+            .execute(
+                "UPDATE stream_uploads SET created_at = ?1 WHERE session_id = ?2",
+                rusqlite::params![created_at as i64, session_id.as_str()],
+            )
+            .map_err(|source| crate::error::StoreError::Db {
+                context: "force stream_upload created_at in test helper",
+                source,
+            })?;
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_list_all_stream_uploads(
         &self,
     ) -> Result<Vec<StreamUploadRecord>, ObjectPgActionError> {
@@ -739,6 +858,16 @@ impl SharedStorageNode {
             sessions.extend(pg.list_all_stream_uploads()?);
         }
         Ok(sessions)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_create_stream_upload(
+        &self,
+        req: &CreateStreamUploadReq,
+    ) -> Result<(), ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(&req.bucket, &req.key);
+        let pg = self.get_pg(pg_id)?;
+        Ok(pg.create_stream_upload(req)?)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

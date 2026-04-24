@@ -1203,9 +1203,14 @@ fn create_multipart_upload_preserves_metadata() {
         .unwrap();
 
     // Verify we can retrieve the upload and its metadata blob is stored.
-    let meta_pg_id = coord.object_pg_id("bucket", "photo.png");
-    let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-    let record = pg.get_multipart_upload(&result.upload_id).unwrap();
+    let record = coord
+        .storage_node
+        .test_get_multipart_upload(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("photo.png"),
+            &result.upload_id,
+        )
+        .unwrap();
     assert_eq!(record.bucket, "bucket");
     assert_eq!(record.key, "photo.png");
     assert_eq!(record.tags.as_deref(), Some(tags_xml));
@@ -1259,18 +1264,20 @@ fn delete_bucket_drains_unqueued_payload_reclaim() {
         .unwrap();
 
     let generation_id = GenerationId::new(1).unwrap();
-    let meta_pg_id = coord.object_pg_id("bucket", "ghost");
-    {
-        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-        pg.put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
-            bucket: trusted_bucket_name("bucket"),
-            key: trusted_object_key("ghost"),
-            generation_id,
-            ec: EcShape { k: 4, m: 2 },
-            created_at: 1,
-        })
+    coord
+        .storage_node
+        .test_put_simple_payload_reclaim(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("ghost"),
+            &SimplePayloadReclaimRecord {
+                bucket: trusted_bucket_name("bucket"),
+                key: trusted_object_key("ghost"),
+                generation_id,
+                ec: EcShape { k: 4, m: 2 },
+                created_at: 1,
+            },
+        )
         .unwrap();
-    }
 
     delete_bucket_test(&coord, "bucket").unwrap();
     assert!(matches!(
@@ -1280,12 +1287,12 @@ fn delete_bucket_drains_unqueued_payload_reclaim() {
 
     wait_until_bucket_gone(&coord, "bucket");
 
-    let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-    assert!(pg
-        .get_simple_payload_reclaim(
+    assert!(coord
+        .storage_node
+        .test_get_simple_payload_reclaim(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("ghost"),
-            generation_id
+            generation_id,
         )
         .unwrap()
         .is_none());
@@ -1336,10 +1343,9 @@ fn delete_bucket_returns_before_payload_lease_and_reclaim_complete() {
         .unwrap();
 
     let generation_id = {
-        let meta_pg_id = admin.object_pg_id("bucket", "key");
-        let pg = admin.storage_node.get_pg(meta_pg_id).unwrap();
-        match pg
-            .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+        match admin
+            .storage_node
+            .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
             .unwrap()
         {
             StoredObject::Live(record) => record.generation_id,
@@ -1360,14 +1366,13 @@ fn delete_bucket_returns_before_payload_lease_and_reclaim_complete() {
         ))
         .unwrap();
 
-    let meta_pg_id = admin.object_pg_id("bucket", "key");
     {
-        let pg = admin.storage_node.get_pg(meta_pg_id).unwrap();
-        assert!(pg
-            .get_object_segments_reclaim(
+        assert!(admin
+            .storage_node
+            .test_get_object_segments_reclaim(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
-                generation_id
+                generation_id,
             )
             .unwrap()
             .is_some());
@@ -1384,12 +1389,12 @@ fn delete_bucket_returns_before_payload_lease_and_reclaim_complete() {
     ));
 
     {
-        let pg = admin.storage_node.get_pg(meta_pg_id).unwrap();
-        assert!(pg
-            .get_object_segments_reclaim(
+        assert!(admin
+            .storage_node
+            .test_get_object_segments_reclaim(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
-                generation_id
+                generation_id,
             )
             .unwrap()
             .is_some());
@@ -1408,13 +1413,21 @@ fn no_such_upload_from_storage() {
         .unwrap();
 
     // Directly call get_multipart_upload on a PG with a bogus upload ID.
-    let meta_pg_id = coord.object_pg_id("bucket", "key");
-    let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-    let err: ServerError = pg
-        .get_multipart_upload(&trusted_upload_id("nonexistent"))
-        .unwrap_err()
-        .into();
-    assert!(matches!(err, ServerError::NoSuchUpload { .. }));
+    let err = coord
+        .storage_node
+        .test_get_multipart_upload(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &trusted_upload_id("nonexistent"),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        storage::ObjectPgActionError::Metadata(storage::MetadataError::NoSuchUpload { .. })
+    ));
+    let err = ServerError::NoSuchUpload {
+        upload_id: "nonexistent".to_string(),
+    };
     assert_eq!(err.s3_error_code(), "NoSuchUpload");
     assert_eq!(err.http_status(), 404);
 }
@@ -1541,17 +1554,28 @@ fn upload_part_first_upload() {
     assert!(result.etag.ends_with('"'));
 
     // Verify part metadata was recorded.
-    let meta_pg_id = coord.object_pg_id("bucket", "key");
-    let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-    let part = pg.get_multipart_part(&create.upload_id, 1).unwrap();
+    let part = coord
+        .storage_node
+        .test_get_multipart_part(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &create.upload_id,
+            1,
+        )
+        .unwrap();
     assert_eq!(part.part_number, 1);
     assert_eq!(part.generation, 0);
     assert_eq!(part.size, 11); // "hello world".len()
     assert_eq!(part.part_okh, [0u8; 16]);
     assert_eq!(part.part_vid, GenerationId::MIN);
 
-    let segments = pg
-        .get_all_multipart_part_segments_for_upload(&create.upload_id)
+    let segments = coord
+        .storage_node
+        .test_get_all_multipart_part_segments_for_upload(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &create.upload_id,
+        )
         .unwrap();
     assert_eq!(segments.len(), 1);
     assert_eq!(segments[0].part_number, 1);
@@ -1623,9 +1647,15 @@ fn upload_part_reupload_increments_generation() {
     )
     .unwrap();
 
-    let meta_pg_id = coord.object_pg_id("bucket", "key");
-    let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-    let part = pg.get_multipart_part(&create.upload_id, 1).unwrap();
+    let part = coord
+        .storage_node
+        .test_get_multipart_part(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &create.upload_id,
+            1,
+        )
+        .unwrap();
     assert_eq!(part.generation, 1);
     assert_eq!(part.size, 6); // "second".len()
 
@@ -1833,16 +1863,18 @@ fn upload_part_multiple_parts() {
     .unwrap();
 
     // Verify all three parts exist.
-    let meta_pg_id = coord.object_pg_id("bucket", "key");
-    let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-
-    let parts_resp = pg
-        .list_multipart_parts(&storage::ListPartsReq {
-            upload_id: UploadId::try_from(create.upload_id.as_str())
-                .expect("generated multipart upload ID is valid"),
-            part_number_marker: None,
-            max_parts: 100,
-        })
+    let parts_resp = coord
+        .storage_node
+        .test_list_multipart_parts(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &storage::ListPartsReq {
+                upload_id: UploadId::try_from(create.upload_id.as_str())
+                    .expect("generated multipart upload ID is valid"),
+                part_number_marker: None,
+                max_parts: 100,
+            },
+        )
         .unwrap();
     assert_eq!(parts_resp.parts.len(), 3);
     assert_eq!(parts_resp.parts[0].part_number, 1);
@@ -1897,9 +1929,15 @@ fn upload_part_repeated_reupload_generations() {
         .unwrap();
     }
 
-    let meta_pg_id = coord.object_pg_id("bucket", "key");
-    let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-    let part = pg.get_multipart_part(&create.upload_id, 1).unwrap();
+    let part = coord
+        .storage_node
+        .test_get_multipart_part(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &create.upload_id,
+            1,
+        )
+        .unwrap();
     assert_eq!(part.generation, 3);
     assert_eq!(part.size, "version-3".len() as u64);
 }
@@ -1967,10 +2005,24 @@ fn upload_part_boundary_part_numbers() {
     )
     .unwrap();
 
-    let meta_pg_id = coord.object_pg_id("bucket", "key");
-    let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-    pg.get_multipart_part(&create.upload_id, 1).unwrap();
-    pg.get_multipart_part(&create.upload_id, 10_000).unwrap();
+    coord
+        .storage_node
+        .test_get_multipart_part(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &create.upload_id,
+            1,
+        )
+        .unwrap();
+    coord
+        .storage_node
+        .test_get_multipart_part(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &create.upload_id,
+            10_000,
+        )
+        .unwrap();
 }
 
 #[test]
@@ -2132,9 +2184,15 @@ fn upload_part_same_part_last_writer_wins() {
     assert_ne!(etag2, etag3);
 
     // Final state should reflect the last writer.
-    let meta_pg_id = coord.object_pg_id("bucket", "key");
-    let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-    let part = pg.get_multipart_part(&create.upload_id, 1).unwrap();
+    let part = coord
+        .storage_node
+        .test_get_multipart_part(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &create.upload_id,
+            1,
+        )
+        .unwrap();
     assert_eq!(part.generation, 2); // 0, 1, 2
     assert_eq!(part.size, "writer-C".len() as u64);
     assert_eq!(format_etag(checksum::crc64::checksum(b"writer-C")), etag3);
@@ -2181,10 +2239,9 @@ fn complete_multipart_upload_happy_path() {
     assert!(result.etag.ends_with("-2\""), "etag = {}", result.etag);
 
     // Object should be visible via get_object metadata.
-    let meta_pg_id = coord.object_pg_id("bucket", "key");
-    let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-    let obj = pg
-        .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+    let obj = coord
+        .storage_node
+        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
         .unwrap();
     let live_obj = obj.as_live().expect("expected live object");
     assert!(matches!(
@@ -2198,8 +2255,9 @@ fn complete_multipart_upload_happy_path() {
     );
 
     // object_parts should be committed.
-    let committed = pg
-        .get_object_parts(
+    let committed = coord
+        .storage_node
+        .test_get_object_parts(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             result.version_id,
@@ -2210,8 +2268,18 @@ fn complete_multipart_upload_happy_path() {
     assert_eq!(committed[1].part_number, 2);
 
     // Upload should be deleted.
-    let err = pg.get_multipart_upload(&upload_id).unwrap_err();
-    assert!(matches!(err, storage::MetadataError::NoSuchUpload { .. }));
+    let err = coord
+        .storage_node
+        .test_get_multipart_upload(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &upload_id,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        storage::ObjectPgActionError::Metadata(storage::MetadataError::NoSuchUpload { .. })
+    ));
 }
 
 #[test]
@@ -2244,10 +2312,9 @@ fn delete_multipart_object_eventually_reclaims_part_shards() {
         .unwrap();
 
     let (generation_id, parts_to_reclaim) = {
-        let meta_pg_id = coord.object_pg_id("bucket", "key");
-        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-        let generation_id = match pg
-            .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+        let generation_id = match coord
+            .storage_node
+            .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
             .unwrap()
         {
             StoredObject::Live(record) => record.generation_id,
@@ -2255,8 +2322,9 @@ fn delete_multipart_object_eventually_reclaims_part_shards() {
                 panic!("expected live multipart object, got {other:?}")
             }
         };
-        let parts = pg
-            .get_object_parts(
+        let parts = coord
+            .storage_node
+            .test_get_object_parts(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
                 result.version_id,
@@ -2710,17 +2778,17 @@ fn complete_multipart_upload_overwrite_unversioned() {
     assert_ne!(result1.etag, result2.etag);
 
     // Verify the object was overwritten — should have 2 parts now.
-    let meta_pg_id = coord.object_pg_id("bucket", "key");
-    let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-    let obj = pg
-        .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+    let obj = coord
+        .storage_node
+        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
         .unwrap();
     let live_obj = obj.as_live().expect("expected live object");
     assert_eq!(live_obj.layout.parts_count(), Some(2));
 
     // Old manifest parts (from first upload) should be replaced.
-    let committed = pg
-        .get_object_parts(
+    let committed = coord
+        .storage_node
+        .test_get_object_parts(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             VersionId::Null,
@@ -2902,11 +2970,15 @@ fn complete_multipart_upload_rejects_non_in_progress_upload() {
 
     let (upload_id, parts) = create_upload_with_parts(&coord, "bucket", "key", &[(1, b"part1")]);
 
-    let meta_pg_id = coord.object_pg_id("bucket", "key");
-    let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-    pg.set_upload_state(&upload_id, UploadState::Completing)
+    coord
+        .storage_node
+        .test_set_upload_state(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &upload_id,
+            UploadState::Completing,
+        )
         .unwrap();
-    drop(pg);
 
     let err = coord
         .complete_multipart_upload(&CompleteMultipartUploadRequest {
@@ -2993,21 +3065,24 @@ fn abort_multipart_upload_reclaims_uploaded_and_streamed_part_shards() {
         })
         .unwrap();
 
-    let meta_pg = coord
+    let uploaded_part = coord
         .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
+        .test_get_multipart_part(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &create.upload_id,
+            1,
+        )
         .unwrap();
-    let uploaded_part =
-        storage::traits::PgMetadataStore::get_multipart_part(&*meta_pg, &create.upload_id, 1)
-            .unwrap();
-    let streamed_segments =
-        storage::traits::PgMetadataStore::get_all_multipart_part_segments_for_upload(
-            &*meta_pg,
+    let streamed_segments = coord
+        .storage_node
+        .test_get_all_multipart_part_segments_for_upload(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
             &create.upload_id,
         )
         .unwrap();
     assert!(!streamed_segments.is_empty());
-    drop(meta_pg);
 
     coord
         .abort_multipart_upload(&multipart_object_request_with_expected_owner(
@@ -3418,8 +3493,14 @@ fn completed_multipart_tombstone_prune_limit_is_global_across_object_pgs() {
     let older_key = find_key_with_object_pg_eq_bucket_pg(&coord, "bucket", "bucket-pg");
     let newer_key = find_key_with_object_pg_ne_bucket_pg(&coord, "bucket", "other-pg");
     assert_ne!(
-        coord.object_pg_id("bucket", &older_key),
-        coord.object_pg_id("bucket", &newer_key)
+        coord.storage_node.test_object_pg_id_for(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key(&older_key),
+        ),
+        coord.storage_node.test_object_pg_id_for(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key(&newer_key),
+        )
     );
 
     let (older_upload_id, older_parts) =
@@ -4114,13 +4195,15 @@ fn begin_stream_part_aborting_upload_returns_no_such_upload_without_creating_ses
         })
         .unwrap();
 
-    let pg = coord
+    coord
         .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
+        .test_set_upload_state(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &upload.upload_id,
+            UploadState::Aborting,
+        )
         .unwrap();
-    pg.set_upload_state(&upload.upload_id, UploadState::Aborting)
-        .unwrap();
-    drop(pg);
 
     let err = coord
         .begin_stream_part(&BeginStreamPartRequest {
@@ -4169,13 +4252,15 @@ fn begin_stream_part_completing_upload_returns_no_such_upload_without_creating_s
         })
         .unwrap();
 
-    let pg = coord
+    coord
         .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
+        .test_set_upload_state(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &upload.upload_id,
+            UploadState::Completing,
+        )
         .unwrap();
-    pg.set_upload_state(&upload.upload_id, UploadState::Completing)
-        .unwrap();
-    drop(pg);
 
     let err = coord
         .begin_stream_part(&BeginStreamPartRequest {
@@ -6887,10 +6972,9 @@ fn stream_put_multiple_segments_correct_manifest() {
     assert_eq!(result.etag, format_etag(crc));
 
     // Verify the committed object segments exist in the metadata PG.
-    let meta_pg_id = coord.object_pg_id("bucket", "key");
-    let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-    let committed = pg
-        .get_object_segments(
+    let committed = coord
+        .storage_node
+        .test_get_object_segments(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             result.version_id,
@@ -6917,27 +7001,33 @@ fn stream_put_abort_cleans_up_shards() {
         .unwrap();
 
     // Record shard keys before abort for verification.
-    let meta_pg = coord
+    let segments = coord
         .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
+        .test_list_stream_segments(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &session_id,
+        )
         .unwrap();
-    let segments = meta_pg.list_stream_segments(&session_id).unwrap();
     assert_eq!(segments.len(), 1);
     let segment = segments[0].clone();
     let shard_pg_id = segment.shard_pg_id;
-    drop(meta_pg);
 
     coord
         .abort_stream_put("bucket", "key", &session_id)
         .unwrap();
 
     // Verify shards were cleaned up.
-    let pg = coord.storage_node.get_pg(shard_pg_id).unwrap();
     for i in 0..6 {
         // k=4, m=2
         let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i);
-        let result = pg.read_shard(&shard_key);
-        assert!(result.is_err(), "shard {i} should have been deleted");
+        assert!(
+            !coord
+                .storage_node
+                .test_shard_exists(shard_pg_id, &shard_key)
+                .unwrap(),
+            "shard {i} should have been deleted"
+        );
     }
 }
 
@@ -7683,20 +7773,19 @@ fn stream_append_accepts_upload_part_session() {
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
 
-    let meta_pg_id = coord.object_pg_id("bucket", "key");
-    let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-    pg.create_stream_upload(&CreateStreamUploadReq {
-        session_id: trusted_session_id("upload-part-session"),
-        bucket: trusted_bucket_name("bucket"),
-        key: trusted_object_key("key"),
-        target: StreamUploadTarget::UploadPart {
-            upload_id: trusted_upload_id("mpu-123"),
-            part_number: 1,
-        },
-        encryption: storage::ObjectEncryption::None,
-    })
-    .unwrap();
-    drop(pg);
+    coord
+        .storage_node
+        .test_create_stream_upload(&CreateStreamUploadReq {
+            session_id: trusted_session_id("upload-part-session"),
+            bucket: trusted_bucket_name("bucket"),
+            key: trusted_object_key("key"),
+            target: StreamUploadTarget::UploadPart {
+                upload_id: trusted_upload_id("mpu-123"),
+                part_number: 1,
+            },
+            encryption: storage::ObjectEncryption::None,
+        })
+        .unwrap();
 
     let session_id = trusted_session_id("upload-part-session");
     coord
@@ -8294,31 +8383,29 @@ fn object_segments_integrity_readback() {
         .unwrap();
 
     // Read back via storage layer directly.
-    let meta_pg_id = coord.object_pg_id("bucket", "verify");
-    {
-        let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-        let record = meta_pg
-            .get_object_meta(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("verify"),
-            )
-            .unwrap();
-        let segments = meta_pg
-            .get_object_segments(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("verify"),
-                record.version_id(),
-            )
-            .unwrap();
+    let record = coord
+        .storage_node
+        .test_get_object_meta(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("verify"),
+        )
+        .unwrap();
+    let segments = coord
+        .storage_node
+        .test_get_object_segments(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("verify"),
+            record.version_id(),
+        )
+        .unwrap();
 
-        assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].segment_index, 0);
-        assert_eq!(segments[0].size, 8);
-        assert!(segments[0].segment_crc64.is_some());
-        assert_eq!(segments[1].segment_index, 1);
-        assert_eq!(segments[1].size, 8);
-        assert!(segments[1].segment_crc64.is_some());
-    } // Drop PG lock before coordinator calls.
+    assert_eq!(segments.len(), 2);
+    assert_eq!(segments[0].segment_index, 0);
+    assert_eq!(segments[0].size, 8);
+    assert!(segments[0].segment_crc64.is_some());
+    assert_eq!(segments[1].segment_index, 1);
+    assert_eq!(segments[1].size, 8);
+    assert!(segments[1].segment_crc64.is_some());
 
     // Verify full readback via coordinator.
     let result = coord
