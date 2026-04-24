@@ -349,18 +349,20 @@ fn buffered_put_single_segment_skips_stream_session_rows() {
     )
     .unwrap();
 
-    let meta_pg_id = coord.object_pg_id("bucket", "key");
-    let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-    let segments = pg
-        .get_object_segments(
+    let segments = coord
+        .storage_node
+        .test_get_object_segments(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             result.version_id,
         )
         .unwrap();
     assert_eq!(segments.len(), 1);
-    assert!(pg.list_all_stream_uploads().unwrap().is_empty());
-    drop(pg);
+    assert!(coord
+        .storage_node
+        .test_list_all_stream_uploads()
+        .unwrap()
+        .is_empty());
 
     let get = coord
         .get_object(&GetObjectRequest {
@@ -404,10 +406,9 @@ fn buffered_put_exact_segment_skips_stream_session_rows() {
     )
     .unwrap();
 
-    let meta_pg_id = coord.object_pg_id("bucket", "exact");
-    let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-    let segments = pg
-        .get_object_segments(
+    let segments = coord
+        .storage_node
+        .test_get_object_segments(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("exact"),
             result.version_id,
@@ -415,7 +416,11 @@ fn buffered_put_exact_segment_skips_stream_session_rows() {
         .unwrap();
     assert_eq!(segments.len(), 1);
     assert_eq!(segments[0].size, INTERNAL_SEGMENT_SIZE as u64);
-    assert!(pg.list_all_stream_uploads().unwrap().is_empty());
+    assert!(coord
+        .storage_node
+        .test_list_all_stream_uploads()
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -456,10 +461,9 @@ fn buffered_put_writes_object_segments() {
     .unwrap();
 
     {
-        let meta_pg_id = coord.object_pg_id("bucket", "key");
-        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-        let segments = pg
-            .get_object_segments(
+        let segments = coord
+            .storage_node
+            .test_get_object_segments(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
                 result.version_id,
@@ -472,7 +476,11 @@ fn buffered_put_writes_object_segments() {
         assert_eq!(segments[1].size, INTERNAL_SEGMENT_SIZE as u64);
         assert_eq!(segments[2].segment_index, 2);
         assert_eq!(segments[2].size, 123);
-        assert!(pg.list_all_stream_uploads().unwrap().is_empty());
+        assert!(coord
+            .storage_node
+            .test_list_all_stream_uploads()
+            .unwrap()
+            .is_empty());
     }
 
     let get = coord

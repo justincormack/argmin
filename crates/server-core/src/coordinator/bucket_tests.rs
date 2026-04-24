@@ -1907,12 +1907,9 @@ fn lifecycle_sweep_expires_nonversioned_current_object() {
     .unwrap();
 
     let (last_modified, generation_id) = {
-        let meta_pg = coord
+        let stored = coord
             .storage_node
-            .get_pg(coord.object_pg_id("bucket", "key"))
-            .unwrap();
-        let stored = meta_pg
-            .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+            .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
             .unwrap();
         let live = stored.as_live().unwrap();
         (live.last_modified, live.generation_id)
@@ -1926,31 +1923,32 @@ fn lifecycle_sweep_expires_nonversioned_current_object() {
     assert_eq!(stats.scanned_buckets, 1);
     assert_eq!(stats.expired_current_objects, 1);
 
-    let meta_pg = coord
-        .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
-        .unwrap();
     assert!(matches!(
-        meta_pg.get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key")),
-        Err(storage::MetadataError::ObjectNotFound)
+        coord
+            .storage_node
+            .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key")),
+        Err(storage::ObjectPgActionError::Metadata(
+            storage::MetadataError::ObjectNotFound
+        ))
     ));
-    assert!(meta_pg
-        .get_object_segments_reclaim(
+    assert!(coord
+        .storage_node
+        .test_get_object_segments_reclaim(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             generation_id
         )
         .unwrap()
         .is_some());
-    assert!(meta_pg
-        .get_object_segments(
+    assert!(coord
+        .storage_node
+        .test_get_object_segments(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             VersionId::Null
         )
         .unwrap()
         .is_empty());
-    drop(meta_pg);
     drop(lease);
 }
 
@@ -1998,12 +1996,9 @@ fn lifecycle_sweep_expires_versioned_current_with_delete_marker() {
     .unwrap();
 
     let (last_modified, generation_id) = {
-        let meta_pg = coord
+        let stored = coord
             .storage_node
-            .get_pg(coord.object_pg_id("bucket", "key"))
-            .unwrap();
-        let stored = meta_pg
-            .get_object_version(
+            .test_get_object_version(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
                 put.version_id,
@@ -2018,24 +2013,23 @@ fn lifecycle_sweep_expires_versioned_current_with_delete_marker() {
     assert_eq!(stats.scanned_buckets, 1);
     assert_eq!(stats.expired_current_objects, 1);
 
-    let meta_pg = coord
+    let current = coord
         .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
-        .unwrap();
-    let current = meta_pg
-        .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
         .unwrap();
     assert!(matches!(current, StoredObject::DeleteMarker(_)));
-    let original = meta_pg
-        .get_object_version(
+    let original = coord
+        .storage_node
+        .test_get_object_version(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             put.version_id,
         )
         .unwrap();
     assert!(matches!(original, StoredObject::Live(_)));
-    assert!(meta_pg
-        .get_object_segments_reclaim(
+    assert!(coord
+        .storage_node
+        .test_get_object_segments_reclaim(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             generation_id
@@ -2113,12 +2107,9 @@ fn lifecycle_sweep_expires_suspended_null_current_with_null_delete_marker() {
     assert_eq!(put.version_id, VersionId::Null);
 
     let (last_modified, generation_id) = {
-        let meta_pg = coord
+        let stored = coord
             .storage_node
-            .get_pg(coord.object_pg_id("bucket", "key"))
-            .unwrap();
-        let stored = meta_pg
-            .get_object_version(
+            .test_get_object_version(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
                 VersionId::Null,
@@ -2136,42 +2127,41 @@ fn lifecycle_sweep_expires_suspended_null_current_with_null_delete_marker() {
     assert_eq!(stats.scanned_buckets, 1);
     assert_eq!(stats.expired_current_objects, 1);
 
-    let meta_pg = coord
+    let current = coord
         .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
-        .unwrap();
-    let current = meta_pg
-        .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
         .unwrap();
     match current {
         StoredObject::DeleteMarker(marker) => assert_eq!(marker.version_id, VersionId::Null),
         other => panic!("expected current delete marker, got {other:?}"),
     }
-    let older_version = meta_pg
-        .get_object_version(
+    let older_version = coord
+        .storage_node
+        .test_get_object_version(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             older.version_id,
         )
         .unwrap();
     assert!(matches!(older_version, StoredObject::Live(_)));
-    let null_version = meta_pg
-        .get_object_version(
+    let null_version = coord
+        .storage_node
+        .test_get_object_version(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             VersionId::Null,
         )
         .unwrap();
     assert!(matches!(null_version, StoredObject::DeleteMarker(_)));
-    assert!(meta_pg
-        .get_object_segments_reclaim(
+    assert!(coord
+        .storage_node
+        .test_get_object_segments_reclaim(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             generation_id
         )
         .unwrap()
         .is_some());
-    drop(meta_pg);
 
     let versions = coord
         .list_object_versions(&ListObjectVersionsRequest {
@@ -2253,12 +2243,9 @@ fn lifecycle_sweep_expires_noncurrent_versioned_live_object() {
     .unwrap();
 
     let (became_noncurrent_at, generation_id) = {
-        let meta_pg = coord
+        let stored = coord
             .storage_node
-            .get_pg(coord.object_pg_id("bucket", "key"))
-            .unwrap();
-        let stored = meta_pg
-            .get_object_version(
+            .test_get_object_version(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
                 older.version_id,
@@ -2277,31 +2264,30 @@ fn lifecycle_sweep_expires_noncurrent_versioned_live_object() {
     assert_eq!(stats.expired_current_objects, 0);
     assert_eq!(stats.expired_noncurrent_versions, 1);
 
-    let meta_pg = coord
+    let latest = coord
         .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
-        .unwrap();
-    let latest = meta_pg
-        .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
         .unwrap();
     assert_eq!(latest.version_id(), current.version_id);
     assert!(matches!(
-        meta_pg.get_object_version(
+        coord.storage_node.test_get_object_version(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             older.version_id
         ),
-        Err(storage::MetadataError::ObjectNotFound)
+        Err(storage::ObjectPgActionError::Metadata(
+            storage::MetadataError::ObjectNotFound
+        ))
     ));
-    assert!(meta_pg
-        .get_object_segments_reclaim(
+    assert!(coord
+        .storage_node
+        .test_get_object_segments_reclaim(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             generation_id
         )
         .unwrap()
         .is_some());
-    drop(meta_pg);
     drop(lease);
 }
 
@@ -2373,12 +2359,9 @@ fn lifecycle_sweep_expires_suspended_noncurrent_numbered_version() {
     assert_eq!(null_current.version_id, VersionId::Null);
 
     let (became_noncurrent_at, generation_id) = {
-        let meta_pg = coord
+        let stored = coord
             .storage_node
-            .get_pg(coord.object_pg_id("bucket", "key"))
-            .unwrap();
-        let stored = meta_pg
-            .get_object_version(
+            .test_get_object_version(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
                 numbered.version_id,
@@ -2397,31 +2380,30 @@ fn lifecycle_sweep_expires_suspended_noncurrent_numbered_version() {
     assert_eq!(stats.expired_current_objects, 0);
     assert_eq!(stats.expired_noncurrent_versions, 1);
 
-    let meta_pg = coord
+    let latest = coord
         .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
-        .unwrap();
-    let latest = meta_pg
-        .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
         .unwrap();
     assert_eq!(latest.version_id(), VersionId::Null);
     assert!(matches!(
-        meta_pg.get_object_version(
+        coord.storage_node.test_get_object_version(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             numbered.version_id
         ),
-        Err(storage::MetadataError::ObjectNotFound)
+        Err(storage::ObjectPgActionError::Metadata(
+            storage::MetadataError::ObjectNotFound
+        ))
     ));
-    assert!(meta_pg
-        .get_object_segments_reclaim(
+    assert!(coord
+        .storage_node
+        .test_get_object_segments_reclaim(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             generation_id
         )
         .unwrap()
         .is_some());
-    drop(meta_pg);
     drop(lease);
 }
 
@@ -3101,11 +3083,14 @@ fn lifecycle_sweep_aborts_due_incomplete_multipart_upload() {
     .unwrap();
 
     let deadline = {
-        let meta_pg = coord
+        let upload = coord
             .storage_node
-            .get_pg(coord.object_pg_id("bucket", "logs/app"))
+            .test_get_multipart_upload(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("logs/app"),
+                &matching.upload_id,
+            )
             .unwrap();
-        let upload = meta_pg.get_multipart_upload(&matching.upload_id).unwrap();
         Coordinator::lifecycle_day_based_deadline(upload.initiated_at, 1).unwrap()
     };
 
@@ -3115,25 +3100,33 @@ fn lifecycle_sweep_aborts_due_incomplete_multipart_upload() {
     assert_eq!(stats.expired_delete_markers, 0);
     assert_eq!(stats.aborted_multipart_uploads, 1);
 
-    let matching_pg = coord
-        .storage_node
-        .get_pg(coord.object_pg_id("bucket", "logs/app"))
-        .unwrap();
     assert!(matches!(
-        matching_pg.get_multipart_upload(&matching.upload_id),
-        Err(storage::MetadataError::NoSuchUpload { .. })
+        coord.storage_node.test_get_multipart_upload(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("logs/app"),
+            &matching.upload_id
+        ),
+        Err(storage::ObjectPgActionError::Metadata(
+            storage::MetadataError::NoSuchUpload { .. }
+        ))
     ));
-    assert!(matching_pg
-        .get_all_multipart_part_segments_for_upload(&matching.upload_id)
+    assert!(coord
+        .storage_node
+        .test_get_all_multipart_part_segments_for_upload(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("logs/app"),
+            &matching.upload_id
+        )
         .unwrap()
         .is_empty());
 
-    let retained_pg = coord
+    assert!(coord
         .storage_node
-        .get_pg(coord.object_pg_id("bucket", "tmp/keep"))
-        .unwrap();
-    assert!(retained_pg
-        .get_multipart_upload(&retained.upload_id)
+        .test_get_multipart_upload(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("tmp/keep"),
+            &retained.upload_id
+        )
         .is_ok());
 }
 
@@ -3173,11 +3166,14 @@ fn lifecycle_abort_rechecks_current_bucket_lifecycle_before_aborting_upload() {
         .unwrap();
 
     let deadline = {
-        let meta_pg = coord
+        let upload = coord
             .storage_node
-            .get_pg(coord.object_pg_id("bucket", "logs/app"))
+            .test_get_multipart_upload(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("logs/app"),
+                &upload.upload_id,
+            )
             .unwrap();
-        let upload = meta_pg.get_multipart_upload(&upload.upload_id).unwrap();
         Coordinator::lifecycle_day_based_deadline(upload.initiated_at, 1).unwrap()
     };
 
@@ -3193,11 +3189,14 @@ fn lifecycle_abort_rechecks_current_bucket_lifecycle_before_aborting_upload() {
         )
         .unwrap());
 
-    let meta_pg = coord
+    assert!(coord
         .storage_node
-        .get_pg(coord.object_pg_id("bucket", "logs/app"))
-        .unwrap();
-    assert!(meta_pg.get_multipart_upload(&upload.upload_id).is_ok());
+        .test_get_multipart_upload(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("logs/app"),
+            &upload.upload_id
+        )
+        .is_ok());
 }
 
 #[test]
@@ -3254,12 +3253,14 @@ fn lifecycle_sweep_finishes_aborting_multipart_upload_without_current_lifecycle_
     .unwrap();
 
     {
-        let meta_pg = coord
+        coord
             .storage_node
-            .get_pg(coord.object_pg_id("bucket", "logs/app"))
-            .unwrap();
-        meta_pg
-            .set_upload_state(&upload.upload_id, UploadState::Aborting)
+            .test_set_upload_state(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("logs/app"),
+                &upload.upload_id,
+                UploadState::Aborting,
+            )
             .unwrap();
     }
     delete_bucket_lifecycle_test(&coord, "bucket", test_requester(), None).unwrap();
@@ -3267,13 +3268,15 @@ fn lifecycle_sweep_finishes_aborting_multipart_upload_without_current_lifecycle_
     let stats = coord.run_lifecycle_sweep_at(0).unwrap();
     assert_eq!(stats.aborted_multipart_uploads, 1);
 
-    let meta_pg = coord
-        .storage_node
-        .get_pg(coord.object_pg_id("bucket", "logs/app"))
-        .unwrap();
     assert!(matches!(
-        meta_pg.get_multipart_upload(&upload.upload_id),
-        Err(storage::MetadataError::NoSuchUpload { .. })
+        coord.storage_node.test_get_multipart_upload(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("logs/app"),
+            &upload.upload_id
+        ),
+        Err(storage::ObjectPgActionError::Metadata(
+            storage::MetadataError::NoSuchUpload { .. }
+        ))
     ));
 }
 

@@ -27,9 +27,10 @@ use crate::types::{
     ListedBucketObjectVersions, ListedBucketObjects, ListedMultipartParts, LoadedBucketSubresource,
     MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
     MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, ObjectReadSnapshot,
-    ObjectReadSnapshotOutcome, ObjectSegmentRecord, PreparedStreamPartCommit, SessionId, ShardKey,
-    StoredObject, StreamUploadPartSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
-    StreamUploadState, StreamUploadTarget, UploadId, UploadState, WriteAck,
+    ObjectReadSnapshotOutcome, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
+    PreparedStreamPartCommit, SessionId, ShardKey, SimplePayloadReclaimRecord, StoredObject,
+    StreamUploadPartSnapshot, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
+    StreamUploadTarget, UploadId, UploadState, WriteAck,
 };
 
 const TRACE_TARGET: &str = "storage";
@@ -613,6 +614,67 @@ impl SharedStorageNode {
         let pg_id = self.test_object_pg_id_for(bucket, key);
         let pg = self.get_pg(pg_id)?;
         Ok(pg.get_object_segments(bucket, key, version_id)?)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_get_object_version(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<StoredObject, ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        Ok(pg.get_object_version(bucket, key, version_id)?)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_get_object_segments_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<Option<ObjectSegmentsReclaimRecord>, ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        Ok(pg.get_object_segments_reclaim(bucket, key, generation_id)?)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_put_simple_payload_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reclaim: &SimplePayloadReclaimRecord,
+    ) -> Result<(), ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        Ok(pg.put_simple_payload_reclaim(reclaim)?)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_get_all_multipart_part_segments_for_upload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<Vec<MultipartPartSegmentRecord>, ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        Ok(pg.get_all_multipart_part_segments_for_upload(upload_id)?)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_set_upload_state(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        state: UploadState,
+    ) -> Result<(), ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        Ok(pg.set_upload_state(upload_id, state)?)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
