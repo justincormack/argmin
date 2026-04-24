@@ -10,6 +10,8 @@ use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWrite
 use std::time::Instant;
 
 use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
+#[cfg(any(test, feature = "test-hooks"))]
+use s3_types::VersionId;
 
 use crate::error::{
     BucketSnapshotLoadError, BucketWriteDrainError, ObjectPgActionError, StoreError,
@@ -25,9 +27,9 @@ use crate::types::{
     ListedBucketObjectVersions, ListedBucketObjects, ListedMultipartParts, LoadedBucketSubresource,
     MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
     MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, ObjectReadSnapshot,
-    ObjectReadSnapshotOutcome, PreparedStreamPartCommit, SessionId, ShardKey, StoredObject,
-    StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
-    WriteAck,
+    ObjectReadSnapshotOutcome, ObjectSegmentRecord, PreparedStreamPartCommit, SessionId, ShardKey,
+    StoredObject, StreamUploadPartSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
+    StreamUploadState, StreamUploadTarget, UploadId, UploadState, WriteAck,
 };
 
 const TRACE_TARGET: &str = "storage";
@@ -544,6 +546,106 @@ impl SharedStorageNode {
                 drop(error.into_inner());
                 Ok(true)
             }
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_bucket_pg_id_for(&self, bucket: &BucketName) -> u32 {
+        self.pg_topology.bucket_pg_for(bucket)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_head_bucket_raw(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        let pg_id = self.test_bucket_pg_id_for(bucket);
+        let pg = self.get_pg(pg_id)?;
+        Ok(pg.head_bucket_raw(bucket)?)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_object_pg_id_for(&self, bucket: &BucketName, key: &ObjectKey) -> u32 {
+        self.pg_topology.object_pg_for(bucket, key)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_shard_pg_id_for(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> u32 {
+        self.pg_topology
+            .shard_pg(bucket.as_str(), key.as_str(), generation_id.get())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_get_object_meta(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<StoredObject, ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        Ok(pg.get_object_meta(bucket, key)?)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_get_multipart_upload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        Ok(pg.get_multipart_upload(upload_id)?)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_get_object_segments(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<Vec<ObjectSegmentRecord>, ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        Ok(pg.get_object_segments(bucket, key, version_id)?)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_list_stream_segments(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        Ok(pg.list_stream_segments(session_id)?)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_list_all_stream_uploads(
+        &self,
+    ) -> Result<Vec<StreamUploadRecord>, ObjectPgActionError> {
+        let mut sessions = Vec::new();
+        for &pg_id in &self.pg_id_list {
+            let pg = self.get_pg(pg_id)?;
+            sessions.extend(pg.list_all_stream_uploads()?);
+        }
+        Ok(sessions)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_shard_exists(&self, pg_id: u32, key: &ShardKey) -> Result<bool, StoreError> {
+        let pg = self.get_pg(pg_id)?;
+        match pg.stat_shard(key) {
+            Ok(_) => Ok(true),
+            Err(StoreError::NotFound) => Ok(false),
+            Err(other) => Err(other),
         }
     }
 

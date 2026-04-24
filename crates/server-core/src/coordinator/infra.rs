@@ -20,8 +20,6 @@ use super::{Coordinator, PgTopology};
 use crate::error::ServerError;
 use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
 #[cfg(test)]
-use storage::GenerationId;
-#[cfg(test)]
 use storage::ObjectKey;
 use storage::{
     BucketFastPathInfo, BucketInfo, BucketName, BucketState, ReclaimWorkItem, SessionId,
@@ -404,11 +402,6 @@ impl Coordinator {
 
     pub(super) fn shard_pg_id_raw(&self, bucket: &str, key: &str, generation: u64) -> u32 {
         self.pg_topology.shard_pg(bucket, key, generation)
-    }
-
-    #[cfg(test)]
-    pub(super) fn shard_pg_id(&self, bucket: &str, key: &str, generation_id: GenerationId) -> u32 {
-        self.shard_pg_id_raw(bucket, key, generation_id.get())
     }
 
     #[cfg(test)]

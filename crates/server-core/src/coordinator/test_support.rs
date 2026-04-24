@@ -342,14 +342,12 @@ pub(crate) fn wait_until_bucket_gone(coord: &Coordinator, name: &str) {
         if matches!(
             coord.unchecked_active_bucket_summary(name),
             Err(ServerError::BucketNotFound { .. })
-        ) {
-            let bucket_pg = coord.get_bucket_pg(name).unwrap();
-            if bucket_pg
-                .head_bucket_raw(&trusted_bucket_name(name))
-                .is_err()
-            {
-                return;
-            }
+        ) && coord
+            .storage_node
+            .test_head_bucket_raw(&trusted_bucket_name(name))
+            .is_err()
+        {
+            return;
         }
     }
     panic!("bucket {name} was not fully removed");
@@ -360,10 +358,15 @@ pub(crate) fn find_key_with_object_pg_ne_bucket_pg(
     bucket: &str,
     prefix: &str,
 ) -> String {
-    let bucket_pg_id = coord.bucket_pg_id(bucket);
+    let bucket_name = trusted_bucket_name(bucket);
+    let bucket_pg_id = coord.storage_node.test_bucket_pg_id_for(&bucket_name);
     for suffix in 0..1024 {
         let key = format!("{prefix}-{suffix}");
-        if coord.object_pg_id(bucket, &key) != bucket_pg_id {
+        if coord
+            .storage_node
+            .test_object_pg_id_for(&bucket_name, &trusted_object_key(&key))
+            != bucket_pg_id
+        {
             return key;
         }
     }
@@ -375,10 +378,15 @@ pub(crate) fn find_key_with_object_pg_eq_bucket_pg(
     bucket: &str,
     prefix: &str,
 ) -> String {
-    let bucket_pg_id = coord.bucket_pg_id(bucket);
+    let bucket_name = trusted_bucket_name(bucket);
+    let bucket_pg_id = coord.storage_node.test_bucket_pg_id_for(&bucket_name);
     for suffix in 0..1024 {
         let key = format!("{prefix}-{suffix}");
-        if coord.object_pg_id(bucket, &key) == bucket_pg_id {
+        if coord
+            .storage_node
+            .test_object_pg_id_for(&bucket_name, &trusted_object_key(&key))
+            == bucket_pg_id
+        {
             return key;
         }
     }
@@ -404,14 +412,13 @@ pub(crate) fn assert_shard_set_deleted(
     generation_id: GenerationId,
     ec: EcShape,
 ) {
-    let pg = coord.storage_node.get_pg(shard_pg_id).unwrap();
     assert!(
         (0..(ec.k as usize + ec.m as usize)).all(|i| {
             let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
-            matches!(
-                pg.stat_shard(&shard_key),
-                Err(storage::StoreError::NotFound)
-            )
+            !coord
+                .storage_node
+                .test_shard_exists(shard_pg_id, &shard_key)
+                .unwrap()
         }),
         "expected shard-set to be reclaimed for generation {generation_id:?}"
     );

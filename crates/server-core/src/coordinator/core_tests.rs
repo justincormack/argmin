@@ -181,15 +181,11 @@ fn put_object_persists_explicit_object_owner_identity() {
         })
         .unwrap();
 
-    let meta_pg = coord
+    let live = coord
         .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
+        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
         .unwrap();
-    let live = meta_pg
-        .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-        .unwrap()
-        .into_live()
-        .expect("expected live object");
+    let live = live.into_live().expect("expected live object");
     assert_eq!(live.owner.principal, owner.principal());
     assert_eq!(live.owner.canonical_id, owner_canonical_id);
 }
@@ -247,14 +243,11 @@ fn delete_marker_persists_explicit_owner_identity() {
         ))
         .unwrap();
 
-    let meta_pg = coord
+    let marker = coord
         .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
+        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
         .unwrap();
-    let marker = match meta_pg
-        .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-        .unwrap()
-    {
+    let marker = match marker {
         StoredObject::DeleteMarker(marker) => marker,
         other => panic!("expected delete marker, got {other:?}"),
     };
@@ -298,14 +291,16 @@ fn multipart_upload_and_complete_persist_explicit_owner_identity() {
         })
         .unwrap();
 
-    let meta_pg = coord
+    let upload_record = coord
         .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
+        .test_get_multipart_upload(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &upload.upload_id,
+        )
         .unwrap();
-    let upload_record = meta_pg.get_multipart_upload(&upload.upload_id).unwrap();
     assert_eq!(upload_record.initiator, Some(expected_owner.clone()));
     assert_eq!(upload_record.owner, expected_owner);
-    drop(meta_pg);
 
     test_helpers::upload_part(
         &coord,
@@ -347,15 +342,11 @@ fn multipart_upload_and_complete_persist_explicit_owner_identity() {
         })
         .unwrap();
 
-    let meta_pg = coord
+    let live = coord
         .storage_node
-        .get_pg(coord.object_pg_id("bucket", "key"))
+        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
         .unwrap();
-    let live = meta_pg
-        .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-        .unwrap()
-        .into_live()
-        .expect("expected completed object");
+    let live = live.into_live().expect("expected completed object");
     assert_eq!(live.owner.principal, owner.principal());
     assert_eq!(live.owner.canonical_id, owner_canonical_id);
 }
@@ -2407,10 +2398,9 @@ fn delete_object_eventually_reclaims_simple_shards() {
     .unwrap();
 
     let (generation_id, ec) = {
-        let meta_pg_id = coord.object_pg_id("bucket", "key");
-        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-        match pg
-            .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+        match coord
+            .storage_node
+            .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
             .unwrap()
         {
             StoredObject::Live(record) => (record.generation_id, record.ec),
@@ -2419,7 +2409,11 @@ fn delete_object_eventually_reclaims_simple_shards() {
             }
         }
     };
-    let shard_pg_id = coord.shard_pg_id("bucket", "key", generation_id);
+    let shard_pg_id = coord.storage_node.test_shard_pg_id_for(
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("key"),
+        generation_id,
+    );
     let okh = object_key_hash(
         trusted_bucket_name("bucket").as_str(),
         trusted_object_key("key").as_str(),
@@ -2790,17 +2784,15 @@ fn shard_file_path(
     shard_index: u8,
 ) -> PathBuf {
     let (shard_pg_id, okh, generation_id) = {
-        let meta_pg_id = coord.object_pg_id(bucket, key);
-        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-        let record = pg
-            .get_object_meta(&trusted_bucket_name(bucket), &trusted_object_key(key))
+        let bucket_name = trusted_bucket_name(bucket);
+        let object_key = trusted_object_key(key);
+        let record = coord
+            .storage_node
+            .test_get_object_meta(&bucket_name, &object_key)
             .unwrap();
-        let segments = pg
-            .get_object_segments(
-                &trusted_bucket_name(bucket),
-                &trusted_object_key(key),
-                record.version_id(),
-            )
+        let segments = coord
+            .storage_node
+            .test_get_object_segments(&bucket_name, &object_key, record.version_id())
             .unwrap();
         if let Some(segment) = segments.first() {
             (
@@ -2810,10 +2802,12 @@ fn shard_file_path(
             )
         } else {
             let live = record.as_live().expect("expected live object");
-            let bucket_name = trusted_bucket_name(bucket);
-            let object_key = trusted_object_key(key);
             (
-                coord.shard_pg_id(bucket, key, live.generation_id),
+                coord.storage_node.test_shard_pg_id_for(
+                    &bucket_name,
+                    &object_key,
+                    live.generation_id,
+                ),
                 object_key_hash(bucket_name.as_str(), object_key.as_str()),
                 live.generation_id,
             )
@@ -3324,10 +3318,9 @@ fn ec_healthy_read_skips_corrupt_parity_shards() {
     .unwrap();
 
     let segment = {
-        let meta_pg_id = coord.object_pg_id("bucket", "obj7");
-        let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-        let segments = meta_pg
-            .get_object_segments(
+        let segments = coord
+            .storage_node
+            .test_get_object_segments(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("obj7"),
                 put.version_id,
@@ -3354,10 +3347,12 @@ fn ec_healthy_read_skips_corrupt_parity_shards() {
         .unwrap();
     assert_eq!(obj.body.read_all().unwrap(), data);
 
-    let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
     let parity_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), 4);
     assert!(
-        shard_pg.stat_shard(&parity_key).is_ok(),
+        coord
+            .storage_node
+            .test_shard_exists(segment.shard_pg_id, &parity_key)
+            .unwrap(),
         "healthy-path read should not touch parity shard 4"
     );
 }
@@ -3393,10 +3388,9 @@ fn ec_reconstruction_stops_after_first_needed_parity_shard() {
     .unwrap();
 
     let segment = {
-        let meta_pg_id = coord.object_pg_id("bucket", "obj8");
-        let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-        let segments = meta_pg
-            .get_object_segments(
+        let segments = coord
+            .storage_node
+            .test_get_object_segments(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("obj8"),
                 put.version_id,
@@ -3424,10 +3418,12 @@ fn ec_reconstruction_stops_after_first_needed_parity_shard() {
         .unwrap();
     assert_eq!(obj.body.read_all().unwrap(), data);
 
-    let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
     let parity_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), 5);
     assert!(
-        shard_pg.stat_shard(&parity_key).is_ok(),
+        coord
+            .storage_node
+            .test_shard_exists(segment.shard_pg_id, &parity_key)
+            .unwrap(),
         "reconstruction should stop once enough shards are present"
     );
 }

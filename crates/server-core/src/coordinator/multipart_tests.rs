@@ -32,11 +32,9 @@ fn upload_part_stream_session_count(
     upload_id: &UploadId,
     part_number: u32,
 ) -> usize {
-    let pg = coord
+    coord
         .storage_node
-        .get_pg(coord.object_pg_id(bucket, key))
-        .unwrap();
-    pg.list_all_stream_uploads()
+        .test_list_all_stream_uploads()
         .unwrap()
         .into_iter()
         .filter(|session| {

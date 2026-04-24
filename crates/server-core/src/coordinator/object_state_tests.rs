@@ -11,10 +11,17 @@ fn find_fresh_key_with_meta_pg_gt_shard_pg(
     bucket: &str,
     prefix: &str,
 ) -> String {
+    let bucket_name = trusted_bucket_name(bucket);
     for suffix in 0..1024 {
         let key = format!("{prefix}-{suffix}");
-        let meta_pg_id = coord.object_pg_id(bucket, &key);
-        let shard_pg_id = coord.shard_pg_id(bucket, &key, GenerationId::MIN);
+        let object_key = trusted_object_key(&key);
+        let meta_pg_id = coord
+            .storage_node
+            .test_object_pg_id_for(&bucket_name, &object_key);
+        let shard_pg_id =
+            coord
+                .storage_node
+                .test_shard_pg_id_for(&bucket_name, &object_key, GenerationId::MIN);
         if meta_pg_id > shard_pg_id {
             return key;
         }
@@ -23,10 +30,14 @@ fn find_fresh_key_with_meta_pg_gt_shard_pg(
 }
 
 fn assert_object_maps_meta_pg_gt_shard_pg(coord: &Coordinator, bucket: &str, key: &str) {
-    let meta_pg_id = coord.object_pg_id(bucket, key);
-    let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-    let generation_id = match meta_pg
-        .get_object_meta(&trusted_bucket_name(bucket), &trusted_object_key(key))
+    let bucket_name = trusted_bucket_name(bucket);
+    let object_key = trusted_object_key(key);
+    let meta_pg_id = coord
+        .storage_node
+        .test_object_pg_id_for(&bucket_name, &object_key);
+    let generation_id = match coord
+        .storage_node
+        .test_get_object_meta(&bucket_name, &object_key)
         .unwrap()
     {
         StoredObject::Live(record) => record.generation_id,
@@ -34,7 +45,10 @@ fn assert_object_maps_meta_pg_gt_shard_pg(coord: &Coordinator, bucket: &str, key
             panic!("expected live object for {bucket}/{key}, got {other:?}")
         }
     };
-    let shard_pg_id = coord.shard_pg_id(bucket, key, generation_id);
+    let shard_pg_id =
+        coord
+            .storage_node
+            .test_shard_pg_id_for(&bucket_name, &object_key, generation_id);
     assert!(
             meta_pg_id > shard_pg_id,
             "expected test object {bucket}/{key} to map to old read slow path: meta_pg_id={meta_pg_id} shard_pg_id={shard_pg_id}"
