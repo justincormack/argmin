@@ -145,6 +145,34 @@ pattern.
 - `crates/storage/src/node/bucket_ops.rs:84`
 - `crates/storage/src/node/bucket_ops.rs:422`
 
+### Bucket Drain Notes
+
+These loops are part of the bucket write-reservation / drain protocol.
+
+- normal bucket-scoped write flows acquire a per-bucket write reservation
+- bucket drain/delete flips `write_reservations_blocked = 1`, which prevents
+  new reservations
+- drain then waits for `active_write_reservations == 0` before the destructive
+  transition can continue
+
+This means there are two distinct cases:
+
+- delete/drain path waiting for already-in-flight reserved work to finish:
+  this waiting is semantically required
+- fresh request path attempting to acquire a new reservation while drain is
+  active: this should likely fail immediately, not poll
+
+So the likely target behavior is:
+
+- keep explicit coordination for the drain/delete path, but replace the
+  `sleep(1ms)` polling with a better state-change/wakeup mechanism
+- stop retrying `BucketWriteDraining` on request paths like
+  `with_bucket_write_reservation_snapshot(...)`; surface a typed error instead
+
+The implementation work should preserve the invariant that `DeleteBucket`
+waits only for work that was already admitted before drain started, while new
+bucket-scoped requests are rejected once drain is active.
+
 ## Order
 
 Recommended order:
