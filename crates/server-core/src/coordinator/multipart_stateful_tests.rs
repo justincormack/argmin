@@ -1,4 +1,5 @@
 use super::test_helpers;
+use super::test_topology::*;
 use super::*;
 use crate::conditional::ReadCondition;
 use crate::metadata_blob::MetadataBlob;
@@ -476,14 +477,8 @@ fn begin_stream_put_with_segment_path(
     for suffix in 0..256 {
         let key = format!("{key_prefix}-{suffix}");
         let session_id = begin_stream_put_test(coord, bucket, &key).unwrap();
-        let meta_pg_id = coord
-            .storage_node
-            .test_object_pg_id_for(&trusted_bucket_name(bucket), &trusted_object_key(&key));
-        let first_vid_pg =
-            coord.shard_pg_id_raw(&format!("segment/{}", session_id.as_str()), "0", 1);
-        let second_vid_pg =
-            coord.shard_pg_id_raw(&format!("segment/{}", session_id.as_str()), "0", 2);
-        let has_cross_pg = first_vid_pg != meta_pg_id || second_vid_pg != meta_pg_id;
+        let has_cross_pg =
+            stream_put_session_has_cross_pg_segments(coord, bucket, &key, &session_id);
         if has_cross_pg == require_cross_pg {
             return (key, session_id);
         }
@@ -511,24 +506,15 @@ fn run_stream_duplicate_segment_race_invariant_test(pg_count: u32, require_cross
 
     let (key, session_id) =
         begin_stream_put_with_segment_path(&admin, "bucket", "stream-race", require_cross_pg);
-    let meta_pg_id = admin
-        .storage_node
-        .test_object_pg_id_for(&trusted_bucket_name("bucket"), &trusted_object_key(&key));
-    let first_vid_pg = admin.shard_pg_id_raw(&format!("segment/{}", session_id.as_str()), "0", 1);
-    let second_vid_pg = admin.shard_pg_id_raw(&format!("segment/{}", session_id.as_str()), "0", 2);
     if require_cross_pg {
         assert!(
-            first_vid_pg != meta_pg_id || second_vid_pg != meta_pg_id,
+            stream_put_session_has_cross_pg_segments(&admin, "bucket", &key, &session_id),
             "{invariant}: expected the staged payloads to span PGs for the cross-PG case"
         );
     } else {
-        assert_eq!(
-            first_vid_pg, meta_pg_id,
-            "{invariant}: expected same-PG case to stage the first payload in the metadata PG"
-        );
-        assert_eq!(
-            second_vid_pg, meta_pg_id,
-            "{invariant}: expected same-PG case to stage the second payload in the metadata PG"
+        assert!(
+            !stream_put_session_has_cross_pg_segments(&admin, "bucket", &key, &session_id),
+            "{invariant}: expected same-PG case to stage both payloads in the metadata PG"
         );
     }
 

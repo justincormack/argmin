@@ -1,5 +1,6 @@
 use super::test_helpers::{self, UploadPartRequest};
 use super::test_support::*;
+use super::test_topology::*;
 use super::*;
 use crate::conditional::{DeleteCondition, ReadCondition, SpecificEtag, WriteCondition};
 use crate::sse::SSE_C_CUSTOMER_KEY_LEN;
@@ -3492,16 +3493,7 @@ fn completed_multipart_tombstone_prune_limit_is_global_across_object_pgs() {
 
     let older_key = find_key_with_object_pg_eq_bucket_pg(&coord, "bucket", "bucket-pg");
     let newer_key = find_key_with_object_pg_ne_bucket_pg(&coord, "bucket", "other-pg");
-    assert_ne!(
-        coord.storage_node.test_object_pg_id_for(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key(&older_key),
-        ),
-        coord.storage_node.test_object_pg_id_for(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key(&newer_key),
-        )
-    );
+    assert!(object_pgs_differ(&coord, "bucket", &older_key, &newer_key));
 
     let (older_upload_id, older_parts) =
         create_upload_with_parts(&coord, "bucket", &older_key, &[(1, b"older")]);

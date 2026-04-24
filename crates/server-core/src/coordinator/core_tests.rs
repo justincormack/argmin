@@ -1,5 +1,6 @@
 use super::test_helpers::{self, UploadPartRequest};
 use super::test_support::*;
+use super::test_topology::*;
 use super::*;
 use crate::conditional::{DeleteCondition, SpecificEtag, WriteCondition};
 use crate::coordinator::bucket_handles::BucketHandleRequest;
@@ -896,24 +897,6 @@ fn list_object_versions_clamps_oversized_max_keys() {
 
 #[test]
 fn list_object_versions_paginates_across_pgs() {
-    fn key_for_prefix_on_distinct_pg(
-        coord: &Coordinator,
-        bucket: &str,
-        prefix: &str,
-        excluded_pg_ids: &[u32],
-    ) -> String {
-        for index in 0..10_000 {
-            let key = format!("{prefix}-{index:04}");
-            let pg_id = coord
-                .storage_node
-                .test_object_pg_id_for(&trusted_bucket_name(bucket), &trusted_object_key(&key));
-            if !excluded_pg_ids.contains(&pg_id) {
-                return key;
-            }
-        }
-        panic!("failed to find key for prefix {prefix}");
-    }
-
     let tmp = test_util::tempdir();
     let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 2, 5]).unwrap());
     let coord = setup_coordinator_with_shared_storage(storage_node);
@@ -932,15 +915,11 @@ fn list_object_versions_paginates_across_pgs() {
     )
     .unwrap();
 
-    let key_a = key_for_prefix_on_distinct_pg(&coord, "bucket", "a", &[]);
-    let pg_a = coord
-        .storage_node
-        .test_object_pg_id_for(&trusted_bucket_name("bucket"), &trusted_object_key(&key_a));
-    let key_b = key_for_prefix_on_distinct_pg(&coord, "bucket", "b", &[pg_a]);
-    let pg_b = coord
-        .storage_node
-        .test_object_pg_id_for(&trusted_bucket_name("bucket"), &trusted_object_key(&key_b));
-    let key_c = key_for_prefix_on_distinct_pg(&coord, "bucket", "c", &[pg_a, pg_b]);
+    let key_a = find_key_with_object_pg_distinct_from(&coord, "bucket", "a", &[]);
+    let pg_a = object_pg_id(&coord, "bucket", &key_a);
+    let key_b = find_key_with_object_pg_distinct_from(&coord, "bucket", "b", &[pg_a]);
+    let pg_b = object_pg_id(&coord, "bucket", &key_b);
+    let key_c = find_key_with_object_pg_distinct_from(&coord, "bucket", "c", &[pg_a, pg_b]);
 
     let older_a = test_helpers::put_object(
         &coord,
@@ -1992,15 +1971,7 @@ fn complete_multipart_upload_does_not_deadlock_when_bucket_policy_shares_pg() {
     .unwrap();
     admin.clear_bucket_policy_cache(&trusted_bucket_name(bucket));
 
-    let bucket_pg_id = storage_node.test_bucket_pg_id_for(&trusted_bucket_name(bucket));
-    let key = (0..1024)
-        .map(|i| format!("same-pg-{i}"))
-        .find(|candidate| {
-            storage_node
-                .test_object_pg_id_for(&trusted_bucket_name(bucket), &trusted_object_key(candidate))
-                == bucket_pg_id
-        })
-        .expect("expected to find a key whose object PG matches the bucket PG");
+    let key = find_key_with_object_pg_eq_bucket_pg(&admin, bucket, "same-pg");
 
     let (upload_id, parts) = create_upload_with_parts(&admin, bucket, &key, &[(1, b"part")]);
 
@@ -2428,11 +2399,7 @@ fn delete_object_eventually_reclaims_simple_shards() {
             }
         }
     };
-    let shard_pg_id = coord.storage_node.test_shard_pg_id_for(
-        &trusted_bucket_name("bucket"),
-        &trusted_object_key("key"),
-        generation_id,
-    );
+    let shard_pg_id = shard_pg_id(&coord, "bucket", "key", generation_id);
     let okh = object_key_hash(
         trusted_bucket_name("bucket").as_str(),
         trusted_object_key("key").as_str(),
@@ -2822,9 +2789,10 @@ fn shard_file_path(
         } else {
             let live = record.as_live().expect("expected live object");
             (
-                coord.storage_node.test_shard_pg_id_for(
-                    &bucket_name,
-                    &object_key,
+                shard_pg_id(
+                    coord,
+                    bucket_name.as_str(),
+                    object_key.as_str(),
                     live.generation_id,
                 ),
                 object_key_hash(bucket_name.as_str(), object_key.as_str()),

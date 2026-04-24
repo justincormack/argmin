@@ -1153,6 +1153,24 @@ Expected migration direction:
   test-only helpers
 - preserve explicit test determinism and blocking probes, but keep them
   storage-owned and test-only rather than exposing raw PG guards again
+- where topology-aware setup is still needed in `server-core` tests, centralize
+  it in an explicit helper seam rather than scattering raw PG-id arithmetic
+  across many test files
+
+Current topology-helper structure:
+
+- the remaining storage-owned topology queries are now intentionally
+  concentrated behind `coordinator/test_topology.rs`
+- normal test files should call intent-shaped helpers from that module, such
+  as:
+  - same-PG vs cross-PG key selection
+  - meta-PG vs shard-PG path selection
+  - stream-session cross-PG predicates
+- this is an intermediate containment step:
+  - it removes scattered PG-awareness from the test surface
+  - it makes the remaining topology coupling explicit and reviewable
+  - it leaves one clear place to replace raw PG-id comparisons with more
+    abstract storage-owned topology selectors later if desired
 
 Likely helper families needed in `storage`:
 

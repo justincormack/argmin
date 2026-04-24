@@ -353,46 +353,6 @@ pub(crate) fn wait_until_bucket_gone(coord: &Coordinator, name: &str) {
     panic!("bucket {name} was not fully removed");
 }
 
-pub(crate) fn find_key_with_object_pg_ne_bucket_pg(
-    coord: &Coordinator,
-    bucket: &str,
-    prefix: &str,
-) -> String {
-    let bucket_name = trusted_bucket_name(bucket);
-    let bucket_pg_id = coord.storage_node.test_bucket_pg_id_for(&bucket_name);
-    for suffix in 0..1024 {
-        let key = format!("{prefix}-{suffix}");
-        if coord
-            .storage_node
-            .test_object_pg_id_for(&bucket_name, &trusted_object_key(&key))
-            != bucket_pg_id
-        {
-            return key;
-        }
-    }
-    panic!("failed to find a key with object_pg_id != bucket_pg_id");
-}
-
-pub(crate) fn find_key_with_object_pg_eq_bucket_pg(
-    coord: &Coordinator,
-    bucket: &str,
-    prefix: &str,
-) -> String {
-    let bucket_name = trusted_bucket_name(bucket);
-    let bucket_pg_id = coord.storage_node.test_bucket_pg_id_for(&bucket_name);
-    for suffix in 0..1024 {
-        let key = format!("{prefix}-{suffix}");
-        if coord
-            .storage_node
-            .test_object_pg_id_for(&bucket_name, &trusted_object_key(&key))
-            == bucket_pg_id
-        {
-            return key;
-        }
-    }
-    panic!("failed to find a key with object_pg_id == bucket_pg_id");
-}
-
 pub(crate) fn reclaim_object_payload(
     coord: &Coordinator,
     bucket: &str,

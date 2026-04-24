@@ -335,3 +335,5 @@ mod streaming;
 mod test_hooks;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod test_topology;
