@@ -21,7 +21,7 @@ correctness and maintainability issue, but it is the same bad pattern family.
 
 ## Status
 
-Status: in progress.
+Status: completed.
 
 ## Goals
 
@@ -121,7 +121,7 @@ remaining `recv_timeout(...)` or sleep-based waits in those harnesses.
 
 ## Phase 3: Remove Production Sleep Loops
 
-Status: next.
+Status: completed.
 
 Production sleeps are not a test flake issue, but they are still the wrong
 pattern.
@@ -196,11 +196,20 @@ elimination of potentially long waits.
   must wait for already-admitted reservations to drain, and those metadata
   operations can still be delayed by IO stalls, lock contention, or hung work
 
-So Phase 3 remains in progress:
+Phase 3 is complete for the original scope of this plan:
 
 - post-terminal request polling is gone
-- transient-drain waiting is still potentially long and needs a stronger
-  coordination or rejection policy if we want to remove that risk entirely
+- the `sleep(1ms)` polling loops in `bucket_ops.rs` were replaced with
+  bucket-scoped coordination wakeups instead of timing-based retries
+
+What remains is a follow-on design question, not unfinished scope in this
+plan:
+
+- transient-drain waiting is still potentially long in principle, even though
+  it no longer uses polling
+- whether that should become bounded wait plus retryable `5xx`, or immediate
+  failure in some cases, is tracked separately in
+  `plans/retry-semantics-plan.md`
 
 ## Order
 

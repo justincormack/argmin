@@ -91,7 +91,7 @@ Initial candidates to examine:
 
 ## Relationship To Other Plans
 
-- `plans/deterministic-test-and-sleep-cleanup-plan.md`
+- `plans/completed/deterministic-test-and-sleep-cleanup-plan.md`
   This plan identifies and removes timing-based waiting patterns. That work may
   reveal request paths where the right long-term behavior is not “better local
   waiting” but “bounded wait then retryable failure”.
@@ -110,4 +110,3 @@ Current working position:
   delete is terminal
 - treat “transient coordination wait might be better as retryable `5xx` after a
   short budget” as an explicit future design question
-

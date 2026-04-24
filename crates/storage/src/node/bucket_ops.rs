@@ -61,8 +61,14 @@ impl SharedStorageNode {
             match PgMetadataStore::begin_bucket_write_drain(&*bucket_pg, bucket) {
                 Ok(()) => break,
                 Err(crate::error::MetadataError::BucketWriteDraining) => {
+                    let (generation_lock, generation_cvar) =
+                        &self.bucket_coordination[self.bucket_lock_index(bucket)];
+                    let mut generation = generation_lock.lock().unwrap();
+                    let observed_generation = *generation;
                     drop(bucket_pg);
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    while *generation == observed_generation {
+                        generation = generation_cvar.wait(generation).unwrap();
+                    }
                 }
                 Err(other) => return Err(other.into()),
             }
@@ -79,9 +85,15 @@ impl SharedStorageNode {
                     persisted: false,
                 });
             }
+            let (generation_lock, generation_cvar) =
+                &self.bucket_coordination[self.bucket_lock_index(bucket)];
+            let mut generation = generation_lock.lock().unwrap();
+            let observed_generation = *generation;
             super::maybe_run_bucket_write_drain_wait_hook(bucket);
             drop(bucket_pg);
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            while *generation == observed_generation {
+                generation = generation_cvar.wait(generation).unwrap();
+            }
         }
     }
 
@@ -139,6 +151,8 @@ impl SharedStorageNode {
         let pg_id = self.pg_topology.bucket_pg_for(bucket);
         let bucket_pg = self.get_pg(pg_id)?;
         PgMetadataStore::mark_bucket_deleting(&*bucket_pg, bucket)?;
+        drop(bucket_pg);
+        self.notify_bucket_coordination_change(bucket);
         Ok(())
     }
 
@@ -419,6 +433,10 @@ impl SharedStorageNode {
                 }
                 Err(crate::error::MetadataError::BucketWriteDraining) => {
                     super::maybe_run_bucket_write_reservation_retry_hook(bucket);
+                    let (generation_lock, generation_cvar) =
+                        &self.bucket_coordination[self.bucket_lock_index(bucket)];
+                    let mut generation = generation_lock.lock().unwrap();
+                    let observed_generation = *generation;
                     match PgMetadataStore::head_bucket(&*bucket_pg, bucket) {
                         Ok(_) => {}
                         Err(crate::error::MetadataError::BucketNotFound { .. }) => {
@@ -431,7 +449,9 @@ impl SharedStorageNode {
                     }
                     drop(bucket_pg);
                     super::maybe_run_after_bucket_write_reservation_retry_hook(bucket);
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    while *generation == observed_generation {
+                        generation = generation_cvar.wait(generation).unwrap();
+                    }
                 }
                 Err(other) => return Err(other.into()),
             }
@@ -574,6 +594,8 @@ impl SharedStorageNode {
         let pg_id = self.pg_topology.bucket_pg_for(bucket);
         let bucket_pg = self.get_pg(pg_id)?;
         PgMetadataStore::release_bucket_write_reservation(&*bucket_pg, bucket)?;
+        drop(bucket_pg);
+        self.notify_bucket_coordination_change(bucket);
         Ok(())
     }
 
@@ -584,6 +606,8 @@ impl SharedStorageNode {
         let pg_id = self.pg_topology.bucket_pg_for(bucket);
         let bucket_pg = self.get_pg(pg_id)?;
         PgMetadataStore::end_bucket_write_drain(&*bucket_pg, bucket)?;
+        drop(bucket_pg);
+        self.notify_bucket_coordination_change(bucket);
         Ok(())
     }
 

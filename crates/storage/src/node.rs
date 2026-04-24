@@ -301,6 +301,7 @@ pub struct SharedStorageNode {
     pg_topology: PgTopology,
     data_dir: PathBuf,
     bucket_locks: Vec<Mutex<()>>,
+    bucket_coordination: Vec<(Mutex<u64>, Condvar)>,
     multipart_completion_locks: Vec<Mutex<()>>,
     bucket_fast_path: RwLock<HashMap<BucketName, BucketFastPathInfo>>,
     object_payload_leases: Mutex<HashMap<(BucketName, ObjectKey, GenerationId), usize>>,
@@ -371,6 +372,10 @@ impl SharedStorageNode {
         for _ in 0..BUCKET_LOCK_STRIPES {
             bucket_locks.push(Mutex::new(()));
         }
+        let mut bucket_coordination = Vec::with_capacity(BUCKET_LOCK_STRIPES);
+        for _ in 0..BUCKET_LOCK_STRIPES {
+            bucket_coordination.push((Mutex::new(0), Condvar::new()));
+        }
         let mut multipart_completion_locks = Vec::with_capacity(BUCKET_LOCK_STRIPES);
         for _ in 0..BUCKET_LOCK_STRIPES {
             multipart_completion_locks.push(Mutex::new(()));
@@ -383,6 +388,7 @@ impl SharedStorageNode {
             pg_topology: PgTopology::new(pg_ids).expect("shared storage node must have PGs"),
             data_dir: data_dir.to_path_buf(),
             bucket_locks,
+            bucket_coordination,
             multipart_completion_locks,
             bucket_fast_path: RwLock::new(HashMap::new()),
             object_payload_leases: Mutex::new(HashMap::new()),
@@ -416,6 +422,14 @@ impl SharedStorageNode {
         (rapidhash_v3_micro_inline::<true, false>(bucket.as_str().as_bytes(), &RAPIDHASH_SECRETS)
             as usize)
             % self.bucket_locks.len()
+    }
+
+    fn notify_bucket_coordination_change(&self, bucket: &BucketName) {
+        let idx = self.bucket_lock_index(bucket);
+        let (generation_lock, generation_cvar) = &self.bucket_coordination[idx];
+        let mut generation = generation_lock.lock().unwrap();
+        *generation += 1;
+        generation_cvar.notify_all();
     }
 
     /// Return the cached active-bucket fast-path metadata for `bucket`.
@@ -1653,8 +1667,6 @@ mod tests {
             *released = true;
             cvar.notify_all();
         }
-        delete_handle.join().unwrap();
-        delete_rx.recv().unwrap().unwrap();
         {
             let (lock, cvar) = &*retry_release;
             let mut released = lock.lock().unwrap();
@@ -1671,6 +1683,8 @@ mod tests {
             }
             other => panic!("expected BucketNotFound completion, got {other:?}"),
         }
+        delete_handle.join().unwrap();
+        delete_rx.recv().unwrap().unwrap();
         request_handle.join().unwrap();
     }
 
