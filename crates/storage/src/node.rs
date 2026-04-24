@@ -287,7 +287,8 @@ impl LocalStorageNode {
     ///
     /// This returns the full PgStore which implements both ShardStore
     /// and PgMetadataStore.
-    pub fn get_pg(&self, pg_id: u32) -> Result<&PgStore, StoreError> {
+    #[cfg(test)]
+    pub(crate) fn get_pg(&self, pg_id: u32) -> Result<&PgStore, StoreError> {
         observability::trace_scope!(TRACE_TARGET, "LocalStorageNode::get_pg", "pg_id={}", pg_id);
         self.stores
             .get(&pg_id)
@@ -1096,7 +1097,7 @@ impl SharedStorageNode {
     }
 
     /// Lock and return a guard for the given PG.
-    pub fn get_pg(&self, pg_id: u32) -> Result<MutexGuard<'_, PgStore>, StoreError> {
+    pub(crate) fn get_pg(&self, pg_id: u32) -> Result<MutexGuard<'_, PgStore>, StoreError> {
         observability::trace_scope!(TRACE_TARGET, "SharedStorageNode::get_pg", "pg_id={}", pg_id);
         let mutex = self
             .stores
@@ -1446,7 +1447,7 @@ impl SharedStorageNode {
     /// ID order to prevent deadlocks and returns `(lower_guard, Some(higher_guard))`.
     ///
     /// The first returned guard corresponds to `pg_a`, the second to `pg_b`.
-    pub fn lock_two_pgs(
+    pub(crate) fn lock_two_pgs(
         &self,
         pg_a: u32,
         pg_b: u32,
