@@ -370,6 +370,18 @@ impl SharedStorageNode {
         BucketLockGuard { guard }
     }
 
+    #[cfg(test)]
+    pub fn try_lock_bucket(&self, bucket: &BucketName) -> Option<BucketLockGuard<'_>> {
+        let idx = self.bucket_lock_index(bucket);
+        match self.bucket_locks[idx].try_lock() {
+            Ok(guard) => Some(BucketLockGuard { guard }),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(error)) => Some(BucketLockGuard {
+                guard: error.into_inner(),
+            }),
+        }
+    }
+
     /// Lock a bucket-scoped stripe mutex used to serialize multipart
     /// completion publication order across coordinators.
     pub fn lock_multipart_completion_bucket(&self, bucket: &BucketName) -> BucketLockGuard<'_> {
@@ -1511,25 +1523,19 @@ mod tests {
 
     #[test]
     fn shared_node_bucket_lock_same_bucket_blocks() {
-        use std::sync::mpsc::channel;
-        use std::time::Duration;
-
         let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
 
-        let (tx, rx) = channel();
-        std::thread::scope(|s| {
-            let guard = node.lock_bucket(&bucket_name("bucket-a"));
-            s.spawn(|| {
-                let _g2 = node.lock_bucket(&bucket_name("bucket-a"));
-                tx.send(()).unwrap();
-            });
-
-            // Second lock on same bucket should block while first guard is held.
-            assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
-            drop(guard);
-            rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        });
+        let guard = node.lock_bucket(&bucket_name("bucket-a"));
+        assert!(
+            node.try_lock_bucket(&bucket_name("bucket-a")).is_none(),
+            "second lock on same bucket should be blocked while first guard is held"
+        );
+        drop(guard);
+        assert!(
+            node.try_lock_bucket(&bucket_name("bucket-a")).is_some(),
+            "bucket lock should become acquirable again after the first guard is dropped"
+        );
     }
 
     #[test]

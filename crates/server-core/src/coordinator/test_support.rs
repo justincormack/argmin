@@ -4,8 +4,6 @@ use crate::conditional::{DeleteCondition, ReadCondition, WriteCondition};
 use crate::sse::{ManagedWrappingKeyConfig, StaticManagedKeyProvider, SSE_C_CUSTOMER_KEY_LEN};
 use std::path::Path;
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
 pub(crate) const NO_READ: &ReadCondition = &ReadCondition {
     if_match: None,
@@ -290,6 +288,10 @@ pub(crate) fn begin_stream_put_with_authorized_request_test<'a>(
 
 pub(crate) fn wait_until_bucket_gone(coord: &Coordinator, name: &str) {
     for _ in 0..200 {
+        coord
+            .read_runtime()
+            .try_finalize_bucket_delete_for(&trusted_bucket_name(name))
+            .unwrap();
         if matches!(
             coord.unchecked_active_bucket_summary(name),
             Err(ServerError::BucketNotFound { .. })
@@ -302,7 +304,6 @@ pub(crate) fn wait_until_bucket_gone(coord: &Coordinator, name: &str) {
                 return;
             }
         }
-        thread::sleep(Duration::from_millis(5));
     }
     panic!("bucket {name} was not fully removed");
 }

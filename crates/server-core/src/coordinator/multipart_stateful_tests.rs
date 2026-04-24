@@ -335,6 +335,24 @@ impl<'a> InvariantHarness<'a> {
         meta_pg.list_stream_segments(session_id).unwrap()
     }
 
+    fn force_stream_session_created_at(
+        &self,
+        bucket: &str,
+        key: &str,
+        session_id: &SessionId,
+        created_at: u64,
+    ) {
+        let meta_pg_id = self.coord.object_pg_id(bucket, key);
+        let meta_pg = self.coord.storage_node.get_pg(meta_pg_id).unwrap();
+        meta_pg
+            .connection()
+            .execute(
+                "UPDATE stream_uploads SET created_at = ?1 WHERE session_id = ?2",
+                (created_at as i64, session_id.as_str()),
+            )
+            .unwrap();
+    }
+
     fn assert_no_active_stream_sessions_for(&self, bucket: &str, key: &str, invariant: &str) {
         let sessions = self.active_stream_sessions_for(bucket, key);
         assert!(
@@ -826,7 +844,7 @@ fn scavenging_stale_sessions_removes_abandoned_streaming_state() {
         .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"data")
         .unwrap();
 
-    std::thread::sleep(std::time::Duration::from_millis(5));
+    state.force_stream_session_created_at("bucket", "key", &session_id, 0);
     let count = coord.scavenge_stale_sessions(1);
     assert_eq!(
         count, 1,
@@ -1210,7 +1228,7 @@ fn failed_stream_put_finalize_is_scavenged_without_visibility_or_orphans() {
     );
     state.assert_no_pending_reclaim_roots_for("bucket", "key", invariant);
 
-    std::thread::sleep(std::time::Duration::from_millis(5));
+    state.force_stream_session_created_at("bucket", "key", &session_id, 0);
     let count = coord.scavenge_stale_sessions(1);
     assert_eq!(
         count, 1,
@@ -1297,7 +1315,7 @@ fn failed_stream_part_finalize_is_scavenged_without_visible_part_or_orphans() {
         "{invariant}: failed part finalize should leave exactly one stale session to scavenge"
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(5));
+    state.force_stream_session_created_at("bucket", "key", &session_id, 0);
     let count = coord.scavenge_stale_sessions(1);
     assert_eq!(
         count, 1,
@@ -1324,30 +1342,10 @@ fn dropping_a_read_only_payload_lease_does_not_enqueue_reclaim_work() {
 
     drop(runtime.acquire_object_payload_lease("bucket", "key", generation_id));
 
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let waiter_stop = Arc::clone(&stop);
-    let waiter_node = Arc::clone(&runtime.storage_node);
-    let (tx, rx) = std::sync::mpsc::channel();
-    let waiter = std::thread::spawn(move || {
-        tx.send(waiter_node.wait_for_reclaim_work(&waiter_stop))
-            .unwrap();
-    });
-
     assert!(
-        rx.recv_timeout(std::time::Duration::from_millis(50))
-            .is_err(),
+        runtime.storage_node.try_take_reclaim_work().is_none(),
         "{invariant}: unexpected reclaim work appeared after dropping a read-only lease"
     );
-
-    stop.store(true, std::sync::atomic::Ordering::SeqCst);
-    runtime.storage_node.wake_reclaim_workers();
-    assert!(
-        rx.recv_timeout(std::time::Duration::from_millis(500))
-            .unwrap()
-            .is_none(),
-        "{invariant}: wake-up after stopping should not surface reclaim work"
-    );
-    waiter.join().unwrap();
 }
 
 #[test]
