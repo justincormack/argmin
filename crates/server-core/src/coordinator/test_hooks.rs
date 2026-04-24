@@ -33,8 +33,12 @@ pub(super) struct BucketWriteHandleTestHooks {
     pub(super) after_loaded: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) probe_direct_put_commit: bool,
     pub(super) probe_begin_stream_part_session: bool,
+    pub(super) probe_finalize_stream_part_commit: bool,
     pub(super) probe_finalize_stream_put_commit: bool,
     pub(super) probe_bucket_mutation_write: bool,
+    pub(super) probe_object_read_snapshot: bool,
+    pub(super) probe_object_metadata_access: bool,
+    pub(super) probe_delete_object_lookup: bool,
 }
 
 pub(super) static BUCKET_WRITE_HANDLE_TEST_HOOKS: OnceLock<Mutex<BucketWriteHandleTestHooks>> =
@@ -292,8 +296,24 @@ pub(super) fn should_probe_finalize_stream_put_commit(bucket: &str) -> bool {
     bucket_write_handle_test_hooks_for(bucket).probe_finalize_stream_put_commit
 }
 
+pub(super) fn should_probe_finalize_stream_part_commit(bucket: &str) -> bool {
+    bucket_write_handle_test_hooks_for(bucket).probe_finalize_stream_part_commit
+}
+
 pub(super) fn should_probe_bucket_mutation_write(bucket: &str) -> bool {
     bucket_write_handle_test_hooks_for(bucket).probe_bucket_mutation_write
+}
+
+pub(super) fn should_probe_object_read_snapshot(bucket: &str) -> bool {
+    bucket_write_handle_test_hooks_for(bucket).probe_object_read_snapshot
+}
+
+pub(super) fn should_probe_object_metadata_access(bucket: &str) -> bool {
+    bucket_write_handle_test_hooks_for(bucket).probe_object_metadata_access
+}
+
+pub(super) fn should_probe_delete_object_lookup(bucket: &str) -> bool {
+    bucket_write_handle_test_hooks_for(bucket).probe_delete_object_lookup
 }
 
 pub(super) fn should_probe_multipart_complete_auth_lookup(bucket: &str, key: &str) -> bool {

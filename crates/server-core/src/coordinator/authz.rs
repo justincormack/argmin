@@ -71,7 +71,8 @@ use super::response_types::{BucketSummary, GetBucketAclResult};
 #[cfg(test)]
 use super::{
     maybe_run_bucket_policy_fast_path_hook, maybe_run_bucket_policy_storage_load_hook,
-    maybe_run_bucket_write_handle_loaded_hook, should_probe_multipart_complete_auth_lookup,
+    maybe_run_bucket_write_handle_loaded_hook, should_probe_delete_object_lookup,
+    should_probe_multipart_complete_auth_lookup, should_probe_object_read_snapshot,
 };
 use super::{read_rwlock_unpoisoned, write_rwlock_unpoisoned, Coordinator};
 use crate::error::ServerError;
@@ -3666,6 +3667,19 @@ impl Coordinator {
         let bucket_info = ValidatedBucket(bucket_handle.bucket().clone());
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket_handle)?;
         let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket_handle)?;
+        #[cfg(test)]
+        if should_probe_delete_object_lookup(bucket.as_str()) {
+            let object_pg_ready = self
+                .storage_node
+                .try_probe_object_pg_available(bucket, key)
+                .map_err(Self::map_object_pg_action_error)?;
+            if !object_pg_ready {
+                return Err(ServerError::InternalError {
+                    reason: "test probe: object pg still locked before delete_object lookup"
+                        .to_string(),
+                });
+            }
+        }
 
         match (bucket_info.versioning, request_version_id) {
             (BucketVersioningState::Disabled, _) => {
@@ -4422,6 +4436,27 @@ impl Coordinator {
             req.key.as_str(),
             req.version_id,
         )?;
+        #[cfg(test)]
+        if should_probe_object_read_snapshot(bucket.bucket().name.as_str()) {
+            let object_pg_ready = self
+                .storage_node
+                .try_probe_object_pg_available(&bucket.bucket().name, req.key)
+                .map_err(|error| {
+                    Self::map_object_read_snapshot_error(
+                        &bucket.bucket().name,
+                        req.key,
+                        req.version_id,
+                        can_discover_missing,
+                        error,
+                    )
+                })?;
+            if !object_pg_ready {
+                return Err(ServerError::InternalError {
+                    reason: "test probe: object pg still locked before object read snapshot"
+                        .to_string(),
+                });
+            }
+        }
         let outcome = self
             .storage_node
             .load_object_read_snapshot_if(

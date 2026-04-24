@@ -5,6 +5,8 @@ use s3_types::{
 use storage::{BucketName, ObjectKey, ObjectLockState};
 
 use super::authz::BucketPolicyAccess;
+#[cfg(test)]
+use super::should_probe_object_metadata_access;
 use super::{
     BucketSummary, Coordinator, GetObjectAclResult, ObjectVersionRequest, PutObjectAclInput,
     PutObjectAclRequest, PutObjectLegalHoldRequest, PutObjectRetentionRequest,
@@ -282,6 +284,27 @@ impl Coordinator {
         } = self.load_object_metadata_policy_context(bucket, req.object.expected_bucket_owner())?;
         let can_discover_missing =
             Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
+        #[cfg(test)]
+        if should_probe_object_metadata_access(bucket.as_str()) {
+            let object_pg_ready = self
+                .storage_node
+                .try_probe_object_pg_available(bucket, key)
+                .map_err(|error| {
+                    Self::map_object_metadata_access_error(
+                        bucket,
+                        key,
+                        req.object.version_id,
+                        can_discover_missing,
+                        error,
+                    )
+                })?;
+            if !object_pg_ready {
+                return Err(ServerError::InternalError {
+                    reason: "test probe: object pg still locked before object metadata access"
+                        .to_string(),
+                });
+            }
+        }
         self.storage_node
             .put_object_tags_if(bucket, key, req.object.version_id, req.tags, |stored| {
                 if !self.requester_can_manage_object_tags_with_bucket_policy(
@@ -406,6 +429,27 @@ impl Coordinator {
         } = self.load_object_metadata_policy_context(bucket, req.expected_bucket_owner())?;
         let can_discover_missing =
             Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
+        #[cfg(test)]
+        if should_probe_object_metadata_access(bucket.as_str()) {
+            let object_pg_ready = self
+                .storage_node
+                .try_probe_object_pg_available(bucket, key)
+                .map_err(|error| {
+                    Self::map_object_metadata_access_error(
+                        bucket,
+                        key,
+                        req.version_id,
+                        can_discover_missing,
+                        error,
+                    )
+                })?;
+            if !object_pg_ready {
+                return Err(ServerError::InternalError {
+                    reason: "test probe: object pg still locked before object metadata access"
+                        .to_string(),
+                });
+            }
+        }
         self.storage_node
             .get_object_retention_if(bucket, key, req.version_id, |stored| {
                 if !self.requester_can_manage_object_lock_with_bucket_policy(
@@ -552,6 +596,27 @@ impl Coordinator {
         } = self.load_object_metadata_policy_context(bucket, req.expected_bucket_owner())?;
         let can_discover_missing =
             Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
+        #[cfg(test)]
+        if should_probe_object_metadata_access(bucket.as_str()) {
+            let object_pg_ready = self
+                .storage_node
+                .try_probe_object_pg_available(bucket, key)
+                .map_err(|error| {
+                    Self::map_object_metadata_access_error(
+                        bucket,
+                        key,
+                        req.version_id,
+                        can_discover_missing,
+                        error,
+                    )
+                })?;
+            if !object_pg_ready {
+                return Err(ServerError::InternalError {
+                    reason: "test probe: object pg still locked before object metadata access"
+                        .to_string(),
+                });
+            }
+        }
         self.storage_node
             .get_object_tags_if(bucket, key, req.version_id, |stored| {
                 if !self.requester_can_manage_object_tags_with_bucket_policy(

@@ -5,7 +5,6 @@ use crate::coordinator::authz::BucketPolicyRequestContext;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
 
 #[derive(Debug, PartialEq, Eq)]
 enum SamePgProgressEvent {
@@ -3703,15 +3702,16 @@ fn begin_stream_part_bucket_policy_and_abac_same_pg_completes_without_deadlock()
 #[test]
 fn finalize_stream_part_reupload_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
+    let bucket = "bucket-finalize-part-reupload-same-pg";
     let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
     coord
-        .create_bucket_for_owner("owner-a", "bucket", false)
+        .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
 
     let upload = coord
         .create_multipart_upload(&CreateMultipartUploadRequest {
             object: object_request_with_expected_owner(
-                "bucket",
+                bucket,
                 "key",
                 test_helpers::requester("owner-a"),
                 None,
@@ -3727,13 +3727,17 @@ fn finalize_stream_part_reupload_same_pg_completes_without_deadlock() {
         })
         .unwrap();
 
-    let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let res = (|| -> Result<(String, String), ServerError> {
+    let (etag_a, etag_b) = run_same_pg_probe_test(
+        bucket,
+        BucketWriteHandleTestHooks {
+            probe_finalize_stream_part_commit: true,
+            ..BucketWriteHandleTestHooks::default()
+        },
+        move || -> Result<(String, String), ServerError> {
             let session_a = coord
                 .begin_stream_part(&BeginStreamPartRequest {
                     upload: multipart_object_request_with_expected_owner(
-                        "bucket",
+                        bucket,
                         "key",
                         &upload.upload_id,
                         test_helpers::requester("owner-a"),
@@ -3745,11 +3749,10 @@ fn finalize_stream_part_reupload_same_pg_completes_without_deadlock() {
                 })?
                 .session_id;
             let data_a = b"streamed-reupload-a";
-            coord
-                .append_plaintext_stream_segment_for_test("bucket", "key", &session_a, 0, data_a)?;
+            coord.append_plaintext_stream_segment_for_test(bucket, "key", &session_a, 0, data_a)?;
             let result_a = coord.finalize_stream_part(FinalizeStreamPartRequest {
                 upload: multipart_object_request_with_expected_owner(
-                    "bucket",
+                    bucket,
                     "key",
                     &upload.upload_id,
                     test_helpers::requester("owner-a"),
@@ -3766,7 +3769,7 @@ fn finalize_stream_part_reupload_same_pg_completes_without_deadlock() {
             let session_b = coord
                 .begin_stream_part(&BeginStreamPartRequest {
                     upload: multipart_object_request_with_expected_owner(
-                        "bucket",
+                        bucket,
                         "key",
                         &upload.upload_id,
                         test_helpers::requester("owner-a"),
@@ -3778,11 +3781,10 @@ fn finalize_stream_part_reupload_same_pg_completes_without_deadlock() {
                 })?
                 .session_id;
             let data_b = b"streamed-reupload-b";
-            coord
-                .append_plaintext_stream_segment_for_test("bucket", "key", &session_b, 0, data_b)?;
+            coord.append_plaintext_stream_segment_for_test(bucket, "key", &session_b, 0, data_b)?;
             let result_b = coord.finalize_stream_part(FinalizeStreamPartRequest {
                 upload: multipart_object_request_with_expected_owner(
-                    "bucket",
+                    bucket,
                     "key",
                     &upload.upload_id,
                     test_helpers::requester("owner-a"),
@@ -3796,16 +3798,10 @@ fn finalize_stream_part_reupload_same_pg_completes_without_deadlock() {
                 computed_checksum: None,
             })?;
             Ok((result_a.etag.to_string(), result_b.etag.to_string()))
-        })();
-        tx.send(res).unwrap();
-    });
-
-    let (etag_a, etag_b) = rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("finalize_stream_part reupload should not self-deadlock on same-pg topology")
-        .unwrap();
+        },
+    )
+    .unwrap();
     assert_ne!(etag_a, etag_b);
-    handle.join().unwrap();
 }
 
 #[test]
@@ -4026,23 +4022,29 @@ fn put_bucket_acl_bucket_policy_same_pg_completes_without_deadlock() {
 #[test]
 fn get_object_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
+    let bucket = "bucket-get-object-policy-same-pg";
     let (admin, reader) = setup_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
     admin
-        .create_bucket_for_owner("owner-a", "bucket", false)
+        .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
     put_bucket_policy_test(&admin,
-            "bucket",
-            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+            bucket,
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket-get-object-policy-same-pg/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
             test_helpers::requester("owner-a"), None)
         .unwrap();
-    admin.clear_bucket_policy_cache(&trusted_bucket_name("bucket"));
+    admin.clear_bucket_policy_cache(&trusted_bucket_name(bucket));
     test_helpers::put_object(
         &admin,
         &PutObjectRequest {
             encryption: WriteEncryptionRequest::none(),
             policy_context: PutObjectPolicyContext::default(),
             object_lock: ObjectLockState::default(),
-            object: object_request_with_expected_owner("bucket", "key", test_helpers::requester("owner-a"), None),
+            object: object_request_with_expected_owner(
+                bucket,
+                "key",
+                test_helpers::requester("owner-a"),
+                None,
+            ),
             data: b"data",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
@@ -4056,44 +4058,47 @@ fn get_object_bucket_policy_same_pg_completes_without_deadlock() {
     )
     .unwrap();
 
-    let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let res = reader.get_object(&GetObjectRequest {
-            sse_customer: None,
-            object: object_version_request_with_expected_owner(
-                "bucket",
-                "key",
-                None,
-                test_helpers::requester("other-user"),
-                None,
-            ),
-            cond: NO_READ,
-        });
-        tx.send(res.map(|result| result.body.read_all())).unwrap();
-    });
-
-    let body = rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("get_object with bucket policy should not self-deadlock")
-        .unwrap()
-        .unwrap();
+    let body = run_same_pg_probe_test(
+        bucket,
+        BucketWriteHandleTestHooks {
+            probe_object_read_snapshot: true,
+            ..BucketWriteHandleTestHooks::default()
+        },
+        move || {
+            reader
+                .get_object(&GetObjectRequest {
+                    sse_customer: None,
+                    object: object_version_request_with_expected_owner(
+                        bucket,
+                        "key",
+                        None,
+                        test_helpers::requester("other-user"),
+                        None,
+                    ),
+                    cond: NO_READ,
+                })
+                .map(|result| result.body.read_all())
+        },
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(body, b"data");
-    handle.join().unwrap();
 }
 
 #[test]
 fn get_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
+    let bucket = "bucket-get-object-tagging-policy-same-pg";
     let (admin, reader) = setup_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
     admin
-        .create_bucket_for_owner("owner-a", "bucket", false)
+        .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
     put_bucket_policy_test(&admin,
-            "bucket",
-            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObjectTagging","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+            bucket,
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObjectTagging","Resource":"arn:aws:s3:::bucket-get-object-tagging-policy-same-pg/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
             test_helpers::requester("owner-a"), None)
         .unwrap();
-    admin.clear_bucket_policy_cache(&trusted_bucket_name("bucket"));
+    admin.clear_bucket_policy_cache(&trusted_bucket_name(bucket));
     let tags_xml =
         "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>";
     test_helpers::put_object(
@@ -4103,7 +4108,7 @@ fn get_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
             policy_context: PutObjectPolicyContext::default(),
             object_lock: ObjectLockState::default(),
             object: object_request_with_expected_owner(
-                "bucket",
+                bucket,
                 "key",
                 test_helpers::requester("owner-a"),
                 None,
@@ -4119,35 +4124,36 @@ fn get_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
     )
     .unwrap();
 
-    let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let res = get_object_tags_test(
-            &reader,
-            "bucket",
-            "key",
-            None,
-            test_helpers::requester("other-user"),
-            None,
-        );
-        tx.send(res).unwrap();
-    });
-
-    let tags = rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("get_object_tagging with bucket policy should not self-deadlock")
-        .unwrap()
-        .expect("expected tags");
+    let tags = run_same_pg_probe_test(
+        bucket,
+        BucketWriteHandleTestHooks {
+            probe_object_metadata_access: true,
+            ..BucketWriteHandleTestHooks::default()
+        },
+        move || {
+            get_object_tags_test(
+                &reader,
+                bucket,
+                "key",
+                None,
+                test_helpers::requester("other-user"),
+                None,
+            )
+        },
+    )
+    .unwrap()
+    .expect("expected tags");
     assert!(tags.contains("<Key>security</Key>"));
     assert!(tags.contains("<Value>public</Value>"));
-    handle.join().unwrap();
 }
 
 #[test]
 fn put_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
+    let bucket = "bucket-put-object-tagging-policy-same-pg";
     let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
     coord
-        .create_bucket_for_owner("owner-a", "bucket", false)
+        .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
     test_helpers::put_object(
         &coord,
@@ -4156,7 +4162,7 @@ fn put_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
             policy_context: PutObjectPolicyContext::default(),
             object_lock: ObjectLockState::default(),
             object: object_request_with_expected_owner(
-                "bucket",
+                bucket,
                 "key",
                 test_helpers::requester("owner-a"),
                 None,
@@ -4172,43 +4178,45 @@ fn put_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
     .unwrap();
     put_bucket_policy_test(
         &coord,
-        "bucket",
-        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"owner-a"},"Action":"s3:PutObjectTagging","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        bucket,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"owner-a"},"Action":"s3:PutObjectTagging","Resource":"arn:aws:s3:::bucket-put-object-tagging-policy-same-pg/*"}]}"#,
         test_helpers::requester("owner-a"),
         None,
     )
     .unwrap();
-    coord.clear_bucket_policy_cache(&trusted_bucket_name("bucket"));
+    coord.clear_bucket_policy_cache(&trusted_bucket_name(bucket));
 
-    let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let res = put_object_tags_test(
-            &coord,
-            "bucket",
-            "key",
-            None,
-            "<Tagging><TagSet><Tag><Key>team</Key><Value>storage</Value></Tag></TagSet></Tagging>",
-            test_helpers::requester("owner-a"),
-            None,
-        );
-        tx.send(res).unwrap();
-    });
-
-    rx.recv_timeout(Duration::from_secs(1))
-        .expect("put_object_tagging with bucket policy should not self-deadlock")
-        .unwrap();
-    handle.join().unwrap();
+    run_same_pg_probe_test(
+        bucket,
+        BucketWriteHandleTestHooks {
+            probe_object_metadata_access: true,
+            ..BucketWriteHandleTestHooks::default()
+        },
+        move || {
+            put_object_tags_test(
+                &coord,
+                bucket,
+                "key",
+                None,
+                "<Tagging><TagSet><Tag><Key>team</Key><Value>storage</Value></Tag></TagSet></Tagging>",
+                test_helpers::requester("owner-a"),
+                None,
+            )
+        },
+    )
+    .unwrap();
 }
 
 #[test]
 fn get_object_retention_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
+    let bucket = "bucket-get-object-retention-policy-same-pg";
     let (admin, reader) = setup_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
     let owner_requester = test_helpers::requester("owner-a");
 
     admin
         .create_bucket(&CreateBucketRequest {
-            name: trusted_bucket_name("bucket"),
+            name: trusted_bucket_name(bucket),
             requester: owner_requester.clone(),
             namespace: BucketNamespace::Global,
             acl: CreateBucketAcl::DefaultPrivate,
@@ -4223,7 +4231,7 @@ fn get_object_retention_bucket_policy_same_pg_completes_without_deadlock() {
             policy_context: PutObjectPolicyContext::default(),
             object_lock: ObjectLockState::default(),
             object: object_request_with_expected_owner(
-                "bucket",
+                bucket,
                 "key",
                 owner_requester.clone(),
                 None,
@@ -4244,7 +4252,7 @@ fn get_object_retention_bucket_policy_same_pg_completes_without_deadlock() {
     };
     put_object_retention_test(
         &admin,
-        "bucket",
+        bucket,
         "key",
         Some(put.version_id),
         retention,
@@ -4254,44 +4262,45 @@ fn get_object_retention_bucket_policy_same_pg_completes_without_deadlock() {
     .unwrap();
     put_bucket_policy_test(
         &admin,
-        "bucket",
-        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObjectRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        bucket,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObjectRetention","Resource":"arn:aws:s3:::bucket-get-object-retention-policy-same-pg/*"}]}"#,
         owner_requester,
         None,
     )
     .unwrap();
-    admin.clear_bucket_policy_cache(&trusted_bucket_name("bucket"));
+    admin.clear_bucket_policy_cache(&trusted_bucket_name(bucket));
 
-    let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let res = get_object_retention_test(
-            &reader,
-            "bucket",
-            "key",
-            Some(put.version_id),
-            test_helpers::requester("other-user"),
-        );
-        tx.send(res).unwrap();
-    });
-
-    let fetched = rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("get_object_retention with bucket policy should not self-deadlock")
-        .unwrap()
-        .expect("expected retention");
+    let fetched = run_same_pg_probe_test(
+        bucket,
+        BucketWriteHandleTestHooks {
+            probe_object_metadata_access: true,
+            ..BucketWriteHandleTestHooks::default()
+        },
+        move || {
+            get_object_retention_test(
+                &reader,
+                bucket,
+                "key",
+                Some(put.version_id),
+                test_helpers::requester("other-user"),
+            )
+        },
+    )
+    .unwrap()
+    .expect("expected retention");
     assert_eq!(fetched, retention);
-    handle.join().unwrap();
 }
 
 #[test]
 fn delete_object_object_lock_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
+    let bucket = "bucket-delete-object-lock-policy-same-pg";
     let (admin, deleter) = setup_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
     let owner_requester = test_helpers::requester("owner-a");
 
     admin
         .create_bucket(&CreateBucketRequest {
-            name: trusted_bucket_name("bucket"),
+            name: trusted_bucket_name(bucket),
             requester: owner_requester.clone(),
             namespace: BucketNamespace::Global,
             acl: CreateBucketAcl::DefaultPrivate,
@@ -4306,7 +4315,7 @@ fn delete_object_object_lock_bucket_policy_same_pg_completes_without_deadlock() 
             policy_context: PutObjectPolicyContext::default(),
             object_lock: ObjectLockState::default(),
             object: object_request_with_expected_owner(
-                "bucket",
+                bucket,
                 "key",
                 owner_requester.clone(),
                 None,
@@ -4323,7 +4332,7 @@ fn delete_object_object_lock_bucket_policy_same_pg_completes_without_deadlock() 
     .unwrap();
     put_object_retention_test(
         &admin,
-        "bucket",
+        bucket,
         "key",
         Some(put.version_id),
         ObjectRetention {
@@ -4335,34 +4344,34 @@ fn delete_object_object_lock_bucket_policy_same_pg_completes_without_deadlock() 
     )
     .unwrap();
     put_bucket_policy_test(&admin,
-            "bucket",
-            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"owner-a"},"Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+            bucket,
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"owner-a"},"Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::bucket-delete-object-lock-policy-same-pg/*"}]}"#,
             owner_requester.clone(), None)
         .unwrap();
-    admin.clear_bucket_policy_cache(&trusted_bucket_name("bucket"));
+    admin.clear_bucket_policy_cache(&trusted_bucket_name(bucket));
 
-    let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let res = deleter.delete_object(&DeleteObjectRequest {
-            object: object_version_request_with_expected_owner(
-                "bucket",
-                "key",
-                Some(put.version_id),
-                owner_requester.clone(),
-                None,
-            ),
-            bypass_governance: false,
-            cond: NO_DELETE,
-        });
-        tx.send(res).unwrap();
-    });
-
-    let err = rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("delete_object with object lock bucket policy should not self-deadlock")
-        .unwrap_err();
+    let err = run_same_pg_probe_test(
+        bucket,
+        BucketWriteHandleTestHooks {
+            probe_delete_object_lookup: true,
+            ..BucketWriteHandleTestHooks::default()
+        },
+        move || {
+            deleter.delete_object(&DeleteObjectRequest {
+                object: object_version_request_with_expected_owner(
+                    bucket,
+                    "key",
+                    Some(put.version_id),
+                    owner_requester.clone(),
+                    None,
+                ),
+                bypass_governance: false,
+                cond: NO_DELETE,
+            })
+        },
+    )
+    .unwrap_err();
     assert!(matches!(err, ServerError::AccessDenied));
-    handle.join().unwrap();
 }
 
 #[test]

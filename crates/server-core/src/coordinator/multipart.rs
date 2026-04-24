@@ -30,7 +30,10 @@ use super::{
     TRACE_TARGET,
 };
 #[cfg(test)]
-use super::{maybe_run_bucket_write_handle_loaded_hook, should_probe_begin_stream_part_session};
+use super::{
+    maybe_run_bucket_write_handle_loaded_hook, should_probe_begin_stream_part_session,
+    should_probe_finalize_stream_part_commit,
+};
 use crate::checksum_claim::ChecksumClaim;
 use crate::conditional::{check_write_conditions, WriteCondition};
 use crate::error::ServerError;
@@ -900,6 +903,22 @@ impl Coordinator {
         let total_size = req.total_size;
         let claimed_checksum = req.claimed_checksum;
         let computed_checksum = req.computed_checksum;
+        #[cfg(test)]
+        if should_probe_finalize_stream_part_commit(req.upload.bucket_name()) {
+            let object_pg_ready = self
+                .storage_node
+                .try_probe_object_pg_available(
+                    req.upload.bucket_name_typed(),
+                    req.upload.key_typed(),
+                )
+                .map_err(Coordinator::map_object_pg_action_error)?;
+            if !object_pg_ready {
+                return Err(ServerError::InternalError {
+                    reason: "test probe: object pg still locked before finalize_stream_part commit"
+                        .to_string(),
+                });
+            }
+        }
         let FinalizeStreamPartOutcome {
             value: result,
             ..
