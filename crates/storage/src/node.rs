@@ -1568,10 +1568,17 @@ mod tests {
     }
 
     #[test]
-    fn with_bucket_write_snapshot_waits_during_bucket_delete_then_returns_not_found() {
+    fn with_bucket_write_snapshot_stops_waiting_once_bucket_delete_becomes_terminal() {
         let tmp = test_util::tempdir();
         let node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap());
         let bucket = create_bucket_for_snapshot_test(&node, "bucket");
+
+        #[derive(Debug)]
+        enum RequestEvent {
+            FirstRetryObserved,
+            UnexpectedExtraRetry,
+            Completed(Result<Result<BucketInfo, ()>, crate::error::BucketSnapshotLoadError>),
+        }
 
         let _serial = STORAGE_TEST_HOOK_SERIAL
             .get_or_init(|| Mutex::new(()))
@@ -1579,10 +1586,11 @@ mod tests {
             .unwrap();
         let (delete_paused_tx, delete_paused_rx) = mpsc::channel();
         let delete_release = Arc::new((Mutex::new(false), Condvar::new()));
-        let (retry_tx, retry_rx) = mpsc::channel();
         let retry_release = Arc::new((Mutex::new(false), Condvar::new()));
-        let retry_seen = Arc::new(AtomicBool::new(false));
-        let retry_seen_hook = Arc::clone(&retry_seen);
+        let retry_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (event_tx, event_rx) = mpsc::channel();
+        let event_tx_for_hook = event_tx.clone();
+        let retry_count_hook = Arc::clone(&retry_count);
         let delete_release_hook = Arc::clone(&delete_release);
         let retry_release_hook = Arc::clone(&retry_release);
         let _hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
@@ -1596,12 +1604,17 @@ mod tests {
                 }
             })),
             after_bucket_write_reservation_retry: Some(Arc::new(move || {
-                if !retry_seen_hook.swap(true, Ordering::SeqCst) {
-                    let _ = retry_tx.send(());
-                    let (lock, cvar) = &*retry_release_hook;
-                    let mut released = lock.lock().unwrap();
-                    while !*released {
-                        released = cvar.wait(released).unwrap();
+                match retry_count_hook.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        let _ = event_tx_for_hook.send(RequestEvent::FirstRetryObserved);
+                        let (lock, cvar) = &*retry_release_hook;
+                        let mut released = lock.lock().unwrap();
+                        while !*released {
+                            released = cvar.wait(released).unwrap();
+                        }
+                    }
+                    _ => {
+                        let _ = event_tx_for_hook.send(RequestEvent::UnexpectedExtraRetry);
                     }
                 }
             })),
@@ -1620,21 +1633,19 @@ mod tests {
 
         let node_for_request = Arc::clone(&node);
         let bucket_for_request = bucket.clone();
-        let (result_tx, result_rx) = mpsc::channel();
         let request_handle = std::thread::spawn(move || {
             let result = node_for_request.with_bucket_write_snapshot(
                 &bucket_for_request,
                 Default::default(),
                 |snapshot| Ok::<_, ()>(snapshot.bucket),
             );
-            result_tx.send(result).unwrap();
+            event_tx.send(RequestEvent::Completed(result)).unwrap();
         });
 
-        retry_rx.recv().unwrap();
-        assert!(matches!(
-            result_rx.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
-        ));
+        match event_rx.recv().unwrap() {
+            RequestEvent::FirstRetryObserved => {}
+            other => panic!("expected first retry event, got {other:?}"),
+        }
 
         {
             let (lock, cvar) = &*delete_release;
@@ -1651,13 +1662,15 @@ mod tests {
             cvar.notify_all();
         }
 
-        let err = result_rx.recv().unwrap().unwrap_err();
-        assert!(matches!(
-            err,
-            crate::error::BucketSnapshotLoadError::Metadata(
-                crate::error::MetadataError::BucketNotFound { .. }
-            )
-        ));
+        match event_rx.recv().unwrap() {
+            RequestEvent::Completed(Err(crate::error::BucketSnapshotLoadError::Metadata(
+                crate::error::MetadataError::BucketNotFound { .. },
+            ))) => {}
+            RequestEvent::UnexpectedExtraRetry => {
+                panic!("request retried again after bucket delete became terminal")
+            }
+            other => panic!("expected BucketNotFound completion, got {other:?}"),
+        }
         request_handle.join().unwrap();
     }
 

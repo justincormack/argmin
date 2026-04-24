@@ -173,6 +173,35 @@ The implementation work should preserve the invariant that `DeleteBucket`
 waits only for work that was already admitted before drain started, while new
 bucket-scoped requests are rejected once drain is active.
 
+### Current Characterization
+
+Current storage characterization tests now pin this narrower behavior:
+
+- temporary drain can still delay a fresh bucket-write snapshot request and
+  later allow it to succeed
+- once bucket delete becomes terminal, the request no longer keeps polling; it
+  returns `BucketNotFound`
+
+This is an improvement over the earlier behavior, but it is not yet a full
+elimination of potentially long waits.
+
+- the request path no longer waits after the bucket has transitioned to
+  `Deleting`
+- but it can still wait during the transient-drain phase while the bucket
+  remains `Active`
+- that residual wait is not for client payload transfer; bucket write
+  reservations are held around metadata/auth/session-setup work, not body
+  streaming
+- however, the wait is still open-ended in principle because `DeleteBucket`
+  must wait for already-admitted reservations to drain, and those metadata
+  operations can still be delayed by IO stalls, lock contention, or hung work
+
+So Phase 3 remains in progress:
+
+- post-terminal request polling is gone
+- transient-drain waiting is still potentially long and needs a stronger
+  coordination or rejection policy if we want to remove that risk entirely
+
 ## Order
 
 Recommended order:

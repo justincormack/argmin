@@ -419,6 +419,16 @@ impl SharedStorageNode {
                 }
                 Err(crate::error::MetadataError::BucketWriteDraining) => {
                     super::maybe_run_bucket_write_reservation_retry_hook(bucket);
+                    match PgMetadataStore::head_bucket(&*bucket_pg, bucket) {
+                        Ok(_) => {}
+                        Err(crate::error::MetadataError::BucketNotFound { .. }) => {
+                            return Err(crate::error::MetadataError::BucketNotFound {
+                                name: bucket.clone(),
+                            }
+                            .into());
+                        }
+                        Err(other) => return Err(other.into()),
+                    }
                     drop(bucket_pg);
                     super::maybe_run_after_bucket_write_reservation_retry_hook(bucket);
                     std::thread::sleep(std::time::Duration::from_millis(1));
