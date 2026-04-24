@@ -1,0 +1,147 @@
+Condvar wait can miss notifications, hanging bucket drains
+Link: https://chatgpt.com/codex/cloud/security/findings/3b70770a71008191a0edd2ed0bcb9790?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: informational (attack path: ignore)
+Status: invalid
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 15c6b67
+Author: justin@specialbusservice.com
+Created: 24/04/2026, 15:29:18
+Assignee: Unassigned
+Signals: Security, Attack-path
+
+# Disposition
+Invalid. The reported missed-notification race is not reachable with the current
+lock ordering. Waiters in `begin_bucket_write_drain(...)` and
+`with_bucket_write_reservation_snapshot(...)` take the bucket coordination
+generation mutex while still holding the per-PG mutex from `get_pg(...)`.
+State-changing paths that notify, such as `release_bucket_write_reservation(...)`
+and `end_bucket_write_drain(...)`, must first acquire that same PG mutex before
+they can mutate state and call `notify_bucket_coordination_change(...)`, which
+increments the generation under the generation mutex. A notifier therefore
+cannot run between the waiter observing the draining condition and sampling the
+generation value, so the alleged lost wakeup cannot occur in these paths.
+
+# Summary
+Introduced a race where a notification can be missed because the generation is sampled after detecting the draining condition, leading to indefinite blocking.
+The commit replaces polling sleeps with a per-bucket condvar that waits on a generation counter. The waiters capture the generation value only after they already observed a draining/reservation condition. If another thread ends the drain or releases the last reservation before the waiter locks the generation mutex, the generation has already advanced and the waiter will block waiting for another change that may never occur. This can leave operations such as begin_bucket_write_drain or write-reservation snapshots waiting indefinitely, potentially exhausting request workers and causing a denial of service.
+
+# Validation
+## Rubric
+- [x] Identify wait sites in begin_bucket_write_drain/with_bucket_write_reservation_snapshot and confirm lock ordering around generation sampling.
+- [x] Verify state-change functions (release reservation/end drain) require PgStore lock and notify under generation mutex.
+- [x] Attempt dynamic reproduction via a wait-path unit test.
+- [x] Attempt valgrind/asan (tool unavailable).
+- [x] Attempt debugger trace (tool unavailable).
+## Report
+Crash attempt: built and ran the wait-path unit test `cargo test -p storage with_bucket_write_snapshot_waits_for_temporary_drain_then_succeeds -- --nocapture`; it completed without hang ("test node::tests::with_bucket_write_snapshot_waits_for_temporary_drain_then_succeeds ... ok"). Valgrind and gdb attempts failed because the tools are not installed (`valgrind: command not found`, `gdb: command not found`). Code inspection shows the generation mutex is acquired while the PgStore guard is still held, and only then is the PgStore guard dropped before waiting: `begin_bucket_write_drain` (crates/storage/src/node/bucket_ops.rs:60-96) and `with_bucket_write_reservation_snapshot` (crates/storage/src/node/bucket_ops.rs:421-454). State changes that would notify (release reservation/end drain) must acquire the same PgStore lock before calling `notify_bucket_coordination_change` (crates/storage/src/node/bucket_ops.rs:590-610), and notify increments the generation under the same mutex (crates/storage/src/node.rs:427-432). This lock ordering prevents a state change/notification from occurring before the waiter samples the generation, so the missed-notification race described in the finding is not reachable in these paths.
+
+# Evidence
+/workspace/argmin/crates/storage/src/node/bucket_ops.rs (L434 to 454)
+  Note: Write-reservation retry path takes the generation after a draining failure; a notify that occurs before the lock is acquired is lost, leaving the wait stuck.
+```
+                Err(crate::error::MetadataError::BucketWriteDraining) => {
+                    super::maybe_run_bucket_write_reservation_retry_hook(bucket);
+                    let (generation_lock, generation_cvar) =
+                        &self.bucket_coordination[self.bucket_lock_index(bucket)];
+                    let mut generation = generation_lock.lock().unwrap();
+                    let observed_generation = *generation;
+                    match PgMetadataStore::head_bucket(&*bucket_pg, bucket) {
+                        Ok(_) => {}
+                        Err(crate::error::MetadataError::BucketNotFound { .. }) => {
+                            return Err(crate::error::MetadataError::BucketNotFound {
+                                name: bucket.clone(),
+                            }
+                            .into());
+                        }
+                        Err(other) => return Err(other.into()),
+                    }
+                    drop(bucket_pg);
+                    super::maybe_run_after_bucket_write_reservation_retry_hook(bucket);
+                    while *generation == observed_generation {
+                        generation = generation_cvar.wait(generation).unwrap();
+                    }
+```
+
+/workspace/argmin/crates/storage/src/node/bucket_ops.rs (L54 to 71)
+  Note: Waiters sample the generation only after receiving BucketWriteDraining; if the drain ends before the lock is taken, the prior notification is missed and the wait can block indefinitely.
+```
+    pub fn begin_bucket_write_drain(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketWriteDrainGuard<'_>, BucketWriteDrainError> {
+        loop {
+            let pg_id = self.pg_topology.bucket_pg_for(bucket);
+            let bucket_pg = self.get_pg(pg_id)?;
+            match PgMetadataStore::begin_bucket_write_drain(&*bucket_pg, bucket) {
+                Ok(()) => break,
+                Err(crate::error::MetadataError::BucketWriteDraining) => {
+                    let (generation_lock, generation_cvar) =
+                        &self.bucket_coordination[self.bucket_lock_index(bucket)];
+                    let mut generation = generation_lock.lock().unwrap();
+                    let observed_generation = *generation;
+                    drop(bucket_pg);
+                    while *generation == observed_generation {
+                        generation = generation_cvar.wait(generation).unwrap();
+                    }
+```
+
+/workspace/argmin/crates/storage/src/node/bucket_ops.rs (L77 to 96)
+  Note: Active-write-reservation drain wait also samples the generation after checking the count; if reservations drop to zero just before locking, the wait can hang.
+```
+        loop {
+            let pg_id = self.pg_topology.bucket_pg_for(bucket);
+            let bucket_pg = self.get_pg(pg_id)?;
+            let info = PgMetadataStore::head_bucket(&*bucket_pg, bucket)?;
+            if info.active_write_reservations == 0 {
+                return Ok(BucketWriteDrainGuard {
+                    node: self,
+                    bucket: bucket.clone(),
+                    persisted: false,
+                });
+            }
+            let (generation_lock, generation_cvar) =
+                &self.bucket_coordination[self.bucket_lock_index(bucket)];
+            let mut generation = generation_lock.lock().unwrap();
+            let observed_generation = *generation;
+            super::maybe_run_bucket_write_drain_wait_hook(bucket);
+            drop(bucket_pg);
+            while *generation == observed_generation {
+                generation = generation_cvar.wait(generation).unwrap();
+            }
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Although the finding claims a missed-notification race, the code shows waiters lock the generation mutex while still holding the per-PG mutex (bucket_ops.rs:54-71, 414-454). State changes that notify require the same PG mutex and increment generation under the generation lock (bucket_ops.rs:590-610; node.rs:427-432), and get_pg is a MutexGuard (node.rs:583-590). This ordering prevents a notify from occurring before the waiter samples generation, so the race is not reachable; impact and likelihood are effectively none.
+## Likelihood
+ignore - Race condition is not reachable under the existing PG mutex and generation lock ordering.
+## Impact
+ignore - The alleged missed-notification hang is prevented by lock ordering; no proven availability impact from this code path.
+## Assumptions
+- Default listen address (127.0.0.1:9000) is used unless operators override ARGMIN_LISTEN_ADDR.
+- Bucket drain/write-reservation paths are reachable through authenticated S3 operations (e.g., bucket delete or write).
+- No out-of-tree code alters the PG mutex and bucket_coordination lock ordering.
+- Valid S3 credentials (access key/secret) for write/delete operations
+- Trigger bucket drain/write reservation paths
+- Concurrent operations to create a draining/reservation wait
+## Path
+Client -> HTTP frontend -> bucket_ops -> condvar wait (missed notify blocked by PG mutex ordering)
+## Path evidence
+- `crates/storage/src/node/bucket_ops.rs:54-71` - Wait path for begin_bucket_write_drain locks generation while holding bucket_pg, then drops bucket_pg before waiting.
+- `crates/storage/src/node/bucket_ops.rs:414-454` - Write-reservation retry path uses the same lock ordering (generation lock held before dropping bucket_pg).
+- `crates/storage/src/node/bucket_ops.rs:590-610` - State changes (release reservation/end drain) acquire bucket_pg and then call notify_bucket_coordination_change after dropping PG lock.
+- `crates/storage/src/node.rs:583-590` - get_pg returns a MutexGuard over PgStore, establishing per-PG mutual exclusion for metadata changes.
+- `crates/storage/src/node.rs:427-432` - notify_bucket_coordination_change increments generation under the generation mutex and notifies all waiters.
+- `crates/argmin-s3/src/config.rs:28-65` - Configuration requires access/secret keys and defaults listen address to 127.0.0.1:9000, indicating authenticated, local-default exposure.
+## Narrative
+The reported missed-notification race is not reachable because the waiters take the generation mutex while still holding the per-PG mutex, then drop the PG mutex before waiting; any state change that would notify must first acquire the same PG mutex and then increments generation under the generation lock. This ordering prevents a notify from occurring before the waiter samples the generation, eliminating the alleged race and DoS condition.
+## Controls
+- Per-PG mutex serialization for metadata changes (SharedStorageNode::get_pg)
+- Generation mutex + condvar for bucket coordination
+- Credential-based auth configured via ARGMIN_ACCESS_KEY_ID/ARGMIN_SECRET_ACCESS_KEY
+## Blindspots
+- Static analysis only; no concurrent runtime stress tests executed here.
+- Deployment exposure (public vs local bind) is environment-dependent and not evidenced in IaC/manifests.
