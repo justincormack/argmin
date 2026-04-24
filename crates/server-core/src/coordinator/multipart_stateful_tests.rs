@@ -964,7 +964,7 @@ fn duplicate_stream_append_race_cross_pg_preserves_one_winner() {
 #[test]
 fn aborting_multipart_upload_rejects_late_list_parts_without_state_loss() {
     let dir = test_util::tempdir();
-    let coord = setup_coordinator(dir.path());
+    let coord = super::test_support::setup_coordinator_without_lifecycle_sweeper(dir.path());
     let invariant = "once a multipart upload is aborting, later list-parts operations fail predictably without losing the upload state";
     let state = InvariantHarness::new(&coord);
 
