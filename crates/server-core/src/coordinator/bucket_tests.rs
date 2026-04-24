@@ -3203,7 +3203,7 @@ fn lifecycle_abort_rechecks_current_bucket_lifecycle_before_aborting_upload() {
 #[test]
 fn lifecycle_sweep_finishes_aborting_multipart_upload_without_current_lifecycle_config() {
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator(tmp.path());
+    let coord = setup_coordinator_without_lifecycle_sweeper(tmp.path());
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
