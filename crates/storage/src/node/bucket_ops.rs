@@ -418,7 +418,9 @@ impl SharedStorageNode {
                     return Self::finish_bucket_write_snapshot_operation(result, release_result);
                 }
                 Err(crate::error::MetadataError::BucketWriteDraining) => {
+                    super::maybe_run_bucket_write_reservation_retry_hook(bucket);
                     drop(bucket_pg);
+                    super::maybe_run_after_bucket_write_reservation_retry_hook(bucket);
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 Err(other) => return Err(other.into()),

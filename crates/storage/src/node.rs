@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(feature = "test-hooks")]
+#[cfg(any(test, feature = "test-hooks"))]
 use std::sync::{Arc, OnceLock};
 use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
@@ -82,24 +82,26 @@ pub struct BucketWriteDrainGuard<'a> {
     persisted: bool,
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(any(test, feature = "test-hooks"))]
 #[derive(Default, Clone)]
 pub struct BucketScopedTestHooks {
     pub target: Option<BucketName>,
     pub before_bucket_lock_acquire: Option<Arc<dyn Fn() + Send + Sync>>,
     pub before_bucket_write_drain_wait: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub before_bucket_write_reservation_retry: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub after_bucket_write_reservation_retry: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_begin_bucket_delete_drain: Option<Arc<dyn Fn() + Send + Sync>>,
     pub before_multipart_completion_lock: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_multipart_completion_lock: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(any(test, feature = "test-hooks"))]
 static BUCKET_SCOPED_TEST_HOOKS: OnceLock<Mutex<BucketScopedTestHooks>> = OnceLock::new();
 
-#[cfg(feature = "test-hooks")]
+#[cfg(any(test, feature = "test-hooks"))]
 pub struct BucketScopedTestHookGuard;
 
-#[cfg(feature = "test-hooks")]
+#[cfg(any(test, feature = "test-hooks"))]
 impl Drop for BucketScopedTestHookGuard {
     fn drop(&mut self) {
         let hooks =
@@ -108,7 +110,7 @@ impl Drop for BucketScopedTestHookGuard {
     }
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(any(test, feature = "test-hooks"))]
 pub fn install_bucket_scoped_test_hooks(hooks: BucketScopedTestHooks) -> BucketScopedTestHookGuard {
     let slot =
         BUCKET_SCOPED_TEST_HOOKS.get_or_init(|| Mutex::new(BucketScopedTestHooks::default()));
@@ -116,7 +118,7 @@ pub fn install_bucket_scoped_test_hooks(hooks: BucketScopedTestHooks) -> BucketS
     BucketScopedTestHookGuard
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(any(test, feature = "test-hooks"))]
 fn maybe_run_bucket_scoped_test_hook(
     bucket: &BucketName,
     project: impl FnOnce(BucketScopedTestHooks) -> Option<Arc<dyn Fn() + Send + Sync>>,
@@ -133,44 +135,60 @@ fn maybe_run_bucket_scoped_test_hook(
     }
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(any(test, feature = "test-hooks"))]
 pub(super) fn maybe_run_before_bucket_lock_acquire_hook(bucket: &BucketName) {
     maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.before_bucket_lock_acquire)
 }
 
-#[cfg(not(feature = "test-hooks"))]
+#[cfg(not(any(test, feature = "test-hooks")))]
 pub(super) fn maybe_run_before_bucket_lock_acquire_hook(_: &BucketName) {}
 
-#[cfg(feature = "test-hooks")]
+#[cfg(any(test, feature = "test-hooks"))]
 pub(super) fn maybe_run_bucket_write_drain_wait_hook(bucket: &BucketName) {
     maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.before_bucket_write_drain_wait)
 }
 
-#[cfg(not(feature = "test-hooks"))]
+#[cfg(not(any(test, feature = "test-hooks")))]
 pub(super) fn maybe_run_bucket_write_drain_wait_hook(_: &BucketName) {}
 
-#[cfg(feature = "test-hooks")]
+#[cfg(any(test, feature = "test-hooks"))]
+pub(super) fn maybe_run_bucket_write_reservation_retry_hook(bucket: &BucketName) {
+    maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.before_bucket_write_reservation_retry)
+}
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(super) fn maybe_run_bucket_write_reservation_retry_hook(_: &BucketName) {}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(super) fn maybe_run_after_bucket_write_reservation_retry_hook(bucket: &BucketName) {
+    maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.after_bucket_write_reservation_retry)
+}
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(super) fn maybe_run_after_bucket_write_reservation_retry_hook(_: &BucketName) {}
+
+#[cfg(any(test, feature = "test-hooks"))]
 pub(super) fn maybe_run_after_begin_bucket_delete_drain_hook(bucket: &BucketName) {
     maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.after_begin_bucket_delete_drain)
 }
 
-#[cfg(not(feature = "test-hooks"))]
+#[cfg(not(any(test, feature = "test-hooks")))]
 pub(super) fn maybe_run_after_begin_bucket_delete_drain_hook(_: &BucketName) {}
 
-#[cfg(feature = "test-hooks")]
+#[cfg(any(test, feature = "test-hooks"))]
 pub(super) fn maybe_run_before_multipart_completion_lock_hook(bucket: &BucketName) {
     maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.before_multipart_completion_lock)
 }
 
-#[cfg(not(feature = "test-hooks"))]
+#[cfg(not(any(test, feature = "test-hooks")))]
 pub(super) fn maybe_run_before_multipart_completion_lock_hook(_: &BucketName) {}
 
-#[cfg(feature = "test-hooks")]
+#[cfg(any(test, feature = "test-hooks"))]
 pub(super) fn maybe_run_after_multipart_completion_lock_hook(bucket: &BucketName) {
     maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.after_multipart_completion_lock)
 }
 
-#[cfg(not(feature = "test-hooks"))]
+#[cfg(not(any(test, feature = "test-hooks")))]
 pub(super) fn maybe_run_after_multipart_completion_lock_hook(_: &BucketName) {}
 
 impl BucketWriteDrainGuard<'_> {
@@ -960,6 +978,9 @@ impl SharedStorageNode {
 mod tests {
     use super::*;
     use std::panic::AssertUnwindSafe;
+    use std::sync::{mpsc, Arc, OnceLock};
+
+    static STORAGE_TEST_HOOK_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn bucket_name(name: &str) -> BucketName {
         BucketName::try_from(name).unwrap()
@@ -1499,6 +1520,145 @@ mod tests {
             })
             .unwrap();
         assert_eq!(result.unwrap().name, bucket);
+    }
+
+    #[test]
+    fn with_bucket_write_snapshot_waits_for_temporary_drain_then_succeeds() {
+        let tmp = test_util::tempdir();
+        let node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap());
+        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
+
+        let _serial = STORAGE_TEST_HOOK_SERIAL
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let (retry_tx, retry_rx) = mpsc::channel();
+        let _hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
+            target: Some(bucket.clone()),
+            after_bucket_write_reservation_retry: Some(Arc::new(move || {
+                let _ = retry_tx.send(());
+            })),
+            ..BucketScopedTestHooks::default()
+        });
+
+        let drain = node.begin_bucket_write_drain(&bucket).unwrap();
+        let node_for_thread = Arc::clone(&node);
+        let bucket_for_thread = bucket.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let result = node_for_thread
+                .with_bucket_write_snapshot(&bucket_for_thread, Default::default(), |snapshot| {
+                    Ok::<_, ()>(snapshot.bucket)
+                })
+                .unwrap();
+            result_tx.send(result).unwrap();
+        });
+
+        retry_rx.recv().unwrap();
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        drop(drain);
+
+        let result = result_rx.recv().unwrap();
+        assert_eq!(result.unwrap().name, bucket);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn with_bucket_write_snapshot_waits_during_bucket_delete_then_returns_not_found() {
+        let tmp = test_util::tempdir();
+        let node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap());
+        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
+
+        let _serial = STORAGE_TEST_HOOK_SERIAL
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let (delete_paused_tx, delete_paused_rx) = mpsc::channel();
+        let delete_release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (retry_tx, retry_rx) = mpsc::channel();
+        let retry_release = Arc::new((Mutex::new(false), Condvar::new()));
+        let retry_seen = Arc::new(AtomicBool::new(false));
+        let retry_seen_hook = Arc::clone(&retry_seen);
+        let delete_release_hook = Arc::clone(&delete_release);
+        let retry_release_hook = Arc::clone(&retry_release);
+        let _hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
+            target: Some(bucket.clone()),
+            after_begin_bucket_delete_drain: Some(Arc::new(move || {
+                let _ = delete_paused_tx.send(());
+                let (lock, cvar) = &*delete_release_hook;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = cvar.wait(released).unwrap();
+                }
+            })),
+            after_bucket_write_reservation_retry: Some(Arc::new(move || {
+                if !retry_seen_hook.swap(true, Ordering::SeqCst) {
+                    let _ = retry_tx.send(());
+                    let (lock, cvar) = &*retry_release_hook;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = cvar.wait(released).unwrap();
+                    }
+                }
+            })),
+            ..BucketScopedTestHooks::default()
+        });
+
+        let node_for_delete = Arc::clone(&node);
+        let bucket_for_delete = bucket.clone();
+        let (delete_tx, delete_rx) = mpsc::channel();
+        let delete_handle = std::thread::spawn(move || {
+            let result = node_for_delete.begin_bucket_delete(&bucket_for_delete);
+            delete_tx.send(result).unwrap();
+        });
+
+        delete_paused_rx.recv().unwrap();
+
+        let node_for_request = Arc::clone(&node);
+        let bucket_for_request = bucket.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let request_handle = std::thread::spawn(move || {
+            let result = node_for_request.with_bucket_write_snapshot(
+                &bucket_for_request,
+                Default::default(),
+                |snapshot| Ok::<_, ()>(snapshot.bucket),
+            );
+            result_tx.send(result).unwrap();
+        });
+
+        retry_rx.recv().unwrap();
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        {
+            let (lock, cvar) = &*delete_release;
+            let mut released = lock.lock().unwrap();
+            *released = true;
+            cvar.notify_all();
+        }
+        delete_handle.join().unwrap();
+        delete_rx.recv().unwrap().unwrap();
+        {
+            let (lock, cvar) = &*retry_release;
+            let mut released = lock.lock().unwrap();
+            *released = true;
+            cvar.notify_all();
+        }
+
+        let err = result_rx.recv().unwrap().unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::BucketSnapshotLoadError::Metadata(
+                crate::error::MetadataError::BucketNotFound { .. }
+            )
+        ));
+        request_handle.join().unwrap();
     }
 
     #[test]
