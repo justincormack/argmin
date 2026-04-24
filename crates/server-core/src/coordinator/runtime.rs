@@ -330,7 +330,12 @@ impl ReadRuntime {
 
         let mut finished = 0u64;
         for (key, upload_id) in candidates {
-            if self.abort_multipart_upload_internal_for(bucket, &key, &upload_id)? {
+            if self.abort_multipart_upload_internal_for(
+                bucket,
+                &key,
+                &upload_id,
+                "lifecycle-runtime",
+            )? {
                 finished += 1;
             }
         }
@@ -625,6 +630,18 @@ impl ReadRuntime {
         upload_id: &UploadId,
         now_millis: u64,
     ) -> Result<bool, ServerError> {
+        #[cfg(feature = "deep-tracing")]
+        if let Some(trace) = observability::current_context() {
+            let _ = observability::event_in_context(
+                &trace,
+                TRACE_TARGET,
+                "multipart_abort_request",
+                Some(format_args!(
+                    "source=lifecycle-check bucket={:?} key={:?} upload_id={:?} now_millis={}",
+                    bucket, key, upload_id, now_millis
+                )),
+            );
+        }
         let _bucket_guard = self.storage_node.lock_bucket(bucket);
         let bucket_info = match self.storage_node.head_bucket_info(bucket) {
             Ok(info) => info,
@@ -646,7 +663,12 @@ impl ReadRuntime {
         };
 
         if upload.state == UploadState::Aborting {
-            return self.abort_multipart_upload_internal_for(bucket, key, upload_id);
+            return self.abort_multipart_upload_internal_for(
+                bucket,
+                key,
+                upload_id,
+                "lifecycle-runtime",
+            );
         }
         if upload.state != UploadState::InProgress {
             return Ok(false);
@@ -667,7 +689,7 @@ impl ReadRuntime {
             return Ok(false);
         }
 
-        self.abort_multipart_upload_internal_for(bucket, key, upload_id)
+        self.abort_multipart_upload_internal_for(bucket, key, upload_id, "lifecycle-runtime")
     }
 
     pub(super) fn abort_multipart_upload_internal_for(
@@ -675,7 +697,20 @@ impl ReadRuntime {
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
+        _source: &'static str,
     ) -> Result<bool, ServerError> {
+        #[cfg(feature = "deep-tracing")]
+        if let Some(trace) = observability::current_context() {
+            let _ = observability::event_in_context(
+                &trace,
+                TRACE_TARGET,
+                "multipart_abort_execute",
+                Some(format_args!(
+                    "source={} bucket={:?} key={:?} upload_id={:?}",
+                    _source, bucket, key, upload_id
+                )),
+            );
+        }
         self.storage_node
             .abort_multipart_upload(bucket, key, upload_id)
             .map_err(Coordinator::map_object_pg_action_error)

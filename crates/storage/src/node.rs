@@ -31,6 +31,7 @@ use crate::types::{
 const TRACE_TARGET: &str = "storage";
 const RAPIDHASH_SECRETS: RapidSecrets = RapidSecrets::seed(0);
 const LOCK_WAIT_EVENT_THRESHOLD_US: u128 = 1_000;
+const RECLAIM_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 
 mod bucket_ops;
 mod listing_ops;
@@ -640,6 +641,22 @@ impl SharedStorageNode {
         }
     }
 
+    /// Take one queued reclaim work item if immediately available.
+    pub fn try_take_reclaim_work(&self) -> Option<ReclaimWorkItem> {
+        let mut state = self
+            .reclaim_queue
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(root) = state.object_queue.pop_front() {
+            state.queued_objects.remove(&root);
+            return Some(ReclaimWorkItem::ObjectPayload(root));
+        }
+        let bucket = state.bucket_delete_queue.pop_front()?;
+        state.queued_bucket_deletes.remove(&bucket);
+        Some(ReclaimWorkItem::BucketDelete(bucket))
+    }
+
     /// Block until reclaim work is available, or stop has been requested.
     pub fn wait_for_reclaim_work(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
         let (state_lock, cv) = &self.reclaim_queue;
@@ -648,7 +665,13 @@ impl SharedStorageNode {
             && state.bucket_delete_queue.is_empty()
             && !stop.load(Ordering::SeqCst)
         {
-            state = cv.wait(state).unwrap_or_else(|e| e.into_inner());
+            let (next_state, _) = cv
+                .wait_timeout(
+                    state,
+                    std::time::Duration::from_millis(RECLAIM_WORKER_WAIT_POLL_MILLIS),
+                )
+                .unwrap_or_else(|e| e.into_inner());
+            state = next_state;
         }
         if stop.load(Ordering::SeqCst) {
             return None;

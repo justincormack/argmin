@@ -4,7 +4,6 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestCaseResult};
 use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use storage::{
     MultipartReclaimPartRecord, MultipartReclaimRecord, ObjectSegmentsReclaimRecord,
@@ -918,27 +917,7 @@ impl ReclaimTraceHarness {
     }
 
     fn take_next_work(&self) -> Result<Option<ReclaimWorkItem>, TestCaseError> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let waiter_stop = Arc::clone(&stop);
-        let waiter_node = Arc::clone(&self.runtime.storage_node);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn(move || {
-            tx.send(waiter_node.wait_for_reclaim_work(&waiter_stop))
-                .unwrap();
-        });
-        let result = match rx.recv_timeout(std::time::Duration::from_millis(25)) {
-            Ok(work) => work,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
-            Err(err) => {
-                return Err(TestCaseError::fail(format!(
-                    "failed waiting for reclaim work: {err:?}"
-                )))
-            }
-        };
-        stop.store(true, Ordering::SeqCst);
-        self.runtime.storage_node.wake_reclaim_workers();
-        waiter.join().unwrap();
-        Ok(result)
+        Ok(self.runtime.storage_node.try_take_reclaim_work())
     }
 }
 
@@ -1135,27 +1114,7 @@ impl ReclaimKindTraceHarness {
     }
 
     fn take_next_work(&self) -> Result<Option<ReclaimWorkItem>, TestCaseError> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let waiter_stop = Arc::clone(&stop);
-        let waiter_node = Arc::clone(&self.runtime.storage_node);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn(move || {
-            tx.send(waiter_node.wait_for_reclaim_work(&waiter_stop))
-                .unwrap();
-        });
-        let result = match rx.recv_timeout(std::time::Duration::from_millis(25)) {
-            Ok(work) => work,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
-            Err(err) => {
-                return Err(TestCaseError::fail(format!(
-                    "failed waiting for reclaim work: {err:?}"
-                )))
-            }
-        };
-        stop.store(true, Ordering::SeqCst);
-        self.runtime.storage_node.wake_reclaim_workers();
-        waiter.join().unwrap();
-        Ok(result)
+        Ok(self.runtime.storage_node.try_take_reclaim_work())
     }
 }
 
@@ -1352,27 +1311,7 @@ impl TwoGenerationReclaimTraceHarness {
     }
 
     fn take_next_work(&self) -> Result<Option<ReclaimWorkItem>, TestCaseError> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let waiter_stop = Arc::clone(&stop);
-        let waiter_node = Arc::clone(&self.runtime.storage_node);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn(move || {
-            tx.send(waiter_node.wait_for_reclaim_work(&waiter_stop))
-                .unwrap();
-        });
-        let result = match rx.recv_timeout(std::time::Duration::from_millis(25)) {
-            Ok(work) => work,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
-            Err(err) => {
-                return Err(TestCaseError::fail(format!(
-                    "failed waiting for reclaim work: {err:?}"
-                )))
-            }
-        };
-        stop.store(true, Ordering::SeqCst);
-        self.runtime.storage_node.wake_reclaim_workers();
-        waiter.join().unwrap();
-        Ok(result)
+        Ok(self.runtime.storage_node.try_take_reclaim_work())
     }
 
     fn bucket_exists(&self) -> bool {
@@ -1570,27 +1509,7 @@ impl TwoKeyReclaimTraceHarness {
     }
 
     fn take_next_work(&self) -> Result<Option<ReclaimWorkItem>, TestCaseError> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let waiter_stop = Arc::clone(&stop);
-        let waiter_node = Arc::clone(&self.runtime.storage_node);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn(move || {
-            tx.send(waiter_node.wait_for_reclaim_work(&waiter_stop))
-                .unwrap();
-        });
-        let result = match rx.recv_timeout(std::time::Duration::from_millis(25)) {
-            Ok(work) => work,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
-            Err(err) => {
-                return Err(TestCaseError::fail(format!(
-                    "failed waiting for reclaim work: {err:?}"
-                )))
-            }
-        };
-        stop.store(true, Ordering::SeqCst);
-        self.runtime.storage_node.wake_reclaim_workers();
-        waiter.join().unwrap();
-        Ok(result)
+        Ok(self.runtime.storage_node.try_take_reclaim_work())
     }
 
     fn bucket_exists(&self) -> bool {
