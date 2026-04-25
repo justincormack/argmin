@@ -45,6 +45,18 @@ const MAX_STREAMING_POST_ACL_FIELD_BYTES: usize = 128;
 const MAX_STREAMING_POST_STATUS_FIELD_BYTES: usize = 16;
 const MAX_STREAMING_POST_CHECKSUM_FIELD_BYTES: usize = 128;
 const MAX_STREAMING_POST_SSE_FIELD_BYTES: usize = 4 * 1024;
+const MAX_ACL_XML_BYTES: usize = 200 * 1024;
+const MAX_DELETE_OBJECTS_XML_BYTES: usize = 2_048_000;
+const MAX_VERSIONING_CONFIGURATION_BYTES: usize = 1024;
+const MAX_OBJECT_LOCK_CONFIGURATION_BYTES: usize = 2 * 1024 * 1024;
+const MAX_BUCKET_ENCRYPTION_CONFIGURATION_BYTES: usize = 2 * 1024 * 1024;
+const MAX_LIFECYCLE_CONFIGURATION_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CORS_CONFIGURATION_BYTES: usize = 64 * 1024;
+const MAX_TAGGING_XML_BYTES: usize = 160 * 1024;
+const MAX_PUBLIC_ACCESS_BLOCK_CONFIGURATION_BYTES: usize = 2 * 1024 * 1024;
+const MAX_OWNERSHIP_CONTROLS_XML_BYTES: usize = 2048;
+const MAX_BUCKET_ABAC_XML_BYTES: usize = 1024;
+const MAX_COMPLETE_MULTIPART_UPLOAD_XML_BYTES: usize = 2_621_440;
 
 /// Incremental hasher for validating trailing checksums in streaming uploads.
 ///
@@ -708,17 +720,19 @@ async fn handle(
 
     // Non-streaming path: collect the full body for buffered control-plane
     // style requests (mostly XML payloads).
-    let body_bytes = match collect_body(body, state.config.body_idle_timeout).await {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            return Ok(s3_response_to_hyper(
-                S3Response::error_with_ids(&err, "", &wire_ids),
-                Some(req_permit),
-                state.config.stream_read_chunk_size,
-                response_trace,
-            ));
-        }
-    };
+    let body_limit = buffered_body_limit_for_request_parts(&parts);
+    let body_bytes =
+        match collect_body_with_limit(body, state.config.body_idle_timeout, body_limit).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return Ok(s3_response_to_hyper(
+                    S3Response::error_with_ids(&err, "", &wire_ids),
+                    Some(req_permit),
+                    state.config.stream_read_chunk_size,
+                    response_trace,
+                ));
+            }
+        };
 
     let s3req = match S3Request::from_hyper(parts, body_bytes, transport_security) {
         Ok(req) => req,
@@ -822,6 +836,38 @@ fn is_streaming_write(
             }))
         }
         _ => Ok(None),
+    }
+}
+
+fn buffered_body_limit_for_request_parts(parts: &http::request::Parts) -> usize {
+    let path = parts.uri.path();
+    let query = parts.uri.query().unwrap_or("");
+    let method = parts.method.as_str();
+    let Ok(op) = route(method, path, query) else {
+        return MAX_BUFFERED_CONTROL_BODY_SIZE;
+    };
+    buffered_body_limit_for_operation(&op)
+}
+
+fn buffered_body_limit_for_operation(op: &S3Operation) -> usize {
+    match op {
+        S3Operation::DeleteObjects { .. } => MAX_DELETE_OBJECTS_XML_BYTES,
+        S3Operation::PutBucketVersioning { .. } => MAX_VERSIONING_CONFIGURATION_BYTES,
+        S3Operation::PutBucketObjectLockConfiguration { .. } => MAX_OBJECT_LOCK_CONFIGURATION_BYTES,
+        S3Operation::PutBucketEncryption { .. } => MAX_BUCKET_ENCRYPTION_CONFIGURATION_BYTES,
+        S3Operation::PutBucketCors { .. } => MAX_CORS_CONFIGURATION_BYTES,
+        S3Operation::PutBucketTagging { .. } | S3Operation::PutObjectTagging { .. } => {
+            MAX_TAGGING_XML_BYTES
+        }
+        S3Operation::PutBucketAbac { .. } => MAX_BUCKET_ABAC_XML_BYTES,
+        S3Operation::PutBucketLifecycle { .. } => MAX_LIFECYCLE_CONFIGURATION_BYTES,
+        S3Operation::PutObjectAcl { .. } | S3Operation::PutBucketAcl { .. } => MAX_ACL_XML_BYTES,
+        S3Operation::PutBucketPublicAccessBlock { .. } => {
+            MAX_PUBLIC_ACCESS_BLOCK_CONFIGURATION_BYTES
+        }
+        S3Operation::PutBucketOwnershipControls { .. } => MAX_OWNERSHIP_CONTROLS_XML_BYTES,
+        S3Operation::CompleteMultipartUpload { .. } => MAX_COMPLETE_MULTIPART_UPLOAD_XML_BYTES,
+        _ => MAX_BUFFERED_CONTROL_BODY_SIZE,
     }
 }
 
@@ -3295,10 +3341,6 @@ fn acquire_frontend(state: &ServerState) -> Arc<HttpFrontend> {
 /// Each call to `frame()` is individually wrapped in a timeout that resets on
 /// every chunk. A client sending data steadily (even slowly) will never be
 /// timed out; only truly stalled connections are killed.
-async fn collect_body(body: Incoming, idle_timeout: Duration) -> Result<Bytes, ServerError> {
-    collect_body_with_limit(body, idle_timeout, MAX_BUFFERED_CONTROL_BODY_SIZE).await
-}
-
 async fn collect_body_with_limit(
     body: Incoming,
     idle_timeout: Duration,
@@ -3401,6 +3443,27 @@ mod tests {
         let recycled = pool.checkout();
         assert!(recycled.capacity() >= crate::coordinator::INTERNAL_SEGMENT_SIZE);
         assert!(recycled.is_empty());
+    }
+
+    #[test]
+    fn buffered_body_limits_use_operation_specific_caps() {
+        let parts = make_parts("PUT", "/bucket?encryption", &[]);
+        assert_eq!(
+            buffered_body_limit_for_request_parts(&parts),
+            MAX_BUCKET_ENCRYPTION_CONFIGURATION_BYTES
+        );
+
+        let parts = make_parts("POST", "/bucket/key?uploadId=upload-id", &[]);
+        assert_eq!(
+            buffered_body_limit_for_request_parts(&parts),
+            MAX_COMPLETE_MULTIPART_UPLOAD_XML_BYTES
+        );
+
+        let parts = make_parts("GET", "/bucket/key", &[]);
+        assert_eq!(
+            buffered_body_limit_for_request_parts(&parts),
+            MAX_BUFFERED_CONTROL_BODY_SIZE
+        );
     }
 
     /// Build a minimal `http::request::Parts` for testing `is_streaming_write`.
