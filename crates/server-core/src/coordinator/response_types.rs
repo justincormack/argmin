@@ -70,6 +70,48 @@ pub struct BucketSummary {
     pub encryption: EffectiveBucketEncryptionConfig,
 }
 
+/// ACL-free bucket execution context used by modern hot-path auth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModernBucketSummary {
+    pub name: BucketName,
+    pub owner_principal: String,
+    pub owner_canonical_id: CanonicalUserId,
+    pub created_at: u64,
+    pub versioning: BucketVersioningState,
+    pub object_lock: BucketObjectLockConfig,
+    pub public_access_block: Option<PublicAccessBlockConfig>,
+    pub ownership_controls: Option<BucketOwnershipControls>,
+    pub bucket_policy_present: bool,
+    pub bucket_policy_public: bool,
+    pub bucket_policy_generation: u64,
+    pub bucket_lifecycle_present: bool,
+    pub bucket_lifecycle_generation: u64,
+    pub bucket_abac_enabled: bool,
+    pub encryption: EffectiveBucketEncryptionConfig,
+}
+
+impl From<&BucketSummary> for ModernBucketSummary {
+    fn from(bucket: &BucketSummary) -> Self {
+        Self {
+            name: bucket.name.clone(),
+            owner_principal: bucket.owner_principal.clone(),
+            owner_canonical_id: bucket.owner_canonical_id.clone(),
+            created_at: bucket.created_at,
+            versioning: bucket.versioning,
+            object_lock: bucket.object_lock,
+            public_access_block: bucket.public_access_block,
+            ownership_controls: bucket.ownership_controls,
+            bucket_policy_present: bucket.bucket_policy_present,
+            bucket_policy_public: bucket.bucket_policy_public,
+            bucket_policy_generation: bucket.bucket_policy_generation,
+            bucket_lifecycle_present: bucket.bucket_lifecycle_present,
+            bucket_lifecycle_generation: bucket.bucket_lifecycle_generation,
+            bucket_abac_enabled: bucket.bucket_abac_enabled,
+            encryption: bucket.encryption,
+        }
+    }
+}
+
 /// Result of a GetBucketAcl operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GetBucketAclResult {

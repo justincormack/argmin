@@ -66,6 +66,8 @@ use super::request_types::{
 };
 #[cfg(test)]
 use super::response_types::GetObjectAclResult;
+#[cfg(test)]
+use super::response_types::ModernBucketSummary;
 use super::response_types::{BucketSummary, GetBucketAclResult};
 #[cfg(test)]
 use super::{
@@ -180,6 +182,15 @@ struct BucketPolicyActionAuthorization<'a> {
     default_allowed: bool,
 }
 
+struct ObjectPolicyEvaluationContext<'a> {
+    requester: &'a Requester,
+    bucket_name: &'a str,
+    bucket_abac_enabled: bool,
+    action: auth::PolicyAction,
+    policy_context: PutObjectPolicyContext<'a>,
+    policy: &'a auth::BucketPolicy,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct CachedBucketPolicy {
     pub(super) generation: u64,
@@ -200,6 +211,14 @@ pub(super) enum ObjectAclAuthorization<'a> {
 enum ExistingObjectTagsMode {
     Available,
     Unavailable,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ModernObjectReadAuthorization {
+    Allowed,
+    Denied,
+    NeedAclFallback,
 }
 
 struct CopySourceReadSnapshotRequest<'a> {
@@ -236,6 +255,16 @@ impl Coordinator {
         Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
             || (requester.authorization_profile() == auth::AuthorizationProfile::OwnerAccountAdmin
                 && Self::requester_is_bucket_owner_account(requester, bucket))
+    }
+
+    #[cfg(test)]
+    fn requester_can_modern_bucket_owner_account_admin(
+        requester: &Requester,
+        bucket: &ModernBucketSummary,
+    ) -> bool {
+        Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
+            || (requester.authorization_profile() == auth::AuthorizationProfile::OwnerAccountAdmin
+                && Self::requester_is_modern_bucket_owner_account(requester, bucket))
     }
 
     pub(super) fn requester_has_acl_permission(
@@ -488,7 +517,29 @@ impl Coordinator {
         let Some(requester_account_id) = aws_account_id_from_principal(account.principal()) else {
             return false;
         };
-        aws_account_id_from_principal(&bucket.owner_principal) == Some(requester_account_id)
+        Self::bucket_owner_account_id(&bucket.owner_principal) == Some(requester_account_id)
+    }
+
+    #[cfg(test)]
+    fn requester_is_modern_bucket_owner_account(
+        requester: &Requester,
+        bucket: &ModernBucketSummary,
+    ) -> bool {
+        let Some(account) = requester.account() else {
+            return false;
+        };
+        if account.principal() == bucket.owner_principal {
+            return true;
+        }
+
+        let Some(requester_account_id) = aws_account_id_from_principal(account.principal()) else {
+            return false;
+        };
+        Self::bucket_owner_account_id(&bucket.owner_principal) == Some(requester_account_id)
+    }
+
+    fn bucket_owner_account_id(owner_principal: &str) -> Option<&str> {
+        aws_account_id_from_principal(owner_principal)
     }
 
     pub(super) fn requester_is_bucket_owner_account_root_principal(
@@ -505,7 +556,7 @@ impl Coordinator {
         let Some(requester_account_id) = aws_account_id_from_principal(account.principal()) else {
             return false;
         };
-        let Some(bucket_owner_account_id) = aws_account_id_from_principal(&bucket.owner_principal)
+        let Some(bucket_owner_account_id) = Self::bucket_owner_account_id(&bucket.owner_principal)
         else {
             return false;
         };
@@ -689,6 +740,20 @@ impl Coordinator {
         }
 
         Self::requester_is_bucket_owner_account(requester, bucket)
+    }
+
+    #[cfg(test)]
+    fn modern_bucket_policy_allow_survives_restrict_public_buckets(
+        requester: &Requester,
+        bucket: &ModernBucketSummary,
+    ) -> bool {
+        if !bucket.bucket_policy_public
+            || !Self::restricts_public_buckets(bucket.public_access_block.as_ref())
+        {
+            return true;
+        }
+
+        Self::requester_is_modern_bucket_owner_account(requester, bucket)
     }
 
     pub(super) fn get_object_policy_action(version_id: Option<VersionId>) -> auth::PolicyAction {
@@ -947,8 +1012,31 @@ impl Coordinator {
             return Ok(auth::PolicyEvaluation::NoMatch);
         };
 
-        let existing_tags_required =
-            policy.requires_existing_object_tags_for_action(request.action);
+        let bucket_tags = self.bucket_tags_for_policy_request(request, policy)?;
+        Self::evaluate_bucket_policy_for_object_request(
+            ObjectPolicyEvaluationContext {
+                requester: request.requester,
+                bucket_name: request.bucket.name.as_str(),
+                bucket_abac_enabled: request.bucket.bucket_abac_enabled,
+                action: request.action,
+                policy_context: request.policy_context,
+                policy,
+            },
+            object,
+            existing_object_tags_mode,
+            &bucket_tags,
+        )
+    }
+
+    fn evaluate_bucket_policy_for_object_request(
+        context: ObjectPolicyEvaluationContext<'_>,
+        object: &StoredObject,
+        existing_object_tags_mode: ExistingObjectTagsMode,
+        bucket_tags: &[(String, String)],
+    ) -> Result<auth::PolicyEvaluation, ServerError> {
+        let existing_tags_required = context
+            .policy
+            .requires_existing_object_tags_for_action(context.action);
         let existing_tags = if existing_tags_required {
             Some(Self::parse_policy_existing_object_tags(object)?)
         } else {
@@ -959,9 +1047,11 @@ impl Coordinator {
             .flat_map(|tags| tags.iter())
             .map(|(key, value)| auth::PolicyTag::new(key, value))
             .collect();
-        let request_object_tags = if policy.requires_request_object_tags_for_action(request.action)
+        let request_object_tags = if context
+            .policy
+            .requires_request_object_tags_for_action(context.action)
         {
-            match request.policy_context.request_object_tags_xml {
+            match context.policy_context.request_object_tags_xml {
                 Some(tags_xml) => Self::parse_serialized_tag_set(tags_xml)?,
                 None => Vec::new(),
             }
@@ -972,17 +1062,16 @@ impl Coordinator {
             .iter()
             .map(|(key, value)| auth::PolicyTag::new(key, value))
             .collect();
-        let bucket_tags = self.bucket_tags_for_policy_request(request, policy)?;
         let bucket_tags: Vec<auth::PolicyTag<'_>> = bucket_tags
             .iter()
             .map(|(key, value)| auth::PolicyTag::new(key, value))
             .collect();
         let policy_request = auth::PolicyRequest::for_object(
-            request.action,
-            request.bucket.name.as_str(),
+            context.action,
+            context.bucket_name,
             object.key().as_str(),
-            request.requester.principal_opt(),
-            request.requester.canonical_user_id(),
+            context.requester.principal_opt(),
+            context.requester.canonical_user_id(),
             if existing_tags_required
                 && matches!(existing_object_tags_mode, ExistingObjectTagsMode::Available)
             {
@@ -992,8 +1081,10 @@ impl Coordinator {
             },
         )
         .with_bucket_tags(
-            if request.bucket.bucket_abac_enabled
-                && policy.requires_bucket_tags_for_action(request.action)
+            if context.bucket_abac_enabled
+                && context
+                    .policy
+                    .requires_bucket_tags_for_action(context.action)
             {
                 auth::bucket_policy::BucketTags::Available(&bucket_tags)
             } else {
@@ -1002,22 +1093,22 @@ impl Coordinator {
         );
         let policy_request = policy_request
             .with_request_object_tags(&request_object_tags)
-            .with_copy_source(request.policy_context.copy_source)
-            .with_metadata_directive(request.policy_context.metadata_directive)
-            .with_canned_acl(request.policy_context.canned_acl)
+            .with_copy_source(context.policy_context.copy_source)
+            .with_metadata_directive(context.policy_context.metadata_directive)
+            .with_canned_acl(context.policy_context.canned_acl)
             .with_server_side_encryption(
-                request
+                context
                     .policy_context
                     .managed_encryption
                     .map(ManagedEncryptionAlgorithm::as_str),
             )
-            .with_sse_customer_algorithm(request.policy_context.sse_customer_algorithm)
-            .with_grant_read(request.policy_context.grant_read)
-            .with_grant_write(request.policy_context.grant_write)
-            .with_grant_read_acp(request.policy_context.grant_read_acp)
-            .with_grant_write_acp(request.policy_context.grant_write_acp)
-            .with_grant_full_control(request.policy_context.grant_full_control);
-        Ok(policy.evaluate(&policy_request))
+            .with_sse_customer_algorithm(context.policy_context.sse_customer_algorithm)
+            .with_grant_read(context.policy_context.grant_read)
+            .with_grant_write(context.policy_context.grant_write)
+            .with_grant_read_acp(context.policy_context.grant_read_acp)
+            .with_grant_write_acp(context.policy_context.grant_write_acp)
+            .with_grant_full_control(context.policy_context.grant_full_control);
+        Ok(context.policy.evaluate(&policy_request))
     }
 
     pub(super) fn bucket_policy_decision_for_key(
@@ -1429,6 +1520,148 @@ impl Coordinator {
                 self.bucket_policy_decision_for_key(request, key)
             }
         }
+    }
+
+    #[cfg(test)]
+    fn bucket_policy_decision_for_object_with_preloaded_tags_modern(
+        requester: &Requester,
+        bucket: &ModernBucketSummary,
+        bucket_tags: Option<&[(String, String)]>,
+        object: &StoredObject,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+        existing_object_tags_mode: ExistingObjectTagsMode,
+    ) -> Result<auth::PolicyEvaluation, ServerError> {
+        let Some(policy) = policy else {
+            return Ok(auth::PolicyEvaluation::NoMatch);
+        };
+
+        Self::evaluate_bucket_policy_for_object_request(
+            ObjectPolicyEvaluationContext {
+                requester,
+                bucket_name: bucket.name.as_str(),
+                bucket_abac_enabled: bucket.bucket_abac_enabled,
+                action,
+                policy_context: PutObjectPolicyContext::default(),
+                policy,
+            },
+            object,
+            existing_object_tags_mode,
+            bucket_tags.unwrap_or(&[]),
+        )
+    }
+
+    #[cfg(test)]
+    fn filter_bucket_policy_allow_for_foreign_owned_read_family_object_modern(
+        bucket: &ModernBucketSummary,
+        object: &StoredObject,
+        action: auth::PolicyAction,
+        decision: auth::PolicyEvaluation,
+    ) -> auth::PolicyEvaluation {
+        if decision != auth::PolicyEvaluation::ExplicitAllow {
+            return decision;
+        }
+
+        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
+            return decision;
+        }
+
+        let is_read_family = matches!(
+            action,
+            auth::PolicyAction::GetObject
+                | auth::PolicyAction::GetObjectVersion
+                | auth::PolicyAction::GetObjectAttributes
+                | auth::PolicyAction::GetObjectVersionAttributes
+                | auth::PolicyAction::GetObjectAcl
+                | auth::PolicyAction::GetObjectVersionAcl
+        );
+        if !is_read_family {
+            return decision;
+        }
+
+        if Self::object_is_owned_by_modern_bucket_owner_account(bucket, object) {
+            return decision;
+        }
+
+        auth::PolicyEvaluation::NoMatch
+    }
+
+    #[cfg(test)]
+    fn object_is_owned_by_modern_bucket_owner_account(
+        bucket: &ModernBucketSummary,
+        object: &StoredObject,
+    ) -> bool {
+        if object.owner().principal == bucket.owner_principal
+            || object.owner().canonical_id == bucket.owner_canonical_id
+        {
+            return true;
+        }
+
+        let Some(object_owner_account_id) =
+            aws_account_id_from_principal(object.owner().principal.as_str())
+        else {
+            return false;
+        };
+        let Some(bucket_owner_account_id) = Self::bucket_owner_account_id(&bucket.owner_principal)
+        else {
+            return false;
+        };
+
+        object_owner_account_id == bucket_owner_account_id
+    }
+
+    #[cfg(test)]
+    fn modern_read_object_authorization_with_bucket_policy(
+        requester: &Requester,
+        bucket: &ModernBucketSummary,
+        bucket_tags: Option<&[(String, String)]>,
+        object: &StoredObject,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+        existing_object_tags_mode: ExistingObjectTagsMode,
+    ) -> Result<ModernObjectReadAuthorization, ServerError> {
+        let decision = Self::filter_bucket_policy_allow_for_foreign_owned_read_family_object_modern(
+            bucket,
+            object,
+            action,
+            Self::bucket_policy_decision_for_object_with_preloaded_tags_modern(
+                requester,
+                bucket,
+                bucket_tags,
+                object,
+                action,
+                policy,
+                existing_object_tags_mode,
+            )?,
+        );
+
+        let modern_default_allowed =
+            if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
+                Self::requester_can_modern_bucket_owner_account_admin(requester, bucket)
+            } else {
+                Self::requester_matches_owner_identity(requester, object.owner())
+            };
+
+        let outcome = match decision {
+            auth::PolicyEvaluation::ExplicitDeny => ModernObjectReadAuthorization::Denied,
+            auth::PolicyEvaluation::ExplicitAllow
+                if Self::modern_bucket_policy_allow_survives_restrict_public_buckets(
+                    requester, bucket,
+                ) =>
+            {
+                ModernObjectReadAuthorization::Allowed
+            }
+            auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
+                if modern_default_allowed {
+                    ModernObjectReadAuthorization::Allowed
+                } else if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
+                    ModernObjectReadAuthorization::Denied
+                } else {
+                    ModernObjectReadAuthorization::NeedAclFallback
+                }
+            }
+        };
+        Ok(outcome)
     }
 
     pub(super) fn requester_can_read_object_with_bucket_policy(
@@ -5031,5 +5264,274 @@ impl Coordinator {
                 snapshot_mode: ObjectReadSnapshotMode::MultipartParts,
             })?;
         Ok(AuthorizedObjectRead { snapshot })
+    }
+}
+
+#[cfg(test)]
+mod modern_auth_tests {
+    use super::{Coordinator, ExistingObjectTagsMode, ModernObjectReadAuthorization};
+    use crate::coordinator::request_types::Requester;
+    use crate::coordinator::response_types::ModernBucketSummary;
+    use s3_types::{AccountIdentity, BucketVersioningState, CanonicalUserId, VersionId};
+    use storage::{
+        AclGrants, BucketName, BucketObjectLockConfig, BucketObjectOwnership,
+        BucketOwnershipControls, EcShape, EffectiveBucketEncryptionConfig, GenerationId,
+        ObjectEncryption, ObjectEtag, ObjectKey, ObjectLayout, ObjectLockState, OwnerIdentity,
+        PublicAccessBlockConfig, StorageClass, StoredObject,
+    };
+
+    fn modern_bucket(ownership: Option<BucketObjectOwnership>) -> ModernBucketSummary {
+        ModernBucketSummary {
+            name: BucketName::try_from("test-bucket").unwrap(),
+            owner_principal: "arn:aws:iam::111122223333:user/bucket-owner".to_string(),
+            owner_canonical_id: CanonicalUserId::from_principal(
+                "arn:aws:iam::111122223333:user/bucket-owner",
+            ),
+            created_at: 0,
+            versioning: BucketVersioningState::Suspended,
+            object_lock: BucketObjectLockConfig::default(),
+            public_access_block: None,
+            ownership_controls: ownership
+                .map(|object_ownership| BucketOwnershipControls { object_ownership }),
+            bucket_policy_present: false,
+            bucket_policy_public: false,
+            bucket_policy_generation: 0,
+            bucket_lifecycle_present: false,
+            bucket_lifecycle_generation: 0,
+            bucket_abac_enabled: false,
+            encryption: EffectiveBucketEncryptionConfig::default(),
+        }
+    }
+
+    fn stored_live_object(owner_principal: &str) -> StoredObject {
+        StoredObject::Live(storage::LiveObjectRecord {
+            bucket: BucketName::try_from("test-bucket").unwrap(),
+            key: ObjectKey::try_from("key").unwrap(),
+            version_id: VersionId::Null,
+            owner: OwnerIdentity::from_principal(owner_principal),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::MIN,
+            size: 4,
+            etag: ObjectEtag::single_part(1),
+            last_modified: 0,
+            became_noncurrent_at: None,
+            storage_class: StorageClass::Standard,
+            ec: EcShape { k: 1, m: 0 },
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        })
+    }
+
+    fn requester(principal: &str) -> Requester {
+        Requester::authenticated(AccountIdentity::from_principal(principal))
+    }
+
+    fn owner_admin_requester() -> Requester {
+        Requester::authenticated_owner_account_admin(AccountIdentity::from_principal(
+            "arn:aws:iam::111122223333:user/owner-admin",
+        ))
+    }
+
+    fn shared_canonical_owner_admin_requester() -> Requester {
+        let owner_canonical =
+            CanonicalUserId::from_principal("arn:aws:iam::111122223333:user/bucket-owner");
+        Requester::authenticated_owner_account_admin(AccountIdentity::new(
+            "arn:aws:iam::111122223333:user/shared-other",
+            owner_canonical,
+            "shared-other",
+        ))
+    }
+
+    fn parse_policy(body: &str) -> auth::BucketPolicy {
+        auth::parse_bucket_policy(body).unwrap()
+    }
+
+    #[test]
+    fn modern_read_auth_allows_object_owner_without_policy() {
+        let bucket = modern_bucket(None);
+        let object = stored_live_object("arn:aws:iam::444455556666:user/object-owner");
+        let requester = requester("arn:aws:iam::444455556666:user/object-owner");
+
+        let outcome = Coordinator::modern_read_object_authorization_with_bucket_policy(
+            &requester,
+            &bucket,
+            None,
+            &object,
+            auth::PolicyAction::GetObject,
+            None,
+            ExistingObjectTagsMode::Available,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ModernObjectReadAuthorization::Allowed);
+    }
+
+    #[test]
+    fn modern_read_auth_returns_acl_fallback_for_foreign_owned_policy_allow() {
+        let bucket = modern_bucket(None);
+        let object = stored_live_object("arn:aws:iam::444455556666:user/object-owner");
+        let requester = requester("arn:aws:iam::111122223333:user/bucket-owner");
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111122223333:user/bucket-owner"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::test-bucket/*"}]}"#,
+        );
+
+        let outcome = Coordinator::modern_read_object_authorization_with_bucket_policy(
+            &requester,
+            &bucket,
+            None,
+            &object,
+            auth::PolicyAction::GetObject,
+            Some(&policy),
+            ExistingObjectTagsMode::Available,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ModernObjectReadAuthorization::NeedAclFallback);
+    }
+
+    #[test]
+    fn modern_read_auth_denies_explicit_policy_deny() {
+        let bucket = modern_bucket(None);
+        let object = stored_live_object("arn:aws:iam::111122223333:user/object-owner");
+        let requester = requester("arn:aws:iam::111122223333:user/object-owner");
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"arn:aws:iam::111122223333:user/object-owner"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::test-bucket/*"}]}"#,
+        );
+
+        let outcome = Coordinator::modern_read_object_authorization_with_bucket_policy(
+            &requester,
+            &bucket,
+            None,
+            &object,
+            auth::PolicyAction::GetObject,
+            Some(&policy),
+            ExistingObjectTagsMode::Available,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ModernObjectReadAuthorization::Denied);
+    }
+
+    #[test]
+    fn modern_read_auth_denies_explicit_policy_deny_for_shared_canonical_owner_admin() {
+        let bucket = modern_bucket(None);
+        let object = stored_live_object("arn:aws:iam::111122223333:user/bucket-owner");
+        let requester = shared_canonical_owner_admin_requester();
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"arn:aws:iam::111122223333:user/shared-other"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::test-bucket/*"}]}"#,
+        );
+
+        let outcome = Coordinator::modern_read_object_authorization_with_bucket_policy(
+            &requester,
+            &bucket,
+            None,
+            &object,
+            auth::PolicyAction::GetObject,
+            Some(&policy),
+            ExistingObjectTagsMode::Available,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ModernObjectReadAuthorization::Denied);
+    }
+
+    #[test]
+    fn modern_read_auth_denies_explicit_policy_deny_for_bucket_owner_root() {
+        let bucket = modern_bucket(None);
+        let object = stored_live_object("arn:aws:iam::111122223333:user/bucket-owner");
+        let requester = Requester::authenticated_owner_account_admin(
+            AccountIdentity::from_principal("arn:aws:iam::111122223333:root"),
+        );
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"arn:aws:iam::111122223333:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::test-bucket/*"}]}"#,
+        );
+
+        let outcome = Coordinator::modern_read_object_authorization_with_bucket_policy(
+            &requester,
+            &bucket,
+            None,
+            &object,
+            auth::PolicyAction::GetObject,
+            Some(&policy),
+            ExistingObjectTagsMode::Available,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ModernObjectReadAuthorization::Denied);
+    }
+
+    #[test]
+    fn modern_read_auth_denies_non_owner_without_policy_on_boe_bucket() {
+        let bucket = modern_bucket(Some(BucketObjectOwnership::BucketOwnerEnforced));
+        let object = stored_live_object("arn:aws:iam::444455556666:user/object-owner");
+        let requester = requester("arn:aws:iam::444455556666:user/other");
+
+        let outcome = Coordinator::modern_read_object_authorization_with_bucket_policy(
+            &requester,
+            &bucket,
+            None,
+            &object,
+            auth::PolicyAction::GetObject,
+            None,
+            ExistingObjectTagsMode::Available,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ModernObjectReadAuthorization::Denied);
+    }
+
+    #[test]
+    fn modern_read_auth_allows_bucket_owner_admin_on_boe_bucket() {
+        let bucket = modern_bucket(Some(BucketObjectOwnership::BucketOwnerEnforced));
+        let object = stored_live_object("arn:aws:iam::444455556666:user/object-owner");
+        let requester = owner_admin_requester();
+
+        let outcome = Coordinator::modern_read_object_authorization_with_bucket_policy(
+            &requester,
+            &bucket,
+            None,
+            &object,
+            auth::PolicyAction::GetObject,
+            None,
+            ExistingObjectTagsMode::Available,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ModernObjectReadAuthorization::Allowed);
+    }
+
+    #[test]
+    fn modern_read_auth_ignores_public_policy_when_restrict_public_buckets_blocks_it() {
+        let mut bucket = modern_bucket(None);
+        bucket.bucket_policy_public = true;
+        bucket.public_access_block = Some(PublicAccessBlockConfig {
+            block_public_acls: false,
+            ignore_public_acls: false,
+            block_public_policy: false,
+            restrict_public_buckets: true,
+        });
+        let object = stored_live_object("arn:aws:iam::111122223333:user/object-owner");
+        let requester = requester("arn:aws:iam::777788889999:user/other");
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::test-bucket/*"}]}"#,
+        );
+
+        let outcome = Coordinator::modern_read_object_authorization_with_bucket_policy(
+            &requester,
+            &bucket,
+            None,
+            &object,
+            auth::PolicyAction::GetObject,
+            Some(&policy),
+            ExistingObjectTagsMode::Available,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ModernObjectReadAuthorization::NeedAclFallback);
     }
 }

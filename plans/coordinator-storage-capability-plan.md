@@ -1212,6 +1212,14 @@ Current guidance for this phase:
     - use fast-path state only when the needed policy/tag inputs are actually
       warm in cache
     - otherwise fall back to a real bucket snapshot load
+    - the first structural refactor inside this slice should be an explicit
+      standalone "modern auth" decision seam for object reads:
+      - `Allow`
+      - `Deny`
+      - `NeedAclFallback`
+      - so the hot path can be tested independently of legacy ACL behavior
+      - and so ACL-backed fallback remains explicit rather than implicit cache
+        coupling
   - later phases can optimize the representation further
     - especially policy residualization
     - and lifecycle specialization
