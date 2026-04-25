@@ -1203,6 +1203,18 @@ the full legacy bucket summary surface.
 
 Current guidance for this phase:
 
+- the first concrete Phase 10 implementation slice should be:
+  - bucket policy + bucket tags for the object-read fast path
+  - specifically `GetObject` / `HeadObject` and closely related object-read
+    request families that currently fall back once bucket policy is present or
+    ABAC bucket tags are needed
+  - this should be correctness-first:
+    - use fast-path state only when the needed policy/tag inputs are actually
+      warm in cache
+    - otherwise fall back to a real bucket snapshot load
+  - later phases can optimize the representation further
+    - especially policy residualization
+    - and lifecycle specialization
 - the cache must become explicitly bounded
   - the current unbounded `HashMap<BucketName, BucketFastPathInfo>` is not an
     acceptable end state

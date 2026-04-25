@@ -8,8 +8,9 @@ use s3_types::{
 };
 use storage::{
     BucketName, BucketObjectLockConfig, BucketObjectOwnership, BucketOwnershipControls,
-    BucketState, ManagedEncryptionAlgorithm, MultipartUploadRecord, ObjectKey,
-    ObjectReadSnapshotMode, OwnerIdentity, PublicAccessBlockConfig, StoredObject, UploadState,
+    BucketState, LoadedBucketSubresource, ManagedEncryptionAlgorithm, MultipartUploadRecord,
+    ObjectKey, ObjectReadSnapshotMode, OwnerIdentity, PublicAccessBlockConfig, StoredObject,
+    UploadState,
 };
 
 use super::authz_results::{
@@ -1667,7 +1668,7 @@ impl Coordinator {
             }
 
             let bucket_info = Self::validate_expected_bucket_owner(
-                Self::bucket_summary_fast(info),
+                Self::bucket_summary_fast(info.clone()),
                 expected_bucket_owner,
             )?
             .into_inner();
@@ -1680,6 +1681,34 @@ impl Coordinator {
                     request,
                     LoadedBucketValue::NotRequested,
                     LoadedBucketValue::NotRequested,
+                    LoadedBucketValue::NotRequested,
+                    LoadedBucketValue::NotRequested,
+                ));
+            }
+
+            let cached_policy = match &info.policy {
+                LoadedBucketSubresource::Loaded(policy) => {
+                    Some(LoadedBucketValue::Loaded(policy.clone()))
+                }
+                LoadedBucketSubresource::Missing | LoadedBucketSubresource::NotRequested => None,
+            };
+            let cached_tags = match (&info.tags, info.bucket_abac_enabled) {
+                (_, false) => Some(LoadedBucketValue::NotRequested),
+                (LoadedBucketSubresource::Loaded(tags), true) => {
+                    Some(LoadedBucketValue::Loaded(tags.clone()))
+                }
+                (LoadedBucketSubresource::Missing, true) => Some(LoadedBucketValue::Missing),
+                (LoadedBucketSubresource::NotRequested, true) => None,
+            };
+
+            if let (Some(policy), Some(tags)) = (cached_policy, cached_tags) {
+                #[cfg(test)]
+                maybe_run_bucket_policy_fast_path_hook(bucket.as_str());
+                return Ok(LoadedBucketHandle::new(
+                    bucket_info,
+                    request,
+                    policy,
+                    tags,
                     LoadedBucketValue::NotRequested,
                     LoadedBucketValue::NotRequested,
                 ));

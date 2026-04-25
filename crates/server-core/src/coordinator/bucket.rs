@@ -550,7 +550,8 @@ impl Coordinator {
             req.config.len()
         );
         let authorized = self.authorize_put_bucket_tagging(req)?;
-        let _ = self.store_authorized_bucket_subresource(&authorized)?;
+        let info = self.store_authorized_bucket_subresource(&authorized)?;
+        self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
 
@@ -573,7 +574,8 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_delete_bucket_tagging(req)?;
-        let _ = self.remove_authorized_bucket_subresource(&authorized)?;
+        let info = self.remove_authorized_bucket_subresource(&authorized)?;
+        self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
 
@@ -606,7 +608,7 @@ impl Coordinator {
             req.config.len()
         );
         let authorized = self.authorize_bucket_tag_control(&req.control)?;
-        let _ = self.store_bucket_subresource(
+        let info = self.store_bucket_subresource(
             &authorized.bucket,
             storage::PutBucketSubresource {
                 kind: storage::BucketSubresourceKind::Tagging,
@@ -614,6 +616,7 @@ impl Coordinator {
                 aux: storage::BucketSubresourceAux::None,
             },
         )?;
+        self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
 
@@ -628,10 +631,12 @@ impl Coordinator {
             req.bucket.name
         );
         let authorized = self.authorize_bucket_tag_control(req)?;
-        let _ = self.remove_authorized_bucket_subresource(&AuthorizedBucketSubresourceDelete {
-            bucket: authorized.bucket,
-            kind: storage::BucketSubresourceKind::Tagging,
-        })?;
+        let info =
+            self.remove_authorized_bucket_subresource(&AuthorizedBucketSubresourceDelete {
+                bucket: authorized.bucket,
+                kind: storage::BucketSubresourceKind::Tagging,
+            })?;
+        self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
 

@@ -1605,9 +1605,11 @@ mod tests {
             bucket_policy_present: false,
             bucket_policy_public: false,
             bucket_policy_generation: 0,
+            policy: crate::types::LoadedBucketSubresource::Missing,
             bucket_lifecycle_present: false,
             bucket_lifecycle_generation: 0,
             bucket_abac_enabled: false,
+            tags: crate::types::LoadedBucketSubresource::NotRequested,
             encryption: crate::types::EffectiveBucketEncryptionConfig::default(),
         };
         node.upsert_bucket_fast_path(info);

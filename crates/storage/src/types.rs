@@ -2030,9 +2030,11 @@ pub struct BucketFastPathInfo {
     pub bucket_policy_present: bool,
     pub bucket_policy_public: bool,
     pub bucket_policy_generation: u64,
+    pub policy: LoadedBucketSubresource<String>,
     pub bucket_lifecycle_present: bool,
     pub bucket_lifecycle_generation: u64,
     pub bucket_abac_enabled: bool,
+    pub tags: LoadedBucketSubresource<String>,
     pub encryption: EffectiveBucketEncryptionConfig,
 }
 
@@ -2057,12 +2059,14 @@ impl std::fmt::Debug for BucketFastPathInfo {
             .field("bucket_policy_present", &self.bucket_policy_present)
             .field("bucket_policy_public", &self.bucket_policy_public)
             .field("bucket_policy_generation", &self.bucket_policy_generation)
+            .field("policy", &self.policy)
             .field("bucket_lifecycle_present", &self.bucket_lifecycle_present)
             .field(
                 "bucket_lifecycle_generation",
                 &self.bucket_lifecycle_generation,
             )
             .field("bucket_abac_enabled", &self.bucket_abac_enabled)
+            .field("tags", &self.tags)
             .field("encryption", &self.encryption)
             .finish()
     }
@@ -2130,9 +2134,15 @@ impl From<BucketInfo> for BucketFastPathInfo {
             bucket_policy_present: info.bucket_policy_present,
             bucket_policy_public: info.bucket_policy_public,
             bucket_policy_generation: info.bucket_policy_generation,
+            policy: if info.bucket_policy_present {
+                LoadedBucketSubresource::NotRequested
+            } else {
+                LoadedBucketSubresource::Missing
+            },
             bucket_lifecycle_present: info.bucket_lifecycle_present,
             bucket_lifecycle_generation: info.bucket_lifecycle_generation,
             bucket_abac_enabled: info.bucket_abac_enabled,
+            tags: LoadedBucketSubresource::NotRequested,
             encryption: info.encryption,
         }
     }
@@ -2156,10 +2166,44 @@ impl From<&BucketInfo> for BucketFastPathInfo {
             bucket_policy_present: info.bucket_policy_present,
             bucket_policy_public: info.bucket_policy_public,
             bucket_policy_generation: info.bucket_policy_generation,
+            policy: if info.bucket_policy_present {
+                LoadedBucketSubresource::NotRequested
+            } else {
+                LoadedBucketSubresource::Missing
+            },
             bucket_lifecycle_present: info.bucket_lifecycle_present,
             bucket_lifecycle_generation: info.bucket_lifecycle_generation,
             bucket_abac_enabled: info.bucket_abac_enabled,
+            tags: LoadedBucketSubresource::NotRequested,
             encryption: info.encryption,
+        }
+    }
+}
+
+impl From<&BucketSnapshot> for BucketFastPathInfo {
+    fn from(snapshot: &BucketSnapshot) -> Self {
+        Self {
+            name: snapshot.bucket.name.clone(),
+            owner_principal: snapshot.bucket.owner_principal.clone(),
+            owner_canonical_id: snapshot.bucket.owner_canonical_id.clone(),
+            created_at: snapshot.bucket.created_at,
+            state: snapshot.bucket.state,
+            versioning: snapshot.bucket.versioning,
+            object_lock: snapshot.bucket.object_lock,
+            acl_grants: snapshot.bucket.acl_grants.clone(),
+            public_read: snapshot.bucket.public_read,
+            public_write: snapshot.bucket.public_write,
+            public_access_block: snapshot.bucket.public_access_block,
+            ownership_controls: snapshot.bucket.ownership_controls,
+            bucket_policy_present: snapshot.bucket.bucket_policy_present,
+            bucket_policy_public: snapshot.bucket.bucket_policy_public,
+            bucket_policy_generation: snapshot.bucket.bucket_policy_generation,
+            policy: snapshot.policy.clone(),
+            bucket_lifecycle_present: snapshot.bucket.bucket_lifecycle_present,
+            bucket_lifecycle_generation: snapshot.bucket.bucket_lifecycle_generation,
+            bucket_abac_enabled: snapshot.bucket.bucket_abac_enabled,
+            tags: snapshot.tags.clone(),
+            encryption: snapshot.bucket.encryption,
         }
     }
 }
