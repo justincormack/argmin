@@ -1208,6 +1208,13 @@ Current guidance for this phase:
     acceptable end state
   - the first target should be a fixed-entry bounded cache with deterministic
     eviction, most likely recency-based
+  - Phase 10 should use count-bounded sizing, not byte-weighted sizing
+    - the modern hot-path bucket execution context is expected to be dominated
+      by tiny fixed-size fields plus a small amount of medium-sized metadata
+    - raw lifecycle and ACL-heavy state are explicitly out of the main hot
+      cache payload
+    - exact byte-weighted sizing should therefore be deferred unless later
+      evidence shows real pressure after the bounded-cache rollout
 - revalidation must be extremely cheap on the hot path
   - bucket metadata changes are rare in normal workloads, so the fast path
     should optimize for cheap local revalidation rather than for queue-based or
@@ -1319,7 +1326,92 @@ Acceptance criteria:
   resolved and pinned by tests, either by removing the stale-cache window or by
   deliberately modeling AWS-compatible asynchronous behavior
 
-### Phase 11: Data-Plane EC and Shard IO Ownership
+### Phase 11: Bucket Policy Residualization for Hot Paths
+
+After the bounded fast-path execution-context cache exists and its freshness
+contract is correct, consider a follow-on optimization for the hottest
+request families: compile bucket policy into per-operation residual policy
+evaluators rather than caching raw policy bodies or evaluating the full parsed
+policy on every request.
+
+This is explicitly a later optimization phase, not part of the initial
+fast-path cache realignment. The first implementation should prioritize:
+
+- bounded cache size
+- cheap hot-path revalidation
+- correct modern auth/config coverage
+- full-snapshot fallback where needed
+
+Only once that is stable should this optimization be considered.
+
+The idea is:
+
+- partition bucket policy by relevant action family
+  - especially `GetObject` / `HeadObject`
+  - later hot write/multipart families if warranted
+- partially evaluate each relevant statement against bucket-static context
+  known at cache-build time
+  - bucket ARN / resource shape
+  - bucket tags
+  - bucket-owner/account-local facts
+  - Public Access Block / ownership-controls interactions where applicable
+  - other bucket-known condition inputs
+- discard irrelevant or unsatisfiable branches for that operation family
+- cache only the residual request-time policy logic that still depends on
+  request-dynamic facts
+  - principal / auth identity
+  - request headers
+  - transport context
+  - source IP / VPC / time
+  - object key / object tags where relevant
+
+This means bucket tags do not necessarily need to remain as first-class
+hot-path inputs if they are only used to resolve bucket-static policy
+conditions: they can be substituted into the policy at cache-build time and
+folded into the residual evaluator.
+
+Potential advantages:
+
+- smaller hot-path policy work
+- less per-request condition evaluation
+- bucket-static inputs like bucket tags disappear into the compiled residual
+  policy rather than remaining as separately consulted state
+- clearer separation between bucket-static and request-dynamic authorization
+  inputs
+
+Risks / constraints:
+
+- this is an authorization optimization, so correctness risk is high
+- it must preserve exact AWS-compatible authorization semantics
+- it should not be attempted before the basic bounded-cache and freshness model
+  is fully pinned by tests
+- any residualization strategy must preserve the request-scoped snapshot
+  contract for the bucket handle model
+
+Initial target if this phase is pursued:
+
+- `GetObject`
+- `HeadObject`
+
+Only after that proves correct and worthwhile should the same approach be
+considered for:
+
+- `PutObject`
+- `CreateMultipartUpload`
+- `UploadPart`
+- `CompleteMultipartUpload`
+
+Acceptance criteria:
+
+- the bucket-static inputs eligible for substitution are explicitly listed
+- the residual policy representation is explicit and reviewable
+- the request-dynamic inputs still evaluated at request time are explicit
+- read/head authorization remains pinned against AWS behavior after the
+  residualization step
+- the optimization is optional and clearly layered on top of the bounded
+  fast-path cache rather than entangled with the initial cache rollout
+
+### Phase 12: Data-Plane EC and Shard IO Ownership
 
 After the request-shape and test-boundary work, there is still one remaining
 storage concern visible above the storage boundary: coordinator/runtime code
