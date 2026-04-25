@@ -1,8 +1,11 @@
+use std::future::Future;
+use std::time::Duration;
+
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketCannedAcl, BucketLocationConstraint, CompletedMultipartUpload, CompletedPart,
-    CreateBucketConfiguration, Grant, ObjectCannedAcl, ObjectOwnership, OwnershipControls,
-    OwnershipControlsRule, Permission,
+    CreateBucketConfiguration, Grant, ObjectAttributes, ObjectCannedAcl, ObjectOwnership,
+    OwnershipControls, OwnershipControlsRule, Permission, Tag, Tagging,
 };
 use s3_tests::{
     assert_s3_err_code, content_md5_header, create_public_write_bucket,
@@ -63,6 +66,21 @@ async fn create_bucket_in_test_region(client: &aws_sdk_s3::Client, bucket: &str)
     request.send().await.unwrap();
 }
 
+async fn create_bucket_in_test_region_with_ownership(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    ownership: ObjectOwnership,
+) {
+    let mut request = s3_tests::create_bucket_request(client, bucket).object_ownership(ownership);
+    if CTX.region() != "us-east-1" {
+        let config = CreateBucketConfiguration::builder()
+            .location_constraint(BucketLocationConstraint::from(CTX.region()))
+            .build();
+        request = request.create_bucket_configuration(config);
+    }
+    request.send().await.unwrap();
+}
+
 async fn set_bucket_ownership(bucket: &str, ownership: ObjectOwnership) {
     let rule = OwnershipControlsRule::builder()
         .object_ownership(ownership)
@@ -76,6 +94,27 @@ async fn set_bucket_ownership(bucket: &str, ownership: ObjectOwnership) {
         .send()
         .await
         .unwrap();
+}
+
+async fn eventually_ok<T, E, F, Fut>(description: &str, mut op: F) -> T
+where
+    E: std::fmt::Debug,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>,
+{
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match op().await {
+            Ok(output) => return output,
+            Err(_) if attempt + 1 < MAX_ATTEMPTS => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(err) => panic!("{description} failed unexpectedly: {err:?}"),
+        }
+    }
+
+    unreachable!()
 }
 
 async fn delete_bucket_ownership(bucket: &str) {
@@ -215,6 +254,32 @@ async fn object_owner_id(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -
         .and_then(|owner| owner.id())
         .expect("expected owner ID in GetObjectAcl")
         .to_string()
+}
+
+async fn object_owner_id_eventually(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    expected_owner_id: &str,
+    description: &str,
+) {
+    const MAX_ATTEMPTS: usize = 50;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let owner_id = object_owner_id(client, bucket, key).await;
+        if owner_id == expected_owner_id {
+            return;
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!(
+            "{description} did not converge to owner {expected_owner_id} for {bucket}/{key}; last owner {owner_id}"
+        );
+    }
+
+    unreachable!()
 }
 
 async fn assert_alt_get_object_tagging_denied(bucket: &str, key: &str) {
@@ -371,13 +436,17 @@ fn test_anonymous_public_write_put_bucket_owner_full_control_makes_bucket_owner_
         assert_eq!(put.0, 200, "unexpected body: {}", put.1);
 
         assert_eq!(object_owner_id(client, &bucket, key).await, bucket_owner);
-        let body = owner_get_object_eventually(&bucket, key)
-            .await
-            .body
-            .collect()
-            .await
-            .unwrap()
-            .into_bytes();
+        let body = owner_get_object_eventually(
+            &bucket,
+            key,
+            "anonymous public-write bucket-owner-full-control owner read",
+        )
+        .await
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
         assert_eq!(&body[..], b"data");
 
         let acl = client
@@ -675,6 +744,611 @@ fn test_bucket_owner_cannot_get_private_object_written_by_other_user() {
             .await
             .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_policy_does_not_grant_bucket_owner_read_of_private_foreign_owned_object() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        create_bucket_in_test_region_with_ownership(client, &bucket, ObjectOwnership::ObjectWriter)
+            .await;
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "AllowAltWriterPutObject",
+                    "Effect": "Allow",
+                    "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) },
+                    "Action": "s3:PutObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                },
+                {
+                    "Sid": "AllowBucketOwnerReadByBucketPolicy",
+                    "Effect": "Allow",
+                    "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.account_id()) },
+                    "Action": "s3:GetObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                }
+            ],
+        });
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy.to_string())
+            .send()
+            .await
+            .unwrap();
+
+        alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key("writer-owned")
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        owner_get_object_access_denied_eventually(&bucket, "writer-owned").await;
+
+        cleanup_keys(&bucket, &["writer-owned"]).await;
+    });
+}
+
+#[test]
+fn test_create_time_object_writer_bucket_policy_does_not_grant_bucket_owner_read_of_private_foreign_owned_object(
+) {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        let key = "writer-owned";
+        create_bucket_in_test_region_with_ownership(client, &bucket, ObjectOwnership::ObjectWriter)
+            .await;
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "AllowAltWriterPutObject",
+                    "Effect": "Allow",
+                    "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) },
+                    "Action": "s3:PutObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                },
+                {
+                    "Sid": "AllowBucketOwnerReadByBucketPolicy",
+                    "Effect": "Allow",
+                    "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.account_id()) },
+                    "Action": "s3:GetObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                }
+            ],
+        });
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy.to_string())
+            .send()
+            .await
+            .unwrap();
+
+        alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        owner_get_object_access_denied_eventually(&bucket, key).await;
+
+        cleanup_keys(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_probe_bucket_owner_enforced_bucket_policy_get_object_sequence_for_pre_boe_foreign_owned_object(
+) {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        let key = "writer-owned";
+        let alt_owner = canonical_owner_id(alt_client).await;
+        create_bucket_in_test_region_with_ownership(client, &bucket, ObjectOwnership::ObjectWriter)
+            .await;
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "AllowAltWriterPutObject",
+                    "Effect": "Allow",
+                    "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) },
+                    "Action": "s3:PutObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                },
+                {
+                    "Sid": "AllowBucketOwnerReadByBucketPolicy",
+                    "Effect": "Allow",
+                    "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.account_id()) },
+                    "Action": "s3:GetObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                }
+            ],
+        });
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy.to_string())
+            .send()
+            .await
+            .unwrap();
+
+        alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(object_owner_id(alt_client, &bucket, key).await, alt_owner);
+        owner_get_object_access_denied_eventually(&bucket, key).await;
+
+        set_bucket_ownership(&bucket, ObjectOwnership::BucketOwnerEnforced).await;
+
+        let bucket_owner = bucket_owner_id(&bucket).await;
+        object_owner_id_eventually(
+            client,
+            &bucket,
+            key,
+            &bucket_owner,
+            "pre-create ObjectWriter BOE owner flip",
+        )
+        .await;
+        let during_boe =
+            owner_get_object_eventually(&bucket, key, "create-time ObjectWriter BOE GetObject")
+                .await
+                .body
+                .collect()
+                .await
+                .unwrap()
+                .into_bytes();
+        assert_eq!(&during_boe[..], b"data");
+
+        delete_bucket_ownership(&bucket).await;
+
+        object_owner_id_eventually(
+            alt_client,
+            &bucket,
+            key,
+            &alt_owner,
+            "pre-create ObjectWriter BOE removal owner flip",
+        )
+        .await;
+        owner_get_object_access_denied_after_boe_removal_eventually(
+            &bucket,
+            key,
+            "create-time ObjectWriter BOE removal GetObject",
+        )
+        .await;
+
+        cleanup_keys(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_probe_bucket_owner_enforced_bucket_policy_get_object_sequence_for_post_creation_object_writer_foreign_owned_object(
+) {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        let key = "writer-owned";
+        let alt_owner = canonical_owner_id(alt_client).await;
+        create_bucket_in_test_region(client, &bucket).await;
+        set_bucket_ownership(&bucket, ObjectOwnership::ObjectWriter).await;
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "AllowAltWriterPutObject",
+                    "Effect": "Allow",
+                    "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) },
+                    "Action": "s3:PutObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                },
+                {
+                    "Sid": "AllowBucketOwnerReadByBucketPolicy",
+                    "Effect": "Allow",
+                    "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.account_id()) },
+                    "Action": "s3:GetObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                }
+            ],
+        });
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy.to_string())
+            .send()
+            .await
+            .unwrap();
+
+        alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(object_owner_id(alt_client, &bucket, key).await, alt_owner);
+        owner_get_object_access_denied_eventually(&bucket, key).await;
+
+        set_bucket_ownership(&bucket, ObjectOwnership::BucketOwnerEnforced).await;
+
+        let bucket_owner = bucket_owner_id(&bucket).await;
+        object_owner_id_eventually(
+            client,
+            &bucket,
+            key,
+            &bucket_owner,
+            "post-creation ObjectWriter BOE owner flip",
+        )
+        .await;
+        let during_boe =
+            owner_get_object_eventually(&bucket, key, "post-creation ObjectWriter BOE GetObject")
+                .await
+                .body
+                .collect()
+                .await
+                .unwrap()
+                .into_bytes();
+        assert_eq!(&during_boe[..], b"data");
+
+        delete_bucket_ownership(&bucket).await;
+
+        object_owner_id_eventually(
+            alt_client,
+            &bucket,
+            key,
+            &alt_owner,
+            "post-creation ObjectWriter BOE removal owner flip",
+        )
+        .await;
+        owner_get_object_access_denied_after_boe_removal_eventually(
+            &bucket,
+            key,
+            "post-creation ObjectWriter BOE removal GetObject",
+        )
+        .await;
+
+        cleanup_keys(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_probe_bucket_owner_enforced_get_object_sequence_without_read_policy_for_pre_boe_foreign_owned_object(
+) {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        let key = "writer-owned";
+        let alt_owner = canonical_owner_id(alt_client).await;
+        create_bucket_in_test_region_with_ownership(client, &bucket, ObjectOwnership::ObjectWriter)
+            .await;
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": "AllowAltWriterPutObject",
+                "Effect": "Allow",
+                "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) },
+                "Action": "s3:PutObject",
+                "Resource": format!("arn:aws:s3:::{bucket}/*"),
+            }],
+        });
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy.to_string())
+            .send()
+            .await
+            .unwrap();
+
+        alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(object_owner_id(alt_client, &bucket, key).await, alt_owner);
+        owner_get_object_access_denied_eventually(&bucket, key).await;
+
+        set_bucket_ownership(&bucket, ObjectOwnership::BucketOwnerEnforced).await;
+
+        let bucket_owner = bucket_owner_id(&bucket).await;
+        object_owner_id_eventually(
+            client,
+            &bucket,
+            key,
+            &bucket_owner,
+            "pre-create ObjectWriter BOE owner flip without read policy",
+        )
+        .await;
+        let during_boe = owner_get_object_eventually(
+            &bucket,
+            key,
+            "create-time ObjectWriter BOE GetObject without read policy",
+        )
+        .await
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+        assert_eq!(&during_boe[..], b"data");
+
+        delete_bucket_ownership(&bucket).await;
+
+        object_owner_id_eventually(
+            alt_client,
+            &bucket,
+            key,
+            &alt_owner,
+            "pre-create ObjectWriter BOE removal owner flip without read policy",
+        )
+        .await;
+        owner_get_object_access_denied_after_boe_removal_eventually(
+            &bucket,
+            key,
+            "create-time ObjectWriter BOE removal GetObject without read policy",
+        )
+        .await;
+
+        cleanup_keys(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_probe_bucket_policy_foreign_owned_object_access_matrix() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        let key = "writer-owned";
+        create_bucket_in_test_region_with_ownership(client, &bucket, ObjectOwnership::ObjectWriter)
+            .await;
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "AllowAltWriterPutObject",
+                    "Effect": "Allow",
+                    "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) },
+                    "Action": "s3:PutObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                },
+                {
+                    "Sid": "AllowBucketOwnerObjectAccess",
+                    "Effect": "Allow",
+                    "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.account_id()) },
+                    "Action": [
+                        "s3:GetObject",
+                        "s3:GetObjectAcl",
+                        "s3:GetObjectTagging",
+                        "s3:GetObjectAttributes",
+                        "s3:PutObjectAcl",
+                        "s3:PutObjectTagging"
+                    ],
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                }
+            ],
+        });
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy.to_string())
+            .send()
+            .await
+            .unwrap();
+
+        alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let get_object = client.get_object().bucket(&bucket).key(key).send().await;
+        let head_object = client.head_object().bucket(&bucket).key(key).send().await;
+        let get_object_attributes = client
+            .get_object_attributes()
+            .bucket(&bucket)
+            .key(key)
+            .object_attributes(ObjectAttributes::ObjectSize)
+            .send()
+            .await;
+        let get_object_acl = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await;
+        let get_object_tagging = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await;
+        let put_object_acl = client
+            .put_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .acl(ObjectCannedAcl::Private)
+            .send()
+            .await;
+        let put_object_tagging = client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .tagging(
+                Tagging::builder()
+                    .tag_set(Tag::builder().key("k").value("v").build().unwrap())
+                    .build()
+                    .unwrap(),
+            )
+            .send()
+            .await;
+
+        eprintln!("GetObject: {get_object:?}");
+        eprintln!("HeadObject: {head_object:?}");
+        eprintln!("GetObjectAttributes: {get_object_attributes:?}");
+        eprintln!("GetObjectAcl: {get_object_acl:?}");
+        eprintln!("GetObjectTagging: {get_object_tagging:?}");
+        eprintln!("PutObjectAcl: {put_object_acl:?}");
+        eprintln!("PutObjectTagging: {put_object_tagging:?}");
+
+        cleanup_keys(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_allows_bucket_owner_put_object_overwrite_of_private_foreign_owned_object() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        let key = "writer-owned";
+        create_bucket_in_test_region_with_ownership(client, &bucket, ObjectOwnership::ObjectWriter)
+            .await;
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "AllowAltWriterPutObject",
+                    "Effect": "Allow",
+                    "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) },
+                    "Action": "s3:PutObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                },
+                {
+                    "Sid": "AllowBucketOwnerOverwrite",
+                    "Effect": "Allow",
+                    "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.account_id()) },
+                    "Action": "s3:PutObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                }
+            ],
+        });
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy.to_string())
+            .send()
+            .await
+            .unwrap();
+
+        alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"writer-data"))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "bucket-owner PutObject overwrite of private foreign-owned object",
+            || {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(key)
+                    .body(ByteStream::from_static(b"owner-data"))
+                    .send()
+            },
+        )
+        .await;
+
+        let body = eventually_ok(
+            "bucket-owner GetObject after overwrite of foreign-owned object",
+            || client.get_object().bucket(&bucket).key(key).send(),
+        )
+        .await
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+        assert_eq!(&body[..], b"owner-data");
+
+        cleanup_keys(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_owner_can_delete_private_foreign_owned_object() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        let key = "writer-owned";
+        create_bucket_in_test_region_with_ownership(client, &bucket, ObjectOwnership::ObjectWriter)
+            .await;
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": "AllowAltWriterPutObject",
+                "Effect": "Allow",
+                "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) },
+                "Action": "s3:PutObject",
+                "Resource": format!("arn:aws:s3:::{bucket}/*"),
+            }],
+        });
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy.to_string())
+            .send()
+            .await
+            .unwrap();
+
+        alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"writer-data"))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "bucket-owner DeleteObject on private foreign-owned object",
+            || client.delete_object().bucket(&bucket).key(key).send(),
+        )
+        .await;
+
+        cleanup(&bucket).await;
     });
 }
 
@@ -1403,7 +2077,7 @@ async fn alt_get_object_eventually(
 }
 
 async fn owner_get_object_access_denied_eventually(bucket: &str, key: &str) {
-    const MAX_ATTEMPTS: usize = 10;
+    const MAX_ATTEMPTS: usize = 30;
 
     for attempt in 0..MAX_ATTEMPTS {
         let result = CTX
@@ -1432,8 +2106,42 @@ async fn owner_get_object_access_denied_eventually(bucket: &str, key: &str) {
     unreachable!()
 }
 
+async fn owner_get_object_access_denied_after_boe_removal_eventually(
+    bucket: &str,
+    key: &str,
+    description: &str,
+) {
+    const MAX_ATTEMPTS: usize = 360;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = CTX
+            .client()
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
+        if result.is_err() && err_status(&result) == 403 && {
+            assert_s3_err_code(&result, "AccessDenied");
+            true
+        } {
+            return;
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!(
+            "{description} did not converge to AccessDenied for {bucket}/{key}: {:?}",
+            result
+        );
+    }
+
+    unreachable!()
+}
+
 async fn owner_head_object_access_denied_eventually(bucket: &str, key: &str) {
-    const MAX_ATTEMPTS: usize = 10;
+    const MAX_ATTEMPTS: usize = 30;
 
     for attempt in 0..MAX_ATTEMPTS {
         let result = CTX
@@ -1465,8 +2173,9 @@ async fn owner_head_object_access_denied_eventually(bucket: &str, key: &str) {
 async fn owner_get_object_eventually(
     bucket: &str,
     key: &str,
+    description: &str,
 ) -> aws_sdk_s3::operation::get_object::GetObjectOutput {
-    const MAX_ATTEMPTS: usize = 10;
+    const MAX_ATTEMPTS: usize = 30;
 
     for attempt in 0..MAX_ATTEMPTS {
         match CTX
@@ -1481,7 +2190,9 @@ async fn owner_get_object_eventually(
             Err(_) if attempt + 1 < MAX_ATTEMPTS => {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
-            Err(err) => panic!("owner GetObject failed unexpectedly: {err:?}"),
+            Err(err) => panic!(
+                "{description} did not converge to allowed GetObject for {bucket}/{key}: {err:?}"
+            ),
         }
     }
 
@@ -1900,13 +2611,17 @@ fn test_bucket_owner_enforced_acl_read_and_restore_semantics() {
             boe_acl.grants()
         );
 
-        let body = owner_get_object_eventually(&bucket, "pre-boe")
-            .await
-            .body
-            .collect()
-            .await
-            .unwrap()
-            .into_bytes();
+        let body = owner_get_object_eventually(
+            &bucket,
+            "pre-boe",
+            "BOE ACL read and restore semantics owner read during BOE",
+        )
+        .await
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
         assert_eq!(&body[..], b"before");
 
         alt.put_object()
