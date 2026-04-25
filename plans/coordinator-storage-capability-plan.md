@@ -1211,8 +1211,19 @@ Current guidance for this phase:
   - Phase 10 should use count-bounded sizing, not byte-weighted sizing
     - the modern hot-path bucket execution context is expected to be dominated
       by tiny fixed-size fields plus a small amount of medium-sized metadata
-    - raw lifecycle and ACL-heavy state are explicitly out of the main hot
-      cache payload
+    - ACL-heavy state is explicitly out of the main hot cache payload
+    - lifecycle is more awkward:
+      - raw lifecycle configuration is too large to want in the long-term hot
+        cache shape
+      - but lifecycle-derived `x-amz-expiration` / multipart abort headers are
+        still observable on hot request families, especially `GetObject`,
+        `HeadObject`, and `CompleteMultipartUpload`
+      - so Phase 10 may still need to carry lifecycle-related fast-path state
+        even if that later becomes a specialized representation rather than the
+        raw lifecycle body
+    - this means count-bounded sizing is still the right initial choice, but
+      practical entry count may need to stay conservative until lifecycle is
+      specialized in a later phase
     - exact byte-weighted sizing should therefore be deferred unless later
       evidence shows real pressure after the bounded-cache rollout
 - revalidation must be extremely cheap on the hot path
@@ -1249,13 +1260,19 @@ Current guidance for this phase:
     - versioning
     - encryption defaults
     - object-lock configuration where the request family needs it
-  - explicitly out of scope for the main hot cache payload:
-    - raw lifecycle configuration
-    - lifecycle configuration should not shape the `GetObject` / `HeadObject`
-      fast path because lifecycle actions are not part of the primary request
-      authorization flow
-    - if lifecycle markers remain at all, they should only be minimal
-      presence/generation hints rather than the cached lifecycle body
+  - lifecycle needs a more precise treatment than simple removal:
+    - raw lifecycle configuration should still be considered out of scope for
+      the long-term hot cache payload because it is large and not part of
+      primary authorization flow
+    - but lifecycle-derived headers are still exposed on hot request families
+      such as `GetObject`, `HeadObject`, and `CompleteMultipartUpload`
+    - so lifecycle cannot simply be dropped from the fast path while those
+      response headers remain in scope
+    - the near-term choice is therefore between:
+      - tolerating lifecycle-shaped cache pressure temporarily
+      - or forcing a real bucket/lifecycle load on those hot paths
+    - a later specialization phase should replace raw lifecycle cache pressure
+      with a narrower lifecycle-derived fast-path representation
   - explicitly de-prioritized for fast-path optimization:
     - ACL-grant-heavy behavior
     - public-read/public-write ACL-derived shortcuts
@@ -1290,6 +1307,16 @@ The main questions are:
     on the object read/head hot paths
 - whether any existing fast-path reads should be narrowed because they weaken
   the request-scoped snapshot contract
+- how lifecycle-derived response-header behavior on hot paths should be served
+  during Phase 10
+  - specifically `x-amz-expiration` on:
+    - `GetObject`
+    - `HeadObject`
+    - `CompleteMultipartUpload`
+  - and multipart abort headers on:
+    - `CreateMultipartUpload`
+    - `ListParts`
+  - until a narrower lifecycle-specialized representation exists
 
 This review should cover at least:
 
@@ -1411,7 +1438,57 @@ Acceptance criteria:
 - the optimization is optional and clearly layered on top of the bounded
   fast-path cache rather than entangled with the initial cache rollout
 
-### Phase 12: Data-Plane EC and Shard IO Ownership
+### Phase 12: Lifecycle Fast-path Specialization
+
+After the initial bounded cache rollout, treat lifecycle the same way as
+policy: as something that should ideally not remain in raw form on the hot
+path, but also cannot simply be removed because lifecycle-derived headers are
+still observable on high-priority request families.
+
+The goal of this phase is to replace raw lifecycle-cache pressure with a
+specialized lifecycle-derived representation that can answer the hot-path
+questions cheaply:
+
+- current-object expiration summary for:
+  - `GetObject`
+  - `HeadObject`
+  - object range / part reads where applicable
+  - `CompleteMultipartUpload`
+- multipart abort summary for:
+  - `CreateMultipartUpload`
+  - `ListParts`
+
+The likely direction is:
+
+- partially evaluate lifecycle rules against bucket-static inputs
+  - especially bucket tags if lifecycle filters depend on them
+- discard irrelevant rules for the specific hot-path query families
+- retain only the narrower residual evaluator needed to answer:
+  - earliest current-object expiration for a specific object/key/tags/size/time
+  - earliest multipart abort summary for a specific upload/key/initiation time
+
+This should let the system preserve AWS-compatible lifecycle-derived response
+headers on hot paths without requiring raw lifecycle configuration to dominate
+cache size.
+
+This is explicitly a later optimization phase because:
+
+- correctness matters for visible response-header behavior
+- lifecycle evaluation is separate from primary authorization flow
+- Phase 10 should first settle boundedness, freshness, and overall fast-path
+  contract before introducing this specialization
+
+Acceptance criteria:
+
+- the hot lifecycle-derived questions are explicitly listed and tested
+- the bucket-static inputs eligible for substitution are explicit
+- the residual lifecycle representation is explicit and reviewable
+- `GetObject` / `HeadObject` / `CompleteMultipartUpload` lifecycle headers stay
+  pinned against AWS behavior
+- the specialized representation materially reduces the need to carry raw
+  lifecycle state in the hot cache
+
+### Phase 13: Data-Plane EC and Shard IO Ownership
 
 After the request-shape and test-boundary work, there is still one remaining
 storage concern visible above the storage boundary: coordinator/runtime code
