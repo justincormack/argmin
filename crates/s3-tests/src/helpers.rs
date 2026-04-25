@@ -752,9 +752,10 @@ where
     );
 
     const MAX_SLOWDOWN_RETRIES: u32 = 4;
+    const MAX_TRANSPORT_RETRIES: u32 = 3;
     let mut attempt = 0;
     loop {
-        let mut response = if method == "HEAD" {
+        let response_result = if method == "HEAD" {
             let mut request = agent
                 .head(connect_url_str)
                 .header("Authorization", &authorization)
@@ -767,7 +768,7 @@ where
                 }
                 request = request.header(name, value);
             }
-            request.call().expect("raw HEAD transport error")
+            request.call()
         } else if method == "GET" {
             let mut request = agent
                 .get(connect_url_str)
@@ -781,7 +782,7 @@ where
                 }
                 request = request.header(name, value);
             }
-            request.call().expect("raw GET transport error")
+            request.call()
         } else if method == "DELETE" {
             let mut request = agent
                 .delete(connect_url_str)
@@ -795,7 +796,7 @@ where
                 }
                 request = request.header(name, value);
             }
-            request.call().expect("raw DELETE transport error")
+            request.call()
         } else {
             let mut request = match method {
                 "PUT" => agent.put(connect_url_str),
@@ -812,7 +813,17 @@ where
                 }
                 request = request.header(name, value);
             }
-            request.send(body).expect("raw request transport error")
+            request.send(body)
+        };
+        let mut response = match response_result {
+            Ok(response) => response,
+            Err(_err) if attempt < MAX_TRANSPORT_RETRIES => {
+                let backoff_ms = 100u64 << attempt;
+                thread::sleep(Duration::from_millis(backoff_ms));
+                attempt += 1;
+                continue;
+            }
+            Err(err) => panic!("raw request transport error: {err}"),
         };
         let status = response.status().as_u16();
         let body_text = response.body_mut().read_to_string().unwrap_or_default();
