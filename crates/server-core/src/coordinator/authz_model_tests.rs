@@ -316,13 +316,15 @@ mod model {
         BucketOwner,
         SameAccountSharedOther,
         SameAccountDistinct,
+        CrossAccount,
     }
 
     impl ObjectOwnerKind {
-        const ALL: [Self; 3] = [
+        const ALL: [Self; 4] = [
             Self::BucketOwner,
             Self::SameAccountSharedOther,
             Self::SameAccountDistinct,
+            Self::CrossAccount,
         ];
     }
 
@@ -332,6 +334,7 @@ mod model {
                 Self::BucketOwner => f.write_str("bucket-owner-principal"),
                 Self::SameAccountSharedOther => f.write_str("same-account-shared-other"),
                 Self::SameAccountDistinct => f.write_str("same-account-distinct"),
+                Self::CrossAccount => f.write_str("cross-account"),
             }
         }
     }
@@ -715,6 +718,7 @@ mod model {
         }
 
         fn policy_decision_allows(self, decision: PolicyDecisionShape, fallback: bool) -> bool {
+            let decision = self.filter_policy_decision_for_foreign_owned_read_family(decision);
             match decision {
                 PolicyDecisionShape::ExplicitDeny => false,
                 PolicyDecisionShape::ExplicitAllowPrivate => true,
@@ -724,6 +728,29 @@ mod model {
                 PolicyDecisionShape::ExplicitAllowPublic
                 | PolicyDecisionShape::NoPolicy
                 | PolicyDecisionShape::NoMatch => fallback,
+            }
+        }
+
+        fn filter_policy_decision_for_foreign_owned_read_family(
+            self,
+            decision: PolicyDecisionShape,
+        ) -> PolicyDecisionShape {
+            if self.bucket.ownership == OwnershipShape::BucketOwnerEnforced {
+                return decision;
+            }
+            if self.object.owner_kind != ObjectOwnerKind::CrossAccount {
+                return decision;
+            }
+            if !matches!(
+                self.action,
+                Action::GetObject | Action::GetObjectAttributes | Action::GetObjectAcl
+            ) {
+                return decision;
+            }
+            match decision {
+                PolicyDecisionShape::ExplicitAllowPrivate
+                | PolicyDecisionShape::ExplicitAllowPublic => PolicyDecisionShape::NoMatch,
+                _ => decision,
             }
         }
 
@@ -756,6 +783,9 @@ mod model {
                 ) | (
                     RequesterIdentityShape::SameAccountDistinctPrincipal,
                     ObjectOwnerKind::SameAccountDistinct,
+                ) | (
+                    RequesterIdentityShape::CrossAccountPrincipal,
+                    ObjectOwnerKind::CrossAccount,
                 )
             )
         }
@@ -784,6 +814,7 @@ mod model {
                     Some(CanonicalGroup::Shared)
                 }
                 ObjectOwnerKind::SameAccountDistinct => Some(CanonicalGroup::Distinct),
+                ObjectOwnerKind::CrossAccount => Some(CanonicalGroup::CrossAccount),
             }
         }
     }
@@ -1206,6 +1237,9 @@ mod harness {
                 ObjectOwnerKind::SameAccountDistinct => {
                     Requester::authenticated(self.same_account_distinct.clone())
                 }
+                ObjectOwnerKind::CrossAccount => {
+                    Requester::authenticated(self.cross_account.clone())
+                }
             }
         }
 
@@ -1220,6 +1254,7 @@ mod harness {
                     self.shared_other_account(owner_principal)
                 }
                 ObjectOwnerKind::SameAccountDistinct => &self.same_account_distinct,
+                ObjectOwnerKind::CrossAccount => &self.cross_account,
             }
         }
 
@@ -1278,6 +1313,7 @@ mod harness {
                     self.shared_other_account(owner_principal).principal()
                 }
                 ObjectOwnerKind::SameAccountDistinct => self.same_account_distinct.principal(),
+                ObjectOwnerKind::CrossAccount => self.cross_account.principal(),
             }
         }
 
@@ -9062,32 +9098,84 @@ use phase9_model::{BucketAction, BucketActionScenario};
 
 #[test]
 fn authz_model_phase1_get_object_existing_matrix() {
-    run_existing_matrix("phase 1", Action::GetObject);
+    run_existing_matrix_without_cross_account_owner("phase 1", Action::GetObject);
 }
 
 #[test]
-fn authz_model_phase1_get_object_attributes_existing_matrix() {
-    run_existing_matrix("phase 1", Action::GetObjectAttributes);
+fn authz_model_phase1_get_object_existing_foreign_owned_matrix() {
+    run_existing_matrix_with_only_cross_account_owner("phase 1", Action::GetObject);
+}
+
+macro_rules! phase1_get_object_attributes_existing_matrix_shards {
+    ($($name:ident => $index:expr),* $(,)?) => {
+        $(
+            #[test]
+            fn $name() {
+                run_existing_matrix_without_cross_account_owner_shard(
+                    "phase 1",
+                    Action::GetObjectAttributes,
+                    $index,
+                    8,
+                );
+            }
+        )*
+    };
+}
+
+phase1_get_object_attributes_existing_matrix_shards! {
+    authz_model_phase1_get_object_attributes_existing_matrix_shard_00 => 0,
+    authz_model_phase1_get_object_attributes_existing_matrix_shard_01 => 1,
+    authz_model_phase1_get_object_attributes_existing_matrix_shard_02 => 2,
+    authz_model_phase1_get_object_attributes_existing_matrix_shard_03 => 3,
+    authz_model_phase1_get_object_attributes_existing_matrix_shard_04 => 4,
+    authz_model_phase1_get_object_attributes_existing_matrix_shard_05 => 5,
+    authz_model_phase1_get_object_attributes_existing_matrix_shard_06 => 6,
+    authz_model_phase1_get_object_attributes_existing_matrix_shard_07 => 7,
+}
+
+#[test]
+fn authz_model_phase1_get_object_attributes_existing_foreign_owned_matrix() {
+    run_existing_matrix_with_only_cross_account_owner("phase 1", Action::GetObjectAttributes);
 }
 
 #[test]
 fn authz_model_phase2_get_object_acl_existing_matrix() {
-    run_existing_matrix("phase 2", Action::GetObjectAcl);
+    run_existing_matrix_without_cross_account_owner("phase 2", Action::GetObjectAcl);
+}
+
+#[test]
+fn authz_model_phase2_get_object_acl_existing_foreign_owned_matrix() {
+    run_existing_matrix_with_only_cross_account_owner("phase 2", Action::GetObjectAcl);
 }
 
 #[test]
 fn authz_model_phase2_get_object_tagging_existing_matrix() {
-    run_existing_matrix("phase 2", Action::GetObjectTagging);
+    run_existing_matrix_without_cross_account_owner("phase 2", Action::GetObjectTagging);
+}
+
+#[test]
+fn authz_model_phase2_get_object_tagging_existing_foreign_owned_matrix() {
+    run_existing_matrix_with_only_cross_account_owner("phase 2", Action::GetObjectTagging);
 }
 
 #[test]
 fn authz_model_phase2_put_object_tagging_existing_matrix() {
-    run_existing_matrix("phase 2", Action::PutObjectTagging);
+    run_existing_matrix_without_cross_account_owner("phase 2", Action::PutObjectTagging);
+}
+
+#[test]
+fn authz_model_phase2_put_object_tagging_existing_foreign_owned_matrix() {
+    run_existing_matrix_with_only_cross_account_owner("phase 2", Action::PutObjectTagging);
 }
 
 #[test]
 fn authz_model_phase2_delete_object_tagging_existing_matrix() {
-    run_existing_matrix("phase 2", Action::DeleteObjectTagging);
+    run_existing_matrix_without_cross_account_owner("phase 2", Action::DeleteObjectTagging);
+}
+
+#[test]
+fn authz_model_phase2_delete_object_tagging_existing_foreign_owned_matrix() {
+    run_existing_matrix_with_only_cross_account_owner("phase 2", Action::DeleteObjectTagging);
 }
 
 #[test]
@@ -9928,8 +10016,36 @@ fn authz_model_phase11_get_bucket_location_matrix() {
     run_phase11_bucket_meta_matrix(BucketMetaAction::GetBucketLocation);
 }
 
-fn run_existing_matrix(phase: &str, action: Action) {
-    let scenarios = Scenario::existing_scenarios(action);
+fn run_existing_matrix_without_cross_account_owner(phase: &str, action: Action) {
+    let scenarios = Scenario::existing_scenarios(action)
+        .into_iter()
+        .filter(|scenario| scenario.object.owner_kind != model::ObjectOwnerKind::CrossAccount)
+        .collect();
+    run_existing_matrix_scenarios(phase, action, scenarios);
+}
+
+fn run_existing_matrix_with_only_cross_account_owner(phase: &str, action: Action) {
+    let scenarios = Scenario::existing_scenarios(action)
+        .into_iter()
+        .filter(|scenario| scenario.object.owner_kind == model::ObjectOwnerKind::CrossAccount)
+        .collect();
+    run_existing_matrix_scenarios(phase, action, scenarios);
+}
+
+fn run_existing_matrix_without_cross_account_owner_shard(
+    phase: &str,
+    action: Action,
+    shard_index: usize,
+    shard_count: usize,
+) {
+    let scenarios = Scenario::existing_scenarios(action)
+        .into_iter()
+        .filter(|scenario| scenario.object.owner_kind != model::ObjectOwnerKind::CrossAccount)
+        .collect();
+    run_existing_matrix_scenarios_shard(phase, action, scenarios, shard_index, shard_count);
+}
+
+fn run_existing_matrix_scenarios(phase: &str, action: Action, scenarios: Vec<Scenario>) {
     assert!(
         !scenarios.is_empty(),
         "{phase} matrix unexpectedly produced no scenarios for {action}"
@@ -9945,6 +10061,48 @@ fn run_existing_matrix(phase: &str, action: Action) {
             "{phase} authz model mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
         );
     }
+}
+
+fn run_existing_matrix_scenarios_shard(
+    phase: &str,
+    action: Action,
+    scenarios: Vec<Scenario>,
+    shard_index: usize,
+    shard_count: usize,
+) {
+    assert!(
+        shard_count > 0,
+        "existing-matrix shard count must be non-zero"
+    );
+    assert!(
+        shard_index < shard_count,
+        "existing-matrix shard index {shard_index} out of range for shard count {shard_count}"
+    );
+    assert!(
+        !scenarios.is_empty(),
+        "{phase} matrix unexpectedly produced no scenarios for {action}"
+    );
+    let harness = MatrixHarness::new();
+    let mut shard_len = 0usize;
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        if index % shard_count != shard_index {
+            continue;
+        }
+        shard_len += 1;
+        let bucket = bucket_name_for(action, index);
+        let expected = scenario.expected_existing_outcome();
+        let actual = to_existing_outcome(harness.run_existing(&bucket, scenario));
+        assert_eq!(
+            actual, expected,
+            "{phase} authz model mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
+        );
+    }
+
+    assert!(
+        shard_len > 0,
+        "{phase} existing-matrix shard {shard_index}/{shard_count} had no scenarios for {action}"
+    );
 }
 
 fn run_missing_matrix(phase: &str, action: Action) {
