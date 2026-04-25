@@ -1,4 +1,4 @@
-use super::authz::ModernObjectReadAuthorization;
+use super::authz::{ModernObjectReadAuthorization, ModernReadAction};
 use super::response_types::ModernBucketSummary;
 use super::test_helpers;
 use super::*;
@@ -657,25 +657,39 @@ mod model {
         }
 
         pub(super) fn expected_modern_existing_outcome(self) -> ModernOutcome {
-            let mut decision = match self.action {
-                Action::GetObject => self.policy.primary,
-                Action::GetObjectAttributes => self.policy.attrs_decision(),
-                Action::GetObjectAcl => self.policy.primary,
+            match self.action {
+                Action::GetObject => self.expected_modern_existing_outcome_for_single_action(
+                    self.policy.primary,
+                    self.modern_default_get_object_allowed(),
+                ),
+                Action::GetObjectAttributes => {
+                    let read = self.expected_modern_existing_outcome_for_single_action(
+                        self.policy.primary,
+                        self.modern_default_get_object_allowed(),
+                    );
+                    let attrs = self.expected_modern_existing_outcome_for_single_action(
+                        self.policy.attrs_decision(),
+                        self.modern_default_get_object_attributes_allowed(),
+                    );
+                    Self::combine_modern_outcome(read, attrs)
+                }
+                Action::GetObjectAcl => {
+                    panic!("modern existing outcome is only defined for fast-path modern reads")
+                }
                 Action::GetObjectTagging
                 | Action::PutObjectTagging
                 | Action::DeleteObjectTagging => {
                     panic!("modern existing outcome is only defined for read-family actions")
                 }
-            };
+            }
+        }
 
+        fn expected_modern_existing_outcome_for_single_action(
+            self,
+            mut decision: PolicyDecisionShape,
+            modern_default_allowed: bool,
+        ) -> ModernOutcome {
             decision = self.filter_policy_decision_for_foreign_owned_read_family(decision);
-
-            let modern_default_allowed =
-                if self.bucket.ownership == OwnershipShape::BucketOwnerEnforced {
-                    self.requester.can_bucket_owner_account_admin()
-                } else {
-                    self.requester_matches_object_owner()
-                };
             let policy_allow_survives = !self.modern_policy_is_public()
                 || !self.bucket.restrict_public_buckets
                 || self.requester.is_bucket_owner_account();
@@ -703,14 +717,39 @@ mod model {
             }
         }
 
+        fn combine_modern_outcome(first: ModernOutcome, second: ModernOutcome) -> ModernOutcome {
+            match (first, second) {
+                (ModernOutcome::Deny, _) | (_, ModernOutcome::Deny) => ModernOutcome::Deny,
+                (ModernOutcome::Allow, ModernOutcome::Allow) => ModernOutcome::Allow,
+                _ => ModernOutcome::NeedAclFallback,
+            }
+        }
+
+        fn modern_default_get_object_allowed(self) -> bool {
+            if self.bucket.ownership == OwnershipShape::BucketOwnerEnforced {
+                self.requester.can_bucket_owner_account_admin()
+            } else {
+                self.requester_matches_object_owner()
+            }
+        }
+
+        fn modern_default_get_object_attributes_allowed(self) -> bool {
+            if self.bucket.ownership == OwnershipShape::BucketOwnerEnforced {
+                self.requester_principal_matches_object_owner()
+            } else {
+                self.requester_matches_object_owner()
+            }
+        }
+
         fn modern_policy_is_public(self) -> bool {
             match self.action {
-                Action::GetObject | Action::GetObjectAcl => self.policy.primary.is_public_allow(),
+                Action::GetObject => self.policy.primary.is_public_allow(),
                 Action::GetObjectAttributes => {
                     self.policy.primary.is_public_allow()
                         || self.policy.attrs_decision().is_public_allow()
                 }
-                Action::GetObjectTagging
+                Action::GetObjectAcl
+                | Action::GetObjectTagging
                 | Action::PutObjectTagging
                 | Action::DeleteObjectTagging => false,
             }
@@ -1916,7 +1955,7 @@ mod harness {
         });
         let bucket_summary =
             modern_bucket_summary(fixtures, bucket, scenario.bucket, policy.as_ref());
-        let action = modern_policy_action(scenario.action, version_id);
+        let action = modern_read_action(scenario.action, version_id);
 
         Coordinator::modern_read_object_authorization_with_bucket_policy(
             &requester,
@@ -1974,15 +2013,15 @@ mod harness {
         }
     }
 
-    fn modern_policy_action(action: Action, version_id: Option<VersionId>) -> auth::PolicyAction {
+    fn modern_read_action(action: Action, version_id: Option<VersionId>) -> ModernReadAction {
         match action {
-            Action::GetObject => Coordinator::get_object_policy_action(version_id),
+            Action::GetObject => ModernReadAction::from_get_object_version(version_id),
             Action::GetObjectAttributes => {
-                Coordinator::get_object_attributes_policy_action(version_id)
+                ModernReadAction::from_get_object_attributes_version(version_id)
             }
-            Action::GetObjectAcl => Coordinator::get_object_acl_policy_action(version_id),
+            Action::GetObjectAcl => panic!("modern read action is not defined for GetObjectAcl"),
             Action::GetObjectTagging | Action::PutObjectTagging | Action::DeleteObjectTagging => {
-                panic!("modern policy action is only defined for read-family actions")
+                panic!("modern read action is only defined for fast-path modern reads")
             }
         }
     }
@@ -9341,16 +9380,6 @@ modern_get_object_attributes_existing_matrix_shards! {
 #[test]
 fn authz_model_modern_get_object_attributes_existing_foreign_owned_matrix() {
     run_modern_existing_matrix_with_only_cross_account_owner(Action::GetObjectAttributes);
-}
-
-#[test]
-fn authz_model_modern_get_object_acl_existing_matrix() {
-    run_modern_existing_matrix_without_cross_account_owner(Action::GetObjectAcl);
-}
-
-#[test]
-fn authz_model_modern_get_object_acl_existing_foreign_owned_matrix() {
-    run_modern_existing_matrix_with_only_cross_account_owner(Action::GetObjectAcl);
 }
 
 #[test]

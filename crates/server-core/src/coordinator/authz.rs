@@ -93,14 +93,6 @@ enum MissingObjectDiscovery {
     ObjectAcl,
 }
 
-#[derive(Clone, Copy)]
-enum ObjectReadAuthorizationKind {
-    Read {
-        existing_object_tags_mode: ExistingObjectTagsMode,
-    },
-    Attributes,
-}
-
 impl MissingObjectDiscovery {
     fn requester_can_discover_missing(
         self,
@@ -218,6 +210,39 @@ pub(super) enum ModernObjectReadAuthorization {
     NeedAclFallback,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ModernReadAction {
+    ReadCurrent,
+    ReadVersion,
+    AttributesCurrent,
+    AttributesVersion,
+}
+
+impl ModernReadAction {
+    pub(super) fn from_get_object_version(version_id: Option<VersionId>) -> Self {
+        match version_id {
+            Some(_) => Self::ReadVersion,
+            None => Self::ReadCurrent,
+        }
+    }
+
+    pub(super) fn from_get_object_attributes_version(version_id: Option<VersionId>) -> Self {
+        match version_id {
+            Some(_) => Self::AttributesVersion,
+            None => Self::AttributesCurrent,
+        }
+    }
+
+    fn policy_action(self) -> auth::PolicyAction {
+        match self {
+            Self::ReadCurrent => auth::PolicyAction::GetObject,
+            Self::ReadVersion => auth::PolicyAction::GetObjectVersion,
+            Self::AttributesCurrent => auth::PolicyAction::GetObjectAttributes,
+            Self::AttributesVersion => auth::PolicyAction::GetObjectVersionAttributes,
+        }
+    }
+}
+
 struct CopySourceReadSnapshotRequest<'a> {
     requester: &'a Requester,
     bucket: &'a BucketName,
@@ -235,8 +260,7 @@ struct AuthorizedObjectReadSnapshotRequest<'a> {
     version_id: Option<VersionId>,
     expected_bucket_owner: Option<&'a str>,
     missing_discovery: MissingObjectDiscovery,
-    policy_action: auth::PolicyAction,
-    authorization_kind: ObjectReadAuthorizationKind,
+    modern_action: ModernReadAction,
     snapshot_mode: ObjectReadSnapshotMode,
 }
 
@@ -1547,7 +1571,6 @@ impl Coordinator {
     fn filter_bucket_policy_allow_for_foreign_owned_read_family_object_modern(
         bucket: &ModernBucketSummary,
         object: &StoredObject,
-        action: auth::PolicyAction,
         decision: auth::PolicyEvaluation,
     ) -> auth::PolicyEvaluation {
         if decision != auth::PolicyEvaluation::ExplicitAllow {
@@ -1555,19 +1578,6 @@ impl Coordinator {
         }
 
         if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
-            return decision;
-        }
-
-        let is_read_family = matches!(
-            action,
-            auth::PolicyAction::GetObject
-                | auth::PolicyAction::GetObjectVersion
-                | auth::PolicyAction::GetObjectAttributes
-                | auth::PolicyAction::GetObjectVersionAttributes
-                | auth::PolicyAction::GetObjectAcl
-                | auth::PolicyAction::GetObjectVersionAcl
-        );
-        if !is_read_family {
             return decision;
         }
 
@@ -1605,18 +1615,17 @@ impl Coordinator {
         requester: &Requester,
         bucket: &ModernBucketSummary,
         object: &StoredObject,
-        action: auth::PolicyAction,
+        action: ModernReadAction,
     ) -> bool {
         match action {
-            auth::PolicyAction::GetObject | auth::PolicyAction::GetObjectVersion => {
+            ModernReadAction::ReadCurrent | ModernReadAction::ReadVersion => {
                 if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
                     Self::requester_can_modern_bucket_owner_account_admin(requester, bucket)
                 } else {
                     Self::requester_matches_owner_identity(requester, object.owner())
                 }
             }
-            auth::PolicyAction::GetObjectAttributes
-            | auth::PolicyAction::GetObjectVersionAttributes => {
+            ModernReadAction::AttributesCurrent | ModernReadAction::AttributesVersion => {
                 if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
                     requester
                         .principal_opt()
@@ -1625,14 +1634,6 @@ impl Coordinator {
                     Self::requester_matches_owner_identity(requester, object.owner())
                 }
             }
-            auth::PolicyAction::GetObjectAcl | auth::PolicyAction::GetObjectVersionAcl => {
-                if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
-                    Self::requester_can_modern_bucket_owner_account_admin(requester, bucket)
-                } else {
-                    Self::requester_matches_owner_identity(requester, object.owner())
-                }
-            }
-            _ => false,
         }
     }
 
@@ -1641,20 +1642,19 @@ impl Coordinator {
         bucket: &ModernBucketSummary,
         bucket_tags: Option<&[(String, String)]>,
         object: &StoredObject,
-        action: auth::PolicyAction,
+        action: ModernReadAction,
         policy: Option<&auth::BucketPolicy>,
         existing_object_tags_mode: ExistingObjectTagsMode,
     ) -> Result<ModernObjectReadAuthorization, ServerError> {
         let decision = Self::filter_bucket_policy_allow_for_foreign_owned_read_family_object_modern(
             bucket,
             object,
-            action,
             Self::bucket_policy_decision_for_object_with_preloaded_tags_modern(
                 requester,
                 bucket,
                 bucket_tags,
                 object,
-                action,
+                action.policy_action(),
                 policy,
                 existing_object_tags_mode,
             )?,
@@ -1703,17 +1703,14 @@ impl Coordinator {
         bucket: &ModernBucketSummary,
         bucket_tags: Option<&[(String, String)]>,
         object: &StoredObject,
-        action: auth::PolicyAction,
+        action: ModernReadAction,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<ModernObjectReadAuthorization, ServerError> {
         match action {
-            auth::PolicyAction::GetObjectAttributes
-            | auth::PolicyAction::GetObjectVersionAttributes => {
+            ModernReadAction::AttributesCurrent | ModernReadAction::AttributesVersion => {
                 let read_action = match action {
-                    auth::PolicyAction::GetObjectVersionAttributes => {
-                        auth::PolicyAction::GetObjectVersion
-                    }
-                    auth::PolicyAction::GetObjectAttributes => auth::PolicyAction::GetObject,
+                    ModernReadAction::AttributesVersion => ModernReadAction::ReadVersion,
+                    ModernReadAction::AttributesCurrent => ModernReadAction::ReadCurrent,
                     _ => unreachable!(),
                 };
                 let read = Self::modern_read_object_authorization_for_single_action(
@@ -4812,41 +4809,35 @@ impl Coordinator {
                 req.version_id,
                 req.snapshot_mode,
                 |stored| {
-                    let allowed = match req.authorization_kind {
-                        ObjectReadAuthorizationKind::Read {
-                            existing_object_tags_mode: ExistingObjectTagsMode::Available,
-                        } => match Self::modern_read_object_authorization_with_bucket_policy(
-                            req.requester,
-                            &modern_bucket_info,
-                            bucket_tags.as_deref(),
-                            stored,
-                            req.policy_action,
-                            bucket_policy.as_deref(),
-                        )? {
-                            ModernObjectReadAuthorization::Allowed => true,
-                            ModernObjectReadAuthorization::Denied => false,
-                            ModernObjectReadAuthorization::NeedAclFallback => {
-                                Self::requester_can_read_object(req.requester, &bucket_info, stored)
-                            }
-                        },
-                        ObjectReadAuthorizationKind::Read {
-                            existing_object_tags_mode: ExistingObjectTagsMode::Unavailable,
-                        } => self
-                            .requester_can_read_object_without_existing_tags_with_bucket_policy(
-                                req.requester,
-                                &bucket_info,
-                                bucket_tags.as_deref(),
-                                stored,
-                                req.policy_action,
-                                bucket_policy.as_deref(),
-                            )?,
-                        ObjectReadAuthorizationKind::Attributes => {
+                    let allowed = match req.modern_action {
+                        ModernReadAction::ReadCurrent | ModernReadAction::ReadVersion => {
                             match Self::modern_read_object_authorization_with_bucket_policy(
                                 req.requester,
                                 &modern_bucket_info,
                                 bucket_tags.as_deref(),
                                 stored,
-                                req.policy_action,
+                                req.modern_action,
+                                bucket_policy.as_deref(),
+                            )? {
+                                ModernObjectReadAuthorization::Allowed => true,
+                                ModernObjectReadAuthorization::Denied => false,
+                                ModernObjectReadAuthorization::NeedAclFallback => {
+                                    Self::requester_can_read_object(
+                                        req.requester,
+                                        &bucket_info,
+                                        stored,
+                                    )
+                                }
+                            }
+                        }
+                        ModernReadAction::AttributesCurrent
+                        | ModernReadAction::AttributesVersion => {
+                            match Self::modern_read_object_authorization_with_bucket_policy(
+                                req.requester,
+                                &modern_bucket_info,
+                                bucket_tags.as_deref(),
+                                stored,
+                                req.modern_action,
                                 bucket_policy.as_deref(),
                             )? {
                                 ModernObjectReadAuthorization::Allowed => true,
@@ -5258,10 +5249,7 @@ impl Coordinator {
                 version_id: req.object.version_id,
                 expected_bucket_owner: req.expected_bucket_owner(),
                 missing_discovery: MissingObjectDiscovery::ReadBucket,
-                policy_action: Self::get_object_policy_action(req.object.version_id),
-                authorization_kind: ObjectReadAuthorizationKind::Read {
-                    existing_object_tags_mode: ExistingObjectTagsMode::Available,
-                },
+                modern_action: ModernReadAction::from_get_object_version(req.object.version_id),
                 snapshot_mode: ObjectReadSnapshotMode::FullPayloadLayout,
             })?;
         Ok(AuthorizedObjectRead { snapshot })
@@ -5279,10 +5267,7 @@ impl Coordinator {
                 version_id: req.object.version_id,
                 expected_bucket_owner: req.expected_bucket_owner(),
                 missing_discovery: MissingObjectDiscovery::ReadBucket,
-                policy_action: Self::get_object_policy_action(req.object.version_id),
-                authorization_kind: ObjectReadAuthorizationKind::Read {
-                    existing_object_tags_mode: ExistingObjectTagsMode::Available,
-                },
+                modern_action: ModernReadAction::from_get_object_version(req.object.version_id),
                 snapshot_mode: ObjectReadSnapshotMode::MetadataOnly,
             })?;
         Ok(AuthorizedObjectRead { snapshot })
@@ -5300,8 +5285,9 @@ impl Coordinator {
                 version_id: req.object.version_id,
                 expected_bucket_owner: req.expected_bucket_owner(),
                 missing_discovery: MissingObjectDiscovery::ReadObjectAttributes,
-                policy_action: Self::get_object_attributes_policy_action(req.object.version_id),
-                authorization_kind: ObjectReadAuthorizationKind::Attributes,
+                modern_action: ModernReadAction::from_get_object_attributes_version(
+                    req.object.version_id,
+                ),
                 snapshot_mode: if req.want_parts {
                     ObjectReadSnapshotMode::MultipartParts
                 } else {
@@ -5323,10 +5309,7 @@ impl Coordinator {
                 version_id: req.object.version_id,
                 expected_bucket_owner: req.expected_bucket_owner(),
                 missing_discovery: MissingObjectDiscovery::ReadBucket,
-                policy_action: Self::get_object_policy_action(req.object.version_id),
-                authorization_kind: ObjectReadAuthorizationKind::Read {
-                    existing_object_tags_mode: ExistingObjectTagsMode::Available,
-                },
+                modern_action: ModernReadAction::from_get_object_version(req.object.version_id),
                 snapshot_mode: ObjectReadSnapshotMode::MultipartParts,
             })?;
         Ok(AuthorizedObjectRead { snapshot })
@@ -5335,7 +5318,7 @@ impl Coordinator {
 
 #[cfg(test)]
 mod modern_auth_tests {
-    use super::{Coordinator, ModernObjectReadAuthorization};
+    use super::{Coordinator, ModernObjectReadAuthorization, ModernReadAction};
     use crate::coordinator::request_types::Requester;
     use crate::coordinator::response_types::ModernBucketSummary;
     use s3_types::{AccountIdentity, BucketVersioningState, CanonicalUserId, VersionId};
@@ -5428,7 +5411,7 @@ mod modern_auth_tests {
             &bucket,
             None,
             &object,
-            auth::PolicyAction::GetObject,
+            ModernReadAction::ReadCurrent,
             None,
         )
         .unwrap();
@@ -5450,7 +5433,7 @@ mod modern_auth_tests {
             &bucket,
             None,
             &object,
-            auth::PolicyAction::GetObject,
+            ModernReadAction::ReadCurrent,
             Some(&policy),
         )
         .unwrap();
@@ -5472,7 +5455,7 @@ mod modern_auth_tests {
             &bucket,
             None,
             &object,
-            auth::PolicyAction::GetObject,
+            ModernReadAction::ReadCurrent,
             Some(&policy),
         )
         .unwrap();
@@ -5494,7 +5477,7 @@ mod modern_auth_tests {
             &bucket,
             None,
             &object,
-            auth::PolicyAction::GetObject,
+            ModernReadAction::ReadCurrent,
             Some(&policy),
         )
         .unwrap();
@@ -5518,7 +5501,7 @@ mod modern_auth_tests {
             &bucket,
             None,
             &object,
-            auth::PolicyAction::GetObject,
+            ModernReadAction::ReadCurrent,
             Some(&policy),
         )
         .unwrap();
@@ -5537,7 +5520,7 @@ mod modern_auth_tests {
             &bucket,
             None,
             &object,
-            auth::PolicyAction::GetObject,
+            ModernReadAction::ReadCurrent,
             None,
         )
         .unwrap();
@@ -5556,7 +5539,7 @@ mod modern_auth_tests {
             &bucket,
             None,
             &object,
-            auth::PolicyAction::GetObject,
+            ModernReadAction::ReadCurrent,
             None,
         )
         .unwrap();
@@ -5585,7 +5568,7 @@ mod modern_auth_tests {
             &bucket,
             None,
             &object,
-            auth::PolicyAction::GetObject,
+            ModernReadAction::ReadCurrent,
             Some(&policy),
         )
         .unwrap();
