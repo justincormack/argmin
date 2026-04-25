@@ -1240,9 +1240,15 @@ Current guidance for this phase:
     - Public Access Block
     - bucket-owner ownership controls
     - versioning
-    - lifecycle presence/generation where hot paths need it
     - encryption defaults
     - object-lock configuration where the request family needs it
+  - explicitly out of scope for the main hot cache payload:
+    - raw lifecycle configuration
+    - lifecycle configuration should not shape the `GetObject` / `HeadObject`
+      fast path because lifecycle actions are not part of the primary request
+      authorization flow
+    - if lifecycle markers remain at all, they should only be minimal
+      presence/generation hints rather than the cached lifecycle body
   - explicitly de-prioritized for fast-path optimization:
     - ACL-grant-heavy behavior
     - public-read/public-write ACL-derived shortcuts
