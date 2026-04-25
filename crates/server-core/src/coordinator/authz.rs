@@ -1611,7 +1611,7 @@ impl Coordinator {
     }
 
     #[cfg(test)]
-    fn modern_read_object_authorization_with_bucket_policy(
+    fn modern_read_object_authorization_with_bucket_policy_impl(
         requester: &Requester,
         bucket: &ModernBucketSummary,
         bucket_tags: Option<&[(String, String)]>,
@@ -1662,6 +1662,26 @@ impl Coordinator {
             }
         };
         Ok(outcome)
+    }
+
+    #[cfg(test)]
+    pub(super) fn modern_read_object_authorization_with_bucket_policy(
+        requester: &Requester,
+        bucket: &ModernBucketSummary,
+        bucket_tags: Option<&[(String, String)]>,
+        object: &StoredObject,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<ModernObjectReadAuthorization, ServerError> {
+        Self::modern_read_object_authorization_with_bucket_policy_impl(
+            requester,
+            bucket,
+            bucket_tags,
+            object,
+            action,
+            policy,
+            ExistingObjectTagsMode::Available,
+        )
     }
 
     pub(super) fn requester_can_read_object_with_bucket_policy(
@@ -5269,7 +5289,7 @@ impl Coordinator {
 
 #[cfg(test)]
 mod modern_auth_tests {
-    use super::{Coordinator, ExistingObjectTagsMode, ModernObjectReadAuthorization};
+    use super::{Coordinator, ModernObjectReadAuthorization};
     use crate::coordinator::request_types::Requester;
     use crate::coordinator::response_types::ModernBucketSummary;
     use s3_types::{AccountIdentity, BucketVersioningState, CanonicalUserId, VersionId};
@@ -5364,7 +5384,6 @@ mod modern_auth_tests {
             &object,
             auth::PolicyAction::GetObject,
             None,
-            ExistingObjectTagsMode::Available,
         )
         .unwrap();
 
@@ -5387,7 +5406,6 @@ mod modern_auth_tests {
             &object,
             auth::PolicyAction::GetObject,
             Some(&policy),
-            ExistingObjectTagsMode::Available,
         )
         .unwrap();
 
@@ -5410,7 +5428,6 @@ mod modern_auth_tests {
             &object,
             auth::PolicyAction::GetObject,
             Some(&policy),
-            ExistingObjectTagsMode::Available,
         )
         .unwrap();
 
@@ -5433,7 +5450,6 @@ mod modern_auth_tests {
             &object,
             auth::PolicyAction::GetObject,
             Some(&policy),
-            ExistingObjectTagsMode::Available,
         )
         .unwrap();
 
@@ -5458,7 +5474,6 @@ mod modern_auth_tests {
             &object,
             auth::PolicyAction::GetObject,
             Some(&policy),
-            ExistingObjectTagsMode::Available,
         )
         .unwrap();
 
@@ -5478,7 +5493,6 @@ mod modern_auth_tests {
             &object,
             auth::PolicyAction::GetObject,
             None,
-            ExistingObjectTagsMode::Available,
         )
         .unwrap();
 
@@ -5498,7 +5512,6 @@ mod modern_auth_tests {
             &object,
             auth::PolicyAction::GetObject,
             None,
-            ExistingObjectTagsMode::Available,
         )
         .unwrap();
 
@@ -5528,7 +5541,6 @@ mod modern_auth_tests {
             &object,
             auth::PolicyAction::GetObject,
             Some(&policy),
-            ExistingObjectTagsMode::Available,
         )
         .unwrap();
 

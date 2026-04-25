@@ -1,3 +1,5 @@
+use super::authz::ModernObjectReadAuthorization;
+use super::response_types::ModernBucketSummary;
 use super::test_helpers;
 use super::*;
 use crate::conditional::{ReadCondition, WriteCondition};
@@ -563,6 +565,23 @@ mod model {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ModernOutcome {
+        Allow,
+        Deny,
+        NeedAclFallback,
+    }
+
+    impl fmt::Display for ModernOutcome {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Allow => f.write_str("Allow"),
+                Self::Deny => f.write_str("Deny"),
+                Self::NeedAclFallback => f.write_str("NeedAclFallback"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) struct Scenario {
         pub(super) action: Action,
         pub(super) target: ExistingTarget,
@@ -634,6 +653,66 @@ mod model {
                 Outcome::Allow
             } else {
                 Outcome::Deny
+            }
+        }
+
+        pub(super) fn expected_modern_existing_outcome(self) -> ModernOutcome {
+            let mut decision = match self.action {
+                Action::GetObject => self.policy.primary,
+                Action::GetObjectAttributes => self.policy.attrs_decision(),
+                Action::GetObjectAcl => self.policy.primary,
+                Action::GetObjectTagging
+                | Action::PutObjectTagging
+                | Action::DeleteObjectTagging => {
+                    panic!("modern existing outcome is only defined for read-family actions")
+                }
+            };
+
+            decision = self.filter_policy_decision_for_foreign_owned_read_family(decision);
+
+            let modern_default_allowed =
+                if self.bucket.ownership == OwnershipShape::BucketOwnerEnforced {
+                    self.requester.can_bucket_owner_account_admin()
+                } else {
+                    self.requester_matches_object_owner()
+                };
+            let policy_allow_survives = !self.modern_policy_is_public()
+                || !self.bucket.restrict_public_buckets
+                || self.requester.is_bucket_owner_account();
+
+            match decision {
+                PolicyDecisionShape::ExplicitDeny => ModernOutcome::Deny,
+                PolicyDecisionShape::ExplicitAllowPrivate
+                | PolicyDecisionShape::ExplicitAllowPublic
+                    if policy_allow_survives =>
+                {
+                    ModernOutcome::Allow
+                }
+                PolicyDecisionShape::ExplicitAllowPublic
+                | PolicyDecisionShape::ExplicitAllowPrivate
+                | PolicyDecisionShape::NoPolicy
+                | PolicyDecisionShape::NoMatch => {
+                    if modern_default_allowed {
+                        ModernOutcome::Allow
+                    } else if self.bucket.ownership == OwnershipShape::BucketOwnerEnforced {
+                        ModernOutcome::Deny
+                    } else {
+                        ModernOutcome::NeedAclFallback
+                    }
+                }
+            }
+        }
+
+        fn modern_policy_is_public(self) -> bool {
+            match self.action {
+                Action::GetObject | Action::GetObjectAcl => self.policy.primary.is_public_allow(),
+                Action::GetObjectAttributes => {
+                    self.policy.primary.is_public_allow()
+                        || self.policy.attrs_decision().is_public_allow()
+                }
+                Action::GetObjectTagging
+                | Action::PutObjectTagging
+                | Action::DeleteObjectTagging => false,
             }
         }
 
@@ -1376,6 +1455,37 @@ mod harness {
             ))
         }
 
+        pub(super) fn run_existing_modern(
+            &self,
+            bucket: &str,
+            scenario: Scenario,
+        ) -> ModernObjectReadAuthorization {
+            materialize_bucket(&self.coord, &self.fixtures, bucket, scenario).unwrap_or_else(
+                |err| {
+                    panic!("failed to materialize bucket for {scenario}: {err:?}");
+                },
+            );
+
+            let object_version = materialize_object(&self.coord, &self.fixtures, bucket, scenario)
+                .unwrap_or_else(|err| {
+                    panic!("failed to materialize object for {scenario}: {err:?}");
+                });
+
+            materialize_policy(&self.coord, &self.fixtures, bucket, scenario).unwrap_or_else(
+                |err| {
+                    panic!("failed to materialize policy for {scenario}: {err:?}");
+                },
+            );
+
+            run_modern_action(
+                &self.coord,
+                &self.fixtures,
+                bucket,
+                scenario,
+                object_version,
+            )
+        }
+
         pub(super) fn run_missing(
             &self,
             bucket: &str,
@@ -1778,6 +1888,102 @@ mod harness {
                 })
                 .map(|_| ()),
             Action::DeleteObjectTagging => coord.delete_object_tags(&object).map(|_| ()),
+        }
+    }
+
+    fn run_modern_action(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: Scenario,
+        object_version: VersionId,
+    ) -> ModernObjectReadAuthorization {
+        let requester = fixtures.requester(scenario.bucket.owner_principal, scenario.requester);
+        let version_id = match scenario.target {
+            ExistingTarget::Current => None,
+            ExistingTarget::Versioned => Some(object_version),
+        };
+        let object = coord
+            .lookup_object_record(
+                &trusted_bucket_name(bucket),
+                &trusted_object_key(KEY),
+                version_id,
+            )
+            .unwrap_or_else(|err| panic!("failed to load object record for {scenario}: {err:?}"));
+        let policy = policy_document(fixtures, bucket, scenario).map(|body| {
+            auth::parse_bucket_policy(&body)
+                .unwrap_or_else(|err| panic!("failed to parse policy for {scenario}: {err:?}"))
+        });
+        let bucket_summary =
+            modern_bucket_summary(fixtures, bucket, scenario.bucket, policy.as_ref());
+        let action = modern_policy_action(scenario.action, version_id);
+
+        Coordinator::modern_read_object_authorization_with_bucket_policy(
+            &requester,
+            &bucket_summary,
+            None,
+            &object,
+            action,
+            policy.as_ref(),
+        )
+        .unwrap_or_else(|err| {
+            panic!("modern auth evaluation failed for {scenario}: {err:?}");
+        })
+    }
+
+    fn modern_bucket_summary(
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        shape: BucketShape,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> ModernBucketSummary {
+        let owner = fixtures.bucket_owner_account(shape.owner_principal);
+        ModernBucketSummary {
+            name: trusted_bucket_name(bucket),
+            owner_principal: owner.principal().to_string(),
+            owner_canonical_id: owner.canonical_user_id().clone(),
+            created_at: 0,
+            versioning: BucketVersioningState::Enabled,
+            object_lock: BucketObjectLockConfig::default(),
+            public_access_block: if shape.block_public_acls
+                || shape.ignore_public_acls
+                || shape.restrict_public_buckets
+            {
+                Some(PublicAccessBlockConfig {
+                    block_public_acls: shape.block_public_acls,
+                    ignore_public_acls: shape.ignore_public_acls,
+                    block_public_policy: false,
+                    restrict_public_buckets: shape.restrict_public_buckets,
+                })
+            } else {
+                None
+            },
+            ownership_controls: match shape.ownership {
+                OwnershipShape::BucketOwnerEnforced => Some(BucketOwnershipControls {
+                    object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                }),
+                OwnershipShape::ObjectWriter => None,
+            },
+            bucket_policy_present: policy.is_some(),
+            bucket_policy_public: policy.is_some_and(auth::BucketPolicy::is_public),
+            bucket_policy_generation: 0,
+            bucket_lifecycle_present: false,
+            bucket_lifecycle_generation: 0,
+            bucket_abac_enabled: false,
+            encryption: EffectiveBucketEncryptionConfig::default(),
+        }
+    }
+
+    fn modern_policy_action(action: Action, version_id: Option<VersionId>) -> auth::PolicyAction {
+        match action {
+            Action::GetObject => Coordinator::get_object_policy_action(version_id),
+            Action::GetObjectAttributes => {
+                Coordinator::get_object_attributes_policy_action(version_id)
+            }
+            Action::GetObjectAcl => Coordinator::get_object_acl_policy_action(version_id),
+            Action::GetObjectTagging | Action::PutObjectTagging | Action::DeleteObjectTagging => {
+                panic!("modern policy action is only defined for read-family actions")
+            }
         }
     }
 
@@ -9097,6 +9303,57 @@ use phase9_harness::{phase9_bucket_name_for, Phase9Harness};
 use phase9_model::{BucketAction, BucketActionScenario};
 
 #[test]
+fn authz_model_modern_get_object_existing_matrix() {
+    run_modern_existing_matrix_without_cross_account_owner(Action::GetObject);
+}
+
+#[test]
+fn authz_model_modern_get_object_existing_foreign_owned_matrix() {
+    run_modern_existing_matrix_with_only_cross_account_owner(Action::GetObject);
+}
+
+macro_rules! modern_get_object_attributes_existing_matrix_shards {
+    ($($name:ident => $index:expr),* $(,)?) => {
+        $(
+            #[test]
+            fn $name() {
+                run_modern_existing_matrix_without_cross_account_owner_shard(
+                    Action::GetObjectAttributes,
+                    $index,
+                    8,
+                );
+            }
+        )*
+    };
+}
+
+modern_get_object_attributes_existing_matrix_shards! {
+    authz_model_modern_get_object_attributes_existing_matrix_shard_00 => 0,
+    authz_model_modern_get_object_attributes_existing_matrix_shard_01 => 1,
+    authz_model_modern_get_object_attributes_existing_matrix_shard_02 => 2,
+    authz_model_modern_get_object_attributes_existing_matrix_shard_03 => 3,
+    authz_model_modern_get_object_attributes_existing_matrix_shard_04 => 4,
+    authz_model_modern_get_object_attributes_existing_matrix_shard_05 => 5,
+    authz_model_modern_get_object_attributes_existing_matrix_shard_06 => 6,
+    authz_model_modern_get_object_attributes_existing_matrix_shard_07 => 7,
+}
+
+#[test]
+fn authz_model_modern_get_object_attributes_existing_foreign_owned_matrix() {
+    run_modern_existing_matrix_with_only_cross_account_owner(Action::GetObjectAttributes);
+}
+
+#[test]
+fn authz_model_modern_get_object_acl_existing_matrix() {
+    run_modern_existing_matrix_without_cross_account_owner(Action::GetObjectAcl);
+}
+
+#[test]
+fn authz_model_modern_get_object_acl_existing_foreign_owned_matrix() {
+    run_modern_existing_matrix_with_only_cross_account_owner(Action::GetObjectAcl);
+}
+
+#[test]
 fn authz_model_phase1_get_object_existing_matrix() {
     run_existing_matrix_without_cross_account_owner("phase 1", Action::GetObject);
 }
@@ -10103,6 +10360,113 @@ fn run_existing_matrix_scenarios_shard(
         shard_len > 0,
         "{phase} existing-matrix shard {shard_index}/{shard_count} had no scenarios for {action}"
     );
+}
+
+fn modern_bucket_name_for(action: Action, index: usize) -> String {
+    let action_slug = match action {
+        Action::GetObject => "go",
+        Action::GetObjectAttributes => "goa",
+        Action::GetObjectAcl => "goacl",
+        Action::GetObjectTagging => "gotag",
+        Action::PutObjectTagging => "potag",
+        Action::DeleteObjectTagging => "dotag",
+    };
+    format!("authz-modern-{action_slug}-{index:05}")
+}
+
+fn run_modern_existing_matrix_without_cross_account_owner(action: Action) {
+    let scenarios = Scenario::existing_scenarios(action)
+        .into_iter()
+        .filter(|scenario| scenario.object.owner_kind != model::ObjectOwnerKind::CrossAccount)
+        .collect();
+    run_modern_existing_matrix_scenarios(action, scenarios);
+}
+
+fn run_modern_existing_matrix_with_only_cross_account_owner(action: Action) {
+    let scenarios = Scenario::existing_scenarios(action)
+        .into_iter()
+        .filter(|scenario| scenario.object.owner_kind == model::ObjectOwnerKind::CrossAccount)
+        .collect();
+    run_modern_existing_matrix_scenarios(action, scenarios);
+}
+
+fn run_modern_existing_matrix_without_cross_account_owner_shard(
+    action: Action,
+    shard_index: usize,
+    shard_count: usize,
+) {
+    let scenarios = Scenario::existing_scenarios(action)
+        .into_iter()
+        .filter(|scenario| scenario.object.owner_kind != model::ObjectOwnerKind::CrossAccount)
+        .collect();
+    run_modern_existing_matrix_scenarios_shard(action, scenarios, shard_index, shard_count);
+}
+
+fn run_modern_existing_matrix_scenarios(action: Action, scenarios: Vec<Scenario>) {
+    assert!(
+        !scenarios.is_empty(),
+        "modern auth matrix unexpectedly produced no scenarios for {action}"
+    );
+    let harness = MatrixHarness::new();
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        let bucket = modern_bucket_name_for(action, index);
+        let expected = scenario.expected_modern_existing_outcome();
+        let actual = to_modern_outcome(harness.run_existing_modern(&bucket, scenario));
+        assert_eq!(
+            actual, expected,
+            "modern auth model mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
+        );
+    }
+}
+
+fn run_modern_existing_matrix_scenarios_shard(
+    action: Action,
+    scenarios: Vec<Scenario>,
+    shard_index: usize,
+    shard_count: usize,
+) {
+    assert!(
+        shard_count > 0,
+        "modern existing-matrix shard count must be non-zero"
+    );
+    assert!(
+        shard_index < shard_count,
+        "modern existing-matrix shard index {shard_index} out of range for shard count {shard_count}"
+    );
+    assert!(
+        !scenarios.is_empty(),
+        "modern auth matrix unexpectedly produced no scenarios for {action}"
+    );
+    let harness = MatrixHarness::new();
+    let mut shard_len = 0usize;
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        if index % shard_count != shard_index {
+            continue;
+        }
+        shard_len += 1;
+        let bucket = modern_bucket_name_for(action, index);
+        let expected = scenario.expected_modern_existing_outcome();
+        let actual = to_modern_outcome(harness.run_existing_modern(&bucket, scenario));
+        assert_eq!(
+            actual, expected,
+            "modern auth model mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
+        );
+    }
+
+    assert!(
+        shard_len > 0,
+        "modern existing-matrix shard {shard_index}/{shard_count} had no scenarios for {action}"
+    );
+}
+
+fn to_modern_outcome(actual: ModernObjectReadAuthorization) -> model::ModernOutcome {
+    match actual {
+        ModernObjectReadAuthorization::Allowed => model::ModernOutcome::Allow,
+        ModernObjectReadAuthorization::Denied => model::ModernOutcome::Deny,
+        ModernObjectReadAuthorization::NeedAclFallback => model::ModernOutcome::NeedAclFallback,
+    }
 }
 
 fn run_missing_matrix(phase: &str, action: Action) {
