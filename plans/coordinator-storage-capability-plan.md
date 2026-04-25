@@ -1208,6 +1208,18 @@ Current guidance for this phase:
     acceptable end state
   - the first target should be a fixed-entry bounded cache with deterministic
     eviction, most likely recency-based
+- revalidation must be extremely cheap on the hot path
+  - bucket metadata changes are rare in normal workloads, so the fast path
+    should optimize for cheap local revalidation rather than for queue-based or
+    lock-heavy invalidation fanout
+  - revalidation should be satisfied by a narrow freshness token check such as
+    generation / ETag / last-modified-style metadata, not by reacquiring the
+    full bucket lock or waiting on an invalidation worker
+  - AWS-compatible propagation lag is acceptable, but the local lag budget
+    should remain small in practice
+    - target: comfortably under 1 second in normal operation
+    - the design should not introduce extra waiting just to refresh bucket
+      cache state
 - fast-path design should be driven by the hottest request families first
   - highest priority:
     - `GetObject`
@@ -1260,6 +1272,9 @@ The main questions are:
     has stored a new policy
   - and whether local behavior should remain immediate here or be made
     intentionally async only if that matches AWS and is explicitly modeled
+  - and, regardless of the allowed propagation window, how that freshness check
+    is performed without introducing bucket-lock reacquisition or queue waits
+    on the object read/head hot paths
 - whether any existing fast-path reads should be narrowed because they weaken
   the request-scoped snapshot contract
 
@@ -1281,6 +1296,11 @@ Acceptance criteria:
 - the cache is explicitly bounded rather than unbounded
 - the intended post-refactor fast-path contract is written down explicitly
 - the intended hot-path priority order is written down explicitly
+- the revalidation contract is written down explicitly
+  - including the freshness token used
+  - the maximum intended local propagation window
+  - and the requirement that hot-path revalidation avoids bucket-lock or
+    queue-based waiting
 - any additional bucket state added to the fast path is justified by hot-path
   need and pinned by tests
 - any request family that uses the fast path preserves the request-scoped
