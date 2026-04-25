@@ -6061,6 +6061,351 @@ fn get_object_rejects_bucket_owner_when_private_object_owned_by_other_principal(
     assert!(matches!(err, ServerError::AccessDenied));
 }
 
+fn setup_object_writer_bucket_with_private_foreign_owned_object(coord: &Coordinator) {
+    let owner_canonical_id = CanonicalUserId::from_principal("owner-a");
+    create_bucket_for_owner_with_flags(
+        coord,
+        "owner-a",
+        &owner_canonical_id,
+        "bucket",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    put_bucket_ownership_controls_test(
+        coord,
+        "bucket",
+        "<OwnershipControls><Rule><ObjectOwnership>ObjectWriter</ObjectOwnership></Rule></OwnershipControls>",
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+    put_bucket_policy_test(
+        coord,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"writer-a"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+    test_helpers::put_object(
+        coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                "bucket",
+                "key",
+                test_helpers::requester("writer-a"),
+                None,
+            ),
+            data: b"writer-owned",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn bucket_policy_does_not_grant_get_object_for_private_foreign_owned_object() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    setup_object_writer_bucket_with_private_foreign_owned_object(&coord);
+
+    put_bucket_policy_test(
+        &coord,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"owner-a"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+
+    let err = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_helpers::requester("owner-a"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert!(matches!(err, ServerError::AccessDenied));
+}
+
+#[test]
+fn bucket_policy_does_not_grant_get_object_acl_for_private_foreign_owned_object() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    setup_object_writer_bucket_with_private_foreign_owned_object(&coord);
+
+    put_bucket_policy_test(
+        &coord,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"owner-a"},"Action":"s3:GetObjectAcl","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+
+    let err = get_object_acl_test(
+        &coord,
+        "bucket",
+        "key",
+        None,
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(err, ServerError::AccessDenied));
+}
+
+#[test]
+fn bucket_policy_does_not_grant_get_object_attributes_for_private_foreign_owned_object() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    setup_object_writer_bucket_with_private_foreign_owned_object(&coord);
+
+    put_bucket_policy_test(
+        &coord,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"owner-a"},"Action":["s3:GetObject","s3:GetObjectAttributes"],"Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+
+    let err = coord
+        .get_object_attributes(&GetObjectAttributesRequest {
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_helpers::requester("owner-a"),
+                None,
+            ),
+            cond: NO_READ,
+            want_parts: false,
+            part_number_marker: None,
+            max_parts: 0,
+            sse_customer: None,
+        })
+        .unwrap_err();
+    assert!(matches!(err, ServerError::AccessDenied));
+}
+
+#[test]
+fn bucket_policy_still_grants_get_object_tagging_for_private_foreign_owned_object() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    setup_object_writer_bucket_with_private_foreign_owned_object(&coord);
+
+    put_bucket_policy_test(
+        &coord,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"owner-a"},"Action":"s3:GetObjectTagging","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+
+    let tags = get_object_tags_test(
+        &coord,
+        "bucket",
+        "key",
+        None,
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+    assert!(tags.is_none());
+}
+
+#[test]
+fn bucket_policy_does_not_grant_copy_object_for_private_foreign_owned_source_object() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    setup_object_writer_bucket_with_private_foreign_owned_object(&coord);
+    coord
+        .create_bucket_for_owner("owner-a", "dst", false)
+        .unwrap();
+
+    put_bucket_policy_test(
+        &coord,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"owner-a"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+
+    let err = coord
+        .copy_object(&CopyObjectRequest {
+            source: copy_source("bucket", "key", None),
+            destination: object_request_with_expected_owner(
+                "dst",
+                "copied",
+                test_helpers::requester("owner-a"),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: None,
+            tagging: TaggingDirective::Copy,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            destination_encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+        })
+        .unwrap_err();
+    assert!(matches!(err, ServerError::AccessDenied));
+}
+
+#[test]
+fn bucket_policy_does_not_grant_upload_part_copy_for_private_foreign_owned_source_object() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    setup_object_writer_bucket_with_private_foreign_owned_object(&coord);
+    coord
+        .create_bucket_for_owner("owner-a", "dst", false)
+        .unwrap();
+
+    put_bucket_policy_test(
+        &coord,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"owner-a"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(
+                "dst",
+                "copied",
+                test_helpers::requester("owner-a"),
+                None,
+            ),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let err = coord
+        .upload_part_copy(&UploadPartCopyRequest {
+            source: copy_source("bucket", "key", None),
+            upload: multipart_object_request_with_expected_owner(
+                "dst",
+                "copied",
+                &upload.upload_id,
+                test_helpers::requester("owner-a"),
+                None,
+            ),
+            part_number: 1,
+            copy_source_range: None,
+            source_sse_customer: None,
+            sse_customer: None,
+        })
+        .unwrap_err();
+    assert!(matches!(err, ServerError::AccessDenied));
+}
+
+#[test]
+fn bucket_policy_get_object_foreign_owned_object_reverts_after_boe_removed() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    setup_object_writer_bucket_with_private_foreign_owned_object(&coord);
+
+    put_bucket_policy_test(
+        &coord,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"owner-a"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+
+    let denied = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_helpers::requester("owner-a"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert!(matches!(denied, ServerError::AccessDenied));
+
+    put_bucket_ownership_controls_test(
+        &coord,
+        "bucket",
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+
+    let allowed = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_helpers::requester("owner-a"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(allowed.body.read_all().unwrap(), b"writer-owned");
+
+    coord
+        .delete_bucket_ownership_controls(&bucket_request_with_expected_owner(
+            "bucket",
+            test_helpers::requester("owner-a"),
+            None,
+        ))
+        .unwrap();
+
+    let denied_again = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_helpers::requester("owner-a"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert!(matches!(denied_again, ServerError::AccessDenied));
+}
+
 #[test]
 fn get_object_allows_public_read_for_anonymous() {
     let tmp = test_util::tempdir();

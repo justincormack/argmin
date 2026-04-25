@@ -852,6 +852,124 @@ fn test_create_time_object_writer_bucket_policy_does_not_grant_bucket_owner_read
 }
 
 #[test]
+fn test_bucket_policy_does_not_grant_bucket_owner_get_object_acl_of_private_foreign_owned_object() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        let key = "writer-owned";
+        create_bucket_in_test_region_with_ownership(client, &bucket, ObjectOwnership::ObjectWriter)
+            .await;
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "AllowAltWriterPutObject",
+                    "Effect": "Allow",
+                    "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) },
+                    "Action": "s3:PutObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                },
+                {
+                    "Sid": "AllowBucketOwnerReadAcl",
+                    "Effect": "Allow",
+                    "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.account_id()) },
+                    "Action": "s3:GetObjectAcl",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                }
+            ],
+        });
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy.to_string())
+            .send()
+            .await
+            .unwrap();
+
+        alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let acl = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await;
+        assert_s3_err_code(&acl, "AccessDenied");
+
+        cleanup_keys(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_does_not_grant_bucket_owner_get_object_attributes_of_private_foreign_owned_object(
+) {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        let key = "writer-owned";
+        create_bucket_in_test_region_with_ownership(client, &bucket, ObjectOwnership::ObjectWriter)
+            .await;
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "AllowAltWriterPutObject",
+                    "Effect": "Allow",
+                    "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) },
+                    "Action": "s3:PutObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                },
+                {
+                    "Sid": "AllowBucketOwnerReadAttributes",
+                    "Effect": "Allow",
+                    "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.account_id()) },
+                    "Action": "s3:GetObjectAttributes",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                }
+            ],
+        });
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy.to_string())
+            .send()
+            .await
+            .unwrap();
+
+        alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let attrs = client
+            .get_object_attributes()
+            .bucket(&bucket)
+            .key(key)
+            .object_attributes(ObjectAttributes::ObjectSize)
+            .send()
+            .await;
+        assert_s3_err_code(&attrs, "AccessDenied");
+
+        cleanup_keys(&bucket, &[key]).await;
+    });
+}
+
+#[test]
 fn test_probe_bucket_owner_enforced_bucket_policy_get_object_sequence_for_pre_boe_foreign_owned_object(
 ) {
     s3_tests::run(async {
@@ -1349,6 +1467,147 @@ fn test_bucket_owner_can_delete_private_foreign_owned_object() {
         .await;
 
         cleanup(&bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_does_not_grant_bucket_owner_copy_object_from_private_foreign_owned_object() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        let src_key = "writer-owned";
+        let dst_key = "copied";
+        create_bucket_in_test_region_with_ownership(client, &bucket, ObjectOwnership::ObjectWriter)
+            .await;
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "AllowAltWriterPutObject",
+                    "Effect": "Allow",
+                    "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) },
+                    "Action": "s3:PutObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                },
+                {
+                    "Sid": "AllowBucketOwnerReadForeignOwnedSource",
+                    "Effect": "Allow",
+                    "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.account_id()) },
+                    "Action": "s3:GetObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                }
+            ],
+        });
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy.to_string())
+            .send()
+            .await
+            .unwrap();
+
+        alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .body(ByteStream::from_static(b"writer-data"))
+            .send()
+            .await
+            .unwrap();
+
+        let copy = client
+            .copy_object()
+            .bucket(&bucket)
+            .key(dst_key)
+            .copy_source(format!("{bucket}/{src_key}"))
+            .send()
+            .await;
+        assert_s3_err_code(&copy, "AccessDenied");
+
+        cleanup_keys(&bucket, &[src_key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_does_not_grant_bucket_owner_upload_part_copy_from_private_foreign_owned_object(
+) {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        let src_key = "writer-owned";
+        let dst_key = "copied-mpu";
+        create_bucket_in_test_region_with_ownership(client, &bucket, ObjectOwnership::ObjectWriter)
+            .await;
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "AllowAltWriterPutObject",
+                    "Effect": "Allow",
+                    "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) },
+                    "Action": "s3:PutObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                },
+                {
+                    "Sid": "AllowBucketOwnerReadForeignOwnedSource",
+                    "Effect": "Allow",
+                    "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.account_id()) },
+                    "Action": "s3:GetObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                }
+            ],
+        });
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy.to_string())
+            .send()
+            .await
+            .unwrap();
+
+        alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .body(ByteStream::from_static(b"writer-data"))
+            .send()
+            .await
+            .unwrap();
+
+        let upload = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = upload.upload_id().expect("expected upload id").to_string();
+
+        let copied_part = client
+            .upload_part_copy()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .copy_source(format!("{bucket}/{src_key}"))
+            .send()
+            .await;
+        assert_s3_err_code(&copied_part, "AccessDenied");
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup_keys(&bucket, &[src_key]).await;
     });
 }
 

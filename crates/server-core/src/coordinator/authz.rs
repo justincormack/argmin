@@ -1315,6 +1315,87 @@ impl Coordinator {
         ))
     }
 
+    fn requester_can_read_family_object_action_with_bucket_policy<F>(
+        &self,
+        request: BucketPolicyRequestContext<'_>,
+        object: &StoredObject,
+        existing_object_tags_mode: ExistingObjectTagsMode,
+        fallback: F,
+    ) -> Result<bool, ServerError>
+    where
+        F: FnOnce() -> bool,
+    {
+        let decision = Self::filter_bucket_policy_allow_for_foreign_owned_read_family_object(
+            request.bucket,
+            object,
+            request.action,
+            self.bucket_policy_decision_for_object(request, object, existing_object_tags_mode)?,
+        );
+        Ok(Self::bucket_policy_allows_with_fallback(
+            request.requester,
+            request.bucket,
+            decision,
+            fallback,
+        ))
+    }
+
+    fn filter_bucket_policy_allow_for_foreign_owned_read_family_object(
+        bucket: &BucketSummary,
+        object: &StoredObject,
+        action: auth::PolicyAction,
+        decision: auth::PolicyEvaluation,
+    ) -> auth::PolicyEvaluation {
+        if decision != auth::PolicyEvaluation::ExplicitAllow {
+            return decision;
+        }
+
+        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
+            return decision;
+        }
+
+        let is_read_family = matches!(
+            action,
+            auth::PolicyAction::GetObject
+                | auth::PolicyAction::GetObjectVersion
+                | auth::PolicyAction::GetObjectAttributes
+                | auth::PolicyAction::GetObjectVersionAttributes
+                | auth::PolicyAction::GetObjectAcl
+                | auth::PolicyAction::GetObjectVersionAcl
+        );
+        if !is_read_family {
+            return decision;
+        }
+
+        if Self::object_is_owned_by_bucket_owner_account(bucket, object) {
+            return decision;
+        }
+
+        auth::PolicyEvaluation::NoMatch
+    }
+
+    fn object_is_owned_by_bucket_owner_account(
+        bucket: &BucketSummary,
+        object: &StoredObject,
+    ) -> bool {
+        if object.owner().principal == bucket.owner_principal
+            || object.owner().canonical_id == bucket.owner_canonical_id
+        {
+            return true;
+        }
+
+        let Some(object_owner_account_id) =
+            aws_account_id_from_principal(object.owner().principal.as_str())
+        else {
+            return false;
+        };
+        let Some(bucket_owner_account_id) = aws_account_id_from_principal(&bucket.owner_principal)
+        else {
+            return false;
+        };
+
+        object_owner_account_id == bucket_owner_account_id
+    }
+
     fn requester_can_missing_object_action_with_bucket_policy<F>(
         &self,
         request: BucketPolicyRequestContext<'_>,
@@ -1359,7 +1440,7 @@ impl Coordinator {
         action: auth::PolicyAction,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<bool, ServerError> {
-        self.requester_can_object_action_with_bucket_policy(
+        self.requester_can_read_family_object_action_with_bucket_policy(
             BucketPolicyRequestContext {
                 requester,
                 bucket,
@@ -1369,6 +1450,7 @@ impl Coordinator {
                 policy,
             },
             object,
+            ExistingObjectTagsMode::Available,
             || Self::requester_can_read_object(requester, bucket, object),
         )
     }
@@ -1382,7 +1464,7 @@ impl Coordinator {
         action: auth::PolicyAction,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<bool, ServerError> {
-        self.requester_can_object_action_with_unavailable_existing_tags_with_bucket_policy(
+        self.requester_can_read_family_object_action_with_bucket_policy(
             BucketPolicyRequestContext {
                 requester,
                 bucket,
@@ -1392,6 +1474,7 @@ impl Coordinator {
                 policy,
             },
             object,
+            ExistingObjectTagsMode::Unavailable,
             || Self::requester_can_read_object(requester, bucket, object),
         )
     }
@@ -1540,7 +1623,7 @@ impl Coordinator {
         action: auth::PolicyAction,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<bool, ServerError> {
-        self.requester_can_object_action_with_bucket_policy(
+        self.requester_can_read_family_object_action_with_bucket_policy(
             BucketPolicyRequestContext {
                 requester,
                 bucket,
@@ -1550,6 +1633,7 @@ impl Coordinator {
                 policy,
             },
             object,
+            ExistingObjectTagsMode::Available,
             || Self::requester_can_read_object_acl(requester, bucket, object),
         )
     }
