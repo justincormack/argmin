@@ -916,6 +916,8 @@ fn test_checksum_algorithm_without_value_header_is_rejected() {
 fn test_oversized_xml_body_limits_match_aws() {
     s3_tests::run(async {
         let versioning_pad = comment_pad(600);
+        let acl_pad = comment_pad(70_000);
+        let encryption_pad = comment_pad(700_000);
         let tagging_pad = comment_pad(41_000);
         let ownership_pad = comment_pad(1_900);
         let public_access_block_pad = comment_pad(420_000);
@@ -938,6 +940,46 @@ fn test_oversized_xml_body_limits_match_aws() {
         cleanup_bucket(&bucket).await;
         assert_eq!(versioning.status, 400, "body: {}", versioning.body);
         assert_max_message_length(&versioning.body, 1024);
+
+        let bucket =
+            create_bucket_in_test_region(Some(ObjectOwnership::BucketOwnerPreferred), false).await;
+        let owner_id = bucket_owner_id(&bucket).await;
+        let acl_url = format!("{}/{}?acl", CTX.endpoint(), bucket);
+        let acl_body = format!(
+            "<AccessControlPolicy>{acl_pad}<Owner><ID>{owner_id}</ID></Owner>{acl_pad}<AccessControlList>{acl_pad}\
+             <Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\">\
+             <ID>{owner_id}</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant>{acl_pad}\
+             </AccessControlList>{acl_pad}</AccessControlPolicy>"
+        )
+        .into_bytes();
+        let acl = send_signed_request(
+            "PUT",
+            &acl_url,
+            &acl_body,
+            std::iter::empty::<(&str, &str)>(),
+        );
+        cleanup_bucket(&bucket).await;
+        assert_eq!(acl.status, 400, "body: {}", acl.body);
+        assert_max_message_length(&acl.body, 204_800);
+
+        let bucket = create_bucket_in_test_region(None, false).await;
+        let encryption_url = format!("{}/{}?encryption", CTX.endpoint(), bucket);
+        let encryption_body = format!(
+            "<ServerSideEncryptionConfiguration>{encryption_pad}<Rule>{encryption_pad}\
+             <ApplyServerSideEncryptionByDefault>{encryption_pad}<SSEAlgorithm>AES256</SSEAlgorithm>{encryption_pad}\
+             </ApplyServerSideEncryptionByDefault>{encryption_pad}</Rule>{encryption_pad}\
+             </ServerSideEncryptionConfiguration>"
+        )
+        .into_bytes();
+        let encryption = send_signed_request(
+            "PUT",
+            &encryption_url,
+            &encryption_body,
+            std::iter::empty::<(&str, &str)>(),
+        );
+        cleanup_bucket(&bucket).await;
+        assert_eq!(encryption.status, 400, "body: {}", encryption.body);
+        assert_max_message_length(&encryption.body, 2_097_152);
 
         let bucket = create_bucket_in_test_region(None, false).await;
         let tagging_url = format!("{}/{}?tagging", CTX.endpoint(), bucket);

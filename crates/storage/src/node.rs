@@ -24,17 +24,20 @@ use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 use crate::types::{
     AbortMultipartUploadLookup, BucketFastPathInfo, BucketInfo, BucketName, BucketSnapshot,
     BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState,
-    BucketSubresourceKind, CreateBucketConfig, CreateStreamUploadReq, FinalizeStreamPartOutcome,
-    GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq, ListPartsReq, ListPartsResp,
-    ListedBucketMultipartUploads, ListedBucketObjectVersions, ListedBucketObjects,
-    ListedMultipartParts, LoadedBucketSubresource, MultipartCompletionPreflight,
-    MultipartCompletionSnapshot, MultipartPartRecord, MultipartPartSegmentRecord,
-    MultipartReclaimRecord, MultipartUploadRecord, ObjectKey, ObjectPartRecord, ObjectReadSnapshot,
-    ObjectReadSnapshotOutcome, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
-    PayloadReclaimRoot, PreparedStreamPartCommit, PutLiveObjectReq, SessionId, ShardKey,
-    SimplePayloadReclaimRecord, StoredObject, StreamUploadPartSnapshot, StreamUploadRecord,
-    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
+    BucketSubresourceKind, CreateStreamUploadReq, FinalizeStreamPartOutcome, GenerationId,
+    ListMultipartUploadsReq, ListObjectVersionsReq, ListPartsReq, ListedBucketMultipartUploads,
+    ListedBucketObjectVersions, ListedBucketObjects, ListedMultipartParts, LoadedBucketSubresource,
+    MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
+    MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, ObjectReadSnapshot,
+    ObjectReadSnapshotOutcome, PreparedStreamPartCommit, SessionId, ShardKey, StoredObject,
+    StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
     WriteAck,
+};
+#[cfg(any(test, feature = "test-hooks"))]
+use crate::types::{
+    CreateBucketConfig, ListPartsResp, MultipartReclaimRecord, ObjectPartRecord,
+    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, PayloadReclaimRoot, PutLiveObjectReq,
+    SimplePayloadReclaimRecord, StreamUploadRecord, StreamUploadSegmentRecord,
 };
 
 const TRACE_TARGET: &str = "storage";

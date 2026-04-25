@@ -708,12 +708,16 @@ fn append_rendered_acl_grant(xml: &mut String, grant: &RenderedAclGrant) {
 }
 
 pub fn parse_acl_xml(data: &[u8]) -> Result<AclGrants, ServerError> {
+    const MAX_ACL_XML_BYTES: usize = 200 * 1024;
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum TextField {
         Permission,
         GranteeId,
         GranteeUri,
     }
+
+    ensure_xml_body_size(data, MAX_ACL_XML_BYTES)?;
 
     let mut reader = Reader::from_reader(data);
     reader.config_mut().trim_text(true);
@@ -2033,6 +2037,8 @@ pub fn get_object_legal_hold_xml(status: Option<LegalHoldStatus>) -> String {
 /// - default encryption may be omitted or set to SSE-S3 (`AES256`)
 /// - `BlockedEncryptionTypes` may contain `SSE-C` or `NONE`
 pub fn parse_bucket_encryption_xml(data: &[u8]) -> Result<BucketEncryptionConfig, ServerError> {
+    const MAX_BUCKET_ENCRYPTION_CONFIGURATION_BYTES: usize = 2 * 1024 * 1024;
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum State {
         Start,
@@ -2060,6 +2066,8 @@ pub fn parse_bucket_encryption_xml(data: &[u8]) -> Result<BucketEncryptionConfig
             "invalid XML entity in bucket encryption XML body",
         )
     }
+
+    ensure_xml_body_size(data, MAX_BUCKET_ENCRYPTION_CONFIGURATION_BYTES)?;
 
     let mut reader = Reader::from_reader(data);
     let mut buf = Vec::new();
@@ -4783,6 +4791,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_acl_xml_rejects_oversized_body() {
+        const MAX_ACL_XML_BYTES: usize = 200 * 1024;
+        let oversized = vec![b' '; MAX_ACL_XML_BYTES + 1];
+        assert!(matches!(
+            parse_acl_xml(&oversized),
+            Err(ServerError::MaxMessageLengthExceeded {
+                max_message_length_bytes: MAX_ACL_XML_BYTES,
+            })
+        ));
+    }
+
+    #[test]
     fn list_objects_xml_format() {
         let result = ListObjectsResult {
             objects: vec![ListEntry {
@@ -5799,6 +5819,18 @@ mod tests {
                 sse_c_blocked: false,
             }
         );
+    }
+
+    #[test]
+    fn parse_bucket_encryption_rejects_oversized_body() {
+        const MAX_BUCKET_ENCRYPTION_CONFIGURATION_BYTES: usize = 2 * 1024 * 1024;
+        let oversized = vec![b' '; MAX_BUCKET_ENCRYPTION_CONFIGURATION_BYTES + 1];
+        assert!(matches!(
+            parse_bucket_encryption_xml(&oversized),
+            Err(ServerError::MaxMessageLengthExceeded {
+                max_message_length_bytes: MAX_BUCKET_ENCRYPTION_CONFIGURATION_BYTES,
+            })
+        ));
     }
 
     // ── CORS XML ─────────────────────────────────────────────────────
