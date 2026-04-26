@@ -384,6 +384,12 @@ impl SharedStorageNode {
         pg_ids: &[u32],
         default_ec_shape: EcShape,
     ) -> Result<Self, StoreError> {
+        EcConfig::new(default_ec_shape.k, default_ec_shape.m).map_err(|error| {
+            StoreError::ErasureCoding {
+                context: "validate storage default ec shape",
+                reason: error.to_string(),
+            }
+        })?;
         std::fs::create_dir_all(data_dir).map_err(|e| StoreError::Io {
             context: "create data dir",
             source: e,
@@ -1792,6 +1798,21 @@ mod tests {
         let tmp = test_util::tempdir();
         let node = LocalStorageNode::open(tmp.path(), &[5, 2, 8, 1]).unwrap();
         assert_eq!(node.pg_ids(), &[1, 2, 5, 8]);
+    }
+
+    #[test]
+    fn shared_storage_node_rejects_invalid_default_ec_shape() {
+        let tmp = test_util::tempdir();
+        let err = match SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0, 1],
+            EcShape { k: 0, m: 2 },
+        ) {
+            Ok(_) => panic!("expected invalid default EC shape to be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, StoreError::ErasureCoding { .. }));
     }
 
     // ── SharedStorageNode tests ──────────────────────────────────────
