@@ -4,14 +4,13 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use ec::{EcConfig, ErasureCodec};
 use s3_types::BucketLifecycleConfiguration;
 use storage::{
-    BucketInfo, BucketName, GenerationId, ObjectEncryption, ObjectKey, ShardKey, SharedStorageNode,
-    UploadId, UploadState, VersionId,
+    BucketInfo, BucketName, EcShape, GenerationId, ObjectEncryption, ObjectKey,
+    SegmentStoredBytesRequest, SharedStorageNode, UploadId, UploadState, VersionId,
 };
 
-use super::payload::{PooledPayloadBuffer, SharedPayloadBuffer};
+use super::payload::SharedPayloadBuffer;
 use super::read_core::{
     MultipartReader, PayloadLease, ReadChunk, ReadRuntime, SegmentListReader, SegmentPayloadRecord,
 };
@@ -732,7 +731,6 @@ impl ReadRuntime {
         sse_customer_request: Option<&SseCustomerRequest>,
     ) -> Result<Arc<SharedPayloadBuffer>, ServerError> {
         let k = segment.ec_k as usize;
-        let m = segment.ec_m as usize;
         let padded = segment.stored_size().div_ceil(k) * k;
         let shard_size = padded / k;
 
@@ -742,166 +740,30 @@ impl ReadRuntime {
             return Ok(Arc::new(SharedPayloadBuffer::from_unpooled(plaintext)));
         }
 
-        if let Some(buf) = self.try_read_segment_payload_direct(
-            segment,
-            part_number,
-            sse_customer_request,
-            k,
-            shard_size,
-            padded,
-        )? {
-            return Ok(buf.into_shared());
-        }
-
-        self.read_segment_payload_recovery(
-            segment,
-            part_number,
-            sse_customer_request,
-            k,
-            m,
-            padded,
-            shard_size,
-        )
-        .map(PooledPayloadBuffer::into_shared)
-    }
-
-    fn try_read_segment_payload_direct(
-        &self,
-        segment: &SegmentPayloadRecord,
-        part_number: Option<u32>,
-        sse_customer_request: Option<&SseCustomerRequest>,
-        k: usize,
-        shard_size: usize,
-        padded: usize,
-    ) -> Result<Option<PooledPayloadBuffer>, ServerError> {
-        let Some(expected_crc64) = segment.segment_crc64 else {
-            return Ok(None);
-        };
-
         let mut buf = self.payload_buffer_pool.checkout(padded);
-        buf.resize_zeroed(padded);
-        for i in 0..k {
-            let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
-            let start = i * shard_size;
-            let end = start + shard_size;
-            match self.storage_node.read_shard_file_into(
-                segment.shard_pg_id,
-                &shard_key,
-                &mut buf[start..end],
-            ) {
-                Ok(()) => {}
-                Err(storage::StoreError::PgNotFound { pg_id }) => {
-                    return Err(ServerError::Store(storage::StoreError::PgNotFound {
-                        pg_id,
-                    }));
-                }
-                Err(_) => return Ok(None),
-            }
-        }
-
-        buf.truncate(segment.stored_size());
-        let actual_crc64 = checksum::crc64::checksum(&buf);
-        if actual_crc64 != expected_crc64 {
-            return Ok(None);
-        }
-        let plaintext =
-            self.decrypt_segment_if_needed(segment, part_number, sse_customer_request, &buf)?;
-        buf.resize_zeroed(0);
-        buf.extend_from_slice(&plaintext);
-        Ok(Some(buf))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn read_segment_payload_recovery(
-        &self,
-        segment: &SegmentPayloadRecord,
-        part_number: Option<u32>,
-        sse_customer_request: Option<&SseCustomerRequest>,
-        k: usize,
-        m: usize,
-        padded: usize,
-        shard_size: usize,
-    ) -> Result<PooledPayloadBuffer, ServerError> {
-        let all_shards = self.storage_node.load_segment_shards_for_recovery(
-            segment.shard_pg_id,
-            &segment.segment_okh,
-            segment.segment_vid,
-            segment.ec_k,
-            segment.ec_m,
+        self.storage_node.read_segment_stored_bytes_into(
+            SegmentStoredBytesRequest {
+                shard_pg_id: segment.shard_pg_id,
+                segment_okh: segment.segment_okh,
+                segment_vid: segment.segment_vid,
+                stored_size: segment.stored_size(),
+                segment_crc64: segment.segment_crc64,
+                ec: EcShape {
+                    k: segment.ec_k,
+                    m: segment.ec_m,
+                },
+            },
+            &mut buf,
         )?;
-
-        let mut recovered = None;
-        let mut recovered_ranges = vec![None; k];
-
-        if !(0..k).all(|i| all_shards[i].is_some()) {
-            let missing_needed: Vec<usize> = (0..k).filter(|&i| all_shards[i].is_none()).collect();
-
-            let present_indices: Vec<usize> =
-                (0..(k + m)).filter(|&i| all_shards[i].is_some()).collect();
-            let present_refs: Vec<&[u8]> = present_indices
-                .iter()
-                .map(|&i| all_shards[i].as_ref().unwrap().as_slice())
-                .collect();
-
-            let tmp_codec;
-            let codec = if segment.ec_k == self.ec_config.data_shards
-                && segment.ec_m == self.ec_config.parity_shards
-            {
-                self.ec_codec.as_ref()
-            } else {
-                let ec_config = EcConfig::new(segment.ec_k, segment.ec_m)?;
-                tmp_codec = ErasureCodec::new(ec_config)?;
-                &tmp_codec
-            };
-
-            let recovered_len = missing_needed.len() * shard_size;
-            let mut recovered_buf = self.payload_buffer_pool.checkout(recovered_len);
-            recovered_buf.resize_zeroed(recovered_len);
-            let mut output_refs: Vec<&mut [u8]> = recovered_buf
-                .chunks_mut(shard_size)
-                .take(missing_needed.len())
-                .collect();
-
-            codec.reconstruct(
-                &present_indices,
-                &present_refs,
-                &missing_needed,
-                &mut output_refs,
-            )?;
-
-            for (slot, &missing_idx) in missing_needed.iter().enumerate() {
-                let start = slot * shard_size;
-                recovered_ranges[missing_idx] = Some((start, start + shard_size));
-            }
-            recovered = Some(recovered_buf);
+        if matches!(segment.encryption, ObjectEncryption::None) {
+            Ok(buf.into_shared())
+        } else {
+            let plaintext =
+                self.decrypt_segment_if_needed(segment, part_number, sse_customer_request, &buf)?;
+            buf.resize_zeroed(0);
+            buf.extend_from_slice(&plaintext);
+            Ok(buf.into_shared())
         }
-
-        let mut buf = self.payload_buffer_pool.checkout(padded);
-        buf.resize_zeroed(0);
-        for (idx, shard) in all_shards.iter().take(k).enumerate() {
-            if let Some(shard) = shard.as_ref() {
-                buf.extend_from_slice(shard);
-            } else if let Some((start, end)) = recovered_ranges[idx] {
-                buf.extend_from_slice(&recovered.as_ref().unwrap()[start..end]);
-            } else {
-                unreachable!("missing reconstructed shard for data index {idx}");
-            }
-        }
-        buf.truncate(segment.stored_size());
-        if let Some(expected_crc64) = segment.segment_crc64 {
-            let actual_crc64 = checksum::crc64::checksum(&buf);
-            if actual_crc64 != expected_crc64 {
-                return Err(ServerError::Store(storage::StoreError::IntegrityError {
-                    expected: expected_crc64,
-                    actual: actual_crc64,
-                }));
-            }
-        }
-        let plaintext =
-            self.decrypt_segment_if_needed(segment, part_number, sse_customer_request, &buf)?;
-        buf.resize_zeroed(0);
-        buf.extend_from_slice(&plaintext);
-        Ok(buf)
     }
 
     fn decrypt_segment_if_needed(

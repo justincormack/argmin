@@ -130,8 +130,6 @@ fn segment_list_reader_next_chunk_moves_whole_loaded_segment() {
     let ec_config = EcConfig::default();
     let runtime = ReadRuntime {
         storage_node: Arc::new(SharedStorageNode::open(dir.path(), &[0]).unwrap()),
-        ec_codec: Arc::new(ErasureCodec::new(ec_config).unwrap()),
-        ec_config,
         #[cfg(test)]
         pg_topology: PgTopology::new(&[0]).unwrap(),
         payload_buffer_pool: PayloadBufferPool::new(ec_config),

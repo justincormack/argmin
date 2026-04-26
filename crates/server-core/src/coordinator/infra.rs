@@ -3,7 +3,7 @@ use super::runtime::LifecycleSweepStats;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use ec::{EcConfig, ErasureCodec};
+use ec::EcConfig;
 
 use super::authz_types::{AuthorizedPutObjectWrite, ValidatedBucket};
 use super::payload::PayloadBufferPool;
@@ -307,7 +307,6 @@ impl Coordinator {
             ReadRuntime,
         ) -> Result<Arc<LifecycleSweeper>, ServerError>,
     {
-        let ec_codec = Arc::new(ErasureCodec::new(ec_config)?);
         #[cfg(test)]
         let pg_topology = PgTopology::new(storage_node.pg_ids()).map_err(|reason| {
             ServerError::InternalError {
@@ -317,8 +316,6 @@ impl Coordinator {
         let payload_buffer_pool = PayloadBufferPool::new(ec_config);
         let read_runtime = ReadRuntime {
             storage_node: Arc::clone(&storage_node),
-            ec_codec: Arc::clone(&ec_codec),
-            ec_config,
             #[cfg(test)]
             pg_topology: pg_topology.clone(),
             payload_buffer_pool: Arc::clone(&payload_buffer_pool),
@@ -355,7 +352,6 @@ impl Coordinator {
         Ok(Self {
             storage_node,
             shared_caches,
-            ec_codec,
             ec_config,
             payload_buffer_pool,
             region,
@@ -373,8 +369,6 @@ impl Coordinator {
     pub(super) fn read_runtime(&self) -> ReadRuntime {
         ReadRuntime {
             storage_node: Arc::clone(&self.storage_node),
-            ec_codec: Arc::clone(&self.ec_codec),
-            ec_config: self.ec_config,
             #[cfg(test)]
             pg_topology: PgTopology::new(self.storage_node.pg_ids())
                 .expect("coordinator storage node should expose a valid PG topology"),

@@ -7812,32 +7812,17 @@ fn stream_append_reuses_encode_scratch_for_aligned_segments() {
         k: coord.ec_config.data_shards,
         m: coord.ec_config.parity_shards,
     };
-    assert_eq!(
-        coord
-            .storage_node
-            .test_ec_write_scratch_allocation_count(ec),
-        0
-    );
+    assert_eq!(coord.storage_node.test_ec_scratch_allocation_count(ec), 0);
 
     coord
         .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"data")
         .unwrap();
-    assert_eq!(
-        coord
-            .storage_node
-            .test_ec_write_scratch_allocation_count(ec),
-        1
-    );
+    assert_eq!(coord.storage_node.test_ec_scratch_allocation_count(ec), 1);
 
     coord
         .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 1, b"more")
         .unwrap();
-    assert_eq!(
-        coord
-            .storage_node
-            .test_ec_write_scratch_allocation_count(ec),
-        1
-    );
+    assert_eq!(coord.storage_node.test_ec_scratch_allocation_count(ec), 1);
 }
 
 // ── Phase 3a: Streaming UploadPart tests ─────────────────────────

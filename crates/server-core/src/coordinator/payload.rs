@@ -134,10 +134,6 @@ impl PooledPayloadBuffer {
         self.buf.as_mut().unwrap().resize(len, 0);
     }
 
-    pub(super) fn truncate(&mut self, len: usize) {
-        self.buf.as_mut().unwrap().truncate(len);
-    }
-
     pub(super) fn into_shared(mut self) -> Arc<SharedPayloadBuffer> {
         Arc::new(SharedPayloadBuffer {
             pool: Some(Arc::clone(&self.pool)),

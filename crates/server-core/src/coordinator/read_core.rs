@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use ec::{EcConfig, ErasureCodec};
 use storage::{
     BucketName, GenerationId, MultipartPartSegmentRecord, ObjectEncryption, ObjectKey,
     ObjectPartRecord, ObjectSegmentRecord, SharedStorageNode,
@@ -24,8 +23,6 @@ pub struct ReadChunk {
 #[derive(Clone)]
 pub(super) struct ReadRuntime {
     pub(super) storage_node: Arc<SharedStorageNode>,
-    pub(super) ec_codec: Arc<ErasureCodec>,
-    pub(super) ec_config: EcConfig,
     #[cfg(test)]
     pub(super) pg_topology: PgTopology,
     pub(super) payload_buffer_pool: Arc<PayloadBufferPool>,

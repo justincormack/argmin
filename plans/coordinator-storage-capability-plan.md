@@ -1715,23 +1715,15 @@ Acceptance criteria:
 
 ### Phase 13: Data-Plane EC and Shard IO Ownership
 
+Phase 13 implementation is complete. Normal data-path EC encode, shard-file
+writes, healthy shard reads, and degraded reconstruction now live in storage.
+Further work in this area is optimization or API tightening, not another
+coordinator/storage boundary move.
+
 Execution priority note: do this before Phase 11 and Phase 12. Although it is
 numbered later, this is still boundary cleanup work, while Phases 11 and 12
 are primarily performance/memory optimizations on top of the settled
 coordinator/storage boundary.
-
-After the request-shape and test-boundary work, there is still one remaining
-storage concern visible above the storage boundary: coordinator/runtime code
-still owns erasure-coding and shard file IO for the data path.
-
-Current remaining seam:
-
-- write side:
-  - coordinator still performs EC encode for streaming/direct segment writes
-  - coordinator still calls storage shard file write helpers directly
-- read side:
-  - read runtime still owns EC decode / reconstruction behavior
-  - storage still exposes direct shard file read helpers used by the read path
 
 Target direction:
 

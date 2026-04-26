@@ -1263,6 +1263,16 @@ pub struct EcShape {
     pub m: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentStoredBytesRequest {
+    pub shard_pg_id: u32,
+    pub segment_okh: [u8; 16],
+    pub segment_vid: GenerationId,
+    pub stored_size: usize,
+    pub segment_crc64: Option<u64>,
+    pub ec: EcShape,
+}
+
 /// Object-level ETag — either a single-part CRC64-NVME or a multipart composite.
 ///
 /// Eliminates the correlated `etag: Vec<u8>` + `etag_kind: EtagKind` +

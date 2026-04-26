@@ -30,9 +30,9 @@ use crate::types::{
     ListedBucketObjectVersions, ListedBucketObjects, ListedMultipartParts, LoadedBucketSubresource,
     MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
     MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, ObjectReadSnapshot,
-    ObjectReadSnapshotOutcome, PreparedStreamPartCommit, SessionId, ShardKey, StoredObject,
-    StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
-    WriteAck,
+    ObjectReadSnapshotOutcome, PreparedStreamPartCommit, SegmentStoredBytesRequest, SessionId,
+    ShardKey, StoredObject, StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget,
+    UploadId, UploadState, WriteAck,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::types::{
@@ -65,14 +65,14 @@ struct EncodeScratchPool {
     allocations: std::sync::atomic::AtomicUsize,
 }
 
-struct EncodeScratch<'a> {
-    pool: &'a EncodeScratchPool,
+struct EncodeScratch {
+    pool: Arc<EncodeScratchPool>,
     buf: Option<Vec<u8>>,
 }
 
 struct StorageEcWriteState {
     codec: ErasureCodec,
-    scratch: EncodeScratchPool,
+    scratch: Arc<EncodeScratchPool>,
 }
 
 pub struct BucketLockGuard<'a> {
@@ -469,7 +469,7 @@ impl SharedStorageNode {
                 context: "build erasure coding codec",
                 reason: error.to_string(),
             })?,
-            scratch: EncodeScratchPool::new(config),
+            scratch: Arc::new(EncodeScratchPool::new(config)),
         });
 
         let mut guard = self.ec_write_states.lock().unwrap();
@@ -480,7 +480,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_ec_write_scratch_allocation_count(&self, shape: EcShape) -> usize {
+    pub fn test_ec_scratch_allocation_count(&self, shape: EcShape) -> usize {
         self.ec_write_states
             .lock()
             .unwrap()
@@ -1181,12 +1181,6 @@ impl SharedStorageNode {
     }
 
     /// Read a shard file directly without taking the per-PG mutex.
-    ///
-    /// The coordinator uses this on the healthy read path and validates the
-    /// assembled segment against `segment_crc64` before serving it. If the
-    /// shard is missing or the segment checksum does not match, callers fall
-    /// back to the fully locked `PgStore::read_shard` path for recovery and
-    /// quarantine behavior.
     pub fn read_shard_file(&self, pg_id: u32, key: &ShardKey) -> Result<Vec<u8>, StoreError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -1261,10 +1255,160 @@ impl SharedStorageNode {
         }
     }
 
+    pub fn read_segment_stored_bytes_into(
+        &self,
+        req: SegmentStoredBytesRequest,
+        dst: &mut Vec<u8>,
+    ) -> Result<(), StoreError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "SharedStorageNode::read_segment_stored_bytes_into",
+            "pg_id={} segment_vid={} stored_size={} k={} m={}",
+            req.shard_pg_id,
+            req.segment_vid.get(),
+            req.stored_size,
+            req.ec.k,
+            req.ec.m
+        );
+        let k = req.ec.k as usize;
+        let padded = req.stored_size.div_ceil(k) * k;
+        let shard_size = padded / k;
+
+        if shard_size == 0 {
+            dst.clear();
+            return Ok(());
+        }
+
+        if self.try_read_segment_stored_bytes_direct_into(req, dst)? {
+            return Ok(());
+        }
+
+        self.read_segment_stored_bytes_recovery_into(req, dst)
+    }
+
+    fn try_read_segment_stored_bytes_direct_into(
+        &self,
+        req: SegmentStoredBytesRequest,
+        dst: &mut Vec<u8>,
+    ) -> Result<bool, StoreError> {
+        let Some(expected_crc64) = req.segment_crc64 else {
+            return Ok(false);
+        };
+
+        let k = req.ec.k as usize;
+        let padded = req.stored_size.div_ceil(k) * k;
+        let shard_size = padded / k;
+        dst.resize(padded, 0);
+        for shard_index in 0..k {
+            let shard_key =
+                ShardKey::new(&req.segment_okh, req.segment_vid.get(), shard_index as u8);
+            let start = shard_index * shard_size;
+            let end = start + shard_size;
+            match self.read_shard_file_into(req.shard_pg_id, &shard_key, &mut dst[start..end]) {
+                Ok(()) => {}
+                Err(StoreError::PgNotFound { pg_id }) => {
+                    return Err(StoreError::PgNotFound { pg_id });
+                }
+                Err(_) => return Ok(false),
+            }
+        }
+
+        dst.truncate(req.stored_size);
+        let actual_crc64 = checksum::crc64::checksum(dst);
+        if actual_crc64 != expected_crc64 {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn read_segment_stored_bytes_recovery_into(
+        &self,
+        req: SegmentStoredBytesRequest,
+        dst: &mut Vec<u8>,
+    ) -> Result<(), StoreError> {
+        let k = req.ec.k as usize;
+        let m = req.ec.m as usize;
+        let padded = req.stored_size.div_ceil(k) * k;
+        let shard_size = padded / k;
+        let all_shards = self.load_segment_shards_for_recovery(
+            req.shard_pg_id,
+            &req.segment_okh,
+            req.segment_vid,
+            req.ec.k,
+            req.ec.m,
+        )?;
+
+        let mut recovered = None;
+        let mut recovered_ranges = vec![None; k];
+
+        if !(0..k).all(|i| all_shards[i].is_some()) {
+            let missing_needed: Vec<usize> = (0..k).filter(|&i| all_shards[i].is_none()).collect();
+
+            let present_indices: Vec<usize> =
+                (0..(k + m)).filter(|&i| all_shards[i].is_some()).collect();
+            let present_refs: Vec<&[u8]> = present_indices
+                .iter()
+                .map(|&i| all_shards[i].as_ref().unwrap().as_slice())
+                .collect();
+
+            let state = self.ec_write_state(req.ec)?;
+            let recovered_len = missing_needed.len() * shard_size;
+            let mut scratch = state.scratch.checkout(recovered_len);
+            let recovered_buf = scratch.as_mut_slice(recovered_len);
+            let mut output_refs: Vec<&mut [u8]> = recovered_buf
+                .chunks_exact_mut(shard_size)
+                .take(missing_needed.len())
+                .collect();
+
+            state
+                .codec
+                .reconstruct(
+                    &present_indices,
+                    &present_refs,
+                    &missing_needed,
+                    &mut output_refs,
+                )
+                .map_err(|error| StoreError::ErasureCoding {
+                    context: "reconstruct segment shards",
+                    reason: error.to_string(),
+                })?;
+
+            for (slot, &missing_idx) in missing_needed.iter().enumerate() {
+                let start = slot * shard_size;
+                recovered_ranges[missing_idx] = Some((start, start + shard_size));
+            }
+            recovered = Some((scratch, recovered_len));
+        }
+
+        dst.clear();
+        dst.reserve(padded);
+        for (idx, shard) in all_shards.iter().take(k).enumerate() {
+            if let Some(shard) = shard.as_ref() {
+                dst.extend_from_slice(shard);
+            } else if let Some((start, end)) = recovered_ranges[idx] {
+                let (scratch, recovered_len) = recovered.as_ref().unwrap();
+                dst.extend_from_slice(&scratch.as_slice(*recovered_len)[start..end]);
+            } else {
+                unreachable!("missing reconstructed shard for data index {idx}");
+            }
+        }
+        dst.truncate(req.stored_size);
+        if let Some(expected_crc64) = req.segment_crc64 {
+            let actual_crc64 = checksum::crc64::checksum(dst);
+            if actual_crc64 != expected_crc64 {
+                return Err(StoreError::IntegrityError {
+                    expected: expected_crc64,
+                    actual: actual_crc64,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Load enough live shards for a segment to support recovery while keeping
     /// PG access, shard status checks, and quarantine handling internal to
     /// storage.
-    pub fn load_segment_shards_for_recovery(
+    fn load_segment_shards_for_recovery(
         &self,
         shard_pg_id: u32,
         segment_okh: &[u8; 16],
@@ -1540,7 +1684,7 @@ impl EncodeScratchPool {
         }
     }
 
-    fn checkout(&self, required_len: usize) -> EncodeScratch<'_> {
+    fn checkout(self: &Arc<Self>, required_len: usize) -> EncodeScratch {
         let mut cached = self.cached.lock().unwrap();
         let maybe_idx = cached.iter().rposition(|buf| buf.len() >= required_len);
         let mut buf = maybe_idx.map_or_else(
@@ -1556,7 +1700,7 @@ impl EncodeScratchPool {
             buf.resize(required_len, 0);
         }
         EncodeScratch {
-            pool: self,
+            pool: Arc::clone(self),
             buf: Some(buf),
         }
     }
@@ -1567,7 +1711,7 @@ impl EncodeScratchPool {
     }
 }
 
-impl EncodeScratch<'_> {
+impl EncodeScratch {
     fn as_mut_slice(&mut self, len: usize) -> &mut [u8] {
         debug_assert!(len <= self.buf.as_ref().unwrap().len());
         &mut self.buf.as_mut().unwrap()[..len]
@@ -1579,7 +1723,7 @@ impl EncodeScratch<'_> {
     }
 }
 
-impl Drop for EncodeScratch<'_> {
+impl Drop for EncodeScratch {
     fn drop(&mut self) {
         let Some(buf) = self.buf.take() else {
             return;
@@ -2408,7 +2552,7 @@ mod tests {
         let ec = EcShape { k: 4, m: 2 };
         let segment_okh = [0xAA; 16];
 
-        assert_eq!(node.test_ec_write_scratch_allocation_count(ec), 0);
+        assert_eq!(node.test_ec_scratch_allocation_count(ec), 0);
 
         let written_a = node
             .write_stream_segment_shards(
@@ -2419,7 +2563,7 @@ mod tests {
                 ec,
             )
             .unwrap();
-        assert_eq!(node.test_ec_write_scratch_allocation_count(ec), 1);
+        assert_eq!(node.test_ec_scratch_allocation_count(ec), 1);
 
         let written_b = node
             .write_stream_segment_shards(
@@ -2430,7 +2574,7 @@ mod tests {
                 ec,
             )
             .unwrap();
-        assert_eq!(node.test_ec_write_scratch_allocation_count(ec), 1);
+        assert_eq!(node.test_ec_scratch_allocation_count(ec), 1);
 
         for written in written_a.iter().chain(written_b.iter()) {
             assert_eq!(
@@ -2438,6 +2582,52 @@ mod tests {
                 written.ack.stored_size
             );
         }
+    }
+
+    #[test]
+    fn shared_node_read_segment_stored_bytes_into_recovers_missing_data_shard() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        let ec = EcShape { k: 4, m: 2 };
+        let segment_okh = [0xAB; 16];
+        let segment_vid = GenerationId::new(1).unwrap();
+        let data = b"recovery-check-segment";
+        let written = node
+            .write_stream_segment_shards(0, &segment_okh, segment_vid, data, ec)
+            .unwrap();
+        assert_eq!(node.test_ec_scratch_allocation_count(ec), 1);
+        let written_pairs: Vec<(ShardKey, WriteAck)> = written
+            .iter()
+            .map(|written| {
+                (
+                    written.key.clone(),
+                    WriteAck {
+                        crc64: written.ack.crc64,
+                        stored_size: written.ack.stored_size,
+                    },
+                )
+            })
+            .collect();
+        node.test_register_written_shards(0, &written_pairs)
+            .unwrap();
+        node.test_delete_shards(0, &[written[0].key.clone()])
+            .unwrap();
+
+        let mut buf = Vec::new();
+        node.read_segment_stored_bytes_into(
+            SegmentStoredBytesRequest {
+                shard_pg_id: 0,
+                segment_okh,
+                segment_vid,
+                stored_size: data.len(),
+                segment_crc64: Some(checksum::crc64::checksum(data)),
+                ec,
+            },
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(buf, data);
+        assert_eq!(node.test_ec_scratch_allocation_count(ec), 1);
     }
 
     #[test]
