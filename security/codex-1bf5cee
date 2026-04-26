@@ -1,7 +1,7 @@
 Fast-path cache can briefly bypass newly added bucket policy
 Link: https://chatgpt.com/codex/cloud/security/findings/9f930a0ae7f481918597cf6545cb2312?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
 Criticality: medium (attack path: medium)
-Status: open
+Status: resolved
 
 # Metadata
 Repo: justincormack/argmin
@@ -16,29 +16,43 @@ Introduced a race condition where object reads can bypass a newly added bucket p
 The commit changes load_bucket_handle_for_object_policy_read to return a LoadedBucketHandle based solely on the in-memory fast-path cache when bucket_policy_present is false. Because put_bucket_policy writes the policy to storage and only afterward updates the fast-path cache, there is a TOCTOU window where object read requests (GetObject/HeadObject/GetObjectAttributes) can still use the stale fast-path entry and skip loading the newly stored policy. During this window, access is decided by ACLs alone, potentially allowing reads that the new policy should deny.
 
 # Current assessment
-Reviewed against the current tree on 23/04/2026. The finding remains valid.
+Reviewed against the current tree on 26/04/2026. The original finding is now
+resolved.
 
-The specific fast-path shortcut is still present:
+What changed:
 
-- `load_bucket_handle_for_object_policy_read(...)` still returns a synthetic
-  loaded bucket handle when the bucket fast path says
-  `bucket_policy_present == false`
-- `cached_bucket_policy_for_loaded_handle(...)` still treats that handle as
-  having no policy and returns `None`
-- `put_bucket_policy(...)` still writes the policy to storage before refreshing
-  the bucket fast-path entry
+- the generic object-read fast path described in this finding no longer exists
+  for non-`BOE` buckets
+- `GetObject` / `HeadObject` / `GetObjectAttributes` only use the cache-backed
+  path for `BucketOwnerEnforced` buckets
+- the shared coordinator-layer BOE cache now carries a persisted
+  `bucket_execution_generation` freshness key
+- same-process bucket mutations publish the new generation immediately
+- a background watcher updates locally known generations for remote mutations
+- stale or deleted bucket entries reload or evict before they can authorize a
+  read as fresh
 
-So there is still a stale-cache window where object reads can authorize from
-ACLs alone immediately after a newly added deny policy is stored.
+So the specific stale `bucket_policy_present == false` bypass window described
+here is gone: object reads no longer trust an old generic fast-path summary
+through a newly added bucket policy in the way this finding depended on.
 
-This is now considered a fast-path correctness issue rather than a storage
-boundary issue. Resolution is deferred to Phase 10 of
-`plans/coordinator-storage-capability-plan.md`, which now explicitly covers
-fast-path freshness for bucket-policy-dependent object reads and the decision
-whether this local behavior should be immediate or intentionally async to match
-AWS.
+What remains is an explicit eventual-consistency propagation window for the BOE
+read cache:
 
-# Validation
+- same-process bucket mutations publish the new execution generation
+  immediately after the storage transaction commits
+- other processes/hosts observe remote mutations asynchronously via the bucket
+  fast-path watcher
+- in non-test builds that watcher polls at a fixed 1000ms interval
+
+This means BOE reads are intentionally not synchronized against bucket-policy
+changes at commit time. That matches the current design goal and accepted AWS
+model for stale bucket-state visibility, and it is not the same bug as the old
+generic fast-path policy bypass. If we want a separate finding for the accepted
+eventual-propagation window, it should be tracked independently with that scope
+rather than by keeping this original stale-summary bypass open.
+
+# Historical validation
 ## Rubric
 - [x] Build server-core in debug and run a targeted PoC test to check object read behavior with stale fast-path cache.
 - [x] Verify `load_bucket_handle_for_object_policy_read` early-returns when `bucket_policy_present` is false (authz.rs:1673-1705).
@@ -47,6 +61,15 @@ AWS.
 - [x] Verify `put_bucket_policy` writes to storage before fast-path update (bucket.rs:764-789).
 ## Report
 Built the debug test target (`cargo test -p server-core --no-run`). Added a targeted PoC test `object_read_denied_policy_can_be_bypassed_when_fast_path_is_stale` in `core_tests.rs` (lines 4896-4934) that: creates a bucket/object, warms the fast-path, installs an explicit deny policy, confirms `HeadObject` is denied when policy is present, then forces the fast-path cache to `bucket_policy_present=false` via `update_bucket_fast_path_if_present` and retries the read. Running `cargo test -p server-core object_read_denied_policy_can_be_bypassed_when_fast_path_is_stale -- --nocapture` panics with `expected AccessDenied with stale fast-path, got Ok(HeadObjectResult { ... size: 4 ... })`, showing the read succeeds despite the deny policy (test output in artifact). Code evidence: `load_bucket_handle_for_object_policy_read` returns early when fast-path says no policy (authz.rs:1673-1705), and `authorize_object_read` uses this loader (authz.rs:4517-4538). `cached_bucket_policy_for_loaded_handle` also short-circuits to `None` when `bucket_policy_present` is false (authz.rs:733-760), so the policy is never loaded. `put_bucket_policy` writes the policy then updates the fast-path cache (bucket.rs:764-789), creating the stale-cache window. Valgrind was not installed; ASan attempt failed due to non-nightly compiler. Debugger attempt used lldb to run the failing test (same panic, no stack since process exited).
+
+# Resolution validation
+- the generic object-read fast path used by the PoC has been removed for
+  non-BOE buckets
+- BOE reads now use a shared coordinator-layer cache keyed by complete fast-path
+  entries rather than a summary with `bucket_policy_present == false`
+- that cache is freshness-gated by persisted `bucket_execution_generation`
+- stale or deleted entries reload or evict before they can authorize a BOE read
+  as fresh
 
 # Evidence
 /workspace/argmin/crates/server-core/src/coordinator/authz.rs (L1673 to 1704)

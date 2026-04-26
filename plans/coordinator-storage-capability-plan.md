@@ -1438,7 +1438,8 @@ This review should cover at least:
   - specifically to confirm they continue using real bucket snapshots rather
     than to force them onto the cache-backed path prematurely
 - bucket-policy-dependent reads
-- the open fast-path freshness issue tracked in `security/codex-1bf5cee`
+  - the original stale-policy bypass tracked in `security/codex-1bf5cee` is
+    resolved by the BOE-only cache scope plus generation-tracked pull freshness
 - bucket ABAC-enabled paths
 - modern ownership-controls/Public Access Block configurations
 - legacy ACL-dependent paths, specifically to decide where full bucket snapshot
@@ -1467,7 +1468,7 @@ Acceptance criteria:
 - the intended hot-path priority order is written down explicitly
 - the revalidation contract is written down explicitly
   - including the freshness token used
-  - the maximum intended local propagation window
+  - the maximum intended remote propagation window
   - and the requirement that hot-path revalidation avoids bucket-lock or
     queue-based waiting
 - the sequencing of the remaining Phase 10 cleanup is written down explicitly:
@@ -1540,6 +1541,12 @@ This gives:
 - eventual cross-process / cross-host coherence
 - no synchronous storage check on BOE read hits
 
+This eventual remote-propagation window is intentional. The BOE read fast path
+is not designed to synchronously observe bucket-policy or other bucket-metadata
+mutations at commit time, and that accepted staleness window should be modeled
+as part of the cache contract rather than treated as the old stale-summary
+bypass bug.
+
 The intended implementation order is:
 
 1. add persisted `bucket_execution_generation` to bucket metadata and include it
@@ -1561,6 +1568,7 @@ Current landing shape:
   removing the cached entry
 - a background watcher polls only cached buckets, batches them by bucket PG,
   and updates locally known generations from authoritative storage metadata
+  - current non-test watcher interval: 1000ms
 - BOE read hits compare materialized generation against locally known
   generation and reload from a real snapshot only when stale
 
