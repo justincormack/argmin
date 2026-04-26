@@ -2907,7 +2907,6 @@ fn complete_multipart_upload_does_not_deadlock_when_bucket_policy_shares_pg() {
         None,
     )
     .unwrap();
-    admin.clear_bucket_policy_cache(&trusted_bucket_name(bucket));
 
     let key = find_key_with_object_pg_eq_bucket_pg(&admin, bucket, "same-pg");
 

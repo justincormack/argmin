@@ -89,7 +89,6 @@ pub(super) struct AuthorizedPutBucketAbac {
 pub(super) struct AuthorizedPutBucketPolicy {
     pub(super) bucket: BucketName,
     pub(super) body: String,
-    pub(super) parsed_policy: Arc<BucketPolicy>,
     pub(super) policy_is_public: bool,
 }
 

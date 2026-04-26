@@ -356,7 +356,6 @@ impl Coordinator {
         Ok(Self {
             storage_node,
             shared_caches,
-            bucket_policy_cache: RwLock::new(HashMap::new()),
             bucket_lifecycle_cache: RwLock::new(HashMap::new()),
             ec_codec,
             ec_config,

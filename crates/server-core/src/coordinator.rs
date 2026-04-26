@@ -35,7 +35,6 @@ use storage::{
     StoredObject, StreamUploadTarget, UploadId, UploadState, UPLOAD_ID_LEN,
 };
 
-use self::authz::CachedBucketPolicy;
 use self::authz_results::*;
 pub use self::authz_types::{
     ActiveWriteEncryption, ActiveWriteEncryptionRef, AuthorizedPutObjectWrite,
@@ -191,17 +190,41 @@ struct BucketFastPathCache {
 #[derive(Debug)]
 struct BucketFastPathCacheEntry {
     info: storage::BucketFastPathInfo,
+    parsed_policy: Option<Arc<auth::BucketPolicy>>,
     known_generation: AtomicU64,
     last_used_tick: AtomicU64,
 }
 
 impl BucketFastPathCacheEntry {
-    fn new(info: storage::BucketFastPathInfo, known_generation: u64, last_used_tick: u64) -> Self {
-        Self {
+    fn parse_policy(
+        info: &storage::BucketFastPathInfo,
+    ) -> Result<Option<Arc<auth::BucketPolicy>>, ServerError> {
+        match &info.policy {
+            storage::BucketFastPathPolicy::Absent => Ok(None),
+            storage::BucketFastPathPolicy::Loaded(policy) => auth::parse_bucket_policy(policy)
+                .map(Arc::new)
+                .map(Some)
+                .map_err(|e| ServerError::InternalError {
+                    reason: format!(
+                        "stored bucket policy for {} failed to parse at cache insert time: {}",
+                        info.name,
+                        e.reason()
+                    ),
+                }),
+        }
+    }
+
+    fn new(
+        info: storage::BucketFastPathInfo,
+        known_generation: u64,
+        last_used_tick: u64,
+    ) -> Result<Self, ServerError> {
+        Ok(Self {
+            parsed_policy: Self::parse_policy(&info)?,
             known_generation: AtomicU64::new(known_generation),
             info,
             last_used_tick: AtomicU64::new(last_used_tick),
-        }
+        })
     }
 
     fn record_hit(&self, tick: u64) {
@@ -266,7 +289,22 @@ impl BucketFastPathCache {
             .map(BucketFastPathCacheEntry::is_fresh)
     }
 
-    fn insert(&mut self, info: storage::BucketFastPathInfo) {
+    fn parsed_policy_if_fresh(
+        &self,
+        bucket: &BucketName,
+        bucket_policy_generation: u64,
+    ) -> Option<Arc<auth::BucketPolicy>> {
+        let entry = self.entries.get(bucket)?;
+        if !(entry.is_fresh()
+            && entry.info.bucket_policy_present
+            && entry.info.bucket_policy_generation == bucket_policy_generation)
+        {
+            return None;
+        }
+        entry.parsed_policy.as_ref().cloned()
+    }
+
+    fn insert(&mut self, info: storage::BucketFastPathInfo) -> Result<(), ServerError> {
         let tick = self.next_tick();
         let bucket = info.name.clone();
         let (known_generation, last_used_tick) = self
@@ -282,11 +320,10 @@ impl BucketFastPathCache {
                 )
             })
             .unwrap_or((info.bucket_execution_generation, tick));
-        self.entries.insert(
-            bucket,
-            BucketFastPathCacheEntry::new(info, known_generation, last_used_tick),
-        );
+        let entry = BucketFastPathCacheEntry::new(info, known_generation, last_used_tick)?;
+        self.entries.insert(bucket, entry);
         self.evict_if_needed();
+        Ok(())
     }
 
     fn remove(&mut self, bucket: &BucketName) {
@@ -393,7 +430,6 @@ fn spawn_bucket_fast_path_watcher(
 pub struct Coordinator {
     storage_node: Arc<SharedStorageNode>,
     shared_caches: Arc<CoordinatorSharedCaches>,
-    bucket_policy_cache: RwLock<HashMap<BucketName, CachedBucketPolicy>>,
     bucket_lifecycle_cache: RwLock<HashMap<BucketName, CachedBucketLifecycle>>,
     ec_codec: Arc<ErasureCodec>,
     ec_config: EcConfig,
@@ -426,8 +462,20 @@ impl Coordinator {
         read_rwlock_unpoisoned(&self.shared_caches.bucket_fast_path).get_if_fresh(bucket)
     }
 
-    pub(super) fn upsert_bucket_fast_path(&self, info: storage::BucketFastPathInfo) {
-        write_rwlock_unpoisoned(&self.shared_caches.bucket_fast_path).insert(info);
+    pub(super) fn parsed_bucket_fast_path_policy_if_fresh(
+        &self,
+        bucket: &BucketName,
+        bucket_policy_generation: u64,
+    ) -> Option<Arc<auth::BucketPolicy>> {
+        read_rwlock_unpoisoned(&self.shared_caches.bucket_fast_path)
+            .parsed_policy_if_fresh(bucket, bucket_policy_generation)
+    }
+
+    pub(super) fn upsert_bucket_fast_path(
+        &self,
+        info: storage::BucketFastPathInfo,
+    ) -> Result<(), ServerError> {
+        write_rwlock_unpoisoned(&self.shared_caches.bucket_fast_path).insert(info)
     }
 
     pub(super) fn remove_bucket_fast_path(&self, bucket: &BucketName) {
@@ -484,7 +532,9 @@ mod bucket_fast_path_cache_tests {
             panic!("poison bucket fast path lock");
         }));
 
-        write_rwlock_unpoisoned(&shared.bucket_fast_path).insert(bucket_fast_path_info("bucket"));
+        write_rwlock_unpoisoned(&shared.bucket_fast_path)
+            .insert(bucket_fast_path_info("bucket"))
+            .unwrap();
         assert_eq!(
             read_rwlock_unpoisoned(&shared.bucket_fast_path)
                 .get(&trusted_bucket_name("bucket"))
@@ -503,15 +553,19 @@ mod bucket_fast_path_cache_tests {
         let mut cache = BucketFastPathCache::default();
 
         for idx in 0..BUCKET_FAST_PATH_MAX_ENTRIES {
-            cache.insert(bucket_fast_path_info(&format!("bucket-{idx:04}")));
+            cache
+                .insert(bucket_fast_path_info(&format!("bucket-{idx:04}")))
+                .unwrap();
         }
 
         assert!(cache.get(&trusted_bucket_name("bucket-0000")).is_some());
 
-        cache.insert(bucket_fast_path_info(&format!(
-            "bucket-{:04}",
-            BUCKET_FAST_PATH_MAX_ENTRIES
-        )));
+        cache
+            .insert(bucket_fast_path_info(&format!(
+                "bucket-{:04}",
+                BUCKET_FAST_PATH_MAX_ENTRIES
+            )))
+            .unwrap();
 
         assert!(cache.get(&trusted_bucket_name("bucket-0000")).is_some());
         assert!(cache.get(&trusted_bucket_name("bucket-0001")).is_none());
@@ -527,12 +581,12 @@ mod bucket_fast_path_cache_tests {
     fn shared_bucket_fast_path_insert_preserves_newer_known_generation() {
         let mut cache = BucketFastPathCache::default();
         let bucket = trusted_bucket_name("bucket");
-        cache.insert(bucket_fast_path_info("bucket"));
+        cache.insert(bucket_fast_path_info("bucket")).unwrap();
         cache.observe_known_generation(&bucket, 7);
 
         let mut reloaded = bucket_fast_path_info("bucket");
         reloaded.bucket_execution_generation = 6;
-        cache.insert(reloaded);
+        cache.insert(reloaded).unwrap();
 
         assert_eq!(cache.is_fresh(&bucket), Some(false));
         let cached = cache.get(&bucket).expect("bucket should remain cached");

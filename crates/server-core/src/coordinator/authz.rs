@@ -66,13 +66,13 @@ use super::request_types::{
 #[cfg(test)]
 use super::response_types::GetObjectAclResult;
 use super::response_types::{BucketSummary, GetBucketAclResult, ModernBucketSummary};
+use super::Coordinator;
 #[cfg(test)]
 use super::{
     maybe_run_bucket_policy_fast_path_hook, maybe_run_bucket_policy_storage_load_hook,
     maybe_run_bucket_write_handle_loaded_hook, should_probe_delete_object_lookup,
     should_probe_multipart_complete_auth_lookup, should_probe_object_read_snapshot,
 };
-use super::{read_rwlock_unpoisoned, write_rwlock_unpoisoned, Coordinator};
 use crate::error::ServerError;
 use crate::sse::{SseCustomerRequest, SseCustomerSegmentScope};
 
@@ -178,12 +178,6 @@ struct ObjectPolicyEvaluationContext<'a> {
     action: auth::PolicyAction,
     policy_context: PutObjectPolicyContext<'a>,
     policy: &'a auth::BucketPolicy,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct CachedBucketPolicy {
-    pub(super) generation: u64,
-    pub(super) policy: Arc<auth::BucketPolicy>,
 }
 
 #[cfg(test)]
@@ -885,16 +879,9 @@ impl Coordinator {
                 }
             })?),
             None => {
-                self.clear_bucket_policy_cache(&bucket.name);
                 return Ok(None);
             }
         };
-
-        self.cache_bucket_policy(
-            &bucket.name,
-            bucket.bucket_policy_generation,
-            Arc::clone(&parsed_policy),
-        );
         Ok(Some(parsed_policy))
     }
 
@@ -923,17 +910,8 @@ impl Coordinator {
                     }
                 })?)
             }
-            LoadedBucketValue::Missing | LoadedBucketValue::NotRequested => {
-                self.clear_bucket_policy_cache(&bucket_summary.name);
-                return Ok(None);
-            }
+            LoadedBucketValue::Missing | LoadedBucketValue::NotRequested => return Ok(None),
         };
-
-        self.cache_bucket_policy(
-            &bucket_summary.name,
-            bucket_summary.bucket_policy_generation,
-            Arc::clone(&parsed_policy),
-        );
         Ok(Some(parsed_policy))
     }
 
@@ -944,25 +922,7 @@ impl Coordinator {
         if !bucket.bucket_policy_present {
             return None;
         }
-
-        let cached = read_rwlock_unpoisoned(&self.bucket_policy_cache)
-            .get(&bucket.name)
-            .cloned()?;
-        (cached.generation == bucket.bucket_policy_generation).then_some(cached.policy)
-    }
-
-    pub(super) fn cache_bucket_policy(
-        &self,
-        bucket: &BucketName,
-        generation: u64,
-        policy: Arc<auth::BucketPolicy>,
-    ) {
-        write_rwlock_unpoisoned(&self.bucket_policy_cache)
-            .insert(bucket.clone(), CachedBucketPolicy { generation, policy });
-    }
-
-    pub(super) fn clear_bucket_policy_cache(&self, bucket: &BucketName) {
-        write_rwlock_unpoisoned(&self.bucket_policy_cache).remove(bucket);
+        self.parsed_bucket_fast_path_policy_if_fresh(&bucket.name, bucket.bucket_policy_generation)
     }
 
     fn load_bucket_tags_for_policy_action(
@@ -2095,7 +2055,7 @@ impl Coordinator {
         let bucket_is_boe =
             Self::is_bucket_owner_enforced(snapshot.bucket.ownership_controls.as_ref());
         if bucket_is_boe {
-            self.upsert_bucket_fast_path((&snapshot).into());
+            self.upsert_bucket_fast_path((&snapshot).into())?;
         } else {
             self.remove_bucket_fast_path(bucket);
         }
@@ -3291,7 +3251,6 @@ impl Coordinator {
         Ok(AuthorizedPutBucketPolicy {
             bucket: req.bucket.name_typed().clone(),
             body: normalized_policy,
-            parsed_policy: Arc::new(parsed_policy),
             policy_is_public,
         })
     }

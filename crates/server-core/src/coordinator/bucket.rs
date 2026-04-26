@@ -302,7 +302,6 @@ impl Coordinator {
             .begin_bucket_delete(&name)
             .map_err(Self::map_bucket_write_drain_error)?;
         self.remove_bucket_fast_path(&name);
-        self.clear_bucket_policy_cache(&name);
         self.clear_bucket_lifecycle_cache(&name);
         self.read_runtime()
             .enqueue_bucket_delete_finalize_for(&name);
@@ -684,11 +683,6 @@ impl Coordinator {
             },
         )?;
         self.clear_bucket_fast_path(&info);
-        self.cache_bucket_policy(
-            &authorized.bucket,
-            info.bucket_policy_generation,
-            Arc::clone(&authorized.parsed_policy),
-        );
         Ok(())
     }
 
@@ -727,7 +721,6 @@ impl Coordinator {
         let authorized = self.authorize_delete_bucket_policy(req)?;
         let info = self.remove_authorized_bucket_subresource(&authorized)?;
         self.clear_bucket_fast_path(&info);
-        self.clear_bucket_policy_cache(&authorized.bucket);
         Ok(())
     }
 

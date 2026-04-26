@@ -3535,7 +3535,6 @@ fn put_object_bucket_policy_same_pg_completes_without_deadlock() {
         None,
     )
     .unwrap();
-    coord.clear_bucket_policy_cache(&trusted_bucket_name(bucket));
 
     let version_id = run_same_pg_probe_test(
         bucket,
@@ -3955,7 +3954,6 @@ fn put_bucket_lifecycle_bucket_policy_same_pg_completes_without_deadlock() {
         None,
     )
     .unwrap();
-    coord.clear_bucket_policy_cache(&trusted_bucket_name(bucket));
 
     run_same_pg_probe_test(
         bucket,
@@ -3999,7 +3997,6 @@ fn put_bucket_acl_bucket_policy_same_pg_completes_without_deadlock() {
         None,
     )
     .unwrap();
-    coord.clear_bucket_policy_cache(&trusted_bucket_name(bucket));
 
     run_same_pg_probe_test(
         bucket,
@@ -4035,7 +4032,6 @@ fn get_object_bucket_policy_same_pg_completes_without_deadlock() {
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket-get-object-policy-same-pg/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
             test_helpers::requester("owner-a"), None)
         .unwrap();
-    admin.clear_bucket_policy_cache(&trusted_bucket_name(bucket));
     test_helpers::put_object(
         &admin,
         &PutObjectRequest {
@@ -4101,7 +4097,6 @@ fn get_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObjectTagging","Resource":"arn:aws:s3:::bucket-get-object-tagging-policy-same-pg/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
             test_helpers::requester("owner-a"), None)
         .unwrap();
-    admin.clear_bucket_policy_cache(&trusted_bucket_name(bucket));
     let tags_xml =
         "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>";
     test_helpers::put_object(
@@ -4187,7 +4182,6 @@ fn put_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
         None,
     )
     .unwrap();
-    coord.clear_bucket_policy_cache(&trusted_bucket_name(bucket));
 
     run_same_pg_probe_test(
         bucket,
@@ -4271,7 +4265,6 @@ fn get_object_retention_bucket_policy_same_pg_completes_without_deadlock() {
         None,
     )
     .unwrap();
-    admin.clear_bucket_policy_cache(&trusted_bucket_name(bucket));
 
     let fetched = run_same_pg_probe_test(
         bucket,
@@ -4351,7 +4344,6 @@ fn delete_object_object_lock_bucket_policy_same_pg_completes_without_deadlock() 
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"owner-a"},"Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::bucket-delete-object-lock-policy-same-pg/*"}]}"#,
             owner_requester.clone(), None)
         .unwrap();
-    admin.clear_bucket_policy_cache(&trusted_bucket_name(bucket));
 
     let err = run_same_pg_probe_test(
         bucket,
