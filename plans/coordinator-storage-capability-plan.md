@@ -1221,6 +1221,13 @@ Current guidance for this phase:
       read miss path should populate it
     - bucket mutations should remove cached entries rather than downgrading
       them to summary-only forms
+    - the next cleanup step after this first landing should be:
+      - move ownership of the BOE read fast-path cache out of `storage` and
+        into a process-shared `server-core` cache structure
+      - this keeps cache policy in the coordinator layer, where later parsed
+        policy/lifecycle representations can live without layering problems
+      - but do this before folding additional parsed state into the cache
+        rather than at the same time
     - the first structural refactor inside this slice should be an explicit
       standalone "modern auth" decision seam for object reads:
       - `Allow`
@@ -1293,6 +1300,14 @@ Current guidance for this phase:
     - target: comfortably under 1 second in normal operation
     - the design should not introduce extra waiting just to refresh bucket
       cache state
+  - the next concrete implementation step should be to switch the BOE read
+    cache from mutation-driven push invalidation toward pull freshness:
+    - BOE reads should check a cheap freshness token before trusting a cached
+      entry
+    - bucket mutation paths should stop carrying most cache-maintenance logic
+      once pull freshness is in place
+    - this pull-freshness step should happen before any attempt to merge the
+      parsed policy/lifecycle caches into the same cache structure
 - fast-path design should be driven by the hottest request families first
   - highest priority:
     - `GetObject`
@@ -1368,6 +1383,9 @@ The main questions are:
 - whether the cache should continue to allow partially populated entries at all
   or should instead require that every cache hit be a complete BOE read
   execution context
+- whether cache ownership should live in `server-core` rather than `storage`
+  now that the remaining planned cache expansions are parsed coordinator-layer
+  representations rather than raw storage metadata
 - which additional bucket state should live in the fast path for correctness or
   performance on those hot paths
   - especially bucket tags when bucket ABAC is enabled
@@ -1389,6 +1407,12 @@ The main questions are:
   - and, regardless of the allowed propagation window, how that freshness check
     is performed without introducing bucket-lock reacquisition or queue waits
     on the object read/head hot paths
+- whether the existing parsed bucket policy and parsed lifecycle caches should
+  be merged into the same shared coordinator-layer cache after the pull
+  freshness model is in place
+  - specifically, this merge should be deferred until after:
+    - the cache has moved to `server-core`
+    - BOE reads use pull freshness rather than mutation-driven push invalidation
 - whether any existing fast-path reads should be narrowed because they weaken
   the request-scoped snapshot contract
 - how lifecycle-derived response-header behavior on hot paths should be served
@@ -1425,6 +1449,11 @@ Acceptance criteria:
   - count-bounded
   - recency-based
   - no byte-weighted sizing yet
+- the intended ownership layer of the BOE read fast-path cache is written down
+  explicitly
+  - short term: move it from `storage` to a process-shared `server-core` cache
+  - later: only then consider merging parsed policy/lifecycle caches into that
+    shared coordinator-layer cache
 - the intended post-refactor fast-path contract is written down explicitly
 - the intended hot-path priority order is written down explicitly
 - the revalidation contract is written down explicitly
@@ -1432,6 +1461,11 @@ Acceptance criteria:
   - the maximum intended local propagation window
   - and the requirement that hot-path revalidation avoids bucket-lock or
     queue-based waiting
+- the sequencing of the remaining Phase 10 cleanup is written down explicitly:
+  1. move cache ownership to shared `server-core`
+  2. implement cheap pull freshness for BOE reads
+  3. only then evaluate folding parsed policy/lifecycle caches into the same
+     shared cache structure
 - any additional bucket state added to the fast path is justified by hot-path
   need and pinned by tests
 - BOE read fast-path entries are populated in one canonical way from a real
