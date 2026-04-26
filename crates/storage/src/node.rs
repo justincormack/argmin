@@ -417,18 +417,6 @@ impl BucketFastPathCache {
         self.evict_if_needed();
     }
 
-    fn update_if_present(
-        &mut self,
-        bucket: &BucketName,
-        update: impl FnOnce(&mut BucketFastPathInfo),
-    ) {
-        let tick = self.next_tick();
-        if let Some(entry) = self.entries.get_mut(bucket) {
-            update(&mut entry.info);
-            entry.last_used_tick.store(tick, Ordering::Relaxed);
-        }
-    }
-
     fn remove(&mut self, bucket: &BucketName) {
         self.entries.remove(bucket);
     }
@@ -552,15 +540,6 @@ impl SharedStorageNode {
     /// Insert or replace the cached active-bucket fast-path metadata.
     pub fn upsert_bucket_fast_path(&self, info: BucketFastPathInfo) {
         write_rwlock_unpoisoned(&self.bucket_fast_path).insert(info);
-    }
-
-    /// Mutate the cached fast-path metadata if present.
-    pub fn update_bucket_fast_path_if_present(
-        &self,
-        bucket: &BucketName,
-        update: impl FnOnce(&mut BucketFastPathInfo),
-    ) {
-        write_rwlock_unpoisoned(&self.bucket_fast_path).update_if_present(bucket, update);
     }
 
     /// Remove cached fast-path metadata for `bucket`.
@@ -1621,11 +1600,11 @@ mod tests {
             bucket_policy_present: false,
             bucket_policy_public: false,
             bucket_policy_generation: 0,
-            policy: crate::types::LoadedBucketSubresource::Missing,
+            policy: crate::types::BucketFastPathPolicy::Absent,
             bucket_lifecycle_present: false,
             bucket_lifecycle_generation: 0,
             bucket_abac_enabled: false,
-            tags: crate::types::LoadedBucketSubresource::NotRequested,
+            tags: crate::types::BucketFastPathTags::NotApplicable,
             encryption: crate::types::EffectiveBucketEncryptionConfig::default(),
         }
     }

@@ -1462,12 +1462,20 @@ fn delete_bucket_does_not_wait_for_bucket_lock() {
 }
 
 #[test]
-fn head_object_lazily_populates_bucket_fast_path() {
+fn head_object_lazily_populates_bucket_fast_path_for_boe_bucket() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
+    put_bucket_ownership_controls_test(
+        &coord,
+        "bucket",
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        test_requester(),
+        None,
+    )
+    .unwrap();
     let key = find_key_with_object_pg_ne_bucket_pg(&coord, "bucket", "head-fast");
     test_helpers::put_object(
         &coord,
@@ -1513,7 +1521,7 @@ fn head_object_lazily_populates_bucket_fast_path() {
     let cached = coord
         .storage_node
         .get_bucket_fast_path(&trusted_bucket_name("bucket"))
-        .expect("head_object should repopulate bucket fast path");
+        .expect("head_object should populate BOE bucket fast path");
     assert_eq!(cached.name.as_str(), "bucket");
     assert_eq!(cached.state, BucketState::Active);
 }
@@ -1798,14 +1806,14 @@ fn head_object_does_not_wait_for_bucket_pg_when_boe_policy_and_abac_tags_fast_pa
 
     let cached = storage_node
         .get_bucket_fast_path(&trusted_bucket_name(bucket))
-        .expect("head_object should repopulate policy/tag fast path");
+        .expect("head_object should populate policy/tag fast path");
     assert!(matches!(
         cached.policy,
-        storage::LoadedBucketSubresource::Loaded(_)
+        storage::BucketFastPathPolicy::Loaded(_)
     ));
     assert!(matches!(
         cached.tags,
-        storage::LoadedBucketSubresource::Loaded(_)
+        storage::BucketFastPathTags::Loaded(_)
     ));
 
     let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
@@ -1865,17 +1873,13 @@ fn head_object_does_not_wait_for_bucket_pg_when_boe_policy_and_abac_tags_fast_pa
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
         })
         .unwrap();
-    let cached = storage_node
+    assert!(storage_node
         .get_bucket_fast_path(&trusted_bucket_name(bucket))
-        .expect("bucket fast path should still exist after tag mutation");
-    assert!(matches!(
-        cached.tags,
-        storage::LoadedBucketSubresource::NotRequested
-    ));
+        .is_none());
 }
 
 #[test]
-fn head_object_falls_back_to_storage_load_when_boe_bucket_policy_body_is_not_warm() {
+fn head_object_reloads_after_boe_policy_mutation_clears_fast_path() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-head-policy-cold-fallback";
     let pg_ids: Vec<u32> = (0..4).collect();
@@ -1935,10 +1939,21 @@ fn head_object_falls_back_to_storage_load_when_boe_bucket_policy_body_is_not_war
             cond: NO_READ,
         })
         .unwrap();
-    let info = storage_node
-        .head_bucket_info(&trusted_bucket_name(bucket))
-        .unwrap();
-    storage_node.upsert_bucket_fast_path((&info).into());
+    assert!(storage_node
+        .get_bucket_fast_path(&trusted_bucket_name(bucket))
+        .is_some());
+
+    put_bucket_policy_test(
+        &admin,
+        bucket,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket-head-policy-cold-fallback/*"}]}"#,
+        test_requester(),
+        None,
+    )
+    .unwrap();
+    assert!(storage_node
+        .get_bucket_fast_path(&trusted_bucket_name(bucket))
+        .is_none());
 
     let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -1978,25 +1993,63 @@ fn put_bucket_tags_invalidates_warm_fast_path_tags() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-put-tags-invalidates-fast-path";
     let coord = setup_coordinator(tmp.path());
+    let owner_account = "111122223333";
+    let owner_requester = test_helpers::requester(owner_account);
 
     coord
-        .create_bucket_for_owner("default-owner", bucket, false)
+        .create_bucket_for_owner(owner_account, bucket, false)
         .unwrap();
+    put_bucket_ownership_controls_test(
+        &coord,
+        bucket,
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        owner_requester.clone(),
+        None,
+    )
+    .unwrap();
     coord
         .put_bucket_tags(&PutBucketConfigRequest {
-            bucket: bucket_request_with_expected_owner(bucket, test_requester(), None),
+            bucket: bucket_request_with_expected_owner(bucket, owner_requester.clone(), None),
             config:
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
         })
         .unwrap();
+    coord
+        .put_bucket_abac(&PutBucketAbacRequest {
+            bucket: bucket_request_with_expected_owner(bucket, owner_requester.clone(), None),
+            enabled: true,
+        })
+        .unwrap();
+    let key = find_key_with_object_pg_ne_bucket_pg(&coord, bucket, "put-tags-invalidates");
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(bucket, &key, owner_requester.clone(), None),
+            data: b"data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
 
     coord
-        .bucket_handle_loader()
-        .load_bucket(
-            &trusted_bucket_name(bucket),
-            None,
-            BucketHandleRequest::new().requiring_bucket_tags(),
-        )
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                &key,
+                None,
+                owner_requester.clone(),
+                None,
+            ),
+            cond: NO_READ,
+        })
         .unwrap();
 
     let cached = coord
@@ -2005,25 +2058,24 @@ fn put_bucket_tags_invalidates_warm_fast_path_tags() {
         .expect("bucket fast path should be populated");
     assert!(matches!(
         cached.tags,
-        storage::LoadedBucketSubresource::Loaded(_)
+        storage::BucketFastPathTags::Loaded(_)
     ));
 
     coord
-        .put_bucket_tags(&PutBucketConfigRequest {
-            bucket: bucket_request_with_expected_owner(bucket, test_requester(), None),
+        .put_bucket_tags_for_tag_resource(&PutBucketTagControlRequest {
+            control: BucketTagControlRequest {
+                bucket: bucket_request_with_expected_owner(bucket, owner_requester, None),
+                account_id: owner_account,
+            },
             config:
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
         })
         .unwrap();
 
-    let cached = coord
+    assert!(coord
         .storage_node
         .get_bucket_fast_path(&trusted_bucket_name(bucket))
-        .expect("bucket fast path should still exist");
-    assert!(matches!(
-        cached.tags,
-        storage::LoadedBucketSubresource::NotRequested
-    ));
+        .is_none());
 }
 
 #[test]

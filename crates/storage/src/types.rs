@@ -2027,12 +2027,44 @@ pub struct BucketFastPathInfo {
     pub bucket_policy_present: bool,
     pub bucket_policy_public: bool,
     pub bucket_policy_generation: u64,
-    pub policy: LoadedBucketSubresource<String>,
+    pub policy: BucketFastPathPolicy,
     pub bucket_lifecycle_present: bool,
     pub bucket_lifecycle_generation: u64,
     pub bucket_abac_enabled: bool,
-    pub tags: LoadedBucketSubresource<String>,
+    pub tags: BucketFastPathTags,
     pub encryption: EffectiveBucketEncryptionConfig,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum BucketFastPathPolicy {
+    Absent,
+    Loaded(String),
+}
+
+impl std::fmt::Debug for BucketFastPathPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent => f.write_str("Absent"),
+            Self::Loaded(_) => f.write_str("Loaded(<redacted>)"),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum BucketFastPathTags {
+    NotApplicable,
+    Missing,
+    Loaded(String),
+}
+
+impl std::fmt::Debug for BucketFastPathTags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotApplicable => f.write_str("NotApplicable"),
+            Self::Missing => f.write_str("Missing"),
+            Self::Loaded(_) => f.write_str("Loaded(<redacted>)"),
+        }
+    }
 }
 
 impl std::fmt::Debug for BucketFastPathInfo {
@@ -2110,64 +2142,6 @@ impl Default for EffectiveBucketEncryptionConfig {
     }
 }
 
-impl From<BucketInfo> for BucketFastPathInfo {
-    fn from(info: BucketInfo) -> Self {
-        Self {
-            name: info.name,
-            owner_principal: info.owner_principal,
-            owner_canonical_id: info.owner_canonical_id,
-            created_at: info.created_at,
-            state: info.state,
-            versioning: info.versioning,
-            object_lock: info.object_lock,
-            public_access_block: info.public_access_block,
-            ownership_controls: info.ownership_controls,
-            bucket_policy_present: info.bucket_policy_present,
-            bucket_policy_public: info.bucket_policy_public,
-            bucket_policy_generation: info.bucket_policy_generation,
-            policy: if info.bucket_policy_present {
-                LoadedBucketSubresource::NotRequested
-            } else {
-                LoadedBucketSubresource::Missing
-            },
-            bucket_lifecycle_present: info.bucket_lifecycle_present,
-            bucket_lifecycle_generation: info.bucket_lifecycle_generation,
-            bucket_abac_enabled: info.bucket_abac_enabled,
-            tags: LoadedBucketSubresource::NotRequested,
-            encryption: info.encryption,
-        }
-    }
-}
-
-impl From<&BucketInfo> for BucketFastPathInfo {
-    fn from(info: &BucketInfo) -> Self {
-        Self {
-            name: info.name.clone(),
-            owner_principal: info.owner_principal.clone(),
-            owner_canonical_id: info.owner_canonical_id.clone(),
-            created_at: info.created_at,
-            state: info.state,
-            versioning: info.versioning,
-            object_lock: info.object_lock,
-            public_access_block: info.public_access_block,
-            ownership_controls: info.ownership_controls,
-            bucket_policy_present: info.bucket_policy_present,
-            bucket_policy_public: info.bucket_policy_public,
-            bucket_policy_generation: info.bucket_policy_generation,
-            policy: if info.bucket_policy_present {
-                LoadedBucketSubresource::NotRequested
-            } else {
-                LoadedBucketSubresource::Missing
-            },
-            bucket_lifecycle_present: info.bucket_lifecycle_present,
-            bucket_lifecycle_generation: info.bucket_lifecycle_generation,
-            bucket_abac_enabled: info.bucket_abac_enabled,
-            tags: LoadedBucketSubresource::NotRequested,
-            encryption: info.encryption,
-        }
-    }
-}
-
 impl From<&BucketSnapshot> for BucketFastPathInfo {
     fn from(snapshot: &BucketSnapshot) -> Self {
         Self {
@@ -2183,11 +2157,22 @@ impl From<&BucketSnapshot> for BucketFastPathInfo {
             bucket_policy_present: snapshot.bucket.bucket_policy_present,
             bucket_policy_public: snapshot.bucket.bucket_policy_public,
             bucket_policy_generation: snapshot.bucket.bucket_policy_generation,
-            policy: snapshot.policy.clone(),
+            policy: match &snapshot.policy {
+                LoadedBucketSubresource::Loaded(policy) => {
+                    BucketFastPathPolicy::Loaded(policy.clone())
+                }
+                LoadedBucketSubresource::Missing | LoadedBucketSubresource::NotRequested => {
+                    BucketFastPathPolicy::Absent
+                }
+            },
             bucket_lifecycle_present: snapshot.bucket.bucket_lifecycle_present,
             bucket_lifecycle_generation: snapshot.bucket.bucket_lifecycle_generation,
             bucket_abac_enabled: snapshot.bucket.bucket_abac_enabled,
-            tags: snapshot.tags.clone(),
+            tags: match &snapshot.tags {
+                LoadedBucketSubresource::Loaded(tags) => BucketFastPathTags::Loaded(tags.clone()),
+                LoadedBucketSubresource::Missing => BucketFastPathTags::Missing,
+                LoadedBucketSubresource::NotRequested => BucketFastPathTags::NotApplicable,
+            },
             encryption: snapshot.bucket.encryption,
         }
     }
@@ -3168,10 +3153,32 @@ mod tests {
         assert!(!debug.contains("secret-policy"));
         assert!(!debug.contains("<LifecycleConfiguration>secret</LifecycleConfiguration>"));
 
-        let fast_debug = format!("{:?}", BucketFastPathInfo::from(&info));
+        let fast_debug = format!(
+            "{:?}",
+            BucketFastPathInfo {
+                name: info.name.clone(),
+                owner_principal: info.owner_principal.clone(),
+                owner_canonical_id: info.owner_canonical_id.clone(),
+                created_at: info.created_at,
+                state: info.state,
+                versioning: info.versioning,
+                object_lock: info.object_lock,
+                public_access_block: info.public_access_block,
+                ownership_controls: info.ownership_controls,
+                bucket_policy_present: info.bucket_policy_present,
+                bucket_policy_public: info.bucket_policy_public,
+                bucket_policy_generation: info.bucket_policy_generation,
+                policy: BucketFastPathPolicy::Loaded("secret-policy".to_string()),
+                bucket_lifecycle_present: info.bucket_lifecycle_present,
+                bucket_lifecycle_generation: info.bucket_lifecycle_generation,
+                bucket_abac_enabled: info.bucket_abac_enabled,
+                tags: BucketFastPathTags::Loaded("secret-tags".to_string()),
+                encryption: info.encryption,
+            }
+        );
         assert!(fast_debug.contains(r#""own\ner""#));
         assert!(!fast_debug.contains("secret-policy"));
-        assert!(!fast_debug.contains("secret"));
+        assert!(!fast_debug.contains("secret-tags"));
     }
 
     #[test]

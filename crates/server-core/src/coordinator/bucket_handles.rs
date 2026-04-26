@@ -359,9 +359,6 @@ impl<'a> BucketHandleLoader<'a> {
         expected_bucket_owner: Option<&str>,
         request: BucketHandleRequest,
     ) -> Result<LoadedBucketHandle, ServerError> {
-        self.coordinator
-            .storage_node
-            .upsert_bucket_fast_path((&snapshot).into());
         let bucket = Coordinator::validate_expected_bucket_owner(
             Coordinator::bucket_summary(snapshot.bucket),
             expected_bucket_owner,

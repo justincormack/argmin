@@ -40,11 +40,8 @@ impl Coordinator {
         }
     }
 
-    fn refresh_bucket_fast_path_if_present(&self, info: &storage::BucketInfo) {
-        self.storage_node
-            .update_bucket_fast_path_if_present(&info.name, |cached| {
-                *cached = info.into();
-            });
+    fn clear_bucket_fast_path(&self, bucket: &storage::BucketName) {
+        self.storage_node.remove_bucket_fast_path(bucket);
     }
 
     fn map_bucket_write_drain_error(err: storage::BucketWriteDrainError) -> ServerError {
@@ -188,7 +185,7 @@ impl Coordinator {
             .storage_node
             .put_bucket_abac_enabled_and_load_info(&bucket, enabled)
             .map_err(Self::map_bucket_snapshot_load_error)?;
-        self.refresh_bucket_fast_path_if_present(&info);
+        self.clear_bucket_fast_path(&info.name);
         Ok(())
     }
 
@@ -240,8 +237,7 @@ impl Coordinator {
             })
             .map_err(Self::map_bucket_snapshot_load_error)?
         {
-            storage::node::BucketCreateAttemptOutcome::Created(info) => {
-                self.storage_node.upsert_bucket_fast_path((&info).into());
+            storage::node::BucketCreateAttemptOutcome::Created(_info) => {
                 Ok(BucketCreateOutcome::Created)
             }
             storage::node::BucketCreateAttemptOutcome::Exists(existing) => match existing.state {
@@ -374,7 +370,7 @@ impl Coordinator {
                 },
                 other => Self::map_bucket_snapshot_load_error(other),
             })?;
-        self.refresh_bucket_fast_path_if_present(&info);
+        self.clear_bucket_fast_path(&info.name);
         Ok(())
     }
 
@@ -420,7 +416,7 @@ impl Coordinator {
             .storage_node
             .put_bucket_object_lock_and_load_info(&authorized.bucket, authorized.config)
             .map_err(Self::map_bucket_snapshot_load_error)?;
-        self.refresh_bucket_fast_path_if_present(&info);
+        self.clear_bucket_fast_path(&info.name);
         Ok(())
     }
 
@@ -454,7 +450,7 @@ impl Coordinator {
             .storage_node
             .put_bucket_encryption_and_load_info(&authorized.bucket, authorized.config)
             .map_err(Self::map_bucket_snapshot_load_error)?;
-        self.refresh_bucket_fast_path_if_present(&info);
+        self.clear_bucket_fast_path(&info.name);
         Ok(())
     }
 
@@ -487,7 +483,7 @@ impl Coordinator {
                 BucketEncryptionConfig::default(),
             )
             .map_err(Self::map_bucket_snapshot_load_error)?;
-        self.refresh_bucket_fast_path_if_present(&info);
+        self.clear_bucket_fast_path(&info.name);
         Ok(())
     }
 
@@ -551,7 +547,7 @@ impl Coordinator {
         );
         let authorized = self.authorize_put_bucket_tagging(req)?;
         let info = self.store_authorized_bucket_subresource(&authorized)?;
-        self.refresh_bucket_fast_path_if_present(&info);
+        self.clear_bucket_fast_path(&info.name);
         Ok(())
     }
 
@@ -575,7 +571,7 @@ impl Coordinator {
         );
         let authorized = self.authorize_delete_bucket_tagging(req)?;
         let info = self.remove_authorized_bucket_subresource(&authorized)?;
-        self.refresh_bucket_fast_path_if_present(&info);
+        self.clear_bucket_fast_path(&info.name);
         Ok(())
     }
 
@@ -616,7 +612,7 @@ impl Coordinator {
                 aux: storage::BucketSubresourceAux::None,
             },
         )?;
-        self.refresh_bucket_fast_path_if_present(&info);
+        self.clear_bucket_fast_path(&info.name);
         Ok(())
     }
 
@@ -636,7 +632,7 @@ impl Coordinator {
                 bucket: authorized.bucket,
                 kind: storage::BucketSubresourceKind::Tagging,
             })?;
-        self.refresh_bucket_fast_path_if_present(&info);
+        self.clear_bucket_fast_path(&info.name);
         Ok(())
     }
 
@@ -653,7 +649,7 @@ impl Coordinator {
             .storage_node
             .put_bucket_abac_enabled_and_load_info(&authorized.bucket, authorized.enabled)
             .map_err(Self::map_bucket_snapshot_load_error)?;
-        self.refresh_bucket_fast_path_if_present(&info);
+        self.clear_bucket_fast_path(&info.name);
         Ok(())
     }
 
@@ -685,7 +681,7 @@ impl Coordinator {
                 aux: storage::BucketSubresourceAux::policy(authorized.policy_is_public),
             },
         )?;
-        self.refresh_bucket_fast_path_if_present(&info);
+        self.clear_bucket_fast_path(&info.name);
         self.cache_bucket_policy(
             &authorized.bucket,
             info.bucket_policy_generation,
@@ -728,7 +724,7 @@ impl Coordinator {
         );
         let authorized = self.authorize_delete_bucket_policy(req)?;
         let info = self.remove_authorized_bucket_subresource(&authorized)?;
-        self.refresh_bucket_fast_path_if_present(&info);
+        self.clear_bucket_fast_path(&info.name);
         self.clear_bucket_policy_cache(&authorized.bucket);
         Ok(())
     }
@@ -766,7 +762,7 @@ impl Coordinator {
                 aux: storage::BucketSubresourceAux::None,
             },
         )?;
-        self.refresh_bucket_fast_path_if_present(&info);
+        self.clear_bucket_fast_path(&info.name);
         self.cache_bucket_lifecycle(
             &authorized.bucket,
             info.bucket_lifecycle_generation,
@@ -798,7 +794,7 @@ impl Coordinator {
         );
         let authorized = self.authorize_delete_bucket_lifecycle(req)?;
         let info = self.remove_authorized_bucket_subresource(&authorized)?;
-        self.refresh_bucket_fast_path_if_present(&info);
+        self.clear_bucket_fast_path(&info.name);
         self.clear_bucket_lifecycle_cache(&authorized.bucket);
         Ok(())
     }
@@ -819,7 +815,7 @@ impl Coordinator {
             .storage_node
             .put_bucket_public_access_block_and_load_info(&authorized.bucket, authorized.config)
             .map_err(Self::map_bucket_snapshot_load_error)?;
-        self.refresh_bucket_fast_path_if_present(&info);
+        self.clear_bucket_fast_path(&info.name);
         Ok(())
     }
 
@@ -852,7 +848,7 @@ impl Coordinator {
             .storage_node
             .delete_bucket_public_access_block_and_load_info(&authorized.bucket)
             .map_err(Self::map_bucket_snapshot_load_error)?;
-        self.refresh_bucket_fast_path_if_present(&info);
+        self.clear_bucket_fast_path(&info.name);
         Ok(())
     }
 
@@ -872,7 +868,7 @@ impl Coordinator {
             .storage_node
             .put_bucket_ownership_controls_and_load_info(&authorized.bucket, authorized.config)
             .map_err(Self::map_bucket_snapshot_load_error)?;
-        self.refresh_bucket_fast_path_if_present(&info);
+        self.clear_bucket_fast_path(&info.name);
         Ok(())
     }
 
@@ -905,7 +901,7 @@ impl Coordinator {
             .storage_node
             .delete_bucket_ownership_controls_and_load_info(&authorized.bucket)
             .map_err(Self::map_bucket_snapshot_load_error)?;
-        self.refresh_bucket_fast_path_if_present(&info);
+        self.clear_bucket_fast_path(&info.name);
         Ok(())
     }
 
@@ -971,7 +967,7 @@ impl Coordinator {
                 authorized.public_write,
             )
             .map_err(Self::map_bucket_snapshot_load_error)?;
-        self.refresh_bucket_fast_path_if_present(&info);
+        self.clear_bucket_fast_path(&info.name);
         Ok(())
     }
 

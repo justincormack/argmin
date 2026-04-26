@@ -8,9 +8,8 @@ use s3_types::{
 };
 use storage::{
     BucketName, BucketObjectLockConfig, BucketObjectOwnership, BucketOwnershipControls,
-    BucketState, LoadedBucketSubresource, ManagedEncryptionAlgorithm, MultipartUploadRecord,
-    ObjectKey, ObjectReadSnapshotMode, OwnerIdentity, PublicAccessBlockConfig, StoredObject,
-    UploadState,
+    BucketState, ManagedEncryptionAlgorithm, MultipartUploadRecord, ObjectKey,
+    ObjectReadSnapshotMode, OwnerIdentity, PublicAccessBlockConfig, StoredObject, UploadState,
 };
 
 use super::authz_results::{
@@ -2048,34 +2047,22 @@ impl Coordinator {
             Self::ensure_expected_bucket_owner_modern(&bucket_info, expected_bucket_owner)?;
 
             if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_ref()) {
-                if !bucket_info.bucket_policy_present {
-                    #[cfg(test)]
-                    maybe_run_bucket_policy_fast_path_hook(bucket.as_str());
-                    return Ok(LoadedBucketHandle::new(
-                        Self::bucket_summary_for_boe_modern_fast_path(bucket_info),
-                        request,
-                        LoadedBucketValue::NotRequested,
-                        LoadedBucketValue::NotRequested,
-                        LoadedBucketValue::NotRequested,
-                        LoadedBucketValue::NotRequested,
-                    ));
-                }
-
                 let cached_policy = match &info.policy {
-                    LoadedBucketSubresource::Loaded(policy) => {
+                    storage::BucketFastPathPolicy::Absent => Some(LoadedBucketValue::Missing),
+                    storage::BucketFastPathPolicy::Loaded(policy) => {
                         Some(LoadedBucketValue::Loaded(policy.clone()))
                     }
-                    LoadedBucketSubresource::Missing | LoadedBucketSubresource::NotRequested => {
-                        None
-                    }
                 };
-                let cached_tags = match (&info.tags, info.bucket_abac_enabled) {
-                    (_, false) => Some(LoadedBucketValue::NotRequested),
-                    (LoadedBucketSubresource::Loaded(tags), true) => {
-                        Some(LoadedBucketValue::Loaded(tags.clone()))
+                let cached_tags = if info.bucket_abac_enabled {
+                    match &info.tags {
+                        storage::BucketFastPathTags::Loaded(tags) => {
+                            Some(LoadedBucketValue::Loaded(tags.clone()))
+                        }
+                        storage::BucketFastPathTags::Missing => Some(LoadedBucketValue::Missing),
+                        storage::BucketFastPathTags::NotApplicable => None,
                     }
-                    (LoadedBucketSubresource::Missing, true) => Some(LoadedBucketValue::Missing),
-                    (LoadedBucketSubresource::NotRequested, true) => None,
+                } else {
+                    Some(LoadedBucketValue::NotRequested)
                 };
 
                 if let (Some(policy), Some(tags)) = (cached_policy, cached_tags) {
@@ -2095,8 +2082,18 @@ impl Coordinator {
 
         #[cfg(test)]
         maybe_run_bucket_policy_storage_load_hook(bucket.as_str());
+        let snapshot = self
+            .storage_node
+            .load_bucket_snapshot(bucket, request.resolve_to_storage_request())
+            .map_err(BucketHandleLoader::map_bucket_snapshot_error)?;
+        let bucket_is_boe =
+            Self::is_bucket_owner_enforced(snapshot.bucket.ownership_controls.as_ref());
+        if bucket_is_boe {
+            self.storage_node
+                .upsert_bucket_fast_path((&snapshot).into());
+        }
         self.bucket_handle_loader()
-            .load_bucket(bucket, expected_bucket_owner, request)
+            .load_bucket_handle_from_snapshot(snapshot, expected_bucket_owner, request)
     }
 
     pub(super) fn with_bucket_write_handle_for<R, T>(

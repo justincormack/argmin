@@ -1209,9 +1209,18 @@ Current guidance for this phase:
     request families that currently fall back once bucket policy is present or
     ABAC bucket tags are needed
   - this should be correctness-first:
-    - use fast-path state only when the needed policy/tag inputs are actually
-      warm in cache
-    - otherwise fall back to a real bucket snapshot load
+    - populate the BOE read fast-path entry from a real bucket snapshot on
+      cache miss
+    - if bucket policy is present, the cached entry should carry the policy
+      body
+    - if bucket ABAC is enabled, the cached entry should carry the bucket-tag
+      state needed by the read path
+    - cache hits should therefore be complete BOE read execution-context hits,
+      not partial entries that require later warming/promotion
+    - generic bucket snapshot loads should not seed this cache; only the BOE
+      read miss path should populate it
+    - bucket mutations should remove cached entries rather than downgrading
+      them to summary-only forms
     - the first structural refactor inside this slice should be an explicit
       standalone "modern auth" decision seam for object reads:
       - `Allow`
@@ -1356,6 +1365,9 @@ The main questions are:
 - whether the current cache payload should be narrowed and re-centered around a
   bounded "bucket execution context" for hot modern paths, rather than the
   broader ACL-heavy bucket summary it currently resembles
+- whether the cache should continue to allow partially populated entries at all
+  or should instead require that every cache hit be a complete BOE read
+  execution context
 - which additional bucket state should live in the fast path for correctness or
   performance on those hot paths
   - especially bucket tags when bucket ABAC is enabled
@@ -1422,6 +1434,10 @@ Acceptance criteria:
     queue-based waiting
 - any additional bucket state added to the fast path is justified by hot-path
   need and pinned by tests
+- BOE read fast-path entries are populated in one canonical way from a real
+  bucket snapshot rather than through later warming/promotion
+- bucket mutations remove fast-path entries rather than attempting partial
+  in-place downgrades
 - any request family that uses the fast path preserves the request-scoped
   snapshot guarantees established by the handle model
 - any request family that cannot preserve those guarantees is documented as
