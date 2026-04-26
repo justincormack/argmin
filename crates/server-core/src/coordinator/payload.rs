@@ -31,19 +31,6 @@ pub(super) struct SharedPayloadBuffer {
     buf: Vec<u8>,
 }
 
-pub(super) struct EncodeScratchPool {
-    scratch_len: usize,
-    max_cached: usize,
-    cached: Mutex<Vec<Vec<u8>>>,
-    #[cfg(test)]
-    allocations: std::sync::atomic::AtomicUsize,
-}
-
-pub(super) struct EncodeScratch<'a> {
-    pool: &'a EncodeScratchPool,
-    buf: Option<Vec<u8>>,
-}
-
 impl ReadChunk {
     pub(super) fn from_vec(data: Vec<u8>) -> Self {
         let len = data.len();
@@ -209,66 +196,7 @@ impl Drop for SharedPayloadBuffer {
     }
 }
 
-impl EncodeScratchPool {
-    pub(super) fn new(ec_config: EcConfig) -> Self {
-        let scratch_len = encode_parity_scratch_len(ec_config);
-        let max_cached = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .max(1);
-        Self {
-            scratch_len,
-            max_cached,
-            cached: Mutex::new(Vec::new()),
-            #[cfg(test)]
-            allocations: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-
-    pub(super) fn checkout(&self) -> EncodeScratch<'_> {
-        let buf = lock_mutex_unpoisoned(&self.cached)
-            .pop()
-            .unwrap_or_else(|| {
-                #[cfg(test)]
-                self.allocations.fetch_add(1, Ordering::Relaxed);
-                vec![0u8; self.scratch_len]
-            });
-        EncodeScratch {
-            pool: self,
-            buf: Some(buf),
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn allocation_count(&self) -> usize {
-        self.allocations.load(Ordering::Relaxed)
-    }
-}
-
-impl EncodeScratch<'_> {
-    pub(super) fn as_mut_slice(&mut self, len: usize) -> &mut [u8] {
-        debug_assert!(len <= self.pool.scratch_len);
-        &mut self.buf.as_mut().unwrap()[..len]
-    }
-
-    pub(super) fn as_slice(&self, len: usize) -> &[u8] {
-        debug_assert!(len <= self.pool.scratch_len);
-        &self.buf.as_ref().unwrap()[..len]
-    }
-}
-
-impl Drop for EncodeScratch<'_> {
-    fn drop(&mut self) {
-        let Some(buf) = self.buf.take() else {
-            return;
-        };
-        let mut cached = lock_mutex_unpoisoned(&self.pool.cached);
-        if cached.len() < self.pool.max_cached {
-            cached.push(buf);
-        }
-    }
-}
-
+#[cfg(test)]
 pub(super) fn encode_parity_scratch_len(ec_config: EcConfig) -> usize {
     let k = ec_config.data_shards as usize;
     let m = ec_config.parity_shards as usize;

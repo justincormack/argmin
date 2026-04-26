@@ -23,35 +23,137 @@ enum StaleObjectPayloadMetadata {
 }
 
 impl SharedStorageNode {
+    fn write_erasure_coded_segment_shards(
+        &self,
+        shard_pg_id: u32,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        data: &[u8],
+        ec: EcShape,
+    ) -> Result<Vec<WrittenShardAck>, StoreError> {
+        let state = self.ec_write_state(ec)?;
+        let k = ec.k as usize;
+        let m = ec.m as usize;
+        let remainder = data.len() % k;
+        let mut padded = Vec::new();
+        let shard_source: &[u8] = if remainder == 0 {
+            data
+        } else {
+            padded.reserve_exact(data.len() + (k - remainder));
+            padded.extend_from_slice(data);
+            padded.resize(data.len() + (k - remainder), 0);
+            &padded
+        };
+
+        let shard_size = shard_source.len() / k;
+        let data_shards: Vec<&[u8]> = (0..k)
+            .map(|i| &shard_source[i * shard_size..(i + 1) * shard_size])
+            .collect();
+        let written_shards = if shard_size == 0 {
+            let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| Vec::new()).collect();
+            let mut parity_refs: Vec<&mut [u8]> = parity_bufs
+                .iter_mut()
+                .map(std::vec::Vec::as_mut_slice)
+                .collect();
+            state
+                .codec
+                .encode(&data_shards, &mut parity_refs)
+                .map_err(|error| StoreError::ErasureCoding {
+                    context: "encode segment parity",
+                    reason: error.to_string(),
+                })?;
+
+            let mut shard_batch: Vec<(ShardKey, &[u8])> = Vec::with_capacity(k + m);
+            for (shard_index, shard_payload) in data_shards.iter().enumerate() {
+                shard_batch.push((
+                    ShardKey::new(segment_okh, segment_vid.get(), shard_index as u8),
+                    *shard_payload,
+                ));
+            }
+            for (parity_index, shard_payload) in parity_bufs.iter().enumerate() {
+                shard_batch.push((
+                    ShardKey::new(segment_okh, segment_vid.get(), (k + parity_index) as u8),
+                    shard_payload.as_slice(),
+                ));
+            }
+            self.write_shard_files(shard_pg_id, &shard_batch)?
+        } else {
+            let parity_len = m.checked_mul(shard_size).ok_or(StoreError::ErasureCoding {
+                context: "size parity scratch",
+                reason: "parity scratch length overflow".to_string(),
+            })?;
+            let mut scratch = state.scratch.checkout(parity_len);
+            {
+                let parity = scratch.as_mut_slice(parity_len);
+                let mut parity_refs: Vec<&mut [u8]> = parity.chunks_exact_mut(shard_size).collect();
+                state
+                    .codec
+                    .encode(&data_shards, &mut parity_refs)
+                    .map_err(|error| StoreError::ErasureCoding {
+                        context: "encode segment parity",
+                        reason: error.to_string(),
+                    })?;
+            }
+            let parity = scratch.as_slice(parity_len);
+
+            let mut shard_batch: Vec<(ShardKey, &[u8])> = Vec::with_capacity(k + m);
+            for (shard_index, shard_payload) in data_shards.iter().enumerate() {
+                shard_batch.push((
+                    ShardKey::new(segment_okh, segment_vid.get(), shard_index as u8),
+                    *shard_payload,
+                ));
+            }
+            for (parity_index, shard_payload) in parity.chunks_exact(shard_size).enumerate() {
+                shard_batch.push((
+                    ShardKey::new(segment_okh, segment_vid.get(), (k + parity_index) as u8),
+                    shard_payload,
+                ));
+            }
+            self.write_shard_files(shard_pg_id, &shard_batch)?
+        };
+
+        Ok(written_shards
+            .into_iter()
+            .map(|(key, ack)| WrittenShardAck { key, ack })
+            .collect())
+    }
+
     pub fn write_direct_put_segment_shards(
         &self,
         transient_segment_id: &SessionId,
         segment_index: u32,
         segment_vid: GenerationId,
         segment_okh: &[u8; 16],
-        shard_payloads: &[&[u8]],
+        data: &[u8],
+        ec: EcShape,
     ) -> Result<DirectPutWrittenSegment, StoreError> {
         let shard_pg_id = self.pg_topology.shard_pg(
             &format!("segment/{}", transient_segment_id.as_str()),
             &segment_index.to_string(),
             segment_vid.get(),
         );
-        let mut shard_batch: Vec<(ShardKey, &[u8])> = Vec::with_capacity(shard_payloads.len());
-        for (shard_index, shard_payload) in shard_payloads.iter().enumerate() {
-            shard_batch.push((
-                ShardKey::new(segment_okh, segment_vid.get(), shard_index as u8),
-                *shard_payload,
-            ));
-        }
-        let written_shards = self
-            .write_shard_files(shard_pg_id, &shard_batch)?
-            .into_iter()
-            .map(|(key, ack)| WrittenShardAck { key, ack })
-            .collect();
+        let written_shards = self.write_erasure_coded_segment_shards(
+            shard_pg_id,
+            segment_okh,
+            segment_vid,
+            data,
+            ec,
+        )?;
         Ok(DirectPutWrittenSegment {
             shard_pg_id,
             written_shards,
         })
+    }
+
+    pub fn write_stream_segment_shards(
+        &self,
+        shard_pg_id: u32,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        data: &[u8],
+        ec: EcShape,
+    ) -> Result<Vec<WrittenShardAck>, StoreError> {
+        self.write_erasure_coded_segment_shards(shard_pg_id, segment_okh, segment_vid, data, ec)
     }
 
     pub fn commit_direct_put_object<E>(

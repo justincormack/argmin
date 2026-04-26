@@ -1257,7 +1257,7 @@ impl DataLayout {
 // ── Composite helper types ─────────────────────────────────────────
 
 /// Erasure coding shape (k data shards, m parity shards).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EcShape {
     pub k: u8,
     pub m: u8,

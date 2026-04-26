@@ -130,16 +130,17 @@ impl Coordinator {
             let segment_vid = GenerationId::MIN;
             let storage_bytes = write_encryption.encrypt_segment(segment_index, req.data)?;
 
-            let written_segment =
-                self.with_erasure_coded_shard_payloads(&storage_bytes, |shard_payloads| {
-                    Ok(self.storage_node.write_direct_put_segment_shards(
-                        &transient_segment_id,
-                        segment_index,
-                        segment_vid,
-                        &segment_okh,
-                        shard_payloads,
-                    )?)
-                })?;
+            let written_segment = self.storage_node.write_direct_put_segment_shards(
+                &transient_segment_id,
+                segment_index,
+                segment_vid,
+                &segment_okh,
+                &storage_bytes,
+                EcShape {
+                    k: self.ec_config.data_shards,
+                    m: self.ec_config.parity_shards,
+                },
+            )?;
 
             let system_metadata = Self::object_system_metadata_with_default_checksum(
                 req.system_metadata,

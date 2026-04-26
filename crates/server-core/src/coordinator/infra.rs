@@ -6,7 +6,7 @@ use std::sync::Arc;
 use ec::{EcConfig, ErasureCodec};
 
 use super::authz_types::{AuthorizedPutObjectWrite, ValidatedBucket};
-use super::payload::{EncodeScratchPool, PayloadBufferPool};
+use super::payload::PayloadBufferPool;
 use super::read_core::ReadRuntime;
 use super::request_types::AuthorizePutObjectRequest;
 use super::response_types::{BucketSummary, ModernBucketSummary};
@@ -357,7 +357,6 @@ impl Coordinator {
             shared_caches,
             ec_codec,
             ec_config,
-            encode_scratch_pool: EncodeScratchPool::new(ec_config),
             payload_buffer_pool,
             region,
             sse_c_validator,

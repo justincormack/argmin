@@ -1,12 +1,13 @@
 /// LocalStorageNode and SharedStorageNode — manage multiple PgStores on a single node.
+use ec::{EcConfig, ErasureCodec};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(test, feature = "test-hooks"))]
-use std::sync::{Arc, OnceLock};
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::sync::OnceLock;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 
 use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
@@ -24,9 +25,9 @@ use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 use crate::types::{
     AbortMultipartUploadLookup, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
     BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind,
-    CreateStreamUploadReq, FinalizeStreamPartOutcome, GenerationId, ListMultipartUploadsReq,
-    ListObjectVersionsReq, ListPartsReq, ListedBucketMultipartUploads, ListedBucketObjectVersions,
-    ListedBucketObjects, ListedMultipartParts, LoadedBucketSubresource,
+    CreateStreamUploadReq, EcShape, FinalizeStreamPartOutcome, GenerationId,
+    ListMultipartUploadsReq, ListObjectVersionsReq, ListPartsReq, ListedBucketMultipartUploads,
+    ListedBucketObjectVersions, ListedBucketObjects, ListedMultipartParts, LoadedBucketSubresource,
     MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
     MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, ObjectReadSnapshot,
     ObjectReadSnapshotOutcome, PreparedStreamPartCommit, SessionId, ShardKey, StoredObject,
@@ -55,6 +56,23 @@ mod stream_ops;
 struct PgDataPaths {
     shards_dir: PathBuf,
     tmp_dir: PathBuf,
+}
+
+struct EncodeScratchPool {
+    max_cached: usize,
+    cached: Mutex<Vec<Vec<u8>>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    allocations: std::sync::atomic::AtomicUsize,
+}
+
+struct EncodeScratch<'a> {
+    pool: &'a EncodeScratchPool,
+    buf: Option<Vec<u8>>,
+}
+
+struct StorageEcWriteState {
+    codec: ErasureCodec,
+    scratch: EncodeScratchPool,
 }
 
 pub struct BucketLockGuard<'a> {
@@ -319,6 +337,7 @@ pub struct SharedStorageNode {
     multipart_completion_locks: Vec<Mutex<()>>,
     object_payload_leases: Mutex<HashMap<(BucketName, ObjectKey, GenerationId), usize>>,
     reclaim_queue: (Mutex<ReclaimQueueState>, Condvar),
+    ec_write_states: Mutex<HashMap<EcShape, Arc<StorageEcWriteState>>>,
 }
 
 type ReclaimRoot = (BucketName, ObjectKey, GenerationId);
@@ -413,6 +432,7 @@ impl SharedStorageNode {
                 }),
                 Condvar::new(),
             ),
+            ec_write_states: Mutex::new(HashMap::new()),
         })
     }
 
@@ -432,6 +452,40 @@ impl SharedStorageNode {
 
     pub fn bucket_pg_id_for(&self, bucket: &BucketName) -> u32 {
         self.pg_topology.bucket_pg_for(bucket)
+    }
+
+    fn ec_write_state(&self, shape: EcShape) -> Result<Arc<StorageEcWriteState>, StoreError> {
+        if let Some(existing) = self.ec_write_states.lock().unwrap().get(&shape).cloned() {
+            return Ok(existing);
+        }
+
+        let config =
+            EcConfig::new(shape.k, shape.m).map_err(|error| StoreError::ErasureCoding {
+                context: "build erasure coding config",
+                reason: error.to_string(),
+            })?;
+        let state = Arc::new(StorageEcWriteState {
+            codec: ErasureCodec::new(config).map_err(|error| StoreError::ErasureCoding {
+                context: "build erasure coding codec",
+                reason: error.to_string(),
+            })?,
+            scratch: EncodeScratchPool::new(config),
+        });
+
+        let mut guard = self.ec_write_states.lock().unwrap();
+        Ok(guard
+            .entry(shape)
+            .or_insert_with(|| Arc::clone(&state))
+            .clone())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_ec_write_scratch_allocation_count(&self, shape: EcShape) -> usize {
+        self.ec_write_states
+            .lock()
+            .unwrap()
+            .get(&shape)
+            .map_or(0, |state| state.scratch.allocation_count())
     }
 
     fn bucket_lock_index(&self, bucket: &BucketName) -> usize {
@@ -1472,6 +1526,71 @@ impl SharedStorageNode {
     }
 }
 
+impl EncodeScratchPool {
+    fn new(_: EcConfig) -> Self {
+        let max_cached = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(1);
+        Self {
+            max_cached,
+            cached: Mutex::new(Vec::new()),
+            #[cfg(any(test, feature = "test-hooks"))]
+            allocations: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn checkout(&self, required_len: usize) -> EncodeScratch<'_> {
+        let mut cached = self.cached.lock().unwrap();
+        let maybe_idx = cached.iter().rposition(|buf| buf.len() >= required_len);
+        let mut buf = maybe_idx.map_or_else(
+            || {
+                #[cfg(any(test, feature = "test-hooks"))]
+                self.allocations.fetch_add(1, Ordering::Relaxed);
+                vec![0u8; required_len]
+            },
+            |idx| cached.swap_remove(idx),
+        );
+        drop(cached);
+        if buf.len() < required_len {
+            buf.resize(required_len, 0);
+        }
+        EncodeScratch {
+            pool: self,
+            buf: Some(buf),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn allocation_count(&self) -> usize {
+        self.allocations.load(Ordering::Relaxed)
+    }
+}
+
+impl EncodeScratch<'_> {
+    fn as_mut_slice(&mut self, len: usize) -> &mut [u8] {
+        debug_assert!(len <= self.buf.as_ref().unwrap().len());
+        &mut self.buf.as_mut().unwrap()[..len]
+    }
+
+    fn as_slice(&self, len: usize) -> &[u8] {
+        debug_assert!(len <= self.buf.as_ref().unwrap().len());
+        &self.buf.as_ref().unwrap()[..len]
+    }
+}
+
+impl Drop for EncodeScratch<'_> {
+    fn drop(&mut self) {
+        let Some(buf) = self.buf.take() else {
+            return;
+        };
+        let mut cached = self.pool.cached.lock().unwrap();
+        if cached.len() < self.pool.max_cached {
+            cached.push(buf);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2280,6 +2399,45 @@ mod tests {
         }
         assert_eq!(pg.read_shard(&key_a).unwrap().data, b"hello");
         assert_eq!(pg.read_shard(&key_b).unwrap().data, b"world");
+    }
+
+    #[test]
+    fn shared_node_write_stream_segment_shards_reuses_encode_scratch() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        let ec = EcShape { k: 4, m: 2 };
+        let segment_okh = [0xAA; 16];
+
+        assert_eq!(node.test_ec_write_scratch_allocation_count(ec), 0);
+
+        let written_a = node
+            .write_stream_segment_shards(
+                0,
+                &segment_okh,
+                GenerationId::new(1).unwrap(),
+                b"hello",
+                ec,
+            )
+            .unwrap();
+        assert_eq!(node.test_ec_write_scratch_allocation_count(ec), 1);
+
+        let written_b = node
+            .write_stream_segment_shards(
+                0,
+                &segment_okh,
+                GenerationId::new(2).unwrap(),
+                b"world",
+                ec,
+            )
+            .unwrap();
+        assert_eq!(node.test_ec_write_scratch_allocation_count(ec), 1);
+
+        for written in written_a.iter().chain(written_b.iter()) {
+            assert_eq!(
+                node.read_shard_file(0, &written.key).unwrap().len() as u64,
+                written.ack.stored_size
+            );
+        }
     }
 
     #[test]

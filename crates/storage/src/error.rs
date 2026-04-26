@@ -27,6 +27,12 @@ pub enum StoreError {
         #[source]
         source: rusqlite::Error,
     },
+
+    #[error("erasure coding error: {context}: {reason}")]
+    ErasureCoding {
+        context: &'static str,
+        reason: String,
+    },
 }
 
 /// Metadata-level errors (object records, bucket operations).

@@ -1715,6 +1715,11 @@ Acceptance criteria:
 
 ### Phase 13: Data-Plane EC and Shard IO Ownership
 
+Execution priority note: do this before Phase 11 and Phase 12. Although it is
+numbered later, this is still boundary cleanup work, while Phases 11 and 12
+are primarily performance/memory optimizations on top of the settled
+coordinator/storage boundary.
+
 After the request-shape and test-boundary work, there is still one remaining
 storage concern visible above the storage boundary: coordinator/runtime code
 still owns erasure-coding and shard file IO for the data path.

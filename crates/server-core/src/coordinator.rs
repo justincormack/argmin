@@ -24,10 +24,12 @@ use storage::ObjectEncryption;
 #[cfg(test)]
 use storage::ObjectLockState;
 #[cfg(test)]
+use storage::ShardKey;
+#[cfg(test)]
 use storage::SimplePayloadReclaimRecord;
 #[cfg(test)]
 use storage::{BucketEncryptionConfig, EffectiveBucketEncryptionConfig, ObjectLayout};
-use storage::{BucketName, ObjectKey, ShardKey, SharedStorageNode};
+use storage::{BucketName, ObjectKey, SharedStorageNode};
 #[cfg(test)]
 use storage::{
     BucketObjectLockConfig, BucketOwnershipControls, BucketState, CreateStreamUploadReq, EcShape,
@@ -41,9 +43,9 @@ pub use self::authz_types::{
 };
 #[cfg(test)]
 use self::payload::encode_parity_scratch_len;
+use self::payload::PayloadBufferPool;
 #[cfg(test)]
 use self::payload::SharedPayloadBuffer;
-use self::payload::{EncodeScratchPool, PayloadBufferPool};
 use self::read_core::{
     segment_payloads_from_object_segments, ReadObjectContext, SegmentPayloadRecord,
 };
@@ -170,6 +172,7 @@ const BUCKET_FAST_PATH_WATCH_INTERVAL_MILLIS: u64 = 1000;
 const MAX_LIST_RECORDS: usize = 100_000;
 const S3_MAX_LIST_KEYS: u32 = 1_000;
 
+#[cfg(test)]
 struct WrittenShard {
     key: ShardKey,
     ack: storage::WriteAck,
@@ -431,7 +434,6 @@ pub struct Coordinator {
     shared_caches: Arc<CoordinatorSharedCaches>,
     ec_codec: Arc<ErasureCodec>,
     ec_config: EcConfig,
-    encode_scratch_pool: EncodeScratchPool,
     payload_buffer_pool: Arc<PayloadBufferPool>,
     region: String,
     sse_c_validator: Option<SseCustomerValidatorConfig>,

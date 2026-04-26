@@ -1,15 +1,18 @@
+#[cfg(test)]
+use storage::GenerationId;
 use storage::{
-    BucketName, EcShape, GenerationId, ManagedEncryptionAlgorithm, ObjectEncryption, ObjectKey,
+    BucketName, EcShape, ManagedEncryptionAlgorithm, ObjectEncryption, ObjectKey,
     PrepareStreamUploadSegmentAppendReq, SessionId, ShardKey, StreamUploadTarget,
 };
 
+#[cfg(test)]
+use super::WrittenShard;
 #[cfg(feature = "deep-tracing")]
 use super::INTERNAL_SEGMENT_SIZE;
 #[cfg(test)]
 use super::{maybe_run_stream_append_prepare_hook, trusted_bucket_name, trusted_object_key};
 use super::{
-    ActiveWriteEncryption, BucketSummary, Coordinator, WriteEncryptionRequest, WrittenShard,
-    TRACE_TARGET,
+    ActiveWriteEncryption, BucketSummary, Coordinator, WriteEncryptionRequest, TRACE_TARGET,
 };
 use crate::error::ServerError;
 use crate::pg::stream_segment_key_hash;
@@ -419,60 +422,7 @@ impl Coordinator {
         }
     }
 
-    pub(super) fn with_erasure_coded_shard_payloads<T>(
-        &self,
-        data: &[u8],
-        action: impl FnOnce(&[&[u8]]) -> Result<T, ServerError>,
-    ) -> Result<T, ServerError> {
-        let k = self.ec_config.data_shards as usize;
-        let m = self.ec_config.parity_shards as usize;
-        let remainder = data.len() % k;
-        let mut padded = Vec::new();
-        let shard_source: &[u8] = if remainder == 0 {
-            data
-        } else {
-            padded.reserve_exact(data.len() + (k - remainder));
-            padded.extend_from_slice(data);
-            padded.resize(data.len() + (k - remainder), 0);
-            &padded
-        };
-
-        let shard_size = shard_source.len() / k;
-        let data_shards: Vec<&[u8]> = (0..k)
-            .map(|i| &shard_source[i * shard_size..(i + 1) * shard_size])
-            .collect();
-        if shard_size == 0 {
-            let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| Vec::new()).collect();
-            let mut parity_refs: Vec<&mut [u8]> = parity_bufs
-                .iter_mut()
-                .map(std::vec::Vec::as_mut_slice)
-                .collect();
-            self.ec_codec.encode(&data_shards, &mut parity_refs)?;
-
-            let mut shard_payloads: Vec<&[u8]> = Vec::with_capacity(k + m);
-            shard_payloads.extend(data_shards.iter().copied());
-            shard_payloads.extend(parity_bufs.iter().map(std::vec::Vec::as_slice));
-            action(&shard_payloads)
-        } else {
-            let parity_len =
-                m.checked_mul(shard_size)
-                    .ok_or_else(|| ServerError::InternalError {
-                        reason: "parity scratch length overflow".to_string(),
-                    })?;
-            let mut scratch = self.encode_scratch_pool.checkout();
-            {
-                let parity = scratch.as_mut_slice(parity_len);
-                let mut parity_refs: Vec<&mut [u8]> = parity.chunks_exact_mut(shard_size).collect();
-                self.ec_codec.encode(&data_shards, &mut parity_refs)?;
-            }
-            let parity = scratch.as_slice(parity_len);
-            let mut shard_payloads: Vec<&[u8]> = Vec::with_capacity(k + m);
-            shard_payloads.extend(data_shards.iter().copied());
-            shard_payloads.extend(parity.chunks_exact(shard_size));
-            action(&shard_payloads)
-        }
-    }
-
+    #[cfg(test)]
     pub(super) fn write_segment_shards(
         &self,
         shard_pg_id: u32,
@@ -480,21 +430,24 @@ impl Coordinator {
         segment_vid: GenerationId,
         data: &[u8],
     ) -> Result<Vec<WrittenShard>, ServerError> {
-        self.with_erasure_coded_shard_payloads(data, |shard_payloads| {
-            let mut shard_batch: Vec<(ShardKey, &[u8])> = Vec::with_capacity(shard_payloads.len());
-            for (shard_index, shard_payload) in shard_payloads.iter().enumerate() {
-                shard_batch.push((
-                    ShardKey::new(segment_okh, segment_vid.get(), shard_index as u8),
-                    *shard_payload,
-                ));
-            }
-            Ok(self
-                .storage_node
-                .write_shard_files(shard_pg_id, &shard_batch)?
-                .into_iter()
-                .map(|(key, ack)| WrittenShard { key, ack })
-                .collect())
-        })
+        Ok(self
+            .storage_node
+            .write_stream_segment_shards(
+                shard_pg_id,
+                segment_okh,
+                segment_vid,
+                data,
+                EcShape {
+                    k: self.ec_config.data_shards,
+                    m: self.ec_config.parity_shards,
+                },
+            )?
+            .into_iter()
+            .map(|written| WrittenShard {
+                key: written.key,
+                ack: written.ack,
+            })
+            .collect())
     }
 
     pub(super) fn append_stream_segment_for(
@@ -583,11 +536,15 @@ impl Coordinator {
         #[cfg(test)]
         maybe_run_stream_append_prepare_hook(session_id, segment_index);
 
-        let written_shards = self.write_segment_shards(
+        let written_shards = self.storage_node.write_stream_segment_shards(
             segment_record.shard_pg_id,
             &segment_okh,
             segment_record.segment_vid,
             data,
+            EcShape {
+                k: segment_record.ec_k,
+                m: segment_record.ec_m,
+            },
         )?;
 
         let shard_batch: Vec<(&ShardKey, storage::WriteAck)> = written_shards
