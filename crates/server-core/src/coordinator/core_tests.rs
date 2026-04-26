@@ -1519,7 +1519,7 @@ fn head_object_lazily_populates_bucket_fast_path() {
 }
 
 #[test]
-fn head_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
+fn head_object_waits_for_bucket_pg_when_non_boe_bucket_fast_path_is_warm() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-head-fast-no-pg";
     let pg_ids: Vec<u32> = (0..4).collect();
@@ -1544,6 +1544,106 @@ fn head_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
             tags: None,
             cond: NO_WRITE,
 
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    storage_node.remove_bucket_fast_path(&trusted_bucket_name(bucket));
+    reader
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                &key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+
+    let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let (event_tx, event_rx) = mpsc::channel();
+    let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
+        bucket: Some(bucket.to_string()),
+        before_storage_load: Some(Arc::new(move || {
+            let _ = event_tx.send(LockWaitEvent::Progress);
+        })),
+        after_policy_fast_path_hit: Some(Arc::new(move || {
+            panic!("non-BOE head_object should not use fast bucket path");
+        })),
+    });
+    let bucket_pg = storage_node
+        .test_lock_bucket_pg(&trusted_bucket_name(bucket))
+        .unwrap();
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let res = reader.head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                &key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        });
+        tx.send(res).unwrap();
+    });
+
+    assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
+    assert!(
+        rx.try_recv().is_err(),
+        "head_object returned before bucket pg released"
+    );
+    drop(bucket_pg);
+    let head = rx
+        .recv()
+        .expect("head_object should complete after bucket pg released")
+        .unwrap();
+    assert_eq!(head.size, 4);
+    handle.join().unwrap();
+}
+
+#[test]
+fn head_object_does_not_wait_for_bucket_pg_when_boe_fast_path_is_warm() {
+    let tmp = test_util::tempdir();
+    let bucket = "bucket-head-boe-fast-no-pg";
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+    let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let reader = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+
+    admin
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+    put_bucket_ownership_controls_test(
+        &admin,
+        bucket,
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        test_requester(),
+        None,
+    )
+    .unwrap();
+    let key = find_key_with_object_pg_ne_bucket_pg(&admin, bucket, "head-boe-fast");
+    test_helpers::put_object(
+        &admin,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(bucket, &key, test_requester(), None),
+            data: b"data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
             acl: NO_PUT_OBJECT_ACL.into(),
         },
     )
@@ -1609,7 +1709,7 @@ fn head_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
 }
 
 #[test]
-fn head_object_does_not_wait_for_bucket_pg_when_policy_and_abac_tags_fast_path_is_warm() {
+fn head_object_does_not_wait_for_bucket_pg_when_boe_policy_and_abac_tags_fast_path_is_warm() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-head-policy-abac-fast";
     let pg_ids: Vec<u32> = (0..4).collect();
@@ -1620,6 +1720,14 @@ fn head_object_does_not_wait_for_bucket_pg_when_policy_and_abac_tags_fast_path_i
     admin
         .create_bucket_for_owner("111122223333", bucket, false)
         .unwrap();
+    put_bucket_ownership_controls_test(
+        &admin,
+        bucket,
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
     admin
         .put_bucket_tags(&PutBucketConfigRequest {
             bucket: bucket_request_with_expected_owner(
@@ -1767,7 +1875,7 @@ fn head_object_does_not_wait_for_bucket_pg_when_policy_and_abac_tags_fast_path_i
 }
 
 #[test]
-fn head_object_falls_back_to_storage_load_when_bucket_policy_body_is_not_warm() {
+fn head_object_falls_back_to_storage_load_when_boe_bucket_policy_body_is_not_warm() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-head-policy-cold-fallback";
     let pg_ids: Vec<u32> = (0..4).collect();
@@ -1778,6 +1886,14 @@ fn head_object_falls_back_to_storage_load_when_bucket_policy_body_is_not_warm() 
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
+    put_bucket_ownership_controls_test(
+        &admin,
+        bucket,
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        test_requester(),
+        None,
+    )
+    .unwrap();
     put_bucket_policy_test(
         &admin,
         bucket,

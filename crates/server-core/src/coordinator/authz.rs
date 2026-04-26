@@ -2083,6 +2083,80 @@ impl Coordinator {
             .load_bucket(bucket, expected_bucket_owner, request)
     }
 
+    fn load_bucket_handle_for_modern_object_read(
+        &self,
+        bucket: &BucketName,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<LoadedBucketHandle, ServerError> {
+        let request = BucketHandleRequest::new()
+            .requiring_policy_view()
+            .requiring_bucket_tags_if_abac_enabled();
+
+        if let Some(info) = self.storage_node.get_bucket_fast_path(bucket) {
+            if info.state != BucketState::Active {
+                return Err(ServerError::BucketNotFound {
+                    name: bucket.to_string(),
+                });
+            }
+
+            let bucket_info = Self::validate_expected_bucket_owner(
+                Self::bucket_summary_fast(info.clone()),
+                expected_bucket_owner,
+            )?
+            .into_inner();
+
+            if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_ref()) {
+                if !bucket_info.bucket_policy_present {
+                    #[cfg(test)]
+                    maybe_run_bucket_policy_fast_path_hook(bucket.as_str());
+                    return Ok(LoadedBucketHandle::new(
+                        bucket_info,
+                        request,
+                        LoadedBucketValue::NotRequested,
+                        LoadedBucketValue::NotRequested,
+                        LoadedBucketValue::NotRequested,
+                        LoadedBucketValue::NotRequested,
+                    ));
+                }
+
+                let cached_policy = match &info.policy {
+                    LoadedBucketSubresource::Loaded(policy) => {
+                        Some(LoadedBucketValue::Loaded(policy.clone()))
+                    }
+                    LoadedBucketSubresource::Missing | LoadedBucketSubresource::NotRequested => {
+                        None
+                    }
+                };
+                let cached_tags = match (&info.tags, info.bucket_abac_enabled) {
+                    (_, false) => Some(LoadedBucketValue::NotRequested),
+                    (LoadedBucketSubresource::Loaded(tags), true) => {
+                        Some(LoadedBucketValue::Loaded(tags.clone()))
+                    }
+                    (LoadedBucketSubresource::Missing, true) => Some(LoadedBucketValue::Missing),
+                    (LoadedBucketSubresource::NotRequested, true) => None,
+                };
+
+                if let (Some(policy), Some(tags)) = (cached_policy, cached_tags) {
+                    #[cfg(test)]
+                    maybe_run_bucket_policy_fast_path_hook(bucket.as_str());
+                    return Ok(LoadedBucketHandle::new(
+                        bucket_info,
+                        request,
+                        policy,
+                        tags,
+                        LoadedBucketValue::NotRequested,
+                        LoadedBucketValue::NotRequested,
+                    ));
+                }
+            }
+        }
+
+        #[cfg(test)]
+        maybe_run_bucket_policy_storage_load_hook(bucket.as_str());
+        self.bucket_handle_loader()
+            .load_bucket(bucket, expected_bucket_owner, request)
+    }
+
     pub(super) fn with_bucket_write_handle_for<R, T>(
         &self,
         req: &R,
@@ -4760,7 +4834,7 @@ impl Coordinator {
         req: AuthorizedObjectReadSnapshotRequest<'_>,
     ) -> Result<storage::ObjectReadSnapshot, ServerError> {
         let bucket =
-            self.load_bucket_handle_for_object_policy_read(req.bucket, req.expected_bucket_owner)?;
+            self.load_bucket_handle_for_modern_object_read(req.bucket, req.expected_bucket_owner)?;
         let bucket_info = ValidatedBucket(bucket.bucket().clone());
         let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
