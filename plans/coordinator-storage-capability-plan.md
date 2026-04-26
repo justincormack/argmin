@@ -1262,11 +1262,37 @@ Current guidance for this phase:
   - highest priority:
     - `GetObject`
     - `HeadObject`
+    - `GetObjectAttributes`
+  - the current intended optimized scope is narrower than "all hot paths"
+    - Phase 10 should optimize only the BOE object-read family:
+      - `GetObject`
+      - `HeadObject`
+      - `GetObjectAttributes`
+    - for these request families, cache-backed bucket loading is acceptable
+      because:
+      - ACL semantics are disabled under `BucketOwnerEnforced`
+      - the request does not need bucket state to define write/publication
+        behavior
+      - the authorized bucket summary can be reused for later response shaping
+        such as lifecycle expiration headers
   - second priority:
     - `PutObject`
     - `CreateMultipartUpload`
     - `UploadPart`
     - `CompleteMultipartUpload`
+  - but these write-family operations should not automatically inherit the
+    object-read fast path
+    - `PutObject` and multipart write paths still need a real bucket snapshot
+      for correctness because bucket state affects the meaning of the write:
+      - versioning outcome
+      - default encryption and SSE-C blocking
+      - object-lock validation
+      - ownership-controls behavior
+      - request-scoped policy/tag view tied to the write
+    - a cache-backed precheck may be possible later, but it cannot replace the
+      authoritative bucket write snapshot
+    - `DeleteObject` is intentionally left on the real bucket-load path
+      because it is not hot enough to justify extra fast-path complexity
   - lower-frequency bucket/admin operations do not need to shape the cache
     contract and can continue forcing full bucket snapshot loads if needed
 - the high-performance path should prioritize modern AWS auth/config behavior
@@ -1341,7 +1367,10 @@ The main questions are:
 This review should cover at least:
 
 - ordinary object reads and heads
+- `GetObjectAttributes` as part of the BOE object-read family
 - hot write and multipart initiation/commit paths
+  - specifically to confirm they continue using real bucket snapshots rather
+    than to force them onto the cache-backed path prematurely
 - bucket-policy-dependent reads
 - the open fast-path freshness issue tracked in `security/codex-1bf5cee`
 - bucket ABAC-enabled paths
@@ -1367,6 +1396,13 @@ Acceptance criteria:
   snapshot guarantees established by the handle model
 - any request family that cannot preserve those guarantees is documented as
   requiring a real bucket snapshot load
+- the BOE object-read fast path is explicitly scoped and tested as:
+  - `GetObject`
+  - `HeadObject`
+  - `GetObjectAttributes`
+- write-family and delete-family paths are explicitly documented as remaining
+  on real bucket snapshots unless a later phase proves a cache-backed precheck
+  preserves the same request-scoped guarantees
 - the cache contents are justified primarily by modern auth/config behavior
   rather than by legacy ACL convenience
 - the policy-freshness issue for object reads after `PutBucketPolicy` is
