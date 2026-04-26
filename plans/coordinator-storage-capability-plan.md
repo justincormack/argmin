@@ -1192,6 +1192,12 @@ but production coordinator request code should no longer depend on it.
 
 ### Phase 10: Fast-path Review and Realignment
 
+Status: implementation complete. The BOE object-read fast path, bounded shared
+cache, parsed-policy consolidation, lifecycle cache removal, and pull-freshness
+mechanism have all landed. Remaining follow-on optimization work now belongs to
+Phase 11 (policy residualization) and Phase 12 (lifecycle/smaller derived
+representations).
+
 After the main request-family migrations land, do a deliberate pass over the
 bucket fast path and decide which parts of the bucket-first handle model should
 participate in it.
