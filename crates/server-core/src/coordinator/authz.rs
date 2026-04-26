@@ -3387,8 +3387,8 @@ impl Coordinator {
             auth::PolicyAction::PutLifecycleConfiguration,
             Self::requester_can_bucket_owner_account_admin,
         )?;
-        let parsed_config = s3_types::parse_lifecycle_configuration_xml(req.config.as_bytes())
-            .map_err(|error| match error {
+        s3_types::parse_lifecycle_configuration_xml(req.config.as_bytes()).map_err(|error| {
+            match error {
                 LifecycleConfigError::MalformedXml { reason } => {
                     ServerError::MalformedXML { reason }
                 }
@@ -3401,11 +3401,11 @@ impl Coordinator {
                 LifecycleConfigError::NotImplemented { feature } => {
                     ServerError::NotImplemented { feature }
                 }
-            })?;
+            }
+        })?;
         Ok(AuthorizedPutBucketLifecycle {
             bucket: req.bucket.name_typed().clone(),
             body: req.config.to_string(),
-            parsed_config,
         })
     }
 
@@ -3434,10 +3434,11 @@ impl Coordinator {
         })
     }
 
-    /// Creates an internal authorization token for lifecycle cache fills.
+    /// Creates an internal authorization token for lifecycle state loads.
     ///
     /// This intentionally bypasses request auth because the coordinator is
-    /// loading already-authoritative stored state for cache population.
+    /// loading already-authoritative stored lifecycle state for internal
+    /// lifecycle evaluation such as response-header computation.
     pub(super) fn authorize_load_bucket_lifecycle_for(
         &self,
         name: &BucketName,

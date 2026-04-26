@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use s3_types::{
     parse_account_regional_bucket_name, AccountIdentity, AclGrants, BucketNamespace,
     BucketVersioningState,
@@ -302,7 +300,6 @@ impl Coordinator {
             .begin_bucket_delete(&name)
             .map_err(Self::map_bucket_write_drain_error)?;
         self.remove_bucket_fast_path(&name);
-        self.clear_bucket_lifecycle_cache(&name);
         self.read_runtime()
             .enqueue_bucket_delete_finalize_for(&name);
         Ok(())
@@ -758,11 +755,6 @@ impl Coordinator {
             },
         )?;
         self.clear_bucket_fast_path(&info);
-        self.cache_bucket_lifecycle(
-            &authorized.bucket,
-            info.bucket_lifecycle_generation,
-            Arc::new(authorized.parsed_config),
-        );
         Ok(())
     }
 
@@ -790,7 +782,6 @@ impl Coordinator {
         let authorized = self.authorize_delete_bucket_lifecycle(req)?;
         let info = self.remove_authorized_bucket_subresource(&authorized)?;
         self.clear_bucket_fast_path(&info);
-        self.clear_bucket_lifecycle_cache(&authorized.bucket);
         Ok(())
     }
 

@@ -39,7 +39,6 @@ use self::authz_results::*;
 pub use self::authz_types::{
     ActiveWriteEncryption, ActiveWriteEncryptionRef, AuthorizedPutObjectWrite,
 };
-use self::lifecycle::CachedBucketLifecycle;
 #[cfg(test)]
 use self::payload::encode_parity_scratch_len;
 #[cfg(test)]
@@ -430,7 +429,6 @@ fn spawn_bucket_fast_path_watcher(
 pub struct Coordinator {
     storage_node: Arc<SharedStorageNode>,
     shared_caches: Arc<CoordinatorSharedCaches>,
-    bucket_lifecycle_cache: RwLock<HashMap<BucketName, CachedBucketLifecycle>>,
     ec_codec: Arc<ErasureCodec>,
     ec_config: EcConfig,
     encode_scratch_pool: EncodeScratchPool,

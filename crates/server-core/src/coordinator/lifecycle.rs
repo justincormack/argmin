@@ -1,25 +1,17 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use s3_types::{
     BucketLifecycleConfiguration, LifecycleDate, LifecycleExpiration, LifecycleRule,
     LifecycleRuleStatus, VersionId,
 };
-use storage::{BucketName, StoredObject};
+use storage::StoredObject;
 
 use super::{
     bucket_handles::{LoadedBucketHandle, LoadedBucketValue},
-    read_rwlock_unpoisoned, write_rwlock_unpoisoned, BucketSummary, Coordinator,
-    DeleteMarkerLifecycleExpiration, LifecycleAbortHeaders, LifecycleExpirationHeader,
-    NoncurrentLifecycleExpiration,
+    BucketSummary, Coordinator, DeleteMarkerLifecycleExpiration, LifecycleAbortHeaders,
+    LifecycleExpirationHeader, NoncurrentLifecycleExpiration,
 };
 use crate::error::ServerError;
-
-#[derive(Debug, Clone)]
-pub(super) struct CachedBucketLifecycle {
-    pub(super) generation: u64,
-    pub(super) config: Arc<BucketLifecycleConfiguration>,
-}
 
 impl Coordinator {
     #[cfg(test)]
@@ -36,102 +28,50 @@ impl Coordinator {
     pub(super) fn cached_bucket_lifecycle(
         &self,
         bucket: &BucketSummary,
-    ) -> Result<Option<Arc<BucketLifecycleConfiguration>>, ServerError> {
+    ) -> Result<Option<BucketLifecycleConfiguration>, ServerError> {
         if !bucket.bucket_lifecycle_present {
             return Ok(None);
         }
 
-        if let Some(cached) = read_rwlock_unpoisoned(&self.bucket_lifecycle_cache)
-            .get(&bucket.name)
-            .cloned()
-        {
-            if cached.generation == bucket.bucket_lifecycle_generation {
-                return Ok(Some(cached.config));
-            }
-        }
-
         let authorized = self.authorize_load_bucket_lifecycle_for(&bucket.name);
         let raw_config = self.load_authorized_bucket_subresource(&authorized)?;
-        let parsed_config = match raw_config {
-            Some(config_xml) => Arc::new(
-                s3_types::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(
+        match raw_config {
+            Some(config_xml) => s3_types::parse_lifecycle_configuration_xml(config_xml.as_bytes())
+                .map(Some)
+                .map_err(
                     |error| ServerError::InternalError {
                         reason: format!(
                             "stored lifecycle configuration for {} failed to parse at request time: {error}",
                             bucket.name
                         ),
                     },
-                )?,
-            ),
-            None => {
-                self.clear_bucket_lifecycle_cache(&bucket.name);
-                return Ok(None);
-            }
-        };
-
-        self.cache_bucket_lifecycle(
-            &bucket.name,
-            bucket.bucket_lifecycle_generation,
-            Arc::clone(&parsed_config),
-        );
-        Ok(Some(parsed_config))
+                ),
+            None => Ok(None),
+        }
     }
 
     pub(super) fn cached_bucket_lifecycle_for_loaded_handle(
         &self,
         bucket: &LoadedBucketHandle,
-    ) -> Result<Option<Arc<BucketLifecycleConfiguration>>, ServerError> {
+    ) -> Result<Option<BucketLifecycleConfiguration>, ServerError> {
         let bucket_summary = bucket.bucket();
         if !bucket_summary.bucket_lifecycle_present {
             return Ok(None);
         }
 
-        if let Some(cached) = read_rwlock_unpoisoned(&self.bucket_lifecycle_cache)
-            .get(&bucket_summary.name)
-            .cloned()
-        {
-            if cached.generation == bucket_summary.bucket_lifecycle_generation {
-                return Ok(Some(cached.config));
-            }
-        }
-
-        let parsed_config = match bucket.lifecycle() {
-            LoadedBucketValue::Loaded(raw_config) => Arc::new(
-                s3_types::parse_lifecycle_configuration_xml(raw_config.as_bytes()).map_err(
-                    |error| ServerError::InternalError {
+        match bucket.lifecycle() {
+            LoadedBucketValue::Loaded(raw_config) => {
+                s3_types::parse_lifecycle_configuration_xml(raw_config.as_bytes())
+                    .map(Some)
+                    .map_err(|error| ServerError::InternalError {
                         reason: format!(
                             "stored lifecycle configuration for {} failed to parse at request time: {error}",
                             bucket_summary.name,
                         ),
-                    },
-                )?,
-            ),
-            LoadedBucketValue::Missing | LoadedBucketValue::NotRequested => {
-                self.clear_bucket_lifecycle_cache(&bucket_summary.name);
-                return Ok(None);
+                    })
             }
-        };
-
-        self.cache_bucket_lifecycle(
-            &bucket_summary.name,
-            bucket_summary.bucket_lifecycle_generation,
-            Arc::clone(&parsed_config),
-        );
-        Ok(Some(parsed_config))
-    }
-
-    pub(super) fn cache_bucket_lifecycle(
-        &self,
-        bucket: &BucketName,
-        generation: u64,
-        config: Arc<BucketLifecycleConfiguration>,
-    ) {
-        write_rwlock_unpoisoned(&self.bucket_lifecycle_cache)
-            .insert(bucket.clone(), CachedBucketLifecycle { generation, config });
-    }
-
-    pub(super) fn clear_bucket_lifecycle_cache(&self, bucket: &BucketName) {
-        write_rwlock_unpoisoned(&self.bucket_lifecycle_cache).remove(bucket);
+            LoadedBucketValue::Missing | LoadedBucketValue::NotRequested => Ok(None),
+        }
     }
 
     pub(super) fn current_object_lifecycle_expiration(
@@ -150,7 +90,7 @@ impl Coordinator {
             None => Vec::new(),
         };
         Ok(Self::evaluate_current_object_lifecycle_expiration(
-            config.as_ref(),
+            &config,
             key,
             &tags,
             size,
@@ -174,7 +114,7 @@ impl Coordinator {
             None => Vec::new(),
         };
         Ok(Self::evaluate_current_object_lifecycle_expiration(
-            config.as_ref(),
+            &config,
             key,
             &tags,
             size,
@@ -198,7 +138,7 @@ impl Coordinator {
             None => Vec::new(),
         };
         Ok(Self::evaluate_current_object_lifecycle_expiration(
-            config.as_ref(),
+            &config,
             key,
             &tags,
             size,
@@ -216,7 +156,7 @@ impl Coordinator {
             return Ok(None);
         };
         Ok(Self::evaluate_multipart_lifecycle_abort_headers(
-            config.as_ref(),
+            &config,
             key,
             initiated_at,
         ))

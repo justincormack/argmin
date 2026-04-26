@@ -3348,7 +3348,7 @@ fn lifecycle_sweeper_drops_with_last_coordinator() {
 }
 
 #[test]
-fn bucket_lifecycle_cache_invalidates_across_coordinators_on_replace() {
+fn bucket_lifecycle_update_is_visible_across_coordinators_on_replace() {
     let tmp = test_util::tempdir();
     let (admin, reader) = setup_coordinators_with_pg_count(tmp.path(), 4);
     admin

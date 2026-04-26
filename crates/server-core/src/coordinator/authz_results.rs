@@ -11,9 +11,7 @@ use super::request_types::{CreateBucketAcl, Requester};
 use super::response_types::GetObjectAclResult;
 use super::response_types::{BucketSummary, GetBucketAclResult};
 use crate::sse::SseCustomerWriteContext;
-use s3_types::{
-    AclGrants, BucketLifecycleConfiguration, BucketVersioningState, CanonicalUserId, VersionId,
-};
+use s3_types::{AclGrants, BucketVersioningState, CanonicalUserId, VersionId};
 #[cfg(test)]
 use s3_types::{LegalHoldStatus, ObjectRetention, StoredLegalHoldStatus};
 use storage::BucketObjectOwnership;
@@ -96,7 +94,6 @@ pub(super) struct AuthorizedPutBucketPolicy {
 pub(super) struct AuthorizedPutBucketLifecycle {
     pub(super) bucket: BucketName,
     pub(super) body: String,
-    pub(super) parsed_config: BucketLifecycleConfiguration,
 }
 
 #[derive(Debug)]

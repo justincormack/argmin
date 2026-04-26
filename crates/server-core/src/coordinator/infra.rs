@@ -1,8 +1,7 @@
 #[cfg(test)]
 use super::runtime::LifecycleSweepStats;
-use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use ec::{EcConfig, ErasureCodec};
 
@@ -356,7 +355,6 @@ impl Coordinator {
         Ok(Self {
             storage_node,
             shared_caches,
-            bucket_lifecycle_cache: RwLock::new(HashMap::new()),
             ec_codec,
             ec_config,
             encode_scratch_pool: EncodeScratchPool::new(ec_config),

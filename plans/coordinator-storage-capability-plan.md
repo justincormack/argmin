@@ -1407,12 +1407,16 @@ The main questions are:
   - and, regardless of the allowed propagation window, how that freshness check
     is performed without introducing bucket-lock reacquisition or queue waits
     on the object read/head hot paths
-- whether the existing parsed bucket policy and parsed lifecycle caches should
-  be merged into the same shared coordinator-layer cache after the pull
-  freshness model is in place
-  - specifically, this merge should be deferred until after:
-    - the cache has moved to `server-core`
-    - BOE reads use pull freshness rather than mutation-driven push invalidation
+- how parsed derived bucket state should be split after the pull-freshness
+  model is in place
+  - current state:
+    - parsed bucket policy is stored in the shared coordinator-layer BOE read
+      cache
+    - the separate parsed lifecycle cache is removed
+    - lifecycle is parse-on-demand until a narrower lifecycle-specialized
+      representation exists
+  - the remaining question is only whether a later specialized lifecycle
+    representation should join the shared cache once it is small enough
 - whether any existing fast-path reads should be narrowed because they weaken
   the request-scoped snapshot contract
 - how lifecycle-derived response-header behavior on hot paths should be served
@@ -1452,8 +1456,13 @@ Acceptance criteria:
 - the intended ownership layer of the BOE read fast-path cache is written down
   explicitly
   - current state: it lives in a process-shared `server-core` cache
-  - later: only then consider merging parsed policy/lifecycle caches into that
-    shared coordinator-layer cache
+  - parsed bucket policy now lives in that shared coordinator-layer cache for
+    BOE read entries
+  - parsed lifecycle should not follow the same move yet:
+    - full parsed lifecycle configurations are too large to want in the shared
+      bucket fast-path cache
+    - until a narrower lifecycle-specialized representation exists, lifecycle
+      should remain parse-on-demand from loaded/raw bucket state
 - the intended post-refactor fast-path contract is written down explicitly
 - the intended hot-path priority order is written down explicitly
 - the revalidation contract is written down explicitly
@@ -1463,8 +1472,9 @@ Acceptance criteria:
     queue-based waiting
 - the sequencing of the remaining Phase 10 cleanup is written down explicitly:
   1. implement cheap pull freshness for BOE reads
-  2. only then evaluate folding parsed policy/lifecycle caches into the same
-     shared cache structure
+  2. fold parsed bucket policy into the shared BOE read cache
+  3. remove the separate parsed lifecycle cache rather than folding full
+     parsed lifecycle configs into the shared BOE read cache
 - any additional bucket state added to the fast path is justified by hot-path
   need and pinned by tests
 - BOE read fast-path entries are populated in one canonical way from a real
