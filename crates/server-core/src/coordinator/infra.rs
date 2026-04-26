@@ -24,6 +24,26 @@ use storage::{
 };
 
 impl Coordinator {
+    fn validate_storage_ec_shape(
+        storage_node: &SharedStorageNode,
+        ec_config: EcConfig,
+    ) -> Result<(), ServerError> {
+        let expected = storage::EcShape {
+            k: ec_config.data_shards,
+            m: ec_config.parity_shards,
+        };
+        let actual = storage_node.default_ec_shape();
+        if actual != expected {
+            return Err(ServerError::InternalError {
+                reason: format!(
+                    "coordinator ec_config ({}/{}) does not match storage default_ec_shape ({}/{})",
+                    expected.k, expected.m, actual.k, actual.m
+                ),
+            });
+        }
+        Ok(())
+    }
+
     pub(super) fn random_session_id(error_reason: &'static str) -> Result<SessionId, ServerError> {
         const HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -307,6 +327,7 @@ impl Coordinator {
             ReadRuntime,
         ) -> Result<Arc<LifecycleSweeper>, ServerError>,
     {
+        Self::validate_storage_ec_shape(&storage_node, ec_config)?;
         #[cfg(test)]
         let pg_topology = PgTopology::new(storage_node.pg_ids()).map_err(|reason| {
             ServerError::InternalError {

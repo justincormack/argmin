@@ -66,6 +66,35 @@ fn rwlock_helpers_recover_after_panic() {
 }
 
 #[test]
+fn coordinator_new_rejects_mismatched_storage_ec_shape() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0, 1, 2, 3],
+            storage::EcShape { k: 5, m: 1 },
+        )
+        .unwrap(),
+    );
+
+    let err = match Coordinator::new(
+        storage_node,
+        EcConfig::default(),
+        "us-east-1".to_string(),
+        None,
+    ) {
+        Ok(_) => panic!("expected mismatched coordinator/storage EC shape to be rejected"),
+        Err(err) => err,
+    };
+
+    assert!(matches!(err, ServerError::InternalError { .. }));
+    let ServerError::InternalError { reason } = err else {
+        unreachable!();
+    };
+    assert!(reason.contains("does not match storage default_ec_shape"));
+}
+
+#[test]
 fn put_object_effective_policy_context_derives_explicit_sse_s3() {
     let metadata = MetadataBlob::default();
     let system_metadata = SystemMetadata::default();
