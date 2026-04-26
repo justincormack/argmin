@@ -162,6 +162,10 @@ pub const INTERNAL_SEGMENT_SIZE: usize = 8 * 1024 * 1024;
 
 const LIFECYCLE_SWEEP_INTERVAL_MILLIS: u64 = 1000;
 const BUCKET_FAST_PATH_MAX_ENTRIES: usize = 1024;
+#[cfg(test)]
+const BUCKET_FAST_PATH_WATCH_INTERVAL_MILLIS: u64 = 50;
+#[cfg(not(test))]
+const BUCKET_FAST_PATH_WATCH_INTERVAL_MILLIS: u64 = 1000;
 
 /// Hard cap on total records fetched across all PGs for a single list query.
 /// Prevents unbounded memory when delimiter causes u32::MAX per-PG limits.
@@ -187,12 +191,14 @@ struct BucketFastPathCache {
 #[derive(Debug)]
 struct BucketFastPathCacheEntry {
     info: storage::BucketFastPathInfo,
+    known_generation: AtomicU64,
     last_used_tick: AtomicU64,
 }
 
 impl BucketFastPathCacheEntry {
-    fn new(info: storage::BucketFastPathInfo, last_used_tick: u64) -> Self {
+    fn new(info: storage::BucketFastPathInfo, known_generation: u64, last_used_tick: u64) -> Self {
         Self {
+            known_generation: AtomicU64::new(known_generation),
             info,
             last_used_tick: AtomicU64::new(last_used_tick),
         }
@@ -212,6 +218,25 @@ impl BucketFastPathCacheEntry {
             }
         }
     }
+
+    fn is_fresh(&self) -> bool {
+        self.info.bucket_execution_generation == self.known_generation.load(Ordering::Relaxed)
+    }
+
+    fn observe_known_generation(&self, generation: u64) {
+        let mut observed = self.known_generation.load(Ordering::Relaxed);
+        while observed < generation {
+            match self.known_generation.compare_exchange_weak(
+                observed,
+                generation,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
 }
 
 impl BucketFastPathCache {
@@ -221,22 +246,61 @@ impl BucketFastPathCache {
             .wrapping_add(1)
     }
 
+    #[cfg(test)]
     fn get(&self, bucket: &BucketName) -> Option<storage::BucketFastPathInfo> {
         let entry = self.entries.get(bucket)?;
         entry.record_hit(self.next_tick());
         Some(entry.info.clone())
     }
 
+    fn get_if_fresh(&self, bucket: &BucketName) -> Option<storage::BucketFastPathInfo> {
+        let entry = self.entries.get(bucket)?;
+        entry.record_hit(self.next_tick());
+        entry.is_fresh().then(|| entry.info.clone())
+    }
+
+    #[cfg(test)]
+    fn is_fresh(&self, bucket: &BucketName) -> Option<bool> {
+        self.entries
+            .get(bucket)
+            .map(BucketFastPathCacheEntry::is_fresh)
+    }
+
     fn insert(&mut self, info: storage::BucketFastPathInfo) {
         let tick = self.next_tick();
         let bucket = info.name.clone();
-        self.entries
-            .insert(bucket, BucketFastPathCacheEntry::new(info, tick));
+        let (known_generation, last_used_tick) = self
+            .entries
+            .get(&bucket)
+            .map(|entry| {
+                (
+                    entry
+                        .known_generation
+                        .load(Ordering::Relaxed)
+                        .max(info.bucket_execution_generation),
+                    entry.last_used_tick.load(Ordering::Relaxed).max(tick),
+                )
+            })
+            .unwrap_or((info.bucket_execution_generation, tick));
+        self.entries.insert(
+            bucket,
+            BucketFastPathCacheEntry::new(info, known_generation, last_used_tick),
+        );
         self.evict_if_needed();
     }
 
     fn remove(&mut self, bucket: &BucketName) {
         self.entries.remove(bucket);
+    }
+
+    fn observe_known_generation(&self, bucket: &BucketName, generation: u64) {
+        if let Some(entry) = self.entries.get(bucket) {
+            entry.observe_known_generation(generation);
+        }
+    }
+
+    fn snapshot_bucket_names(&self) -> Vec<BucketName> {
+        self.entries.keys().cloned().collect()
     }
 
     fn evict_if_needed(&mut self) {
@@ -273,8 +337,57 @@ fn shared_caches_for_storage_node(
         return existing;
     }
     let shared = Arc::new(CoordinatorSharedCaches::default());
+    spawn_bucket_fast_path_watcher(&shared, storage_node);
     guard.insert(key, Arc::downgrade(&shared));
     shared
+}
+
+fn spawn_bucket_fast_path_watcher(
+    shared: &Arc<CoordinatorSharedCaches>,
+    storage_node: &Arc<SharedStorageNode>,
+) {
+    let shared = Arc::downgrade(shared);
+    let storage_node = Arc::downgrade(storage_node);
+    std::thread::Builder::new()
+        .name("argmin-bucket-fast-path-watch".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(
+                BUCKET_FAST_PATH_WATCH_INTERVAL_MILLIS,
+            ));
+            let Some(shared) = shared.upgrade() else {
+                break;
+            };
+            let Some(storage_node) = storage_node.upgrade() else {
+                break;
+            };
+            let buckets =
+                { read_rwlock_unpoisoned(&shared.bucket_fast_path).snapshot_bucket_names() };
+            if buckets.is_empty() {
+                continue;
+            }
+            let mut buckets_by_pg = HashMap::<u32, Vec<BucketName>>::new();
+            for bucket in buckets {
+                buckets_by_pg
+                    .entry(storage_node.bucket_pg_id_for(&bucket))
+                    .or_default()
+                    .push(bucket);
+            }
+            for (pg_id, buckets) in buckets_by_pg {
+                let generations =
+                    match storage_node.load_bucket_execution_generations_for_pg(pg_id, &buckets) {
+                        Ok(generations) => generations,
+                        Err(_) => continue,
+                    };
+                let mut cache = write_rwlock_unpoisoned(&shared.bucket_fast_path);
+                for bucket in buckets {
+                    match generations.get(&bucket) {
+                        Some(&generation) => cache.observe_known_generation(&bucket, generation),
+                        None => cache.remove(&bucket),
+                    }
+                }
+            }
+        })
+        .expect("coordinator should spawn bucket fast path watcher");
 }
 
 pub struct Coordinator {
@@ -298,11 +411,19 @@ impl Coordinator {
         storage::clock::current_time_millis()
     }
 
+    #[cfg(test)]
     pub(super) fn get_bucket_fast_path(
         &self,
         bucket: &BucketName,
     ) -> Option<storage::BucketFastPathInfo> {
         read_rwlock_unpoisoned(&self.shared_caches.bucket_fast_path).get(bucket)
+    }
+
+    pub(super) fn get_bucket_fast_path_if_fresh(
+        &self,
+        bucket: &BucketName,
+    ) -> Option<storage::BucketFastPathInfo> {
+        read_rwlock_unpoisoned(&self.shared_caches.bucket_fast_path).get_if_fresh(bucket)
     }
 
     pub(super) fn upsert_bucket_fast_path(&self, info: storage::BucketFastPathInfo) {
@@ -311,6 +432,15 @@ impl Coordinator {
 
     pub(super) fn remove_bucket_fast_path(&self, bucket: &BucketName) {
         write_rwlock_unpoisoned(&self.shared_caches.bucket_fast_path).remove(bucket);
+    }
+
+    pub(super) fn observe_bucket_fast_path_generation(&self, bucket: &BucketName, generation: u64) {
+        read_rwlock_unpoisoned(&self.shared_caches.bucket_fast_path)
+            .observe_known_generation(bucket, generation);
+    }
+    #[cfg(test)]
+    pub(super) fn bucket_fast_path_is_fresh_for_test(&self, bucket: &BucketName) -> Option<bool> {
+        read_rwlock_unpoisoned(&self.shared_caches.bucket_fast_path).is_fresh(bucket)
     }
 }
 
@@ -339,6 +469,7 @@ mod bucket_fast_path_cache_tests {
             policy: storage::BucketFastPathPolicy::Absent,
             bucket_lifecycle_present: false,
             bucket_lifecycle_generation: 0,
+            bucket_execution_generation: 0,
             bucket_abac_enabled: false,
             tags: storage::BucketFastPathTags::NotApplicable,
             encryption: storage::EffectiveBucketEncryptionConfig::default(),
@@ -390,6 +521,22 @@ mod bucket_fast_path_cache_tests {
                 BUCKET_FAST_PATH_MAX_ENTRIES
             )))
             .is_some());
+    }
+
+    #[test]
+    fn shared_bucket_fast_path_insert_preserves_newer_known_generation() {
+        let mut cache = BucketFastPathCache::default();
+        let bucket = trusted_bucket_name("bucket");
+        cache.insert(bucket_fast_path_info("bucket"));
+        cache.observe_known_generation(&bucket, 7);
+
+        let mut reloaded = bucket_fast_path_info("bucket");
+        reloaded.bucket_execution_generation = 6;
+        cache.insert(reloaded);
+
+        assert_eq!(cache.is_fresh(&bucket), Some(false));
+        let cached = cache.get(&bucket).expect("bucket should remain cached");
+        assert_eq!(cached.bucket_execution_generation, 6);
     }
 }
 

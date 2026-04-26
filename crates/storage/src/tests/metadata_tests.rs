@@ -989,6 +989,139 @@ fn file_bucket_metadata_config_roundtrip() {
 }
 
 #[test]
+fn file_bucket_execution_generation_tracks_bucket_mutations() {
+    let (_dir, store) = make_pg_store();
+    let bucket = bucket_name("bucket");
+    store
+        .create_bucket(
+            &bucket,
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+
+    assert_eq!(
+        store
+            .head_bucket(&bucket)
+            .unwrap()
+            .bucket_execution_generation,
+        1
+    );
+
+    store
+        .put_bucket_versioning(&bucket, BucketVersioningState::Enabled)
+        .unwrap();
+    assert_eq!(
+        store
+            .head_bucket(&bucket)
+            .unwrap()
+            .bucket_execution_generation,
+        2
+    );
+
+    store
+        .put_bucket_subresource(
+            &bucket,
+            PutBucketSubresource {
+                kind: BucketSubresourceKind::Tagging,
+                body: "<Tagging/>",
+                aux: BucketSubresourceAux::None,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .head_bucket(&bucket)
+            .unwrap()
+            .bucket_execution_generation,
+        3
+    );
+
+    store
+        .delete_bucket_subresource(&bucket, BucketSubresourceKind::Tagging)
+        .unwrap();
+    assert_eq!(
+        store
+            .head_bucket(&bucket)
+            .unwrap()
+            .bucket_execution_generation,
+        4
+    );
+
+    store.put_bucket_abac_enabled(&bucket, true).unwrap();
+    assert_eq!(
+        store
+            .head_bucket(&bucket)
+            .unwrap()
+            .bucket_execution_generation,
+        5
+    );
+
+    store
+        .put_bucket_public_access_block(
+            &bucket,
+            PublicAccessBlockConfig {
+                block_public_acls: true,
+                ignore_public_acls: false,
+                block_public_policy: true,
+                restrict_public_buckets: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .head_bucket(&bucket)
+            .unwrap()
+            .bucket_execution_generation,
+        6
+    );
+}
+
+#[test]
+fn file_bucket_execution_generation_advances_across_delete_recreate() {
+    let (_dir, store) = make_pg_store();
+    let bucket = bucket_name("bucket");
+    store
+        .create_bucket(
+            &bucket,
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+    let first = store
+        .head_bucket(&bucket)
+        .unwrap()
+        .bucket_execution_generation;
+    store.begin_bucket_write_drain(&bucket).unwrap();
+    store.mark_bucket_deleting(&bucket).unwrap();
+    store.delete_bucket(&bucket).unwrap();
+    store
+        .create_bucket(
+            &bucket,
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+    let second = store
+        .head_bucket(&bucket)
+        .unwrap()
+        .bucket_execution_generation;
+    assert!(
+        second > first,
+        "bucket execution generation must advance across delete/recreate"
+    );
+}
+
+#[test]
 fn file_bucket_subresource_roundtrip() {
     let (_dir, store) = make_pg_store();
     store

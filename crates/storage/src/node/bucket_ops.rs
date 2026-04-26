@@ -1,5 +1,6 @@
 use super::*;
 use s3_types::{AclGrants, BucketVersioningState};
+use std::collections::HashMap;
 
 use crate::{
     BucketEncryptionConfig, BucketInfo, BucketObjectLockConfig, BucketOwnershipControls,
@@ -285,6 +286,15 @@ impl SharedStorageNode {
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         let bucket_pg = self.get_pg(self.pg_topology.bucket_pg_for(bucket))?;
         Ok(PgMetadataStore::head_bucket(&*bucket_pg, bucket)?)
+    }
+
+    pub fn load_bucket_execution_generations_for_pg(
+        &self,
+        pg_id: u32,
+        buckets: &[BucketName],
+    ) -> Result<HashMap<BucketName, u64>, BucketSnapshotLoadError> {
+        let bucket_pg = self.get_pg(pg_id)?;
+        Ok(bucket_pg.load_bucket_execution_generations(buckets)?)
     }
 
     pub fn get_bucket_subresource(

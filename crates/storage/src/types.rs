@@ -1865,6 +1865,8 @@ pub struct BucketInfo {
     pub bucket_lifecycle_present: bool,
     /// Monotonic generation incremented on every lifecycle update/delete.
     pub bucket_lifecycle_generation: u64,
+    /// Monotonic generation incremented on every bucket metadata mutation.
+    pub bucket_execution_generation: u64,
     /// Whether bucket ABAC is enabled for `s3:BucketTag/${TagKey}` evaluation.
     pub bucket_abac_enabled: bool,
     /// Effective bucket encryption semantics used on hot paths.
@@ -1993,6 +1995,10 @@ impl std::fmt::Debug for BucketInfo {
                 "bucket_lifecycle_generation",
                 &self.bucket_lifecycle_generation,
             )
+            .field(
+                "bucket_execution_generation",
+                &self.bucket_execution_generation,
+            )
             .field("bucket_abac_enabled", &self.bucket_abac_enabled)
             .field("encryption", &self.encryption)
             .finish()
@@ -2030,6 +2036,7 @@ pub struct BucketFastPathInfo {
     pub policy: BucketFastPathPolicy,
     pub bucket_lifecycle_present: bool,
     pub bucket_lifecycle_generation: u64,
+    pub bucket_execution_generation: u64,
     pub bucket_abac_enabled: bool,
     pub tags: BucketFastPathTags,
     pub encryption: EffectiveBucketEncryptionConfig,
@@ -2090,6 +2097,10 @@ impl std::fmt::Debug for BucketFastPathInfo {
             .field(
                 "bucket_lifecycle_generation",
                 &self.bucket_lifecycle_generation,
+            )
+            .field(
+                "bucket_execution_generation",
+                &self.bucket_execution_generation,
             )
             .field("bucket_abac_enabled", &self.bucket_abac_enabled)
             .field("tags", &self.tags)
@@ -2167,6 +2178,7 @@ impl From<&BucketSnapshot> for BucketFastPathInfo {
             },
             bucket_lifecycle_present: snapshot.bucket.bucket_lifecycle_present,
             bucket_lifecycle_generation: snapshot.bucket.bucket_lifecycle_generation,
+            bucket_execution_generation: snapshot.bucket.bucket_execution_generation,
             bucket_abac_enabled: snapshot.bucket.bucket_abac_enabled,
             tags: match &snapshot.tags {
                 LoadedBucketSubresource::Loaded(tags) => BucketFastPathTags::Loaded(tags.clone()),
@@ -3143,6 +3155,7 @@ mod tests {
             bucket_policy_generation: 7,
             bucket_lifecycle_present: true,
             bucket_lifecycle_generation: 8,
+            bucket_execution_generation: 9,
             bucket_abac_enabled: false,
             encryption: EffectiveBucketEncryptionConfig::default(),
         };
@@ -3171,6 +3184,7 @@ mod tests {
                 policy: BucketFastPathPolicy::Loaded("secret-policy".to_string()),
                 bucket_lifecycle_present: info.bucket_lifecycle_present,
                 bucket_lifecycle_generation: info.bucket_lifecycle_generation,
+                bucket_execution_generation: info.bucket_execution_generation,
                 bucket_abac_enabled: info.bucket_abac_enabled,
                 tags: BucketFastPathTags::Loaded("secret-tags".to_string()),
                 encryption: info.encryption,

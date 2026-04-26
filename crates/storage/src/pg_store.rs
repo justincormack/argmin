@@ -10,11 +10,12 @@
 ///   shards/<hex_prefix>/<shard_key_hex>
 ///   tmp/
 /// ```
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 use crate::error::{MetadataError, StoreError};
 use crate::schema::init_pg_schema;
@@ -29,7 +30,7 @@ SELECT name, owner_principal, owner_canonical_id, created_at, region, state, ver
        EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 4 AND body IS NOT NULL) AS bucket_policy_present, \
        bucket_policy_public, bucket_policy_generation, \
        EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 5 AND body IS NOT NULL) AS bucket_lifecycle_present, \
-       bucket_lifecycle_generation, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
+       bucket_lifecycle_generation, bucket_execution_generation, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
 FROM buckets";
 
 /// Part segment rows use a sentinel version_id during staging (pre-CompleteMultipartUpload).
@@ -1024,12 +1025,12 @@ impl PgStore {
         let ownership_controls = Self::parse_ownership_controls(row.get(17)?, 17)?;
         let object_lock = Self::parse_bucket_object_lock(
             (
-                row.get::<_, i64>(26)?,
-                row.get::<_, Option<u8>>(27)?,
-                row.get::<_, Option<i64>>(28)?,
+                row.get::<_, i64>(27)?,
+                row.get::<_, Option<u8>>(28)?,
                 row.get::<_, Option<i64>>(29)?,
+                row.get::<_, Option<i64>>(30)?,
             ),
-            [26, 27, 28, 29],
+            [27, 28, 29, 30],
         )?;
         let acl_grants = Self::parse_acl_grants(row.get::<_, String>(7)?, 7, "acl_grants")?;
         Ok(BucketInfo {
@@ -1062,21 +1063,22 @@ impl PgStore {
             bucket_policy_generation: row.get::<_, i64>(20)? as u64,
             bucket_lifecycle_present: row.get::<_, i64>(21)? != 0,
             bucket_lifecycle_generation: row.get::<_, i64>(22)? as u64,
-            bucket_abac_enabled: row.get::<_, i64>(23)? != 0,
+            bucket_execution_generation: row.get::<_, i64>(23)? as u64,
+            bucket_abac_enabled: row.get::<_, i64>(24)? != 0,
             encryption: BucketEncryptionConfig {
                 default_encryption: row
-                    .get::<_, Option<u8>>(24)?
+                    .get::<_, Option<u8>>(25)?
                     .map(|value| {
                         ManagedEncryptionAlgorithm::from_u8(value).ok_or_else(|| {
                             rusqlite::Error::FromSqlConversionFailure(
-                                24,
+                                25,
                                 rusqlite::types::Type::Integer,
                                 Box::from(format!("invalid default_encryption_type: {value}")),
                             )
                         })
                     })
                     .transpose()?,
-                sse_c_blocked: row.get::<_, i64>(25)? != 0,
+                sse_c_blocked: row.get::<_, i64>(26)? != 0,
             }
             .effective(),
         })
@@ -1260,6 +1262,19 @@ impl PgStore {
                 _ => {}
             }
 
+            let execution_generation = self.next_bucket_execution_generation_in_txn(
+                "put bucket subresource (allocate execution generation)",
+            )?;
+            self.conn
+                .execute(
+                    "UPDATE buckets SET bucket_execution_generation = ?1 WHERE name = ?2",
+                    params![execution_generation as i64, name],
+                )
+                .map_err(|source| MetadataError::Db {
+                    context: "put bucket subresource (bump execution generation)",
+                    source,
+                })?;
+
             Ok(())
         })();
         match result {
@@ -1371,6 +1386,19 @@ impl PgStore {
                 }
                 _ => {}
             }
+
+            let execution_generation = self.next_bucket_execution_generation_in_txn(
+                "delete bucket subresource (allocate execution generation)",
+            )?;
+            self.conn
+                .execute(
+                    "UPDATE buckets SET bucket_execution_generation = ?1 WHERE name = ?2",
+                    params![execution_generation as i64, name],
+                )
+                .map_err(|source| MetadataError::Db {
+                    context: "delete bucket subresource (bump execution generation)",
+                    source,
+                })?;
 
             Ok(())
         })();
@@ -1883,6 +1911,62 @@ impl ShardStore for PgStore {
 }
 
 impl PgStore {
+    fn with_immediate_txn<T>(
+        &self,
+        begin_context: &'static str,
+        commit_context: &'static str,
+        body: impl FnOnce(&Self) -> Result<T, MetadataError>,
+    ) -> Result<T, MetadataError> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|source| MetadataError::Db {
+                context: begin_context,
+                source,
+            })?;
+        let result = body(self);
+        match result {
+            Ok(value) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(|source| MetadataError::Db {
+                        context: commit_context,
+                        source,
+                    })?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    fn next_bucket_execution_generation_in_txn(
+        &self,
+        context: &'static str,
+    ) -> Result<u64, MetadataError> {
+        self.conn
+            .query_row(
+                "UPDATE pg_counters \
+                 SET next_bucket_execution_generation = next_bucket_execution_generation + 1 \
+                 WHERE singleton = 0 \
+                 RETURNING next_bucket_execution_generation",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|source| MetadataError::Db { context, source })
+            .and_then(|raw| {
+                raw.try_into().map_err(|_| MetadataError::Db {
+                    context: "decode next bucket execution generation",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::from("negative next_bucket_execution_generation"),
+                    ),
+                })
+            })
+    }
+
     pub fn create_bucket_with_config(
         &self,
         config: &CreateBucketConfig<'_>,
@@ -1909,39 +1993,99 @@ impl PgStore {
                 source: e,
             }
         })?;
-        let result = self.conn.execute(
-            "INSERT INTO buckets \
-             (name, owner_principal, owner_canonical_id, created_at, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, 0, ?10, 1, ?11, ?12, ?13, ?14)",
-            params![
-                config.name,
-                config.owner_principal,
-                config.owner_canonical_id.as_str(),
-                now,
-                BucketState::Active as u8,
-                config.versioning as u8 as i64,
-                config.acl_grants.serialized(),
-                i32::from(config.public_read),
-                i32::from(config.public_write),
-                Option::<u8>::None,
-                object_lock_enabled,
-                object_lock_default_mode,
-                object_lock_default_days,
-                object_lock_default_years,
-            ],
-        );
-        match result {
-            Ok(_) => Ok(()),
-            Err(rusqlite::Error::SqliteFailure(err, _))
-                if err.code == rusqlite::ffi::ErrorCode::ConstraintViolation =>
-            {
-                Err(MetadataError::BucketAlreadyExists)
-            }
-            Err(e) => Err(MetadataError::Db {
-                context: "create bucket",
-                source: e,
-            }),
+        self.with_immediate_txn(
+            "create bucket (begin txn)",
+            "create bucket (commit txn)",
+            |store| {
+                let generation = store
+                    .next_bucket_execution_generation_in_txn("create bucket (allocate execution generation)")?;
+                match store.conn.execute(
+                    "INSERT INTO buckets \
+                     (name, owner_principal, owner_canonical_id, created_at, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years, bucket_execution_generation) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, 0, ?10, 1, ?11, ?12, ?13, ?14, ?15)",
+                    params![
+                        config.name,
+                        config.owner_principal,
+                        config.owner_canonical_id.as_str(),
+                        now,
+                        BucketState::Active as u8,
+                        config.versioning as u8 as i64,
+                        config.acl_grants.serialized(),
+                        i32::from(config.public_read),
+                        i32::from(config.public_write),
+                        Option::<u8>::None,
+                        object_lock_enabled,
+                        object_lock_default_mode,
+                        object_lock_default_days,
+                        object_lock_default_years,
+                        generation as i64,
+                    ],
+                ) {
+                    Ok(_) => Ok(()),
+                    Err(rusqlite::Error::SqliteFailure(err, _))
+                        if err.code == rusqlite::ffi::ErrorCode::ConstraintViolation =>
+                    {
+                        Err(MetadataError::BucketAlreadyExists)
+                    }
+                    Err(source) => Err(MetadataError::Db {
+                        context: "create bucket",
+                        source,
+                    }),
+                }
+            },
+        )
+    }
+
+    pub fn load_bucket_execution_generations(
+        &self,
+        buckets: &[BucketName],
+    ) -> Result<HashMap<BucketName, u64>, MetadataError> {
+        if buckets.is_empty() {
+            return Ok(HashMap::new());
         }
+        let placeholders = std::iter::repeat_n("?", buckets.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT name, bucket_execution_generation \
+             FROM buckets \
+             WHERE name IN ({placeholders})"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|source| MetadataError::Db {
+                context: "prepare load bucket execution generations",
+                source,
+            })?;
+        let rows = stmt
+            .query_map(
+                params_from_iter(buckets.iter().map(|bucket| bucket.as_str())),
+                |row| Ok((row.get::<_, BucketName>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(|source| MetadataError::Db {
+                context: "query load bucket execution generations",
+                source,
+            })?;
+        let mut generations = HashMap::with_capacity(buckets.len());
+        for row in rows {
+            let (bucket, generation) = row.map_err(|source| MetadataError::Db {
+                context: "row load bucket execution generations",
+                source,
+            })?;
+            generations.insert(
+                bucket,
+                generation.try_into().map_err(|_| MetadataError::Db {
+                    context: "decode bucket execution generation",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Integer,
+                        Box::from("negative bucket_execution_generation"),
+                    ),
+                })?,
+            );
+        }
+        Ok(generations)
     }
 
     fn next_object_write_sequence(&self, bucket: &str, key: &str) -> Result<u64, MetadataError> {
@@ -2412,29 +2556,40 @@ impl PgMetadataStore for PgStore {
     }
 
     fn mark_bucket_deleting(&self, name: &BucketName) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets \
-                 SET state = ?1 \
-                 WHERE name = ?2 \
-                   AND state = ?3 \
-                   AND write_reservations_blocked = 1 \
-                   AND active_write_reservations = 0",
-                params![
-                    BucketState::Deleting as u8,
-                    name.as_str(),
-                    BucketState::Active as u8
-                ],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "mark bucket deleting",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(bucket_not_found(name.as_str()));
-        }
-        Ok(())
+        self.with_immediate_txn(
+            "mark bucket deleting (begin txn)",
+            "mark bucket deleting (commit txn)",
+            |store| {
+                let generation = store.next_bucket_execution_generation_in_txn(
+                    "mark bucket deleting (allocate execution generation)",
+                )?;
+                let updated = store
+                    .conn
+                    .execute(
+                        "UPDATE buckets \
+                         SET state = ?1, \
+                             bucket_execution_generation = ?2 \
+                         WHERE name = ?3 \
+                           AND state = ?4 \
+                           AND write_reservations_blocked = 1 \
+                           AND active_write_reservations = 0",
+                        params![
+                            BucketState::Deleting as u8,
+                            generation as i64,
+                            name.as_str(),
+                            BucketState::Active as u8
+                        ],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "mark bucket deleting",
+                        source,
+                    })?;
+                if updated == 0 {
+                    return Err(bucket_not_found(name.as_str()));
+                }
+                Ok(())
+            },
+        )
     }
 
     fn acquire_bucket_write_reservation(
@@ -2559,16 +2714,29 @@ impl PgMetadataStore for PgStore {
             });
         }
 
-        self.conn
-            .execute(
-                "UPDATE buckets SET versioning = ?1 WHERE name = ?2",
-                params![state as u8 as i64, name.as_str()],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put bucket versioning",
-                source: e,
-            })?;
-        Ok(())
+        self.with_immediate_txn(
+            "put bucket versioning (begin txn)",
+            "put bucket versioning (commit txn)",
+            |store| {
+                let generation = store.next_bucket_execution_generation_in_txn(
+                    "put bucket versioning (allocate execution generation)",
+                )?;
+                store
+                    .conn
+                    .execute(
+                        "UPDATE buckets \
+                         SET versioning = ?1, \
+                             bucket_execution_generation = ?2 \
+                         WHERE name = ?3",
+                        params![state as u8 as i64, generation as i64, name.as_str()],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "put bucket versioning",
+                        source,
+                    })?;
+                Ok(())
+            },
+        )
     }
 
     fn put_bucket_object_lock(
@@ -2581,31 +2749,42 @@ impl PgMetadataStore for PgStore {
                 context: "put bucket object lock (encode)",
                 source: e,
             })?;
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets \
-                 SET object_lock_enabled = ?1, \
-                     object_lock_default_mode = ?2, \
-                     object_lock_default_days = ?3, \
-                     object_lock_default_years = ?4 \
-                 WHERE name = ?5",
-                params![
-                    enabled,
-                    default_mode,
-                    default_days,
-                    default_years,
-                    name.as_str()
-                ],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put bucket object lock",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(bucket_not_found(name.as_str()));
-        }
-        Ok(())
+        self.with_immediate_txn(
+            "put bucket object lock (begin txn)",
+            "put bucket object lock (commit txn)",
+            |store| {
+                let generation = store.next_bucket_execution_generation_in_txn(
+                    "put bucket object lock (allocate execution generation)",
+                )?;
+                let updated = store
+                    .conn
+                    .execute(
+                        "UPDATE buckets \
+                         SET object_lock_enabled = ?1, \
+                             object_lock_default_mode = ?2, \
+                             object_lock_default_days = ?3, \
+                             object_lock_default_years = ?4, \
+                             bucket_execution_generation = ?5 \
+                         WHERE name = ?6",
+                        params![
+                            enabled,
+                            default_mode,
+                            default_days,
+                            default_years,
+                            generation as i64,
+                            name.as_str()
+                        ],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "put bucket object lock",
+                        source,
+                    })?;
+                if updated == 0 {
+                    return Err(bucket_not_found(name.as_str()));
+                }
+                Ok(())
+            },
+        )
     }
 
     fn put_bucket_acl(
@@ -2615,25 +2794,40 @@ impl PgMetadataStore for PgStore {
         public_read: bool,
         public_write: bool,
     ) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets SET acl_grants = ?1, public_read = ?2, public_write = ?3 WHERE name = ?4",
-                params![
-                    acl_grants.serialized(),
-                    i32::from(public_read),
-                    i32::from(public_write),
-                    name.as_str()
-                ],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put bucket acl",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(bucket_not_found(name.as_str()));
-        }
-        Ok(())
+        self.with_immediate_txn(
+            "put bucket acl (begin txn)",
+            "put bucket acl (commit txn)",
+            |store| {
+                let generation = store.next_bucket_execution_generation_in_txn(
+                    "put bucket acl (allocate execution generation)",
+                )?;
+                let updated = store
+                    .conn
+                    .execute(
+                        "UPDATE buckets \
+                         SET acl_grants = ?1, \
+                             public_read = ?2, \
+                             public_write = ?3, \
+                             bucket_execution_generation = ?4 \
+                         WHERE name = ?5",
+                        params![
+                            acl_grants.serialized(),
+                            i32::from(public_read),
+                            i32::from(public_write),
+                            generation as i64,
+                            name.as_str()
+                        ],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "put bucket acl",
+                        source,
+                    })?;
+                if updated == 0 {
+                    return Err(bucket_not_found(name.as_str()));
+                }
+                Ok(())
+            },
+        )
     }
 
     fn put_bucket_subresource(
@@ -2672,33 +2866,44 @@ impl PgMetadataStore for PgStore {
             block_public_policy,
             restrict_public_buckets,
         ) = Self::public_access_block_sql_values(Some(config));
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets SET \
-                     public_access_block_present = ?1, \
-                     public_access_block_block_public_acls = ?2, \
-                     public_access_block_ignore_public_acls = ?3, \
-                     public_access_block_block_public_policy = ?4, \
-                     public_access_block_restrict_public_buckets = ?5 \
-                 WHERE name = ?6",
-                params![
-                    present,
-                    block_public_acls,
-                    ignore_public_acls,
-                    block_public_policy,
-                    restrict_public_buckets,
-                    name.as_str(),
-                ],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put bucket public access block",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(bucket_not_found(name.as_str()));
-        }
-        Ok(())
+        self.with_immediate_txn(
+            "put bucket public access block (begin txn)",
+            "put bucket public access block (commit txn)",
+            |store| {
+                let generation = store.next_bucket_execution_generation_in_txn(
+                    "put bucket public access block (allocate execution generation)",
+                )?;
+                let updated = store
+                    .conn
+                    .execute(
+                        "UPDATE buckets SET \
+                             public_access_block_present = ?1, \
+                             public_access_block_block_public_acls = ?2, \
+                             public_access_block_ignore_public_acls = ?3, \
+                             public_access_block_block_public_policy = ?4, \
+                             public_access_block_restrict_public_buckets = ?5, \
+                             bucket_execution_generation = ?6 \
+                         WHERE name = ?7",
+                        params![
+                            present,
+                            block_public_acls,
+                            ignore_public_acls,
+                            block_public_policy,
+                            restrict_public_buckets,
+                            generation as i64,
+                            name.as_str(),
+                        ],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "put bucket public access block",
+                        source,
+                    })?;
+                if updated == 0 {
+                    return Err(bucket_not_found(name.as_str()));
+                }
+                Ok(())
+            },
+        )
     }
 
     fn get_bucket_public_access_block(
@@ -2744,33 +2949,44 @@ impl PgMetadataStore for PgStore {
             block_public_policy,
             restrict_public_buckets,
         ) = Self::public_access_block_sql_values(None);
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets SET \
-                     public_access_block_present = ?1, \
-                     public_access_block_block_public_acls = ?2, \
-                     public_access_block_ignore_public_acls = ?3, \
-                     public_access_block_block_public_policy = ?4, \
-                     public_access_block_restrict_public_buckets = ?5 \
-                 WHERE name = ?6",
-                params![
-                    present,
-                    block_public_acls,
-                    ignore_public_acls,
-                    block_public_policy,
-                    restrict_public_buckets,
-                    name.as_str(),
-                ],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "delete bucket public access block",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(bucket_not_found(name.as_str()));
-        }
-        Ok(())
+        self.with_immediate_txn(
+            "delete bucket public access block (begin txn)",
+            "delete bucket public access block (commit txn)",
+            |store| {
+                let generation = store.next_bucket_execution_generation_in_txn(
+                    "delete bucket public access block (allocate execution generation)",
+                )?;
+                let updated = store
+                    .conn
+                    .execute(
+                        "UPDATE buckets SET \
+                             public_access_block_present = ?1, \
+                             public_access_block_block_public_acls = ?2, \
+                             public_access_block_ignore_public_acls = ?3, \
+                             public_access_block_block_public_policy = ?4, \
+                             public_access_block_restrict_public_buckets = ?5, \
+                             bucket_execution_generation = ?6 \
+                         WHERE name = ?7",
+                        params![
+                            present,
+                            block_public_acls,
+                            ignore_public_acls,
+                            block_public_policy,
+                            restrict_public_buckets,
+                            generation as i64,
+                            name.as_str(),
+                        ],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "delete bucket public access block",
+                        source,
+                    })?;
+                if updated == 0 {
+                    return Err(bucket_not_found(name.as_str()));
+                }
+                Ok(())
+            },
+        )
     }
 
     fn put_bucket_ownership_controls(
@@ -2778,23 +2994,36 @@ impl PgMetadataStore for PgStore {
         name: &BucketName,
         config: BucketOwnershipControls,
     ) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets SET ownership_controls_mode = ?1 WHERE name = ?2",
-                params![
-                    Self::ownership_controls_sql_value(Some(config)),
-                    name.as_str()
-                ],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put bucket ownership controls",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(bucket_not_found(name.as_str()));
-        }
-        Ok(())
+        self.with_immediate_txn(
+            "put bucket ownership controls (begin txn)",
+            "put bucket ownership controls (commit txn)",
+            |store| {
+                let generation = store.next_bucket_execution_generation_in_txn(
+                    "put bucket ownership controls (allocate execution generation)",
+                )?;
+                let updated = store
+                    .conn
+                    .execute(
+                        "UPDATE buckets \
+                         SET ownership_controls_mode = ?1, \
+                             bucket_execution_generation = ?2 \
+                         WHERE name = ?3",
+                        params![
+                            Self::ownership_controls_sql_value(Some(config)),
+                            generation as i64,
+                            name.as_str()
+                        ],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "put bucket ownership controls",
+                        source,
+                    })?;
+                if updated == 0 {
+                    return Err(bucket_not_found(name.as_str()));
+                }
+                Ok(())
+            },
+        )
     }
 
     fn get_bucket_ownership_controls(
@@ -2816,20 +3045,36 @@ impl PgMetadataStore for PgStore {
     }
 
     fn delete_bucket_ownership_controls(&self, name: &BucketName) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets SET ownership_controls_mode = ?1 WHERE name = ?2",
-                params![Self::ownership_controls_sql_value(None), name.as_str()],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "delete bucket ownership controls",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(bucket_not_found(name.as_str()));
-        }
-        Ok(())
+        self.with_immediate_txn(
+            "delete bucket ownership controls (begin txn)",
+            "delete bucket ownership controls (commit txn)",
+            |store| {
+                let generation = store.next_bucket_execution_generation_in_txn(
+                    "delete bucket ownership controls (allocate execution generation)",
+                )?;
+                let updated = store
+                    .conn
+                    .execute(
+                        "UPDATE buckets \
+                         SET ownership_controls_mode = ?1, \
+                             bucket_execution_generation = ?2 \
+                         WHERE name = ?3",
+                        params![
+                            Self::ownership_controls_sql_value(None),
+                            generation as i64,
+                            name.as_str()
+                        ],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "delete bucket ownership controls",
+                        source,
+                    })?;
+                if updated == 0 {
+                    return Err(bucket_not_found(name.as_str()));
+                }
+                Ok(())
+            },
+        )
     }
 
     fn put_bucket_abac_enabled(
@@ -2837,20 +3082,36 @@ impl PgMetadataStore for PgStore {
         name: &BucketName,
         enabled: bool,
     ) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets SET bucket_abac_enabled = ?1 WHERE name = ?2",
-                params![if enabled { 1 } else { 0 }, name.as_str()],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put bucket abac enabled",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(bucket_not_found(name.as_str()));
-        }
-        Ok(())
+        self.with_immediate_txn(
+            "put bucket abac enabled (begin txn)",
+            "put bucket abac enabled (commit txn)",
+            |store| {
+                let generation = store.next_bucket_execution_generation_in_txn(
+                    "put bucket abac enabled (allocate execution generation)",
+                )?;
+                let updated = store
+                    .conn
+                    .execute(
+                        "UPDATE buckets \
+                         SET bucket_abac_enabled = ?1, \
+                             bucket_execution_generation = ?2 \
+                         WHERE name = ?3",
+                        params![
+                            if enabled { 1 } else { 0 },
+                            generation as i64,
+                            name.as_str()
+                        ],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "put bucket abac enabled",
+                        source,
+                    })?;
+                if updated == 0 {
+                    return Err(bucket_not_found(name.as_str()));
+                }
+                Ok(())
+            },
+        )
     }
 
     fn get_bucket_abac_enabled(&self, name: &BucketName) -> Result<bool, MetadataError> {
@@ -2874,24 +3135,38 @@ impl PgMetadataStore for PgStore {
         name: &BucketName,
         config: BucketEncryptionConfig,
     ) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets SET default_encryption_type = ?1, sse_c_blocked = ?2 WHERE name = ?3",
-                params![
-                    config.default_encryption.map(|value| value as u8),
-                    i32::from(config.sse_c_blocked),
-                    name.as_str()
-                ],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put bucket encryption",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(bucket_not_found(name.as_str()));
-        }
-        Ok(())
+        self.with_immediate_txn(
+            "put bucket encryption (begin txn)",
+            "put bucket encryption (commit txn)",
+            |store| {
+                let generation = store.next_bucket_execution_generation_in_txn(
+                    "put bucket encryption (allocate execution generation)",
+                )?;
+                let updated = store
+                    .conn
+                    .execute(
+                        "UPDATE buckets \
+                         SET default_encryption_type = ?1, \
+                             sse_c_blocked = ?2, \
+                             bucket_execution_generation = ?3 \
+                         WHERE name = ?4",
+                        params![
+                            config.default_encryption.map(|value| value as u8),
+                            i32::from(config.sse_c_blocked),
+                            generation as i64,
+                            name.as_str()
+                        ],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "put bucket encryption",
+                        source,
+                    })?;
+                if updated == 0 {
+                    return Err(bucket_not_found(name.as_str()));
+                }
+                Ok(())
+            },
+        )
     }
 
     fn get_bucket_encryption(

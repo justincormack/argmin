@@ -7,11 +7,14 @@ use crate::coordinator::bucket_handles::BucketHandleRequest;
 use crate::sse::SSE_CUSTOMER_ALGORITHM;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
 use std::thread;
+use std::time::Duration;
 use storage::{install_bucket_scoped_test_hooks, BucketScopedTestHooks};
 
 static STORAGE_TEST_HOOK_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, PartialEq, Eq)]
 enum LockWaitEvent {
@@ -1884,17 +1887,18 @@ fn head_object_does_not_wait_for_bucket_pg_when_boe_policy_and_abac_tags_fast_pa
         .unwrap();
     assert!(admin
         .get_bucket_fast_path(&trusted_bucket_name(bucket))
-        .is_none());
+        .is_some());
 }
 
 #[test]
-fn head_object_reloads_after_boe_policy_mutation_clears_fast_path() {
+fn head_object_reloads_after_boe_policy_mutation_rebuilds_fast_path() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-head-policy-cold-fallback";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
     let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
     let reader = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let reader_after_reload = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
 
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
@@ -1917,6 +1921,7 @@ fn head_object_reloads_after_boe_policy_mutation_clears_fast_path() {
     .unwrap();
 
     let key = find_key_with_object_pg_ne_bucket_pg(&admin, bucket, "head-policy-cold");
+    let key_after_reload = key.clone();
     test_helpers::put_object(
         &admin,
         &PutObjectRequest {
@@ -1960,41 +1965,115 @@ fn head_object_reloads_after_boe_policy_mutation_clears_fast_path() {
         None,
     )
     .unwrap();
-    assert!(reader
+    let cached = reader
         .get_bucket_fast_path(&trusted_bucket_name(bucket))
-        .is_none());
+        .expect("policy mutation should leave cached entry in place");
+    let raw = storage_node
+        .test_head_bucket_raw(&trusted_bucket_name(bucket))
+        .expect("policy mutation should leave bucket metadata readable");
+    assert!(
+        raw.bucket_execution_generation > cached.bucket_execution_generation,
+        "bucket execution generation should advance on policy mutation"
+    );
+    assert_eq!(
+        reader.bucket_fast_path_is_fresh_for_test(&trusted_bucket_name(bucket)),
+        Some(false),
+        "same-process policy mutation should immediately mark the cached BOE entry stale"
+    );
 
-    let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap();
-    let (event_tx, event_rx) = mpsc::channel::<LockWaitEvent>();
-    let event_tx_fast_path = event_tx.clone();
-    let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
-        bucket: Some(bucket.to_string()),
-        before_storage_load: Some(Arc::new(move || {
-            let _ = event_tx.send(LockWaitEvent::Progress);
-        })),
-        after_policy_fast_path_hit: Some(Arc::new(move || {
-            let _ = event_tx_fast_path.send(LockWaitEvent::UnexpectedStorageLoad);
-        })),
-    });
+    {
+        let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let saw_storage_load = Arc::new(AtomicBool::new(false));
+        let saw_fast_path = Arc::new(AtomicBool::new(false));
+        let saw_storage_load_hook = Arc::clone(&saw_storage_load);
+        let saw_fast_path_hook = Arc::clone(&saw_fast_path);
+        let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
+            bucket: Some(bucket.to_string()),
+            before_storage_load: Some(Arc::new(move || {
+                saw_storage_load_hook.store(true, Ordering::SeqCst);
+            })),
+            after_policy_fast_path_hit: Some(Arc::new(move || {
+                saw_fast_path_hook.store(true, Ordering::SeqCst);
+            })),
+        });
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let res = reader.head_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    bucket,
+                    &key,
+                    None,
+                    test_requester(),
+                    None,
+                ),
+                cond: NO_READ,
+            });
+            tx.send(res).unwrap();
+        });
+        let head = rx
+            .recv_timeout(TEST_EVENT_TIMEOUT)
+            .expect("head_object should complete after storage reload")
+            .unwrap();
+        assert!(
+            saw_storage_load.load(Ordering::SeqCst),
+            "first read after policy mutation should reload from storage"
+        );
+        assert_eq!(head.size, 4);
+        handle.join().unwrap();
+    }
 
-    let head = reader
-        .head_object(&GetObjectRequest {
-            sse_customer: None,
-            object: object_version_request_with_expected_owner(
-                bucket,
-                &key,
-                None,
-                test_requester(),
-                None,
-            ),
-            cond: NO_READ,
-        })
-        .unwrap();
-    assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
-    assert_eq!(head.size, 4);
+    {
+        let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let saw_storage_load = Arc::new(AtomicBool::new(false));
+        let saw_fast_path = Arc::new(AtomicBool::new(false));
+        let saw_storage_load_hook = Arc::clone(&saw_storage_load);
+        let saw_fast_path_hook = Arc::clone(&saw_fast_path);
+        let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
+            bucket: Some(bucket.to_string()),
+            before_storage_load: Some(Arc::new(move || {
+                saw_storage_load_hook.store(true, Ordering::SeqCst);
+            })),
+            after_policy_fast_path_hit: Some(Arc::new(move || {
+                saw_fast_path_hook.store(true, Ordering::SeqCst);
+            })),
+        });
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let res = reader_after_reload.head_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    bucket,
+                    &key_after_reload,
+                    None,
+                    test_requester(),
+                    None,
+                ),
+                cond: NO_READ,
+            });
+            tx.send(res).unwrap();
+        });
+        let head = rx
+            .recv_timeout(TEST_EVENT_TIMEOUT)
+            .expect("head_object should complete from rebuilt fast path")
+            .unwrap();
+        assert!(
+            !saw_storage_load.load(Ordering::SeqCst),
+            "rebuilt BOE entry should not reload from storage on the next read"
+        );
+        assert!(
+            saw_fast_path.load(Ordering::SeqCst),
+            "rebuilt BOE entry should serve the next read from the fast path"
+        );
+        assert_eq!(head.size, 4);
+        handle.join().unwrap();
+    }
 }
 
 #[test]
@@ -2078,7 +2157,366 @@ fn production_constructors_share_bucket_fast_path_cache_across_coordinators() {
 
     assert!(reader
         .get_bucket_fast_path(&trusted_bucket_name(bucket))
-        .is_none());
+        .is_some());
+
+    let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let (event_tx, event_rx) = mpsc::channel::<LockWaitEvent>();
+    let event_tx_fast_path = event_tx.clone();
+    let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
+        bucket: Some(bucket.to_string()),
+        before_storage_load: Some(Arc::new(move || {
+            let _ = event_tx.send(LockWaitEvent::Progress);
+        })),
+        after_policy_fast_path_hit: Some(Arc::new(move || {
+            let _ = event_tx_fast_path.send(LockWaitEvent::UnexpectedStorageLoad);
+        })),
+    });
+    let err = reader
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "key",
+                None,
+                test_helpers::requester("444455556666"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
+    assert!(matches!(err, ServerError::AccessDenied));
+}
+
+#[test]
+fn bucket_fast_path_watcher_observes_direct_storage_policy_mutation() {
+    let tmp = test_util::tempdir();
+    let bucket = "bucket-fast-path-watch-direct-policy";
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+    let admin = setup_direct_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let reader = setup_direct_coordinator_with_shared_storage(Arc::clone(&storage_node));
+
+    admin
+        .create_bucket_for_owner("111122223333", bucket, false)
+        .unwrap();
+    put_bucket_ownership_controls_test(
+        &admin,
+        bucket,
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+    put_bucket_policy_test(
+        &admin,
+        bucket,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket-fast-path-watch-direct-policy/*"}]}"#,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+    test_helpers::put_object(
+        &admin,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                bucket,
+                "key",
+                test_helpers::requester("111122223333"),
+                None,
+            ),
+            data: b"data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    reader
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "key",
+                None,
+                test_helpers::requester("444455556666"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    let bucket_name = trusted_bucket_name(bucket);
+    assert_eq!(
+        reader.bucket_fast_path_is_fresh_for_test(&bucket_name),
+        Some(true)
+    );
+
+    storage_node
+        .delete_bucket_subresource_and_load_info(
+            &bucket_name,
+            storage::BucketSubresourceKind::Policy,
+        )
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    while reader.bucket_fast_path_is_fresh_for_test(&bucket_name) != Some(false) {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "bucket fast path watcher did not observe direct storage policy mutation"
+        );
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let (event_tx, event_rx) = mpsc::channel::<LockWaitEvent>();
+    let event_tx_fast_path = event_tx.clone();
+    let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
+        bucket: Some(bucket.to_string()),
+        before_storage_load: Some(Arc::new(move || {
+            let _ = event_tx.send(LockWaitEvent::Progress);
+        })),
+        after_policy_fast_path_hit: Some(Arc::new(move || {
+            let _ = event_tx_fast_path.send(LockWaitEvent::UnexpectedStorageLoad);
+        })),
+    });
+    let err = reader
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "key",
+                None,
+                test_helpers::requester("444455556666"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
+    assert!(matches!(err, ServerError::AccessDenied));
+}
+
+#[test]
+fn bucket_fast_path_watcher_observes_direct_storage_delete_recreate() {
+    let tmp = test_util::tempdir();
+    let bucket = "bucket-fast-path-watch-direct-recreate";
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+    let admin = setup_direct_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let reader = setup_direct_coordinator_with_shared_storage(Arc::clone(&storage_node));
+
+    admin
+        .create_bucket_for_owner("111122223333", bucket, false)
+        .unwrap();
+    put_bucket_ownership_controls_test(
+        &admin,
+        bucket,
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+    let warm_err = reader
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "missing-key",
+                None,
+                test_helpers::requester("111122223333"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(warm_err, ServerError::ObjectNotFound { .. }),
+        "unexpected warm error: {warm_err:?}"
+    );
+    let bucket_name = trusted_bucket_name(bucket);
+    let cached_generation = reader
+        .get_bucket_fast_path(&bucket_name)
+        .expect("BOE read should warm cache")
+        .bucket_execution_generation;
+    assert_eq!(
+        reader.bucket_fast_path_is_fresh_for_test(&bucket_name),
+        Some(true)
+    );
+
+    storage_node.begin_bucket_delete(&bucket_name).unwrap();
+    storage_node.delete_bucket_metadata(&bucket_name).unwrap();
+    let recreated_owner = CanonicalUserId::from_principal("777788889999");
+    storage_node
+        .create_bucket_with_config_and_load_info(&storage::CreateBucketConfig {
+            name: bucket,
+            owner_principal: "777788889999",
+            owner_canonical_id: &recreated_owner,
+            acl_grants: &AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            versioning: BucketVersioningState::Disabled,
+            object_lock: BucketObjectLockConfig::default(),
+        })
+        .unwrap();
+    let recreated = storage_node.test_head_bucket_raw(&bucket_name).unwrap();
+    assert!(
+        recreated.bucket_execution_generation > cached_generation,
+        "delete/recreate must advance authoritative bucket execution generation"
+    );
+
+    let start = std::time::Instant::now();
+    while reader.bucket_fast_path_is_fresh_for_test(&bucket_name) != Some(false) {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "bucket fast path watcher did not observe direct storage delete/recreate"
+        );
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let (event_tx, event_rx) = mpsc::channel::<LockWaitEvent>();
+    let event_tx_fast_path = event_tx.clone();
+    let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
+        bucket: Some(bucket.to_string()),
+        before_storage_load: Some(Arc::new(move || {
+            let _ = event_tx.send(LockWaitEvent::Progress);
+        })),
+        after_policy_fast_path_hit: Some(Arc::new(move || {
+            let _ = event_tx_fast_path.send(LockWaitEvent::UnexpectedStorageLoad);
+        })),
+    });
+    let err = reader
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "missing-key",
+                None,
+                test_helpers::requester("111122223333"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
+    assert!(matches!(err, ServerError::AccessDenied));
+}
+
+#[test]
+fn bucket_fast_path_watcher_recovers_after_observing_missing_bucket_before_recreate() {
+    let tmp = test_util::tempdir();
+    let bucket = "bucket-fast-path-watch-delete-then-recreate";
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+    let admin = setup_direct_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let reader = setup_direct_coordinator_with_shared_storage(Arc::clone(&storage_node));
+
+    admin
+        .create_bucket_for_owner("111122223333", bucket, false)
+        .unwrap();
+    put_bucket_ownership_controls_test(
+        &admin,
+        bucket,
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+
+    let warm_err = reader
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "missing-key",
+                None,
+                test_helpers::requester("111122223333"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(warm_err, ServerError::ObjectNotFound { .. }),
+        "unexpected warm error: {warm_err:?}"
+    );
+    let bucket_name = trusted_bucket_name(bucket);
+    assert!(
+        reader.get_bucket_fast_path(&bucket_name).is_some(),
+        "BOE read should warm cache"
+    );
+
+    storage_node.begin_bucket_delete(&bucket_name).unwrap();
+    storage_node.delete_bucket_metadata(&bucket_name).unwrap();
+
+    let start = std::time::Instant::now();
+    while reader.get_bucket_fast_path(&bucket_name).is_some() {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "bucket fast path watcher did not remove cache entry after direct delete"
+        );
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let recreated_owner = CanonicalUserId::from_principal("111122223333");
+    storage_node
+        .create_bucket_with_config_and_load_info(&storage::CreateBucketConfig {
+            name: bucket,
+            owner_principal: "111122223333",
+            owner_canonical_id: &recreated_owner,
+            acl_grants: &AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            versioning: BucketVersioningState::Disabled,
+            object_lock: BucketObjectLockConfig::default(),
+        })
+        .unwrap();
+    storage_node
+        .put_bucket_ownership_controls_and_load_info(
+            &bucket_name,
+            BucketOwnershipControls {
+                object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
+            },
+        )
+        .unwrap();
+
+    let reload_err = reader
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "missing-key",
+                None,
+                test_helpers::requester("111122223333"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(reload_err, ServerError::ObjectNotFound { .. }),
+        "unexpected reload error: {reload_err:?}"
+    );
+    assert_eq!(
+        reader.bucket_fast_path_is_fresh_for_test(&bucket_name),
+        Some(true),
+        "recreated bucket should repopulate a fresh BOE fast-path entry"
+    );
 }
 
 #[test]
@@ -2166,7 +2604,37 @@ fn put_bucket_tags_invalidates_warm_fast_path_tags() {
 
     assert!(coord
         .get_bucket_fast_path(&trusted_bucket_name(bucket))
-        .is_none());
+        .is_some());
+
+    let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let (event_tx, event_rx) = mpsc::channel::<LockWaitEvent>();
+    let event_tx_fast_path = event_tx.clone();
+    let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
+        bucket: Some(bucket.to_string()),
+        before_storage_load: Some(Arc::new(move || {
+            let _ = event_tx.send(LockWaitEvent::Progress);
+        })),
+        after_policy_fast_path_hit: Some(Arc::new(move || {
+            let _ = event_tx_fast_path.send(LockWaitEvent::UnexpectedStorageLoad);
+        })),
+    });
+    coord
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                &key,
+                None,
+                test_helpers::requester(owner_account),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
 }
 
 #[test]

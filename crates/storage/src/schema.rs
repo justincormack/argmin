@@ -376,6 +376,7 @@ CREATE TABLE IF NOT EXISTS buckets (
     bucket_policy_public INTEGER NOT NULL DEFAULT 0 CHECK (bucket_policy_public IN (0, 1)),
     bucket_policy_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_policy_generation >= 0),
     bucket_lifecycle_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_lifecycle_generation >= 0),
+    bucket_execution_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_execution_generation >= 0),
     completed_multipart_upload_sequence INTEGER NOT NULL DEFAULT 0 CHECK (completed_multipart_upload_sequence >= 0),
     bucket_abac_enabled INTEGER NOT NULL DEFAULT 0 CHECK (bucket_abac_enabled IN (0, 1)),
     default_encryption_type INTEGER CHECK (
@@ -398,6 +399,13 @@ CREATE TABLE IF NOT EXISTS buckets (
 /// Index for bucket listing by owner and bucket name.
 const CREATE_BUCKETS_OWNER_LIST_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_buckets_owner_list ON buckets (owner_principal, name)";
+
+/// Per-PG monotonic counters for bucket execution freshness.
+const CREATE_PG_COUNTERS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS pg_counters (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
+    next_bucket_execution_generation INTEGER NOT NULL DEFAULT 0 CHECK (next_bucket_execution_generation >= 0)
+)";
 
 /// Bucket-scoped opaque subresource storage.
 const CREATE_BUCKET_SUBRESOURCES_TABLE: &str = "\
@@ -454,6 +462,13 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_MULTIPART_PART_CHUNKS_VERSION_INDEX, [])?;
     conn.execute(CREATE_BUCKETS_TABLE, [])?;
     conn.execute(CREATE_BUCKETS_OWNER_LIST_INDEX, [])?;
+    conn.execute(CREATE_PG_COUNTERS_TABLE, [])?;
+    conn.execute(
+        "INSERT INTO pg_counters (singleton, next_bucket_execution_generation) \
+         VALUES (0, 0) \
+         ON CONFLICT(singleton) DO NOTHING",
+        [],
+    )?;
     conn.execute(CREATE_BUCKET_SUBRESOURCES_TABLE, [])?;
     conn.execute(CREATE_BUCKET_SUBRESOURCES_KIND_BUCKET_INDEX, [])?;
     conn.execute(CREATE_OBJECT_PARTS_OFFSET_INDEX, [])?;

@@ -1469,8 +1469,9 @@ Acceptance criteria:
   need and pinned by tests
 - BOE read fast-path entries are populated in one canonical way from a real
   bucket snapshot rather than through later warming/promotion
-- before pull freshness lands, bucket mutations may remove fast-path entries
-  rather than attempting partial in-place downgrades
+- once pull freshness lands, bucket mutations should normally leave cached BOE
+  entries in place and only advance the locally known execution generation
+  rather than eagerly removing the entry
 - any request family that uses the fast path preserves the request-scoped
   snapshot guarantees established by the handle model
 - any request family that cannot preserve those guarantees is documented as
@@ -1538,6 +1539,20 @@ The intended implementation order is:
 3. add a background watcher that batches cached-bucket generation checks by PG
 4. switch BOE reads to compare materialized generation against known generation
    before deciding whether to reuse or rebuild the cached entry
+
+Current landing shape:
+
+- `bucket_execution_generation` is persisted in bucket metadata and updated in
+  the same transaction as bucket metadata and subresource mutations
+- cached BOE entries keep both:
+  - the generation they were materialized from
+  - the latest generation currently known to this process
+- same-process bucket mutations advance the locally known generation rather than
+  removing the cached entry
+- a background watcher polls only cached buckets, batches them by bucket PG,
+  and updates locally known generations from authoritative storage metadata
+- BOE read hits compare materialized generation against locally known
+  generation and reload from a real snapshot only when stale
 
 ### Phase 11: Bucket Policy Residualization for Hot Paths
 

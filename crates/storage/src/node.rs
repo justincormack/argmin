@@ -430,6 +430,10 @@ impl SharedStorageNode {
         &self.pg_topology
     }
 
+    pub fn bucket_pg_id_for(&self, bucket: &BucketName) -> u32 {
+        self.pg_topology.bucket_pg_for(bucket)
+    }
+
     fn bucket_lock_index(&self, bucket: &BucketName) -> usize {
         (rapidhash_v3_micro_inline::<true, false>(bucket.as_str().as_bytes(), &RAPIDHASH_SECRETS)
             as usize)
@@ -533,7 +537,7 @@ impl SharedStorageNode {
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_bucket_pg_id_for(&self, bucket: &BucketName) -> u32 {
-        self.pg_topology.bucket_pg_for(bucket)
+        self.bucket_pg_id_for(bucket)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
