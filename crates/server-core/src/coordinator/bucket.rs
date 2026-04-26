@@ -41,7 +41,7 @@ impl Coordinator {
     }
 
     fn clear_bucket_fast_path(&self, bucket: &storage::BucketName) {
-        self.storage_node.remove_bucket_fast_path(bucket);
+        self.remove_bucket_fast_path(bucket);
     }
 
     fn map_bucket_write_drain_error(err: storage::BucketWriteDrainError) -> ServerError {
@@ -301,7 +301,7 @@ impl Coordinator {
         self.storage_node
             .begin_bucket_delete(&name)
             .map_err(Self::map_bucket_write_drain_error)?;
-        self.storage_node.remove_bucket_fast_path(&name);
+        self.remove_bucket_fast_path(&name);
         self.clear_bucket_policy_cache(&name);
         self.clear_bucket_lifecycle_cache(&name);
         self.read_runtime()

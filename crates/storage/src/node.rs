@@ -3,10 +3,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::{Arc, OnceLock};
-use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 
 use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
@@ -22,11 +22,11 @@ use crate::pg_store::PgStore;
 use crate::pg_topology::PgTopology;
 use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 use crate::types::{
-    AbortMultipartUploadLookup, BucketFastPathInfo, BucketInfo, BucketName, BucketSnapshot,
-    BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState,
-    BucketSubresourceKind, CreateStreamUploadReq, FinalizeStreamPartOutcome, GenerationId,
-    ListMultipartUploadsReq, ListObjectVersionsReq, ListPartsReq, ListedBucketMultipartUploads,
-    ListedBucketObjectVersions, ListedBucketObjects, ListedMultipartParts, LoadedBucketSubresource,
+    AbortMultipartUploadLookup, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
+    BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind,
+    CreateStreamUploadReq, FinalizeStreamPartOutcome, GenerationId, ListMultipartUploadsReq,
+    ListObjectVersionsReq, ListPartsReq, ListedBucketMultipartUploads, ListedBucketObjectVersions,
+    ListedBucketObjects, ListedMultipartParts, LoadedBucketSubresource,
     MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
     MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, ObjectReadSnapshot,
     ObjectReadSnapshotOutcome, PreparedStreamPartCommit, SessionId, ShardKey, StoredObject,
@@ -44,8 +44,6 @@ const TRACE_TARGET: &str = "storage";
 const RAPIDHASH_SECRETS: RapidSecrets = RapidSecrets::seed(0);
 const LOCK_WAIT_EVENT_THRESHOLD_US: u128 = 1_000;
 const RECLAIM_WORKER_WAIT_POLL_MILLIS: u64 = 100;
-const BUCKET_FAST_PATH_MAX_ENTRIES: usize = 1024;
-
 mod bucket_ops;
 mod listing_ops;
 mod multipart_ops;
@@ -53,14 +51,6 @@ mod object_delete_ops;
 mod object_metadata_ops;
 mod object_read_ops;
 mod stream_ops;
-
-fn write_rwlock_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
-    lock.write().unwrap_or_else(|err| err.into_inner())
-}
-
-fn read_rwlock_unpoisoned<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
-    lock.read().unwrap_or_else(|err| err.into_inner())
-}
 
 struct PgDataPaths {
     shards_dir: PathBuf,
@@ -327,7 +317,6 @@ pub struct SharedStorageNode {
     bucket_locks: Vec<Mutex<()>>,
     bucket_coordination: Vec<(Mutex<u64>, Condvar)>,
     multipart_completion_locks: Vec<Mutex<()>>,
-    bucket_fast_path: RwLock<BucketFastPathCache>,
     object_payload_leases: Mutex<HashMap<(BucketName, ObjectKey, GenerationId), usize>>,
     reclaim_queue: (Mutex<ReclaimQueueState>, Condvar),
 }
@@ -358,82 +347,6 @@ struct ReclaimQueueState {
     queued_objects: HashSet<ReclaimRoot>,
     bucket_delete_queue: VecDeque<BucketName>,
     queued_bucket_deletes: HashSet<BucketName>,
-}
-
-#[derive(Debug, Default)]
-struct BucketFastPathCache {
-    entries: HashMap<BucketName, BucketFastPathCacheEntry>,
-    next_touch: AtomicU64,
-}
-
-#[derive(Debug)]
-struct BucketFastPathCacheEntry {
-    info: BucketFastPathInfo,
-    last_used_tick: AtomicU64,
-}
-
-impl BucketFastPathCacheEntry {
-    fn new(info: BucketFastPathInfo, last_used_tick: u64) -> Self {
-        Self {
-            info,
-            last_used_tick: AtomicU64::new(last_used_tick),
-        }
-    }
-
-    fn record_hit(&self, tick: u64) {
-        let mut observed = self.last_used_tick.load(Ordering::Relaxed);
-        while observed < tick {
-            match self.last_used_tick.compare_exchange_weak(
-                observed,
-                tick,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => observed = actual,
-            }
-        }
-    }
-}
-
-impl BucketFastPathCache {
-    fn next_tick(&self) -> u64 {
-        self.next_touch
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1)
-    }
-
-    fn get(&self, bucket: &BucketName) -> Option<BucketFastPathInfo> {
-        let entry = self.entries.get(bucket)?;
-        entry.record_hit(self.next_tick());
-        Some(entry.info.clone())
-    }
-
-    fn insert(&mut self, info: BucketFastPathInfo) {
-        let tick = self.next_tick();
-        let bucket = info.name.clone();
-        self.entries
-            .insert(bucket, BucketFastPathCacheEntry::new(info, tick));
-        self.evict_if_needed();
-    }
-
-    fn remove(&mut self, bucket: &BucketName) {
-        self.entries.remove(bucket);
-    }
-
-    fn evict_if_needed(&mut self) {
-        while self.entries.len() > BUCKET_FAST_PATH_MAX_ENTRIES {
-            let Some(lru_bucket) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used_tick.load(Ordering::Relaxed))
-                .map(|(bucket, _)| bucket.clone())
-            else {
-                break;
-            };
-            self.entries.remove(&lru_bucket);
-        }
-    }
 }
 
 const BUCKET_LOCK_STRIPES: usize = 256;
@@ -490,7 +403,6 @@ impl SharedStorageNode {
             bucket_locks,
             bucket_coordination,
             multipart_completion_locks,
-            bucket_fast_path: RwLock::new(BucketFastPathCache::default()),
             object_payload_leases: Mutex::new(HashMap::new()),
             reclaim_queue: (
                 Mutex::new(ReclaimQueueState {
@@ -530,21 +442,6 @@ impl SharedStorageNode {
         let mut generation = generation_lock.lock().unwrap();
         *generation += 1;
         generation_cvar.notify_all();
-    }
-
-    /// Return the cached active-bucket fast-path metadata for `bucket`.
-    pub fn get_bucket_fast_path(&self, bucket: &BucketName) -> Option<BucketFastPathInfo> {
-        read_rwlock_unpoisoned(&self.bucket_fast_path).get(bucket)
-    }
-
-    /// Insert or replace the cached active-bucket fast-path metadata.
-    pub fn upsert_bucket_fast_path(&self, info: BucketFastPathInfo) {
-        write_rwlock_unpoisoned(&self.bucket_fast_path).insert(info);
-    }
-
-    /// Remove cached fast-path metadata for `bucket`.
-    pub fn remove_bucket_fast_path(&self, bucket: &BucketName) {
-        write_rwlock_unpoisoned(&self.bucket_fast_path).remove(bucket);
     }
 
     /// Lock a bucket-scoped stripe mutex.
@@ -1574,39 +1471,12 @@ impl SharedStorageNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::panic::AssertUnwindSafe;
     use std::sync::{mpsc, Arc, OnceLock};
 
     static STORAGE_TEST_HOOK_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn bucket_name(name: &str) -> BucketName {
         BucketName::try_from(name).unwrap()
-    }
-
-    fn bucket_fast_path_info(name: &str) -> BucketFastPathInfo {
-        BucketFastPathInfo {
-            name: bucket_name(name),
-            owner_principal: "owner".to_string(),
-            owner_canonical_id: s3_types::CanonicalUserId::from_principal("owner"),
-            created_at: 0,
-            state: crate::types::BucketState::Active,
-            versioning: s3_types::BucketVersioningState::Disabled,
-            object_lock: s3_types::BucketObjectLockConfig {
-                enabled: false,
-                default_retention: None,
-            },
-            public_access_block: None,
-            ownership_controls: None,
-            bucket_policy_present: false,
-            bucket_policy_public: false,
-            bucket_policy_generation: 0,
-            policy: crate::types::BucketFastPathPolicy::Absent,
-            bucket_lifecycle_present: false,
-            bucket_lifecycle_generation: 0,
-            bucket_abac_enabled: false,
-            tags: crate::types::BucketFastPathTags::NotApplicable,
-            encryption: crate::types::EffectiveBucketEncryptionConfig::default(),
-        }
     }
 
     #[test]
@@ -1665,58 +1535,6 @@ mod tests {
         let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
         assert_eq!(node.data_dir(), tmp.path());
-    }
-
-    #[test]
-    fn shared_node_bucket_fast_path_recovers_from_poisoned_lock() {
-        let tmp = test_util::tempdir();
-        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
-        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let _guard = node.bucket_fast_path.write().unwrap();
-            panic!("poison bucket fast path lock");
-        }));
-
-        node.upsert_bucket_fast_path(bucket_fast_path_info("bucket"));
-        assert_eq!(
-            node.get_bucket_fast_path(&bucket_name("bucket"))
-                .as_ref()
-                .map(|entry| entry.name.as_str()),
-            Some("bucket")
-        );
-        node.remove_bucket_fast_path(&bucket_name("bucket"));
-        assert!(node.get_bucket_fast_path(&bucket_name("bucket")).is_none());
-    }
-
-    #[test]
-    fn shared_node_bucket_fast_path_is_count_bounded_with_read_hit_recency() {
-        let tmp = test_util::tempdir();
-        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
-
-        for idx in 0..BUCKET_FAST_PATH_MAX_ENTRIES {
-            node.upsert_bucket_fast_path(bucket_fast_path_info(&format!("bucket-{idx:04}")));
-        }
-
-        assert!(node
-            .get_bucket_fast_path(&bucket_name("bucket-0000"))
-            .is_some());
-
-        node.upsert_bucket_fast_path(bucket_fast_path_info(&format!(
-            "bucket-{:04}",
-            BUCKET_FAST_PATH_MAX_ENTRIES
-        )));
-
-        assert!(node
-            .get_bucket_fast_path(&bucket_name("bucket-0000"))
-            .is_some());
-        assert!(node
-            .get_bucket_fast_path(&bucket_name("bucket-0001"))
-            .is_none());
-        assert!(node
-            .get_bucket_fast_path(&bucket_name(&format!(
-                "bucket-{:04}",
-                BUCKET_FAST_PATH_MAX_ENTRIES
-            )))
-            .is_some());
     }
 
     #[test]

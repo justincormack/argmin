@@ -2036,7 +2036,7 @@ impl Coordinator {
             .requiring_policy_view()
             .requiring_bucket_tags_if_abac_enabled();
 
-        if let Some(info) = self.storage_node.get_bucket_fast_path(bucket) {
+        if let Some(info) = self.get_bucket_fast_path(bucket) {
             if info.state != BucketState::Active {
                 return Err(ServerError::BucketNotFound {
                     name: bucket.to_string(),
@@ -2089,8 +2089,7 @@ impl Coordinator {
         let bucket_is_boe =
             Self::is_bucket_owner_enforced(snapshot.bucket.ownership_controls.as_ref());
         if bucket_is_boe {
-            self.storage_node
-                .upsert_bucket_fast_path((&snapshot).into());
+            self.upsert_bucket_fast_path((&snapshot).into());
         }
         self.bucket_handle_loader()
             .load_bucket_handle_from_snapshot(snapshot, expected_bucket_owner, request)

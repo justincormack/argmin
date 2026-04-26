@@ -14,7 +14,7 @@ use super::response_types::{BucketSummary, ModernBucketSummary};
 use super::runtime::{LifecycleSweeper, ReclaimSweeper};
 #[cfg(test)]
 use super::trusted_bucket_name;
-use super::Coordinator;
+use super::{shared_caches_for_storage_node, Coordinator, CoordinatorSharedCaches};
 use crate::error::ServerError;
 #[cfg(test)]
 use crate::pg::PgTopology;
@@ -233,8 +233,9 @@ impl Coordinator {
             |storage_node: &Arc<SharedStorageNode>, read_runtime: ReadRuntime| {
                 LifecycleSweeper::acquire_shared(storage_node, read_runtime)
             };
-        Self::new_with_lifecycle_sweeper_factory(
-            storage_node,
+        Self::new_with_shared_caches_and_lifecycle_sweeper_factory(
+            Arc::clone(&storage_node),
+            shared_caches_for_storage_node(&storage_node),
             ec_config,
             region,
             sse_c_validator,
@@ -255,8 +256,9 @@ impl Coordinator {
             |storage_node: &Arc<SharedStorageNode>, read_runtime: ReadRuntime| {
                 LifecycleSweeper::acquire_shared(storage_node, read_runtime)
             };
-        Self::new_with_lifecycle_sweeper_factory(
-            storage_node,
+        Self::new_with_shared_caches_and_lifecycle_sweeper_factory(
+            Arc::clone(&storage_node),
+            shared_caches_for_storage_node(&storage_node),
             ec_config,
             region,
             sse_c_validator,
@@ -265,8 +267,35 @@ impl Coordinator {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn new_with_lifecycle_sweeper_factory<F>(
         storage_node: Arc<SharedStorageNode>,
+        ec_config: EcConfig,
+        region: String,
+        sse_c_validator: Option<SseCustomerValidatorConfig>,
+        managed_key_provider: Option<StaticManagedKeyProvider>,
+        lifecycle_sweeper_factory: F,
+    ) -> Result<Self, ServerError>
+    where
+        F: FnOnce(
+            &Arc<SharedStorageNode>,
+            ReadRuntime,
+        ) -> Result<Arc<LifecycleSweeper>, ServerError>,
+    {
+        Self::new_with_shared_caches_and_lifecycle_sweeper_factory(
+            Arc::clone(&storage_node),
+            shared_caches_for_storage_node(&storage_node),
+            ec_config,
+            region,
+            sse_c_validator,
+            managed_key_provider,
+            lifecycle_sweeper_factory,
+        )
+    }
+
+    pub(super) fn new_with_shared_caches_and_lifecycle_sweeper_factory<F>(
+        storage_node: Arc<SharedStorageNode>,
+        shared_caches: Arc<CoordinatorSharedCaches>,
         ec_config: EcConfig,
         region: String,
         sse_c_validator: Option<SseCustomerValidatorConfig>,
@@ -326,6 +355,7 @@ impl Coordinator {
         let sweeper_storage_node = Arc::clone(&storage_node);
         Ok(Self {
             storage_node,
+            shared_caches,
             bucket_policy_cache: RwLock::new(HashMap::new()),
             bucket_lifecycle_cache: RwLock::new(HashMap::new()),
             ec_codec,

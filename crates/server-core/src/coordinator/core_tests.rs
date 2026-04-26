@@ -21,6 +21,19 @@ enum LockWaitEvent {
     CompletedEarly,
 }
 
+fn setup_direct_coordinator_with_shared_storage(
+    storage_node: Arc<SharedStorageNode>,
+) -> Coordinator {
+    Coordinator::new_with_managed_key_provider(
+        storage_node,
+        EcConfig::default(),
+        "us-east-1".to_string(),
+        None,
+        test_sse_s3_provider(),
+    )
+    .unwrap()
+}
+
 #[test]
 fn lock_mutex_unpoisoned_recovers_after_panic() {
     let lock = Mutex::new(vec![1usize]);
@@ -1495,11 +1508,8 @@ fn head_object_lazily_populates_bucket_fast_path_for_boe_bucket() {
     )
     .unwrap();
 
-    coord
-        .storage_node
-        .remove_bucket_fast_path(&trusted_bucket_name("bucket"));
+    coord.remove_bucket_fast_path(&trusted_bucket_name("bucket"));
     assert!(coord
-        .storage_node
         .get_bucket_fast_path(&trusted_bucket_name("bucket"))
         .is_none());
 
@@ -1519,7 +1529,6 @@ fn head_object_lazily_populates_bucket_fast_path_for_boe_bucket() {
     assert_eq!(head.size, 4);
 
     let cached = coord
-        .storage_node
         .get_bucket_fast_path(&trusted_bucket_name("bucket"))
         .expect("head_object should populate BOE bucket fast path");
     assert_eq!(cached.name.as_str(), "bucket");
@@ -1557,7 +1566,7 @@ fn head_object_waits_for_bucket_pg_when_non_boe_bucket_fast_path_is_warm() {
     )
     .unwrap();
 
-    storage_node.remove_bucket_fast_path(&trusted_bucket_name(bucket));
+    reader.remove_bucket_fast_path(&trusted_bucket_name(bucket));
     reader
         .head_object(&GetObjectRequest {
             sse_customer: None,
@@ -1657,7 +1666,7 @@ fn head_object_does_not_wait_for_bucket_pg_when_boe_fast_path_is_warm() {
     )
     .unwrap();
 
-    storage_node.remove_bucket_fast_path(&trusted_bucket_name(bucket));
+    reader.remove_bucket_fast_path(&trusted_bucket_name(bucket));
     reader
         .head_object(&GetObjectRequest {
             sse_customer: None,
@@ -1789,7 +1798,7 @@ fn head_object_does_not_wait_for_bucket_pg_when_boe_policy_and_abac_tags_fast_pa
     )
     .unwrap();
 
-    storage_node.remove_bucket_fast_path(&trusted_bucket_name(bucket));
+    reader.remove_bucket_fast_path(&trusted_bucket_name(bucket));
     reader
         .head_object(&GetObjectRequest {
             sse_customer: None,
@@ -1804,7 +1813,7 @@ fn head_object_does_not_wait_for_bucket_pg_when_boe_policy_and_abac_tags_fast_pa
         })
         .unwrap();
 
-    let cached = storage_node
+    let cached = reader
         .get_bucket_fast_path(&trusted_bucket_name(bucket))
         .expect("head_object should populate policy/tag fast path");
     assert!(matches!(
@@ -1873,7 +1882,7 @@ fn head_object_does_not_wait_for_bucket_pg_when_boe_policy_and_abac_tags_fast_pa
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
         })
         .unwrap();
-    assert!(storage_node
+    assert!(admin
         .get_bucket_fast_path(&trusted_bucket_name(bucket))
         .is_none());
 }
@@ -1925,7 +1934,7 @@ fn head_object_reloads_after_boe_policy_mutation_clears_fast_path() {
     )
     .unwrap();
 
-    storage_node.remove_bucket_fast_path(&trusted_bucket_name(bucket));
+    reader.remove_bucket_fast_path(&trusted_bucket_name(bucket));
     reader
         .head_object(&GetObjectRequest {
             sse_customer: None,
@@ -1939,7 +1948,7 @@ fn head_object_reloads_after_boe_policy_mutation_clears_fast_path() {
             cond: NO_READ,
         })
         .unwrap();
-    assert!(storage_node
+    assert!(reader
         .get_bucket_fast_path(&trusted_bucket_name(bucket))
         .is_some());
 
@@ -1951,7 +1960,7 @@ fn head_object_reloads_after_boe_policy_mutation_clears_fast_path() {
         None,
     )
     .unwrap();
-    assert!(storage_node
+    assert!(reader
         .get_bucket_fast_path(&trusted_bucket_name(bucket))
         .is_none());
 
@@ -1986,6 +1995,90 @@ fn head_object_reloads_after_boe_policy_mutation_clears_fast_path() {
         .unwrap();
     assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
     assert_eq!(head.size, 4);
+}
+
+#[test]
+fn production_constructors_share_bucket_fast_path_cache_across_coordinators() {
+    let tmp = test_util::tempdir();
+    let bucket = "bucket-prod-shared-cache";
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+    let admin = setup_direct_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let reader = setup_direct_coordinator_with_shared_storage(Arc::clone(&storage_node));
+
+    admin
+        .create_bucket_for_owner("111122223333", bucket, false)
+        .unwrap();
+    put_bucket_ownership_controls_test(
+        &admin,
+        bucket,
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+    put_bucket_policy_test(
+        &admin,
+        bucket,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket-prod-shared-cache/*"}]}"#,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+    test_helpers::put_object(
+        &admin,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                bucket,
+                "key",
+                test_helpers::requester("111122223333"),
+                None,
+            ),
+            data: b"data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    reader
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "key",
+                None,
+                test_helpers::requester("444455556666"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert!(matches!(
+        reader
+            .get_bucket_fast_path(&trusted_bucket_name(bucket))
+            .expect("reader should warm shared fast path")
+            .policy,
+        storage::BucketFastPathPolicy::Loaded(_)
+    ));
+
+    admin
+        .delete_bucket_policy(&bucket_request_with_expected_owner(
+            bucket,
+            test_helpers::requester("111122223333"),
+            None,
+        ))
+        .unwrap();
+
+    assert!(reader
+        .get_bucket_fast_path(&trusted_bucket_name(bucket))
+        .is_none());
 }
 
 #[test]
@@ -2053,7 +2146,6 @@ fn put_bucket_tags_invalidates_warm_fast_path_tags() {
         .unwrap();
 
     let cached = coord
-        .storage_node
         .get_bucket_fast_path(&trusted_bucket_name(bucket))
         .expect("bucket fast path should be populated");
     assert!(matches!(
@@ -2073,7 +2165,6 @@ fn put_bucket_tags_invalidates_warm_fast_path_tags() {
         .unwrap();
 
     assert!(coord
-        .storage_node
         .get_bucket_fast_path(&trusted_bucket_name(bucket))
         .is_none());
 }
@@ -2109,7 +2200,7 @@ fn delete_object_falls_back_to_storage_load_when_bucket_fast_path_is_acl_free() 
     )
     .unwrap();
 
-    storage_node.remove_bucket_fast_path(&trusted_bucket_name(bucket));
+    deleter.remove_bucket_fast_path(&trusted_bucket_name(bucket));
     admin
         .head_object(&GetObjectRequest {
             sse_customer: None,

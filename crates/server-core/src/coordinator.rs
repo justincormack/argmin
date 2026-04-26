@@ -1,6 +1,9 @@
 /// Coordinator: orchestrates S3 operations across EC, storage, and metadata layers.
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
+};
 
 use checksum::{ChecksumAlgorithm, RawChecksum};
 #[cfg(test)]
@@ -158,6 +161,7 @@ pub const MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 pub const INTERNAL_SEGMENT_SIZE: usize = 8 * 1024 * 1024;
 
 const LIFECYCLE_SWEEP_INTERVAL_MILLIS: u64 = 1000;
+const BUCKET_FAST_PATH_MAX_ENTRIES: usize = 1024;
 
 /// Hard cap on total records fetched across all PGs for a single list query.
 /// Prevents unbounded memory when delimiter causes u32::MAX per-PG limits.
@@ -174,8 +178,108 @@ const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 /// Maximum number of parts in a multipart upload (matches AWS S3).
 const MAX_PARTS: usize = 10_000;
 
+#[derive(Debug, Default)]
+struct BucketFastPathCache {
+    entries: HashMap<BucketName, BucketFastPathCacheEntry>,
+    next_touch: AtomicU64,
+}
+
+#[derive(Debug)]
+struct BucketFastPathCacheEntry {
+    info: storage::BucketFastPathInfo,
+    last_used_tick: AtomicU64,
+}
+
+impl BucketFastPathCacheEntry {
+    fn new(info: storage::BucketFastPathInfo, last_used_tick: u64) -> Self {
+        Self {
+            info,
+            last_used_tick: AtomicU64::new(last_used_tick),
+        }
+    }
+
+    fn record_hit(&self, tick: u64) {
+        let mut observed = self.last_used_tick.load(Ordering::Relaxed);
+        while observed < tick {
+            match self.last_used_tick.compare_exchange_weak(
+                observed,
+                tick,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+}
+
+impl BucketFastPathCache {
+    fn next_tick(&self) -> u64 {
+        self.next_touch
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
+    }
+
+    fn get(&self, bucket: &BucketName) -> Option<storage::BucketFastPathInfo> {
+        let entry = self.entries.get(bucket)?;
+        entry.record_hit(self.next_tick());
+        Some(entry.info.clone())
+    }
+
+    fn insert(&mut self, info: storage::BucketFastPathInfo) {
+        let tick = self.next_tick();
+        let bucket = info.name.clone();
+        self.entries
+            .insert(bucket, BucketFastPathCacheEntry::new(info, tick));
+        self.evict_if_needed();
+    }
+
+    fn remove(&mut self, bucket: &BucketName) {
+        self.entries.remove(bucket);
+    }
+
+    fn evict_if_needed(&mut self) {
+        while self.entries.len() > BUCKET_FAST_PATH_MAX_ENTRIES {
+            let Some(lru_bucket) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used_tick.load(Ordering::Relaxed))
+                .map(|(bucket, _)| bucket.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&lru_bucket);
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct CoordinatorSharedCaches {
+    bucket_fast_path: RwLock<BucketFastPathCache>,
+}
+
+fn shared_caches_for_storage_node(
+    storage_node: &Arc<SharedStorageNode>,
+) -> Arc<CoordinatorSharedCaches> {
+    static SHARED_COORDINATOR_CACHES: OnceLock<
+        Mutex<HashMap<usize, Weak<CoordinatorSharedCaches>>>,
+    > = OnceLock::new();
+
+    let key = Arc::as_ptr(storage_node) as usize;
+    let registry = SHARED_COORDINATOR_CACHES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = lock_mutex_unpoisoned(registry);
+    if let Some(existing) = guard.get(&key).and_then(Weak::upgrade) {
+        return existing;
+    }
+    let shared = Arc::new(CoordinatorSharedCaches::default());
+    guard.insert(key, Arc::downgrade(&shared));
+    shared
+}
+
 pub struct Coordinator {
     storage_node: Arc<SharedStorageNode>,
+    shared_caches: Arc<CoordinatorSharedCaches>,
     bucket_policy_cache: RwLock<HashMap<BucketName, CachedBucketPolicy>>,
     bucket_lifecycle_cache: RwLock<HashMap<BucketName, CachedBucketLifecycle>>,
     ec_codec: Arc<ErasureCodec>,
@@ -192,6 +296,100 @@ pub struct Coordinator {
 impl Coordinator {
     fn now_millis() -> u64 {
         storage::clock::current_time_millis()
+    }
+
+    pub(super) fn get_bucket_fast_path(
+        &self,
+        bucket: &BucketName,
+    ) -> Option<storage::BucketFastPathInfo> {
+        read_rwlock_unpoisoned(&self.shared_caches.bucket_fast_path).get(bucket)
+    }
+
+    pub(super) fn upsert_bucket_fast_path(&self, info: storage::BucketFastPathInfo) {
+        write_rwlock_unpoisoned(&self.shared_caches.bucket_fast_path).insert(info);
+    }
+
+    pub(super) fn remove_bucket_fast_path(&self, bucket: &BucketName) {
+        write_rwlock_unpoisoned(&self.shared_caches.bucket_fast_path).remove(bucket);
+    }
+}
+
+#[cfg(test)]
+mod bucket_fast_path_cache_tests {
+    use super::*;
+    use std::panic::AssertUnwindSafe;
+
+    fn bucket_fast_path_info(name: &str) -> storage::BucketFastPathInfo {
+        storage::BucketFastPathInfo {
+            name: trusted_bucket_name(name),
+            owner_principal: "owner".to_string(),
+            owner_canonical_id: s3_types::CanonicalUserId::from_principal("owner"),
+            created_at: 0,
+            state: storage::BucketState::Active,
+            versioning: s3_types::BucketVersioningState::Disabled,
+            object_lock: s3_types::BucketObjectLockConfig {
+                enabled: false,
+                default_retention: None,
+            },
+            public_access_block: None,
+            ownership_controls: None,
+            bucket_policy_present: false,
+            bucket_policy_public: false,
+            bucket_policy_generation: 0,
+            policy: storage::BucketFastPathPolicy::Absent,
+            bucket_lifecycle_present: false,
+            bucket_lifecycle_generation: 0,
+            bucket_abac_enabled: false,
+            tags: storage::BucketFastPathTags::NotApplicable,
+            encryption: storage::EffectiveBucketEncryptionConfig::default(),
+        }
+    }
+
+    #[test]
+    fn shared_bucket_fast_path_recovers_from_poisoned_lock() {
+        let shared = CoordinatorSharedCaches::default();
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = shared.bucket_fast_path.write().unwrap();
+            panic!("poison bucket fast path lock");
+        }));
+
+        write_rwlock_unpoisoned(&shared.bucket_fast_path).insert(bucket_fast_path_info("bucket"));
+        assert_eq!(
+            read_rwlock_unpoisoned(&shared.bucket_fast_path)
+                .get(&trusted_bucket_name("bucket"))
+                .as_ref()
+                .map(|entry| entry.name.as_str()),
+            Some("bucket")
+        );
+        write_rwlock_unpoisoned(&shared.bucket_fast_path).remove(&trusted_bucket_name("bucket"));
+        assert!(read_rwlock_unpoisoned(&shared.bucket_fast_path)
+            .get(&trusted_bucket_name("bucket"))
+            .is_none());
+    }
+
+    #[test]
+    fn shared_bucket_fast_path_is_count_bounded_with_read_hit_recency() {
+        let mut cache = BucketFastPathCache::default();
+
+        for idx in 0..BUCKET_FAST_PATH_MAX_ENTRIES {
+            cache.insert(bucket_fast_path_info(&format!("bucket-{idx:04}")));
+        }
+
+        assert!(cache.get(&trusted_bucket_name("bucket-0000")).is_some());
+
+        cache.insert(bucket_fast_path_info(&format!(
+            "bucket-{:04}",
+            BUCKET_FAST_PATH_MAX_ENTRIES
+        )));
+
+        assert!(cache.get(&trusted_bucket_name("bucket-0000")).is_some());
+        assert!(cache.get(&trusted_bucket_name("bucket-0001")).is_none());
+        assert!(cache
+            .get(&trusted_bucket_name(format!(
+                "bucket-{:04}",
+                BUCKET_FAST_PATH_MAX_ENTRIES
+            )))
+            .is_some());
     }
 }
 

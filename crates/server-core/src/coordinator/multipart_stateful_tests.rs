@@ -45,12 +45,15 @@ fn setup_coordinator(dir: &Path) -> Coordinator {
 
 fn setup_coordinator_with_shared_storage(storage_node: Arc<SharedStorageNode>) -> Coordinator {
     let ec_config = EcConfig::default();
-    Coordinator::new_with_managed_key_provider(
+    let shared_caches = shared_caches_for_storage_node(&storage_node);
+    Coordinator::new_with_shared_caches_and_lifecycle_sweeper_factory(
         storage_node,
+        shared_caches,
         ec_config,
         "us-east-1".to_string(),
         None,
-        test_sse_s3_provider(),
+        Some(test_sse_s3_provider()),
+        LifecycleSweeper::acquire_shared,
     )
     .unwrap()
 }

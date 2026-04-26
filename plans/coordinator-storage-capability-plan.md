@@ -1451,7 +1451,7 @@ Acceptance criteria:
   - no byte-weighted sizing yet
 - the intended ownership layer of the BOE read fast-path cache is written down
   explicitly
-  - short term: move it from `storage` to a process-shared `server-core` cache
+  - current state: it lives in a process-shared `server-core` cache
   - later: only then consider merging parsed policy/lifecycle caches into that
     shared coordinator-layer cache
 - the intended post-refactor fast-path contract is written down explicitly
@@ -1462,9 +1462,8 @@ Acceptance criteria:
   - and the requirement that hot-path revalidation avoids bucket-lock or
     queue-based waiting
 - the sequencing of the remaining Phase 10 cleanup is written down explicitly:
-  1. move cache ownership to shared `server-core`
-  2. implement cheap pull freshness for BOE reads
-  3. only then evaluate folding parsed policy/lifecycle caches into the same
+  1. implement cheap pull freshness for BOE reads
+  2. only then evaluate folding parsed policy/lifecycle caches into the same
      shared cache structure
 - any additional bucket state added to the fast path is justified by hot-path
   need and pinned by tests
