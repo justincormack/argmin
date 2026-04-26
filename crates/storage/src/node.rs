@@ -3,10 +3,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::{Arc, OnceLock};
-use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
+use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
 use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
@@ -56,6 +56,10 @@ mod stream_ops;
 
 fn write_rwlock_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
     lock.write().unwrap_or_else(|err| err.into_inner())
+}
+
+fn read_rwlock_unpoisoned<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|err| err.into_inner())
 }
 
 struct PgDataPaths {
@@ -358,21 +362,58 @@ struct ReclaimQueueState {
 
 #[derive(Debug, Default)]
 struct BucketFastPathCache {
-    entries: HashMap<BucketName, BucketFastPathInfo>,
-    recency: VecDeque<BucketName>,
+    entries: HashMap<BucketName, BucketFastPathCacheEntry>,
+    next_touch: AtomicU64,
+}
+
+#[derive(Debug)]
+struct BucketFastPathCacheEntry {
+    info: BucketFastPathInfo,
+    last_used_tick: AtomicU64,
+}
+
+impl BucketFastPathCacheEntry {
+    fn new(info: BucketFastPathInfo, last_used_tick: u64) -> Self {
+        Self {
+            info,
+            last_used_tick: AtomicU64::new(last_used_tick),
+        }
+    }
+
+    fn record_hit(&self, tick: u64) {
+        let mut observed = self.last_used_tick.load(Ordering::Relaxed);
+        while observed < tick {
+            match self.last_used_tick.compare_exchange_weak(
+                observed,
+                tick,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
 }
 
 impl BucketFastPathCache {
-    fn get(&mut self, bucket: &BucketName) -> Option<BucketFastPathInfo> {
-        let info = self.entries.get(bucket).cloned()?;
-        self.touch(bucket);
-        Some(info)
+    fn next_tick(&self) -> u64 {
+        self.next_touch
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
+    }
+
+    fn get(&self, bucket: &BucketName) -> Option<BucketFastPathInfo> {
+        let entry = self.entries.get(bucket)?;
+        entry.record_hit(self.next_tick());
+        Some(entry.info.clone())
     }
 
     fn insert(&mut self, info: BucketFastPathInfo) {
+        let tick = self.next_tick();
         let bucket = info.name.clone();
-        self.entries.insert(bucket.clone(), info);
-        self.touch(&bucket);
+        self.entries
+            .insert(bucket, BucketFastPathCacheEntry::new(info, tick));
         self.evict_if_needed();
     }
 
@@ -381,26 +422,25 @@ impl BucketFastPathCache {
         bucket: &BucketName,
         update: impl FnOnce(&mut BucketFastPathInfo),
     ) {
-        if let Some(info) = self.entries.get_mut(bucket) {
-            update(info);
-            self.touch(bucket);
+        let tick = self.next_tick();
+        if let Some(entry) = self.entries.get_mut(bucket) {
+            update(&mut entry.info);
+            entry.last_used_tick.store(tick, Ordering::Relaxed);
         }
     }
 
     fn remove(&mut self, bucket: &BucketName) {
-        if self.entries.remove(bucket).is_some() {
-            self.recency.retain(|entry| entry != bucket);
-        }
-    }
-
-    fn touch(&mut self, bucket: &BucketName) {
-        self.recency.retain(|entry| entry != bucket);
-        self.recency.push_back(bucket.clone());
+        self.entries.remove(bucket);
     }
 
     fn evict_if_needed(&mut self) {
         while self.entries.len() > BUCKET_FAST_PATH_MAX_ENTRIES {
-            let Some(lru_bucket) = self.recency.pop_front() else {
+            let Some(lru_bucket) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used_tick.load(Ordering::Relaxed))
+                .map(|(bucket, _)| bucket.clone())
+            else {
                 break;
             };
             self.entries.remove(&lru_bucket);
@@ -506,7 +546,7 @@ impl SharedStorageNode {
 
     /// Return the cached active-bucket fast-path metadata for `bucket`.
     pub fn get_bucket_fast_path(&self, bucket: &BucketName) -> Option<BucketFastPathInfo> {
-        write_rwlock_unpoisoned(&self.bucket_fast_path).get(bucket)
+        read_rwlock_unpoisoned(&self.bucket_fast_path).get(bucket)
     }
 
     /// Insert or replace the cached active-bucket fast-path metadata.
@@ -1669,7 +1709,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_node_bucket_fast_path_is_count_bounded_lru() {
+    fn shared_node_bucket_fast_path_is_count_bounded_with_read_hit_recency() {
         let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
 

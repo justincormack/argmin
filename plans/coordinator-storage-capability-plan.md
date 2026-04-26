@@ -1232,6 +1232,11 @@ Current guidance for this phase:
     - count-bounded rather than byte-weighted
     - one shared cache per `SharedStorageNode`
     - deterministic recency-based eviction
+    - hot-path cache hits should remain read-only:
+      - no cache write-lock acquisition on cache hits
+      - no O(n) recency maintenance on cache hits
+      - lightweight per-entry hit tracking is acceptable if it preserves cheap
+        shared-read behavior for the BOE read fast path
   - the current intended first landing is a `1024`-entry recency-bounded cache
     for `BucketFastPathInfo`
   - practical memory note for this first landing:
