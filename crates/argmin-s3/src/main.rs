@@ -100,7 +100,14 @@ async fn main() {
             });
 
     // Create one shared storage node for all workers.
-    let storage_node = match SharedStorageNode::open(data_dir, &pg_ids) {
+    let storage_node = match SharedStorageNode::open_with_default_ec_shape(
+        data_dir,
+        &pg_ids,
+        storage::EcShape {
+            k: ec_config.data_shards,
+            m: ec_config.parity_shards,
+        },
+    ) {
         Ok(s) => Arc::new(s),
         Err(e) => {
             eprintln!("failed to open storage: {e}");

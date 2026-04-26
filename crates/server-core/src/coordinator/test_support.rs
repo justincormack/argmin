@@ -90,8 +90,18 @@ pub(crate) fn setup_coordinator(dir: &Path) -> Coordinator {
 
 pub(crate) fn setup_coordinator_in_region(dir: &Path, region: &str) -> Coordinator {
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
     let ec_config = EcConfig::default();
+    let storage_node = Arc::new(
+        SharedStorageNode::open_with_default_ec_shape(
+            dir,
+            &pg_ids,
+            storage::EcShape {
+                k: ec_config.data_shards,
+                m: ec_config.parity_shards,
+            },
+        )
+        .unwrap(),
+    );
     Coordinator::new_with_managed_key_provider(
         storage_node,
         ec_config,
@@ -104,8 +114,18 @@ pub(crate) fn setup_coordinator_in_region(dir: &Path, region: &str) -> Coordinat
 
 pub(crate) fn setup_coordinator_with_pg_count(dir: &Path, pg_count: u32) -> Coordinator {
     let pg_ids: Vec<u32> = (0..pg_count).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
     let ec_config = EcConfig::default();
+    let storage_node = Arc::new(
+        SharedStorageNode::open_with_default_ec_shape(
+            dir,
+            &pg_ids,
+            storage::EcShape {
+                k: ec_config.data_shards,
+                m: ec_config.parity_shards,
+            },
+        )
+        .unwrap(),
+    );
     Coordinator::new_with_managed_key_provider(
         storage_node,
         ec_config,
@@ -121,8 +141,18 @@ pub(crate) fn setup_coordinator_with_pg_count_without_lifecycle_sweeper(
     pg_count: u32,
 ) -> Coordinator {
     let pg_ids: Vec<u32> = (0..pg_count).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
     let ec_config = EcConfig::default();
+    let storage_node = Arc::new(
+        SharedStorageNode::open_with_default_ec_shape(
+            dir,
+            &pg_ids,
+            storage::EcShape {
+                k: ec_config.data_shards,
+                m: ec_config.parity_shards,
+            },
+        )
+        .unwrap(),
+    );
     Coordinator::new_with_lifecycle_sweeper_factory(
         storage_node,
         ec_config,
@@ -136,15 +166,35 @@ pub(crate) fn setup_coordinator_with_pg_count_without_lifecycle_sweeper(
 
 pub(crate) fn setup_coordinator_without_managed_key_provider(dir: &Path) -> Coordinator {
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
     let ec_config = EcConfig::default();
+    let storage_node = Arc::new(
+        SharedStorageNode::open_with_default_ec_shape(
+            dir,
+            &pg_ids,
+            storage::EcShape {
+                k: ec_config.data_shards,
+                m: ec_config.parity_shards,
+            },
+        )
+        .unwrap(),
+    );
     Coordinator::new(storage_node, ec_config, "us-east-1".to_string(), None).unwrap()
 }
 
 pub(crate) fn setup_coordinator_without_lifecycle_sweeper(dir: &Path) -> Coordinator {
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
     let ec_config = EcConfig::default();
+    let storage_node = Arc::new(
+        SharedStorageNode::open_with_default_ec_shape(
+            dir,
+            &pg_ids,
+            storage::EcShape {
+                k: ec_config.data_shards,
+                m: ec_config.parity_shards,
+            },
+        )
+        .unwrap(),
+    );
     Coordinator::new_with_lifecycle_sweeper_factory(
         storage_node,
         ec_config,

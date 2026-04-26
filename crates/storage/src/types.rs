@@ -2339,7 +2339,6 @@ pub struct StreamPutFinalizeSnapshot {
 pub struct PreparedStreamPutCommit<T> {
     pub value: T,
     pub versioning: BucketVersioningState,
-    pub ec: EcShape,
     pub owner: OwnerIdentity,
     pub acl_grants: AclGrants,
     pub public_read: bool,
@@ -2361,6 +2360,7 @@ pub struct WrittenShardAck {
 #[derive(Debug, Clone)]
 pub struct DirectPutWrittenSegment {
     pub shard_pg_id: u32,
+    pub ec: EcShape,
     pub written_shards: Vec<WrittenShardAck>,
 }
 
@@ -2881,7 +2881,6 @@ pub struct PrepareStreamUploadSegmentAppendReq {
     pub segment_crc64: Option<u64>,
     /// 16-byte object key hash for shard keys.
     pub segment_okh: [u8; 16],
-    pub ec: EcShape,
 }
 
 /// Staging segment record for an in-progress streaming session.

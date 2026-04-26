@@ -1,5 +1,5 @@
 use storage::{
-    BucketName, CommitDirectPutObjectReq, CreateStreamUploadReq, EcShape, GenerationId, ObjectKey,
+    BucketName, CommitDirectPutObjectReq, CreateStreamUploadReq, GenerationId, ObjectKey,
     SessionId, StreamPutFinalizeSnapshot, StreamUploadTarget,
 };
 
@@ -136,10 +136,6 @@ impl Coordinator {
                 segment_vid,
                 &segment_okh,
                 &storage_bytes,
-                EcShape {
-                    k: self.ec_config.data_shards,
-                    m: self.ec_config.parity_shards,
-                },
             )?;
 
             let system_metadata = Self::object_system_metadata_with_default_checksum(
@@ -163,10 +159,7 @@ impl Coordinator {
                 public_read,
                 size: req.data.len() as u64,
                 etag_crc64: object_crc64,
-                ec: EcShape {
-                    k: self.ec_config.data_shards,
-                    m: self.ec_config.parity_shards,
-                },
+                ec: written_segment.ec,
                 object_lock: resolved_object_lock,
                 encryption,
                 tags: authorized.tags().map(storage::SerializedTagSet::from),
@@ -515,10 +508,6 @@ impl Coordinator {
                         Ok(storage::PreparedStreamPutCommit {
                             value: system_metadata,
                             versioning: bucket_info.versioning,
-                            ec: EcShape {
-                                k: self.ec_config.data_shards,
-                                m: self.ec_config.parity_shards,
-                            },
                             owner,
                             acl_grants: acl_grants.clone(),
                             public_read: Self::acl_grants_public_read(&acl_grants),

@@ -125,8 +125,8 @@ impl SharedStorageNode {
         segment_vid: GenerationId,
         segment_okh: &[u8; 16],
         data: &[u8],
-        ec: EcShape,
     ) -> Result<DirectPutWrittenSegment, StoreError> {
+        let ec = self.default_ec_shape();
         let shard_pg_id = self.pg_topology.shard_pg(
             &format!("segment/{}", transient_segment_id.as_str()),
             &segment_index.to_string(),
@@ -141,6 +141,7 @@ impl SharedStorageNode {
         )?;
         Ok(DirectPutWrittenSegment {
             shard_pg_id,
+            ec,
             written_shards,
         })
     }
@@ -151,8 +152,8 @@ impl SharedStorageNode {
         segment_okh: &[u8; 16],
         segment_vid: GenerationId,
         data: &[u8],
-        ec: EcShape,
     ) -> Result<Vec<WrittenShardAck>, StoreError> {
+        let ec = self.default_ec_shape();
         self.write_erasure_coded_segment_shards(shard_pg_id, segment_okh, segment_vid, data, ec)
     }
 
@@ -401,8 +402,8 @@ impl SharedStorageNode {
                 request.segment_index,
                 segment_vid,
             ),
-            ec_k: request.ec.k,
-            ec_m: request.ec.m,
+            ec_k: self.default_ec_shape.k,
+            ec_m: self.default_ec_shape.m,
         };
         Ok((session.target, segment_record))
     }
@@ -640,7 +641,12 @@ impl SharedStorageNode {
                         generation_id,
                         size: prepared.size,
                         etag_crc64: prepared.etag_crc64,
-                        ec: prepared.ec,
+                        ec: staging_segments
+                            .first()
+                            .map_or(self.default_ec_shape, |segment| EcShape {
+                                k: segment.ec_k,
+                                m: segment.ec_m,
+                            }),
                         tags: prepared.tags.clone(),
                         metadata_blob: Some(prepared.metadata_blob.clone()),
                         system_metadata_blob: Some(prepared.system_metadata_blob.clone()),

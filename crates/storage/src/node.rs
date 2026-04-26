@@ -331,6 +331,7 @@ pub struct SharedStorageNode {
     pg_paths: HashMap<u32, PgDataPaths>,
     pg_id_list: Vec<u32>,
     pg_topology: PgTopology,
+    default_ec_shape: EcShape,
     data_dir: PathBuf,
     bucket_locks: Vec<Mutex<()>>,
     bucket_coordination: Vec<(Mutex<u64>, Condvar)>,
@@ -371,8 +372,18 @@ struct ReclaimQueueState {
 const BUCKET_LOCK_STRIPES: usize = 256;
 
 impl SharedStorageNode {
+    pub const DEFAULT_EC_SHAPE: EcShape = EcShape { k: 4, m: 2 };
+
     /// Open a shared storage node, creating PG directories as needed.
     pub fn open(data_dir: &Path, pg_ids: &[u32]) -> Result<Self, StoreError> {
+        Self::open_with_default_ec_shape(data_dir, pg_ids, Self::DEFAULT_EC_SHAPE)
+    }
+
+    pub fn open_with_default_ec_shape(
+        data_dir: &Path,
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+    ) -> Result<Self, StoreError> {
         std::fs::create_dir_all(data_dir).map_err(|e| StoreError::Io {
             context: "create data dir",
             source: e,
@@ -418,6 +429,7 @@ impl SharedStorageNode {
             pg_paths,
             pg_id_list,
             pg_topology: PgTopology::new(pg_ids).expect("shared storage node must have PGs"),
+            default_ec_shape,
             data_dir: data_dir.to_path_buf(),
             bucket_locks,
             bucket_coordination,
@@ -434,6 +446,10 @@ impl SharedStorageNode {
             ),
             ec_write_states: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub fn default_ec_shape(&self) -> EcShape {
+        self.default_ec_shape
     }
 
     /// Return the data directory path.
@@ -2158,7 +2174,6 @@ mod tests {
                     size: 5,
                     segment_crc64: Some(checksum::crc64::checksum(b"hello")),
                     segment_okh: [i as u8; 16],
-                    ec: crate::types::EcShape { k: 1, m: 0 },
                 };
                 let (_, record) = node
                     .prepare_stream_segment_append(&bucket, &key, &request)
@@ -2186,8 +2201,8 @@ mod tests {
                     segment_okh: [0x55; 16],
                     segment_vid: winner_vid,
                     shard_pg_id: meta_pg_id,
-                    ec_k: request.ec.k,
-                    ec_m: request.ec.m,
+                    ec_k: node.default_ec_shape.k,
+                    ec_m: node.default_ec_shape.m,
                 })
                 .unwrap();
             winner_vid
@@ -2555,24 +2570,12 @@ mod tests {
         assert_eq!(node.test_ec_scratch_allocation_count(ec), 0);
 
         let written_a = node
-            .write_stream_segment_shards(
-                0,
-                &segment_okh,
-                GenerationId::new(1).unwrap(),
-                b"hello",
-                ec,
-            )
+            .write_stream_segment_shards(0, &segment_okh, GenerationId::new(1).unwrap(), b"hello")
             .unwrap();
         assert_eq!(node.test_ec_scratch_allocation_count(ec), 1);
 
         let written_b = node
-            .write_stream_segment_shards(
-                0,
-                &segment_okh,
-                GenerationId::new(2).unwrap(),
-                b"world",
-                ec,
-            )
+            .write_stream_segment_shards(0, &segment_okh, GenerationId::new(2).unwrap(), b"world")
             .unwrap();
         assert_eq!(node.test_ec_scratch_allocation_count(ec), 1);
 
@@ -2593,7 +2596,7 @@ mod tests {
         let segment_vid = GenerationId::new(1).unwrap();
         let data = b"recovery-check-segment";
         let written = node
-            .write_stream_segment_shards(0, &segment_okh, segment_vid, data, ec)
+            .write_stream_segment_shards(0, &segment_okh, segment_vid, data)
             .unwrap();
         assert_eq!(node.test_ec_scratch_allocation_count(ec), 1);
         let written_pairs: Vec<(ShardKey, WriteAck)> = written

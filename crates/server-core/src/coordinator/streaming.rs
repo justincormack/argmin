@@ -1,7 +1,7 @@
 #[cfg(test)]
 use storage::GenerationId;
 use storage::{
-    BucketName, EcShape, ManagedEncryptionAlgorithm, ObjectEncryption, ObjectKey,
+    BucketName, ManagedEncryptionAlgorithm, ObjectEncryption, ObjectKey,
     PrepareStreamUploadSegmentAppendReq, SessionId, ShardKey, StreamUploadTarget,
 };
 
@@ -432,16 +432,7 @@ impl Coordinator {
     ) -> Result<Vec<WrittenShard>, ServerError> {
         Ok(self
             .storage_node
-            .write_stream_segment_shards(
-                shard_pg_id,
-                segment_okh,
-                segment_vid,
-                data,
-                EcShape {
-                    k: self.ec_config.data_shards,
-                    m: self.ec_config.parity_shards,
-                },
-            )?
+            .write_stream_segment_shards(shard_pg_id, segment_okh, segment_vid, data)?
             .into_iter()
             .map(|written| WrittenShard {
                 key: written.key,
@@ -510,10 +501,6 @@ impl Coordinator {
                     size: logical_size,
                     segment_crc64: Some(checksum::crc64::checksum(data)),
                     segment_okh,
-                    ec: EcShape {
-                        k: self.ec_config.data_shards,
-                        m: self.ec_config.parity_shards,
-                    },
                 },
             )
             .map_err(|error| match error {
@@ -541,10 +528,6 @@ impl Coordinator {
             &segment_okh,
             segment_record.segment_vid,
             data,
-            EcShape {
-                k: segment_record.ec_k,
-                m: segment_record.ec_m,
-            },
         )?;
 
         let shard_batch: Vec<(&ShardKey, storage::WriteAck)> = written_shards
