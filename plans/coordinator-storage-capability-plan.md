@@ -1469,8 +1469,8 @@ Acceptance criteria:
   need and pinned by tests
 - BOE read fast-path entries are populated in one canonical way from a real
   bucket snapshot rather than through later warming/promotion
-- bucket mutations remove fast-path entries rather than attempting partial
-  in-place downgrades
+- before pull freshness lands, bucket mutations may remove fast-path entries
+  rather than attempting partial in-place downgrades
 - any request family that uses the fast path preserves the request-scoped
   snapshot guarantees established by the handle model
 - any request family that cannot preserve those guarantees is documented as
@@ -1487,6 +1487,57 @@ Acceptance criteria:
 - the policy-freshness issue for object reads after `PutBucketPolicy` is
   resolved and pinned by tests, either by removing the stale-cache window or by
   deliberately modeling AWS-compatible asynchronous behavior
+
+### Phase 10 Freshness Mechanism
+
+The pull-freshness mechanism for the BOE object-read fast path should be:
+
+- one authoritative persisted `bucket_execution_generation` in bucket metadata
+  - incremented on every bucket mutation, not just mutations currently known to
+    affect BOE reads
+  - this keeps the mechanism future-safe for later fast-path use cases
+- one shared coordinator-layer cache entry per cached bucket containing:
+  - the materialized BOE read execution context
+  - the generation it was built from
+  - the latest generation currently known to this process
+- local bucket mutations update the persisted generation and immediately advance
+  the process-local known generation for any cached entry
+  - local writes therefore invalidate stale BOE read entries immediately
+  - reads do not need to synchronously re-check storage after same-process
+    mutations
+- remote mutations are discovered by a background watcher
+  - the watcher only cares about buckets currently present in the shared
+    fast-path cache
+  - it should not scan uncached buckets
+  - it should poll at a modest interval rather than continuously
+- the watcher should batch work by bucket PG
+  - gather cached buckets by their bucket PG
+  - issue one metadata query per PG for the cached buckets assigned to that PG
+  - this is preferred over per-bucket probes and over scanning every bucket in
+    the PG
+- BOE read hits stay read-hot
+  - request-time revalidation consults only the process-local known generation
+  - no bucket PG lock or metadata query is taken on the hot read hit path
+  - if the cached materialized generation matches the known generation, use the
+    entry directly
+  - if it differs, reload from a real bucket snapshot and rebuild the entry
+
+This gives:
+
+- authoritative recorded state for correctness and future multihost support
+- immediate same-process coherence
+- eventual cross-process / cross-host coherence
+- no synchronous storage check on BOE read hits
+
+The intended implementation order is:
+
+1. add persisted `bucket_execution_generation` to bucket metadata and include it
+   in the BOE fast-path entry
+2. stop mutation paths from eagerly removing cache entries once the generation
+   mechanism is in place; instead advance the shared entry's known generation
+3. add a background watcher that batches cached-bucket generation checks by PG
+4. switch BOE reads to compare materialized generation against known generation
+   before deciding whether to reuse or rebuild the cached entry
 
 ### Phase 11: Bucket Policy Residualization for Hot Paths
 
