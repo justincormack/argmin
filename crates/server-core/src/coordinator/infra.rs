@@ -10,7 +10,7 @@ use super::authz_types::{AuthorizedPutObjectWrite, ValidatedBucket};
 use super::payload::{EncodeScratchPool, PayloadBufferPool};
 use super::read_core::ReadRuntime;
 use super::request_types::AuthorizePutObjectRequest;
-use super::response_types::BucketSummary;
+use super::response_types::{BucketSummary, ModernBucketSummary};
 use super::runtime::{LifecycleSweeper, ReclaimSweeper};
 #[cfg(test)]
 use super::trusted_bucket_name;
@@ -116,15 +116,37 @@ impl Coordinator {
         }
     }
 
-    pub(super) fn bucket_summary_fast(info: BucketFastPathInfo) -> BucketSummary {
+    pub(super) fn modern_bucket_summary_fast(info: BucketFastPathInfo) -> ModernBucketSummary {
+        ModernBucketSummary {
+            name: info.name,
+            owner_principal: info.owner_principal,
+            owner_canonical_id: info.owner_canonical_id,
+            created_at: info.created_at,
+            versioning: info.versioning,
+            object_lock: info.object_lock,
+            public_access_block: info.public_access_block,
+            ownership_controls: info.ownership_controls,
+            bucket_policy_present: info.bucket_policy_present,
+            bucket_policy_public: info.bucket_policy_public,
+            bucket_policy_generation: info.bucket_policy_generation,
+            bucket_lifecycle_present: info.bucket_lifecycle_present,
+            bucket_lifecycle_generation: info.bucket_lifecycle_generation,
+            bucket_abac_enabled: info.bucket_abac_enabled,
+            encryption: info.encryption,
+        }
+    }
+
+    pub(super) fn bucket_summary_for_boe_modern_fast_path(
+        info: ModernBucketSummary,
+    ) -> BucketSummary {
         BucketSummary {
             name: info.name,
             owner_principal: info.owner_principal,
             owner_canonical_id: info.owner_canonical_id,
             created_at: info.created_at,
-            acl_grants: info.acl_grants,
-            public_read: info.public_read,
-            public_write: info.public_write,
+            acl_grants: s3_types::AclGrants::default(),
+            public_read: false,
+            public_write: false,
             versioning: info.versioning,
             object_lock: info.object_lock,
             public_access_block: info.public_access_block,
@@ -145,15 +167,6 @@ impl Coordinator {
         name: &str,
     ) -> Result<BucketSummary, ServerError> {
         let name = trusted_bucket_name(name);
-        if let Some(info) = self.storage_node.get_bucket_fast_path(&name) {
-            if info.state == BucketState::Active {
-                return Ok(Self::bucket_summary_fast(info));
-            }
-            return Err(ServerError::BucketNotFound {
-                name: name.to_string(),
-            });
-        }
-
         let info = self
             .storage_node
             .head_bucket_info(&name)
@@ -178,15 +191,6 @@ impl Coordinator {
         &self,
         name: &BucketName,
     ) -> Result<BucketSummary, ServerError> {
-        if let Some(info) = self.storage_node.get_bucket_fast_path(name) {
-            if info.state == BucketState::Active {
-                return Ok(Self::bucket_summary_fast(info));
-            }
-            return Err(ServerError::BucketNotFound {
-                name: name.to_string(),
-            });
-        }
-
         let info = self
             .storage_node
             .head_bucket_info(name)

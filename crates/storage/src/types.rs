@@ -2022,9 +2022,6 @@ pub struct BucketFastPathInfo {
     pub state: BucketState,
     pub versioning: BucketVersioningState,
     pub object_lock: BucketObjectLockConfig,
-    pub acl_grants: AclGrants,
-    pub public_read: bool,
-    pub public_write: bool,
     pub public_access_block: Option<PublicAccessBlockConfig>,
     pub ownership_controls: Option<BucketOwnershipControls>,
     pub bucket_policy_present: bool,
@@ -2051,9 +2048,6 @@ impl std::fmt::Debug for BucketFastPathInfo {
             .field("state", &self.state)
             .field("versioning", &self.versioning)
             .field("object_lock", &self.object_lock)
-            .field("acl_grants", &self.acl_grants)
-            .field("public_read", &self.public_read)
-            .field("public_write", &self.public_write)
             .field("public_access_block", &self.public_access_block)
             .field("ownership_controls", &self.ownership_controls)
             .field("bucket_policy_present", &self.bucket_policy_present)
@@ -2126,9 +2120,6 @@ impl From<BucketInfo> for BucketFastPathInfo {
             state: info.state,
             versioning: info.versioning,
             object_lock: info.object_lock,
-            acl_grants: info.acl_grants,
-            public_read: info.public_read,
-            public_write: info.public_write,
             public_access_block: info.public_access_block,
             ownership_controls: info.ownership_controls,
             bucket_policy_present: info.bucket_policy_present,
@@ -2158,9 +2149,6 @@ impl From<&BucketInfo> for BucketFastPathInfo {
             state: info.state,
             versioning: info.versioning,
             object_lock: info.object_lock,
-            acl_grants: info.acl_grants.clone(),
-            public_read: info.public_read,
-            public_write: info.public_write,
             public_access_block: info.public_access_block,
             ownership_controls: info.ownership_controls,
             bucket_policy_present: info.bucket_policy_present,
@@ -2190,9 +2178,6 @@ impl From<&BucketSnapshot> for BucketFastPathInfo {
             state: snapshot.bucket.state,
             versioning: snapshot.bucket.versioning,
             object_lock: snapshot.bucket.object_lock,
-            acl_grants: snapshot.bucket.acl_grants.clone(),
-            public_read: snapshot.bucket.public_read,
-            public_write: snapshot.bucket.public_write,
             public_access_block: snapshot.bucket.public_access_block,
             ownership_controls: snapshot.bucket.ownership_controls,
             bucket_policy_present: snapshot.bucket.bucket_policy_present,

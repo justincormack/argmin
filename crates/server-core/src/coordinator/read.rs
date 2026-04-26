@@ -29,7 +29,10 @@ impl Coordinator {
         let key = req.object.key();
         let version_id = req.object.version_id;
         let cond = req.cond;
-        let AuthorizedObjectRead { snapshot } = self.authorize_get_object(req)?;
+        let AuthorizedObjectRead {
+            bucket: bucket_summary,
+            snapshot,
+        } = self.authorize_get_object(req)?;
         let storage::ObjectReadSnapshot {
             stored,
             object_segments,
@@ -77,12 +80,8 @@ impl Coordinator {
                 req.sse_customer.cloned(),
             );
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                let lifecycle_bucket = self.checked_active_bucket_summary_for(
-                    req.object.bucket_name_typed(),
-                    req.expected_bucket_owner(),
-                )?;
                 self.current_object_lifecycle_expiration(
-                    &lifecycle_bucket,
+                    &bucket_summary,
                     key,
                     record.tags.as_deref(),
                     record.size,
@@ -140,12 +139,8 @@ impl Coordinator {
                 body
             };
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                let lifecycle_bucket = self.checked_active_bucket_summary_for(
-                    req.object.bucket_name_typed(),
-                    req.expected_bucket_owner(),
-                )?;
                 self.current_object_lifecycle_expiration(
-                    &lifecycle_bucket,
+                    &bucket_summary,
                     key,
                     record.tags.as_deref(),
                     record.size,
@@ -195,7 +190,10 @@ impl Coordinator {
         let version_id = req.object.version_id;
         let part_number = req.part_number;
         let cond = req.cond;
-        let AuthorizedObjectRead { snapshot } = self.authorize_get_object(&GetObjectRequest {
+        let AuthorizedObjectRead {
+            bucket: bucket_summary,
+            snapshot,
+        } = self.authorize_get_object(&GetObjectRequest {
             object: ObjectVersionRequest::new(
                 req.object.bucket_name_typed().clone(),
                 req.object.key_typed().clone(),
@@ -281,12 +279,8 @@ impl Coordinator {
                 req.sse_customer.cloned(),
             );
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                let lifecycle_bucket = self.checked_active_bucket_summary_for(
-                    req.object.bucket_name_typed(),
-                    req.expected_bucket_owner(),
-                )?;
                 self.current_object_lifecycle_expiration(
-                    &lifecycle_bucket,
+                    &bucket_summary,
                     key,
                     record.tags.as_deref(),
                     record.size,
@@ -346,12 +340,8 @@ impl Coordinator {
                 body
             };
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                let lifecycle_bucket = self.checked_active_bucket_summary_for(
-                    req.object.bucket_name_typed(),
-                    req.expected_bucket_owner(),
-                )?;
                 self.current_object_lifecycle_expiration(
-                    &lifecycle_bucket,
+                    &bucket_summary,
                     key,
                     record.tags.as_deref(),
                     record.size,
@@ -409,18 +399,20 @@ impl Coordinator {
         let version_id = req.object.version_id;
         let part_number = req.part_number;
         let cond = req.cond;
-        let AuthorizedObjectRead { snapshot } =
-            self.authorize_head_object_for_part(&GetObjectRequest {
-                object: ObjectVersionRequest::new(
-                    req.object.bucket_name_typed().clone(),
-                    req.object.key_typed().clone(),
-                    req.object.version_id,
-                    req.object.requester().clone(),
-                    req.expected_bucket_owner(),
-                ),
-                cond: req.cond,
-                sse_customer: req.sse_customer,
-            })?;
+        let AuthorizedObjectRead {
+            bucket: bucket_summary,
+            snapshot,
+        } = self.authorize_head_object_for_part(&GetObjectRequest {
+            object: ObjectVersionRequest::new(
+                req.object.bucket_name_typed().clone(),
+                req.object.key_typed().clone(),
+                req.object.version_id,
+                req.object.requester().clone(),
+                req.expected_bucket_owner(),
+            ),
+            cond: req.cond,
+            sse_customer: req.sse_customer,
+        })?;
         let storage::ObjectReadSnapshot {
             stored,
             object_segments: _,
@@ -447,12 +439,8 @@ impl Coordinator {
         if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             let obj_parts = multipart_parts;
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                let lifecycle_bucket = self.checked_active_bucket_summary_for(
-                    req.object.bucket_name_typed(),
-                    req.expected_bucket_owner(),
-                )?;
                 self.current_object_lifecycle_expiration(
-                    &lifecycle_bucket,
+                    &bucket_summary,
                     key,
                     record.tags.as_deref(),
                     record.size,
@@ -518,12 +506,8 @@ impl Coordinator {
                 return Err(ServerError::InvalidPart { part_number });
             }
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                let lifecycle_bucket = self.checked_active_bucket_summary_for(
-                    req.object.bucket_name_typed(),
-                    req.expected_bucket_owner(),
-                )?;
                 self.current_object_lifecycle_expiration(
-                    &lifecycle_bucket,
+                    &bucket_summary,
                     key,
                     record.tags.as_deref(),
                     record.size,
@@ -577,7 +561,10 @@ impl Coordinator {
         let key = req.object.key();
         let version_id = req.object.version_id;
         let cond = req.cond;
-        let AuthorizedObjectRead { snapshot } = self.authorize_head_object(req)?;
+        let AuthorizedObjectRead {
+            bucket: bucket_summary,
+            snapshot,
+        } = self.authorize_head_object(req)?;
         let storage::ObjectReadSnapshot {
             stored,
             object_segments: _,
@@ -608,12 +595,8 @@ impl Coordinator {
             self.prepare_sse_customer_read_access(&record.encryption, req.sse_customer)?;
         let emit_lifecycle_expiration = version_id.is_none();
         let lifecycle_expiration = if emit_lifecycle_expiration {
-            let lifecycle_bucket = self.checked_active_bucket_summary_for(
-                req.object.bucket_name_typed(),
-                req.expected_bucket_owner(),
-            )?;
             self.current_object_lifecycle_expiration(
-                &lifecycle_bucket,
+                &bucket_summary,
                 key,
                 record.tags.as_deref(),
                 record.size,
@@ -666,7 +649,10 @@ impl Coordinator {
         let want_parts = req.want_parts;
         let part_number_marker = req.part_number_marker;
         let max_parts = req.max_parts;
-        let AuthorizedObjectRead { snapshot } = self.authorize_get_object_attributes(req)?;
+        let AuthorizedObjectRead {
+            bucket: _,
+            snapshot,
+        } = self.authorize_get_object_attributes(req)?;
         let storage::ObjectReadSnapshot {
             stored,
             object_segments: _,
@@ -795,7 +781,10 @@ impl Coordinator {
         let version_id = req.object.version_id;
         let range = req.range;
         let cond = req.cond;
-        let AuthorizedObjectRead { snapshot } = self.authorize_get_object(&GetObjectRequest {
+        let AuthorizedObjectRead {
+            bucket: bucket_summary,
+            snapshot,
+        } = self.authorize_get_object(&GetObjectRequest {
             object: ObjectVersionRequest::new(
                 req.object.bucket_name_typed().clone(),
                 req.object.key_typed().clone(),
@@ -933,12 +922,8 @@ impl Coordinator {
             (metadata, system_metadata, body)
         };
         let lifecycle_expiration = if emit_lifecycle_expiration {
-            let lifecycle_bucket = self.checked_active_bucket_summary_for(
-                req.object.bucket_name_typed(),
-                req.expected_bucket_owner(),
-            )?;
             self.current_object_lifecycle_expiration(
-                &lifecycle_bucket,
+                &bucket_summary,
                 key,
                 record.tags.as_deref(),
                 record.size,

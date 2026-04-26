@@ -2022,61 +2022,6 @@ impl Coordinator {
             .requiring_policy_view()
             .requiring_bucket_tags_if_abac_enabled();
 
-        if let Some(info) = self.storage_node.get_bucket_fast_path(bucket) {
-            if info.state != BucketState::Active {
-                return Err(ServerError::BucketNotFound {
-                    name: bucket.to_string(),
-                });
-            }
-
-            let bucket_info = Self::validate_expected_bucket_owner(
-                Self::bucket_summary_fast(info.clone()),
-                expected_bucket_owner,
-            )?
-            .into_inner();
-
-            if !bucket_info.bucket_policy_present {
-                #[cfg(test)]
-                maybe_run_bucket_policy_fast_path_hook(bucket.as_str());
-                return Ok(LoadedBucketHandle::new(
-                    bucket_info,
-                    request,
-                    LoadedBucketValue::NotRequested,
-                    LoadedBucketValue::NotRequested,
-                    LoadedBucketValue::NotRequested,
-                    LoadedBucketValue::NotRequested,
-                ));
-            }
-
-            let cached_policy = match &info.policy {
-                LoadedBucketSubresource::Loaded(policy) => {
-                    Some(LoadedBucketValue::Loaded(policy.clone()))
-                }
-                LoadedBucketSubresource::Missing | LoadedBucketSubresource::NotRequested => None,
-            };
-            let cached_tags = match (&info.tags, info.bucket_abac_enabled) {
-                (_, false) => Some(LoadedBucketValue::NotRequested),
-                (LoadedBucketSubresource::Loaded(tags), true) => {
-                    Some(LoadedBucketValue::Loaded(tags.clone()))
-                }
-                (LoadedBucketSubresource::Missing, true) => Some(LoadedBucketValue::Missing),
-                (LoadedBucketSubresource::NotRequested, true) => None,
-            };
-
-            if let (Some(policy), Some(tags)) = (cached_policy, cached_tags) {
-                #[cfg(test)]
-                maybe_run_bucket_policy_fast_path_hook(bucket.as_str());
-                return Ok(LoadedBucketHandle::new(
-                    bucket_info,
-                    request,
-                    policy,
-                    tags,
-                    LoadedBucketValue::NotRequested,
-                    LoadedBucketValue::NotRequested,
-                ));
-            }
-        }
-
         #[cfg(test)]
         maybe_run_bucket_policy_storage_load_hook(bucket.as_str());
         self.bucket_handle_loader()
@@ -2099,18 +2044,15 @@ impl Coordinator {
                 });
             }
 
-            let bucket_info = Self::validate_expected_bucket_owner(
-                Self::bucket_summary_fast(info.clone()),
-                expected_bucket_owner,
-            )?
-            .into_inner();
+            let bucket_info = Self::modern_bucket_summary_fast(info.clone());
+            Self::ensure_expected_bucket_owner_modern(&bucket_info, expected_bucket_owner)?;
 
             if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_ref()) {
                 if !bucket_info.bucket_policy_present {
                     #[cfg(test)]
                     maybe_run_bucket_policy_fast_path_hook(bucket.as_str());
                     return Ok(LoadedBucketHandle::new(
-                        bucket_info,
+                        Self::bucket_summary_for_boe_modern_fast_path(bucket_info),
                         request,
                         LoadedBucketValue::NotRequested,
                         LoadedBucketValue::NotRequested,
@@ -2140,7 +2082,7 @@ impl Coordinator {
                     #[cfg(test)]
                     maybe_run_bucket_policy_fast_path_hook(bucket.as_str());
                     return Ok(LoadedBucketHandle::new(
-                        bucket_info,
+                        Self::bucket_summary_for_boe_modern_fast_path(bucket_info),
                         request,
                         policy,
                         tags,
@@ -2495,6 +2437,16 @@ impl Coordinator {
     ) -> Result<ValidatedBucket, ServerError> {
         Self::ensure_expected_bucket_owner(&bucket, expected_bucket_owner)?;
         Ok(ValidatedBucket(bucket))
+    }
+
+    fn ensure_expected_bucket_owner_modern(
+        bucket: &ModernBucketSummary,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        if expected_bucket_owner.is_some_and(|expected| expected != bucket.owner_principal) {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(())
     }
 
     pub(super) fn requester_principal_required(requester: &Requester) -> Result<&str, ServerError> {
@@ -4832,9 +4784,10 @@ impl Coordinator {
     fn authorize_object_read_snapshot(
         &self,
         req: AuthorizedObjectReadSnapshotRequest<'_>,
-    ) -> Result<storage::ObjectReadSnapshot, ServerError> {
+    ) -> Result<(BucketSummary, storage::ObjectReadSnapshot), ServerError> {
         let bucket =
             self.load_bucket_handle_for_modern_object_read(req.bucket, req.expected_bucket_owner)?;
+        let bucket_summary = bucket.bucket().clone();
         let bucket_info = ValidatedBucket(bucket.bucket().clone());
         let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
@@ -4942,7 +4895,7 @@ impl Coordinator {
                     error,
                 )
             })??;
-        Ok(outcome.snapshot)
+        Ok((bucket_summary, outcome.snapshot))
     }
 
     fn authorize_copy_source_read_snapshot(
@@ -5315,7 +5268,7 @@ impl Coordinator {
         &self,
         req: &GetObjectRequest<'_>,
     ) -> Result<AuthorizedObjectRead, ServerError> {
-        let snapshot =
+        let (bucket, snapshot) =
             self.authorize_object_read_snapshot(AuthorizedObjectReadSnapshotRequest {
                 requester: req.object.requester(),
                 bucket: req.object.bucket_name_typed(),
@@ -5326,14 +5279,14 @@ impl Coordinator {
                 modern_action: ModernReadAction::from_get_object_version(req.object.version_id),
                 snapshot_mode: ObjectReadSnapshotMode::FullPayloadLayout,
             })?;
-        Ok(AuthorizedObjectRead { snapshot })
+        Ok(AuthorizedObjectRead { bucket, snapshot })
     }
 
     pub(super) fn authorize_head_object(
         &self,
         req: &GetObjectRequest<'_>,
     ) -> Result<AuthorizedObjectRead, ServerError> {
-        let snapshot =
+        let (bucket, snapshot) =
             self.authorize_object_read_snapshot(AuthorizedObjectReadSnapshotRequest {
                 requester: req.object.requester(),
                 bucket: req.object.bucket_name_typed(),
@@ -5344,14 +5297,14 @@ impl Coordinator {
                 modern_action: ModernReadAction::from_get_object_version(req.object.version_id),
                 snapshot_mode: ObjectReadSnapshotMode::MetadataOnly,
             })?;
-        Ok(AuthorizedObjectRead { snapshot })
+        Ok(AuthorizedObjectRead { bucket, snapshot })
     }
 
     pub(super) fn authorize_get_object_attributes(
         &self,
         req: &GetObjectAttributesRequest<'_>,
     ) -> Result<AuthorizedObjectRead, ServerError> {
-        let snapshot =
+        let (bucket, snapshot) =
             self.authorize_object_read_snapshot(AuthorizedObjectReadSnapshotRequest {
                 requester: req.object.requester(),
                 bucket: req.object.bucket_name_typed(),
@@ -5368,14 +5321,14 @@ impl Coordinator {
                     ObjectReadSnapshotMode::MetadataOnly
                 },
             })?;
-        Ok(AuthorizedObjectRead { snapshot })
+        Ok(AuthorizedObjectRead { bucket, snapshot })
     }
 
     pub(super) fn authorize_head_object_for_part(
         &self,
         req: &GetObjectRequest<'_>,
     ) -> Result<AuthorizedObjectRead, ServerError> {
-        let snapshot =
+        let (bucket, snapshot) =
             self.authorize_object_read_snapshot(AuthorizedObjectReadSnapshotRequest {
                 requester: req.object.requester(),
                 bucket: req.object.bucket_name_typed(),
@@ -5386,7 +5339,7 @@ impl Coordinator {
                 modern_action: ModernReadAction::from_get_object_version(req.object.version_id),
                 snapshot_mode: ObjectReadSnapshotMode::MultipartParts,
             })?;
-        Ok(AuthorizedObjectRead { snapshot })
+        Ok(AuthorizedObjectRead { bucket, snapshot })
     }
 }
 

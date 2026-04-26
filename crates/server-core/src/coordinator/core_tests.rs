@@ -2027,7 +2027,7 @@ fn put_bucket_tags_invalidates_warm_fast_path_tags() {
 }
 
 #[test]
-fn delete_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
+fn delete_object_falls_back_to_storage_load_when_bucket_fast_path_is_acl_free() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-delete-fast-no-pg";
     let pg_ids: Vec<u32> = (0..4).collect();
@@ -2077,14 +2077,13 @@ fn delete_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
         .lock()
         .unwrap();
     let (event_tx, event_rx) = mpsc::channel();
-    let event_tx_load = event_tx.clone();
     let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
         bucket: Some(bucket.to_string()),
         before_storage_load: Some(Arc::new(move || {
-            let _ = event_tx_load.send(LockWaitEvent::UnexpectedStorageLoad);
+            let _ = event_tx.send(LockWaitEvent::Progress);
         })),
         after_policy_fast_path_hit: Some(Arc::new(move || {
-            let _ = event_tx.send(LockWaitEvent::Progress);
+            panic!("delete_object should not use ACL-free fast bucket path");
         })),
     });
     let bucket_pg = storage_node
@@ -2105,11 +2104,15 @@ fn delete_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
     });
 
     assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
+    assert!(
+        rx.try_recv().is_err(),
+        "delete_object returned before bucket pg released"
+    );
+    drop(bucket_pg);
     let deleted = rx
         .recv()
-        .expect("delete_object should not block on bucket pg")
+        .expect("delete_object should complete after bucket pg released")
         .unwrap();
-    drop(bucket_pg);
     assert!(!deleted.delete_marker);
     assert!(matches!(
         admin.get_object(&GetObjectRequest {

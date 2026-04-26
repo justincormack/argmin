@@ -230,6 +230,7 @@ pub(super) struct AuthorizedGetObjectAcl {
 }
 
 pub(super) struct AuthorizedObjectRead {
+    pub(super) bucket: BucketSummary,
     pub(super) snapshot: ObjectReadSnapshot,
 }
 
