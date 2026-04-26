@@ -4,7 +4,6 @@ use crate::conditional::ReadCondition;
 use crate::metadata_blob::MetadataBlob;
 use crate::sse::ManagedWrappingKeyConfig;
 use crate::system_metadata::SystemMetadata;
-use ec::EcConfig;
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestCaseResult};
 use std::fmt::Write as _;
@@ -34,10 +33,8 @@ fn test_sse_s3_provider() -> StaticManagedKeyProvider {
 fn setup_coordinator(dir: &Path) -> Coordinator {
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
-    let ec_config = EcConfig::default();
     Coordinator::new_with_managed_key_provider(
         storage_node,
-        ec_config,
         "us-east-1".to_string(),
         None,
         test_sse_s3_provider(),

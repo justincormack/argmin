@@ -5693,7 +5693,6 @@ mod tests {
         canonical_headers, canonical_query_string, canonical_request, sha256_hex, string_to_sign,
     };
     use auth::SecretKey;
-    use ec::EcConfig;
     use ring::hmac;
     use server_core::sse::{ManagedWrappingKeyConfig, StaticManagedKeyProvider};
     use std::sync::Arc;
@@ -5710,13 +5709,11 @@ mod tests {
     fn setup_frontend_with_sse_s3(dir: &std::path::Path) -> HttpFrontend {
         let pg_ids: Vec<u32> = (0..4).collect();
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
-        let ec_config = EcConfig::default();
         let sse_s3_provider = StaticManagedKeyProvider::single(
             ManagedWrappingKeyConfig::from_base64(1, TEST_SSE_S3_WRAPPING_KEY_B64).unwrap(),
         );
         let coordinator = Coordinator::new_with_managed_key_provider(
             storage_node,
-            ec_config,
             "us-east-1".to_string(),
             None,
             sse_s3_provider,

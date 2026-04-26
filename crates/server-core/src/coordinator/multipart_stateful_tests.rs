@@ -6,7 +6,6 @@ use crate::metadata_blob::MetadataBlob;
 use crate::pg::PgTopology;
 use crate::sse::ManagedWrappingKeyConfig;
 use crate::system_metadata::SystemMetadata;
-use ec::EcConfig;
 use std::path::Path;
 use std::sync::{Arc, Barrier, MutexGuard};
 use storage::{
@@ -32,10 +31,8 @@ fn test_sse_s3_provider() -> StaticManagedKeyProvider {
 fn setup_coordinator(dir: &Path) -> Coordinator {
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
-    let ec_config = EcConfig::default();
     Coordinator::new_with_managed_key_provider(
         storage_node,
-        ec_config,
         "us-east-1".to_string(),
         None,
         test_sse_s3_provider(),
@@ -44,12 +41,10 @@ fn setup_coordinator(dir: &Path) -> Coordinator {
 }
 
 fn setup_coordinator_with_shared_storage(storage_node: Arc<SharedStorageNode>) -> Coordinator {
-    let ec_config = EcConfig::default();
     let shared_caches = shared_caches_for_storage_node(&storage_node);
     Coordinator::new_with_shared_caches_and_lifecycle_sweeper_factory(
         storage_node,
         shared_caches,
-        ec_config,
         "us-east-1".to_string(),
         None,
         Some(test_sse_s3_provider()),
@@ -205,12 +200,12 @@ fn create_upload_with_parts(
 }
 
 fn make_test_read_runtime(dir: &Path) -> ReadRuntime {
-    let ec_config = EcConfig::default();
+    let storage_node = Arc::new(SharedStorageNode::open(dir, &[0]).unwrap());
     ReadRuntime {
-        storage_node: Arc::new(SharedStorageNode::open(dir, &[0]).unwrap()),
+        storage_node: Arc::clone(&storage_node),
         #[cfg(test)]
         pg_topology: PgTopology::new(&[0]).unwrap(),
-        payload_buffer_pool: PayloadBufferPool::new(ec_config),
+        payload_buffer_pool: PayloadBufferPool::new(storage_node.default_ec_shape()),
         sse_c_validator: None,
         managed_key_provider: None,
     }

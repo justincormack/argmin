@@ -121,7 +121,6 @@ async fn main() {
     for _ in 0..config.workers {
         let coordinator = Coordinator::new_with_managed_key_provider(
             Arc::clone(&storage_node),
-            ec_config,
             config.region.clone(),
             sse_c_validator.clone(),
             managed_key_provider.clone(),

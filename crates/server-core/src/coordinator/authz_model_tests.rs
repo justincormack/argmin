@@ -6,7 +6,6 @@ use crate::conditional::{ReadCondition, WriteCondition};
 use crate::metadata_blob::MetadataBlob;
 use crate::sse::ManagedWrappingKeyConfig;
 use crate::system_metadata::SystemMetadata;
-use ec::EcConfig;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
@@ -1606,7 +1605,6 @@ mod harness {
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
         Coordinator::new_with_managed_key_provider(
             storage_node,
-            EcConfig::default(),
             "us-east-1".to_string(),
             None,
             test_sse_s3_provider(),

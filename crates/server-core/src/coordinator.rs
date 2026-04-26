@@ -8,7 +8,6 @@ use std::sync::{
 use checksum::{ChecksumAlgorithm, RawChecksum};
 #[cfg(test)]
 use checksum::{ChecksumType, MultipartChecksumConfig};
-use ec::EcConfig;
 #[cfg(test)]
 pub(crate) use s3_types::{
     AccountIdentity, BucketNamespace, LegalHoldStatus, ObjectLockDefaultRetention, ObjectLockMode,
@@ -432,7 +431,6 @@ fn spawn_bucket_fast_path_watcher(
 pub struct Coordinator {
     storage_node: Arc<SharedStorageNode>,
     shared_caches: Arc<CoordinatorSharedCaches>,
-    ec_config: EcConfig,
     payload_buffer_pool: Arc<PayloadBufferPool>,
     region: String,
     sse_c_validator: Option<SseCustomerValidatorConfig>,

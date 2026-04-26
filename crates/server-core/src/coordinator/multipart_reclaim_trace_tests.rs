@@ -1,6 +1,5 @@
 use super::*;
 use crate::pg::PgTopology;
-use ec::EcConfig;
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestCaseResult};
 use std::fmt::Write as _;
@@ -27,12 +26,12 @@ fn trace_generation_id_new() -> GenerationId {
 }
 
 fn make_test_read_runtime(dir: &Path) -> ReadRuntime {
-    let ec_config = EcConfig::default();
+    let storage_node = Arc::new(SharedStorageNode::open(dir, &[0]).unwrap());
     ReadRuntime {
-        storage_node: Arc::new(SharedStorageNode::open(dir, &[0]).unwrap()),
+        storage_node: Arc::clone(&storage_node),
         #[cfg(test)]
         pg_topology: PgTopology::new(&[0]).unwrap(),
-        payload_buffer_pool: PayloadBufferPool::new(ec_config),
+        payload_buffer_pool: PayloadBufferPool::new(storage_node.default_ec_shape()),
         sse_c_validator: None,
         managed_key_provider: None,
     }

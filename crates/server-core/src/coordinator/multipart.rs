@@ -1066,6 +1066,13 @@ impl Coordinator {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
+                    let ec = staging_segments.first().map_or(
+                        self.storage_node.default_ec_shape(),
+                        |segment| storage::EcShape {
+                            k: segment.ec_k,
+                            m: segment.ec_m,
+                        },
+                    );
 
                     let part_record = MultipartPartRecord {
                         upload_id: upload_id.clone(),
@@ -1077,8 +1084,8 @@ impl Coordinator {
                         part_okh: [0u8; 16],
                         part_vid: GenerationId::new(u64::from(generation) + 1)
                             .expect("multipart part generation must be nonzero"),
-                        ec_k: self.ec_config.data_shards,
-                        ec_m: self.ec_config.parity_shards,
+                        ec_k: ec.k,
+                        ec_m: ec.m,
                         last_modified: now,
                         checksum: checksum.as_ref().map(ChecksumBytes::from),
                     };

@@ -2,6 +2,7 @@ use super::test_helpers;
 use super::*;
 use crate::conditional::{DeleteCondition, ReadCondition, WriteCondition};
 use crate::sse::{ManagedWrappingKeyConfig, StaticManagedKeyProvider, SSE_C_CUSTOMER_KEY_LEN};
+use ec::EcConfig;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -104,7 +105,6 @@ pub(crate) fn setup_coordinator_in_region(dir: &Path, region: &str) -> Coordinat
     );
     Coordinator::new_with_managed_key_provider(
         storage_node,
-        ec_config,
         region.to_string(),
         None,
         test_sse_s3_provider(),
@@ -128,7 +128,6 @@ pub(crate) fn setup_coordinator_with_pg_count(dir: &Path, pg_count: u32) -> Coor
     );
     Coordinator::new_with_managed_key_provider(
         storage_node,
-        ec_config,
         "us-east-1".to_string(),
         None,
         test_sse_s3_provider(),
@@ -155,7 +154,6 @@ pub(crate) fn setup_coordinator_with_pg_count_without_lifecycle_sweeper(
     );
     Coordinator::new_with_lifecycle_sweeper_factory(
         storage_node,
-        ec_config,
         "us-east-1".to_string(),
         None,
         Some(test_sse_s3_provider()),
@@ -178,7 +176,7 @@ pub(crate) fn setup_coordinator_without_managed_key_provider(dir: &Path) -> Coor
         )
         .unwrap(),
     );
-    Coordinator::new(storage_node, ec_config, "us-east-1".to_string(), None).unwrap()
+    Coordinator::new(storage_node, "us-east-1".to_string(), None).unwrap()
 }
 
 pub(crate) fn setup_coordinator_without_lifecycle_sweeper(dir: &Path) -> Coordinator {
@@ -197,7 +195,6 @@ pub(crate) fn setup_coordinator_without_lifecycle_sweeper(dir: &Path) -> Coordin
     );
     Coordinator::new_with_lifecycle_sweeper_factory(
         storage_node,
-        ec_config,
         "us-east-1".to_string(),
         None,
         Some(test_sse_s3_provider()),
@@ -209,12 +206,10 @@ pub(crate) fn setup_coordinator_without_lifecycle_sweeper(dir: &Path) -> Coordin
 pub(crate) fn setup_coordinator_with_shared_storage(
     storage_node: Arc<SharedStorageNode>,
 ) -> Coordinator {
-    let ec_config = EcConfig::default();
     let shared_caches = shared_caches_for_storage_node(&storage_node);
     Coordinator::new_with_shared_caches_and_lifecycle_sweeper_factory(
         storage_node,
         shared_caches,
-        ec_config,
         "us-east-1".to_string(),
         None,
         Some(test_sse_s3_provider()),
@@ -226,12 +221,10 @@ pub(crate) fn setup_coordinator_with_shared_storage(
 pub(crate) fn setup_coordinator_with_shared_storage_without_lifecycle_sweeper(
     storage_node: Arc<SharedStorageNode>,
 ) -> Coordinator {
-    let ec_config = EcConfig::default();
     let shared_caches = shared_caches_for_storage_node(&storage_node);
     Coordinator::new_with_shared_caches_and_lifecycle_sweeper_factory(
         storage_node,
         shared_caches,
-        ec_config,
         "us-east-1".to_string(),
         None,
         Some(test_sse_s3_provider()),
@@ -275,7 +268,6 @@ pub(crate) fn setup_coordinator_with_sse_c(dir: &Path) -> Coordinator {
 
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
-    let ec_config = EcConfig::default();
     let validator = SseCustomerValidatorConfig::from_base64(
         1,
         &base64::engine::general_purpose::STANDARD.encode([9u8; 32]),
@@ -283,7 +275,6 @@ pub(crate) fn setup_coordinator_with_sse_c(dir: &Path) -> Coordinator {
     .unwrap();
     Coordinator::new_with_managed_key_provider(
         storage_node,
-        ec_config,
         "us-east-1".to_string(),
         Some(validator),
         test_sse_s3_provider(),

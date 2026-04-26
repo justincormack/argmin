@@ -7808,10 +7808,7 @@ fn stream_append_reuses_encode_scratch_for_aligned_segments() {
         .unwrap();
 
     let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
-    let ec = EcShape {
-        k: coord.ec_config.data_shards,
-        m: coord.ec_config.parity_shards,
-    };
+    let ec = coord.storage_node.default_ec_shape();
     assert_eq!(coord.storage_node.test_ec_scratch_allocation_count(ec), 0);
 
     coord

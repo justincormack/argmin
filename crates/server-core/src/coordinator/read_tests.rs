@@ -2,6 +2,7 @@ use super::test_helpers;
 use super::test_support::*;
 use super::*;
 use crate::pg::PgTopology;
+use ec::EcConfig;
 
 #[test]
 fn stream_put_get_object_readable() {
@@ -127,12 +128,12 @@ fn stream_put_get_multi_segment() {
 #[test]
 fn segment_list_reader_next_chunk_moves_whole_loaded_segment() {
     let dir = test_util::tempdir();
-    let ec_config = EcConfig::default();
+    let storage_node = Arc::new(SharedStorageNode::open(dir.path(), &[0]).unwrap());
     let runtime = ReadRuntime {
-        storage_node: Arc::new(SharedStorageNode::open(dir.path(), &[0]).unwrap()),
+        storage_node: Arc::clone(&storage_node),
         #[cfg(test)]
         pg_topology: PgTopology::new(&[0]).unwrap(),
-        payload_buffer_pool: PayloadBufferPool::new(ec_config),
+        payload_buffer_pool: PayloadBufferPool::new(storage_node.default_ec_shape()),
         sse_c_validator: None,
         managed_key_provider: None,
     };
@@ -429,8 +430,13 @@ fn encode_parity_scratch_covers_max_sse_c_segment() {
     let m = ec_config.parity_shards as usize;
     let padded = (INTERNAL_SEGMENT_SIZE + SSE_C_SEGMENT_TAG_LEN).div_ceil(k) * k;
     let expected = (padded / k) * m;
-
-    assert_eq!(encode_parity_scratch_len(ec_config), expected);
+    assert_eq!(
+        encode_parity_scratch_len(storage::EcShape {
+            k: ec_config.data_shards,
+            m: ec_config.parity_shards,
+        }),
+        expected
+    );
 }
 
 #[test]

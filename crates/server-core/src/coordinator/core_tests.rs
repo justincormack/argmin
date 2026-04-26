@@ -29,7 +29,6 @@ fn setup_direct_coordinator_with_shared_storage(
 ) -> Coordinator {
     Coordinator::new_with_managed_key_provider(
         storage_node,
-        EcConfig::default(),
         "us-east-1".to_string(),
         None,
         test_sse_s3_provider(),
@@ -63,35 +62,6 @@ fn rwlock_helpers_recover_after_panic() {
     assert_eq!(guard.get("bucket"), Some(&1));
     assert_eq!(guard.get("poisoned"), Some(&2));
     assert_eq!(guard.get("ok"), Some(&3));
-}
-
-#[test]
-fn coordinator_new_rejects_mismatched_storage_ec_shape() {
-    let tmp = test_util::tempdir();
-    let storage_node = Arc::new(
-        SharedStorageNode::open_with_default_ec_shape(
-            tmp.path(),
-            &[0, 1, 2, 3],
-            storage::EcShape { k: 5, m: 1 },
-        )
-        .unwrap(),
-    );
-
-    let err = match Coordinator::new(
-        storage_node,
-        EcConfig::default(),
-        "us-east-1".to_string(),
-        None,
-    ) {
-        Ok(_) => panic!("expected mismatched coordinator/storage EC shape to be rejected"),
-        Err(err) => err,
-    };
-
-    assert!(matches!(err, ServerError::InternalError { .. }));
-    let ServerError::InternalError { reason } = err else {
-        unreachable!();
-    };
-    assert!(reason.contains("does not match storage default_ec_shape"));
 }
 
 #[test]
@@ -3955,10 +3925,7 @@ fn ec_degraded_read_reuses_reconstruction_scratch() {
     delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj-reconstruct", 0);
 
     assert_eq!(coord.payload_buffer_pool.allocation_count(), 0);
-    let ec = EcShape {
-        k: coord.ec_config.data_shards,
-        m: coord.ec_config.parity_shards,
-    };
+    let ec = coord.storage_node.default_ec_shape();
     assert_eq!(coord.storage_node.test_ec_scratch_allocation_count(ec), 1);
 
     let first = coord

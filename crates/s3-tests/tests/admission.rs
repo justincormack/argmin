@@ -48,7 +48,6 @@ async fn start_server(
     let host_id = Arc::<str>::from(server_http::http::new_host_id());
     let frontends: Vec<server_http::http::HttpFrontend> = (0..pool_size)
         .map(|_| {
-            let ec_config = ec::EcConfig::default();
             let sse_s3_provider = ManagedWrappingKeyConfig::from_base64(
                 1,
                 s3_tests::server::TEST_SSE_S3_WRAPPING_KEY_B64,
@@ -57,7 +56,6 @@ async fn start_server(
             .expect("valid test SSE-S3 wrapping key");
             let coordinator = server_core::coordinator::Coordinator::new_with_managed_key_provider(
                 Arc::clone(&storage_node),
-                ec_config,
                 "us-east-1".to_string(),
                 None,
                 sse_s3_provider,

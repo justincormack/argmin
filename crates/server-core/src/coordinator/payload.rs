@@ -3,8 +3,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
-use ec::EcConfig;
-use storage::SharedStorageNode;
+use storage::{EcShape, SharedStorageNode};
 
 use super::lock_mutex_unpoisoned;
 use super::read_core::{PayloadLease, ReadChunk, SegmentPayloadRecord};
@@ -75,8 +74,8 @@ impl std::ops::Deref for ReadChunk {
 }
 
 impl PayloadBufferPool {
-    pub(super) fn new(ec_config: EcConfig) -> Arc<Self> {
-        let default_capacity = segment_payload_buffer_capacity(ec_config);
+    pub(super) fn new(ec_shape: EcShape) -> Arc<Self> {
+        let default_capacity = segment_payload_buffer_capacity(ec_shape);
         let max_cached = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
@@ -193,16 +192,16 @@ impl Drop for SharedPayloadBuffer {
 }
 
 #[cfg(test)]
-pub(super) fn encode_parity_scratch_len(ec_config: EcConfig) -> usize {
-    let k = ec_config.data_shards as usize;
-    let m = ec_config.parity_shards as usize;
+pub(super) fn encode_parity_scratch_len(ec_shape: EcShape) -> usize {
+    let k = ec_shape.k as usize;
+    let m = ec_shape.m as usize;
     let padded = max_stored_segment_size().div_ceil(k) * k;
     let shard_size = padded / k;
     shard_size.saturating_mul(m)
 }
 
-pub(super) fn segment_payload_buffer_capacity(ec_config: EcConfig) -> usize {
-    let k = ec_config.data_shards as usize;
+pub(super) fn segment_payload_buffer_capacity(ec_shape: EcShape) -> usize {
+    let k = ec_shape.k as usize;
     max_stored_segment_size().div_ceil(k) * k
 }
 

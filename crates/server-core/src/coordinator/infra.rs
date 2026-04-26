@@ -3,8 +3,6 @@ use super::runtime::LifecycleSweepStats;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use ec::EcConfig;
-
 use super::authz_types::{AuthorizedPutObjectWrite, ValidatedBucket};
 use super::payload::PayloadBufferPool;
 use super::read_core::ReadRuntime;
@@ -24,26 +22,6 @@ use storage::{
 };
 
 impl Coordinator {
-    fn validate_storage_ec_shape(
-        storage_node: &SharedStorageNode,
-        ec_config: EcConfig,
-    ) -> Result<(), ServerError> {
-        let expected = storage::EcShape {
-            k: ec_config.data_shards,
-            m: ec_config.parity_shards,
-        };
-        let actual = storage_node.default_ec_shape();
-        if actual != expected {
-            return Err(ServerError::InternalError {
-                reason: format!(
-                    "coordinator ec_config ({}/{}) does not match storage default_ec_shape ({}/{})",
-                    expected.k, expected.m, actual.k, actual.m
-                ),
-            });
-        }
-        Ok(())
-    }
-
     pub(super) fn random_session_id(error_reason: &'static str) -> Result<SessionId, ServerError> {
         const HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -244,7 +222,6 @@ impl Coordinator {
     /// Create a new coordinator.
     pub fn new(
         storage_node: Arc<SharedStorageNode>,
-        ec_config: EcConfig,
         region: String,
         sse_c_validator: Option<SseCustomerValidatorConfig>,
     ) -> Result<Self, ServerError> {
@@ -255,7 +232,6 @@ impl Coordinator {
         Self::new_with_shared_caches_and_lifecycle_sweeper_factory(
             Arc::clone(&storage_node),
             shared_caches_for_storage_node(&storage_node),
-            ec_config,
             region,
             sse_c_validator,
             None,
@@ -266,7 +242,6 @@ impl Coordinator {
     /// Create a new coordinator with a managed object-encryption wrapping-key provider.
     pub fn new_with_managed_key_provider(
         storage_node: Arc<SharedStorageNode>,
-        ec_config: EcConfig,
         region: String,
         sse_c_validator: Option<SseCustomerValidatorConfig>,
         managed_key_provider: StaticManagedKeyProvider,
@@ -278,7 +253,6 @@ impl Coordinator {
         Self::new_with_shared_caches_and_lifecycle_sweeper_factory(
             Arc::clone(&storage_node),
             shared_caches_for_storage_node(&storage_node),
-            ec_config,
             region,
             sse_c_validator,
             Some(managed_key_provider),
@@ -289,7 +263,6 @@ impl Coordinator {
     #[cfg(test)]
     pub(super) fn new_with_lifecycle_sweeper_factory<F>(
         storage_node: Arc<SharedStorageNode>,
-        ec_config: EcConfig,
         region: String,
         sse_c_validator: Option<SseCustomerValidatorConfig>,
         managed_key_provider: Option<StaticManagedKeyProvider>,
@@ -304,7 +277,6 @@ impl Coordinator {
         Self::new_with_shared_caches_and_lifecycle_sweeper_factory(
             Arc::clone(&storage_node),
             shared_caches_for_storage_node(&storage_node),
-            ec_config,
             region,
             sse_c_validator,
             managed_key_provider,
@@ -315,7 +287,6 @@ impl Coordinator {
     pub(super) fn new_with_shared_caches_and_lifecycle_sweeper_factory<F>(
         storage_node: Arc<SharedStorageNode>,
         shared_caches: Arc<CoordinatorSharedCaches>,
-        ec_config: EcConfig,
         region: String,
         sse_c_validator: Option<SseCustomerValidatorConfig>,
         managed_key_provider: Option<StaticManagedKeyProvider>,
@@ -327,14 +298,13 @@ impl Coordinator {
             ReadRuntime,
         ) -> Result<Arc<LifecycleSweeper>, ServerError>,
     {
-        Self::validate_storage_ec_shape(&storage_node, ec_config)?;
         #[cfg(test)]
         let pg_topology = PgTopology::new(storage_node.pg_ids()).map_err(|reason| {
             ServerError::InternalError {
                 reason: reason.to_string(),
             }
         })?;
-        let payload_buffer_pool = PayloadBufferPool::new(ec_config);
+        let payload_buffer_pool = PayloadBufferPool::new(storage_node.default_ec_shape());
         let read_runtime = ReadRuntime {
             storage_node: Arc::clone(&storage_node),
             #[cfg(test)]
@@ -373,7 +343,6 @@ impl Coordinator {
         Ok(Self {
             storage_node,
             shared_caches,
-            ec_config,
             payload_buffer_pool,
             region,
             sse_c_validator,
