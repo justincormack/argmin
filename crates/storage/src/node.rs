@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::{Arc, OnceLock};
-use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
 use std::time::Instant;
 
 use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
@@ -44,6 +44,7 @@ const TRACE_TARGET: &str = "storage";
 const RAPIDHASH_SECRETS: RapidSecrets = RapidSecrets::seed(0);
 const LOCK_WAIT_EVENT_THRESHOLD_US: u128 = 1_000;
 const RECLAIM_WORKER_WAIT_POLL_MILLIS: u64 = 100;
+const BUCKET_FAST_PATH_MAX_ENTRIES: usize = 1024;
 
 mod bucket_ops;
 mod listing_ops;
@@ -52,10 +53,6 @@ mod object_delete_ops;
 mod object_metadata_ops;
 mod object_read_ops;
 mod stream_ops;
-
-fn read_rwlock_unpoisoned<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
-    lock.read().unwrap_or_else(|err| err.into_inner())
-}
 
 fn write_rwlock_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
     lock.write().unwrap_or_else(|err| err.into_inner())
@@ -326,7 +323,7 @@ pub struct SharedStorageNode {
     bucket_locks: Vec<Mutex<()>>,
     bucket_coordination: Vec<(Mutex<u64>, Condvar)>,
     multipart_completion_locks: Vec<Mutex<()>>,
-    bucket_fast_path: RwLock<HashMap<BucketName, BucketFastPathInfo>>,
+    bucket_fast_path: RwLock<BucketFastPathCache>,
     object_payload_leases: Mutex<HashMap<(BucketName, ObjectKey, GenerationId), usize>>,
     reclaim_queue: (Mutex<ReclaimQueueState>, Condvar),
 }
@@ -357,6 +354,58 @@ struct ReclaimQueueState {
     queued_objects: HashSet<ReclaimRoot>,
     bucket_delete_queue: VecDeque<BucketName>,
     queued_bucket_deletes: HashSet<BucketName>,
+}
+
+#[derive(Debug, Default)]
+struct BucketFastPathCache {
+    entries: HashMap<BucketName, BucketFastPathInfo>,
+    recency: VecDeque<BucketName>,
+}
+
+impl BucketFastPathCache {
+    fn get(&mut self, bucket: &BucketName) -> Option<BucketFastPathInfo> {
+        let info = self.entries.get(bucket).cloned()?;
+        self.touch(bucket);
+        Some(info)
+    }
+
+    fn insert(&mut self, info: BucketFastPathInfo) {
+        let bucket = info.name.clone();
+        self.entries.insert(bucket.clone(), info);
+        self.touch(&bucket);
+        self.evict_if_needed();
+    }
+
+    fn update_if_present(
+        &mut self,
+        bucket: &BucketName,
+        update: impl FnOnce(&mut BucketFastPathInfo),
+    ) {
+        if let Some(info) = self.entries.get_mut(bucket) {
+            update(info);
+            self.touch(bucket);
+        }
+    }
+
+    fn remove(&mut self, bucket: &BucketName) {
+        if self.entries.remove(bucket).is_some() {
+            self.recency.retain(|entry| entry != bucket);
+        }
+    }
+
+    fn touch(&mut self, bucket: &BucketName) {
+        self.recency.retain(|entry| entry != bucket);
+        self.recency.push_back(bucket.clone());
+    }
+
+    fn evict_if_needed(&mut self) {
+        while self.entries.len() > BUCKET_FAST_PATH_MAX_ENTRIES {
+            let Some(lru_bucket) = self.recency.pop_front() else {
+                break;
+            };
+            self.entries.remove(&lru_bucket);
+        }
+    }
 }
 
 const BUCKET_LOCK_STRIPES: usize = 256;
@@ -413,7 +462,7 @@ impl SharedStorageNode {
             bucket_locks,
             bucket_coordination,
             multipart_completion_locks,
-            bucket_fast_path: RwLock::new(HashMap::new()),
+            bucket_fast_path: RwLock::new(BucketFastPathCache::default()),
             object_payload_leases: Mutex::new(HashMap::new()),
             reclaim_queue: (
                 Mutex::new(ReclaimQueueState {
@@ -457,14 +506,12 @@ impl SharedStorageNode {
 
     /// Return the cached active-bucket fast-path metadata for `bucket`.
     pub fn get_bucket_fast_path(&self, bucket: &BucketName) -> Option<BucketFastPathInfo> {
-        read_rwlock_unpoisoned(&self.bucket_fast_path)
-            .get(bucket)
-            .cloned()
+        write_rwlock_unpoisoned(&self.bucket_fast_path).get(bucket)
     }
 
     /// Insert or replace the cached active-bucket fast-path metadata.
     pub fn upsert_bucket_fast_path(&self, info: BucketFastPathInfo) {
-        write_rwlock_unpoisoned(&self.bucket_fast_path).insert(info.name.clone(), info);
+        write_rwlock_unpoisoned(&self.bucket_fast_path).insert(info);
     }
 
     /// Mutate the cached fast-path metadata if present.
@@ -473,9 +520,7 @@ impl SharedStorageNode {
         bucket: &BucketName,
         update: impl FnOnce(&mut BucketFastPathInfo),
     ) {
-        if let Some(info) = write_rwlock_unpoisoned(&self.bucket_fast_path).get_mut(bucket) {
-            update(info);
-        }
+        write_rwlock_unpoisoned(&self.bucket_fast_path).update_if_present(bucket, update);
     }
 
     /// Remove cached fast-path metadata for `bucket`.
@@ -1519,6 +1564,32 @@ mod tests {
         BucketName::try_from(name).unwrap()
     }
 
+    fn bucket_fast_path_info(name: &str) -> BucketFastPathInfo {
+        BucketFastPathInfo {
+            name: bucket_name(name),
+            owner_principal: "owner".to_string(),
+            owner_canonical_id: s3_types::CanonicalUserId::from_principal("owner"),
+            created_at: 0,
+            state: crate::types::BucketState::Active,
+            versioning: s3_types::BucketVersioningState::Disabled,
+            object_lock: s3_types::BucketObjectLockConfig {
+                enabled: false,
+                default_retention: None,
+            },
+            public_access_block: None,
+            ownership_controls: None,
+            bucket_policy_present: false,
+            bucket_policy_public: false,
+            bucket_policy_generation: 0,
+            policy: crate::types::LoadedBucketSubresource::Missing,
+            bucket_lifecycle_present: false,
+            bucket_lifecycle_generation: 0,
+            bucket_abac_enabled: false,
+            tags: crate::types::LoadedBucketSubresource::NotRequested,
+            encryption: crate::types::EffectiveBucketEncryptionConfig::default(),
+        }
+    }
+
     #[test]
     fn data_dir_accessor() {
         let tmp = test_util::tempdir();
@@ -1586,30 +1657,7 @@ mod tests {
             panic!("poison bucket fast path lock");
         }));
 
-        let info = BucketFastPathInfo {
-            name: crate::types::BucketName::try_from("bucket").unwrap(),
-            owner_principal: "owner".to_string(),
-            owner_canonical_id: s3_types::CanonicalUserId::from_principal("owner"),
-            created_at: 0,
-            state: crate::types::BucketState::Active,
-            versioning: s3_types::BucketVersioningState::Disabled,
-            object_lock: s3_types::BucketObjectLockConfig {
-                enabled: false,
-                default_retention: None,
-            },
-            public_access_block: None,
-            ownership_controls: None,
-            bucket_policy_present: false,
-            bucket_policy_public: false,
-            bucket_policy_generation: 0,
-            policy: crate::types::LoadedBucketSubresource::Missing,
-            bucket_lifecycle_present: false,
-            bucket_lifecycle_generation: 0,
-            bucket_abac_enabled: false,
-            tags: crate::types::LoadedBucketSubresource::NotRequested,
-            encryption: crate::types::EffectiveBucketEncryptionConfig::default(),
-        };
-        node.upsert_bucket_fast_path(info);
+        node.upsert_bucket_fast_path(bucket_fast_path_info("bucket"));
         assert_eq!(
             node.get_bucket_fast_path(&bucket_name("bucket"))
                 .as_ref()
@@ -1618,6 +1666,38 @@ mod tests {
         );
         node.remove_bucket_fast_path(&bucket_name("bucket"));
         assert!(node.get_bucket_fast_path(&bucket_name("bucket")).is_none());
+    }
+
+    #[test]
+    fn shared_node_bucket_fast_path_is_count_bounded_lru() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+
+        for idx in 0..BUCKET_FAST_PATH_MAX_ENTRIES {
+            node.upsert_bucket_fast_path(bucket_fast_path_info(&format!("bucket-{idx:04}")));
+        }
+
+        assert!(node
+            .get_bucket_fast_path(&bucket_name("bucket-0000"))
+            .is_some());
+
+        node.upsert_bucket_fast_path(bucket_fast_path_info(&format!(
+            "bucket-{:04}",
+            BUCKET_FAST_PATH_MAX_ENTRIES
+        )));
+
+        assert!(node
+            .get_bucket_fast_path(&bucket_name("bucket-0000"))
+            .is_some());
+        assert!(node
+            .get_bucket_fast_path(&bucket_name("bucket-0001"))
+            .is_none());
+        assert!(node
+            .get_bucket_fast_path(&bucket_name(&format!(
+                "bucket-{:04}",
+                BUCKET_FAST_PATH_MAX_ENTRIES
+            )))
+            .is_some());
     }
 
     #[test]

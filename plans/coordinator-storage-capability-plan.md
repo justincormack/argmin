@@ -1228,6 +1228,27 @@ Current guidance for this phase:
     acceptable end state
   - the first target should be a fixed-entry bounded cache with deterministic
     eviction, most likely recency-based
+  - the initial implementation should remain simple:
+    - count-bounded rather than byte-weighted
+    - one shared cache per `SharedStorageNode`
+    - deterministic recency-based eviction
+  - the current intended first landing is a `1024`-entry recency-bounded cache
+    for `BucketFastPathInfo`
+  - practical memory note for this first landing:
+    - cold entries are small, but warmed entries can carry bucket policy and
+      ABAC tag bodies
+    - rough upper-bound sizing is therefore dominated by:
+      - bucket policy up to `20 KiB`
+      - bucket tags up to `160 KiB`
+    - a fully worst-case warm cache would therefore be much larger than the
+      typical cold-entry footprint
+    - that is acceptable for the initial rollout because:
+      - observed total process memory has historically been on the order of a
+        few hundred MiB in practice
+      - production profiling can tune the entry cap later if real workloads
+        show pressure
+    - so `1024` entries is considered a reasonable initial count-bounded cap,
+      not a permanently fixed final value
   - Phase 10 should use count-bounded sizing, not byte-weighted sizing
     - the modern hot-path bucket execution context is expected to be dominated
       by tiny fixed-size fields plus a small amount of medium-sized metadata
@@ -1383,6 +1404,10 @@ This review should cover at least:
 Acceptance criteria:
 
 - the cache is explicitly bounded rather than unbounded
+- the initial bounded implementation is simple and deterministic
+  - count-bounded
+  - recency-based
+  - no byte-weighted sizing yet
 - the intended post-refactor fast-path contract is written down explicitly
 - the intended hot-path priority order is written down explicitly
 - the revalidation contract is written down explicitly
