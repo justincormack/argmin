@@ -1716,9 +1716,10 @@ Acceptance criteria:
 ### Phase 13: Data-Plane EC and Shard IO Ownership
 
 Phase 13 implementation is complete. Normal data-path EC encode, shard-file
-writes, healthy shard reads, and degraded reconstruction now live in storage.
-Further work in this area is optimization or API tightening, not another
-coordinator/storage boundary move.
+writes, healthy shard reads, degraded reconstruction, and default EC shape
+selection for normal writes now live in storage. Coordinator no longer owns
+`EcConfig`. Further work in this area is optimization or API tightening, not
+another coordinator/storage boundary move.
 
 Execution priority note: do this before Phase 11 and Phase 12. Although it is
 numbered later, this is still boundary cleanup work, while Phases 11 and 12
