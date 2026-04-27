@@ -113,7 +113,7 @@ Expand to short traces that mix:
 
 - versioning changes
 - object-lock retention / legal-hold state
-- delete current vs version-specific operations
+- delete current vs version-specific authorization operations
 
 This phase should target cases where a state change followed by a write or
 delete probe could silently regress even if the individual fixed matrices still
@@ -125,6 +125,17 @@ Acceptance criteria:
   delete-marker transitions
 - governance-bypass and missing-version behavior stays aligned with the fixed
   Phase 7 / 7A rules
+- Implemented initial `phase13` BOE versioned-delete authorization trace covering:
+  - current read after owner-created delete markers
+  - current vs specific-version delete authorization probes
+  - governance/compliance/legal-hold effects on specific-version delete authorization
+  - bypass-governance behavior against missing and locked versions in authorization
+- Remaining gap: explicit versioning-mode transitions themselves are still not
+  generated; the current Phase 3 slice starts from a versioning-enabled BOE
+  bucket
+- Remaining gap: Phase 13 does not yet exercise `delete_object(...)` execution
+  and `apply_authorized_delete_object(...)` mutation/recheck behavior; it only
+  covers the BOE authorization decision path
 
 ## Verification
 

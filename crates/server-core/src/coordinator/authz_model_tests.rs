@@ -10644,6 +10644,658 @@ mod phase12_harness {
     }
 }
 
+mod phase13_model {
+    use super::phase7_model::DeletePolicyShape;
+    use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Phase13ReadPolicyState {
+        None,
+        AllowPrivate,
+    }
+
+    impl fmt::Display for Phase13ReadPolicyState {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::None => f.write_str("no-read-policy"),
+                Self::AllowPrivate => f.write_str("allow-read-private"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Phase13CurrentState {
+        Live,
+        DeleteMarker,
+        Missing,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Phase13RetentionState {
+        None,
+        Governance,
+        Compliance,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Phase13Mutation {
+        ReadPolicy(Phase13ReadPolicyState),
+        DeletePolicy(DeletePolicyShape),
+        OwnerPutCurrentVersion,
+        OwnerDeleteCurrent,
+        OwnerDeleteTrackedVersion,
+        ApplyTrackedGovernanceRetention,
+        ApplyTrackedComplianceRetention,
+        ApplyTrackedLegalHold,
+    }
+
+    impl fmt::Display for Phase13Mutation {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::ReadPolicy(state) => write!(f, "set-read-policy={state}"),
+                Self::DeletePolicy(policy) => write!(f, "set-delete-policy={policy}"),
+                Self::OwnerPutCurrentVersion => f.write_str("owner-put-current-version"),
+                Self::OwnerDeleteCurrent => f.write_str("owner-delete-current"),
+                Self::OwnerDeleteTrackedVersion => f.write_str("owner-delete-tracked-version"),
+                Self::ApplyTrackedGovernanceRetention => {
+                    f.write_str("apply-tracked-governance-retention")
+                }
+                Self::ApplyTrackedComplianceRetention => {
+                    f.write_str("apply-tracked-compliance-retention")
+                }
+                Self::ApplyTrackedLegalHold => f.write_str("apply-tracked-legal-hold"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Phase13Probe {
+        GetObjectCurrent,
+        GetObjectAttributesCurrent,
+        DeleteCurrent,
+        DeleteTrackedVersion,
+        DeleteTrackedVersionBypass,
+    }
+
+    impl fmt::Display for Phase13Probe {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::GetObjectCurrent => f.write_str("get-object-current"),
+                Self::GetObjectAttributesCurrent => f.write_str("get-object-attributes-current"),
+                Self::DeleteCurrent => f.write_str("delete-current"),
+                Self::DeleteTrackedVersion => f.write_str("delete-tracked-version"),
+                Self::DeleteTrackedVersionBypass => f.write_str("delete-tracked-version-bypass"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct Phase13State {
+        pub(super) read_policy: Phase13ReadPolicyState,
+        pub(super) delete_policy: DeletePolicyShape,
+        pub(super) current: Phase13CurrentState,
+        pub(super) tracked_version_present: bool,
+        pub(super) tracked_version_is_current: bool,
+        pub(super) revealed_after_tracked_delete: Phase13CurrentState,
+        pub(super) tracked_version_retention: Phase13RetentionState,
+        pub(super) tracked_version_legal_hold: bool,
+    }
+
+    impl Phase13State {
+        pub(super) fn new() -> Self {
+            Self {
+                read_policy: Phase13ReadPolicyState::None,
+                delete_policy: DeletePolicyShape::None,
+                current: Phase13CurrentState::Live,
+                tracked_version_present: true,
+                tracked_version_is_current: true,
+                revealed_after_tracked_delete: Phase13CurrentState::Missing,
+                tracked_version_retention: Phase13RetentionState::None,
+                tracked_version_legal_hold: false,
+            }
+        }
+
+        pub(super) fn apply(&mut self, mutation: Phase13Mutation) {
+            match mutation {
+                Phase13Mutation::ReadPolicy(state) => self.read_policy = state,
+                Phase13Mutation::DeletePolicy(policy) => self.delete_policy = policy,
+                Phase13Mutation::OwnerPutCurrentVersion => {
+                    self.revealed_after_tracked_delete = self.current;
+                    self.current = Phase13CurrentState::Live;
+                    self.tracked_version_present = true;
+                    self.tracked_version_is_current = true;
+                    self.tracked_version_retention = Phase13RetentionState::None;
+                    self.tracked_version_legal_hold = false;
+                }
+                Phase13Mutation::OwnerDeleteCurrent => {
+                    self.current = Phase13CurrentState::DeleteMarker;
+                    self.tracked_version_is_current = false;
+                }
+                Phase13Mutation::OwnerDeleteTrackedVersion => {
+                    if self.tracked_version_present
+                        && self.tracked_version_retention == Phase13RetentionState::None
+                        && !self.tracked_version_legal_hold
+                    {
+                        self.tracked_version_present = false;
+                        if self.tracked_version_is_current {
+                            self.current = self.revealed_after_tracked_delete;
+                        }
+                        self.tracked_version_is_current = false;
+                        self.tracked_version_retention = Phase13RetentionState::None;
+                        self.tracked_version_legal_hold = false;
+                    }
+                }
+                Phase13Mutation::ApplyTrackedGovernanceRetention => {
+                    if self.tracked_version_present
+                        && self.tracked_version_retention == Phase13RetentionState::None
+                    {
+                        self.tracked_version_retention = Phase13RetentionState::Governance;
+                    }
+                }
+                Phase13Mutation::ApplyTrackedComplianceRetention => {
+                    if self.tracked_version_present
+                        && self.tracked_version_retention == Phase13RetentionState::None
+                    {
+                        self.tracked_version_retention = Phase13RetentionState::Compliance;
+                    }
+                }
+                Phase13Mutation::ApplyTrackedLegalHold => {
+                    if self.tracked_version_present {
+                        self.tracked_version_legal_hold = true;
+                    }
+                }
+            }
+        }
+
+        pub(super) fn expected_outcome(self, probe: Phase13Probe) -> model::Outcome {
+            match probe {
+                Phase13Probe::GetObjectCurrent | Phase13Probe::GetObjectAttributesCurrent => {
+                    if self.read_policy == Phase13ReadPolicyState::AllowPrivate
+                        && self.current == Phase13CurrentState::Live
+                    {
+                        model::Outcome::Allow
+                    } else {
+                        model::Outcome::Deny
+                    }
+                }
+                Phase13Probe::DeleteCurrent => {
+                    if self.delete_policy == DeletePolicyShape::AllowDeleteObject {
+                        model::Outcome::Allow
+                    } else {
+                        model::Outcome::Deny
+                    }
+                }
+                Phase13Probe::DeleteTrackedVersion => self.expected_delete_version(false),
+                Phase13Probe::DeleteTrackedVersionBypass => self.expected_delete_version(true),
+            }
+        }
+
+        fn expected_delete_version(self, bypass: bool) -> model::Outcome {
+            let delete_allowed = matches!(
+                self.delete_policy,
+                DeletePolicyShape::AllowDeleteVersion
+                    | DeletePolicyShape::AllowDeleteVersionAndBypass
+            );
+            if !delete_allowed {
+                return model::Outcome::Deny;
+            }
+
+            let bypass_allowed =
+                self.delete_policy == DeletePolicyShape::AllowDeleteVersionAndBypass;
+
+            if !self.tracked_version_present {
+                if !bypass || bypass_allowed {
+                    return model::Outcome::Allow;
+                }
+                return model::Outcome::Deny;
+            }
+
+            if self.tracked_version_legal_hold {
+                return model::Outcome::Deny;
+            }
+
+            match self.tracked_version_retention {
+                Phase13RetentionState::None => model::Outcome::Allow,
+                Phase13RetentionState::Governance => {
+                    if bypass && bypass_allowed {
+                        model::Outcome::Allow
+                    } else {
+                        model::Outcome::Deny
+                    }
+                }
+                Phase13RetentionState::Compliance => model::Outcome::Deny,
+            }
+        }
+    }
+}
+
+mod phase13_harness {
+    use std::cell::{Cell, RefCell};
+
+    use super::harness::{setup_coordinator, IdentityFixtures};
+    use super::model::Outcome;
+    use super::phase13_model::{Phase13Mutation, Phase13Probe, Phase13ReadPolicyState};
+    use super::phase7_model::{DeleteObjectLockShape, DeletePolicyShape};
+    use super::*;
+
+    const PHASE13_KEY: &str = "phase13-key";
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ClassifiedPhase13Result {
+        Allow,
+        Deny,
+    }
+
+    pub(super) struct Phase13Harness {
+        _tmp: test_util::TempDir,
+        coord: Coordinator,
+        fixtures: IdentityFixtures,
+        read_policy: Cell<Phase13ReadPolicyState>,
+        delete_policy: Cell<DeletePolicyShape>,
+        tracked_version_id: RefCell<Option<VersionId>>,
+        tracked_version_present: Cell<bool>,
+    }
+
+    impl Phase13Harness {
+        pub(super) fn new() -> Self {
+            let tmp = test_util::tempdir();
+            let coord = setup_coordinator(tmp.path());
+            let fixtures = IdentityFixtures::new();
+            Self {
+                _tmp: tmp,
+                coord,
+                fixtures,
+                read_policy: Cell::new(Phase13ReadPolicyState::None),
+                delete_policy: Cell::new(DeletePolicyShape::None),
+                tracked_version_id: RefCell::new(None),
+                tracked_version_present: Cell::new(false),
+            }
+        }
+
+        pub(super) fn prepare(&self, bucket: &str) {
+            self.coord
+                .create_bucket(&CreateBucketRequest {
+                    name: trusted_bucket_name(bucket),
+                    requester: Requester::authenticated(self.fixtures.owner_user.clone()),
+                    namespace: BucketNamespace::Global,
+                    acl: CreateBucketAcl::DefaultPrivate,
+                    ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                    object_lock_enabled: true,
+                })
+                .unwrap_or_else(|err| panic!("failed to create phase 13 bucket: {err:?}"));
+            self.coord
+                .put_bucket_versioning(&PutBucketVersioningRequest {
+                    bucket: BucketRequest::new(
+                        trusted_bucket_name(bucket),
+                        Requester::authenticated(self.fixtures.owner_user.clone()),
+                        None,
+                    ),
+                    state: BucketVersioningState::Enabled,
+                })
+                .unwrap_or_else(|err| panic!("failed to enable versioning for phase 13: {err:?}"));
+            let version_id = self.owner_put_current_version(bucket);
+            self.tracked_version_id.replace(Some(version_id));
+            self.tracked_version_present.set(true);
+            self.read_policy.set(Phase13ReadPolicyState::None);
+            self.delete_policy.set(DeletePolicyShape::None);
+        }
+
+        pub(super) fn apply_mutation(&self, bucket: &str, mutation: Phase13Mutation) {
+            match mutation {
+                Phase13Mutation::ReadPolicy(state) => {
+                    self.read_policy.set(state);
+                    self.apply_bucket_policy(bucket);
+                }
+                Phase13Mutation::DeletePolicy(policy) => {
+                    self.delete_policy.set(policy);
+                    self.apply_bucket_policy(bucket);
+                }
+                Phase13Mutation::OwnerPutCurrentVersion => {
+                    let version_id = self.owner_put_current_version(bucket);
+                    self.tracked_version_id.replace(Some(version_id));
+                    self.tracked_version_present.set(true);
+                }
+                Phase13Mutation::OwnerDeleteCurrent => {
+                    self.coord
+                        .delete_object(&DeleteObjectRequest {
+                            object: ObjectVersionRequest::new(
+                                trusted_bucket_name(bucket),
+                                trusted_object_key(PHASE13_KEY),
+                                None,
+                                Requester::authenticated(self.fixtures.owner_user.clone()),
+                                None,
+                            ),
+                            bypass_governance: false,
+                            cond: NO_DELETE,
+                        })
+                        .unwrap_or_else(|err| {
+                            panic!("failed to owner-delete current version for phase 13: {err:?}")
+                        });
+                }
+                Phase13Mutation::OwnerDeleteTrackedVersion => {
+                    if let Some(version_id) = *self.tracked_version_id.borrow() {
+                        match self.coord.delete_object(&DeleteObjectRequest {
+                            object: ObjectVersionRequest::new(
+                                trusted_bucket_name(bucket),
+                                trusted_object_key(PHASE13_KEY),
+                                Some(version_id),
+                                Requester::authenticated(self.fixtures.owner_user.clone()),
+                                None,
+                            ),
+                            bypass_governance: false,
+                            cond: NO_DELETE,
+                        }) {
+                            Ok(_) => {
+                                self.tracked_version_present.set(false);
+                            }
+                            Err(
+                                ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied,
+                            ) => {}
+                            Err(err) => {
+                                panic!(
+                                    "failed to owner-delete tracked version for phase 13: {err:?}"
+                                )
+                            }
+                        }
+                    }
+                }
+                Phase13Mutation::ApplyTrackedGovernanceRetention => {
+                    self.apply_tracked_version_lock(bucket, DeleteObjectLockShape::Governance)
+                }
+                Phase13Mutation::ApplyTrackedComplianceRetention => {
+                    self.apply_tracked_version_lock(bucket, DeleteObjectLockShape::Compliance)
+                }
+                Phase13Mutation::ApplyTrackedLegalHold => {
+                    self.apply_tracked_version_lock(bucket, DeleteObjectLockShape::LegalHold)
+                }
+            }
+        }
+
+        pub(super) fn probe(&self, bucket: &str, probe: Phase13Probe) -> ClassifiedPhase13Result {
+            let requester = Requester::authenticated(self.fixtures.cross_account.clone());
+            let version_id = self
+                .tracked_version_id
+                .borrow()
+                .unwrap_or_else(|| VersionId::from_u64(999_999));
+            let result = match probe {
+                Phase13Probe::GetObjectCurrent => self
+                    .coord
+                    .get_object(&GetObjectRequest {
+                        sse_customer: None,
+                        object: ObjectVersionRequest::new(
+                            trusted_bucket_name(bucket),
+                            trusted_object_key(PHASE13_KEY),
+                            None,
+                            requester,
+                            None,
+                        ),
+                        cond: NO_READ,
+                    })
+                    .and_then(|result| {
+                        let _ = read_all_phase13_body(result.body)?;
+                        Ok(())
+                    }),
+                Phase13Probe::GetObjectAttributesCurrent => self
+                    .coord
+                    .get_object_attributes(&GetObjectAttributesRequest {
+                        object: ObjectVersionRequest::new(
+                            trusted_bucket_name(bucket),
+                            trusted_object_key(PHASE13_KEY),
+                            None,
+                            requester,
+                            None,
+                        ),
+                        cond: NO_READ,
+                        want_parts: false,
+                        part_number_marker: None,
+                        max_parts: 0,
+                        sse_customer: None,
+                    })
+                    .map(|_| ()),
+                Phase13Probe::DeleteCurrent => self
+                    .coord
+                    .authorize_delete_object(&DeleteObjectRequest {
+                        object: ObjectVersionRequest::new(
+                            trusted_bucket_name(bucket),
+                            trusted_object_key(PHASE13_KEY),
+                            None,
+                            requester,
+                            None,
+                        ),
+                        bypass_governance: false,
+                        cond: NO_DELETE,
+                    })
+                    .map(|_| ()),
+                Phase13Probe::DeleteTrackedVersion => self
+                    .coord
+                    .authorize_delete_object(&DeleteObjectRequest {
+                        object: ObjectVersionRequest::new(
+                            trusted_bucket_name(bucket),
+                            trusted_object_key(PHASE13_KEY),
+                            Some(version_id),
+                            requester,
+                            None,
+                        ),
+                        bypass_governance: false,
+                        cond: NO_DELETE,
+                    })
+                    .map(|_| ()),
+                Phase13Probe::DeleteTrackedVersionBypass => self
+                    .coord
+                    .authorize_delete_object(&DeleteObjectRequest {
+                        object: ObjectVersionRequest::new(
+                            trusted_bucket_name(bucket),
+                            trusted_object_key(PHASE13_KEY),
+                            Some(version_id),
+                            requester,
+                            None,
+                        ),
+                        bypass_governance: true,
+                        cond: NO_DELETE,
+                    })
+                    .map(|_| ()),
+            };
+            classify_phase13(result)
+        }
+
+        fn owner_put_current_version(&self, bucket: &str) -> VersionId {
+            test_helpers::put_object(
+                &self.coord,
+                &PutObjectRequest {
+                    encryption: WriteEncryptionRequest::none(),
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
+                    object: ObjectRequest::new(
+                        trusted_bucket_name(bucket),
+                        trusted_object_key(PHASE13_KEY),
+                        Requester::authenticated(self.fixtures.owner_user.clone()),
+                        None,
+                    ),
+                    data: b"phase13",
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    tags: None,
+                    cond: NO_WRITE,
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                },
+            )
+            .unwrap_or_else(|err| panic!("failed to owner-put phase 13 object: {err:?}"))
+            .version_id
+        }
+
+        fn apply_tracked_version_lock(&self, bucket: &str, lock: DeleteObjectLockShape) {
+            if !self.tracked_version_present.get() {
+                return;
+            }
+            let Some(version_id) = *self.tracked_version_id.borrow() else {
+                return;
+            };
+            match lock {
+                DeleteObjectLockShape::None => {}
+                DeleteObjectLockShape::Governance | DeleteObjectLockShape::Compliance => {
+                    match self.coord.put_object_retention(&PutObjectRetentionRequest {
+                        object: ObjectVersionRequest::new(
+                            trusted_bucket_name(bucket),
+                            trusted_object_key(PHASE13_KEY),
+                            Some(version_id),
+                            Requester::authenticated(self.fixtures.owner_user.clone()),
+                            None,
+                        ),
+                        retention: ObjectRetention {
+                            mode: match lock {
+                                DeleteObjectLockShape::Governance => ObjectLockMode::Governance,
+                                DeleteObjectLockShape::Compliance => ObjectLockMode::Compliance,
+                                DeleteObjectLockShape::None | DeleteObjectLockShape::LegalHold => {
+                                    unreachable!()
+                                }
+                            },
+                            retain_until_unix_seconds: Coordinator::current_unix_seconds()
+                                .expect("phase 13 current time")
+                                + 3600,
+                        },
+                        bypass_governance: false,
+                    }) {
+                        Ok(()) => {}
+                        Err(
+                            ServerError::AccessDenied
+                            | ServerError::AnonymousApiAccessDenied
+                            | ServerError::VersionNotFound { .. }
+                            | ServerError::MethodNotAllowed,
+                        ) => {}
+                        Err(err) => {
+                            panic!("failed to apply tracked retention in phase 13: {err:?}")
+                        }
+                    }
+                }
+                DeleteObjectLockShape::LegalHold => {
+                    match self
+                        .coord
+                        .put_object_legal_hold(&PutObjectLegalHoldRequest {
+                            object: ObjectVersionRequest::new(
+                                trusted_bucket_name(bucket),
+                                trusted_object_key(PHASE13_KEY),
+                                Some(version_id),
+                                Requester::authenticated(self.fixtures.owner_user.clone()),
+                                None,
+                            ),
+                            legal_hold: LegalHoldStatus::On,
+                        }) {
+                        Ok(()) => {}
+                        Err(
+                            ServerError::AccessDenied
+                            | ServerError::AnonymousApiAccessDenied
+                            | ServerError::VersionNotFound { .. }
+                            | ServerError::MethodNotAllowed,
+                        ) => {}
+                        Err(err) => {
+                            panic!("failed to apply tracked legal hold in phase 13: {err:?}")
+                        }
+                    }
+                }
+            }
+        }
+
+        fn apply_bucket_policy(&self, bucket: &str) {
+            let Some(document) = phase13_policy_document(
+                &self.fixtures,
+                bucket,
+                self.read_policy.get(),
+                self.delete_policy.get(),
+            ) else {
+                self.coord
+                    .delete_bucket_policy(&BucketRequest::new(
+                        trusted_bucket_name(bucket),
+                        Requester::authenticated(self.fixtures.owner_user.clone()),
+                        None,
+                    ))
+                    .unwrap_or_else(|err| {
+                        panic!("failed to delete phase 13 bucket policy: {err:?}")
+                    });
+                return;
+            };
+            self.coord
+                .put_bucket_policy(&PutBucketPolicyRequest {
+                    bucket: BucketRequest::new(
+                        trusted_bucket_name(bucket),
+                        Requester::authenticated(self.fixtures.owner_user.clone()),
+                        None,
+                    ),
+                    config: &document,
+                    confirm_remove_self_bucket_access: false,
+                })
+                .unwrap_or_else(|err| panic!("failed to put phase 13 bucket policy: {err:?}"));
+        }
+    }
+
+    pub(super) fn to_phase13_outcome(result: ClassifiedPhase13Result) -> Outcome {
+        match result {
+            ClassifiedPhase13Result::Allow => Outcome::Allow,
+            ClassifiedPhase13Result::Deny => Outcome::Deny,
+        }
+    }
+
+    fn phase13_policy_document(
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        read_policy: Phase13ReadPolicyState,
+        delete_policy: DeletePolicyShape,
+    ) -> Option<String> {
+        let principal = fixtures.cross_account.principal();
+        let resource = format!("arn:aws:s3:::{bucket}/{PHASE13_KEY}");
+        let mut statements = Vec::new();
+        if read_policy == Phase13ReadPolicyState::AllowPrivate {
+            statements.push(format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":["s3:GetObject","s3:GetObjectAttributes"],"Resource":"{resource}"}}"#
+            ));
+        }
+        match delete_policy {
+            DeletePolicyShape::None => {}
+            DeletePolicyShape::AllowDeleteObject => statements.push(format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:DeleteObject","Resource":"{resource}"}}"#
+            )),
+            DeletePolicyShape::AllowDeleteVersion => statements.push(format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:DeleteObjectVersion","Resource":"{resource}"}}"#
+            )),
+            DeletePolicyShape::AllowDeleteVersionAndBypass => statements.push(format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":["s3:DeleteObjectVersion","s3:BypassGovernanceRetention"],"Resource":"{resource}"}}"#
+            )),
+            DeletePolicyShape::DenyBypass => statements.push(format!(
+                r#"{{"Effect":"Deny","Principal":{{"AWS":"{principal}"}},"Action":"s3:BypassGovernanceRetention","Resource":"{resource}"}}"#
+            )),
+        }
+        if statements.is_empty() {
+            None
+        } else {
+            Some(format!(
+                r#"{{"Version":"2012-10-17","Statement":[{}]}}"#,
+                statements.join(",")
+            ))
+        }
+    }
+
+    fn classify_phase13(result: Result<(), ServerError>) -> ClassifiedPhase13Result {
+        match result {
+            Ok(()) => ClassifiedPhase13Result::Allow,
+            Err(
+                ServerError::AccessDenied
+                | ServerError::AnonymousApiAccessDenied
+                | ServerError::DeleteMarkerHit { .. }
+                | ServerError::ObjectNotFound { .. }
+                | ServerError::VersionNotFound { .. },
+            ) => ClassifiedPhase13Result::Deny,
+            Err(other) => panic!("unexpected phase 13 probe result: {other:?}"),
+        }
+    }
+
+    fn read_all_phase13_body(mut body: ReadHandle) -> Result<Vec<u8>, ServerError> {
+        let mut out = Vec::new();
+        while let Some(chunk) = body.next_chunk(INTERNAL_SEGMENT_SIZE)? {
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
+}
+
 use harness::{bucket_name_for, to_existing_outcome, to_missing_outcome, MatrixHarness};
 use model::{Action, MissingScenario, Scenario};
 use phase10_harness::Phase10Harness;
@@ -10653,6 +11305,8 @@ use phase12_harness::{to_boe_trace_outcome, Phase12Harness};
 use phase12_model::{
     BoeTraceBucketTagState, BoeTraceMutation, BoeTracePolicyState, BoeTraceProbe, BoeTraceState,
 };
+use phase13_harness::{to_phase13_outcome, Phase13Harness};
+use phase13_model::{Phase13Mutation, Phase13Probe, Phase13ReadPolicyState, Phase13State};
 use phase4_harness::{
     acl_bucket_name_for, to_acl_outcome, to_write_outcome, write_bucket_name_for, Phase4Harness,
 };
@@ -10667,7 +11321,7 @@ use phase6_model::{CopyObjectScenario, UploadPartCopyScenario};
 use phase7_harness::{
     phase7_delete_bucket_name_for, phase7_object_lock_bucket_name_for, Phase7Harness,
 };
-use phase7_model::{DeleteScenario, ObjectLockScenario};
+use phase7_model::{DeletePolicyShape, DeleteScenario, ObjectLockScenario};
 use phase7a_harness::{
     phase7a_management_bucket_name_for, phase7a_write_bucket_name_for, Phase7aHarness,
 };
@@ -12398,6 +13052,53 @@ fn boe_modern_trace_strategy() -> impl Strategy<Value = (Vec<BoeTraceMutation>, 
     )
 }
 
+fn phase13_read_policy_strategy() -> impl Strategy<Value = Phase13ReadPolicyState> {
+    prop_oneof![
+        Just(Phase13ReadPolicyState::None),
+        Just(Phase13ReadPolicyState::AllowPrivate),
+    ]
+}
+
+fn phase13_delete_policy_strategy() -> impl Strategy<Value = DeletePolicyShape> {
+    prop_oneof![
+        Just(DeletePolicyShape::None),
+        Just(DeletePolicyShape::AllowDeleteObject),
+        Just(DeletePolicyShape::AllowDeleteVersion),
+        Just(DeletePolicyShape::AllowDeleteVersionAndBypass),
+        Just(DeletePolicyShape::DenyBypass),
+    ]
+}
+
+fn phase13_probe_strategy() -> impl Strategy<Value = Phase13Probe> {
+    prop_oneof![
+        Just(Phase13Probe::GetObjectCurrent),
+        Just(Phase13Probe::GetObjectAttributesCurrent),
+        Just(Phase13Probe::DeleteCurrent),
+        Just(Phase13Probe::DeleteTrackedVersion),
+        Just(Phase13Probe::DeleteTrackedVersionBypass),
+    ]
+}
+
+fn phase13_mutation_strategy() -> impl Strategy<Value = Phase13Mutation> {
+    prop_oneof![
+        phase13_read_policy_strategy().prop_map(Phase13Mutation::ReadPolicy),
+        phase13_delete_policy_strategy().prop_map(Phase13Mutation::DeletePolicy),
+        Just(Phase13Mutation::OwnerPutCurrentVersion),
+        Just(Phase13Mutation::OwnerDeleteCurrent),
+        Just(Phase13Mutation::OwnerDeleteTrackedVersion),
+        Just(Phase13Mutation::ApplyTrackedGovernanceRetention),
+        Just(Phase13Mutation::ApplyTrackedComplianceRetention),
+        Just(Phase13Mutation::ApplyTrackedLegalHold),
+    ]
+}
+
+fn phase13_trace_strategy() -> impl Strategy<Value = (Vec<Phase13Mutation>, Phase13Probe)> {
+    (
+        prop::collection::vec(phase13_mutation_strategy(), 0..=6),
+        phase13_probe_strategy(),
+    )
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(32))]
 
@@ -12426,6 +13127,36 @@ proptest! {
             actual,
             expected,
             "phase 12 BOE modern trace mismatch\nprobe: {}\ntrace:\n{}",
+            probe,
+            trace
+        );
+    }
+
+    #[test]
+    fn prop_boe_versioned_delete_trace_matches_model(
+        (mutations, probe) in phase13_trace_strategy()
+    ) {
+        let trace = mutations
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let harness = Phase13Harness::new();
+        let bucket = "authz-phase13-prop";
+        harness.prepare(bucket);
+        let mut state = Phase13State::new();
+
+        for mutation in mutations.iter().copied() {
+            harness.apply_mutation(bucket, mutation);
+            state.apply(mutation);
+        }
+
+        let expected = state.expected_outcome(probe);
+        let actual = to_phase13_outcome(harness.probe(bucket, probe));
+        prop_assert_eq!(
+            actual,
+            expected,
+            "phase 13 BOE versioned trace mismatch\nprobe: {}\ntrace:\n{}",
             probe,
             trace
         );
