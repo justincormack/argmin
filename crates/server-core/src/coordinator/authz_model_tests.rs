@@ -9894,12 +9894,28 @@ fn authz_model_phase3_get_object_missing_matrix() {
     run_missing_matrix("phase 3", Action::GetObject);
 }
 
+#[test]
+fn authz_model_modern_boe_get_object_missing_matrix() {
+    run_boe_missing_matrix(Action::GetObject);
+}
+
 macro_rules! phase3_get_object_attributes_missing_matrix_shards {
     ($($name:ident => $index:expr),* $(,)?) => {
         $(
             #[test]
             fn $name() {
                 run_missing_matrix_shard("phase 3", Action::GetObjectAttributes, $index, 32);
+            }
+        )*
+    };
+}
+
+macro_rules! boe_get_object_attributes_missing_matrix_shards {
+    ($($name:ident => $index:expr),* $(,)?) => {
+        $(
+            #[test]
+            fn $name() {
+                run_boe_missing_matrix_shard(Action::GetObjectAttributes, $index, 8);
             }
         )*
     };
@@ -9938,6 +9954,17 @@ phase3_get_object_attributes_missing_matrix_shards!(
     authz_model_phase3_get_object_attributes_missing_matrix_shard_29 => 29,
     authz_model_phase3_get_object_attributes_missing_matrix_shard_30 => 30,
     authz_model_phase3_get_object_attributes_missing_matrix_shard_31 => 31,
+);
+
+boe_get_object_attributes_missing_matrix_shards!(
+    authz_model_modern_boe_get_object_attributes_missing_matrix_shard_00 => 0,
+    authz_model_modern_boe_get_object_attributes_missing_matrix_shard_01 => 1,
+    authz_model_modern_boe_get_object_attributes_missing_matrix_shard_02 => 2,
+    authz_model_modern_boe_get_object_attributes_missing_matrix_shard_03 => 3,
+    authz_model_modern_boe_get_object_attributes_missing_matrix_shard_04 => 4,
+    authz_model_modern_boe_get_object_attributes_missing_matrix_shard_05 => 5,
+    authz_model_modern_boe_get_object_attributes_missing_matrix_shard_06 => 6,
+    authz_model_modern_boe_get_object_attributes_missing_matrix_shard_07 => 7,
 );
 
 #[test]
@@ -11182,6 +11209,76 @@ fn run_missing_matrix_shard(phase: &str, action: Action, shard_index: usize, sha
         shard_index + 1,
         shard_count
     );
+}
+
+fn run_boe_missing_matrix(action: Action) {
+    let scenarios: Vec<_> = MissingScenario::missing_scenarios(action)
+        .into_iter()
+        .filter(|scenario| scenario.bucket.ownership == model::OwnershipShape::BucketOwnerEnforced)
+        .collect();
+    run_boe_missing_matrix_scenarios(action, scenarios);
+}
+
+fn run_boe_missing_matrix_shard(action: Action, shard_index: usize, shard_count: usize) {
+    assert!(
+        shard_count > 0,
+        "BOE missing-matrix shard count must be non-zero"
+    );
+    assert!(
+        shard_index < shard_count,
+        "BOE missing-matrix shard index {shard_index} out of range for shard count {shard_count}"
+    );
+    let scenarios: Vec<_> = MissingScenario::missing_scenarios(action)
+        .into_iter()
+        .filter(|scenario| scenario.bucket.ownership == model::OwnershipShape::BucketOwnerEnforced)
+        .collect();
+    assert!(
+        !scenarios.is_empty(),
+        "BOE missing-object matrix unexpectedly produced no scenarios for {action}"
+    );
+    let harness = MatrixHarness::new();
+    let mut shard_len = 0usize;
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        if index % shard_count != shard_index {
+            continue;
+        }
+        shard_len += 1;
+        let bucket = format!("{}-boe-missing", bucket_name_for(action, index));
+        let expected = scenario.expected_outcome();
+        let actual = to_missing_outcome(harness.run_missing(&bucket, scenario), scenario.target);
+        assert_eq!(
+            actual, expected,
+            "BOE missing-object authz mismatch\nshard: {}/{}\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}",
+            shard_index + 1,
+            shard_count
+        );
+    }
+
+    assert!(
+        shard_len > 0,
+        "BOE missing-object matrix shard {}/{} unexpectedly produced no scenarios for {action}",
+        shard_index + 1,
+        shard_count
+    );
+}
+
+fn run_boe_missing_matrix_scenarios(action: Action, scenarios: Vec<MissingScenario>) {
+    assert!(
+        !scenarios.is_empty(),
+        "BOE missing-object matrix unexpectedly produced no scenarios for {action}"
+    );
+    let harness = MatrixHarness::new();
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        let bucket = format!("{}-boe-missing", bucket_name_for(action, index));
+        let expected = scenario.expected_outcome();
+        let actual = to_missing_outcome(harness.run_missing(&bucket, scenario), scenario.target);
+        assert_eq!(
+            actual, expected,
+            "BOE missing-object authz mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
+        );
+    }
 }
 
 fn run_phase4_write_matrix(action: WriteAction) {

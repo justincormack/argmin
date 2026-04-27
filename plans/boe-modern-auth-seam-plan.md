@@ -1,6 +1,6 @@
 # BOE Modern Auth Seam Plan
 
-Status: in progress
+Status: completed
 
 ## Goal
 
@@ -170,3 +170,20 @@ Before committing a substantial slice:
 - run `cargo nextest run`
   or `/bin/bash -lc 'S3_TEST_TIMEOUT_SECS=30 cargo test --workspace --no-fail-fast'`
   as appropriate for the change size and repository policy
+
+## Completion Notes
+
+- BOE read-family authorization is now explicit and directly tested both as a
+  snapshot-backed evaluator and, for the cached read path, via fast-path
+  invariants against that evaluator.
+- BOE write, multipart continuation, multipart completion, multipart copy, and
+  delete authorization now have explicit snapshot-backed modern-auth seams.
+- `AbortMultipartUpload` remains intentionally shared because its authorization
+  is ownership/initiator based rather than ACL-fallback based; this behavior is
+  pinned with AWS-backed tests.
+- BOE-specific authz model coverage now exists for:
+  - write-family operations
+  - multipart write/manage operations
+  - delete authorization
+  - missing-object discovery
+  - read fast-path equivalence
