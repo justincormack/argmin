@@ -6,7 +6,7 @@ This is a deliberately small follow-up to
 `plans/completed/authz-model-testing-plan.md`.
 
 Note: explicit extraction of the BOE modern-auth evaluation seam is tracked
-separately in `plans/boe-modern-auth-seam-plan.md`. This stateful follow-up
+separately in `plans/completed/boe-modern-auth-seam-plan.md`. This stateful follow-up
 assumes that seam as an input where relevant; it is not the plan for creating
 it.
 
@@ -14,19 +14,21 @@ The fixed-matrix authz model work is complete. What remains, if we want to
 push further, is a bounded stateful layer that checks short traces across the
 same AWS-pinned rules instead of only point-in-time scenarios.
 
+This follow-up is intentionally narrowed to the explicit BOE modern-auth seam.
+It is not a plan for legacy ACL or mixed authz state traces.
+
 ## Goal
 
-Add a bounded `proptest` trace model for short authz-relevant state
+Add a bounded `proptest` trace model for short BOE modern-auth state
 transitions without turning the suite into an unreviewable state-machine
 project.
 
 The goal is to catch regressions where individually-correct operations compose
 incorrectly across changes in:
 
-- ownership controls
-- public access block
 - bucket policy
-- ACL provenance-sensitive request context
+- public access block
+- bucket ABAC and bucket tags
 - versioning and object-lock state
 - delete-marker and missing-object discovery behavior
 
@@ -37,16 +39,14 @@ randomized fuzzer for all S3 behavior.
 
 Bounded generated operations may include:
 
-- set ownership controls
 - set public-access-block
 - set or delete a narrow bucket policy
-- put object with a constrained ACL shape
-- copy object with constrained destination headers
-- change object ACL
-- update bucket ACL with constrained request context
+- enable or disable bucket ABAC
+- replace bucket tags with a small fixed tag set
+- put object with BOE-compatible request shape
 - change bucket versioning state
 - delete object or object version with bounded object-lock state
-- read or mutate object tags
+- probe modern read/write/delete actions
 
 The initial trace depth should stay short, for example 2-6 operations, with a
 small number of identities and object keys.
@@ -57,6 +57,7 @@ small number of identities and object keys.
 - do not replace the explicit fixed matrices with generated coverage
 - do not generate large bodies, multipart payloads, or unbounded policy
   documents
+- do not generate ACL mutations or ACL-sensitive request-context transitions
 - do not broaden the identity surface beyond the existing small owner /
   same-account-admin / cross-account fixtures unless a concrete gap requires it
 
@@ -66,7 +67,7 @@ Build a small trace harness inside
 `crates/server-core/src/coordinator/authz_model_tests.rs` or a nearby follow-up
 module that can:
 
-- materialize a bucket and one or two object seeds
+- materialize a BOE bucket and one or two object seeds
 - apply a short sequence of bounded state mutations
 - run one probe authorization/read/write action at the end
 - classify the result into the same compact outcome enums used by the fixed
@@ -79,30 +80,31 @@ Acceptance criteria:
 - the first trace family is small enough that failures can be reasoned about
   locally without replay infrastructure
 
-## Phase 2: BOE / Public-ACL / Policy Interaction Traces
+## Phase 2: BOE / Policy / Bucket-Tag Interaction Traces
 
 Add the first generated family around the historically tricky transitions:
 
-- ACL/public-read object or bucket state
-- `IgnorePublicAcls` vs `BlockPublicAcls`
-- object ownership mode transitions
+- `RestrictPublicBuckets`
 - narrow bucket-policy allow / deny
+- bucket ABAC enable / disable
+- bucket-tag-conditioned bucket policy
+- bucket tag mutation between matching and non-matching values
 
-The probe actions should focus on reads and discovery first, because those are
-where the existing fixed matrices already document the most subtle rules.
+The probe actions should focus on modern reads and discovery first, because
+those are where the existing fixed matrices already document the most subtle
+BOE distinctions.
 
 Acceptance criteria:
 
-- generated traces preserve the explicit AWS-compatible distinction between
-  `IgnorePublicAcls` and `BlockPublicAcls`
+- generated traces preserve the explicit AWS-compatible interaction between
+  bucket-tag-conditioned policy, `RestrictPublicBuckets`, and BOE fallback
 - BOE `GetObject` vs `GetObjectAttributes` remains encoded as distinct expected
   behavior, not collapsed into one generic read rule
 
-## Phase 3: Request-context and Delete/Object-lock Traces
+## Phase 3: Delete/Object-lock and Versioning Traces
 
 Expand to short traces that mix:
 
-- provenance-sensitive request-context writes
 - versioning changes
 - object-lock retention / legal-hold state
 - delete current vs version-specific operations
@@ -113,7 +115,8 @@ pass.
 
 Acceptance criteria:
 
-- ACL/tagging request-context exactness is preserved across state transitions
+- BOE modern delete/read behavior remains stable across versioning and
+  delete-marker transitions
 - governance-bypass and missing-version behavior stays aligned with the fixed
   Phase 7 / 7A rules
 
