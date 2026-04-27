@@ -695,6 +695,43 @@ impl Coordinator {
         )
     }
 
+    pub(super) fn modern_write_multipart_upload_with_bucket_policy(
+        requester: &Requester,
+        bucket: &ModernBucketSummary,
+        bucket_tags: Option<&[(String, String)]>,
+        upload: &MultipartUploadRecord,
+        policy_context: &PutObjectPolicyContext<'_>,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<ModernObjectWriteAuthorization, ServerError> {
+        let decision = Self::bucket_policy_decision_for_put_object_action_modern(
+            requester,
+            bucket,
+            bucket_tags,
+            upload.key.as_str(),
+            auth::PolicyAction::PutObject,
+            policy_context,
+            policy,
+        )?;
+        let allowed = match decision {
+            auth::PolicyEvaluation::ExplicitDeny => false,
+            auth::PolicyEvaluation::ExplicitAllow
+                if Self::modern_bucket_policy_allow_survives_restrict_public_buckets(
+                    requester, bucket,
+                ) =>
+            {
+                true
+            }
+            auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
+                Self::requester_can_modern_bucket_owner_account_admin(requester, bucket)
+            }
+        };
+        Ok(if allowed {
+            ModernObjectWriteAuthorization::Allowed
+        } else {
+            ModernObjectWriteAuthorization::Denied
+        })
+    }
+
     pub(super) fn with_multipart_upload_managed_encryption_policy_context<'a>(
         policy_context: PutObjectPolicyContext<'a>,
         upload: &'a MultipartUploadRecord,
@@ -4598,7 +4635,20 @@ impl Coordinator {
             policy_context,
             &dst_upload,
         );
-        if !self.requester_can_write_multipart_upload_with_bucket_policy(
+        let modern_bucket_info = ModernBucketSummary::from(&*dst_bucket_info);
+        if Self::is_bucket_owner_enforced(dst_bucket_info.ownership_controls.as_ref()) {
+            if Self::modern_write_multipart_upload_with_bucket_policy(
+                requester,
+                &modern_bucket_info,
+                dst_bucket_tags.as_deref(),
+                &dst_upload,
+                &policy_context,
+                dst_bucket_policy.as_deref(),
+            )? != ModernObjectWriteAuthorization::Allowed
+            {
+                return Err(ServerError::AccessDenied);
+            }
+        } else if !self.requester_can_write_multipart_upload_with_bucket_policy(
             requester,
             &dst_bucket_info,
             dst_bucket_tags.as_deref(),
@@ -4668,7 +4718,20 @@ impl Coordinator {
         }
         let policy_context =
             Self::with_multipart_upload_managed_encryption_policy_context(policy_context, upload);
-        if !self.requester_can_write_multipart_upload_with_bucket_policy(
+        let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
+        if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_ref()) {
+            if Self::modern_write_multipart_upload_with_bucket_policy(
+                req.upload.requester(),
+                &modern_bucket_info,
+                bucket_tags.as_deref(),
+                upload,
+                &policy_context,
+                bucket_policy.as_deref(),
+            )? != ModernObjectWriteAuthorization::Allowed
+            {
+                return Err(ServerError::AccessDenied);
+            }
+        } else if !self.requester_can_write_multipart_upload_with_bucket_policy(
             req.upload.requester(),
             &bucket_info,
             bucket_tags.as_deref(),
@@ -4731,6 +4794,7 @@ impl Coordinator {
             let bucket_info = ValidatedBucket(bucket_handle.bucket().clone());
             let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket_handle)?;
             let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket_handle)?;
+            let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
             #[cfg(test)]
             let upload =
                 if should_probe_multipart_complete_auth_lookup(bucket.as_str(), key.as_str()) {
@@ -4758,7 +4822,19 @@ impl Coordinator {
                 ),
                 &upload,
             );
-            if !self.requester_can_write_multipart_upload_with_bucket_policy(
+            if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_ref()) {
+                if Self::modern_write_multipart_upload_with_bucket_policy(
+                    req.upload.requester(),
+                    &modern_bucket_info,
+                    bucket_tags.as_deref(),
+                    &upload,
+                    &policy_context,
+                    bucket_policy.as_deref(),
+                )? != ModernObjectWriteAuthorization::Allowed
+                {
+                    return Err(ServerError::AccessDenied);
+                }
+            } else if !self.requester_can_write_multipart_upload_with_bucket_policy(
                 req.upload.requester(),
                 &bucket_info,
                 bucket_tags.as_deref(),

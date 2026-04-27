@@ -5273,6 +5273,36 @@ mod phase6_model {
                     policy: UploadPartCopyPolicyShape::AllowPrivate,
                     context: CopyContextShape::Exact,
                 },
+                Self {
+                    name: "boe-cross-account-initiator-no-policy-denied",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::BOE,
+                    source_access: CopySourceAccess::Readable,
+                    upload_owner: UploadOwnerShape::Requester,
+                    upload_state: UploadStateShape::InProgress,
+                    policy: UploadPartCopyPolicyShape::NoPolicy,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "boe-cross-account-initiator-copy-source-policy-allowed",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::BOE,
+                    source_access: CopySourceAccess::Readable,
+                    upload_owner: UploadOwnerShape::Requester,
+                    upload_state: UploadStateShape::InProgress,
+                    policy: UploadPartCopyPolicyShape::AllowWithCopySourceCondition,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "boe-bucket-owner-no-policy-allowed",
+                    requester: CopyRequesterShape::BucketOwnerPrincipal,
+                    bucket: CopyBucketShape::BOE,
+                    source_access: CopySourceAccess::Readable,
+                    upload_owner: UploadOwnerShape::Requester,
+                    upload_state: UploadStateShape::InProgress,
+                    policy: UploadPartCopyPolicyShape::NoPolicy,
+                    context: CopyContextShape::Exact,
+                },
             ]
         }
 
@@ -5290,9 +5320,13 @@ mod phase6_model {
                     self.requester == CopyRequesterShape::BucketOwnerPrincipal
                 }
             };
-            let can_write_bucket = self.requester == CopyRequesterShape::BucketOwnerPrincipal
-                || self.bucket.bucket_public_write;
-            let fallback = can_manage && can_write_bucket;
+            let fallback = if self.bucket.ownership == OwnershipShape::BucketOwnerEnforced {
+                self.requester == CopyRequesterShape::BucketOwnerPrincipal
+            } else {
+                let can_write_bucket = self.requester == CopyRequesterShape::BucketOwnerPrincipal
+                    || self.bucket.bucket_public_write;
+                can_manage && can_write_bucket
+            };
             let allowed = match self.policy {
                 UploadPartCopyPolicyShape::NoPolicy => fallback,
                 UploadPartCopyPolicyShape::AllowPrivate => true,
@@ -5838,7 +5872,11 @@ mod phase6_harness {
         scenario: UploadPartCopyScenario,
     ) -> Result<(), ServerError> {
         let Some(policy) = upload_part_copy_policy_document(fixtures, bucket, scenario) else {
-            return Ok(());
+            return coord.delete_bucket_policy(&BucketRequest::new(
+                trusted_bucket_name(bucket),
+                Requester::authenticated(fixtures.owner_user.clone()),
+                None,
+            ));
         };
         coord.put_bucket_policy(&PutBucketPolicyRequest {
             bucket: BucketRequest::new(
@@ -7230,6 +7268,24 @@ mod phase7a_model {
                         upload: MultipartUploadShape::CrossAccountBucketOwnerEnforced,
                         requester: Phase7aRequesterShape::UploadOwnerExact,
                         policy: MultipartPolicyShape::None,
+                        target_completed_upload: false,
+                        expected: MultipartOutcome::Allow,
+                    },
+                    Self {
+                        name: "boe-cross-account-initiator-needs-putobject-policy",
+                        action,
+                        upload: MultipartUploadShape::CrossAccountBucketOwnerEnforced,
+                        requester: Phase7aRequesterShape::Initiator,
+                        policy: MultipartPolicyShape::None,
+                        target_completed_upload: false,
+                        expected: MultipartOutcome::Deny,
+                    },
+                    Self {
+                        name: "boe-cross-account-initiator-allowed-with-putobject-policy",
+                        action,
+                        upload: MultipartUploadShape::CrossAccountBucketOwnerEnforced,
+                        requester: Phase7aRequesterShape::Initiator,
+                        policy: MultipartPolicyShape::AllowRequesterPutObject,
                         target_completed_upload: false,
                         expected: MultipartOutcome::Allow,
                     },
@@ -9851,6 +9907,32 @@ fn authz_model_phase6_upload_part_copy_matrix() {
 }
 
 #[test]
+fn authz_model_modern_boe_upload_part_copy_matrix() {
+    let scenarios: Vec<_> = UploadPartCopyScenario::scenarios()
+        .into_iter()
+        .filter(|scenario| {
+            scenario.bucket.ownership
+                == crate::coordinator::authz_model_tests::model::OwnershipShape::BucketOwnerEnforced
+        })
+        .collect();
+    assert!(
+        !scenarios.is_empty(),
+        "modern BOE upload-part-copy matrix unexpectedly produced no scenarios"
+    );
+    let harness = Phase6Harness::new();
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        let bucket = format!("authz-modern-boe-upc-{index:05}");
+        let expected = scenario.expected_outcome();
+        let actual = to_upload_part_copy_outcome(harness.run_upload_part_copy(&bucket, scenario));
+        assert_eq!(
+            actual, expected,
+            "modern BOE upload-part-copy mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
+        );
+    }
+}
+
+#[test]
 fn authz_model_phase7_object_lock_matrix() {
     let scenarios = ObjectLockScenario::scenarios();
     assert!(
@@ -9911,6 +9993,31 @@ fn authz_model_phase7a_multipart_write_matrix() {
 }
 
 #[test]
+fn authz_model_modern_boe_multipart_write_matrix() {
+    let scenarios: Vec<_> = MultipartWriteScenario::scenarios()
+        .into_iter()
+        .filter(|scenario| {
+            scenario.upload == phase7a_model::MultipartUploadShape::CrossAccountBucketOwnerEnforced
+        })
+        .collect();
+    assert!(
+        !scenarios.is_empty(),
+        "modern BOE multipart write matrix unexpectedly produced no scenarios"
+    );
+    let harness = Phase7aHarness::new();
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        let bucket = format!("authz-modern-boe-mpu-write-{index:05}");
+        let actual = harness.run_write(&bucket, scenario);
+        assert_eq!(
+            actual, scenario.expected,
+            "modern BOE multipart write mismatch\nscenario: {scenario}\nexpected: {}\nactual: {actual}",
+            scenario.expected
+        );
+    }
+}
+
+#[test]
 fn authz_model_phase7a_multipart_management_matrix() {
     let scenarios = MultipartManagementScenario::scenarios();
     assert!(
@@ -9925,6 +10032,31 @@ fn authz_model_phase7a_multipart_management_matrix() {
         assert_eq!(
             actual, scenario.expected,
             "phase 7A multipart management mismatch\nscenario: {scenario}\nexpected: {}\nactual: {actual}",
+            scenario.expected
+        );
+    }
+}
+
+#[test]
+fn authz_model_modern_boe_multipart_management_matrix() {
+    let scenarios: Vec<_> = MultipartManagementScenario::scenarios()
+        .into_iter()
+        .filter(|scenario| {
+            scenario.upload == phase7a_model::MultipartUploadShape::CrossAccountBucketOwnerEnforced
+        })
+        .collect();
+    assert!(
+        !scenarios.is_empty(),
+        "modern BOE multipart management matrix unexpectedly produced no scenarios"
+    );
+    let harness = Phase7aHarness::new();
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        let bucket = format!("authz-modern-boe-mpu-manage-{index:05}");
+        let actual = harness.run_management(&bucket, scenario);
+        assert_eq!(
+            actual, scenario.expected,
+            "modern BOE multipart management mismatch\nscenario: {scenario}\nexpected: {}\nactual: {actual}",
             scenario.expected
         );
     }
