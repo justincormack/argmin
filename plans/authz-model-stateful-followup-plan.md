@@ -1,6 +1,6 @@
 ## Authz Model Stateful Follow-up
 
-Status: planned
+Status: in progress
 
 This is a deliberately small follow-up to
 `plans/completed/authz-model-testing-plan.md`.
@@ -79,6 +79,9 @@ Acceptance criteria:
 - failure output prints the full trace in a reviewable form
 - the first trace family is small enough that failures can be reasoned about
   locally without replay infrastructure
+- Implemented: `phase12` BOE modern-read trace harness over bounded policy /
+  `RestrictPublicBuckets` / bucket-ABAC / bucket-tag mutations with
+  `GetObject` and `GetObjectAttributes` probes
 
 ## Phase 2: BOE / Policy / Bucket-Tag Interaction Traces
 
@@ -100,6 +103,8 @@ Acceptance criteria:
   bucket-tag-conditioned policy, `RestrictPublicBuckets`, and BOE fallback
 - BOE `GetObject` vs `GetObjectAttributes` remains encoded as distinct expected
   behavior, not collapsed into one generic read rule
+- Implemented initial generated family for that read/discovery subset; write /
+  delete / versioning traces remain pending
 
 ## Phase 3: Delete/Object-lock and Versioning Traces
 

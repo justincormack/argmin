@@ -16,6 +16,9 @@ use crate::conditional::{ReadCondition, WriteCondition};
 use crate::metadata_blob::MetadataBlob;
 use crate::sse::ManagedWrappingKeyConfig;
 use crate::system_metadata::SystemMetadata;
+use proptest::prelude::*;
+use proptest::test_runner::Config as ProptestConfig;
+use std::cell::Cell;
 use std::fmt;
 use std::path::Path;
 use std::sync::{
@@ -9974,11 +9977,516 @@ mod phase11_harness {
     }
 }
 
+mod phase12_model {
+    use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BoeTracePolicyState {
+        None,
+        AllowObjectOnlyPrivate,
+        AllowBothPrivate,
+        AllowBothPublic,
+        DenyBothPrivate,
+        AllowBothPrivateTagPublic,
+    }
+
+    impl fmt::Display for BoeTracePolicyState {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::None => f.write_str("no-policy"),
+                Self::AllowObjectOnlyPrivate => f.write_str("allow-object-only-private"),
+                Self::AllowBothPrivate => f.write_str("allow-both-private"),
+                Self::AllowBothPublic => f.write_str("allow-both-public"),
+                Self::DenyBothPrivate => f.write_str("deny-both-private"),
+                Self::AllowBothPrivateTagPublic => {
+                    f.write_str("allow-both-private-bucket-tag-public")
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BoeTraceBucketTagState {
+        Public,
+        Private,
+    }
+
+    impl fmt::Display for BoeTraceBucketTagState {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Public => f.write_str("tag-public"),
+                Self::Private => f.write_str("tag-private"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BoeTraceProbe {
+        GetObject,
+        GetObjectAttributes,
+    }
+
+    impl fmt::Display for BoeTraceProbe {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::GetObject => f.write_str("get-object"),
+                Self::GetObjectAttributes => f.write_str("get-object-attributes"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BoeTraceMutation {
+        Policy(BoeTracePolicyState),
+        RestrictPublicBuckets(bool),
+        BucketAbac(bool),
+        BucketTags(BoeTraceBucketTagState),
+    }
+
+    impl fmt::Display for BoeTraceMutation {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Policy(policy) => write!(f, "set-policy={policy}"),
+                Self::RestrictPublicBuckets(enabled) => {
+                    write!(f, "set-restrict-public-buckets={enabled}")
+                }
+                Self::BucketAbac(enabled) => write!(f, "set-bucket-abac={enabled}"),
+                Self::BucketTags(tags) => write!(f, "set-bucket-tags={tags}"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BoeTraceDecision {
+        NoMatch,
+        ExplicitAllowPrivate,
+        ExplicitAllowPublic,
+        ExplicitDeny,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct BoeTraceState {
+        pub(super) policy: BoeTracePolicyState,
+        pub(super) restrict_public_buckets: bool,
+        pub(super) bucket_abac_enabled: bool,
+        pub(super) bucket_tags: BoeTraceBucketTagState,
+    }
+
+    impl BoeTraceState {
+        pub(super) fn new() -> Self {
+            Self {
+                policy: BoeTracePolicyState::None,
+                restrict_public_buckets: false,
+                bucket_abac_enabled: false,
+                bucket_tags: BoeTraceBucketTagState::Public,
+            }
+        }
+
+        pub(super) fn apply(&mut self, mutation: BoeTraceMutation) {
+            match mutation {
+                BoeTraceMutation::Policy(policy) => self.policy = policy,
+                BoeTraceMutation::RestrictPublicBuckets(enabled) => {
+                    self.restrict_public_buckets = enabled;
+                }
+                BoeTraceMutation::BucketAbac(enabled) => {
+                    self.bucket_abac_enabled = enabled;
+                }
+                BoeTraceMutation::BucketTags(tags) => self.bucket_tags = tags,
+            }
+        }
+
+        pub(super) fn expected_outcome(self, probe: BoeTraceProbe) -> model::Outcome {
+            let read = self.decision_for_object_read();
+            match probe {
+                BoeTraceProbe::GetObject => self.resolve_single_action(read),
+                BoeTraceProbe::GetObjectAttributes => {
+                    let attrs = self.decision_for_attributes_read();
+                    if matches!(read, BoeTraceDecision::ExplicitDeny)
+                        || matches!(attrs, BoeTraceDecision::ExplicitDeny)
+                    {
+                        return model::Outcome::Deny;
+                    }
+                    if self.resolve_single_action(read) == model::Outcome::Allow
+                        && self.resolve_single_action(attrs) == model::Outcome::Allow
+                    {
+                        model::Outcome::Allow
+                    } else {
+                        model::Outcome::Deny
+                    }
+                }
+            }
+        }
+
+        fn resolve_single_action(self, decision: BoeTraceDecision) -> model::Outcome {
+            match decision {
+                BoeTraceDecision::ExplicitDeny => model::Outcome::Deny,
+                BoeTraceDecision::ExplicitAllowPrivate => model::Outcome::Allow,
+                BoeTraceDecision::ExplicitAllowPublic => {
+                    if self.restrict_public_buckets {
+                        model::Outcome::Deny
+                    } else {
+                        model::Outcome::Allow
+                    }
+                }
+                BoeTraceDecision::NoMatch => model::Outcome::Deny,
+            }
+        }
+
+        fn decision_for_object_read(self) -> BoeTraceDecision {
+            match self.policy {
+                BoeTracePolicyState::None => BoeTraceDecision::NoMatch,
+                BoeTracePolicyState::AllowObjectOnlyPrivate
+                | BoeTracePolicyState::AllowBothPrivate => BoeTraceDecision::ExplicitAllowPrivate,
+                BoeTracePolicyState::AllowBothPublic => BoeTraceDecision::ExplicitAllowPublic,
+                BoeTracePolicyState::DenyBothPrivate => BoeTraceDecision::ExplicitDeny,
+                BoeTracePolicyState::AllowBothPrivateTagPublic => {
+                    if self.bucket_abac_enabled
+                        && self.bucket_tags == BoeTraceBucketTagState::Public
+                    {
+                        BoeTraceDecision::ExplicitAllowPrivate
+                    } else {
+                        BoeTraceDecision::NoMatch
+                    }
+                }
+            }
+        }
+
+        fn decision_for_attributes_read(self) -> BoeTraceDecision {
+            match self.policy {
+                BoeTracePolicyState::AllowBothPrivate => BoeTraceDecision::ExplicitAllowPrivate,
+                BoeTracePolicyState::AllowBothPublic => BoeTraceDecision::ExplicitAllowPublic,
+                BoeTracePolicyState::DenyBothPrivate => BoeTraceDecision::ExplicitDeny,
+                BoeTracePolicyState::AllowBothPrivateTagPublic => {
+                    BoeTraceDecision::ExplicitAllowPrivate
+                }
+                BoeTracePolicyState::None | BoeTracePolicyState::AllowObjectOnlyPrivate => {
+                    BoeTraceDecision::NoMatch
+                }
+            }
+        }
+    }
+}
+
+mod phase12_harness {
+    use super::harness::{setup_coordinator, IdentityFixtures};
+    use super::model::Outcome;
+    use super::phase12_model::{
+        BoeTraceBucketTagState, BoeTraceMutation, BoeTracePolicyState, BoeTraceProbe,
+    };
+    use super::*;
+
+    const PHASE12_KEY: &str = "key";
+    const PHASE12_BUCKET_TAGS_PUBLIC_XML: &str =
+        "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>";
+    const PHASE12_BUCKET_TAGS_PRIVATE_XML: &str =
+        "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>";
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ClassifiedBoeTraceResult {
+        Allow,
+        Deny,
+    }
+
+    pub(super) struct Phase12Harness {
+        _tmp: test_util::TempDir,
+        coord: Coordinator,
+        fixtures: IdentityFixtures,
+        bucket_abac_enabled: Cell<bool>,
+    }
+
+    impl Phase12Harness {
+        pub(super) fn new() -> Self {
+            let tmp = test_util::tempdir();
+            let coord = setup_coordinator(tmp.path());
+            let fixtures = IdentityFixtures::new();
+            Self {
+                _tmp: tmp,
+                coord,
+                fixtures,
+                bucket_abac_enabled: Cell::new(false),
+            }
+        }
+
+        pub(super) fn prepare(&self, bucket: &str) {
+            let owner = OwnerIdentity::new(
+                self.fixtures.owner_user.principal(),
+                self.fixtures.owner_user.canonical_user_id().clone(),
+            );
+            let grants = Coordinator::bucket_acl_grants_from_flags(&owner, false, false);
+            self.coord
+                .create_bucket_with_acl_grants(&owner, bucket, grants, false)
+                .unwrap_or_else(|err| panic!("failed to create phase 12 bucket: {err:?}"));
+            self.coord
+                .put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
+                    bucket: BucketRequest::new(
+                        trusted_bucket_name(bucket),
+                        Requester::authenticated(self.fixtures.owner_user.clone()),
+                        None,
+                    ),
+                    config: BucketOwnershipControls {
+                        object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                    },
+                })
+                .unwrap_or_else(|err| panic!("failed to enable BOE for phase 12 bucket: {err:?}"));
+            self.coord
+                .put_bucket_tags(&PutBucketConfigRequest {
+                    bucket: BucketRequest::new(
+                        trusted_bucket_name(bucket),
+                        Requester::authenticated(self.fixtures.owner_user.clone()),
+                        None,
+                    ),
+                    config: PHASE12_BUCKET_TAGS_PUBLIC_XML,
+                })
+                .unwrap_or_else(|err| panic!("failed to seed phase 12 bucket tags: {err:?}"));
+            self.bucket_abac_enabled.set(false);
+            test_helpers::put_object(
+                &self.coord,
+                &PutObjectRequest {
+                    encryption: WriteEncryptionRequest::none(),
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
+                    object: ObjectRequest::new(
+                        trusted_bucket_name(bucket),
+                        trusted_object_key(PHASE12_KEY),
+                        Requester::authenticated(self.fixtures.owner_user.clone()),
+                        None,
+                    ),
+                    data: b"phase-12-object",
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    tags: None,
+                    cond: NO_WRITE,
+                    acl: PutObjectWriteAcl::None,
+                },
+            )
+            .unwrap_or_else(|err| panic!("failed to seed phase 12 object: {err:?}"));
+        }
+
+        pub(super) fn apply_mutation(&self, bucket: &str, mutation: BoeTraceMutation) {
+            let owner_requester = Requester::authenticated(self.fixtures.owner_user.clone());
+            match mutation {
+                BoeTraceMutation::Policy(policy) => match policy {
+                    BoeTracePolicyState::None => self
+                        .coord
+                        .delete_bucket_policy(&BucketRequest::new(
+                            trusted_bucket_name(bucket),
+                            owner_requester,
+                            None,
+                        ))
+                        .unwrap_or_else(|err| {
+                            panic!("failed to delete phase 12 bucket policy: {err:?}")
+                        }),
+                    _ => {
+                        let config = phase12_policy_document(&self.fixtures, bucket, policy);
+                        self.coord
+                            .put_bucket_policy(&PutBucketPolicyRequest {
+                                bucket: BucketRequest::new(
+                                    trusted_bucket_name(bucket),
+                                    owner_requester,
+                                    None,
+                                ),
+                                config: &config,
+                                confirm_remove_self_bucket_access: false,
+                            })
+                            .unwrap_or_else(|err| {
+                                panic!("failed to set phase 12 bucket policy {policy}: {err:?}")
+                            });
+                    }
+                },
+                BoeTraceMutation::RestrictPublicBuckets(enabled) => {
+                    if enabled {
+                        self.coord
+                            .put_bucket_public_access_block(&PutBucketPublicAccessBlockRequest {
+                                bucket: BucketRequest::new(
+                                    trusted_bucket_name(bucket),
+                                    owner_requester,
+                                    None,
+                                ),
+                                config: PublicAccessBlockConfig {
+                                    block_public_acls: false,
+                                    ignore_public_acls: false,
+                                    block_public_policy: false,
+                                    restrict_public_buckets: true,
+                                },
+                            })
+                            .unwrap_or_else(|err| {
+                                panic!(
+                                    "failed to enable restrict-public-buckets for phase 12: {err:?}"
+                                )
+                            });
+                    } else {
+                        self.coord
+                            .delete_bucket_public_access_block(&BucketRequest::new(
+                                trusted_bucket_name(bucket),
+                                owner_requester,
+                                None,
+                            ))
+                            .unwrap_or_else(|err| {
+                                panic!("failed to delete public access block for phase 12: {err:?}")
+                            });
+                    }
+                }
+                BoeTraceMutation::BucketAbac(enabled) => {
+                    self.coord
+                        .put_bucket_abac(&PutBucketAbacRequest {
+                            bucket: BucketRequest::new(
+                                trusted_bucket_name(bucket),
+                                owner_requester,
+                                None,
+                            ),
+                            enabled,
+                        })
+                        .unwrap_or_else(|err| {
+                            panic!("failed to set bucket ABAC for phase 12 bucket: {err:?}")
+                        });
+                    self.bucket_abac_enabled.set(enabled);
+                }
+                BoeTraceMutation::BucketTags(tags) => {
+                    let config = match tags {
+                        BoeTraceBucketTagState::Public => PHASE12_BUCKET_TAGS_PUBLIC_XML,
+                        BoeTraceBucketTagState::Private => PHASE12_BUCKET_TAGS_PRIVATE_XML,
+                    };
+                    if self.bucket_abac_enabled.get() {
+                        self.coord
+                            .put_bucket_tags_for_tag_resource(&PutBucketTagControlRequest {
+                                control: BucketTagControlRequest {
+                                    bucket: BucketRequest::new(
+                                        trusted_bucket_name(bucket),
+                                        owner_requester,
+                                        None,
+                                    ),
+                                    account_id: "111122223333",
+                                },
+                                config,
+                            })
+                            .unwrap_or_else(|err| {
+                                panic!("failed to set bucket tags through tag control: {err:?}")
+                            });
+                    } else {
+                        self.coord
+                            .put_bucket_tags(&PutBucketConfigRequest {
+                                bucket: BucketRequest::new(
+                                    trusted_bucket_name(bucket),
+                                    owner_requester,
+                                    None,
+                                ),
+                                config,
+                            })
+                            .unwrap_or_else(|err| {
+                                panic!("failed to set bucket tags through tagging API: {err:?}")
+                            });
+                    }
+                }
+            }
+        }
+
+        pub(super) fn probe(&self, bucket: &str, probe: BoeTraceProbe) -> ClassifiedBoeTraceResult {
+            let requester = Requester::authenticated(self.fixtures.cross_account.clone());
+            let result = match probe {
+                BoeTraceProbe::GetObject => self
+                    .coord
+                    .get_object(&GetObjectRequest {
+                        sse_customer: None,
+                        object: ObjectVersionRequest::new(
+                            trusted_bucket_name(bucket),
+                            trusted_object_key(PHASE12_KEY),
+                            None,
+                            requester,
+                            None,
+                        ),
+                        cond: NO_READ,
+                    })
+                    .and_then(|result| {
+                        let _ = read_all_phase12_body(result.body)?;
+                        Ok(())
+                    }),
+                BoeTraceProbe::GetObjectAttributes => self
+                    .coord
+                    .get_object_attributes(&GetObjectAttributesRequest {
+                        object: ObjectVersionRequest::new(
+                            trusted_bucket_name(bucket),
+                            trusted_object_key(PHASE12_KEY),
+                            None,
+                            requester,
+                            None,
+                        ),
+                        cond: NO_READ,
+                        want_parts: false,
+                        part_number_marker: None,
+                        max_parts: 0,
+                        sse_customer: None,
+                    })
+                    .map(|_| ()),
+            };
+            classify_phase12(result)
+        }
+    }
+
+    pub(super) fn to_boe_trace_outcome(result: ClassifiedBoeTraceResult) -> Outcome {
+        match result {
+            ClassifiedBoeTraceResult::Allow => Outcome::Allow,
+            ClassifiedBoeTraceResult::Deny => Outcome::Deny,
+        }
+    }
+
+    fn phase12_policy_document(
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        policy: BoeTracePolicyState,
+    ) -> String {
+        match policy {
+            BoeTracePolicyState::None => panic!("no policy document for no-policy state"),
+            BoeTracePolicyState::AllowObjectOnlyPrivate => format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::{bucket}/{PHASE12_KEY}"}}]}}"#,
+                fixtures.cross_account.principal()
+            ),
+            BoeTracePolicyState::AllowBothPrivate => format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":["s3:GetObject","s3:GetObjectAttributes"],"Resource":"arn:aws:s3:::{bucket}/{PHASE12_KEY}"}}]}}"#,
+                fixtures.cross_account.principal()
+            ),
+            BoeTracePolicyState::AllowBothPublic => format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":"*","Action":["s3:GetObject","s3:GetObjectAttributes"],"Resource":"arn:aws:s3:::{bucket}/{PHASE12_KEY}"}}]}}"#
+            ),
+            BoeTracePolicyState::DenyBothPrivate => format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny","Principal":{{"AWS":"{}"}},"Action":["s3:GetObject","s3:GetObjectAttributes"],"Resource":"arn:aws:s3:::{bucket}/{PHASE12_KEY}"}}]}}"#,
+                fixtures.cross_account.principal()
+            ),
+            BoeTracePolicyState::AllowBothPrivateTagPublic => format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::{bucket}/{PHASE12_KEY}","Condition":{{"StringEquals":{{"s3:BucketTag/security":"public"}}}}}},{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:GetObjectAttributes","Resource":"arn:aws:s3:::{bucket}/{PHASE12_KEY}"}}]}}"#,
+                fixtures.cross_account.principal(),
+                fixtures.cross_account.principal()
+            ),
+        }
+    }
+
+    fn classify_phase12(result: Result<(), ServerError>) -> ClassifiedBoeTraceResult {
+        match result {
+            Ok(()) => ClassifiedBoeTraceResult::Allow,
+            Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
+                ClassifiedBoeTraceResult::Deny
+            }
+            Err(other) => panic!("unexpected phase 12 probe result: {other:?}"),
+        }
+    }
+
+    fn read_all_phase12_body(mut body: ReadHandle) -> Result<Vec<u8>, ServerError> {
+        let mut out = Vec::new();
+        while let Some(chunk) = body.next_chunk(INTERNAL_SEGMENT_SIZE)? {
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
+}
+
 use harness::{bucket_name_for, to_existing_outcome, to_missing_outcome, MatrixHarness};
 use model::{Action, MissingScenario, Scenario};
 use phase10_harness::Phase10Harness;
 use phase11_harness::{phase11_bucket_name_for, Phase11Harness};
 use phase11_model::{BucketMetaAction, BucketMetaScenario};
+use phase12_harness::{to_boe_trace_outcome, Phase12Harness};
+use phase12_model::{
+    BoeTraceBucketTagState, BoeTraceMutation, BoeTracePolicyState, BoeTraceProbe, BoeTraceState,
+};
 use phase4_harness::{
     acl_bucket_name_for, to_acl_outcome, to_write_outcome, write_bucket_name_for, Phase4Harness,
 };
@@ -11668,6 +12176,82 @@ fn run_phase11_bucket_meta_matrix(action: BucketMetaAction) {
             actual, scenario.expected,
             "phase 11 bucket-meta mismatch\nscenario: {scenario}\nexpected: {}\nactual: {actual}",
             scenario.expected
+        );
+    }
+}
+
+fn boe_trace_policy_strategy() -> impl Strategy<Value = BoeTracePolicyState> {
+    prop_oneof![
+        Just(BoeTracePolicyState::None),
+        Just(BoeTracePolicyState::AllowObjectOnlyPrivate),
+        Just(BoeTracePolicyState::AllowBothPrivate),
+        Just(BoeTracePolicyState::AllowBothPublic),
+        Just(BoeTracePolicyState::DenyBothPrivate),
+        Just(BoeTracePolicyState::AllowBothPrivateTagPublic),
+    ]
+}
+
+fn boe_trace_bucket_tag_strategy() -> impl Strategy<Value = BoeTraceBucketTagState> {
+    prop_oneof![
+        Just(BoeTraceBucketTagState::Public),
+        Just(BoeTraceBucketTagState::Private),
+    ]
+}
+
+fn boe_trace_probe_strategy() -> impl Strategy<Value = BoeTraceProbe> {
+    prop_oneof![
+        Just(BoeTraceProbe::GetObject),
+        Just(BoeTraceProbe::GetObjectAttributes),
+    ]
+}
+
+fn boe_trace_mutation_strategy() -> impl Strategy<Value = BoeTraceMutation> {
+    prop_oneof![
+        boe_trace_policy_strategy().prop_map(BoeTraceMutation::Policy),
+        any::<bool>().prop_map(BoeTraceMutation::RestrictPublicBuckets),
+        any::<bool>().prop_map(BoeTraceMutation::BucketAbac),
+        boe_trace_bucket_tag_strategy().prop_map(BoeTraceMutation::BucketTags),
+    ]
+}
+
+fn boe_modern_read_trace_strategy() -> impl Strategy<Value = (Vec<BoeTraceMutation>, BoeTraceProbe)>
+{
+    (
+        prop::collection::vec(boe_trace_mutation_strategy(), 0..=6),
+        boe_trace_probe_strategy(),
+    )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    #[test]
+    fn prop_boe_modern_read_trace_matches_model(
+        (mutations, probe) in boe_modern_read_trace_strategy()
+    ) {
+        let trace = mutations
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let harness = Phase12Harness::new();
+        let bucket = "authz-phase12-prop";
+        harness.prepare(bucket);
+        let mut state = BoeTraceState::new();
+
+        for mutation in mutations.iter().copied() {
+            harness.apply_mutation(bucket, mutation);
+            state.apply(mutation);
+        }
+
+        let expected = state.expected_outcome(probe);
+        let actual = to_boe_trace_outcome(harness.probe(bucket, probe));
+        prop_assert_eq!(
+            actual,
+            expected,
+            "phase 12 BOE modern read trace mismatch\nprobe: {}\ntrace:\n{}",
+            probe,
+            trace
         );
     }
 }
