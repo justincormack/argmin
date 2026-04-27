@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+mod modern;
+mod policy;
+
 #[cfg(test)]
 use s3_types::StoredLegalHoldStatus;
 use s3_types::{
@@ -12,6 +15,10 @@ use storage::{
     ObjectReadSnapshotMode, OwnerIdentity, PublicAccessBlockConfig, StoredObject, UploadState,
 };
 
+pub(super) use self::modern::{
+    ModernObjectReadAuthorization, ModernObjectWriteAuthorization, ModernReadAction,
+    ModernWriteAction,
+};
 use super::authz_results::{
     AuthorizedAbortMultipartUpload, AuthorizedBeginStreamPart, AuthorizedBucketConfigAccess,
     AuthorizedBucketSubresourceBodyGet, AuthorizedBucketSubresourceDelete,
@@ -171,15 +178,6 @@ struct BucketPolicyActionAuthorization<'a> {
     default_allowed: bool,
 }
 
-struct ObjectPolicyEvaluationContext<'a> {
-    requester: &'a Requester,
-    bucket_name: &'a str,
-    bucket_abac_enabled: bool,
-    action: auth::PolicyAction,
-    policy_context: PutObjectPolicyContext<'a>,
-    policy: &'a auth::BucketPolicy,
-}
-
 #[cfg(test)]
 #[allow(dead_code)]
 pub(super) enum ObjectAclAuthorization<'a> {
@@ -194,58 +192,6 @@ pub(super) enum ObjectAclAuthorization<'a> {
 enum ExistingObjectTagsMode {
     Available,
     Unavailable,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ModernObjectReadAuthorization {
-    Allowed,
-    Denied,
-    NeedAclFallback,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ModernObjectWriteAuthorization {
-    Allowed,
-    Denied,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ModernWriteAction {
-    PutObject,
-    CreateMultipartUpload,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ModernReadAction {
-    ReadCurrent,
-    ReadVersion,
-    AttributesCurrent,
-    AttributesVersion,
-}
-
-impl ModernReadAction {
-    pub(super) fn from_get_object_version(version_id: Option<VersionId>) -> Self {
-        match version_id {
-            Some(_) => Self::ReadVersion,
-            None => Self::ReadCurrent,
-        }
-    }
-
-    pub(super) fn from_get_object_attributes_version(version_id: Option<VersionId>) -> Self {
-        match version_id {
-            Some(_) => Self::AttributesVersion,
-            None => Self::AttributesCurrent,
-        }
-    }
-
-    fn policy_action(self) -> auth::PolicyAction {
-        match self {
-            Self::ReadCurrent => auth::PolicyAction::GetObject,
-            Self::ReadVersion => auth::PolicyAction::GetObjectVersion,
-            Self::AttributesCurrent => auth::PolicyAction::GetObjectAttributes,
-            Self::AttributesVersion => auth::PolicyAction::GetObjectVersionAttributes,
-        }
-    }
 }
 
 struct CopySourceReadSnapshotRequest<'a> {
@@ -281,15 +227,6 @@ impl Coordinator {
         Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
             || (requester.authorization_profile() == auth::AuthorizationProfile::OwnerAccountAdmin
                 && Self::requester_is_bucket_owner_account(requester, bucket))
-    }
-
-    fn requester_can_modern_bucket_owner_account_admin(
-        requester: &Requester,
-        bucket: &ModernBucketSummary,
-    ) -> bool {
-        Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
-            || (requester.authorization_profile() == auth::AuthorizationProfile::OwnerAccountAdmin
-                && Self::requester_is_modern_bucket_owner_account(requester, bucket))
     }
 
     pub(super) fn requester_has_acl_permission(
@@ -545,23 +482,6 @@ impl Coordinator {
         Self::bucket_owner_account_id(&bucket.owner_principal) == Some(requester_account_id)
     }
 
-    fn requester_is_modern_bucket_owner_account(
-        requester: &Requester,
-        bucket: &ModernBucketSummary,
-    ) -> bool {
-        let Some(account) = requester.account() else {
-            return false;
-        };
-        if account.principal() == bucket.owner_principal {
-            return true;
-        }
-
-        let Some(requester_account_id) = aws_account_id_from_principal(account.principal()) else {
-            return false;
-        };
-        Self::bucket_owner_account_id(&bucket.owner_principal) == Some(requester_account_id)
-    }
-
     fn bucket_owner_account_id(owner_principal: &str) -> Option<&str> {
         aws_account_id_from_principal(owner_principal)
     }
@@ -703,33 +623,14 @@ impl Coordinator {
         policy_context: &PutObjectPolicyContext<'_>,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<ModernObjectWriteAuthorization, ServerError> {
-        let decision = Self::bucket_policy_decision_for_put_object_action_modern(
+        modern::write_multipart_upload_with_bucket_policy(
             requester,
             bucket,
             bucket_tags,
-            upload.key.as_str(),
-            auth::PolicyAction::PutObject,
+            upload,
             policy_context,
             policy,
-        )?;
-        let allowed = match decision {
-            auth::PolicyEvaluation::ExplicitDeny => false,
-            auth::PolicyEvaluation::ExplicitAllow
-                if Self::modern_bucket_policy_allow_survives_restrict_public_buckets(
-                    requester, bucket,
-                ) =>
-            {
-                true
-            }
-            auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
-                Self::requester_can_modern_bucket_owner_account_admin(requester, bucket)
-            }
-        };
-        Ok(if allowed {
-            ModernObjectWriteAuthorization::Allowed
-        } else {
-            ModernObjectWriteAuthorization::Denied
-        })
+        )
     }
 
     pub(super) fn with_multipart_upload_managed_encryption_policy_context<'a>(
@@ -788,32 +689,6 @@ impl Coordinator {
 
     pub(super) fn effective_public_write(bucket: &BucketSummary) -> bool {
         bucket.public_write && !Self::ignores_public_acls(bucket.public_access_block.as_ref())
-    }
-
-    pub(super) fn bucket_policy_allow_survives_restrict_public_buckets(
-        requester: &Requester,
-        bucket: &BucketSummary,
-    ) -> bool {
-        if !bucket.bucket_policy_public
-            || !Self::restricts_public_buckets(bucket.public_access_block.as_ref())
-        {
-            return true;
-        }
-
-        Self::requester_is_bucket_owner_account(requester, bucket)
-    }
-
-    fn modern_bucket_policy_allow_survives_restrict_public_buckets(
-        requester: &Requester,
-        bucket: &ModernBucketSummary,
-    ) -> bool {
-        if !bucket.bucket_policy_public
-            || !Self::restricts_public_buckets(bucket.public_access_block.as_ref())
-        {
-            return true;
-        }
-
-        Self::requester_is_modern_bucket_owner_account(requester, bucket)
     }
 
     pub(super) fn get_object_policy_action(version_id: Option<VersionId>) -> auth::PolicyAction {
@@ -974,34 +849,6 @@ impl Coordinator {
         self.parsed_bucket_fast_path_policy_if_fresh(&bucket.name, bucket.bucket_policy_generation)
     }
 
-    fn load_bucket_tags_for_policy_action(
-        &self,
-        bucket: &BucketSummary,
-        action: auth::PolicyAction,
-        policy: &auth::BucketPolicy,
-    ) -> Result<Option<Vec<(String, String)>>, ServerError> {
-        if !(bucket.bucket_abac_enabled && policy.requires_bucket_tags_for_action(action)) {
-            return Ok(None);
-        }
-
-        let tags = self
-            .storage_node
-            .get_bucket_subresource(&bucket.name, storage::BucketSubresourceKind::Tagging)
-            .map_err(|error| match error {
-                storage::BucketSnapshotLoadError::Store(error) => ServerError::Store(error),
-                storage::BucketSnapshotLoadError::Metadata(
-                    storage::MetadataError::BucketNotFound { name },
-                ) => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                storage::BucketSnapshotLoadError::Metadata(other) => ServerError::Metadata(other),
-            })?;
-        match tags {
-            Some(tags_xml) => Ok(Some(Self::parse_serialized_tag_set(&tags_xml)?)),
-            None => Ok(Some(Vec::new())),
-        }
-    }
-
     pub(super) fn loaded_bucket_tags_for_policy(
         bucket: &LoadedBucketHandle,
     ) -> Result<Option<Vec<(String, String)>>, ServerError> {
@@ -1014,161 +861,18 @@ impl Coordinator {
         }
     }
 
-    fn bucket_tags_for_policy_request(
-        &self,
-        request: BucketPolicyRequestContext<'_>,
-        policy: &auth::BucketPolicy,
-    ) -> Result<Vec<(String, String)>, ServerError> {
-        if let Some(tags) = request.bucket_tags {
-            return Ok(tags.to_vec());
-        }
-
-        Ok(self
-            .load_bucket_tags_for_policy_action(request.bucket, request.action, policy)?
-            .unwrap_or_default())
-    }
-
-    fn bucket_policy_decision_for_object(
-        &self,
-        request: BucketPolicyRequestContext<'_>,
-        object: &StoredObject,
-        existing_object_tags_mode: ExistingObjectTagsMode,
-    ) -> Result<auth::PolicyEvaluation, ServerError> {
-        let Some(policy) = request.policy else {
-            return Ok(auth::PolicyEvaluation::NoMatch);
-        };
-
-        let bucket_tags = self.bucket_tags_for_policy_request(request, policy)?;
-        Self::evaluate_bucket_policy_for_object_request(
-            ObjectPolicyEvaluationContext {
-                requester: request.requester,
-                bucket_name: request.bucket.name.as_str(),
-                bucket_abac_enabled: request.bucket.bucket_abac_enabled,
-                action: request.action,
-                policy_context: request.policy_context,
-                policy,
-            },
-            object,
-            existing_object_tags_mode,
-            &bucket_tags,
-        )
-    }
-
     fn evaluate_bucket_policy_for_object_request(
-        context: ObjectPolicyEvaluationContext<'_>,
+        context: policy::ObjectPolicyEvaluationContext<'_>,
         object: &StoredObject,
         existing_object_tags_mode: ExistingObjectTagsMode,
         bucket_tags: &[(String, String)],
     ) -> Result<auth::PolicyEvaluation, ServerError> {
-        let existing_tags_required = context
-            .policy
-            .requires_existing_object_tags_for_action(context.action);
-        let existing_tags = if existing_tags_required {
-            Some(Self::parse_policy_existing_object_tags(object)?)
-        } else {
-            None
-        };
-        let existing_tags: Vec<auth::PolicyTag<'_>> = existing_tags
-            .iter()
-            .flat_map(|tags| tags.iter())
-            .map(|(key, value)| auth::PolicyTag::new(key, value))
-            .collect();
-        let request_object_tags = if context
-            .policy
-            .requires_request_object_tags_for_action(context.action)
-        {
-            match context.policy_context.request_object_tags_xml {
-                Some(tags_xml) => Self::parse_serialized_tag_set(tags_xml)?,
-                None => Vec::new(),
-            }
-        } else {
-            Vec::new()
-        };
-        let request_object_tags: Vec<auth::PolicyTag<'_>> = request_object_tags
-            .iter()
-            .map(|(key, value)| auth::PolicyTag::new(key, value))
-            .collect();
-        let bucket_tags: Vec<auth::PolicyTag<'_>> = bucket_tags
-            .iter()
-            .map(|(key, value)| auth::PolicyTag::new(key, value))
-            .collect();
-        let policy_request = auth::PolicyRequest::for_object(
-            context.action,
-            context.bucket_name,
-            object.key().as_str(),
-            context.requester.principal_opt(),
-            context.requester.canonical_user_id(),
-            if existing_tags_required
-                && matches!(existing_object_tags_mode, ExistingObjectTagsMode::Available)
-            {
-                auth::bucket_policy::ExistingObjectTags::Available(&existing_tags)
-            } else {
-                auth::bucket_policy::ExistingObjectTags::Unavailable
-            },
+        policy::evaluate_bucket_policy_for_object_request(
+            context,
+            object,
+            existing_object_tags_mode,
+            bucket_tags,
         )
-        .with_bucket_tags(
-            if context.bucket_abac_enabled
-                && context
-                    .policy
-                    .requires_bucket_tags_for_action(context.action)
-            {
-                auth::bucket_policy::BucketTags::Available(&bucket_tags)
-            } else {
-                auth::bucket_policy::BucketTags::Unavailable
-            },
-        );
-        let policy_request = policy_request
-            .with_request_object_tags(&request_object_tags)
-            .with_copy_source(context.policy_context.copy_source)
-            .with_metadata_directive(context.policy_context.metadata_directive)
-            .with_canned_acl(context.policy_context.canned_acl)
-            .with_server_side_encryption(
-                context
-                    .policy_context
-                    .managed_encryption
-                    .map(ManagedEncryptionAlgorithm::as_str),
-            )
-            .with_sse_customer_algorithm(context.policy_context.sse_customer_algorithm)
-            .with_grant_read(context.policy_context.grant_read)
-            .with_grant_write(context.policy_context.grant_write)
-            .with_grant_read_acp(context.policy_context.grant_read_acp)
-            .with_grant_write_acp(context.policy_context.grant_write_acp)
-            .with_grant_full_control(context.policy_context.grant_full_control);
-        Ok(context.policy.evaluate(&policy_request))
-    }
-
-    pub(super) fn bucket_policy_decision_for_key(
-        &self,
-        request: BucketPolicyRequestContext<'_>,
-        key: &str,
-    ) -> Result<auth::PolicyEvaluation, ServerError> {
-        let Some(policy) = request.policy else {
-            return Ok(auth::PolicyEvaluation::NoMatch);
-        };
-
-        let bucket_tags = self.bucket_tags_for_policy_request(request, policy)?;
-        let bucket_tags: Vec<auth::PolicyTag<'_>> = bucket_tags
-            .iter()
-            .map(|(key, value)| auth::PolicyTag::new(key, value))
-            .collect();
-        let policy_request = auth::PolicyRequest::for_object(
-            request.action,
-            request.bucket.name.as_str(),
-            key,
-            request.requester.principal_opt(),
-            request.requester.canonical_user_id(),
-            auth::bucket_policy::ExistingObjectTags::Unavailable,
-        )
-        .with_bucket_tags(
-            if request.bucket.bucket_abac_enabled
-                && policy.requires_bucket_tags_for_action(request.action)
-            {
-                auth::bucket_policy::BucketTags::Available(&bucket_tags)
-            } else {
-                auth::bucket_policy::BucketTags::Unavailable
-            },
-        );
-        Ok(policy.evaluate(&policy_request))
     }
 
     fn bucket_policy_decision_for_bucket_loaded_with_tags(
@@ -1179,37 +883,14 @@ impl Coordinator {
         action: auth::PolicyAction,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<auth::PolicyEvaluation, ServerError> {
-        let Some(policy) = policy else {
-            return Ok(auth::PolicyEvaluation::NoMatch);
-        };
-
-        let bucket_tags_available =
-            bucket.bucket_abac_enabled && policy.requires_bucket_tags_for_action(action);
-        let bucket_tags = if let Some(bucket_tags) = bucket_tags {
-            Some(bucket_tags.to_vec())
-        } else if bucket_tags_available {
-            self.load_bucket_tags_for_policy_action(bucket, action, policy)?
-        } else {
-            None
-        };
-        let bucket_tags: Vec<auth::PolicyTag<'_>> = bucket_tags
-            .iter()
-            .flat_map(|tags| tags.iter())
-            .map(|(key, value)| auth::PolicyTag::new(key, value))
-            .collect();
-
-        let request = auth::PolicyRequest::for_bucket(
+        policy::bucket_policy_decision_for_bucket_loaded_with_tags(
+            self,
+            requester,
+            bucket,
+            bucket_tags,
             action,
-            bucket.name.as_str(),
-            requester.principal_opt(),
-            requester.canonical_user_id(),
-            if bucket_tags_available {
-                auth::bucket_policy::BucketTags::Available(&bucket_tags)
-            } else {
-                auth::bucket_policy::BucketTags::Unavailable
-            },
-        );
-        Ok(policy.evaluate(&request))
+            policy,
+        )
     }
 
     fn bucket_policy_decision_for_loaded_handle(
@@ -1219,14 +900,7 @@ impl Coordinator {
         action: auth::PolicyAction,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<auth::PolicyEvaluation, ServerError> {
-        let bucket_tags = Self::loaded_bucket_tags_for_policy(bucket)?;
-        self.bucket_policy_decision_for_bucket_loaded_with_tags(
-            requester,
-            bucket.bucket(),
-            bucket_tags.as_deref(),
-            action,
-            policy,
-        )
+        policy::bucket_policy_decision_for_loaded_handle(self, requester, bucket, action, policy)
     }
 
     fn bucket_policy_decision_for_loaded_handle_with_context(
@@ -1237,162 +911,23 @@ impl Coordinator {
         policy_context: PutObjectPolicyContext<'_>,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<auth::PolicyEvaluation, ServerError> {
-        let Some(policy) = policy else {
-            return Ok(auth::PolicyEvaluation::NoMatch);
-        };
-
-        let bucket_tags = Self::loaded_bucket_tags_for_policy(bucket)?;
-        let bucket_tags_available = bucket_tags.is_some();
-        let bucket_tags: Vec<auth::PolicyTag<'_>> = bucket_tags
-            .iter()
-            .flat_map(|tags| tags.iter())
-            .map(|(key, value)| auth::PolicyTag::new(key, value))
-            .collect();
-
-        let request = auth::PolicyRequest::for_bucket(
+        policy::bucket_policy_decision_for_loaded_handle_with_context(
+            self,
+            requester,
+            bucket,
             action,
-            bucket.bucket().name.as_str(),
-            requester.principal_opt(),
-            requester.canonical_user_id(),
-            if bucket_tags_available {
-                auth::bucket_policy::BucketTags::Available(&bucket_tags)
-            } else {
-                auth::bucket_policy::BucketTags::Unavailable
-            },
+            policy_context,
+            policy,
         )
-        .with_canned_acl(policy_context.canned_acl)
-        .with_grant_read(policy_context.grant_read)
-        .with_grant_write(policy_context.grant_write)
-        .with_grant_read_acp(policy_context.grant_read_acp)
-        .with_grant_write_acp(policy_context.grant_write_acp)
-        .with_grant_full_control(policy_context.grant_full_control);
-        Ok(policy.evaluate(&request))
     }
 
+    #[cfg(test)]
     pub(super) fn bucket_policy_decision_for_put_object_action(
         &self,
         request: BucketPolicyRequestContext<'_>,
         key: &str,
     ) -> Result<auth::PolicyEvaluation, ServerError> {
-        let Some(policy) = request.policy else {
-            return Ok(auth::PolicyEvaluation::NoMatch);
-        };
-
-        let request_object_tags = if policy.requires_request_object_tags_for_action(request.action)
-        {
-            match request.policy_context.request_object_tags_xml {
-                Some(tags_xml) => Self::parse_serialized_tag_set(tags_xml)?,
-                None => Vec::new(),
-            }
-        } else {
-            Vec::new()
-        };
-        let request_object_tags: Vec<auth::PolicyTag<'_>> = request_object_tags
-            .iter()
-            .map(|(tag_key, value)| auth::PolicyTag::new(tag_key, value))
-            .collect();
-        let bucket_tags = self.bucket_tags_for_policy_request(request, policy)?;
-        let bucket_tags: Vec<auth::PolicyTag<'_>> = bucket_tags
-            .iter()
-            .map(|(key, value)| auth::PolicyTag::new(key, value))
-            .collect();
-        let policy_request = auth::PolicyRequest::for_object(
-            request.action,
-            request.bucket.name.as_str(),
-            key,
-            request.requester.principal_opt(),
-            request.requester.canonical_user_id(),
-            auth::bucket_policy::ExistingObjectTags::Unavailable,
-        )
-        .with_bucket_tags(
-            if request.bucket.bucket_abac_enabled
-                && policy.requires_bucket_tags_for_action(request.action)
-            {
-                auth::bucket_policy::BucketTags::Available(&bucket_tags)
-            } else {
-                auth::bucket_policy::BucketTags::Unavailable
-            },
-        )
-        .with_request_object_tags(&request_object_tags)
-        .with_copy_source(request.policy_context.copy_source)
-        .with_metadata_directive(request.policy_context.metadata_directive)
-        .with_canned_acl(request.policy_context.canned_acl)
-        .with_server_side_encryption(
-            request
-                .policy_context
-                .managed_encryption
-                .map(ManagedEncryptionAlgorithm::as_str),
-        )
-        .with_sse_customer_algorithm(request.policy_context.sse_customer_algorithm)
-        .with_grant_read(request.policy_context.grant_read)
-        .with_grant_write(request.policy_context.grant_write)
-        .with_grant_read_acp(request.policy_context.grant_read_acp)
-        .with_grant_write_acp(request.policy_context.grant_write_acp)
-        .with_grant_full_control(request.policy_context.grant_full_control);
-        Ok(policy.evaluate(&policy_request))
-    }
-
-    fn bucket_policy_decision_for_put_object_action_modern(
-        requester: &Requester,
-        bucket: &ModernBucketSummary,
-        bucket_tags: Option<&[(String, String)]>,
-        key: &str,
-        action: auth::PolicyAction,
-        policy_context: &PutObjectPolicyContext<'_>,
-        policy: Option<&auth::BucketPolicy>,
-    ) -> Result<auth::PolicyEvaluation, ServerError> {
-        let Some(policy) = policy else {
-            return Ok(auth::PolicyEvaluation::NoMatch);
-        };
-
-        let request_object_tags = if policy.requires_request_object_tags_for_action(action) {
-            match policy_context.request_object_tags_xml {
-                Some(tags_xml) => Self::parse_serialized_tag_set(tags_xml)?,
-                None => Vec::new(),
-            }
-        } else {
-            Vec::new()
-        };
-        let request_object_tags: Vec<auth::PolicyTag<'_>> = request_object_tags
-            .iter()
-            .map(|(tag_key, value)| auth::PolicyTag::new(tag_key, value))
-            .collect();
-        let bucket_tags: Vec<auth::PolicyTag<'_>> = bucket_tags
-            .unwrap_or(&[])
-            .iter()
-            .map(|(key, value)| auth::PolicyTag::new(key, value))
-            .collect();
-        let policy_request = auth::PolicyRequest::for_object(
-            action,
-            bucket.name.as_str(),
-            key,
-            requester.principal_opt(),
-            requester.canonical_user_id(),
-            auth::bucket_policy::ExistingObjectTags::Unavailable,
-        )
-        .with_bucket_tags(
-            if bucket.bucket_abac_enabled && policy.requires_bucket_tags_for_action(action) {
-                auth::bucket_policy::BucketTags::Available(&bucket_tags)
-            } else {
-                auth::bucket_policy::BucketTags::Unavailable
-            },
-        )
-        .with_request_object_tags(&request_object_tags)
-        .with_copy_source(policy_context.copy_source)
-        .with_metadata_directive(policy_context.metadata_directive)
-        .with_canned_acl(policy_context.canned_acl)
-        .with_server_side_encryption(
-            policy_context
-                .managed_encryption
-                .map(ManagedEncryptionAlgorithm::as_str),
-        )
-        .with_sse_customer_algorithm(policy_context.sse_customer_algorithm)
-        .with_grant_read(policy_context.grant_read)
-        .with_grant_write(policy_context.grant_write)
-        .with_grant_read_acp(policy_context.grant_read_acp)
-        .with_grant_write_acp(policy_context.grant_write_acp)
-        .with_grant_full_control(policy_context.grant_full_control);
-        Ok(policy.evaluate(&policy_request))
+        policy::bucket_policy_decision_for_put_object_action(self, request, key)
     }
 
     fn requester_can_put_object_action_with_bucket_policy(
@@ -1400,14 +935,7 @@ impl Coordinator {
         authorization: BucketPolicyActionAuthorization<'_>,
         key: &str,
     ) -> Result<bool, ServerError> {
-        let decision =
-            self.bucket_policy_decision_for_put_object_action(authorization.request, key)?;
-        Ok(Self::bucket_policy_allows_with_fallback(
-            authorization.request.requester,
-            authorization.request.bucket,
-            decision,
-            || authorization.default_allowed,
-        ))
+        policy::requester_can_put_object_action_with_bucket_policy(self, authorization, key)
     }
 
     pub(super) fn modern_put_object_authorization_with_bucket_policy(
@@ -1419,68 +947,15 @@ impl Coordinator {
         policy_context: &PutObjectPolicyContext<'_>,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<ModernObjectWriteAuthorization, ServerError> {
-        if action == ModernWriteAction::CreateMultipartUpload && requester.is_anonymous() {
-            return Ok(ModernObjectWriteAuthorization::Denied);
-        }
-        let decision = Self::bucket_policy_decision_for_put_object_action_modern(
+        modern::put_object_authorization_with_bucket_policy(
             requester,
             bucket,
             bucket_tags,
             key,
-            auth::PolicyAction::PutObject,
+            action,
             policy_context,
             policy,
-        )?;
-        let allowed = match decision {
-            auth::PolicyEvaluation::ExplicitDeny => false,
-            auth::PolicyEvaluation::ExplicitAllow
-                if Self::modern_bucket_policy_allow_survives_restrict_public_buckets(
-                    requester, bucket,
-                ) =>
-            {
-                true
-            }
-            auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
-                Self::requester_can_modern_bucket_owner_account_admin(requester, bucket)
-            }
-        };
-        if !allowed {
-            return Ok(ModernObjectWriteAuthorization::Denied);
-        }
-
-        if policy_context.request_object_tags_xml.is_some() {
-            // Secondary inline-tag authorization must evaluate the original
-            // immutable request context unchanged. Rebuilding a reduced
-            // context here silently drops request headers and diverges from
-            // the primary PutObject/CreateMultipartUpload evaluation surface.
-            let tagging_decision = Self::bucket_policy_decision_for_put_object_action_modern(
-                requester,
-                bucket,
-                bucket_tags,
-                key,
-                auth::PolicyAction::PutObjectTagging,
-                policy_context,
-                policy,
-            )?;
-            let tagging_allowed = match tagging_decision {
-                auth::PolicyEvaluation::ExplicitDeny => false,
-                auth::PolicyEvaluation::ExplicitAllow
-                    if Self::modern_bucket_policy_allow_survives_restrict_public_buckets(
-                        requester, bucket,
-                    ) =>
-                {
-                    true
-                }
-                auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
-                    Self::requester_can_modern_bucket_owner_account_admin(requester, bucket)
-                }
-            };
-            if !tagging_allowed {
-                return Ok(ModernObjectWriteAuthorization::Denied);
-            }
-        }
-
-        Ok(ModernObjectWriteAuthorization::Allowed)
+        )
     }
 
     fn modern_delete_object_authorization_with_bucket_policy(
@@ -1492,40 +967,15 @@ impl Coordinator {
         action: auth::PolicyAction,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<bool, ServerError> {
-        let decision = match object {
-            Some(object) => Self::bucket_policy_decision_for_object_with_preloaded_tags_modern(
-                requester,
-                bucket,
-                bucket_tags,
-                object,
-                action,
-                policy,
-                ExistingObjectTagsMode::Available,
-            )?,
-            None => Self::bucket_policy_decision_for_put_object_action_modern(
-                requester,
-                bucket,
-                bucket_tags,
-                key,
-                action,
-                &PutObjectPolicyContext::default(),
-                policy,
-            )?,
-        };
-
-        Ok(match decision {
-            auth::PolicyEvaluation::ExplicitDeny => false,
-            auth::PolicyEvaluation::ExplicitAllow
-                if Self::modern_bucket_policy_allow_survives_restrict_public_buckets(
-                    requester, bucket,
-                ) =>
-            {
-                true
-            }
-            auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
-                Self::requester_can_modern_bucket_owner_account_admin(requester, bucket)
-            }
-        })
+        modern::delete_object_authorization_with_bucket_policy(
+            requester,
+            bucket,
+            bucket_tags,
+            key,
+            object,
+            action,
+            policy,
+        )
     }
 
     fn bucket_policy_allows_with_fallback<F>(
@@ -1537,17 +987,7 @@ impl Coordinator {
     where
         F: FnOnce() -> bool,
     {
-        match decision {
-            auth::PolicyEvaluation::ExplicitDeny => false,
-            auth::PolicyEvaluation::ExplicitAllow
-                if Self::bucket_policy_allow_survives_restrict_public_buckets(
-                    requester, bucket,
-                ) =>
-            {
-                true
-            }
-            auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => fallback(),
-        }
+        policy::bucket_policy_allows_with_fallback(requester, bucket, decision, fallback)
     }
 
     fn bucket_policy_allows_with_root_principal_bypass<F>(
@@ -1559,14 +999,9 @@ impl Coordinator {
     where
         F: FnOnce() -> bool,
     {
-        match decision {
-            auth::PolicyEvaluation::ExplicitDeny
-                if Self::requester_is_bucket_owner_account_root_principal(requester, bucket) =>
-            {
-                fallback()
-            }
-            _ => Self::bucket_policy_allows_with_fallback(requester, bucket, decision, fallback),
-        }
+        policy::bucket_policy_allows_with_root_principal_bypass(
+            requester, bucket, decision, fallback,
+        )
     }
 
     fn requester_can_object_action_with_bucket_policy<F>(
@@ -1578,17 +1013,7 @@ impl Coordinator {
     where
         F: FnOnce() -> bool,
     {
-        let decision = self.bucket_policy_decision_for_object(
-            request,
-            object,
-            ExistingObjectTagsMode::Available,
-        )?;
-        Ok(Self::bucket_policy_allows_with_fallback(
-            request.requester,
-            request.bucket,
-            decision,
-            fallback,
-        ))
+        policy::requester_can_object_action_with_bucket_policy(self, request, object, fallback)
     }
 
     fn requester_can_object_action_with_unavailable_existing_tags_with_bucket_policy<F>(
@@ -1600,17 +1025,9 @@ impl Coordinator {
     where
         F: FnOnce() -> bool,
     {
-        let decision = self.bucket_policy_decision_for_object(
-            request,
-            object,
-            ExistingObjectTagsMode::Unavailable,
-        )?;
-        Ok(Self::bucket_policy_allows_with_fallback(
-            request.requester,
-            request.bucket,
-            decision,
-            fallback,
-        ))
+        policy::requester_can_object_action_with_unavailable_existing_tags_with_bucket_policy(
+            self, request, object, fallback,
+        )
     }
 
     fn requester_can_read_family_object_action_with_bucket_policy<F>(
@@ -1623,75 +1040,13 @@ impl Coordinator {
     where
         F: FnOnce() -> bool,
     {
-        let decision = Self::filter_bucket_policy_allow_for_foreign_owned_read_family_object(
-            request.bucket,
+        policy::requester_can_read_family_object_action_with_bucket_policy(
+            self,
+            request,
             object,
-            request.action,
-            self.bucket_policy_decision_for_object(request, object, existing_object_tags_mode)?,
-        );
-        Ok(Self::bucket_policy_allows_with_fallback(
-            request.requester,
-            request.bucket,
-            decision,
+            existing_object_tags_mode,
             fallback,
-        ))
-    }
-
-    fn filter_bucket_policy_allow_for_foreign_owned_read_family_object(
-        bucket: &BucketSummary,
-        object: &StoredObject,
-        action: auth::PolicyAction,
-        decision: auth::PolicyEvaluation,
-    ) -> auth::PolicyEvaluation {
-        if decision != auth::PolicyEvaluation::ExplicitAllow {
-            return decision;
-        }
-
-        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
-            return decision;
-        }
-
-        let is_read_family = matches!(
-            action,
-            auth::PolicyAction::GetObject
-                | auth::PolicyAction::GetObjectVersion
-                | auth::PolicyAction::GetObjectAttributes
-                | auth::PolicyAction::GetObjectVersionAttributes
-                | auth::PolicyAction::GetObjectAcl
-                | auth::PolicyAction::GetObjectVersionAcl
-        );
-        if !is_read_family {
-            return decision;
-        }
-
-        if Self::object_is_owned_by_bucket_owner_account(bucket, object) {
-            return decision;
-        }
-
-        auth::PolicyEvaluation::NoMatch
-    }
-
-    fn object_is_owned_by_bucket_owner_account(
-        bucket: &BucketSummary,
-        object: &StoredObject,
-    ) -> bool {
-        if object.owner().principal == bucket.owner_principal
-            || object.owner().canonical_id == bucket.owner_canonical_id
-        {
-            return true;
-        }
-
-        let Some(object_owner_account_id) =
-            aws_account_id_from_principal(object.owner().principal.as_str())
-        else {
-            return false;
-        };
-        let Some(bucket_owner_account_id) = aws_account_id_from_principal(&bucket.owner_principal)
-        else {
-            return false;
-        };
-
-        object_owner_account_id == bucket_owner_account_id
+        )
     }
 
     fn requester_can_missing_object_action_with_bucket_policy<F>(
@@ -1703,13 +1058,7 @@ impl Coordinator {
     where
         F: FnOnce() -> bool,
     {
-        let decision = self.object_policy_decision(request, ObjectPolicyTarget::MissingKey(key))?;
-        Ok(Self::bucket_policy_allows_with_fallback(
-            request.requester,
-            request.bucket,
-            decision,
-            fallback,
-        ))
+        policy::requester_can_missing_object_action_with_bucket_policy(self, request, key, fallback)
     }
 
     fn object_policy_decision(
@@ -1717,174 +1066,7 @@ impl Coordinator {
         request: BucketPolicyRequestContext<'_>,
         target: ObjectPolicyTarget<'_>,
     ) -> Result<auth::PolicyEvaluation, ServerError> {
-        match target {
-            ObjectPolicyTarget::Existing(object) => self.bucket_policy_decision_for_object(
-                request,
-                object,
-                ExistingObjectTagsMode::Available,
-            ),
-            ObjectPolicyTarget::MissingKey(key) => {
-                self.bucket_policy_decision_for_key(request, key)
-            }
-        }
-    }
-
-    fn bucket_policy_decision_for_object_with_preloaded_tags_modern(
-        requester: &Requester,
-        bucket: &ModernBucketSummary,
-        bucket_tags: Option<&[(String, String)]>,
-        object: &StoredObject,
-        action: auth::PolicyAction,
-        policy: Option<&auth::BucketPolicy>,
-        existing_object_tags_mode: ExistingObjectTagsMode,
-    ) -> Result<auth::PolicyEvaluation, ServerError> {
-        let Some(policy) = policy else {
-            return Ok(auth::PolicyEvaluation::NoMatch);
-        };
-
-        Self::evaluate_bucket_policy_for_object_request(
-            ObjectPolicyEvaluationContext {
-                requester,
-                bucket_name: bucket.name.as_str(),
-                bucket_abac_enabled: bucket.bucket_abac_enabled,
-                action,
-                policy_context: PutObjectPolicyContext::default(),
-                policy,
-            },
-            object,
-            existing_object_tags_mode,
-            bucket_tags.unwrap_or(&[]),
-        )
-    }
-
-    fn filter_bucket_policy_allow_for_foreign_owned_read_family_object_modern(
-        bucket: &ModernBucketSummary,
-        object: &StoredObject,
-        decision: auth::PolicyEvaluation,
-    ) -> auth::PolicyEvaluation {
-        if decision != auth::PolicyEvaluation::ExplicitAllow {
-            return decision;
-        }
-
-        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
-            return decision;
-        }
-
-        if Self::object_is_owned_by_modern_bucket_owner_account(bucket, object) {
-            return decision;
-        }
-
-        auth::PolicyEvaluation::NoMatch
-    }
-
-    fn object_is_owned_by_modern_bucket_owner_account(
-        bucket: &ModernBucketSummary,
-        object: &StoredObject,
-    ) -> bool {
-        if object.owner().principal == bucket.owner_principal
-            || object.owner().canonical_id == bucket.owner_canonical_id
-        {
-            return true;
-        }
-
-        let Some(object_owner_account_id) =
-            aws_account_id_from_principal(object.owner().principal.as_str())
-        else {
-            return false;
-        };
-        let Some(bucket_owner_account_id) = Self::bucket_owner_account_id(&bucket.owner_principal)
-        else {
-            return false;
-        };
-
-        object_owner_account_id == bucket_owner_account_id
-    }
-
-    fn modern_read_object_default_allowed(
-        requester: &Requester,
-        bucket: &ModernBucketSummary,
-        object: &StoredObject,
-        action: ModernReadAction,
-    ) -> bool {
-        match action {
-            ModernReadAction::ReadCurrent | ModernReadAction::ReadVersion => {
-                if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
-                    Self::requester_can_modern_bucket_owner_account_admin(requester, bucket)
-                } else {
-                    Self::requester_matches_owner_identity(requester, object.owner())
-                }
-            }
-            ModernReadAction::AttributesCurrent | ModernReadAction::AttributesVersion => {
-                if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
-                    requester
-                        .principal_opt()
-                        .is_some_and(|principal| principal == object.owner().principal.as_str())
-                } else {
-                    Self::requester_matches_owner_identity(requester, object.owner())
-                }
-            }
-        }
-    }
-
-    fn modern_read_object_authorization_for_single_action(
-        requester: &Requester,
-        bucket: &ModernBucketSummary,
-        bucket_tags: Option<&[(String, String)]>,
-        object: &StoredObject,
-        action: ModernReadAction,
-        policy: Option<&auth::BucketPolicy>,
-        existing_object_tags_mode: ExistingObjectTagsMode,
-    ) -> Result<ModernObjectReadAuthorization, ServerError> {
-        let decision = Self::filter_bucket_policy_allow_for_foreign_owned_read_family_object_modern(
-            bucket,
-            object,
-            Self::bucket_policy_decision_for_object_with_preloaded_tags_modern(
-                requester,
-                bucket,
-                bucket_tags,
-                object,
-                action.policy_action(),
-                policy,
-                existing_object_tags_mode,
-            )?,
-        );
-        let modern_default_allowed =
-            Self::modern_read_object_default_allowed(requester, bucket, object, action);
-
-        let outcome = match decision {
-            auth::PolicyEvaluation::ExplicitDeny => ModernObjectReadAuthorization::Denied,
-            auth::PolicyEvaluation::ExplicitAllow
-                if Self::modern_bucket_policy_allow_survives_restrict_public_buckets(
-                    requester, bucket,
-                ) =>
-            {
-                ModernObjectReadAuthorization::Allowed
-            }
-            auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
-                if modern_default_allowed {
-                    ModernObjectReadAuthorization::Allowed
-                } else if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
-                    ModernObjectReadAuthorization::Denied
-                } else {
-                    ModernObjectReadAuthorization::NeedAclFallback
-                }
-            }
-        };
-        Ok(outcome)
-    }
-
-    fn combine_modern_read_authorization(
-        first: ModernObjectReadAuthorization,
-        second: ModernObjectReadAuthorization,
-    ) -> ModernObjectReadAuthorization {
-        match (first, second) {
-            (ModernObjectReadAuthorization::Denied, _)
-            | (_, ModernObjectReadAuthorization::Denied) => ModernObjectReadAuthorization::Denied,
-            (ModernObjectReadAuthorization::Allowed, ModernObjectReadAuthorization::Allowed) => {
-                ModernObjectReadAuthorization::Allowed
-            }
-            _ => ModernObjectReadAuthorization::NeedAclFallback,
-        }
+        policy::object_policy_decision(self, request, target)
     }
 
     pub(super) fn modern_read_object_authorization_with_bucket_policy(
@@ -1895,43 +1077,14 @@ impl Coordinator {
         action: ModernReadAction,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<ModernObjectReadAuthorization, ServerError> {
-        match action {
-            ModernReadAction::AttributesCurrent | ModernReadAction::AttributesVersion => {
-                let read_action = match action {
-                    ModernReadAction::AttributesVersion => ModernReadAction::ReadVersion,
-                    ModernReadAction::AttributesCurrent => ModernReadAction::ReadCurrent,
-                    _ => unreachable!(),
-                };
-                let read = Self::modern_read_object_authorization_for_single_action(
-                    requester,
-                    bucket,
-                    bucket_tags,
-                    object,
-                    read_action,
-                    policy,
-                    ExistingObjectTagsMode::Available,
-                )?;
-                let attrs = Self::modern_read_object_authorization_for_single_action(
-                    requester,
-                    bucket,
-                    bucket_tags,
-                    object,
-                    action,
-                    policy,
-                    ExistingObjectTagsMode::Unavailable,
-                )?;
-                Ok(Self::combine_modern_read_authorization(read, attrs))
-            }
-            _ => Self::modern_read_object_authorization_for_single_action(
-                requester,
-                bucket,
-                bucket_tags,
-                object,
-                action,
-                policy,
-                ExistingObjectTagsMode::Available,
-            ),
-        }
+        modern::read_object_authorization_with_bucket_policy(
+            requester,
+            bucket,
+            bucket_tags,
+            object,
+            action,
+            policy,
+        )
     }
 
     pub(super) fn requester_can_read_object_with_bucket_policy(
