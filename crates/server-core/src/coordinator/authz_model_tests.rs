@@ -10682,7 +10682,7 @@ mod phase13_model {
         ReadPolicy(Phase13ReadPolicyState),
         DeletePolicy(DeletePolicyShape),
         OwnerPutCurrentVersion,
-        OwnerDeleteCurrent,
+        OwnerDelete,
         OwnerDeleteTrackedVersion,
         ApplyTrackedGovernanceRetention,
         ApplyTrackedComplianceRetention,
@@ -10695,7 +10695,7 @@ mod phase13_model {
                 Self::ReadPolicy(state) => write!(f, "set-read-policy={state}"),
                 Self::DeletePolicy(policy) => write!(f, "set-delete-policy={policy}"),
                 Self::OwnerPutCurrentVersion => f.write_str("owner-put-current-version"),
-                Self::OwnerDeleteCurrent => f.write_str("owner-delete-current"),
+                Self::OwnerDelete => f.write_str("owner-delete-current"),
                 Self::OwnerDeleteTrackedVersion => f.write_str("owner-delete-tracked-version"),
                 Self::ApplyTrackedGovernanceRetention => {
                     f.write_str("apply-tracked-governance-retention")
@@ -10710,9 +10710,9 @@ mod phase13_model {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum Phase13Probe {
-        GetObjectCurrent,
-        GetObjectAttributesCurrent,
-        DeleteCurrent,
+        Object,
+        Attributes,
+        Delete,
         DeleteTrackedVersion,
         DeleteTrackedVersionBypass,
     }
@@ -10720,9 +10720,9 @@ mod phase13_model {
     impl fmt::Display for Phase13Probe {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
-                Self::GetObjectCurrent => f.write_str("get-object-current"),
-                Self::GetObjectAttributesCurrent => f.write_str("get-object-attributes-current"),
-                Self::DeleteCurrent => f.write_str("delete-current"),
+                Self::Object => f.write_str("get-object-current"),
+                Self::Attributes => f.write_str("get-object-attributes-current"),
+                Self::Delete => f.write_str("delete-current"),
                 Self::DeleteTrackedVersion => f.write_str("delete-tracked-version"),
                 Self::DeleteTrackedVersionBypass => f.write_str("delete-tracked-version-bypass"),
             }
@@ -10796,7 +10796,7 @@ mod phase13_model {
                     self.tracked_version_retention = Phase13RetentionState::None;
                     self.tracked_version_legal_hold = false;
                 }
-                Phase13Mutation::OwnerDeleteCurrent => {
+                Phase13Mutation::OwnerDelete => {
                     self.current = Phase13CurrentState::DeleteMarker;
                     self.tracked_version_is_current = false;
                 }
@@ -10838,10 +10838,8 @@ mod phase13_model {
 
         pub(super) fn expected_outcome(self, probe: Phase13Probe) -> model::Outcome {
             match probe {
-                Phase13Probe::GetObjectCurrent | Phase13Probe::GetObjectAttributesCurrent => {
-                    self.current_read_outcome()
-                }
-                Phase13Probe::DeleteCurrent => {
+                Phase13Probe::Object | Phase13Probe::Attributes => self.current_read_outcome(),
+                Phase13Probe::Delete => {
                     if self.delete_policy == DeletePolicyShape::AllowDeleteObject {
                         model::Outcome::Allow
                     } else {
@@ -11060,7 +11058,7 @@ mod phase13_harness {
                     self.tracked_version_id.replace(Some(version_id));
                     self.tracked_version_present.set(true);
                 }
-                Phase13Mutation::OwnerDeleteCurrent => {
+                Phase13Mutation::OwnerDelete => {
                     self.coord
                         .delete_object(&DeleteObjectRequest {
                             object: ObjectVersionRequest::new(
@@ -11125,7 +11123,7 @@ mod phase13_harness {
                 .borrow()
                 .unwrap_or_else(|| VersionId::from_u64(999_999));
             let result = match probe {
-                Phase13Probe::GetObjectCurrent => self
+                Phase13Probe::Object => self
                     .coord
                     .get_object(&GetObjectRequest {
                         sse_customer: None,
@@ -11142,7 +11140,7 @@ mod phase13_harness {
                         let _ = read_all_phase13_body(result.body)?;
                         Ok(())
                     }),
-                Phase13Probe::GetObjectAttributesCurrent => self
+                Phase13Probe::Attributes => self
                     .coord
                     .get_object_attributes(&GetObjectAttributesRequest {
                         object: ObjectVersionRequest::new(
@@ -11159,7 +11157,7 @@ mod phase13_harness {
                         sse_customer: None,
                     })
                     .map(|_| ()),
-                Phase13Probe::DeleteCurrent => self
+                Phase13Probe::Delete => self
                     .coord
                     .authorize_delete_object(&DeleteObjectRequest {
                         object: ObjectVersionRequest::new(
@@ -11537,6 +11535,528 @@ mod phase13_harness {
     }
 }
 
+mod phase14_model {
+    use super::*;
+
+    const DISABLED_VERSIONING_TARGETS: [BucketVersioningState; 2] = [
+        BucketVersioningState::Disabled,
+        BucketVersioningState::Enabled,
+    ];
+    const ENABLED_VERSIONING_TARGETS: [BucketVersioningState; 2] = [
+        BucketVersioningState::Enabled,
+        BucketVersioningState::Suspended,
+    ];
+    const SUSPENDED_VERSIONING_TARGETS: [BucketVersioningState; 2] = [
+        BucketVersioningState::Enabled,
+        BucketVersioningState::Suspended,
+    ];
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Phase14ReadPolicyState {
+        None,
+        AllowPrivate,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Phase14DeletePolicyState {
+        None,
+        AllowDeleteObject,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Phase14CurrentState {
+        Missing,
+        Live,
+        DeleteMarker,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Phase14Mutation {
+        SetVersioning(BucketVersioningState),
+        ReadPolicy(Phase14ReadPolicyState),
+        DeletePolicy(Phase14DeletePolicyState),
+        OwnerPutCurrent,
+        OwnerDelete,
+    }
+
+    impl fmt::Display for Phase14Mutation {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::SetVersioning(state) => write!(f, "set-versioning={state:?}"),
+                Self::ReadPolicy(state) => write!(f, "set-read-policy={state}"),
+                Self::DeletePolicy(state) => write!(f, "set-delete-policy={state}"),
+                Self::OwnerPutCurrent => f.write_str("owner-put-current"),
+                Self::OwnerDelete => f.write_str("owner-delete-current"),
+            }
+        }
+    }
+
+    impl fmt::Display for Phase14ReadPolicyState {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::None => f.write_str("none"),
+                Self::AllowPrivate => f.write_str("allow-read-private"),
+            }
+        }
+    }
+
+    impl fmt::Display for Phase14DeletePolicyState {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::None => f.write_str("none"),
+                Self::AllowDeleteObject => f.write_str("allow-delete-object"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Phase14Probe {
+        Object,
+        Attributes,
+        Delete,
+    }
+
+    impl fmt::Display for Phase14Probe {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Object => f.write_str("get-object-current"),
+                Self::Attributes => f.write_str("get-object-attributes-current"),
+                Self::Delete => f.write_str("delete-current"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Phase14ExecutionOutcome {
+        Denied,
+        Applied {
+            delete_marker: bool,
+            current_read: model::Outcome,
+        },
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct Phase14State {
+        pub(super) versioning: BucketVersioningState,
+        pub(super) read_policy: Phase14ReadPolicyState,
+        pub(super) delete_policy: Phase14DeletePolicyState,
+        pub(super) current: Phase14CurrentState,
+    }
+
+    impl Phase14State {
+        pub(super) fn new() -> Self {
+            Self {
+                versioning: BucketVersioningState::Disabled,
+                read_policy: Phase14ReadPolicyState::None,
+                delete_policy: Phase14DeletePolicyState::None,
+                current: Phase14CurrentState::Missing,
+            }
+        }
+
+        pub(super) fn legal_versioning_targets(&self) -> &'static [BucketVersioningState] {
+            match self.versioning {
+                BucketVersioningState::Disabled => &DISABLED_VERSIONING_TARGETS,
+                BucketVersioningState::Enabled => &ENABLED_VERSIONING_TARGETS,
+                BucketVersioningState::Suspended => &SUSPENDED_VERSIONING_TARGETS,
+            }
+        }
+
+        pub(super) fn apply(&mut self, mutation: Phase14Mutation) {
+            match mutation {
+                Phase14Mutation::SetVersioning(state) => {
+                    assert!(self.legal_versioning_targets().contains(&state));
+                    self.versioning = state;
+                }
+                Phase14Mutation::ReadPolicy(state) => self.read_policy = state,
+                Phase14Mutation::DeletePolicy(state) => self.delete_policy = state,
+                Phase14Mutation::OwnerPutCurrent => self.current = Phase14CurrentState::Live,
+                Phase14Mutation::OwnerDelete => {
+                    self.current = match self.versioning {
+                        BucketVersioningState::Disabled => Phase14CurrentState::Missing,
+                        BucketVersioningState::Enabled | BucketVersioningState::Suspended => {
+                            Phase14CurrentState::DeleteMarker
+                        }
+                    };
+                }
+            }
+        }
+
+        pub(super) fn expected_outcome(self, probe: Phase14Probe) -> model::Outcome {
+            match probe {
+                Phase14Probe::Object | Phase14Probe::Attributes => self.current_read_outcome(),
+                Phase14Probe::Delete => {
+                    if self.delete_policy == Phase14DeletePolicyState::AllowDeleteObject {
+                        model::Outcome::Allow
+                    } else {
+                        model::Outcome::Deny
+                    }
+                }
+            }
+        }
+
+        pub(super) fn expected_execution_outcome(self) -> Phase14ExecutionOutcome {
+            if self.delete_policy != Phase14DeletePolicyState::AllowDeleteObject {
+                return Phase14ExecutionOutcome::Denied;
+            }
+            let delete_marker = match self.versioning {
+                BucketVersioningState::Disabled => false,
+                BucketVersioningState::Enabled | BucketVersioningState::Suspended => true,
+            };
+            Phase14ExecutionOutcome::Applied {
+                delete_marker,
+                current_read: model::Outcome::Deny,
+            }
+        }
+
+        fn current_read_outcome(self) -> model::Outcome {
+            if self.read_policy == Phase14ReadPolicyState::AllowPrivate
+                && self.current == Phase14CurrentState::Live
+            {
+                model::Outcome::Allow
+            } else {
+                model::Outcome::Deny
+            }
+        }
+    }
+}
+
+mod phase14_harness {
+    use std::cell::Cell;
+
+    use super::harness::{setup_coordinator, IdentityFixtures};
+    use super::model::Outcome;
+    use super::phase14_model::{
+        Phase14DeletePolicyState, Phase14ExecutionOutcome, Phase14Mutation, Phase14Probe,
+        Phase14ReadPolicyState,
+    };
+    use super::*;
+
+    const PHASE14_KEY: &str = "phase14-key";
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ClassifiedPhase14Result {
+        Allow,
+        Deny,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ClassifiedPhase14ExecutionResult {
+        Denied,
+        Applied {
+            delete_marker: bool,
+            current_read: Outcome,
+        },
+    }
+
+    pub(super) struct Phase14Harness {
+        _tmp: test_util::TempDir,
+        coord: Coordinator,
+        fixtures: IdentityFixtures,
+        read_policy: Cell<Phase14ReadPolicyState>,
+        delete_policy: Cell<Phase14DeletePolicyState>,
+    }
+
+    impl Phase14Harness {
+        pub(super) fn new() -> Self {
+            let tmp = test_util::tempdir();
+            let coord = setup_coordinator(tmp.path());
+            let fixtures = IdentityFixtures::new();
+            Self {
+                _tmp: tmp,
+                coord,
+                fixtures,
+                read_policy: Cell::new(Phase14ReadPolicyState::None),
+                delete_policy: Cell::new(Phase14DeletePolicyState::None),
+            }
+        }
+
+        pub(super) fn prepare(&self, bucket: &str) {
+            self.coord
+                .create_bucket(&CreateBucketRequest {
+                    name: trusted_bucket_name(bucket),
+                    requester: Requester::authenticated(self.fixtures.owner_user.clone()),
+                    namespace: BucketNamespace::Global,
+                    acl: CreateBucketAcl::DefaultPrivate,
+                    ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                    object_lock_enabled: false,
+                })
+                .unwrap_or_else(|err| panic!("failed to create phase 14 bucket: {err:?}"));
+            self.read_policy.set(Phase14ReadPolicyState::None);
+            self.delete_policy.set(Phase14DeletePolicyState::None);
+        }
+
+        pub(super) fn apply_mutation(&self, bucket: &str, mutation: Phase14Mutation) {
+            match mutation {
+                Phase14Mutation::SetVersioning(state) => {
+                    self.coord
+                        .put_bucket_versioning(&PutBucketVersioningRequest {
+                            bucket: BucketRequest::new(
+                                trusted_bucket_name(bucket),
+                                Requester::authenticated(self.fixtures.owner_user.clone()),
+                                None,
+                            ),
+                            state,
+                        })
+                        .unwrap_or_else(|err| {
+                            panic!("failed to set phase 14 bucket versioning to {state:?}: {err:?}")
+                        });
+                }
+                Phase14Mutation::ReadPolicy(state) => {
+                    self.read_policy.set(state);
+                    self.apply_bucket_policy(bucket);
+                }
+                Phase14Mutation::DeletePolicy(state) => {
+                    self.delete_policy.set(state);
+                    self.apply_bucket_policy(bucket);
+                }
+                Phase14Mutation::OwnerPutCurrent => {
+                    test_helpers::put_object(
+                        &self.coord,
+                        &PutObjectRequest {
+                            encryption: WriteEncryptionRequest::none(),
+                            policy_context: PutObjectPolicyContext::default(),
+                            object_lock: ObjectLockState::default(),
+                            object: ObjectRequest::new(
+                                trusted_bucket_name(bucket),
+                                trusted_object_key(PHASE14_KEY),
+                                Requester::authenticated(self.fixtures.owner_user.clone()),
+                                None,
+                            ),
+                            data: b"phase14",
+                            metadata: &MetadataBlob::new(),
+                            system_metadata: &SystemMetadata::EMPTY,
+                            tags: None,
+                            cond: NO_WRITE,
+                            acl: NO_PUT_OBJECT_ACL.into(),
+                        },
+                    )
+                    .unwrap_or_else(|err| panic!("failed to owner-put phase 14 object: {err:?}"));
+                }
+                Phase14Mutation::OwnerDelete => {
+                    self.coord
+                        .delete_object(&DeleteObjectRequest {
+                            object: ObjectVersionRequest::new(
+                                trusted_bucket_name(bucket),
+                                trusted_object_key(PHASE14_KEY),
+                                None,
+                                Requester::authenticated(self.fixtures.owner_user.clone()),
+                                None,
+                            ),
+                            bypass_governance: false,
+                            cond: NO_DELETE,
+                        })
+                        .unwrap_or_else(|err| {
+                            panic!("failed to owner-delete current object for phase 14: {err:?}")
+                        });
+                }
+            }
+        }
+
+        pub(super) fn probe(&self, bucket: &str, probe: Phase14Probe) -> ClassifiedPhase14Result {
+            let requester = Requester::authenticated(self.fixtures.cross_account.clone());
+            let result = match probe {
+                Phase14Probe::Object => self
+                    .coord
+                    .get_object(&GetObjectRequest {
+                        sse_customer: None,
+                        object: ObjectVersionRequest::new(
+                            trusted_bucket_name(bucket),
+                            trusted_object_key(PHASE14_KEY),
+                            None,
+                            requester,
+                            None,
+                        ),
+                        cond: NO_READ,
+                    })
+                    .and_then(|result| {
+                        let _ = read_all_phase14_body(result.body)?;
+                        Ok(())
+                    }),
+                Phase14Probe::Attributes => self
+                    .coord
+                    .get_object_attributes(&GetObjectAttributesRequest {
+                        object: ObjectVersionRequest::new(
+                            trusted_bucket_name(bucket),
+                            trusted_object_key(PHASE14_KEY),
+                            None,
+                            requester,
+                            None,
+                        ),
+                        cond: NO_READ,
+                        want_parts: false,
+                        part_number_marker: None,
+                        max_parts: 0,
+                        sse_customer: None,
+                    })
+                    .map(|_| ()),
+                Phase14Probe::Delete => self
+                    .coord
+                    .authorize_delete_object(&DeleteObjectRequest {
+                        object: ObjectVersionRequest::new(
+                            trusted_bucket_name(bucket),
+                            trusted_object_key(PHASE14_KEY),
+                            None,
+                            requester,
+                            None,
+                        ),
+                        bypass_governance: false,
+                        cond: NO_DELETE,
+                    })
+                    .map(|_| ()),
+            };
+            classify_phase14(result)
+        }
+
+        pub(super) fn execution_probe(&self, bucket: &str) -> ClassifiedPhase14ExecutionResult {
+            let requester = Requester::authenticated(self.fixtures.cross_account.clone());
+            let deleted = match self.coord.delete_object(&DeleteObjectRequest {
+                object: ObjectVersionRequest::new(
+                    trusted_bucket_name(bucket),
+                    trusted_object_key(PHASE14_KEY),
+                    None,
+                    requester.clone(),
+                    None,
+                ),
+                bypass_governance: false,
+                cond: NO_DELETE,
+            }) {
+                Ok(result) => result,
+                Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
+                    return ClassifiedPhase14ExecutionResult::Denied;
+                }
+                Err(err) => panic!("unexpected phase 14 delete execution result: {err:?}"),
+            };
+
+            let current_read = to_phase14_outcome(classify_phase14(
+                self.coord
+                    .get_object(&GetObjectRequest {
+                        sse_customer: None,
+                        object: ObjectVersionRequest::new(
+                            trusted_bucket_name(bucket),
+                            trusted_object_key(PHASE14_KEY),
+                            None,
+                            requester,
+                            None,
+                        ),
+                        cond: NO_READ,
+                    })
+                    .and_then(|result| {
+                        let _ = read_all_phase14_body(result.body)?;
+                        Ok(())
+                    }),
+            ));
+
+            ClassifiedPhase14ExecutionResult::Applied {
+                delete_marker: deleted.delete_marker,
+                current_read,
+            }
+        }
+
+        fn apply_bucket_policy(&self, bucket: &str) {
+            let Some(document) = phase14_policy_document(
+                &self.fixtures,
+                bucket,
+                self.read_policy.get(),
+                self.delete_policy.get(),
+            ) else {
+                self.coord
+                    .delete_bucket_policy(&BucketRequest::new(
+                        trusted_bucket_name(bucket),
+                        Requester::authenticated(self.fixtures.owner_user.clone()),
+                        None,
+                    ))
+                    .unwrap_or_else(|err| {
+                        panic!("failed to delete phase 14 bucket policy: {err:?}")
+                    });
+                return;
+            };
+            self.coord
+                .put_bucket_policy(&PutBucketPolicyRequest {
+                    bucket: BucketRequest::new(
+                        trusted_bucket_name(bucket),
+                        Requester::authenticated(self.fixtures.owner_user.clone()),
+                        None,
+                    ),
+                    config: &document,
+                    confirm_remove_self_bucket_access: false,
+                })
+                .unwrap_or_else(|err| panic!("failed to put phase 14 bucket policy: {err:?}"));
+        }
+    }
+
+    pub(super) fn to_phase14_outcome(result: ClassifiedPhase14Result) -> Outcome {
+        match result {
+            ClassifiedPhase14Result::Allow => Outcome::Allow,
+            ClassifiedPhase14Result::Deny => Outcome::Deny,
+        }
+    }
+
+    pub(super) fn to_phase14_execution_outcome(
+        result: ClassifiedPhase14ExecutionResult,
+    ) -> Phase14ExecutionOutcome {
+        match result {
+            ClassifiedPhase14ExecutionResult::Denied => Phase14ExecutionOutcome::Denied,
+            ClassifiedPhase14ExecutionResult::Applied {
+                delete_marker,
+                current_read,
+            } => Phase14ExecutionOutcome::Applied {
+                delete_marker,
+                current_read,
+            },
+        }
+    }
+
+    fn phase14_policy_document(
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        read_policy: Phase14ReadPolicyState,
+        delete_policy: Phase14DeletePolicyState,
+    ) -> Option<String> {
+        let principal = fixtures.cross_account.principal();
+        let resource = format!("arn:aws:s3:::{bucket}/{PHASE14_KEY}");
+        let mut statements = Vec::new();
+        if read_policy == Phase14ReadPolicyState::AllowPrivate {
+            statements.push(format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":["s3:GetObject","s3:GetObjectAttributes"],"Resource":"{resource}"}}"#
+            ));
+        }
+        if delete_policy == Phase14DeletePolicyState::AllowDeleteObject {
+            statements.push(format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:DeleteObject","Resource":"{resource}"}}"#
+            ));
+        }
+        if statements.is_empty() {
+            None
+        } else {
+            Some(format!(
+                r#"{{"Version":"2012-10-17","Statement":[{}]}}"#,
+                statements.join(",")
+            ))
+        }
+    }
+
+    fn classify_phase14(result: Result<(), ServerError>) -> ClassifiedPhase14Result {
+        match result {
+            Ok(()) => ClassifiedPhase14Result::Allow,
+            Err(
+                ServerError::AccessDenied
+                | ServerError::AnonymousApiAccessDenied
+                | ServerError::DeleteMarkerHit { .. }
+                | ServerError::ObjectNotFound { .. },
+            ) => ClassifiedPhase14Result::Deny,
+            Err(err) => panic!("unexpected phase 14 result: {err:?}"),
+        }
+    }
+
+    fn read_all_phase14_body(mut body: ReadHandle) -> Result<Vec<u8>, ServerError> {
+        let mut out = Vec::new();
+        while let Some(chunk) = body.next_chunk(INTERNAL_SEGMENT_SIZE)? {
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
+}
+
 use harness::{bucket_name_for, to_existing_outcome, to_missing_outcome, MatrixHarness};
 use model::{Action, MissingScenario, Scenario};
 use phase10_harness::Phase10Harness;
@@ -11549,6 +12069,10 @@ use phase12_model::{
 use phase13_harness::{to_phase13_execution_outcome, to_phase13_outcome, Phase13Harness};
 use phase13_model::{
     Phase13ExecutionProbe, Phase13Mutation, Phase13Probe, Phase13ReadPolicyState, Phase13State,
+};
+use phase14_harness::{to_phase14_execution_outcome, to_phase14_outcome, Phase14Harness};
+use phase14_model::{
+    Phase14DeletePolicyState, Phase14Mutation, Phase14Probe, Phase14ReadPolicyState, Phase14State,
 };
 use phase4_harness::{
     acl_bucket_name_for, to_acl_outcome, to_write_outcome, write_bucket_name_for, Phase4Harness,
@@ -13314,9 +13838,9 @@ fn phase13_delete_policy_strategy() -> impl Strategy<Value = DeletePolicyShape> 
 
 fn phase13_probe_strategy() -> impl Strategy<Value = Phase13Probe> {
     prop_oneof![
-        Just(Phase13Probe::GetObjectCurrent),
-        Just(Phase13Probe::GetObjectAttributesCurrent),
-        Just(Phase13Probe::DeleteCurrent),
+        Just(Phase13Probe::Object),
+        Just(Phase13Probe::Attributes),
+        Just(Phase13Probe::Delete),
         Just(Phase13Probe::DeleteTrackedVersion),
         Just(Phase13Probe::DeleteTrackedVersionBypass),
     ]
@@ -13335,7 +13859,7 @@ fn phase13_mutation_strategy() -> impl Strategy<Value = Phase13Mutation> {
         phase13_read_policy_strategy().prop_map(Phase13Mutation::ReadPolicy),
         phase13_delete_policy_strategy().prop_map(Phase13Mutation::DeletePolicy),
         Just(Phase13Mutation::OwnerPutCurrentVersion),
-        Just(Phase13Mutation::OwnerDeleteCurrent),
+        Just(Phase13Mutation::OwnerDelete),
         Just(Phase13Mutation::OwnerDeleteTrackedVersion),
         Just(Phase13Mutation::ApplyTrackedGovernanceRetention),
         Just(Phase13Mutation::ApplyTrackedComplianceRetention),
@@ -13356,6 +13880,97 @@ fn phase13_execution_trace_strategy(
         prop::collection::vec(phase13_mutation_strategy(), 0..=6),
         phase13_execution_probe_strategy(),
     )
+}
+
+#[derive(Debug, Clone)]
+enum Phase14TraceSeed {
+    Transition { choice: u8 },
+    ReadPolicy(Phase14ReadPolicyState),
+    DeletePolicy(Phase14DeletePolicyState),
+    OwnerPutCurrent,
+    OwnerDelete,
+}
+
+fn phase14_read_policy_strategy() -> impl Strategy<Value = Phase14ReadPolicyState> {
+    prop_oneof![
+        Just(Phase14ReadPolicyState::None),
+        Just(Phase14ReadPolicyState::AllowPrivate),
+    ]
+}
+
+fn phase14_delete_policy_strategy() -> impl Strategy<Value = Phase14DeletePolicyState> {
+    prop_oneof![
+        Just(Phase14DeletePolicyState::None),
+        Just(Phase14DeletePolicyState::AllowDeleteObject),
+    ]
+}
+
+fn phase14_probe_strategy() -> impl Strategy<Value = Phase14Probe> {
+    prop_oneof![
+        Just(Phase14Probe::Object),
+        Just(Phase14Probe::Attributes),
+        Just(Phase14Probe::Delete),
+    ]
+}
+
+fn phase14_trace_seed_strategy() -> impl Strategy<Value = Phase14TraceSeed> {
+    prop_oneof![
+        any::<u8>().prop_map(|choice| Phase14TraceSeed::Transition { choice }),
+        phase14_read_policy_strategy().prop_map(Phase14TraceSeed::ReadPolicy),
+        phase14_delete_policy_strategy().prop_map(Phase14TraceSeed::DeletePolicy),
+        Just(Phase14TraceSeed::OwnerPutCurrent),
+        Just(Phase14TraceSeed::OwnerDelete),
+    ]
+}
+
+fn phase14_trace_strategy() -> impl Strategy<Value = (Vec<Phase14Mutation>, Phase14Probe)> {
+    (
+        prop::collection::vec(phase14_trace_seed_strategy(), 0..=6),
+        phase14_probe_strategy(),
+    )
+        .prop_map(|(seeds, probe)| {
+            let mut state = Phase14State::new();
+            let mut mutations = Vec::with_capacity(seeds.len());
+            for seed in seeds {
+                let mutation = match seed {
+                    Phase14TraceSeed::Transition { choice } => {
+                        let legal_targets = state.legal_versioning_targets();
+                        let next = legal_targets[(choice as usize) % legal_targets.len()];
+                        Phase14Mutation::SetVersioning(next)
+                    }
+                    Phase14TraceSeed::ReadPolicy(policy) => Phase14Mutation::ReadPolicy(policy),
+                    Phase14TraceSeed::DeletePolicy(policy) => Phase14Mutation::DeletePolicy(policy),
+                    Phase14TraceSeed::OwnerPutCurrent => Phase14Mutation::OwnerPutCurrent,
+                    Phase14TraceSeed::OwnerDelete => Phase14Mutation::OwnerDelete,
+                };
+                state.apply(mutation);
+                mutations.push(mutation);
+            }
+            (mutations, probe)
+        })
+}
+
+fn phase14_execution_trace_strategy() -> impl Strategy<Value = Vec<Phase14Mutation>> {
+    prop::collection::vec(phase14_trace_seed_strategy(), 0..=6).prop_map(|seeds| {
+        let mut state = Phase14State::new();
+        let mut mutations = Vec::with_capacity(seeds.len());
+        for seed in seeds {
+            let mutation = match seed {
+                Phase14TraceSeed::Transition { choice } => {
+                    let legal_targets = state.legal_versioning_targets();
+                    let next = legal_targets[(choice as usize) % legal_targets.len()];
+                    Phase14Mutation::SetVersioning(next)
+                }
+                Phase14TraceSeed::ReadPolicy(policy) => Phase14Mutation::ReadPolicy(policy),
+                Phase14TraceSeed::DeletePolicy(policy) => Phase14Mutation::DeletePolicy(policy),
+                Phase14TraceSeed::OwnerPutCurrent => Phase14Mutation::OwnerPutCurrent,
+                Phase14TraceSeed::OwnerDelete => Phase14Mutation::OwnerDelete,
+            };
+            state.apply(mutation);
+            mutations.push(mutation);
+        }
+        mutations
+    })
 }
 
 proptest! {
@@ -13447,6 +14062,65 @@ proptest! {
             expected,
             "phase 13 BOE versioned execution trace mismatch\nprobe: {}\ntrace:\n{}",
             probe,
+            trace
+        );
+    }
+
+    #[test]
+    fn prop_boe_versioning_transition_trace_matches_model(
+        (mutations, probe) in phase14_trace_strategy()
+    ) {
+        let trace = mutations
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let harness = Phase14Harness::new();
+        let bucket = "authz-phase14-prop";
+        harness.prepare(bucket);
+        let mut state = Phase14State::new();
+
+        for mutation in mutations.iter().copied() {
+            harness.apply_mutation(bucket, mutation);
+            state.apply(mutation);
+        }
+
+        let expected = state.expected_outcome(probe);
+        let actual = to_phase14_outcome(harness.probe(bucket, probe));
+        prop_assert_eq!(
+            actual,
+            expected,
+            "phase 14 BOE versioning trace mismatch\nprobe: {}\ntrace:\n{}",
+            probe,
+            trace
+        );
+    }
+
+    #[test]
+    fn prop_boe_versioning_transition_execution_trace_matches_model(
+        mutations in phase14_execution_trace_strategy()
+    ) {
+        let trace = mutations
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let harness = Phase14Harness::new();
+        let bucket = "authz-phase14-exec-prop";
+        harness.prepare(bucket);
+        let mut state = Phase14State::new();
+
+        for mutation in mutations.iter().copied() {
+            harness.apply_mutation(bucket, mutation);
+            state.apply(mutation);
+        }
+
+        let expected = state.expected_execution_outcome();
+        let actual = to_phase14_execution_outcome(harness.execution_probe(bucket));
+        prop_assert_eq!(
+            actual,
+            expected,
+            "phase 14 BOE versioning execution trace mismatch\ntrace:\n{}",
             trace
         );
     }
