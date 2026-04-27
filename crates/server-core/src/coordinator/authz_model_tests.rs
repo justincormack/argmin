@@ -4,6 +4,10 @@ use super::authz::{
 };
 use super::response_types::ModernBucketSummary;
 use super::test_helpers;
+use super::test_hooks::{
+    install_bucket_policy_load_test_hooks, BucketPolicyLoadTestHooks,
+    BUCKET_POLICY_LOAD_TEST_SERIAL,
+};
 use super::*;
 use crate::conditional::{ReadCondition, WriteCondition};
 use crate::metadata_blob::MetadataBlob;
@@ -11,7 +15,10 @@ use crate::sse::ManagedWrappingKeyConfig;
 use crate::system_metadata::SystemMetadata;
 use std::fmt;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 const NO_READ: &ReadCondition = &ReadCondition {
     if_match: None,
@@ -1525,6 +1532,114 @@ mod harness {
                 scenario,
                 object_version,
             )
+        }
+
+        pub(super) fn run_existing_boe_fast_path_invariant(
+            &self,
+            bucket: &str,
+            scenario: Scenario,
+        ) -> (ClassifiedResult, ModernObjectReadAuthorization) {
+            assert_eq!(
+                scenario.bucket.ownership,
+                model::OwnershipShape::BucketOwnerEnforced,
+                "BOE fast-path invariant only applies to BOE scenarios: {scenario}"
+            );
+            assert!(
+                matches!(
+                    scenario.action,
+                    model::Action::GetObject | model::Action::GetObjectAttributes
+                ),
+                "BOE fast-path invariant only applies to modern read actions: {scenario}"
+            );
+
+            materialize_bucket(&self.coord, &self.fixtures, bucket, scenario).unwrap_or_else(
+                |err| {
+                    panic!("failed to materialize bucket for {scenario}: {err:?}");
+                },
+            );
+            let object_version = materialize_object(&self.coord, &self.fixtures, bucket, scenario)
+                .unwrap_or_else(|err| {
+                    panic!("failed to materialize object for {scenario}: {err:?}");
+                });
+            materialize_policy(&self.coord, &self.fixtures, bucket, scenario).unwrap_or_else(
+                |err| {
+                    panic!("failed to materialize policy for {scenario}: {err:?}");
+                },
+            );
+
+            self.coord
+                .remove_bucket_fast_path(&trusted_bucket_name(bucket));
+            assert!(
+                self.coord
+                    .get_bucket_fast_path(&trusted_bucket_name(bucket))
+                    .is_none(),
+                "test setup should begin with a cold bucket fast path for {scenario}"
+            );
+
+            let warmed = classify(run_action(
+                &self.coord,
+                &self.fixtures,
+                bucket,
+                scenario,
+                object_version,
+            ));
+            assert!(
+                matches!(
+                    warmed,
+                    ClassifiedResult::Allow | ClassifiedResult::AccessDenied
+                ),
+                "existing-object BOE warm-up produced impossible result for {scenario}: {warmed:?}"
+            );
+            assert!(
+                self.coord
+                    .get_bucket_fast_path(&trusted_bucket_name(bucket))
+                    .is_some(),
+                "BOE warm-up should populate the bucket fast path for {scenario}"
+            );
+
+            let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
+                .get_or_init(|| std::sync::Mutex::new(()))
+                .lock()
+                .unwrap();
+            let saw_storage_load = Arc::new(AtomicBool::new(false));
+            let saw_fast_path = Arc::new(AtomicBool::new(false));
+            let saw_storage_load_hook = Arc::clone(&saw_storage_load);
+            let saw_fast_path_hook = Arc::clone(&saw_fast_path);
+            let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
+                bucket: Some(bucket.to_string()),
+                before_storage_load: Some(Arc::new(move || {
+                    saw_storage_load_hook.store(true, Ordering::SeqCst);
+                })),
+                after_policy_fast_path_hit: Some(Arc::new(move || {
+                    saw_fast_path_hook.store(true, Ordering::SeqCst);
+                })),
+            });
+
+            let actual = classify(run_action(
+                &self.coord,
+                &self.fixtures,
+                bucket,
+                scenario,
+                object_version,
+            ));
+            assert!(
+                saw_fast_path.load(Ordering::SeqCst),
+                "warm BOE read should use the bucket fast path for {scenario}"
+            );
+            assert!(
+                !saw_storage_load.load(Ordering::SeqCst),
+                "warm BOE read should not reload bucket policy/tags from storage for {scenario}"
+            );
+
+            let modern = run_modern_action(
+                &self.coord,
+                &self.fixtures,
+                bucket,
+                scenario,
+                object_version,
+            );
+
+            (actual, modern)
         }
 
         pub(super) fn run_missing(
@@ -9634,6 +9749,11 @@ fn authz_model_modern_get_object_existing_foreign_owned_matrix() {
     run_modern_existing_matrix_with_only_cross_account_owner(Action::GetObject);
 }
 
+#[test]
+fn authz_model_boe_get_object_fast_path_matches_snapshot_evaluator() {
+    run_boe_read_fast_path_invariant(Action::GetObject);
+}
+
 macro_rules! modern_get_object_attributes_existing_matrix_shards {
     ($($name:ident => $index:expr),* $(,)?) => {
         $(
@@ -9649,6 +9769,21 @@ macro_rules! modern_get_object_attributes_existing_matrix_shards {
     };
 }
 
+macro_rules! boe_get_object_attributes_fast_path_invariant_shards {
+    ($($name:ident => $index:expr),* $(,)?) => {
+        $(
+            #[test]
+            fn $name() {
+                run_boe_read_fast_path_invariant_shard(
+                    Action::GetObjectAttributes,
+                    $index,
+                    4,
+                );
+            }
+        )*
+    };
+}
+
 modern_get_object_attributes_existing_matrix_shards! {
     authz_model_modern_get_object_attributes_existing_matrix_shard_00 => 0,
     authz_model_modern_get_object_attributes_existing_matrix_shard_01 => 1,
@@ -9658,6 +9793,13 @@ modern_get_object_attributes_existing_matrix_shards! {
     authz_model_modern_get_object_attributes_existing_matrix_shard_05 => 5,
     authz_model_modern_get_object_attributes_existing_matrix_shard_06 => 6,
     authz_model_modern_get_object_attributes_existing_matrix_shard_07 => 7,
+}
+
+boe_get_object_attributes_fast_path_invariant_shards! {
+    authz_model_boe_get_object_attributes_fast_path_matches_snapshot_evaluator_shard_00 => 0,
+    authz_model_boe_get_object_attributes_fast_path_matches_snapshot_evaluator_shard_01 => 1,
+    authz_model_boe_get_object_attributes_fast_path_matches_snapshot_evaluator_shard_02 => 2,
+    authz_model_boe_get_object_attributes_fast_path_matches_snapshot_evaluator_shard_03 => 3,
 }
 
 #[test]
@@ -10889,11 +11031,89 @@ fn run_modern_existing_matrix_scenarios_shard(
     );
 }
 
+fn run_boe_read_fast_path_invariant(action: Action) {
+    let scenarios: Vec<_> = Scenario::existing_scenarios(action)
+        .into_iter()
+        .filter(|scenario| scenario.bucket.ownership == model::OwnershipShape::BucketOwnerEnforced)
+        .collect();
+    run_boe_read_fast_path_invariant_scenarios(action, scenarios);
+}
+
+fn run_boe_read_fast_path_invariant_shard(action: Action, shard_index: usize, shard_count: usize) {
+    assert!(
+        shard_count > 0,
+        "BOE read fast-path invariant shard count must be non-zero"
+    );
+    assert!(
+        shard_index < shard_count,
+        "BOE read fast-path invariant shard index {shard_index} out of range for shard count {shard_count}"
+    );
+    let scenarios: Vec<_> = Scenario::existing_scenarios(action)
+        .into_iter()
+        .filter(|scenario| scenario.bucket.ownership == model::OwnershipShape::BucketOwnerEnforced)
+        .collect();
+    assert!(
+        !scenarios.is_empty(),
+        "BOE read fast-path invariant unexpectedly produced no scenarios for {action}"
+    );
+    let harness = MatrixHarness::new();
+    let mut shard_len = 0usize;
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        if index % shard_count != shard_index {
+            continue;
+        }
+        shard_len += 1;
+        let bucket = format!("{}-boe-fast", modern_bucket_name_for(action, index));
+        let (actual, modern) = harness.run_existing_boe_fast_path_invariant(&bucket, scenario);
+        let actual = to_modern_existing_from_classified(actual);
+        let modern = to_modern_outcome(modern);
+        assert_eq!(
+            actual, modern,
+            "BOE read fast-path invariant mismatch\nscenario: {scenario}\nfast-path actual: {actual}\nsnapshot modern: {modern}"
+        );
+    }
+
+    assert!(
+        shard_len > 0,
+        "BOE read fast-path invariant shard {shard_index}/{shard_count} had no scenarios for {action}"
+    );
+}
+
+fn run_boe_read_fast_path_invariant_scenarios(action: Action, scenarios: Vec<Scenario>) {
+    assert!(
+        !scenarios.is_empty(),
+        "BOE read fast-path invariant unexpectedly produced no scenarios for {action}"
+    );
+    let harness = MatrixHarness::new();
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        let bucket = format!("{}-boe-fast", modern_bucket_name_for(action, index));
+        let (actual, modern) = harness.run_existing_boe_fast_path_invariant(&bucket, scenario);
+        let actual = to_modern_existing_from_classified(actual);
+        let modern = to_modern_outcome(modern);
+        assert_eq!(
+            actual, modern,
+            "BOE read fast-path invariant mismatch\nscenario: {scenario}\nfast-path actual: {actual}\nsnapshot modern: {modern}"
+        );
+    }
+}
+
 fn to_modern_outcome(actual: ModernObjectReadAuthorization) -> model::ModernOutcome {
     match actual {
         ModernObjectReadAuthorization::Allowed => model::ModernOutcome::Allow,
         ModernObjectReadAuthorization::Denied => model::ModernOutcome::Deny,
         ModernObjectReadAuthorization::NeedAclFallback => model::ModernOutcome::NeedAclFallback,
+    }
+}
+
+fn to_modern_existing_from_classified(actual: harness::ClassifiedResult) -> model::ModernOutcome {
+    match actual {
+        harness::ClassifiedResult::Allow => model::ModernOutcome::Allow,
+        harness::ClassifiedResult::AccessDenied => model::ModernOutcome::Deny,
+        harness::ClassifiedResult::NoSuchKey | harness::ClassifiedResult::VersionNotFound => {
+            panic!("existing-object BOE invariant produced an impossible missing-object result")
+        }
     }
 }
 

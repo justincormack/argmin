@@ -108,6 +108,9 @@ Initial target families:
 
 Current implementation note:
 
+- `HeadObject` shares the same BOE read authorization action and object-read
+  snapshot path as `GetObject`; the fast-path invariant is therefore covered by
+  the same read-family evaluator checks.
 - `AbortMultipartUpload` stays on the shared multipart management path rather
   than a separate BOE-specific evaluator. The current semantics are already
   ownership/initiator based and do not rely on ACL fallback, so BOE does not
