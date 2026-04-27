@@ -12605,6 +12605,173 @@ fn test_bucket_policy_boe_multipart_upload_acl_condition_applies() {
 }
 
 #[test]
+fn test_bucket_policy_boe_delete_object_requires_delete_object_policy() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket_request(client, &bucket)
+            .object_ownership(ObjectOwnership::BucketOwnerEnforced)
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("denied")
+            .body(ByteStream::from_static(b"denied"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("allowed")
+            .body(ByteStream::from_static(b"allowed"))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_access_denied(
+            "BOE DeleteObject denied without DeleteObject policy",
+            || {
+                alt_client
+                    .delete_object()
+                    .bucket(&bucket)
+                    .key("denied")
+                    .send()
+            },
+        )
+        .await;
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:DeleteObject",
+                bucket_wildcard_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok_with_retry(
+            "BOE DeleteObject allowed with DeleteObject policy",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .delete_object()
+                    .bucket(&bucket)
+                    .key("allowed")
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &["denied"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_boe_delete_object_version_requires_delete_object_version_policy() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket_request(client, &bucket)
+            .object_ownership(ObjectOwnership::BucketOwnerEnforced)
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let denied_version_id = client
+            .put_object()
+            .bucket(&bucket)
+            .key("denied")
+            .body(ByteStream::from_static(b"denied"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected denied version id")
+            .to_string();
+        let allowed_version_id = client
+            .put_object()
+            .bucket(&bucket)
+            .key("allowed")
+            .body(ByteStream::from_static(b"allowed"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected allowed version id")
+            .to_string();
+
+        eventually_access_denied(
+            "BOE DeleteObjectVersion denied without DeleteObjectVersion policy",
+            || {
+                alt_client
+                    .delete_object()
+                    .bucket(&bucket)
+                    .key("denied")
+                    .version_id(&denied_version_id)
+                    .send()
+            },
+        )
+        .await;
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:DeleteObjectVersion",
+                bucket_wildcard_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok_with_retry(
+            "BOE DeleteObjectVersion allowed with DeleteObjectVersion policy",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .delete_object()
+                    .bucket(&bucket)
+                    .key("allowed")
+                    .version_id(&allowed_version_id)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_multipart_upload_acl_condition_applies() {
     s3_tests::run(async {
         let principal = alt_policy_principal();
@@ -13240,6 +13407,94 @@ fn test_bucket_policy_upload_part_and_complete_allow_same_account_non_initiator_
 }
 
 #[test]
+fn test_bucket_policy_boe_upload_part_and_complete_allow_same_account_non_initiator_with_put_object(
+) {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let second_client = CTX.require_second_client();
+        let same_account_principal = same_account_exact_principal().await;
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket_request(client, &bucket)
+            .object_ownership(ObjectOwnership::BucketOwnerEnforced)
+            .send()
+            .await
+            .unwrap();
+        let key = "boe-same-account-non-initiator-write";
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(multipart_put_object_policy_for_alt_and_same_account(
+                &bucket,
+                &same_account_principal,
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let upload = eventually_ok_with_retry(
+            "BOE CreateMultipartUpload with PutObject only",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .create_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .send()
+            },
+        )
+        .await;
+        let upload_id = upload.upload_id().unwrap().to_string();
+
+        let uploaded = eventually_ok_with_retry(
+            "BOE UploadPart by same-account non-initiator with PutObject only",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                second_client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .part_number(1)
+                    .body(ByteStream::from(vec![b'y'; 1024]))
+                    .send()
+            },
+        )
+        .await;
+        let etag = uploaded.e_tag().expect("expected upload part etag");
+
+        eventually_ok_with_retry(
+            "BOE CompleteMultipartUpload by same-account non-initiator with PutObject only",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                second_client
+                    .complete_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .multipart_upload(
+                        CompletedMultipartUpload::builder()
+                            .parts(CompletedPart::builder().part_number(1).e_tag(etag).build())
+                            .build(),
+                    )
+                    .send()
+            },
+        )
+        .await;
+
+        let object = get_object_eventually(client, &bucket, key).await;
+        let body = object.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.as_ref(), vec![b'y'; 1024].as_slice());
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_management_paths_deny_same_account_non_initiator_with_put_object() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -13307,6 +13562,103 @@ fn test_bucket_policy_management_paths_deny_same_account_non_initiator_with_put_
 
         eventually_access_denied(
             "AbortMultipartUpload by same-account non-initiator with PutObject only",
+            || {
+                second_client
+                    .abort_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .send()
+            },
+        )
+        .await;
+
+        alt_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_boe_management_paths_deny_same_account_non_initiator_with_put_object() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let second_client = CTX.require_second_client();
+        let same_account_principal = same_account_exact_principal().await;
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket_request(client, &bucket)
+            .object_ownership(ObjectOwnership::BucketOwnerEnforced)
+            .send()
+            .await
+            .unwrap();
+        let key = "boe-same-account-non-initiator-manage";
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(multipart_put_object_policy_for_alt_and_same_account(
+                &bucket,
+                &same_account_principal,
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let upload = eventually_ok_with_retry(
+            "BOE CreateMultipartUpload with PutObject only",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .create_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .send()
+            },
+        )
+        .await;
+        let upload_id = upload.upload_id().unwrap().to_string();
+
+        eventually_ok_with_retry(
+            "BOE UploadPart by initiator for management split setup",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .part_number(1)
+                    .body(ByteStream::from(vec![b'z'; 1024]))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "BOE ListParts by same-account non-initiator with PutObject only",
+            || {
+                second_client
+                    .list_parts()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "BOE AbortMultipartUpload by same-account non-initiator with PutObject only",
             || {
                 second_client
                     .abort_multipart_upload()
@@ -13423,6 +13775,61 @@ fn test_bucket_policy_completed_abort_denies_same_account_non_initiator_with_put
         assert_eq!(body.as_ref(), vec![b'q'; 1024].as_slice());
 
         cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_boe_abort_multipart_upload_initiator_only_requires_put_object() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket_request(client, &bucket)
+            .object_ownership(ObjectOwnership::BucketOwnerEnforced)
+            .send()
+            .await
+            .unwrap();
+        let key = "boe-cross-account-abort";
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal.clone(),
+                "Allow",
+                "s3:PutObject",
+                bucket_wildcard_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let upload = eventually_ok_with_retry(
+            "BOE CreateMultipartUpload allowed with PutObject only",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .create_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .send()
+            },
+        )
+        .await;
+        let upload_id = upload.upload_id().unwrap().to_string();
+
+        alt_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket, &[]).await;
     });
 }
 

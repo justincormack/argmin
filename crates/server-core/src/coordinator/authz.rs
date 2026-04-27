@@ -1483,6 +1483,51 @@ impl Coordinator {
         Ok(ModernObjectWriteAuthorization::Allowed)
     }
 
+    fn modern_delete_object_authorization_with_bucket_policy(
+        requester: &Requester,
+        bucket: &ModernBucketSummary,
+        bucket_tags: Option<&[(String, String)]>,
+        key: &str,
+        object: Option<&StoredObject>,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<bool, ServerError> {
+        let decision = match object {
+            Some(object) => Self::bucket_policy_decision_for_object_with_preloaded_tags_modern(
+                requester,
+                bucket,
+                bucket_tags,
+                object,
+                action,
+                policy,
+                ExistingObjectTagsMode::Available,
+            )?,
+            None => Self::bucket_policy_decision_for_put_object_action_modern(
+                requester,
+                bucket,
+                bucket_tags,
+                key,
+                action,
+                &PutObjectPolicyContext::default(),
+                policy,
+            )?,
+        };
+
+        Ok(match decision {
+            auth::PolicyEvaluation::ExplicitDeny => false,
+            auth::PolicyEvaluation::ExplicitAllow
+                if Self::modern_bucket_policy_allow_survives_restrict_public_buckets(
+                    requester, bucket,
+                ) =>
+            {
+                true
+            }
+            auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
+                Self::requester_can_modern_bucket_owner_account_admin(requester, bucket)
+            }
+        })
+    }
+
     fn bucket_policy_allows_with_fallback<F>(
         requester: &Requester,
         bucket: &BucketSummary,
@@ -4199,6 +4244,7 @@ impl Coordinator {
         let bucket_info = ValidatedBucket(bucket_handle.bucket().clone());
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket_handle)?;
         let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket_handle)?;
+        let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
         #[cfg(test)]
         if should_probe_delete_object_lookup(bucket.as_str()) {
             let object_pg_ready = self
@@ -4218,17 +4264,32 @@ impl Coordinator {
                 match self
                     .storage_node
                     .load_object_if(bucket, key, None, |stored| {
-                        if !self.requester_can_delete_object_with_bucket_policy(
-                            BucketPolicyAccess {
+                        let allowed = if Self::is_bucket_owner_enforced(
+                            bucket_info.ownership_controls.as_ref(),
+                        ) {
+                            Self::modern_delete_object_authorization_with_bucket_policy(
                                 requester,
-                                bucket: &bucket_info,
-                                bucket_tags: bucket_tags.as_deref(),
-                                policy: bucket_policy.as_deref(),
-                            },
-                            key_str,
-                            Some(stored),
-                            Self::delete_object_policy_action(None),
-                        )? {
+                                &modern_bucket_info,
+                                bucket_tags.as_deref(),
+                                key_str,
+                                Some(stored),
+                                Self::delete_object_policy_action(None),
+                                bucket_policy.as_deref(),
+                            )?
+                        } else {
+                            self.requester_can_delete_object_with_bucket_policy(
+                                BucketPolicyAccess {
+                                    requester,
+                                    bucket: &bucket_info,
+                                    bucket_tags: bucket_tags.as_deref(),
+                                    policy: bucket_policy.as_deref(),
+                                },
+                                key_str,
+                                Some(stored),
+                                Self::delete_object_policy_action(None),
+                            )?
+                        };
+                        if !allowed {
                             return Err(ServerError::AccessDenied);
                         }
                         Ok(())
@@ -4245,17 +4306,32 @@ impl Coordinator {
                     Err(storage::ObjectPgActionError::Metadata(
                         storage::MetadataError::ObjectNotFound,
                     )) => {
-                        if !self.requester_can_delete_object_with_bucket_policy(
-                            BucketPolicyAccess {
+                        let allowed = if Self::is_bucket_owner_enforced(
+                            bucket_info.ownership_controls.as_ref(),
+                        ) {
+                            Self::modern_delete_object_authorization_with_bucket_policy(
                                 requester,
-                                bucket: &bucket_info,
-                                bucket_tags: bucket_tags.as_deref(),
-                                policy: bucket_policy.as_deref(),
-                            },
-                            key_str,
-                            None,
-                            Self::delete_object_policy_action(None),
-                        )? {
+                                &modern_bucket_info,
+                                bucket_tags.as_deref(),
+                                key_str,
+                                None,
+                                Self::delete_object_policy_action(None),
+                                bucket_policy.as_deref(),
+                            )?
+                        } else {
+                            self.requester_can_delete_object_with_bucket_policy(
+                                BucketPolicyAccess {
+                                    requester,
+                                    bucket: &bucket_info,
+                                    bucket_tags: bucket_tags.as_deref(),
+                                    policy: bucket_policy.as_deref(),
+                                },
+                                key_str,
+                                None,
+                                Self::delete_object_policy_action(None),
+                            )?
+                        };
+                        if !allowed {
                             return Err(ServerError::AccessDenied);
                         }
                         Ok(AuthorizedDeleteObject::UnversionedDelete {
@@ -4274,17 +4350,32 @@ impl Coordinator {
                 match self
                     .storage_node
                     .load_object_if(bucket, key, Some(version_id), |stored| {
-                        if !self.requester_can_delete_object_with_bucket_policy(
-                            BucketPolicyAccess {
+                        let allowed = if Self::is_bucket_owner_enforced(
+                            bucket_info.ownership_controls.as_ref(),
+                        ) {
+                            Self::modern_delete_object_authorization_with_bucket_policy(
                                 requester,
-                                bucket: &bucket_info,
-                                bucket_tags: bucket_tags.as_deref(),
-                                policy: bucket_policy.as_deref(),
-                            },
-                            key_str,
-                            Some(stored),
-                            Self::delete_object_policy_action(Some(version_id)),
-                        )? {
+                                &modern_bucket_info,
+                                bucket_tags.as_deref(),
+                                key_str,
+                                Some(stored),
+                                Self::delete_object_policy_action(Some(version_id)),
+                                bucket_policy.as_deref(),
+                            )?
+                        } else {
+                            self.requester_can_delete_object_with_bucket_policy(
+                                BucketPolicyAccess {
+                                    requester,
+                                    bucket: &bucket_info,
+                                    bucket_tags: bucket_tags.as_deref(),
+                                    policy: bucket_policy.as_deref(),
+                                },
+                                key_str,
+                                Some(stored),
+                                Self::delete_object_policy_action(Some(version_id)),
+                            )?
+                        };
+                        if !allowed {
                             return Err(ServerError::AccessDenied);
                         }
 
@@ -4320,17 +4411,32 @@ impl Coordinator {
                     Err(storage::ObjectPgActionError::Metadata(
                         storage::MetadataError::ObjectNotFound,
                     )) => {
-                        if !self.requester_can_delete_object_with_bucket_policy(
-                            BucketPolicyAccess {
+                        let allowed = if Self::is_bucket_owner_enforced(
+                            bucket_info.ownership_controls.as_ref(),
+                        ) {
+                            Self::modern_delete_object_authorization_with_bucket_policy(
                                 requester,
-                                bucket: &bucket_info,
-                                bucket_tags: bucket_tags.as_deref(),
-                                policy: bucket_policy.as_deref(),
-                            },
-                            key_str,
-                            None,
-                            Self::delete_object_policy_action(Some(version_id)),
-                        )? {
+                                &modern_bucket_info,
+                                bucket_tags.as_deref(),
+                                key_str,
+                                None,
+                                Self::delete_object_policy_action(Some(version_id)),
+                                bucket_policy.as_deref(),
+                            )?
+                        } else {
+                            self.requester_can_delete_object_with_bucket_policy(
+                                BucketPolicyAccess {
+                                    requester,
+                                    bucket: &bucket_info,
+                                    bucket_tags: bucket_tags.as_deref(),
+                                    policy: bucket_policy.as_deref(),
+                                },
+                                key_str,
+                                None,
+                                Self::delete_object_policy_action(Some(version_id)),
+                            )?
+                        };
+                        if !allowed {
                             return Err(ServerError::AccessDenied);
                         }
                         if bucket_info.object_lock.enabled
@@ -4356,17 +4462,32 @@ impl Coordinator {
                 match self
                     .storage_node
                     .load_object_if(bucket, key, None, |stored| {
-                        if !self.requester_can_delete_object_with_bucket_policy(
-                            BucketPolicyAccess {
+                        let allowed = if Self::is_bucket_owner_enforced(
+                            bucket_info.ownership_controls.as_ref(),
+                        ) {
+                            Self::modern_delete_object_authorization_with_bucket_policy(
                                 requester,
-                                bucket: &bucket_info,
-                                bucket_tags: bucket_tags.as_deref(),
-                                policy: bucket_policy.as_deref(),
-                            },
-                            key_str,
-                            Some(stored),
-                            Self::delete_object_policy_action(None),
-                        )? {
+                                &modern_bucket_info,
+                                bucket_tags.as_deref(),
+                                key_str,
+                                Some(stored),
+                                Self::delete_object_policy_action(None),
+                                bucket_policy.as_deref(),
+                            )?
+                        } else {
+                            self.requester_can_delete_object_with_bucket_policy(
+                                BucketPolicyAccess {
+                                    requester,
+                                    bucket: &bucket_info,
+                                    bucket_tags: bucket_tags.as_deref(),
+                                    policy: bucket_policy.as_deref(),
+                                },
+                                key_str,
+                                Some(stored),
+                                Self::delete_object_policy_action(None),
+                            )?
+                        };
+                        if !allowed {
                             return Err(ServerError::AccessDenied);
                         }
                         Ok(())
@@ -4384,17 +4505,32 @@ impl Coordinator {
                     Err(storage::ObjectPgActionError::Metadata(
                         storage::MetadataError::ObjectNotFound,
                     )) => {
-                        if !self.requester_can_delete_object_with_bucket_policy(
-                            BucketPolicyAccess {
+                        let allowed = if Self::is_bucket_owner_enforced(
+                            bucket_info.ownership_controls.as_ref(),
+                        ) {
+                            Self::modern_delete_object_authorization_with_bucket_policy(
                                 requester,
-                                bucket: &bucket_info,
-                                bucket_tags: bucket_tags.as_deref(),
-                                policy: bucket_policy.as_deref(),
-                            },
-                            key_str,
-                            None,
-                            Self::delete_object_policy_action(None),
-                        )? {
+                                &modern_bucket_info,
+                                bucket_tags.as_deref(),
+                                key_str,
+                                None,
+                                Self::delete_object_policy_action(None),
+                                bucket_policy.as_deref(),
+                            )?
+                        } else {
+                            self.requester_can_delete_object_with_bucket_policy(
+                                BucketPolicyAccess {
+                                    requester,
+                                    bucket: &bucket_info,
+                                    bucket_tags: bucket_tags.as_deref(),
+                                    policy: bucket_policy.as_deref(),
+                                },
+                                key_str,
+                                None,
+                                Self::delete_object_policy_action(None),
+                            )?
+                        };
+                        if !allowed {
                             return Err(ServerError::AccessDenied);
                         }
                         Ok(AuthorizedDeleteObject::CurrentDeleteMarkerInsert {

@@ -6444,6 +6444,21 @@ mod phase7_model {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum DeleteOwnershipShape {
+        ObjectWriter,
+        BucketOwnerEnforced,
+    }
+
+    impl fmt::Display for DeleteOwnershipShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::ObjectWriter => f.write_str("object-writer"),
+                Self::BucketOwnerEnforced => f.write_str("bucket-owner-enforced"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum DeleteOutcome {
         Allow,
         Deny,
@@ -6462,6 +6477,7 @@ mod phase7_model {
     pub(super) struct DeleteScenario {
         pub(super) name: &'static str,
         pub(super) requester: Phase7RequesterShape,
+        pub(super) ownership: DeleteOwnershipShape,
         pub(super) target: DeleteTargetShape,
         pub(super) bucket_object_lock_enabled: bool,
         pub(super) object_lock: DeleteObjectLockShape,
@@ -6476,6 +6492,7 @@ mod phase7_model {
                 Self {
                     name: "current-missing-bypass-header-does-not-need-bypass-permission",
                     requester: Phase7RequesterShape::CrossAccount,
+                    ownership: DeleteOwnershipShape::ObjectWriter,
                     target: DeleteTargetShape::CurrentMissing,
                     bucket_object_lock_enabled: true,
                     object_lock: DeleteObjectLockShape::None,
@@ -6486,6 +6503,7 @@ mod phase7_model {
                 Self {
                     name: "current-existing-governance-delete-marker-insert-ignores-bypass-header",
                     requester: Phase7RequesterShape::BucketOwnerStandard,
+                    ownership: DeleteOwnershipShape::ObjectWriter,
                     target: DeleteTargetShape::CurrentExisting,
                     bucket_object_lock_enabled: true,
                     object_lock: DeleteObjectLockShape::Governance,
@@ -6496,6 +6514,7 @@ mod phase7_model {
                 Self {
                     name: "same-account-standard-cannot-version-delete-with-governance-bypass",
                     requester: Phase7RequesterShape::SameAccountStandard,
+                    ownership: DeleteOwnershipShape::ObjectWriter,
                     target: DeleteTargetShape::SpecificVersionExisting,
                     bucket_object_lock_enabled: true,
                     object_lock: DeleteObjectLockShape::Governance,
@@ -6506,6 +6525,7 @@ mod phase7_model {
                 Self {
                     name: "same-account-admin-can-version-delete-with-governance-bypass",
                     requester: Phase7RequesterShape::SameAccountAdmin,
+                    ownership: DeleteOwnershipShape::ObjectWriter,
                     target: DeleteTargetShape::SpecificVersionExisting,
                     bucket_object_lock_enabled: true,
                     object_lock: DeleteObjectLockShape::Governance,
@@ -6516,6 +6536,7 @@ mod phase7_model {
                 Self {
                     name: "same-account-admin-bypass-blocked-by-explicit-deny",
                     requester: Phase7RequesterShape::SameAccountAdmin,
+                    ownership: DeleteOwnershipShape::ObjectWriter,
                     target: DeleteTargetShape::SpecificVersionExisting,
                     bucket_object_lock_enabled: true,
                     object_lock: DeleteObjectLockShape::Governance,
@@ -6526,6 +6547,7 @@ mod phase7_model {
                 Self {
                     name: "cross-account-version-delete-with-governance-needs-bypass-allow",
                     requester: Phase7RequesterShape::CrossAccount,
+                    ownership: DeleteOwnershipShape::ObjectWriter,
                     target: DeleteTargetShape::SpecificVersionExisting,
                     bucket_object_lock_enabled: true,
                     object_lock: DeleteObjectLockShape::Governance,
@@ -6536,6 +6558,7 @@ mod phase7_model {
                 Self {
                     name: "cross-account-version-delete-with-governance-allowed-with-bypass-policy",
                     requester: Phase7RequesterShape::CrossAccount,
+                    ownership: DeleteOwnershipShape::ObjectWriter,
                     target: DeleteTargetShape::SpecificVersionExisting,
                     bucket_object_lock_enabled: true,
                     object_lock: DeleteObjectLockShape::Governance,
@@ -6546,6 +6569,7 @@ mod phase7_model {
                 Self {
                     name: "missing-version-delete-without-bypass-uses-delete-version-action",
                     requester: Phase7RequesterShape::CrossAccount,
+                    ownership: DeleteOwnershipShape::ObjectWriter,
                     target: DeleteTargetShape::SpecificVersionMissing,
                     bucket_object_lock_enabled: true,
                     object_lock: DeleteObjectLockShape::None,
@@ -6556,6 +6580,7 @@ mod phase7_model {
                 Self {
                     name: "missing-version-delete-with-bypass-needs-bypass-permission",
                     requester: Phase7RequesterShape::CrossAccount,
+                    ownership: DeleteOwnershipShape::ObjectWriter,
                     target: DeleteTargetShape::SpecificVersionMissing,
                     bucket_object_lock_enabled: true,
                     object_lock: DeleteObjectLockShape::None,
@@ -6566,6 +6591,7 @@ mod phase7_model {
                 Self {
                     name: "missing-version-delete-with-bypass-allowed-with-bypass-policy",
                     requester: Phase7RequesterShape::CrossAccount,
+                    ownership: DeleteOwnershipShape::ObjectWriter,
                     target: DeleteTargetShape::SpecificVersionMissing,
                     bucket_object_lock_enabled: true,
                     object_lock: DeleteObjectLockShape::None,
@@ -6576,6 +6602,7 @@ mod phase7_model {
                 Self {
                     name: "missing-version-bypass-on-plain-bucket-does-not-need-bypass-permission",
                     requester: Phase7RequesterShape::CrossAccount,
+                    ownership: DeleteOwnershipShape::ObjectWriter,
                     target: DeleteTargetShape::SpecificVersionMissing,
                     bucket_object_lock_enabled: false,
                     object_lock: DeleteObjectLockShape::None,
@@ -6586,6 +6613,7 @@ mod phase7_model {
                 Self {
                     name: "compliance-retention-denies-delete-even-for-admin-bypass",
                     requester: Phase7RequesterShape::SameAccountAdmin,
+                    ownership: DeleteOwnershipShape::ObjectWriter,
                     target: DeleteTargetShape::SpecificVersionExisting,
                     bucket_object_lock_enabled: true,
                     object_lock: DeleteObjectLockShape::Compliance,
@@ -6596,12 +6624,68 @@ mod phase7_model {
                 Self {
                     name: "legal-hold-denies-delete-even-for-admin-bypass",
                     requester: Phase7RequesterShape::SameAccountAdmin,
+                    ownership: DeleteOwnershipShape::ObjectWriter,
                     target: DeleteTargetShape::SpecificVersionExisting,
                     bucket_object_lock_enabled: true,
                     object_lock: DeleteObjectLockShape::LegalHold,
                     bypass_governance: true,
                     policy: DeletePolicyShape::None,
                     expected: DeleteOutcome::Deny,
+                },
+                Self {
+                    name: "boe-owner-exact-retains-delete-fallback-without-policy",
+                    requester: Phase7RequesterShape::BucketOwnerStandard,
+                    ownership: DeleteOwnershipShape::BucketOwnerEnforced,
+                    target: DeleteTargetShape::CurrentExisting,
+                    bucket_object_lock_enabled: false,
+                    object_lock: DeleteObjectLockShape::None,
+                    bypass_governance: false,
+                    policy: DeletePolicyShape::None,
+                    expected: DeleteOutcome::Allow,
+                },
+                Self {
+                    name: "boe-same-account-admin-retains-delete-fallback-without-policy",
+                    requester: Phase7RequesterShape::SameAccountAdmin,
+                    ownership: DeleteOwnershipShape::BucketOwnerEnforced,
+                    target: DeleteTargetShape::CurrentExisting,
+                    bucket_object_lock_enabled: false,
+                    object_lock: DeleteObjectLockShape::None,
+                    bypass_governance: false,
+                    policy: DeletePolicyShape::None,
+                    expected: DeleteOutcome::Allow,
+                },
+                Self {
+                    name: "boe-same-account-standard-does-not-get-delete-fallback",
+                    requester: Phase7RequesterShape::SameAccountStandard,
+                    ownership: DeleteOwnershipShape::BucketOwnerEnforced,
+                    target: DeleteTargetShape::CurrentExisting,
+                    bucket_object_lock_enabled: false,
+                    object_lock: DeleteObjectLockShape::None,
+                    bypass_governance: false,
+                    policy: DeletePolicyShape::None,
+                    expected: DeleteOutcome::Deny,
+                },
+                Self {
+                    name: "boe-cross-account-current-delete-needs-delete-object-policy",
+                    requester: Phase7RequesterShape::CrossAccount,
+                    ownership: DeleteOwnershipShape::BucketOwnerEnforced,
+                    target: DeleteTargetShape::CurrentExisting,
+                    bucket_object_lock_enabled: false,
+                    object_lock: DeleteObjectLockShape::None,
+                    bypass_governance: false,
+                    policy: DeletePolicyShape::AllowDeleteObject,
+                    expected: DeleteOutcome::Allow,
+                },
+                Self {
+                    name: "boe-cross-account-version-delete-needs-delete-version-policy",
+                    requester: Phase7RequesterShape::CrossAccount,
+                    ownership: DeleteOwnershipShape::BucketOwnerEnforced,
+                    target: DeleteTargetShape::SpecificVersionExisting,
+                    bucket_object_lock_enabled: false,
+                    object_lock: DeleteObjectLockShape::None,
+                    bypass_governance: false,
+                    policy: DeletePolicyShape::AllowDeleteVersion,
+                    expected: DeleteOutcome::Allow,
                 },
             ]
         }
@@ -6611,8 +6695,13 @@ mod phase7_model {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(
                 f,
-                "Delete target={} requester={} lock={} bypass={} policy={}",
-                self.target, self.requester, self.object_lock, self.bypass_governance, self.policy
+                "Delete ownership={} target={} requester={} lock={} bypass={} policy={}",
+                self.ownership,
+                self.target,
+                self.requester,
+                self.object_lock,
+                self.bypass_governance,
+                self.policy
             )
         }
     }
@@ -6621,9 +6710,9 @@ mod phase7_model {
 mod phase7_harness {
     use super::harness::{setup_coordinator, IdentityFixtures};
     use super::phase7_model::{
-        DeleteObjectLockShape, DeleteOutcome, DeletePolicyShape, DeleteScenario, DeleteTargetShape,
-        ObjectLockActionShape, ObjectLockOutcome, ObjectLockPolicyShape, ObjectLockRecordShape,
-        ObjectLockScenario, Phase7RequesterShape,
+        DeleteObjectLockShape, DeleteOutcome, DeleteOwnershipShape, DeletePolicyShape,
+        DeleteScenario, DeleteTargetShape, ObjectLockActionShape, ObjectLockOutcome,
+        ObjectLockPolicyShape, ObjectLockRecordShape, ObjectLockScenario, Phase7RequesterShape,
     };
     use super::*;
 
@@ -6780,7 +6869,19 @@ mod phase7_harness {
         bucket: &str,
         scenario: DeleteScenario,
     ) -> Result<Option<VersionId>, ServerError> {
-        create_phase7_bucket(coord, fixtures, bucket, scenario.bucket_object_lock_enabled)?;
+        coord.create_bucket(&CreateBucketRequest {
+            name: trusted_bucket_name(bucket),
+            requester: Requester::authenticated(fixtures.owner_user.clone()),
+            namespace: BucketNamespace::Global,
+            acl: CreateBucketAcl::DefaultPrivate,
+            ownership: match scenario.ownership {
+                DeleteOwnershipShape::ObjectWriter => BucketObjectOwnership::ObjectWriter,
+                DeleteOwnershipShape::BucketOwnerEnforced => {
+                    BucketObjectOwnership::BucketOwnerEnforced
+                }
+            },
+            object_lock_enabled: scenario.bucket_object_lock_enabled,
+        })?;
         if matches!(
             scenario.target,
             DeleteTargetShape::SpecificVersionExisting | DeleteTargetShape::SpecificVersionMissing
@@ -9967,6 +10068,31 @@ fn authz_model_phase7_delete_matrix() {
         assert_eq!(
             actual, scenario.expected,
             "phase 7 delete mismatch\nscenario: {scenario}\nexpected: {}\nactual: {actual}",
+            scenario.expected
+        );
+    }
+}
+
+#[test]
+fn authz_model_modern_boe_delete_matrix() {
+    let scenarios: Vec<_> = DeleteScenario::scenarios()
+        .into_iter()
+        .filter(|scenario| {
+            scenario.ownership == phase7_model::DeleteOwnershipShape::BucketOwnerEnforced
+        })
+        .collect();
+    assert!(
+        !scenarios.is_empty(),
+        "modern BOE delete matrix unexpectedly produced no scenarios"
+    );
+    let harness = Phase7Harness::new();
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        let bucket = format!("{}-boe", phase7_delete_bucket_name_for(index));
+        let actual = harness.run_delete(&bucket, scenario);
+        assert_eq!(
+            actual, scenario.expected,
+            "modern BOE delete mismatch\nscenario: {scenario}\nexpected: {}\nactual: {actual}",
             scenario.expected
         );
     }

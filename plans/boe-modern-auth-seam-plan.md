@@ -1,6 +1,6 @@
 # BOE Modern Auth Seam Plan
 
-Status: planned
+Status: in progress
 
 ## Goal
 
@@ -106,6 +106,13 @@ Initial target families:
 - `AbortMultipartUpload`
 - `DeleteObject`
 
+Current implementation note:
+
+- `AbortMultipartUpload` stays on the shared multipart management path rather
+  than a separate BOE-specific evaluator. The current semantics are already
+  ownership/initiator based and do not rely on ACL fallback, so BOE does not
+  introduce a distinct authorization branch there.
+
 Acceptance criteria:
 
 - the plan names which operations are intended to use the seam
@@ -142,6 +149,8 @@ Acceptance criteria:
 - BOE modern-auth tests are clearly distinguishable from legacy ACL matrices
 - read fast-path correctness is checked against the explicit BOE evaluator
 - non-read BOE expectations no longer depend on read-fast-path-specific wiring
+- multipart management behavior that remains shared is explicitly justified and
+  externally pinned with AWS-backed tests
 
 ## Verification
 
