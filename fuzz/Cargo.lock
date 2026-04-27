@@ -542,6 +542,7 @@ name = "s3-types"
 version = "0.1.0"
 dependencies = [
  "ring",
+ "thiserror",
 ]
 
 [[package]]
@@ -654,6 +655,7 @@ name = "storage"
 version = "0.1.0"
 dependencies = [
  "checksum",
+ "ec",
  "observability",
  "rapidhash",
  "rusqlite",

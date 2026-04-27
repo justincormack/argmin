@@ -1,7 +1,8 @@
 #![no_main]
 
 use auth::bucket_policy::{
-    parse_bucket_policy, BucketPolicy, PolicyAction, PolicyEvaluation, PolicyRequest, PolicyTag,
+    parse_bucket_policy, BucketPolicy, BucketTags, ExistingObjectTags, PolicyAction,
+    PolicyEvaluation, PolicyRequest, PolicyTag,
 };
 use libfuzzer_sys::fuzz_target;
 use serde_json::{Map, Value};
@@ -87,17 +88,18 @@ impl RequestCase {
                 &self.bucket,
                 self.principal.as_deref(),
                 None,
+                BucketTags::Unavailable,
             )
         } else {
-            PolicyRequest::new(
+            PolicyRequest::for_object(
                 self.action,
                 &self.bucket,
                 &self.key,
                 self.principal.as_deref(),
                 None,
+                ExistingObjectTags::Available(&existing_tags),
             )
         }
-        .with_existing_object_tags(&existing_tags)
         .with_request_object_tags(&request_tags)
         .with_copy_source(self.copy_source.as_deref())
         .with_metadata_directive(self.metadata_directive.as_deref())
