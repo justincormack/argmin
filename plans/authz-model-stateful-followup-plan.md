@@ -103,8 +103,9 @@ Acceptance criteria:
   bucket-tag-conditioned policy, `RestrictPublicBuckets`, and BOE fallback
 - BOE `GetObject` vs `GetObjectAttributes` remains encoded as distinct expected
   behavior, not collapsed into one generic read rule
-- Implemented initial generated family for that read/discovery subset; write /
-  delete / versioning traces remain pending
+- Implemented initial generated family for BOE modern reads, `PutObject`,
+  `CreateMultipartUpload`, and `DeleteObject`; versioning and object-lock
+  traces remain pending
 
 ## Phase 3: Delete/Object-lock and Versioning Traces
 

@@ -16,13 +16,19 @@
 //!
 //! Set `ARGMIN_KEEP_TEST_DIRS=1` to preserve directories for debugging.
 
+use std::fs::{File, OpenOptions};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 
 /// Base directory under the system temp dir for all test data.
 const BASE_DIR_NAME: &str = "argmin-tests";
+const INIT_LOCK_FILE_NAME: &str = ".init.lock";
+const SESSION_LOCK_FILE_NAME: &str = ".session.lock";
 
 static INIT: Once = Once::new();
+static SESSION_LOCK: OnceLock<File> = OnceLock::new();
 
 /// Return the base directory (`$TMPDIR/argmin-tests/`).
 fn base_dir() -> PathBuf {
@@ -65,6 +71,15 @@ fn cleanup_stale_sessions() {
             continue;
         }
 
+        let lock_path = entry.path().join(SESSION_LOCK_FILE_NAME);
+        if lock_path.exists() {
+            if session_lock_is_held(&lock_path) {
+                continue;
+            }
+            let _ = std::fs::remove_dir_all(entry.path());
+            continue;
+        }
+
         // Check if the process is still alive.
         if process_alive(pid) {
             continue;
@@ -73,6 +88,52 @@ fn cleanup_stale_sessions() {
         // Dead process — clean up its session directory.
         let _ = std::fs::remove_dir_all(entry.path());
     }
+}
+
+fn open_lock_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn flock_exclusive(file: &File, nonblocking: bool) -> std::io::Result<()> {
+    let mut operation = libc::LOCK_EX;
+    if nonblocking {
+        operation |= libc::LOCK_NB;
+    }
+    // SAFETY: `flock` operates on a valid open file descriptor owned by `file`.
+    let ret = unsafe { libc::flock(file.as_raw_fd(), operation) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn flock_exclusive(_file: &File, _nonblocking: bool) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn session_lock_is_held(path: &Path) -> bool {
+    let Ok(file) = open_lock_file(path) else {
+        return false;
+    };
+    match flock_exclusive(&file, true) {
+        Ok(()) => false,
+        Err(err) if err.raw_os_error() == Some(libc::EWOULDBLOCK) => true,
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(unix))]
+fn session_lock_is_held(_path: &Path) -> bool {
+    true
 }
 
 /// Check if a process with the given PID is still running.
@@ -100,8 +161,20 @@ fn process_alive(_pid: u32) -> bool {
 ///
 /// Called once per process via `Once`.
 fn init() {
+    let base = base_dir();
+    let _ = std::fs::create_dir_all(&base);
+    let init_lock = open_lock_file(&base.join(INIT_LOCK_FILE_NAME))
+        .expect("failed to open test init lock file");
+    flock_exclusive(&init_lock, false).expect("failed to lock test init lock file");
+
     let session = session_dir();
-    let _ = std::fs::create_dir_all(&session);
+    std::fs::create_dir_all(&session).expect("failed to create test session directory");
+    let session_lock = open_lock_file(&session.join(SESSION_LOCK_FILE_NAME))
+        .expect("failed to open test session lock file");
+    flock_exclusive(&session_lock, false).expect("failed to lock test session lock file");
+    SESSION_LOCK
+        .set(session_lock)
+        .expect("test session lock already initialized");
     cleanup_stale_sessions();
 }
 

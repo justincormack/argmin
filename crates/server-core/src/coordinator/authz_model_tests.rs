@@ -7299,7 +7299,7 @@ mod phase7_harness {
                         system_metadata: &SystemMetadata::EMPTY,
                         tags: None,
                         cond: NO_WRITE,
-                        acl: NO_PHASE7_PUT_OBJECT_ACL.into(),
+                        acl: NO_PUT_OBJECT_ACL.into(),
                     },
                 )?;
                 Some(put.version_id)
@@ -9988,6 +9988,14 @@ mod phase12_model {
         AllowBothPublic,
         DenyBothPrivate,
         AllowBothPrivateTagPublic,
+        AllowWritePrivate,
+        AllowWritePublic,
+        DenyWritePrivate,
+        AllowWritePrivateTagPublic,
+        AllowDeletePrivate,
+        AllowDeletePublic,
+        DenyDeletePrivate,
+        AllowDeletePrivateTagPublic,
     }
 
     impl fmt::Display for BoeTracePolicyState {
@@ -10000,6 +10008,18 @@ mod phase12_model {
                 Self::DenyBothPrivate => f.write_str("deny-both-private"),
                 Self::AllowBothPrivateTagPublic => {
                     f.write_str("allow-both-private-bucket-tag-public")
+                }
+                Self::AllowWritePrivate => f.write_str("allow-write-private"),
+                Self::AllowWritePublic => f.write_str("allow-write-public"),
+                Self::DenyWritePrivate => f.write_str("deny-write-private"),
+                Self::AllowWritePrivateTagPublic => {
+                    f.write_str("allow-write-private-bucket-tag-public")
+                }
+                Self::AllowDeletePrivate => f.write_str("allow-delete-private"),
+                Self::AllowDeletePublic => f.write_str("allow-delete-public"),
+                Self::DenyDeletePrivate => f.write_str("deny-delete-private"),
+                Self::AllowDeletePrivateTagPublic => {
+                    f.write_str("allow-delete-private-bucket-tag-public")
                 }
             }
         }
@@ -10024,6 +10044,9 @@ mod phase12_model {
     pub(super) enum BoeTraceProbe {
         GetObject,
         GetObjectAttributes,
+        PutObject,
+        CreateMultipartUpload,
+        DeleteObject,
     }
 
     impl fmt::Display for BoeTraceProbe {
@@ -10031,6 +10054,9 @@ mod phase12_model {
             match self {
                 Self::GetObject => f.write_str("get-object"),
                 Self::GetObjectAttributes => f.write_str("get-object-attributes"),
+                Self::PutObject => f.write_str("put-object"),
+                Self::CreateMultipartUpload => f.write_str("create-multipart-upload"),
+                Self::DeleteObject => f.write_str("delete-object"),
             }
         }
     }
@@ -10114,6 +10140,12 @@ mod phase12_model {
                         model::Outcome::Deny
                     }
                 }
+                BoeTraceProbe::PutObject | BoeTraceProbe::CreateMultipartUpload => {
+                    self.resolve_single_action(self.decision_for_write())
+                }
+                BoeTraceProbe::DeleteObject => {
+                    self.resolve_single_action(self.decision_for_delete())
+                }
             }
         }
 
@@ -10148,6 +10180,14 @@ mod phase12_model {
                         BoeTraceDecision::NoMatch
                     }
                 }
+                BoeTracePolicyState::AllowWritePrivate
+                | BoeTracePolicyState::AllowWritePublic
+                | BoeTracePolicyState::DenyWritePrivate
+                | BoeTracePolicyState::AllowWritePrivateTagPublic
+                | BoeTracePolicyState::AllowDeletePrivate
+                | BoeTracePolicyState::AllowDeletePublic
+                | BoeTracePolicyState::DenyDeletePrivate
+                | BoeTracePolicyState::AllowDeletePrivateTagPublic => BoeTraceDecision::NoMatch,
             }
         }
 
@@ -10159,9 +10199,52 @@ mod phase12_model {
                 BoeTracePolicyState::AllowBothPrivateTagPublic => {
                     BoeTraceDecision::ExplicitAllowPrivate
                 }
-                BoeTracePolicyState::None | BoeTracePolicyState::AllowObjectOnlyPrivate => {
-                    BoeTraceDecision::NoMatch
+                BoeTracePolicyState::None
+                | BoeTracePolicyState::AllowObjectOnlyPrivate
+                | BoeTracePolicyState::AllowWritePrivate
+                | BoeTracePolicyState::AllowWritePublic
+                | BoeTracePolicyState::DenyWritePrivate
+                | BoeTracePolicyState::AllowWritePrivateTagPublic
+                | BoeTracePolicyState::AllowDeletePrivate
+                | BoeTracePolicyState::AllowDeletePublic
+                | BoeTracePolicyState::DenyDeletePrivate
+                | BoeTracePolicyState::AllowDeletePrivateTagPublic => BoeTraceDecision::NoMatch,
+            }
+        }
+
+        fn decision_for_write(self) -> BoeTraceDecision {
+            match self.policy {
+                BoeTracePolicyState::AllowWritePrivate => BoeTraceDecision::ExplicitAllowPrivate,
+                BoeTracePolicyState::AllowWritePublic => BoeTraceDecision::ExplicitAllowPublic,
+                BoeTracePolicyState::DenyWritePrivate => BoeTraceDecision::ExplicitDeny,
+                BoeTracePolicyState::AllowWritePrivateTagPublic => {
+                    if self.bucket_abac_enabled
+                        && self.bucket_tags == BoeTraceBucketTagState::Public
+                    {
+                        BoeTraceDecision::ExplicitAllowPrivate
+                    } else {
+                        BoeTraceDecision::NoMatch
+                    }
                 }
+                _ => BoeTraceDecision::NoMatch,
+            }
+        }
+
+        fn decision_for_delete(self) -> BoeTraceDecision {
+            match self.policy {
+                BoeTracePolicyState::AllowDeletePrivate => BoeTraceDecision::ExplicitAllowPrivate,
+                BoeTracePolicyState::AllowDeletePublic => BoeTraceDecision::ExplicitAllowPublic,
+                BoeTracePolicyState::DenyDeletePrivate => BoeTraceDecision::ExplicitDeny,
+                BoeTracePolicyState::AllowDeletePrivateTagPublic => {
+                    if self.bucket_abac_enabled
+                        && self.bucket_tags == BoeTraceBucketTagState::Public
+                    {
+                        BoeTraceDecision::ExplicitAllowPrivate
+                    } else {
+                        BoeTraceDecision::NoMatch
+                    }
+                }
+                _ => BoeTraceDecision::NoMatch,
             }
         }
     }
@@ -10417,6 +10500,59 @@ mod phase12_harness {
                         sse_customer: None,
                     })
                     .map(|_| ()),
+                BoeTraceProbe::PutObject => self
+                    .coord
+                    .put_object(&PutObjectRequest {
+                        encryption: WriteEncryptionRequest::none(),
+                        policy_context: PutObjectPolicyContext::default(),
+                        object_lock: ObjectLockState::default(),
+                        object: ObjectRequest::new(
+                            trusted_bucket_name(bucket),
+                            trusted_object_key(PHASE12_KEY),
+                            requester,
+                            None,
+                        ),
+                        data: b"phase12-overwrite",
+                        metadata: &MetadataBlob::new(),
+                        system_metadata: &SystemMetadata::EMPTY,
+                        tags: None,
+                        cond: NO_WRITE,
+                        acl: NO_PUT_OBJECT_ACL.into(),
+                    })
+                    .map(|_| ()),
+                BoeTraceProbe::CreateMultipartUpload => self
+                    .coord
+                    .create_multipart_upload(&CreateMultipartUploadRequest {
+                        object: ObjectRequest::new(
+                            trusted_bucket_name(bucket),
+                            trusted_object_key(PHASE12_KEY),
+                            requester,
+                            None,
+                        ),
+                        metadata: &MetadataBlob::new(),
+                        system_metadata: &SystemMetadata::EMPTY,
+                        tags: None,
+                        checksum: None,
+                        acl: NO_PUT_OBJECT_ACL.into(),
+                        policy_context: PutObjectPolicyContext::default(),
+                        object_lock: ObjectLockState::default(),
+                        encryption: WriteEncryptionRequest::none(),
+                    })
+                    .map(|_| ()),
+                BoeTraceProbe::DeleteObject => self
+                    .coord
+                    .delete_object(&DeleteObjectRequest {
+                        object: ObjectVersionRequest::new(
+                            trusted_bucket_name(bucket),
+                            trusted_object_key(PHASE12_KEY),
+                            None,
+                            requester,
+                            None,
+                        ),
+                        bypass_governance: false,
+                        cond: NO_DELETE,
+                    })
+                    .map(|_| ()),
             };
             classify_phase12(result)
         }
@@ -10454,6 +10590,36 @@ mod phase12_harness {
             BoeTracePolicyState::AllowBothPrivateTagPublic => format!(
                 r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::{bucket}/{PHASE12_KEY}","Condition":{{"StringEquals":{{"s3:BucketTag/security":"public"}}}}}},{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:GetObjectAttributes","Resource":"arn:aws:s3:::{bucket}/{PHASE12_KEY}"}}]}}"#,
                 fixtures.cross_account.principal(),
+                fixtures.cross_account.principal()
+            ),
+            BoeTracePolicyState::AllowWritePrivate => format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::{bucket}/{PHASE12_KEY}"}}]}}"#,
+                fixtures.cross_account.principal()
+            ),
+            BoeTracePolicyState::AllowWritePublic => format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::{bucket}/{PHASE12_KEY}"}}]}}"#
+            ),
+            BoeTracePolicyState::DenyWritePrivate => format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny","Principal":{{"AWS":"{}"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::{bucket}/{PHASE12_KEY}"}}]}}"#,
+                fixtures.cross_account.principal()
+            ),
+            BoeTracePolicyState::AllowWritePrivateTagPublic => format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::{bucket}/{PHASE12_KEY}","Condition":{{"StringEquals":{{"s3:BucketTag/security":"public"}}}}}}]}}"#,
+                fixtures.cross_account.principal()
+            ),
+            BoeTracePolicyState::AllowDeletePrivate => format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:DeleteObject","Resource":"arn:aws:s3:::{bucket}/{PHASE12_KEY}"}}]}}"#,
+                fixtures.cross_account.principal()
+            ),
+            BoeTracePolicyState::AllowDeletePublic => format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":"*","Action":"s3:DeleteObject","Resource":"arn:aws:s3:::{bucket}/{PHASE12_KEY}"}}]}}"#
+            ),
+            BoeTracePolicyState::DenyDeletePrivate => format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny","Principal":{{"AWS":"{}"}},"Action":"s3:DeleteObject","Resource":"arn:aws:s3:::{bucket}/{PHASE12_KEY}"}}]}}"#,
+                fixtures.cross_account.principal()
+            ),
+            BoeTracePolicyState::AllowDeletePrivateTagPublic => format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:DeleteObject","Resource":"arn:aws:s3:::{bucket}/{PHASE12_KEY}","Condition":{{"StringEquals":{{"s3:BucketTag/security":"public"}}}}}}]}}"#,
                 fixtures.cross_account.principal()
             ),
         }
@@ -12188,6 +12354,14 @@ fn boe_trace_policy_strategy() -> impl Strategy<Value = BoeTracePolicyState> {
         Just(BoeTracePolicyState::AllowBothPublic),
         Just(BoeTracePolicyState::DenyBothPrivate),
         Just(BoeTracePolicyState::AllowBothPrivateTagPublic),
+        Just(BoeTracePolicyState::AllowWritePrivate),
+        Just(BoeTracePolicyState::AllowWritePublic),
+        Just(BoeTracePolicyState::DenyWritePrivate),
+        Just(BoeTracePolicyState::AllowWritePrivateTagPublic),
+        Just(BoeTracePolicyState::AllowDeletePrivate),
+        Just(BoeTracePolicyState::AllowDeletePublic),
+        Just(BoeTracePolicyState::DenyDeletePrivate),
+        Just(BoeTracePolicyState::AllowDeletePrivateTagPublic),
     ]
 }
 
@@ -12202,6 +12376,9 @@ fn boe_trace_probe_strategy() -> impl Strategy<Value = BoeTraceProbe> {
     prop_oneof![
         Just(BoeTraceProbe::GetObject),
         Just(BoeTraceProbe::GetObjectAttributes),
+        Just(BoeTraceProbe::PutObject),
+        Just(BoeTraceProbe::CreateMultipartUpload),
+        Just(BoeTraceProbe::DeleteObject),
     ]
 }
 
@@ -12214,8 +12391,7 @@ fn boe_trace_mutation_strategy() -> impl Strategy<Value = BoeTraceMutation> {
     ]
 }
 
-fn boe_modern_read_trace_strategy() -> impl Strategy<Value = (Vec<BoeTraceMutation>, BoeTraceProbe)>
-{
+fn boe_modern_trace_strategy() -> impl Strategy<Value = (Vec<BoeTraceMutation>, BoeTraceProbe)> {
     (
         prop::collection::vec(boe_trace_mutation_strategy(), 0..=6),
         boe_trace_probe_strategy(),
@@ -12226,8 +12402,8 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(32))]
 
     #[test]
-    fn prop_boe_modern_read_trace_matches_model(
-        (mutations, probe) in boe_modern_read_trace_strategy()
+    fn prop_boe_modern_trace_matches_model(
+        (mutations, probe) in boe_modern_trace_strategy()
     ) {
         let trace = mutations
             .iter()
@@ -12249,7 +12425,7 @@ proptest! {
         prop_assert_eq!(
             actual,
             expected,
-            "phase 12 BOE modern read trace mismatch\nprobe: {}\ntrace:\n{}",
+            "phase 12 BOE modern trace mismatch\nprobe: {}\ntrace:\n{}",
             probe,
             trace
         );
