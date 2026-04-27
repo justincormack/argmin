@@ -1,10 +1,31 @@
 use super::*;
+use std::ops::Deref;
+
+#[derive(Clone, Copy)]
+pub(in crate::coordinator) struct BoeBucketSummary<'a>(&'a ModernBucketSummary);
+
+impl<'a> BoeBucketSummary<'a> {
+    pub(in crate::coordinator) fn new(bucket: &'a ModernBucketSummary) -> Option<Self> {
+        if Coordinator::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
+            Some(Self(bucket))
+        } else {
+            None
+        }
+    }
+}
+
+impl Deref for BoeBucketSummary<'_> {
+    type Target = ModernBucketSummary;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::coordinator) enum ModernObjectReadAuthorization {
     Allowed,
     Denied,
-    NeedAclFallback,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +65,7 @@ impl ModernReadAction {
         }
     }
 
-    fn policy_action(self) -> auth::PolicyAction {
+    pub(in crate::coordinator) fn policy_action(self) -> auth::PolicyAction {
         match self {
             Self::ReadCurrent => auth::PolicyAction::GetObject,
             Self::ReadVersion => auth::PolicyAction::GetObjectVersion,
@@ -56,7 +77,7 @@ impl ModernReadAction {
 
 fn requester_is_modern_bucket_owner_account(
     requester: &Requester,
-    bucket: &ModernBucketSummary,
+    bucket: BoeBucketSummary<'_>,
 ) -> bool {
     let Some(account) = requester.account() else {
         return false;
@@ -73,7 +94,7 @@ fn requester_is_modern_bucket_owner_account(
 
 fn requester_can_modern_bucket_owner_account_admin(
     requester: &Requester,
-    bucket: &ModernBucketSummary,
+    bucket: BoeBucketSummary<'_>,
 ) -> bool {
     Coordinator::requester_can_bucket_admin(requester, &bucket.owner_principal)
         || (requester.authorization_profile() == auth::AuthorizationProfile::OwnerAccountAdmin
@@ -82,7 +103,7 @@ fn requester_can_modern_bucket_owner_account_admin(
 
 fn modern_bucket_policy_allow_survives_restrict_public_buckets(
     requester: &Requester,
-    bucket: &ModernBucketSummary,
+    bucket: BoeBucketSummary<'_>,
 ) -> bool {
     if !bucket.bucket_policy_public
         || !Coordinator::restricts_public_buckets(bucket.public_access_block.as_ref())
@@ -95,7 +116,7 @@ fn modern_bucket_policy_allow_survives_restrict_public_buckets(
 
 fn bucket_policy_decision_for_put_object_action_modern(
     requester: &Requester,
-    bucket: &ModernBucketSummary,
+    bucket: BoeBucketSummary<'_>,
     bucket_tags: Option<&[(String, String)]>,
     key: &str,
     action: auth::PolicyAction,
@@ -158,7 +179,7 @@ fn bucket_policy_decision_for_put_object_action_modern(
 
 pub(super) fn write_multipart_upload_with_bucket_policy(
     requester: &Requester,
-    bucket: &ModernBucketSummary,
+    bucket: BoeBucketSummary<'_>,
     bucket_tags: Option<&[(String, String)]>,
     upload: &MultipartUploadRecord,
     policy_context: &PutObjectPolicyContext<'_>,
@@ -193,7 +214,7 @@ pub(super) fn write_multipart_upload_with_bucket_policy(
 
 pub(super) fn put_object_authorization_with_bucket_policy(
     requester: &Requester,
-    bucket: &ModernBucketSummary,
+    bucket: BoeBucketSummary<'_>,
     bucket_tags: Option<&[(String, String)]>,
     key: &str,
     action: ModernWriteAction,
@@ -260,7 +281,7 @@ pub(super) fn put_object_authorization_with_bucket_policy(
 
 pub(super) fn delete_object_authorization_with_bucket_policy(
     requester: &Requester,
-    bucket: &ModernBucketSummary,
+    bucket: BoeBucketSummary<'_>,
     bucket_tags: Option<&[(String, String)]>,
     key: &str,
     object: Option<&StoredObject>,
@@ -303,7 +324,7 @@ pub(super) fn delete_object_authorization_with_bucket_policy(
 
 fn bucket_policy_decision_for_object_with_preloaded_tags_modern(
     requester: &Requester,
-    bucket: &ModernBucketSummary,
+    bucket: BoeBucketSummary<'_>,
     bucket_tags: Option<&[(String, String)]>,
     object: &StoredObject,
     action: auth::PolicyAction,
@@ -329,53 +350,9 @@ fn bucket_policy_decision_for_object_with_preloaded_tags_modern(
     )
 }
 
-fn filter_bucket_policy_allow_for_foreign_owned_read_family_object_modern(
-    bucket: &ModernBucketSummary,
-    object: &StoredObject,
-    decision: auth::PolicyEvaluation,
-) -> auth::PolicyEvaluation {
-    if decision != auth::PolicyEvaluation::ExplicitAllow {
-        return decision;
-    }
-
-    if Coordinator::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
-        return decision;
-    }
-
-    if object_is_owned_by_modern_bucket_owner_account(bucket, object) {
-        return decision;
-    }
-
-    auth::PolicyEvaluation::NoMatch
-}
-
-fn object_is_owned_by_modern_bucket_owner_account(
-    bucket: &ModernBucketSummary,
-    object: &StoredObject,
-) -> bool {
-    if object.owner().principal == bucket.owner_principal
-        || object.owner().canonical_id == bucket.owner_canonical_id
-    {
-        return true;
-    }
-
-    let Some(object_owner_account_id) =
-        aws_account_id_from_principal(object.owner().principal.as_str())
-    else {
-        return false;
-    };
-    let Some(bucket_owner_account_id) =
-        Coordinator::bucket_owner_account_id(&bucket.owner_principal)
-    else {
-        return false;
-    };
-
-    object_owner_account_id == bucket_owner_account_id
-}
-
 fn modern_read_object_default_allowed(
     requester: &Requester,
-    bucket: &ModernBucketSummary,
+    bucket: BoeBucketSummary<'_>,
     object: &StoredObject,
     action: ModernReadAction,
 ) -> bool {
@@ -401,26 +378,22 @@ fn modern_read_object_default_allowed(
 
 fn modern_read_object_authorization_for_single_action(
     requester: &Requester,
-    bucket: &ModernBucketSummary,
+    bucket: BoeBucketSummary<'_>,
     bucket_tags: Option<&[(String, String)]>,
     object: &StoredObject,
     action: ModernReadAction,
     policy: Option<&auth::BucketPolicy>,
     existing_object_tags_mode: ExistingObjectTagsMode,
 ) -> Result<ModernObjectReadAuthorization, ServerError> {
-    let decision = filter_bucket_policy_allow_for_foreign_owned_read_family_object_modern(
+    let decision = bucket_policy_decision_for_object_with_preloaded_tags_modern(
+        requester,
         bucket,
+        bucket_tags,
         object,
-        bucket_policy_decision_for_object_with_preloaded_tags_modern(
-            requester,
-            bucket,
-            bucket_tags,
-            object,
-            action.policy_action(),
-            policy,
-            existing_object_tags_mode,
-        )?,
-    );
+        action.policy_action(),
+        policy,
+        existing_object_tags_mode,
+    )?;
     let modern_default_allowed =
         modern_read_object_default_allowed(requester, bucket, object, action);
 
@@ -434,10 +407,8 @@ fn modern_read_object_authorization_for_single_action(
         auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
             if modern_default_allowed {
                 ModernObjectReadAuthorization::Allowed
-            } else if Coordinator::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
-                ModernObjectReadAuthorization::Denied
             } else {
-                ModernObjectReadAuthorization::NeedAclFallback
+                ModernObjectReadAuthorization::Denied
             }
         }
     };
@@ -455,13 +426,12 @@ fn combine_modern_read_authorization(
         (ModernObjectReadAuthorization::Allowed, ModernObjectReadAuthorization::Allowed) => {
             ModernObjectReadAuthorization::Allowed
         }
-        _ => ModernObjectReadAuthorization::NeedAclFallback,
     }
 }
 
 pub(super) fn read_object_authorization_with_bucket_policy(
     requester: &Requester,
-    bucket: &ModernBucketSummary,
+    bucket: BoeBucketSummary<'_>,
     bucket_tags: Option<&[(String, String)]>,
     object: &StoredObject,
     action: ModernReadAction,

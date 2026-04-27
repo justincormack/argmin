@@ -16,8 +16,8 @@ use storage::{
 };
 
 pub(super) use self::modern::{
-    ModernObjectReadAuthorization, ModernObjectWriteAuthorization, ModernReadAction,
-    ModernWriteAction,
+    BoeBucketSummary, ModernObjectReadAuthorization, ModernObjectWriteAuthorization,
+    ModernReadAction, ModernWriteAction,
 };
 use super::authz_results::{
     AuthorizedAbortMultipartUpload, AuthorizedBeginStreamPart, AuthorizedBucketConfigAccess,
@@ -363,20 +363,6 @@ impl Coordinator {
                 && !Self::ignores_public_acls(bucket.public_access_block.as_ref()))
     }
 
-    pub(super) fn requester_can_read_object_attributes(
-        requester: &Requester,
-        bucket: &BucketSummary,
-        object: &StoredObject,
-    ) -> bool {
-        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
-            return requester
-                .principal_opt()
-                .is_some_and(|principal| principal == object.owner().principal.as_str());
-        }
-
-        Self::requester_can_read_object(requester, bucket, object)
-    }
-
     pub(super) fn requester_can_read_bucket_acl(
         requester: &Requester,
         bucket: &BucketSummary,
@@ -617,7 +603,7 @@ impl Coordinator {
 
     pub(super) fn modern_write_multipart_upload_with_bucket_policy(
         requester: &Requester,
-        bucket: &ModernBucketSummary,
+        bucket: BoeBucketSummary<'_>,
         bucket_tags: Option<&[(String, String)]>,
         upload: &MultipartUploadRecord,
         policy_context: &PutObjectPolicyContext<'_>,
@@ -940,7 +926,7 @@ impl Coordinator {
 
     pub(super) fn modern_put_object_authorization_with_bucket_policy(
         requester: &Requester,
-        bucket: &ModernBucketSummary,
+        bucket: BoeBucketSummary<'_>,
         bucket_tags: Option<&[(String, String)]>,
         key: &str,
         action: ModernWriteAction,
@@ -960,7 +946,7 @@ impl Coordinator {
 
     fn modern_delete_object_authorization_with_bucket_policy(
         requester: &Requester,
-        bucket: &ModernBucketSummary,
+        bucket: BoeBucketSummary<'_>,
         bucket_tags: Option<&[(String, String)]>,
         key: &str,
         object: Option<&StoredObject>,
@@ -1071,7 +1057,7 @@ impl Coordinator {
 
     pub(super) fn modern_read_object_authorization_with_bucket_policy(
         requester: &Requester,
-        bucket: &ModernBucketSummary,
+        bucket: BoeBucketSummary<'_>,
         bucket_tags: Option<&[(String, String)]>,
         object: &StoredObject,
         action: ModernReadAction,
@@ -3334,9 +3320,11 @@ impl Coordinator {
         let bucket_tags = Self::loaded_bucket_tags_for_policy(bucket)?;
         let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
         if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_ref()) {
+            let modern_bucket =
+                BoeBucketSummary::new(&modern_bucket_info).expect("BOE branch requires BOE bucket");
             if Self::modern_put_object_authorization_with_bucket_policy(
                 req.object.requester(),
-                &modern_bucket_info,
+                modern_bucket,
                 bucket_tags.as_deref(),
                 key,
                 ModernWriteAction::PutObject,
@@ -3398,6 +3386,7 @@ impl Coordinator {
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket_handle)?;
         let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket_handle)?;
         let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
+        let modern_bucket = BoeBucketSummary::new(&modern_bucket_info);
         #[cfg(test)]
         if should_probe_delete_object_lookup(bucket.as_str()) {
             let object_pg_ready = self
@@ -3422,7 +3411,7 @@ impl Coordinator {
                         ) {
                             Self::modern_delete_object_authorization_with_bucket_policy(
                                 requester,
-                                &modern_bucket_info,
+                                modern_bucket.expect("BOE branch requires BOE bucket"),
                                 bucket_tags.as_deref(),
                                 key_str,
                                 Some(stored),
@@ -3464,7 +3453,7 @@ impl Coordinator {
                         ) {
                             Self::modern_delete_object_authorization_with_bucket_policy(
                                 requester,
-                                &modern_bucket_info,
+                                modern_bucket.expect("BOE branch requires BOE bucket"),
                                 bucket_tags.as_deref(),
                                 key_str,
                                 None,
@@ -3508,7 +3497,7 @@ impl Coordinator {
                         ) {
                             Self::modern_delete_object_authorization_with_bucket_policy(
                                 requester,
-                                &modern_bucket_info,
+                                modern_bucket.expect("BOE branch requires BOE bucket"),
                                 bucket_tags.as_deref(),
                                 key_str,
                                 Some(stored),
@@ -3569,7 +3558,7 @@ impl Coordinator {
                         ) {
                             Self::modern_delete_object_authorization_with_bucket_policy(
                                 requester,
-                                &modern_bucket_info,
+                                modern_bucket.expect("BOE branch requires BOE bucket"),
                                 bucket_tags.as_deref(),
                                 key_str,
                                 None,
@@ -3620,7 +3609,7 @@ impl Coordinator {
                         ) {
                             Self::modern_delete_object_authorization_with_bucket_policy(
                                 requester,
-                                &modern_bucket_info,
+                                modern_bucket.expect("BOE branch requires BOE bucket"),
                                 bucket_tags.as_deref(),
                                 key_str,
                                 Some(stored),
@@ -3663,7 +3652,7 @@ impl Coordinator {
                         ) {
                             Self::modern_delete_object_authorization_with_bucket_policy(
                                 requester,
-                                &modern_bucket_info,
+                                modern_bucket.expect("BOE branch requires BOE bucket"),
                                 bucket_tags.as_deref(),
                                 key_str,
                                 None,
@@ -3813,9 +3802,11 @@ impl Coordinator {
         let bucket_tags = Self::loaded_bucket_tags_for_policy(bucket)?;
         let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
         if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_ref()) {
+            let modern_bucket =
+                BoeBucketSummary::new(&modern_bucket_info).expect("BOE branch requires BOE bucket");
             if Self::modern_put_object_authorization_with_bucket_policy(
                 req.object.requester(),
-                &modern_bucket_info,
+                modern_bucket,
                 bucket_tags.as_deref(),
                 key,
                 ModernWriteAction::CreateMultipartUpload,
@@ -3926,9 +3917,11 @@ impl Coordinator {
         );
         let modern_bucket_info = ModernBucketSummary::from(&*dst_bucket_info);
         if Self::is_bucket_owner_enforced(dst_bucket_info.ownership_controls.as_ref()) {
+            let modern_bucket =
+                BoeBucketSummary::new(&modern_bucket_info).expect("BOE branch requires BOE bucket");
             if Self::modern_write_multipart_upload_with_bucket_policy(
                 requester,
-                &modern_bucket_info,
+                modern_bucket,
                 dst_bucket_tags.as_deref(),
                 &dst_upload,
                 &policy_context,
@@ -4009,9 +4002,11 @@ impl Coordinator {
             Self::with_multipart_upload_managed_encryption_policy_context(policy_context, upload);
         let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
         if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_ref()) {
+            let modern_bucket =
+                BoeBucketSummary::new(&modern_bucket_info).expect("BOE branch requires BOE bucket");
             if Self::modern_write_multipart_upload_with_bucket_policy(
                 req.upload.requester(),
-                &modern_bucket_info,
+                modern_bucket,
                 bucket_tags.as_deref(),
                 upload,
                 &policy_context,
@@ -4084,6 +4079,7 @@ impl Coordinator {
             let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket_handle)?;
             let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket_handle)?;
             let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
+            let modern_bucket = BoeBucketSummary::new(&modern_bucket_info);
             #[cfg(test)]
             let upload =
                 if should_probe_multipart_complete_auth_lookup(bucket.as_str(), key.as_str()) {
@@ -4114,7 +4110,7 @@ impl Coordinator {
             if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_ref()) {
                 if Self::modern_write_multipart_upload_with_bucket_policy(
                     req.upload.requester(),
-                    &modern_bucket_info,
+                    modern_bucket.expect("BOE branch requires BOE bucket"),
                     bucket_tags.as_deref(),
                     &upload,
                     &policy_context,
@@ -4295,6 +4291,7 @@ impl Coordinator {
         let bucket_summary = bucket.bucket().clone();
         let bucket_info = ValidatedBucket(bucket.bucket().clone());
         let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
+        let modern_bucket = BoeBucketSummary::new(&modern_bucket_info);
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
         let bucket_tags = if bucket_policy.is_some() {
             Self::loaded_bucket_tags_for_policy(&bucket)?
@@ -4343,44 +4340,68 @@ impl Coordinator {
                 |stored| {
                     let allowed = match req.modern_action {
                         ModernReadAction::ReadCurrent | ModernReadAction::ReadVersion => {
-                            match Self::modern_read_object_authorization_with_bucket_policy(
-                                req.requester,
-                                &modern_bucket_info,
-                                bucket_tags.as_deref(),
-                                stored,
-                                req.modern_action,
-                                bucket_policy.as_deref(),
-                            )? {
-                                ModernObjectReadAuthorization::Allowed => true,
-                                ModernObjectReadAuthorization::Denied => false,
-                                ModernObjectReadAuthorization::NeedAclFallback => {
-                                    Self::requester_can_read_object(
-                                        req.requester,
-                                        &bucket_info,
-                                        stored,
-                                    )
+                            if let Some(modern_bucket) = modern_bucket {
+                                match Self::modern_read_object_authorization_with_bucket_policy(
+                                    req.requester,
+                                    modern_bucket,
+                                    bucket_tags.as_deref(),
+                                    stored,
+                                    req.modern_action,
+                                    bucket_policy.as_deref(),
+                                )? {
+                                    ModernObjectReadAuthorization::Allowed => true,
+                                    ModernObjectReadAuthorization::Denied => false,
                                 }
+                            } else {
+                                self.requester_can_read_object_with_bucket_policy(
+                                    req.requester,
+                                    &bucket_info,
+                                    bucket_tags.as_deref(),
+                                    stored,
+                                    req.modern_action.policy_action(),
+                                    bucket_policy.as_deref(),
+                                )?
                             }
                         }
                         ModernReadAction::AttributesCurrent
                         | ModernReadAction::AttributesVersion => {
-                            match Self::modern_read_object_authorization_with_bucket_policy(
-                                req.requester,
-                                &modern_bucket_info,
-                                bucket_tags.as_deref(),
-                                stored,
-                                req.modern_action,
-                                bucket_policy.as_deref(),
-                            )? {
-                                ModernObjectReadAuthorization::Allowed => true,
-                                ModernObjectReadAuthorization::Denied => false,
-                                ModernObjectReadAuthorization::NeedAclFallback => {
-                                    Self::requester_can_read_object_attributes(
-                                        req.requester,
-                                        &bucket_info,
-                                        stored,
-                                    )
+                            if let Some(modern_bucket) = modern_bucket {
+                                match Self::modern_read_object_authorization_with_bucket_policy(
+                                    req.requester,
+                                    modern_bucket,
+                                    bucket_tags.as_deref(),
+                                    stored,
+                                    req.modern_action,
+                                    bucket_policy.as_deref(),
+                                )? {
+                                    ModernObjectReadAuthorization::Allowed => true,
+                                    ModernObjectReadAuthorization::Denied => false,
                                 }
+                            } else {
+                                let read_action = match req.modern_action {
+                                    ModernReadAction::AttributesCurrent => {
+                                        auth::PolicyAction::GetObject
+                                    }
+                                    ModernReadAction::AttributesVersion => {
+                                        auth::PolicyAction::GetObjectVersion
+                                    }
+                                    _ => unreachable!(),
+                                };
+                                self.requester_can_read_object_with_bucket_policy(
+                                    req.requester,
+                                    &bucket_info,
+                                    bucket_tags.as_deref(),
+                                    stored,
+                                    read_action,
+                                    bucket_policy.as_deref(),
+                                )? && self.requester_can_read_object_without_existing_tags_with_bucket_policy(
+                                    req.requester,
+                                    &bucket_info,
+                                    bucket_tags.as_deref(),
+                                    stored,
+                                    req.modern_action.policy_action(),
+                                    bucket_policy.as_deref(),
+                                )?
                             }
                         }
                     };
@@ -4851,6 +4872,7 @@ impl Coordinator {
 #[cfg(test)]
 mod modern_auth_tests {
     use super::{Coordinator, ModernObjectReadAuthorization, ModernReadAction};
+    use crate::coordinator::authz::BoeBucketSummary;
     use crate::coordinator::request_types::Requester;
     use crate::coordinator::response_types::ModernBucketSummary;
     use s3_types::{AccountIdentity, BucketVersioningState, CanonicalUserId, VersionId};
@@ -4933,36 +4955,17 @@ mod modern_auth_tests {
     }
 
     #[test]
-    fn modern_read_auth_allows_object_owner_without_policy() {
-        let bucket = modern_bucket(None);
+    fn modern_read_auth_allows_explicit_policy_allow_on_boe_bucket() {
+        let bucket = modern_bucket(Some(BucketObjectOwnership::BucketOwnerEnforced));
         let object = stored_live_object("arn:aws:iam::444455556666:user/object-owner");
-        let requester = requester("arn:aws:iam::444455556666:user/object-owner");
-
-        let outcome = Coordinator::modern_read_object_authorization_with_bucket_policy(
-            &requester,
-            &bucket,
-            None,
-            &object,
-            ModernReadAction::ReadCurrent,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(outcome, ModernObjectReadAuthorization::Allowed);
-    }
-
-    #[test]
-    fn modern_read_auth_returns_acl_fallback_for_foreign_owned_policy_allow() {
-        let bucket = modern_bucket(None);
-        let object = stored_live_object("arn:aws:iam::444455556666:user/object-owner");
-        let requester = requester("arn:aws:iam::111122223333:user/bucket-owner");
+        let requester = requester("arn:aws:iam::777788889999:user/other");
         let policy = parse_policy(
-            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111122223333:user/bucket-owner"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::test-bucket/*"}]}"#,
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::777788889999:user/other"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::test-bucket/*"}]}"#,
         );
 
         let outcome = Coordinator::modern_read_object_authorization_with_bucket_policy(
             &requester,
-            &bucket,
+            BoeBucketSummary::new(&bucket).unwrap(),
             None,
             &object,
             ModernReadAction::ReadCurrent,
@@ -4970,21 +4973,40 @@ mod modern_auth_tests {
         )
         .unwrap();
 
-        assert_eq!(outcome, ModernObjectReadAuthorization::NeedAclFallback);
+        assert_eq!(outcome, ModernObjectReadAuthorization::Allowed);
     }
 
     #[test]
-    fn modern_read_auth_denies_explicit_policy_deny() {
-        let bucket = modern_bucket(None);
-        let object = stored_live_object("arn:aws:iam::111122223333:user/object-owner");
-        let requester = requester("arn:aws:iam::111122223333:user/object-owner");
+    fn modern_read_auth_denies_without_policy_on_boe_bucket() {
+        let bucket = modern_bucket(Some(BucketObjectOwnership::BucketOwnerEnforced));
+        let object = stored_live_object("arn:aws:iam::444455556666:user/object-owner");
+        let requester = requester("arn:aws:iam::777788889999:user/other");
+
+        let outcome = Coordinator::modern_read_object_authorization_with_bucket_policy(
+            &requester,
+            BoeBucketSummary::new(&bucket).unwrap(),
+            None,
+            &object,
+            ModernReadAction::ReadCurrent,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ModernObjectReadAuthorization::Denied);
+    }
+
+    #[test]
+    fn modern_read_auth_denies_explicit_policy_deny_on_boe_bucket() {
+        let bucket = modern_bucket(Some(BucketObjectOwnership::BucketOwnerEnforced));
+        let object = stored_live_object("arn:aws:iam::444455556666:user/object-owner");
+        let requester = requester("arn:aws:iam::777788889999:user/other");
         let policy = parse_policy(
-            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"arn:aws:iam::111122223333:user/object-owner"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::test-bucket/*"}]}"#,
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"arn:aws:iam::777788889999:user/other"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::test-bucket/*"}]}"#,
         );
 
         let outcome = Coordinator::modern_read_object_authorization_with_bucket_policy(
             &requester,
-            &bucket,
+            BoeBucketSummary::new(&bucket).unwrap(),
             None,
             &object,
             ModernReadAction::ReadCurrent,
@@ -4996,8 +5018,9 @@ mod modern_auth_tests {
     }
 
     #[test]
-    fn modern_read_auth_denies_explicit_policy_deny_for_shared_canonical_owner_admin() {
-        let bucket = modern_bucket(None);
+    fn modern_read_auth_denies_explicit_policy_deny_for_shared_canonical_owner_admin_on_boe_bucket()
+    {
+        let bucket = modern_bucket(Some(BucketObjectOwnership::BucketOwnerEnforced));
         let object = stored_live_object("arn:aws:iam::111122223333:user/bucket-owner");
         let requester = shared_canonical_owner_admin_requester();
         let policy = parse_policy(
@@ -5006,7 +5029,7 @@ mod modern_auth_tests {
 
         let outcome = Coordinator::modern_read_object_authorization_with_bucket_policy(
             &requester,
-            &bucket,
+            BoeBucketSummary::new(&bucket).unwrap(),
             None,
             &object,
             ModernReadAction::ReadCurrent,
@@ -5018,8 +5041,8 @@ mod modern_auth_tests {
     }
 
     #[test]
-    fn modern_read_auth_denies_explicit_policy_deny_for_bucket_owner_root() {
-        let bucket = modern_bucket(None);
+    fn modern_read_auth_denies_explicit_policy_deny_for_bucket_owner_root_on_boe_bucket() {
+        let bucket = modern_bucket(Some(BucketObjectOwnership::BucketOwnerEnforced));
         let object = stored_live_object("arn:aws:iam::111122223333:user/bucket-owner");
         let requester = Requester::authenticated_owner_account_admin(
             AccountIdentity::from_principal("arn:aws:iam::111122223333:root"),
@@ -5030,7 +5053,7 @@ mod modern_auth_tests {
 
         let outcome = Coordinator::modern_read_object_authorization_with_bucket_policy(
             &requester,
-            &bucket,
+            BoeBucketSummary::new(&bucket).unwrap(),
             None,
             &object,
             ModernReadAction::ReadCurrent,
@@ -5049,7 +5072,7 @@ mod modern_auth_tests {
 
         let outcome = Coordinator::modern_read_object_authorization_with_bucket_policy(
             &requester,
-            &bucket,
+            BoeBucketSummary::new(&bucket).unwrap(),
             None,
             &object,
             ModernReadAction::ReadCurrent,
@@ -5068,7 +5091,7 @@ mod modern_auth_tests {
 
         let outcome = Coordinator::modern_read_object_authorization_with_bucket_policy(
             &requester,
-            &bucket,
+            BoeBucketSummary::new(&bucket).unwrap(),
             None,
             &object,
             ModernReadAction::ReadCurrent,
@@ -5081,7 +5104,7 @@ mod modern_auth_tests {
 
     #[test]
     fn modern_read_auth_ignores_public_policy_when_restrict_public_buckets_blocks_it() {
-        let mut bucket = modern_bucket(None);
+        let mut bucket = modern_bucket(Some(BucketObjectOwnership::BucketOwnerEnforced));
         bucket.bucket_policy_public = true;
         bucket.public_access_block = Some(PublicAccessBlockConfig {
             block_public_acls: false,
@@ -5097,7 +5120,7 @@ mod modern_auth_tests {
 
         let outcome = Coordinator::modern_read_object_authorization_with_bucket_policy(
             &requester,
-            &bucket,
+            BoeBucketSummary::new(&bucket).unwrap(),
             None,
             &object,
             ModernReadAction::ReadCurrent,
@@ -5105,6 +5128,6 @@ mod modern_auth_tests {
         )
         .unwrap();
 
-        assert_eq!(outcome, ModernObjectReadAuthorization::NeedAclFallback);
+        assert_eq!(outcome, ModernObjectReadAuthorization::Denied);
     }
 }

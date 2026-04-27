@@ -1,6 +1,6 @@
 use super::authz::{
-    ModernObjectReadAuthorization, ModernObjectWriteAuthorization, ModernReadAction,
-    ModernWriteAction,
+    BoeBucketSummary, ModernObjectReadAuthorization, ModernObjectWriteAuthorization,
+    ModernReadAction, ModernWriteAction,
 };
 use super::response_types::ModernBucketSummary;
 use super::test_helpers;
@@ -577,7 +577,6 @@ mod model {
     pub(super) enum ModernOutcome {
         Allow,
         Deny,
-        NeedAclFallback,
     }
 
     impl fmt::Display for ModernOutcome {
@@ -585,7 +584,6 @@ mod model {
             match self {
                 Self::Allow => f.write_str("Allow"),
                 Self::Deny => f.write_str("Deny"),
-                Self::NeedAclFallback => f.write_str("NeedAclFallback"),
             }
         }
     }
@@ -717,10 +715,8 @@ mod model {
                 | PolicyDecisionShape::NoMatch => {
                     if modern_default_allowed {
                         ModernOutcome::Allow
-                    } else if self.bucket.ownership == OwnershipShape::BucketOwnerEnforced {
-                        ModernOutcome::Deny
                     } else {
-                        ModernOutcome::NeedAclFallback
+                        ModernOutcome::Deny
                     }
                 }
             }
@@ -730,7 +726,6 @@ mod model {
             match (first, second) {
                 (ModernOutcome::Deny, _) | (_, ModernOutcome::Deny) => ModernOutcome::Deny,
                 (ModernOutcome::Allow, ModernOutcome::Allow) => ModernOutcome::Allow,
-                _ => ModernOutcome::NeedAclFallback,
             }
         }
 
@@ -2053,6 +2048,11 @@ mod harness {
         scenario: Scenario,
         object_version: VersionId,
     ) -> ModernObjectReadAuthorization {
+        assert_eq!(
+            scenario.bucket.ownership,
+            model::OwnershipShape::BucketOwnerEnforced,
+            "BOE modern read evaluation only applies to BOE scenarios: {scenario}"
+        );
         let requester = fixtures.requester(scenario.bucket.owner_principal, scenario.requester);
         let version_id = match scenario.target {
             ExistingTarget::Current => None,
@@ -2075,7 +2075,7 @@ mod harness {
 
         Coordinator::modern_read_object_authorization_with_bucket_policy(
             &requester,
-            &bucket_summary,
+            BoeBucketSummary::new(&bucket_summary).expect("BOE modern read requires BOE bucket"),
             None,
             &object,
             action,
@@ -2092,6 +2092,11 @@ mod harness {
         shape: BucketShape,
         policy: Option<&auth::BucketPolicy>,
     ) -> ModernBucketSummary {
+        assert_eq!(
+            shape.ownership,
+            model::OwnershipShape::BucketOwnerEnforced,
+            "BOE modern read summary only applies to BOE scenarios"
+        );
         let owner = fixtures.bucket_owner_account(shape.owner_principal);
         ModernBucketSummary {
             name: trusted_bucket_name(bucket),
@@ -3546,7 +3551,7 @@ mod phase4_harness {
         };
         Coordinator::modern_put_object_authorization_with_bucket_policy(
             &requester,
-            &bucket_summary,
+            BoeBucketSummary::new(&bucket_summary).expect("modern BOE write requires BOE bucket"),
             None,
             PHASE4_KEY,
             match scenario.action {
@@ -9740,13 +9745,8 @@ use phase9_harness::{phase9_bucket_name_for, Phase9Harness};
 use phase9_model::{BucketAction, BucketActionScenario};
 
 #[test]
-fn authz_model_modern_get_object_existing_matrix() {
-    run_modern_existing_matrix_without_cross_account_owner(Action::GetObject);
-}
-
-#[test]
-fn authz_model_modern_get_object_existing_foreign_owned_matrix() {
-    run_modern_existing_matrix_with_only_cross_account_owner(Action::GetObject);
+fn authz_model_modern_boe_get_object_existing_matrix() {
+    run_modern_boe_existing_matrix(Action::GetObject);
 }
 
 #[test]
@@ -9754,12 +9754,12 @@ fn authz_model_boe_get_object_fast_path_matches_snapshot_evaluator() {
     run_boe_read_fast_path_invariant(Action::GetObject);
 }
 
-macro_rules! modern_get_object_attributes_existing_matrix_shards {
+macro_rules! modern_boe_get_object_attributes_existing_matrix_shards {
     ($($name:ident => $index:expr),* $(,)?) => {
         $(
             #[test]
             fn $name() {
-                run_modern_existing_matrix_without_cross_account_owner_shard(
+                run_modern_boe_existing_matrix_shard(
                     Action::GetObjectAttributes,
                     $index,
                     8,
@@ -9784,15 +9784,15 @@ macro_rules! boe_get_object_attributes_fast_path_invariant_shards {
     };
 }
 
-modern_get_object_attributes_existing_matrix_shards! {
-    authz_model_modern_get_object_attributes_existing_matrix_shard_00 => 0,
-    authz_model_modern_get_object_attributes_existing_matrix_shard_01 => 1,
-    authz_model_modern_get_object_attributes_existing_matrix_shard_02 => 2,
-    authz_model_modern_get_object_attributes_existing_matrix_shard_03 => 3,
-    authz_model_modern_get_object_attributes_existing_matrix_shard_04 => 4,
-    authz_model_modern_get_object_attributes_existing_matrix_shard_05 => 5,
-    authz_model_modern_get_object_attributes_existing_matrix_shard_06 => 6,
-    authz_model_modern_get_object_attributes_existing_matrix_shard_07 => 7,
+modern_boe_get_object_attributes_existing_matrix_shards! {
+    authz_model_modern_boe_get_object_attributes_existing_matrix_shard_00 => 0,
+    authz_model_modern_boe_get_object_attributes_existing_matrix_shard_01 => 1,
+    authz_model_modern_boe_get_object_attributes_existing_matrix_shard_02 => 2,
+    authz_model_modern_boe_get_object_attributes_existing_matrix_shard_03 => 3,
+    authz_model_modern_boe_get_object_attributes_existing_matrix_shard_04 => 4,
+    authz_model_modern_boe_get_object_attributes_existing_matrix_shard_05 => 5,
+    authz_model_modern_boe_get_object_attributes_existing_matrix_shard_06 => 6,
+    authz_model_modern_boe_get_object_attributes_existing_matrix_shard_07 => 7,
 }
 
 boe_get_object_attributes_fast_path_invariant_shards! {
@@ -9800,11 +9800,6 @@ boe_get_object_attributes_fast_path_invariant_shards! {
     authz_model_boe_get_object_attributes_fast_path_matches_snapshot_evaluator_shard_01 => 1,
     authz_model_boe_get_object_attributes_fast_path_matches_snapshot_evaluator_shard_02 => 2,
     authz_model_boe_get_object_attributes_fast_path_matches_snapshot_evaluator_shard_03 => 3,
-}
-
-#[test]
-fn authz_model_modern_get_object_attributes_existing_foreign_owned_matrix() {
-    run_modern_existing_matrix_with_only_cross_account_owner(Action::GetObjectAttributes);
 }
 
 #[test]
@@ -10971,30 +10966,18 @@ fn modern_bucket_name_for(action: Action, index: usize) -> String {
     format!("authz-modern-{action_slug}-{index:05}")
 }
 
-fn run_modern_existing_matrix_without_cross_account_owner(action: Action) {
+fn run_modern_boe_existing_matrix(action: Action) {
     let scenarios = Scenario::existing_scenarios(action)
         .into_iter()
-        .filter(|scenario| scenario.object.owner_kind != model::ObjectOwnerKind::CrossAccount)
+        .filter(|scenario| scenario.bucket.ownership == model::OwnershipShape::BucketOwnerEnforced)
         .collect();
     run_modern_existing_matrix_scenarios(action, scenarios);
 }
 
-fn run_modern_existing_matrix_with_only_cross_account_owner(action: Action) {
+fn run_modern_boe_existing_matrix_shard(action: Action, shard_index: usize, shard_count: usize) {
     let scenarios = Scenario::existing_scenarios(action)
         .into_iter()
-        .filter(|scenario| scenario.object.owner_kind == model::ObjectOwnerKind::CrossAccount)
-        .collect();
-    run_modern_existing_matrix_scenarios(action, scenarios);
-}
-
-fn run_modern_existing_matrix_without_cross_account_owner_shard(
-    action: Action,
-    shard_index: usize,
-    shard_count: usize,
-) {
-    let scenarios = Scenario::existing_scenarios(action)
-        .into_iter()
-        .filter(|scenario| scenario.object.owner_kind != model::ObjectOwnerKind::CrossAccount)
+        .filter(|scenario| scenario.bucket.ownership == model::OwnershipShape::BucketOwnerEnforced)
         .collect();
     run_modern_existing_matrix_scenarios_shard(action, scenarios, shard_index, shard_count);
 }
@@ -11002,7 +10985,7 @@ fn run_modern_existing_matrix_without_cross_account_owner_shard(
 fn run_modern_existing_matrix_scenarios(action: Action, scenarios: Vec<Scenario>) {
     assert!(
         !scenarios.is_empty(),
-        "modern auth matrix unexpectedly produced no scenarios for {action}"
+        "modern BOE auth matrix unexpectedly produced no scenarios for {action}"
     );
     let harness = MatrixHarness::new();
 
@@ -11012,7 +10995,7 @@ fn run_modern_existing_matrix_scenarios(action: Action, scenarios: Vec<Scenario>
         let actual = to_modern_outcome(harness.run_existing_modern(&bucket, scenario));
         assert_eq!(
             actual, expected,
-            "modern auth model mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
+            "modern BOE auth model mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
         );
     }
 }
@@ -11033,7 +11016,7 @@ fn run_modern_existing_matrix_scenarios_shard(
     );
     assert!(
         !scenarios.is_empty(),
-        "modern auth matrix unexpectedly produced no scenarios for {action}"
+        "modern BOE auth matrix unexpectedly produced no scenarios for {action}"
     );
     let harness = MatrixHarness::new();
     let mut shard_len = 0usize;
@@ -11048,7 +11031,7 @@ fn run_modern_existing_matrix_scenarios_shard(
         let actual = to_modern_outcome(harness.run_existing_modern(&bucket, scenario));
         assert_eq!(
             actual, expected,
-            "modern auth model mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
+            "modern BOE auth model mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
         );
     }
 
@@ -11130,7 +11113,6 @@ fn to_modern_outcome(actual: ModernObjectReadAuthorization) -> model::ModernOutc
     match actual {
         ModernObjectReadAuthorization::Allowed => model::ModernOutcome::Allow,
         ModernObjectReadAuthorization::Denied => model::ModernOutcome::Deny,
-        ModernObjectReadAuthorization::NeedAclFallback => model::ModernOutcome::NeedAclFallback,
     }
 }
 
