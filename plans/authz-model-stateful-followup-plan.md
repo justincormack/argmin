@@ -5,6 +5,11 @@ Status: planned
 This is a deliberately small follow-up to
 `plans/completed/authz-model-testing-plan.md`.
 
+Note: explicit extraction of the BOE modern-auth evaluation seam is tracked
+separately in `plans/boe-modern-auth-seam-plan.md`. This stateful follow-up
+assumes that seam as an input where relevant; it is not the plan for creating
+it.
+
 The fixed-matrix authz model work is complete. What remains, if we want to
 push further, is a bounded stateful layer that checks short traces across the
 same AWS-pinned rules instead of only point-in-time scenarios.
