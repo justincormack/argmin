@@ -65,20 +65,29 @@ results elsewhere.
 
 ### Streaming write prepare failures can differ at the transport level
 
-For streaming `PutObject`, `UploadPart`, and streaming `POST Object` flows,
-Argmin distinguishes between:
+For streaming `PutObject`, `UploadPart`, and streaming `POST Object` flows
+that fail before or during body ingestion, Argmin uses a bounded unread-body
+reject path rather than an unbounded drain to EOF.
+
+The server distinguishes between:
 
 - auth-layer failures or anonymous denies, where the server closes promptly to
   avoid letting an unauthenticated client hold request capacity by continuing
   to stream a body, and
-- authenticated permission denials, where the server prefers to drain/respond
-  so SDK clients see a normal S3 error instead of a transport-level broken
-  pipe while still writing the request body.
+- authenticated permission or validation failures, where the server first
+  attempts to drain a bounded amount of unread body and return a normal S3
+  error so SDK clients do not see a transport-level broken pipe while still
+  writing the request body.
 
-The compatibility target remains the same final S3 error code and body.
-However, exact transport timing and whether the connection is closed early can
-still differ slightly from AWS in some edge cases with unread streaming
-bodies.
+That bounded drain has both byte and wall-clock limits. If the unread body is
+too large or the client keeps sending too slowly, the server closes the
+connection instead of continuing to read indefinitely after the request has
+already been rejected.
+
+The compatibility target remains the same final S3 error code and body where
+practical. Exact transport timing, and whether an unread-body rejection is
+reported as a normal S3 error or an early connection close, can still differ
+slightly from AWS in these edge cases.
 
 ## Current known gaps
 

@@ -45,8 +45,9 @@ const MAX_STREAMING_POST_ACL_FIELD_BYTES: usize = 128;
 const MAX_STREAMING_POST_STATUS_FIELD_BYTES: usize = 16;
 const MAX_STREAMING_POST_CHECKSUM_FIELD_BYTES: usize = 128;
 const MAX_STREAMING_POST_SSE_FIELD_BYTES: usize = 4 * 1024;
-const MAX_STREAMING_POST_REJECT_DRAIN_BYTES: usize = 64 * 1024;
-const MAX_STREAMING_POST_REJECT_DRAIN_DURATION: Duration = Duration::from_millis(200);
+const MAX_STREAMING_REJECT_DRAIN_BYTES: usize =
+    crate::coordinator::INTERNAL_SEGMENT_SIZE + (64 * 1024);
+const MAX_STREAMING_REJECT_DRAIN_DURATION: Duration = Duration::from_secs(2);
 const MAX_ACL_XML_BYTES: usize = 200 * 1024;
 const MAX_DELETE_OBJECTS_XML_BYTES: usize = 2_048_000;
 const MAX_VERSIONING_CONFIGURATION_BYTES: usize = 1024;
@@ -2574,8 +2575,7 @@ async fn finish_streaming_prepare_failure(
     if should_close_streaming_prepare_failure(err, has_auth_attempt) {
         close_response_connection(resp)
     } else {
-        drain_request_body(body, idle_timeout).await;
-        resp
+        finish_streaming_rejection_bounded(resp, body, idle_timeout).await
     }
 }
 
@@ -2592,7 +2592,10 @@ async fn finish_streaming_prepare_failure(
 /// So:
 /// - auth failures always close promptly
 /// - anonymous `AccessDenied` closes promptly
-/// - authenticated `AccessDenied` drains and responds
+/// - authenticated `AccessDenied` drains within a small budget, then responds
+///   or closes if the client keeps sending
+/// - other prepare-time validation failures use the same bounded drain path
+///   rather than an unbounded EOF drain
 fn should_close_streaming_prepare_failure(err: &ServerError, has_auth_attempt: bool) -> bool {
     match err {
         ServerError::Auth(_) => true,
@@ -2613,11 +2616,19 @@ async fn finish_streaming_post_rejection(
     body: &mut Incoming,
     idle_timeout: Duration,
 ) -> S3Response {
+    finish_streaming_rejection_bounded(resp, body, idle_timeout).await
+}
+
+async fn finish_streaming_rejection_bounded(
+    resp: S3Response,
+    body: &mut Incoming,
+    idle_timeout: Duration,
+) -> S3Response {
     if drain_request_body_bounded(
         body,
         idle_timeout,
-        MAX_STREAMING_POST_REJECT_DRAIN_BYTES,
-        MAX_STREAMING_POST_REJECT_DRAIN_DURATION,
+        MAX_STREAMING_REJECT_DRAIN_BYTES,
+        MAX_STREAMING_REJECT_DRAIN_DURATION,
     )
     .await
     {
@@ -2625,10 +2636,6 @@ async fn finish_streaming_post_rejection(
     } else {
         close_response_connection(resp)
     }
-}
-
-async fn drain_request_body(body: &mut Incoming, idle_timeout: Duration) {
-    while let Ok(Some(Ok(_))) = tokio::time::timeout(idle_timeout, body.frame()).await {}
 }
 
 async fn drain_request_body_bounded(
@@ -3848,7 +3855,7 @@ mod tests {
     ) -> (String, usize) {
         const WRITE_CHUNK_BYTES: usize = 1024;
         const WRITE_CHUNK_DELAY: Duration = Duration::from_millis(20);
-        const RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
+        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
 
         let mut stream = StdTcpStream::connect(addr).unwrap();
         stream.set_nodelay(true).unwrap();
@@ -3887,7 +3894,7 @@ mod tests {
     ) -> (String, usize) {
         const WRITE_CHUNK_BYTES: usize = 1024;
         const WRITE_CHUNK_DELAY: Duration = Duration::from_millis(20);
-        const RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
+        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
 
         let mut stream = StdTcpStream::connect(addr).unwrap();
         stream.set_nodelay(true).unwrap();
@@ -5076,6 +5083,117 @@ Connection: keep-alive\r\n\r\n"
         assert!(
             bytes_sent < TOTAL_BODY_BYTES,
             "server read the full denied UploadPart body before responding: sent {bytes_sent} bytes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_put_missing_content_sha256_closes_before_full_body_is_sent() {
+        const TOTAL_BODY_BYTES: usize = 256 * 1024;
+
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend, "mybucket");
+        let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
+
+        let body = vec![b'x'; TOTAL_BODY_BYTES];
+        let signed = sign_headers("PUT", "/mybucket/mykey", &addr, &body, &[]);
+        let request = format!(
+            "PUT /mybucket/mykey HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Authorization: {}\r\n\
+x-amz-date: {}\r\n\
+Content-Length: {TOTAL_BODY_BYTES}\r\n\
+Connection: keep-alive\r\n\r\n",
+            signed.authorization, signed.amz_date
+        );
+        let (response, bytes_sent) =
+            denied_streaming_request_response(&addr, request, TOTAL_BODY_BYTES);
+
+        assert!(
+            response.starts_with("HTTP/1.1 400"),
+            "expected 400 status, got: {}",
+            response.lines().next().unwrap_or("")
+        );
+        assert!(
+            response.contains("Missing required header for this request: x-amz-content-sha256"),
+            "expected missing x-amz-content-sha256 body, got: {response}"
+        );
+        assert!(
+            response.to_ascii_lowercase().contains("connection: close"),
+            "expected Connection: close header, got: {response}"
+        );
+        assert!(
+            bytes_sent < TOTAL_BODY_BYTES,
+            "server read the full missing-sha256 PUT body before responding: sent {bytes_sent} bytes"
+        );
+        assert_eq!(
+            frontend.coordinator.scavenge_stale_sessions(0),
+            0,
+            "missing-sha256 PUT should not create a stream session"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_put_object_lock_without_checksum_closes_before_full_body_is_sent() {
+        const TOTAL_BODY_BYTES: usize = 256 * 1024;
+
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend, "mybucket");
+        let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
+
+        let body = vec![b'x'; TOTAL_BODY_BYTES];
+        let signed = sign_headers(
+            "PUT",
+            "/mybucket/mykey",
+            &addr,
+            &body,
+            &[
+                ("x-amz-object-lock-mode", "COMPLIANCE"),
+                (
+                    "x-amz-object-lock-retain-until-date",
+                    "2099-01-01T00:00:00Z",
+                ),
+            ],
+        );
+        let request = format!(
+            "PUT /mybucket/mykey HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Authorization: {}\r\n\
+x-amz-date: {}\r\n\
+x-amz-content-sha256: {}\r\n\
+x-amz-object-lock-mode: COMPLIANCE\r\n\
+x-amz-object-lock-retain-until-date: 2099-01-01T00:00:00Z\r\n\
+Content-Length: {TOTAL_BODY_BYTES}\r\n\
+Connection: keep-alive\r\n\r\n",
+            signed.authorization, signed.amz_date, signed.amz_content_sha256
+        );
+        let (response, bytes_sent) =
+            denied_streaming_request_response(&addr, request, TOTAL_BODY_BYTES);
+
+        assert!(
+            response.starts_with("HTTP/1.1 400"),
+            "expected 400 status, got: {}",
+            response.lines().next().unwrap_or("")
+        );
+        assert!(
+            response.contains(
+                "Content-MD5 OR x-amz-checksum- HTTP header is required for Put Object requests with Object Lock parameters"
+            ),
+            "expected object-lock checksum requirement body, got: {response}"
+        );
+        assert!(
+            response.to_ascii_lowercase().contains("connection: close"),
+            "expected Connection: close header, got: {response}"
+        );
+        assert!(
+            bytes_sent < TOTAL_BODY_BYTES,
+            "server read the full object-lock checksum failure PUT body before responding: sent {bytes_sent} bytes"
+        );
+        assert_eq!(
+            frontend.coordinator.scavenge_stale_sessions(0),
+            0,
+            "object-lock checksum failure PUT should not create a stream session"
         );
     }
 
