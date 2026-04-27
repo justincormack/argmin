@@ -204,6 +204,18 @@ pub(super) enum ModernObjectReadAuthorization {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ModernObjectWriteAuthorization {
+    Allowed,
+    Denied,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ModernWriteAction {
+    PutObject,
+    CreateMultipartUpload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ModernReadAction {
     ReadCurrent,
     ReadVersion,
@@ -1283,6 +1295,69 @@ impl Coordinator {
         Ok(policy.evaluate(&policy_request))
     }
 
+    fn bucket_policy_decision_for_put_object_action_modern(
+        requester: &Requester,
+        bucket: &ModernBucketSummary,
+        bucket_tags: Option<&[(String, String)]>,
+        key: &str,
+        action: auth::PolicyAction,
+        policy_context: &PutObjectPolicyContext<'_>,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<auth::PolicyEvaluation, ServerError> {
+        let Some(policy) = policy else {
+            return Ok(auth::PolicyEvaluation::NoMatch);
+        };
+
+        let request_object_tags = if policy.requires_request_object_tags_for_action(action) {
+            match policy_context.request_object_tags_xml {
+                Some(tags_xml) => Self::parse_serialized_tag_set(tags_xml)?,
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let request_object_tags: Vec<auth::PolicyTag<'_>> = request_object_tags
+            .iter()
+            .map(|(tag_key, value)| auth::PolicyTag::new(tag_key, value))
+            .collect();
+        let bucket_tags: Vec<auth::PolicyTag<'_>> = bucket_tags
+            .unwrap_or(&[])
+            .iter()
+            .map(|(key, value)| auth::PolicyTag::new(key, value))
+            .collect();
+        let policy_request = auth::PolicyRequest::for_object(
+            action,
+            bucket.name.as_str(),
+            key,
+            requester.principal_opt(),
+            requester.canonical_user_id(),
+            auth::bucket_policy::ExistingObjectTags::Unavailable,
+        )
+        .with_bucket_tags(
+            if bucket.bucket_abac_enabled && policy.requires_bucket_tags_for_action(action) {
+                auth::bucket_policy::BucketTags::Available(&bucket_tags)
+            } else {
+                auth::bucket_policy::BucketTags::Unavailable
+            },
+        )
+        .with_request_object_tags(&request_object_tags)
+        .with_copy_source(policy_context.copy_source)
+        .with_metadata_directive(policy_context.metadata_directive)
+        .with_canned_acl(policy_context.canned_acl)
+        .with_server_side_encryption(
+            policy_context
+                .managed_encryption
+                .map(ManagedEncryptionAlgorithm::as_str),
+        )
+        .with_sse_customer_algorithm(policy_context.sse_customer_algorithm)
+        .with_grant_read(policy_context.grant_read)
+        .with_grant_write(policy_context.grant_write)
+        .with_grant_read_acp(policy_context.grant_read_acp)
+        .with_grant_write_acp(policy_context.grant_write_acp)
+        .with_grant_full_control(policy_context.grant_full_control);
+        Ok(policy.evaluate(&policy_request))
+    }
+
     fn requester_can_put_object_action_with_bucket_policy(
         &self,
         authorization: BucketPolicyActionAuthorization<'_>,
@@ -1296,6 +1371,79 @@ impl Coordinator {
             decision,
             || authorization.default_allowed,
         ))
+    }
+
+    pub(super) fn modern_put_object_authorization_with_bucket_policy(
+        requester: &Requester,
+        bucket: &ModernBucketSummary,
+        bucket_tags: Option<&[(String, String)]>,
+        key: &str,
+        action: ModernWriteAction,
+        policy_context: &PutObjectPolicyContext<'_>,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<ModernObjectWriteAuthorization, ServerError> {
+        if action == ModernWriteAction::CreateMultipartUpload && requester.is_anonymous() {
+            return Ok(ModernObjectWriteAuthorization::Denied);
+        }
+        let decision = Self::bucket_policy_decision_for_put_object_action_modern(
+            requester,
+            bucket,
+            bucket_tags,
+            key,
+            auth::PolicyAction::PutObject,
+            policy_context,
+            policy,
+        )?;
+        let allowed = match decision {
+            auth::PolicyEvaluation::ExplicitDeny => false,
+            auth::PolicyEvaluation::ExplicitAllow
+                if Self::modern_bucket_policy_allow_survives_restrict_public_buckets(
+                    requester, bucket,
+                ) =>
+            {
+                true
+            }
+            auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
+                Self::requester_can_modern_bucket_owner_account_admin(requester, bucket)
+            }
+        };
+        if !allowed {
+            return Ok(ModernObjectWriteAuthorization::Denied);
+        }
+
+        if policy_context.request_object_tags_xml.is_some() {
+            // Secondary inline-tag authorization must evaluate the original
+            // immutable request context unchanged. Rebuilding a reduced
+            // context here silently drops request headers and diverges from
+            // the primary PutObject/CreateMultipartUpload evaluation surface.
+            let tagging_decision = Self::bucket_policy_decision_for_put_object_action_modern(
+                requester,
+                bucket,
+                bucket_tags,
+                key,
+                auth::PolicyAction::PutObjectTagging,
+                policy_context,
+                policy,
+            )?;
+            let tagging_allowed = match tagging_decision {
+                auth::PolicyEvaluation::ExplicitDeny => false,
+                auth::PolicyEvaluation::ExplicitAllow
+                    if Self::modern_bucket_policy_allow_survives_restrict_public_buckets(
+                        requester, bucket,
+                    ) =>
+                {
+                    true
+                }
+                auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
+                    Self::requester_can_modern_bucket_owner_account_admin(requester, bucket)
+                }
+            };
+            if !tagging_allowed {
+                return Ok(ModernObjectWriteAuthorization::Denied);
+            }
+        }
+
+        Ok(ModernObjectWriteAuthorization::Allowed)
     }
 
     fn bucket_policy_allows_with_fallback<F>(
@@ -3949,7 +4097,21 @@ impl Coordinator {
         let bucket_info = ValidatedBucket(bucket.bucket().clone());
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(bucket)?;
         let bucket_tags = Self::loaded_bucket_tags_for_policy(bucket)?;
-        if !self.requester_can_put_object_with_bucket_policy(
+        let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
+        if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_ref()) {
+            if Self::modern_put_object_authorization_with_bucket_policy(
+                req.object.requester(),
+                &modern_bucket_info,
+                bucket_tags.as_deref(),
+                key,
+                ModernWriteAction::PutObject,
+                &req.policy_context,
+                bucket_policy.as_deref(),
+            )? != ModernObjectWriteAuthorization::Allowed
+            {
+                return Err(ServerError::AccessDenied);
+            }
+        } else if !self.requester_can_put_object_with_bucket_policy(
             BucketPolicyAccess {
                 requester: req.object.requester(),
                 bucket: &bucket_info,
@@ -4323,7 +4485,21 @@ impl Coordinator {
         }
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(bucket)?;
         let bucket_tags = Self::loaded_bucket_tags_for_policy(bucket)?;
-        if !self.requester_can_put_object_with_bucket_policy(
+        let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
+        if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_ref()) {
+            if Self::modern_put_object_authorization_with_bucket_policy(
+                req.object.requester(),
+                &modern_bucket_info,
+                bucket_tags.as_deref(),
+                key,
+                ModernWriteAction::CreateMultipartUpload,
+                &policy_context,
+                bucket_policy.as_deref(),
+            )? != ModernObjectWriteAuthorization::Allowed
+            {
+                return Err(ServerError::AccessDenied);
+            }
+        } else if !self.requester_can_put_object_with_bucket_policy(
             BucketPolicyAccess {
                 requester: req.object.requester(),
                 bucket: &bucket_info,

@@ -1,4 +1,7 @@
-use super::authz::{ModernObjectReadAuthorization, ModernReadAction};
+use super::authz::{
+    ModernObjectReadAuthorization, ModernObjectWriteAuthorization, ModernReadAction,
+    ModernWriteAction,
+};
 use super::response_types::ModernBucketSummary;
 use super::test_helpers;
 use super::*;
@@ -2249,7 +2252,7 @@ mod harness {
 }
 
 mod phase4_model {
-    use super::model::{OwnershipShape, PolicyDecisionShape};
+    use super::model::{Outcome, OwnershipShape, PolicyDecisionShape};
     use super::*;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2579,6 +2582,33 @@ mod phase4_model {
                 return WriteOutcome::Deny;
             }
             WriteOutcome::Allow
+        }
+
+        pub(super) fn expected_modern_boe_outcome(self) -> Outcome {
+            debug_assert_eq!(self.bucket.ownership, OwnershipShape::BucketOwnerEnforced);
+            if self.action == WriteAction::CreateMultipartUpload && self.requester.is_anonymous() {
+                return Outcome::Deny;
+            }
+            let fallback = self.requester.is_bucket_owner_account_admin();
+            let allowed = match self.policy {
+                PolicyDecisionShape::ExplicitDeny => false,
+                PolicyDecisionShape::ExplicitAllowPrivate => true,
+                PolicyDecisionShape::ExplicitAllowPublic => {
+                    if !self.bucket.restrict_public_buckets
+                        || self.requester.is_bucket_owner_account()
+                    {
+                        true
+                    } else {
+                        fallback
+                    }
+                }
+                PolicyDecisionShape::NoPolicy | PolicyDecisionShape::NoMatch => fallback,
+            };
+            if allowed {
+                Outcome::Allow
+            } else {
+                Outcome::Deny
+            }
         }
 
         fn is_possible(self) -> bool {
@@ -3128,6 +3158,23 @@ mod phase4_harness {
             ))
         }
 
+        pub(super) fn run_write_modern(
+            &self,
+            bucket: &str,
+            scenario: WriteScenario,
+        ) -> ModernObjectWriteAuthorization {
+            materialize_write_bucket(&self.coord, &self.fixtures, bucket, scenario.bucket)
+                .unwrap_or_else(|err| {
+                    panic!("failed to materialize phase 4 write bucket for {scenario}: {err:?}");
+                });
+            materialize_write_policy(&self.coord, &self.fixtures, bucket, scenario).unwrap_or_else(
+                |err| {
+                    panic!("failed to materialize phase 4 write policy for {scenario}: {err:?}");
+                },
+            );
+            run_modern_write_action(&self.coord, &self.fixtures, bucket, scenario)
+        }
+
         pub(super) fn run_acl_update(
             &self,
             bucket: &str,
@@ -3359,6 +3406,87 @@ mod phase4_harness {
                 })?;
                 coord.abort_stream_put(bucket, PHASE4_KEY, &prepared.session_id)
             }
+        }
+    }
+
+    fn run_modern_write_action(
+        _coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: WriteScenario,
+    ) -> ModernObjectWriteAuthorization {
+        let requester = write_requester(fixtures, scenario.requester);
+        let policy = write_policy_document(fixtures, bucket, scenario).map(|body| {
+            auth::parse_bucket_policy(&body)
+                .unwrap_or_else(|err| panic!("failed to parse policy for {scenario}: {err:?}"))
+        });
+        let bucket_summary =
+            modern_write_bucket_summary(fixtures, bucket, scenario.bucket, policy.as_ref());
+        let policy_context = match scenario.action {
+            WriteAction::BeginStreamPut => PutObjectPolicyContext::default()
+                .with_default_canned_acl(scenario.acl.policy_condition_value()),
+            WriteAction::PutObject | WriteAction::CreateMultipartUpload => {
+                PutObjectPolicyContext::default()
+            }
+        };
+        Coordinator::modern_put_object_authorization_with_bucket_policy(
+            &requester,
+            &bucket_summary,
+            None,
+            PHASE4_KEY,
+            match scenario.action {
+                WriteAction::PutObject | WriteAction::BeginStreamPut => {
+                    ModernWriteAction::PutObject
+                }
+                WriteAction::CreateMultipartUpload => ModernWriteAction::CreateMultipartUpload,
+            },
+            &policy_context,
+            policy.as_ref(),
+        )
+        .unwrap_or_else(|err| {
+            panic!("modern BOE write evaluation failed for {scenario}: {err:?}");
+        })
+    }
+
+    fn modern_write_bucket_summary(
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        shape: WriteBucketShape,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> ModernBucketSummary {
+        ModernBucketSummary {
+            name: trusted_bucket_name(bucket),
+            owner_principal: fixtures.owner_user.principal().to_string(),
+            owner_canonical_id: fixtures.owner_user.canonical_user_id().clone(),
+            created_at: 0,
+            versioning: BucketVersioningState::Enabled,
+            object_lock: BucketObjectLockConfig::default(),
+            public_access_block: if shape.block_public_acls
+                || shape.ignore_public_acls
+                || shape.restrict_public_buckets
+            {
+                Some(PublicAccessBlockConfig {
+                    block_public_acls: shape.block_public_acls,
+                    ignore_public_acls: shape.ignore_public_acls,
+                    block_public_policy: false,
+                    restrict_public_buckets: shape.restrict_public_buckets,
+                })
+            } else {
+                None
+            },
+            ownership_controls: match shape.ownership {
+                OwnershipShape::BucketOwnerEnforced => Some(BucketOwnershipControls {
+                    object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                }),
+                OwnershipShape::ObjectWriter => None,
+            },
+            bucket_policy_present: policy.is_some(),
+            bucket_policy_public: policy.is_some_and(auth::BucketPolicy::is_public),
+            bucket_policy_generation: 0,
+            bucket_lifecycle_present: false,
+            bucket_lifecycle_generation: 0,
+            bucket_abac_enabled: false,
+            encryption: EffectiveBucketEncryptionConfig::default(),
         }
     }
 
@@ -9549,6 +9677,21 @@ fn authz_model_phase4_begin_stream_put_write_matrix() {
 }
 
 #[test]
+fn authz_model_modern_boe_put_object_write_matrix() {
+    run_phase4_modern_boe_write_matrix(WriteAction::PutObject);
+}
+
+#[test]
+fn authz_model_modern_boe_create_multipart_upload_write_matrix() {
+    run_phase4_modern_boe_write_matrix(WriteAction::CreateMultipartUpload);
+}
+
+#[test]
+fn authz_model_modern_boe_begin_stream_put_write_matrix() {
+    run_phase4_modern_boe_write_matrix(WriteAction::BeginStreamPut);
+}
+
+#[test]
 fn authz_model_phase4_put_object_acl_matrix_shard_00() {
     run_phase4_acl_matrix_shard(AclUpdateAction::PutObjectAcl, 0, 8);
 }
@@ -10496,6 +10639,13 @@ fn to_modern_outcome(actual: ModernObjectReadAuthorization) -> model::ModernOutc
     }
 }
 
+fn to_simple_outcome(actual: ModernObjectWriteAuthorization) -> model::Outcome {
+    match actual {
+        ModernObjectWriteAuthorization::Allowed => model::Outcome::Allow,
+        ModernObjectWriteAuthorization::Denied => model::Outcome::Deny,
+    }
+}
+
 fn run_missing_matrix(phase: &str, action: Action) {
     let scenarios = MissingScenario::missing_scenarios(action);
     assert!(
@@ -10572,6 +10722,39 @@ fn run_phase4_write_matrix(action: WriteAction) {
             actual, expected,
             "phase 4 authz model mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
         );
+    }
+}
+
+fn run_phase4_modern_boe_write_matrix(action: WriteAction) {
+    let scenarios: Vec<_> = WriteScenario::scenarios(action)
+        .into_iter()
+        .filter(|scenario| scenario.bucket.ownership == model::OwnershipShape::BucketOwnerEnforced)
+        .collect();
+    assert!(
+        !scenarios.is_empty(),
+        "phase 4 modern BOE matrix unexpectedly produced no scenarios for {action}"
+    );
+    let harness = Phase4Harness::new();
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        let bucket = format!(
+            "authz-modern-boe-{}-{index:05}",
+            modern_write_action_slug(action)
+        );
+        let expected = scenario.expected_modern_boe_outcome();
+        let actual = to_simple_outcome(harness.run_write_modern(&bucket, scenario));
+        assert_eq!(
+            actual, expected,
+            "phase 4 modern BOE authz mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
+        );
+    }
+}
+
+fn modern_write_action_slug(action: WriteAction) -> &'static str {
+    match action {
+        WriteAction::PutObject => "putobj",
+        WriteAction::CreateMultipartUpload => "mpu",
+        WriteAction::BeginStreamPut => "streamput",
     }
 }
 

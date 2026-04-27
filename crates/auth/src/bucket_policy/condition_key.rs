@@ -132,14 +132,14 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
         operator_support: OperatorSupport::AnyEvaluable,
         resolve: resolve_canned_acl,
         evaluable_for_action: None,
-        supported_for_action: Some(request_header_supported_for_action_non_get),
+        supported_for_action: Some(canned_acl_supported_for_action),
     },
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:x-amz-server-side-encryption"),
         operator_support: OperatorSupport::AnyEvaluable,
         resolve: resolve_server_side_encryption,
         evaluable_for_action: None,
-        supported_for_action: Some(request_header_supported_for_action_non_get),
+        supported_for_action: Some(server_side_encryption_supported_for_action),
     },
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:x-amz-server-side-encryption-customer-algorithm"),
@@ -366,6 +366,22 @@ fn request_header_supported_for_action_non_get(action: PolicyAction) -> bool {
     )
 }
 
+fn canned_acl_supported_for_action(action: PolicyAction) -> bool {
+    request_header_supported_for_action_non_get(action)
+        && !matches!(
+            action,
+            PolicyAction::PutObjectTagging | PolicyAction::PutObjectVersionTagging
+        )
+}
+
+fn server_side_encryption_supported_for_action(action: PolicyAction) -> bool {
+    request_header_supported_for_action_non_get(action)
+        && !matches!(
+            action,
+            PolicyAction::PutObjectTagging | PolicyAction::PutObjectVersionTagging
+        )
+}
+
 /// Whether a condition clause is supported on a given action at
 /// statement-validation time.
 ///
@@ -491,6 +507,7 @@ mod tests {
         let (acl, param) = lookup("s3:x-amz-acl").unwrap();
         assert_eq!(param, "");
         assert_eq!(acl.operator_support, OperatorSupport::AnyEvaluable);
+        assert!(acl.supported_for_action.is_some());
 
         let (sse, _) = lookup("s3:x-amz-server-side-encryption").unwrap();
         assert!(sse.supported_for_action.is_some());
@@ -531,6 +548,30 @@ mod tests {
             assert!(!predicate(PolicyAction::GetObjectVersion));
             assert!(predicate(PolicyAction::PutObject));
         }
+    }
+
+    #[test]
+    fn canned_acl_is_not_supported_for_tagging_actions() {
+        let (resolver, _) = lookup("s3:x-amz-acl").unwrap();
+        let predicate = resolver
+            .supported_for_action
+            .expect("canned ACL has a support predicate");
+        assert!(predicate(PolicyAction::PutObject));
+        assert!(predicate(PolicyAction::PutObjectAcl));
+        assert!(!predicate(PolicyAction::PutObjectTagging));
+        assert!(!predicate(PolicyAction::PutObjectVersionTagging));
+    }
+
+    #[test]
+    fn sse_is_not_supported_for_tagging_actions() {
+        let (resolver, _) = lookup("s3:x-amz-server-side-encryption").unwrap();
+        let predicate = resolver
+            .supported_for_action
+            .expect("SSE has a support predicate");
+        assert!(predicate(PolicyAction::PutObject));
+        assert!(predicate(PolicyAction::PutObjectAcl));
+        assert!(!predicate(PolicyAction::PutObjectTagging));
+        assert!(!predicate(PolicyAction::PutObjectVersionTagging));
     }
 
     #[test]
