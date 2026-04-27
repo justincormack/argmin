@@ -10730,6 +10730,35 @@ mod phase13_model {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Phase13ExecutionProbe {
+        Current,
+        Version,
+        VersionBypass,
+    }
+
+    impl fmt::Display for Phase13ExecutionProbe {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Current => f.write_str("delete-current-then-read-current"),
+                Self::Version => f.write_str("delete-tracked-version-then-read-current"),
+                Self::VersionBypass => {
+                    f.write_str("delete-tracked-version-bypass-then-read-current")
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Phase13ExecutionOutcome {
+        Denied,
+        Applied {
+            delete_marker: bool,
+            current_read: model::Outcome,
+            tracked_version_read: Option<model::Outcome>,
+        },
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) struct Phase13State {
         pub(super) read_policy: Phase13ReadPolicyState,
         pub(super) delete_policy: DeletePolicyShape,
@@ -10810,13 +10839,7 @@ mod phase13_model {
         pub(super) fn expected_outcome(self, probe: Phase13Probe) -> model::Outcome {
             match probe {
                 Phase13Probe::GetObjectCurrent | Phase13Probe::GetObjectAttributesCurrent => {
-                    if self.read_policy == Phase13ReadPolicyState::AllowPrivate
-                        && self.current == Phase13CurrentState::Live
-                    {
-                        model::Outcome::Allow
-                    } else {
-                        model::Outcome::Deny
-                    }
+                    self.current_read_outcome()
                 }
                 Phase13Probe::DeleteCurrent => {
                     if self.delete_policy == DeletePolicyShape::AllowDeleteObject {
@@ -10827,6 +10850,25 @@ mod phase13_model {
                 }
                 Phase13Probe::DeleteTrackedVersion => self.expected_delete_version(false),
                 Phase13Probe::DeleteTrackedVersionBypass => self.expected_delete_version(true),
+            }
+        }
+
+        pub(super) fn expected_execution_outcome(
+            self,
+            probe: Phase13ExecutionProbe,
+        ) -> Phase13ExecutionOutcome {
+            match probe {
+                Phase13ExecutionProbe::Current => {
+                    if self.delete_policy != DeletePolicyShape::AllowDeleteObject {
+                        return Phase13ExecutionOutcome::Denied;
+                    }
+                    let current = Phase13CurrentState::DeleteMarker;
+                    Self::execution_outcome_from_read_policy(self.read_policy, current, true, None)
+                }
+                Phase13ExecutionProbe::Version => self.expected_version_delete_execution(false),
+                Phase13ExecutionProbe::VersionBypass => {
+                    self.expected_version_delete_execution(true)
+                }
             }
         }
 
@@ -10866,6 +10908,56 @@ mod phase13_model {
                 Phase13RetentionState::Compliance => model::Outcome::Deny,
             }
         }
+
+        fn expected_version_delete_execution(self, bypass: bool) -> Phase13ExecutionOutcome {
+            if self.expected_delete_version(bypass) != model::Outcome::Allow {
+                return Phase13ExecutionOutcome::Denied;
+            }
+
+            let current = if self.tracked_version_present && self.tracked_version_is_current {
+                self.revealed_after_tracked_delete
+            } else {
+                self.current
+            };
+
+            Self::execution_outcome_from_read_policy(
+                self.read_policy,
+                current,
+                false,
+                Some(model::Outcome::Deny),
+            )
+        }
+
+        fn current_read_outcome(self) -> model::Outcome {
+            if self.read_policy == Phase13ReadPolicyState::AllowPrivate
+                && self.current == Phase13CurrentState::Live
+            {
+                model::Outcome::Allow
+            } else {
+                model::Outcome::Deny
+            }
+        }
+
+        fn execution_outcome_from_read_policy(
+            read_policy: Phase13ReadPolicyState,
+            current: Phase13CurrentState,
+            delete_marker: bool,
+            tracked_version_read: Option<model::Outcome>,
+        ) -> Phase13ExecutionOutcome {
+            let current_read = if read_policy == Phase13ReadPolicyState::AllowPrivate
+                && current == Phase13CurrentState::Live
+            {
+                model::Outcome::Allow
+            } else {
+                model::Outcome::Deny
+            };
+
+            Phase13ExecutionOutcome::Applied {
+                delete_marker,
+                current_read,
+                tracked_version_read,
+            }
+        }
     }
 }
 
@@ -10874,7 +10966,10 @@ mod phase13_harness {
 
     use super::harness::{setup_coordinator, IdentityFixtures};
     use super::model::Outcome;
-    use super::phase13_model::{Phase13Mutation, Phase13Probe, Phase13ReadPolicyState};
+    use super::phase13_model::{
+        Phase13ExecutionOutcome, Phase13ExecutionProbe, Phase13Mutation, Phase13Probe,
+        Phase13ReadPolicyState,
+    };
     use super::phase7_model::{DeleteObjectLockShape, DeletePolicyShape};
     use super::*;
 
@@ -10884,6 +10979,16 @@ mod phase13_harness {
     pub(super) enum ClassifiedPhase13Result {
         Allow,
         Deny,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ClassifiedPhase13ExecutionResult {
+        Denied,
+        Applied {
+            delete_marker: bool,
+            current_read: Outcome,
+            tracked_version_read: Option<Outcome>,
+        },
     }
 
     pub(super) struct Phase13Harness {
@@ -10973,7 +11078,8 @@ mod phase13_harness {
                         });
                 }
                 Phase13Mutation::OwnerDeleteTrackedVersion => {
-                    if let Some(version_id) = *self.tracked_version_id.borrow() {
+                    let tracked_version_id = *self.tracked_version_id.borrow();
+                    if let Some(version_id) = tracked_version_id {
                         match self.coord.delete_object(&DeleteObjectRequest {
                             object: ObjectVersionRequest::new(
                                 trusted_bucket_name(bucket),
@@ -10986,6 +11092,7 @@ mod phase13_harness {
                             cond: NO_DELETE,
                         }) {
                             Ok(_) => {
+                                self.tracked_version_id.replace(None);
                                 self.tracked_version_present.set(false);
                             }
                             Err(
@@ -11096,6 +11203,123 @@ mod phase13_harness {
                     .map(|_| ()),
             };
             classify_phase13(result)
+        }
+
+        pub(super) fn execution_probe(
+            &self,
+            bucket: &str,
+            probe: Phase13ExecutionProbe,
+        ) -> ClassifiedPhase13ExecutionResult {
+            let requester = Requester::authenticated(self.fixtures.cross_account.clone());
+            let version_id = self
+                .tracked_version_id
+                .borrow()
+                .unwrap_or_else(|| VersionId::from_u64(999_999));
+            let (delete_result, read_current, read_tracked_version) = match probe {
+                Phase13ExecutionProbe::Current => (
+                    self.coord.delete_object(&DeleteObjectRequest {
+                        object: ObjectVersionRequest::new(
+                            trusted_bucket_name(bucket),
+                            trusted_object_key(PHASE13_KEY),
+                            None,
+                            requester.clone(),
+                            None,
+                        ),
+                        bypass_governance: false,
+                        cond: NO_DELETE,
+                    }),
+                    true,
+                    None,
+                ),
+                Phase13ExecutionProbe::Version => (
+                    self.coord.delete_object(&DeleteObjectRequest {
+                        object: ObjectVersionRequest::new(
+                            trusted_bucket_name(bucket),
+                            trusted_object_key(PHASE13_KEY),
+                            Some(version_id),
+                            requester.clone(),
+                            None,
+                        ),
+                        bypass_governance: false,
+                        cond: NO_DELETE,
+                    }),
+                    true,
+                    Some(version_id),
+                ),
+                Phase13ExecutionProbe::VersionBypass => (
+                    self.coord.delete_object(&DeleteObjectRequest {
+                        object: ObjectVersionRequest::new(
+                            trusted_bucket_name(bucket),
+                            trusted_object_key(PHASE13_KEY),
+                            Some(version_id),
+                            requester.clone(),
+                            None,
+                        ),
+                        bypass_governance: true,
+                        cond: NO_DELETE,
+                    }),
+                    true,
+                    Some(version_id),
+                ),
+            };
+
+            let deleted = match delete_result {
+                Ok(result) => result,
+                Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
+                    return ClassifiedPhase13ExecutionResult::Denied;
+                }
+                Err(err) => panic!("unexpected phase 13 delete execution result: {err:?}"),
+            };
+
+            let tracked_requester = requester.clone();
+            let read_result = if read_current {
+                self.coord
+                    .get_object(&GetObjectRequest {
+                        sse_customer: None,
+                        object: ObjectVersionRequest::new(
+                            trusted_bucket_name(bucket),
+                            trusted_object_key(PHASE13_KEY),
+                            None,
+                            requester,
+                            None,
+                        ),
+                        cond: NO_READ,
+                    })
+                    .and_then(|result| {
+                        let _ = read_all_phase13_body(result.body)?;
+                        Ok(())
+                    })
+            } else {
+                Ok(())
+            };
+
+            let current_read = to_phase13_outcome(classify_phase13(read_result));
+            let tracked_version_read = read_tracked_version.map(|tracked_version_id| {
+                to_phase13_outcome(classify_phase13(
+                    self.coord
+                        .get_object(&GetObjectRequest {
+                            sse_customer: None,
+                            object: ObjectVersionRequest::new(
+                                trusted_bucket_name(bucket),
+                                trusted_object_key(PHASE13_KEY),
+                                Some(tracked_version_id),
+                                tracked_requester.clone(),
+                                None,
+                            ),
+                            cond: NO_READ,
+                        })
+                        .and_then(|result| {
+                            let _ = read_all_phase13_body(result.body)?;
+                            Ok(())
+                        }),
+                ))
+            });
+
+            ClassifiedPhase13ExecutionResult::Applied {
+                delete_marker: deleted.delete_marker,
+                current_read,
+                tracked_version_read,
+            }
         }
 
         fn owner_put_current_version(&self, bucket: &str) -> VersionId {
@@ -11234,6 +11458,23 @@ mod phase13_harness {
         }
     }
 
+    pub(super) fn to_phase13_execution_outcome(
+        result: ClassifiedPhase13ExecutionResult,
+    ) -> Phase13ExecutionOutcome {
+        match result {
+            ClassifiedPhase13ExecutionResult::Denied => Phase13ExecutionOutcome::Denied,
+            ClassifiedPhase13ExecutionResult::Applied {
+                delete_marker,
+                current_read,
+                tracked_version_read,
+            } => Phase13ExecutionOutcome::Applied {
+                delete_marker,
+                current_read,
+                tracked_version_read,
+            },
+        }
+    }
+
     fn phase13_policy_document(
         fixtures: &IdentityFixtures,
         bucket: &str,
@@ -11305,8 +11546,10 @@ use phase12_harness::{to_boe_trace_outcome, Phase12Harness};
 use phase12_model::{
     BoeTraceBucketTagState, BoeTraceMutation, BoeTracePolicyState, BoeTraceProbe, BoeTraceState,
 };
-use phase13_harness::{to_phase13_outcome, Phase13Harness};
-use phase13_model::{Phase13Mutation, Phase13Probe, Phase13ReadPolicyState, Phase13State};
+use phase13_harness::{to_phase13_execution_outcome, to_phase13_outcome, Phase13Harness};
+use phase13_model::{
+    Phase13ExecutionProbe, Phase13Mutation, Phase13Probe, Phase13ReadPolicyState, Phase13State,
+};
 use phase4_harness::{
     acl_bucket_name_for, to_acl_outcome, to_write_outcome, write_bucket_name_for, Phase4Harness,
 };
@@ -13079,6 +13322,14 @@ fn phase13_probe_strategy() -> impl Strategy<Value = Phase13Probe> {
     ]
 }
 
+fn phase13_execution_probe_strategy() -> impl Strategy<Value = Phase13ExecutionProbe> {
+    prop_oneof![
+        Just(Phase13ExecutionProbe::Current),
+        Just(Phase13ExecutionProbe::Version),
+        Just(Phase13ExecutionProbe::VersionBypass),
+    ]
+}
+
 fn phase13_mutation_strategy() -> impl Strategy<Value = Phase13Mutation> {
     prop_oneof![
         phase13_read_policy_strategy().prop_map(Phase13Mutation::ReadPolicy),
@@ -13096,6 +13347,14 @@ fn phase13_trace_strategy() -> impl Strategy<Value = (Vec<Phase13Mutation>, Phas
     (
         prop::collection::vec(phase13_mutation_strategy(), 0..=6),
         phase13_probe_strategy(),
+    )
+}
+
+fn phase13_execution_trace_strategy(
+) -> impl Strategy<Value = (Vec<Phase13Mutation>, Phase13ExecutionProbe)> {
+    (
+        prop::collection::vec(phase13_mutation_strategy(), 0..=6),
+        phase13_execution_probe_strategy(),
     )
 }
 
@@ -13157,6 +13416,36 @@ proptest! {
             actual,
             expected,
             "phase 13 BOE versioned trace mismatch\nprobe: {}\ntrace:\n{}",
+            probe,
+            trace
+        );
+    }
+
+    #[test]
+    fn prop_boe_versioned_delete_execution_trace_matches_model(
+        (mutations, probe) in phase13_execution_trace_strategy()
+    ) {
+        let trace = mutations
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let harness = Phase13Harness::new();
+        let bucket = "authz-phase13-exec-prop";
+        harness.prepare(bucket);
+        let mut state = Phase13State::new();
+
+        for mutation in mutations.iter().copied() {
+            harness.apply_mutation(bucket, mutation);
+            state.apply(mutation);
+        }
+
+        let expected = state.expected_execution_outcome(probe);
+        let actual = to_phase13_execution_outcome(harness.execution_probe(bucket, probe));
+        prop_assert_eq!(
+            actual,
+            expected,
+            "phase 13 BOE versioned execution trace mismatch\nprobe: {}\ntrace:\n{}",
             probe,
             trace
         );

@@ -130,12 +130,18 @@ Acceptance criteria:
   - current vs specific-version delete authorization probes
   - governance/compliance/legal-hold effects on specific-version delete authorization
   - bypass-governance behavior against missing and locked versions in authorization
+- Implemented companion `phase13` BOE delete execution probes covering:
+  - `delete_object(...)` mutation effects on current-read visibility
+  - current-delete delete-marker insertion
+  - specific-version delete reveal of prior current state
+  - specific-version read-after-delete to prove the deleted tracked version is
+    no longer readable
 - Remaining gap: explicit versioning-mode transitions themselves are still not
   generated; the current Phase 3 slice starts from a versioning-enabled BOE
   bucket
-- Remaining gap: Phase 13 does not yet exercise `delete_object(...)` execution
-  and `apply_authorized_delete_object(...)` mutation/recheck behavior; it only
-  covers the BOE authorization decision path
+- Remaining gap: Phase 13 execution coverage is still focused on end-to-end
+  delete outcome plus resulting current-read visibility, not direct
+  `apply_authorized_delete_object(...)` TOCTOU-style recheck races
 
 ## Verification
 
