@@ -22,6 +22,46 @@ impl Deref for BoeBucketSummary<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(in crate::coordinator) enum PreloadedBucketTags<'a> {
+    Available(&'a [(String, String)]),
+    Unavailable,
+}
+
+impl<'a> PreloadedBucketTags<'a> {
+    pub(in crate::coordinator) fn new(tags: Option<&'a [(String, String)]>) -> Self {
+        match tags {
+            Some(tags) => Self::Available(tags),
+            None => Self::Unavailable,
+        }
+    }
+
+    fn for_policy_action(
+        self,
+        bucket: BoeBucketSummary<'_>,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<Option<&'a [(String, String)]>, ServerError> {
+        let Some(policy) = policy else {
+            return Ok(None);
+        };
+        if !(bucket.bucket_abac_enabled && policy.requires_bucket_tags_for_action(action)) {
+            return Ok(None);
+        }
+        match self {
+            Self::Available(tags) => Ok(Some(tags)),
+            Self::Unavailable => Err(ServerError::InternalError {
+                // This is a coordinator wiring bug, not an AWS-facing semantic branch.
+                // Any BOE modern-auth path that evaluates a bucket-tag-conditioned policy
+                // must have loaded the bucket tags before reaching the evaluator.
+                reason: format!(
+                    "BOE modern auth requires preloaded bucket tags for {action:?} when bucket ABAC is enabled"
+                ),
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::coordinator) enum ModernObjectReadAuthorization {
     Allowed,
@@ -117,7 +157,7 @@ fn modern_bucket_policy_allow_survives_restrict_public_buckets(
 fn bucket_policy_decision_for_put_object_action_modern(
     requester: &Requester,
     bucket: BoeBucketSummary<'_>,
-    bucket_tags: Option<&[(String, String)]>,
+    bucket_tags: PreloadedBucketTags<'_>,
     key: &str,
     action: auth::PolicyAction,
     policy_context: &PutObjectPolicyContext<'_>,
@@ -139,9 +179,10 @@ fn bucket_policy_decision_for_put_object_action_modern(
         .iter()
         .map(|(tag_key, value)| auth::PolicyTag::new(tag_key, value))
         .collect();
+    let bucket_tags = bucket_tags.for_policy_action(bucket, action, Some(policy))?;
     let bucket_tags: Vec<auth::PolicyTag<'_>> = bucket_tags
-        .unwrap_or(&[])
-        .iter()
+        .into_iter()
+        .flat_map(|tags| tags.iter())
         .map(|(key, value)| auth::PolicyTag::new(key, value))
         .collect();
     let policy_request = auth::PolicyRequest::for_object(
@@ -180,7 +221,7 @@ fn bucket_policy_decision_for_put_object_action_modern(
 pub(super) fn write_multipart_upload_with_bucket_policy(
     requester: &Requester,
     bucket: BoeBucketSummary<'_>,
-    bucket_tags: Option<&[(String, String)]>,
+    bucket_tags: PreloadedBucketTags<'_>,
     upload: &MultipartUploadRecord,
     policy_context: &PutObjectPolicyContext<'_>,
     policy: Option<&auth::BucketPolicy>,
@@ -215,7 +256,7 @@ pub(super) fn write_multipart_upload_with_bucket_policy(
 pub(super) fn put_object_authorization_with_bucket_policy(
     requester: &Requester,
     bucket: BoeBucketSummary<'_>,
-    bucket_tags: Option<&[(String, String)]>,
+    bucket_tags: PreloadedBucketTags<'_>,
     key: &str,
     action: ModernWriteAction,
     policy_context: &PutObjectPolicyContext<'_>,
@@ -282,7 +323,7 @@ pub(super) fn put_object_authorization_with_bucket_policy(
 pub(super) fn delete_object_authorization_with_bucket_policy(
     requester: &Requester,
     bucket: BoeBucketSummary<'_>,
-    bucket_tags: Option<&[(String, String)]>,
+    bucket_tags: PreloadedBucketTags<'_>,
     key: &str,
     object: Option<&StoredObject>,
     action: auth::PolicyAction,
@@ -325,7 +366,7 @@ pub(super) fn delete_object_authorization_with_bucket_policy(
 fn bucket_policy_decision_for_object_with_preloaded_tags_modern(
     requester: &Requester,
     bucket: BoeBucketSummary<'_>,
-    bucket_tags: Option<&[(String, String)]>,
+    bucket_tags: PreloadedBucketTags<'_>,
     object: &StoredObject,
     action: auth::PolicyAction,
     policy: Option<&auth::BucketPolicy>,
@@ -334,6 +375,7 @@ fn bucket_policy_decision_for_object_with_preloaded_tags_modern(
     let Some(policy) = policy else {
         return Ok(auth::PolicyEvaluation::NoMatch);
     };
+    let bucket_tags = bucket_tags.for_policy_action(bucket, action, Some(policy))?;
 
     Coordinator::evaluate_bucket_policy_for_object_request(
         super::policy::ObjectPolicyEvaluationContext {
@@ -358,28 +400,18 @@ fn modern_read_object_default_allowed(
 ) -> bool {
     match action {
         ModernReadAction::ReadCurrent | ModernReadAction::ReadVersion => {
-            if Coordinator::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
-                requester_can_modern_bucket_owner_account_admin(requester, bucket)
-            } else {
-                Coordinator::requester_matches_owner_identity(requester, object.owner())
-            }
+            requester_can_modern_bucket_owner_account_admin(requester, bucket)
         }
-        ModernReadAction::AttributesCurrent | ModernReadAction::AttributesVersion => {
-            if Coordinator::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
-                requester
-                    .principal_opt()
-                    .is_some_and(|principal| principal == object.owner().principal.as_str())
-            } else {
-                Coordinator::requester_matches_owner_identity(requester, object.owner())
-            }
-        }
+        ModernReadAction::AttributesCurrent | ModernReadAction::AttributesVersion => requester
+            .principal_opt()
+            .is_some_and(|principal| principal == object.owner().principal.as_str()),
     }
 }
 
 fn modern_read_object_authorization_for_single_action(
     requester: &Requester,
     bucket: BoeBucketSummary<'_>,
-    bucket_tags: Option<&[(String, String)]>,
+    bucket_tags: PreloadedBucketTags<'_>,
     object: &StoredObject,
     action: ModernReadAction,
     policy: Option<&auth::BucketPolicy>,
@@ -432,7 +464,7 @@ fn combine_modern_read_authorization(
 pub(super) fn read_object_authorization_with_bucket_policy(
     requester: &Requester,
     bucket: BoeBucketSummary<'_>,
-    bucket_tags: Option<&[(String, String)]>,
+    bucket_tags: PreloadedBucketTags<'_>,
     object: &StoredObject,
     action: ModernReadAction,
     policy: Option<&auth::BucketPolicy>,

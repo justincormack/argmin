@@ -1,12 +1,15 @@
 use super::authz::{
     BoeBucketSummary, ModernObjectReadAuthorization, ModernObjectWriteAuthorization,
-    ModernReadAction, ModernWriteAction,
+    ModernReadAction, ModernWriteAction, PreloadedBucketTags,
 };
 use super::response_types::ModernBucketSummary;
 use super::test_helpers;
 use super::test_hooks::{
     install_bucket_policy_load_test_hooks, BucketPolicyLoadTestHooks,
     BUCKET_POLICY_LOAD_TEST_SERIAL,
+};
+use super::test_support::{
+    put_bucket_ownership_controls_test, put_bucket_policy_test, NO_DELETE, NO_PUT_OBJECT_ACL,
 };
 use super::*;
 use crate::conditional::{ReadCondition, WriteCondition};
@@ -32,6 +35,8 @@ const KEY: &str = "key";
 const MISSING_KEY: &str = "missing";
 const TAGS_XML: &str =
     "<Tagging><TagSet><Tag><Key>env</Key><Value>phase2</Value></Tag></TagSet></Tagging>";
+const BOE_BUCKET_TAGS_XML: &str =
+    "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>";
 const TEST_SSE_S3_WRAPPING_KEY_B64: &str = "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=";
 
 mod model {
@@ -1667,6 +1672,253 @@ mod harness {
                 version_id,
             ))
         }
+
+        fn setup_boe_abac_bucket_with_bucket_tag_policy(
+            &self,
+            bucket: &str,
+            policy_action: &str,
+        ) -> Requester {
+            self.coord
+                .create_bucket_for_owner(self.fixtures.owner_user.principal(), bucket, false)
+                .unwrap();
+            put_bucket_ownership_controls_test(
+                &self.coord,
+                bucket,
+                "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+                Requester::authenticated(self.fixtures.owner_user.clone()),
+                None,
+            )
+            .unwrap();
+            self.coord
+                .put_bucket_tags(&PutBucketConfigRequest {
+                    bucket: BucketRequest::new(
+                        trusted_bucket_name(bucket),
+                        Requester::authenticated(self.fixtures.owner_user.clone()),
+                        None,
+                    ),
+                    config: BOE_BUCKET_TAGS_XML,
+                })
+                .unwrap();
+            self.coord
+                .put_bucket_abac(&PutBucketAbacRequest {
+                    bucket: BucketRequest::new(
+                        trusted_bucket_name(bucket),
+                        Requester::authenticated(self.fixtures.owner_user.clone()),
+                        None,
+                    ),
+                    enabled: true,
+                })
+                .unwrap();
+            put_bucket_policy_test(
+                &self.coord,
+                bucket,
+                &format!(
+                    r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"{}","Resource":"arn:aws:s3:::{}/*","Condition":{{"StringEquals":{{"s3:BucketTag/security":"public"}}}}}}]}}"#,
+                    self.fixtures.cross_account.principal(),
+                    policy_action,
+                    bucket
+                ),
+                Requester::authenticated(self.fixtures.owner_user.clone()),
+                None,
+            )
+            .unwrap();
+            Requester::authenticated(self.fixtures.cross_account.clone())
+        }
+
+        pub(super) fn run_boe_bucket_tag_snapshot_loader_invariant(&self, bucket: &str) {
+            let requester =
+                self.setup_boe_abac_bucket_with_bucket_tag_policy(bucket, "s3:GetObject");
+            test_helpers::put_object(
+                &self.coord,
+                &PutObjectRequest {
+                    encryption: WriteEncryptionRequest::none(),
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
+                    object: ObjectRequest::new(
+                        trusted_bucket_name(bucket),
+                        trusted_object_key(KEY),
+                        Requester::authenticated(self.fixtures.owner_user.clone()),
+                        None,
+                    ),
+                    data: b"boe-abac-read",
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    tags: None,
+                    cond: NO_WRITE,
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                },
+            )
+            .unwrap();
+
+            self.coord
+                .remove_bucket_fast_path(&trusted_bucket_name(bucket));
+            self.coord
+                .head_object(&GetObjectRequest {
+                    sse_customer: None,
+                    object: ObjectVersionRequest::new(
+                        trusted_bucket_name(bucket),
+                        trusted_object_key(KEY),
+                        None,
+                        requester,
+                        None,
+                    ),
+                    cond: NO_READ,
+                })
+                .unwrap();
+            let cached = self
+                .coord
+                .get_bucket_fast_path(&trusted_bucket_name(bucket))
+                .expect("cold BOE ABAC read should populate fast path");
+            assert!(matches!(
+                cached.tags,
+                storage::BucketFastPathTags::Loaded(_)
+            ));
+        }
+
+        pub(super) fn run_boe_bucket_tag_fast_path_loader_invariant(&self, bucket: &str) {
+            let requester =
+                self.setup_boe_abac_bucket_with_bucket_tag_policy(bucket, "s3:GetObject");
+            test_helpers::put_object(
+                &self.coord,
+                &PutObjectRequest {
+                    encryption: WriteEncryptionRequest::none(),
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
+                    object: ObjectRequest::new(
+                        trusted_bucket_name(bucket),
+                        trusted_object_key(KEY),
+                        Requester::authenticated(self.fixtures.owner_user.clone()),
+                        None,
+                    ),
+                    data: b"boe-abac-read",
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    tags: None,
+                    cond: NO_WRITE,
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                },
+            )
+            .unwrap();
+            self.coord
+                .head_object(&GetObjectRequest {
+                    sse_customer: None,
+                    object: ObjectVersionRequest::new(
+                        trusted_bucket_name(bucket),
+                        trusted_object_key(KEY),
+                        None,
+                        requester,
+                        None,
+                    ),
+                    cond: NO_READ,
+                })
+                .unwrap();
+
+            let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
+                .get_or_init(|| std::sync::Mutex::new(()))
+                .lock()
+                .unwrap();
+            let saw_storage_load = Arc::new(AtomicBool::new(false));
+            let saw_fast_path = Arc::new(AtomicBool::new(false));
+            let saw_storage_load_hook = Arc::clone(&saw_storage_load);
+            let saw_fast_path_hook = Arc::clone(&saw_fast_path);
+            let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
+                bucket: Some(bucket.to_string()),
+                before_storage_load: Some(Arc::new(move || {
+                    saw_storage_load_hook.store(true, Ordering::SeqCst);
+                })),
+                after_policy_fast_path_hit: Some(Arc::new(move || {
+                    saw_fast_path_hook.store(true, Ordering::SeqCst);
+                })),
+            });
+
+            self.coord
+                .head_object(&GetObjectRequest {
+                    sse_customer: None,
+                    object: ObjectVersionRequest::new(
+                        trusted_bucket_name(bucket),
+                        trusted_object_key(KEY),
+                        None,
+                        Requester::authenticated(self.fixtures.cross_account.clone()),
+                        None,
+                    ),
+                    cond: NO_READ,
+                })
+                .unwrap();
+            assert!(
+                saw_fast_path.load(Ordering::SeqCst),
+                "warm BOE ABAC load should hit the fast path"
+            );
+            assert!(
+                !saw_storage_load.load(Ordering::SeqCst),
+                "warm BOE ABAC load should not reload storage"
+            );
+        }
+
+        pub(super) fn run_boe_bucket_tag_put_object_invariant(&self, bucket: &str) {
+            let requester =
+                self.setup_boe_abac_bucket_with_bucket_tag_policy(bucket, "s3:PutObject");
+            test_helpers::put_object(
+                &self.coord,
+                &PutObjectRequest {
+                    encryption: WriteEncryptionRequest::none(),
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
+                    object: ObjectRequest::new(
+                        trusted_bucket_name(bucket),
+                        trusted_object_key(KEY),
+                        requester,
+                        None,
+                    ),
+                    data: b"boe-abac-write",
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    tags: None,
+                    cond: NO_WRITE,
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                },
+            )
+            .unwrap();
+        }
+
+        pub(super) fn run_boe_bucket_tag_delete_invariant(&self, bucket: &str) {
+            let requester =
+                self.setup_boe_abac_bucket_with_bucket_tag_policy(bucket, "s3:DeleteObject");
+            test_helpers::put_object(
+                &self.coord,
+                &PutObjectRequest {
+                    encryption: WriteEncryptionRequest::none(),
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
+                    object: ObjectRequest::new(
+                        trusted_bucket_name(bucket),
+                        trusted_object_key(KEY),
+                        Requester::authenticated(self.fixtures.owner_user.clone()),
+                        None,
+                    ),
+                    data: b"boe-abac-delete",
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    tags: None,
+                    cond: NO_WRITE,
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                },
+            )
+            .unwrap();
+
+            self.coord
+                .delete_object(&DeleteObjectRequest {
+                    object: ObjectVersionRequest::new(
+                        trusted_bucket_name(bucket),
+                        trusted_object_key(KEY),
+                        None,
+                        requester,
+                        None,
+                    ),
+                    bypass_governance: false,
+                    cond: NO_DELETE,
+                })
+                .unwrap();
+        }
     }
 
     pub(super) fn bucket_name_for(action: Action, index: usize) -> String {
@@ -2073,10 +2325,13 @@ mod harness {
             modern_bucket_summary(fixtures, bucket, scenario.bucket, policy.as_ref());
         let action = modern_read_action(scenario.action, version_id);
 
+        let bucket =
+            BoeBucketSummary::new(&bucket_summary).expect("BOE modern read requires BOE bucket");
+        let bucket_tags = PreloadedBucketTags::new(None);
         Coordinator::modern_read_object_authorization_with_bucket_policy(
             &requester,
-            BoeBucketSummary::new(&bucket_summary).expect("BOE modern read requires BOE bucket"),
-            None,
+            bucket,
+            bucket_tags,
             &object,
             action,
             policy.as_ref(),
@@ -3549,10 +3804,13 @@ mod phase4_harness {
                 PutObjectPolicyContext::default()
             }
         };
+        let bucket =
+            BoeBucketSummary::new(&bucket_summary).expect("modern BOE write requires BOE bucket");
+        let bucket_tags = PreloadedBucketTags::new(None);
         Coordinator::modern_put_object_authorization_with_bucket_policy(
             &requester,
-            BoeBucketSummary::new(&bucket_summary).expect("modern BOE write requires BOE bucket"),
-            None,
+            bucket,
+            bucket_tags,
             PHASE4_KEY,
             match scenario.action {
                 WriteAction::PutObject | WriteAction::BeginStreamPut => {
@@ -9752,6 +10010,29 @@ fn authz_model_modern_boe_get_object_existing_matrix() {
 #[test]
 fn authz_model_boe_get_object_fast_path_matches_snapshot_evaluator() {
     run_boe_read_fast_path_invariant(Action::GetObject);
+}
+
+#[test]
+fn authz_model_boe_bucket_tag_policy_snapshot_loader_preloads_tags() {
+    MatrixHarness::new()
+        .run_boe_bucket_tag_snapshot_loader_invariant("authz-modern-boe-bucket-tags-snapshot");
+}
+
+#[test]
+fn authz_model_boe_bucket_tag_policy_fast_path_preserves_tags() {
+    MatrixHarness::new()
+        .run_boe_bucket_tag_fast_path_loader_invariant("authz-modern-boe-bucket-tags-fast");
+}
+
+#[test]
+fn authz_model_boe_bucket_tag_policy_put_object_path_preloads_tags() {
+    MatrixHarness::new()
+        .run_boe_bucket_tag_put_object_invariant("authz-modern-boe-bucket-tags-put");
+}
+
+#[test]
+fn authz_model_boe_bucket_tag_policy_delete_path_preloads_tags() {
+    MatrixHarness::new().run_boe_bucket_tag_delete_invariant("authz-modern-boe-bucket-tags-delete");
 }
 
 macro_rules! modern_boe_get_object_attributes_existing_matrix_shards {
