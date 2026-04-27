@@ -1879,12 +1879,16 @@ async fn handle_streaming_put(
     {
         Ok(Ok(ctx)) => ctx,
         Ok(Err(err)) => {
-            drain_request_body(&mut body, idle_timeout).await;
-            return error_response(&err);
+            return finish_streaming_prepare_failure(error_response(&err), &mut body, idle_timeout)
+                .await
         }
         Err(_) => {
-            drain_request_body(&mut body, idle_timeout).await;
-            return internal_error_response();
+            return finish_streaming_prepare_failure(
+                internal_error_response(),
+                &mut body,
+                idle_timeout,
+            )
+            .await
         }
     };
     // Build chunked decoder if needed.
@@ -2510,6 +2514,25 @@ async fn abort_streaming_post_object(
     .await;
 }
 
+fn close_response_connection(mut resp: S3Response) -> S3Response {
+    resp.headers
+        .push(("Connection".to_string(), "close".to_string()));
+    resp
+}
+
+async fn finish_streaming_prepare_failure(
+    resp: S3Response,
+    body: &mut Incoming,
+    idle_timeout: Duration,
+) -> S3Response {
+    if resp.status_code == 403 {
+        close_response_connection(resp)
+    } else {
+        drain_request_body(body, idle_timeout).await;
+        resp
+    }
+}
+
 async fn drain_request_body(body: &mut Incoming, idle_timeout: Duration) {
     while let Ok(Some(Ok(_))) = tokio::time::timeout(idle_timeout, body.frame()).await {}
 }
@@ -2570,12 +2593,16 @@ async fn handle_streaming_part(
     {
         Ok(Ok(ctx)) => ctx,
         Ok(Err(err)) => {
-            drain_request_body(&mut body, idle_timeout).await;
-            return error_response(&err);
+            return finish_streaming_prepare_failure(error_response(&err), &mut body, idle_timeout)
+                .await
         }
         Err(_) => {
-            drain_request_body(&mut body, idle_timeout).await;
-            return internal_error_response();
+            return finish_streaming_prepare_failure(
+                internal_error_response(),
+                &mut body,
+                idle_timeout,
+            )
+            .await
         }
     };
     if trailing_hasher.is_none() {
@@ -3402,7 +3429,10 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream as StdTcpStream};
     use std::panic::AssertUnwindSafe;
-    use std::sync::{atomic::AtomicUsize, Arc};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use auth::canonical::{
@@ -3506,19 +3536,24 @@ mod tests {
         })
     }
 
-    fn create_test_bucket_and_upload(frontend: &HttpFrontend, bucket: &str, key: &str) -> String {
+    fn create_test_bucket(frontend: &HttpFrontend, bucket: &str) {
         let requester = server_core::coordinator::test_helpers::requester(TEST_ACCESS_KEY);
         frontend
             .coordinator
             .create_bucket(&crate::coordinator::CreateBucketRequest {
                 name: storage::BucketName::try_from(bucket.to_string()).unwrap(),
-                requester: requester.clone(),
+                requester,
                 namespace: s3_types::BucketNamespace::Global,
                 acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
                 ownership: crate::coordinator::BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
             })
             .unwrap();
+    }
+
+    fn create_test_bucket_and_upload(frontend: &HttpFrontend, bucket: &str, key: &str) -> String {
+        create_test_bucket(frontend, bucket);
+        let requester = server_core::coordinator::test_helpers::requester(TEST_ACCESS_KEY);
         frontend
             .coordinator
             .create_multipart_upload(&crate::coordinator::CreateMultipartUploadRequest {
@@ -3665,6 +3700,43 @@ mod tests {
         }
 
         String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn denied_streaming_request_response(
+        addr: &str,
+        request_head: String,
+        total_body_bytes: usize,
+    ) -> (String, usize) {
+        const WRITE_CHUNK_BYTES: usize = 1024;
+        const WRITE_CHUNK_DELAY: Duration = Duration::from_millis(20);
+        const RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
+
+        let mut stream = StdTcpStream::connect(addr).unwrap();
+        stream.set_nodelay(true).unwrap();
+
+        let mut writer = stream.try_clone().unwrap();
+        writer.set_nodelay(true).unwrap();
+
+        let bytes_sent = Arc::new(AtomicUsize::new(0));
+        let bytes_sent_writer = Arc::clone(&bytes_sent);
+        let body_chunk = vec![b'x'; WRITE_CHUNK_BYTES];
+        let writer_handle = std::thread::spawn(move || {
+            writer.write_all(request_head.as_bytes()).unwrap();
+            let chunk_count = total_body_bytes / WRITE_CHUNK_BYTES;
+            for _ in 0..chunk_count {
+                match writer.write_all(&body_chunk) {
+                    Ok(()) => {
+                        bytes_sent_writer.fetch_add(WRITE_CHUNK_BYTES, Ordering::Relaxed);
+                        std::thread::sleep(WRITE_CHUNK_DELAY);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let response = read_http_response(&mut stream, RESPONSE_TIMEOUT);
+        writer_handle.join().unwrap();
+        (response, bytes_sent.load(Ordering::Relaxed))
     }
 
     fn hmac_sha256(key: &[u8], data: &[u8]) -> hmac::Tag {
@@ -4648,6 +4720,80 @@ Connection: close\r\n\r\n",
             frontend.coordinator.scavenge_stale_sessions(0),
             0,
             "streaming session leaked after UploadPart bad checksum"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn denied_streaming_put_responds_before_full_body_is_sent() {
+        const TOTAL_BODY_BYTES: usize = 256 * 1024;
+
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend, "mybucket");
+        let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
+
+        let request = format!(
+            "PUT /mybucket/mykey HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Content-Length: {TOTAL_BODY_BYTES}\r\n\
+Connection: keep-alive\r\n\r\n"
+        );
+        let (response, bytes_sent) =
+            denied_streaming_request_response(&addr, request, TOTAL_BODY_BYTES);
+
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "expected 403 status, got: {}",
+            response.lines().next().unwrap_or("")
+        );
+        assert!(
+            response.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied body, got: {response}"
+        );
+        assert!(
+            response.to_ascii_lowercase().contains("connection: close"),
+            "expected Connection: close header, got: {response}"
+        );
+        assert!(
+            bytes_sent < TOTAL_BODY_BYTES,
+            "server read the full denied PUT body before responding: sent {bytes_sent} bytes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn denied_streaming_upload_part_responds_before_full_body_is_sent() {
+        const TOTAL_BODY_BYTES: usize = 256 * 1024;
+
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        let upload_id = create_test_bucket_and_upload(&frontend, "mybucket", "mykey");
+        let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
+
+        let request = format!(
+            "PUT /mybucket/mykey?partNumber=1&uploadId={upload_id} HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Content-Length: {TOTAL_BODY_BYTES}\r\n\
+Connection: keep-alive\r\n\r\n"
+        );
+        let (response, bytes_sent) =
+            denied_streaming_request_response(&addr, request, TOTAL_BODY_BYTES);
+
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "expected 403 status, got: {}",
+            response.lines().next().unwrap_or("")
+        );
+        assert!(
+            response.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied body, got: {response}"
+        );
+        assert!(
+            response.to_ascii_lowercase().contains("connection: close"),
+            "expected Connection: close header, got: {response}"
+        );
+        assert!(
+            bytes_sent < TOTAL_BODY_BYTES,
+            "server read the full denied UploadPart body before responding: sent {bytes_sent} bytes"
         );
     }
 }
