@@ -9,6 +9,33 @@ use crate::sigv4;
 
 const TRACE_TARGET: &str = "auth";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PostPolicyCondition {
+    BucketExact(String),
+    FieldExact { field: String, expected: String },
+    StartsWith { field: String, prefix: String },
+    Eq { field: String, expected: String },
+    ContentLengthRange { min: u64, max: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedPostPolicy {
+    conditions: Vec<PostPolicyCondition>,
+}
+
+impl PreparedPostPolicy {
+    #[must_use]
+    pub fn max_content_length(&self) -> Option<u64> {
+        self.conditions
+            .iter()
+            .filter_map(|condition| match condition {
+                PostPolicyCondition::ContentLengthRange { max, .. } => Some(*max),
+                _ => None,
+            })
+            .min()
+    }
+}
+
 /// Authenticate a POST Object request using SigV4 form fields.
 ///
 /// SigV4 POST signs the base64-encoded policy directly (no canonical request).
@@ -77,7 +104,7 @@ pub fn authenticate_post_sigv4(
 ///
 /// These are distinct from `AuthError` — policy violations are 400 (bad request),
 /// not 403 (access denied).
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PostPolicyError {
     #[error("malformed policy: {0}")]
     Malformed(&'static str),
@@ -90,17 +117,10 @@ pub enum PostPolicyError {
     },
 }
 
-/// Validate a POST policy document.
-///
-/// Checks expiration and condition matching.
-/// Returns `PostPolicyError` (maps to HTTP 400) on failure.
-pub fn validate_post_policy(
+fn parse_post_policy(
     policy_b64: &str,
-    form_fields: &[(&str, &str)],
-    file_size: usize,
-    bucket: &str,
     now_epoch_secs: u64,
-) -> Result<(), PostPolicyError> {
+) -> Result<PreparedPostPolicy, PostPolicyError> {
     use base64::Engine;
 
     let policy_bytes = base64::engine::general_purpose::STANDARD
@@ -132,8 +152,7 @@ pub fn validate_post_policy(
         return Err(PostPolicyError::Malformed("empty conditions"));
     }
 
-    // Track which field names are covered by policy conditions
-    let mut covered_fields = std::collections::HashSet::new();
+    let mut parsed_conditions = Vec::with_capacity(conditions.len());
 
     for condition in conditions {
         if let Some(obj) = condition.as_object() {
@@ -149,24 +168,12 @@ pub fn validate_post_policy(
                 // "bucket" is a special virtual condition key (not a form field)
                 // and must be lowercase — "Bucket" is treated as a regular field.
                 if key == "bucket" {
-                    covered_fields.insert("bucket".to_string());
-                    if bucket != expected {
-                        return Err(PostPolicyError::ConditionFailed {
-                            condition: "bucket",
-                            field: None,
-                        });
-                    }
+                    parsed_conditions.push(PostPolicyCondition::BucketExact(expected.to_string()));
                 } else {
-                    // Form field condition keys are case-insensitive
-                    let field_name = key.to_ascii_lowercase();
-                    covered_fields.insert(field_name.clone());
-                    let form_val = find_field(form_fields, &field_name);
-                    if form_val != Some(expected) {
-                        return Err(PostPolicyError::ConditionFailed {
-                            condition: "exact match",
-                            field: Some(field_name),
-                        });
-                    }
+                    parsed_conditions.push(PostPolicyCondition::FieldExact {
+                        field: key.to_ascii_lowercase(),
+                        expected: expected.to_string(),
+                    });
                 }
             }
         } else if let Some(arr) = condition.as_array() {
@@ -195,14 +202,10 @@ pub fn validate_post_policy(
                             "field reference must start with $",
                         ))?
                         .to_ascii_lowercase();
-                    covered_fields.insert(field_name.clone());
-                    let form_val = find_field(form_fields, &field_name).unwrap_or("");
-                    if !form_val.starts_with(prefix) {
-                        return Err(PostPolicyError::ConditionFailed {
-                            condition: "starts-with",
-                            field: Some(field_name),
-                        });
-                    }
+                    parsed_conditions.push(PostPolicyCondition::StartsWith {
+                        field: field_name,
+                        prefix: prefix.to_string(),
+                    });
                 } else if op.eq_ignore_ascii_case("eq") {
                     let field_ref = arr[1]
                         .as_str()
@@ -216,14 +219,10 @@ pub fn validate_post_policy(
                             "field reference must start with $",
                         ))?
                         .to_ascii_lowercase();
-                    covered_fields.insert(field_name.clone());
-                    let form_val = find_field(form_fields, &field_name);
-                    if form_val != Some(expected) {
-                        return Err(PostPolicyError::ConditionFailed {
-                            condition: "eq",
-                            field: Some(field_name),
-                        });
-                    }
+                    parsed_conditions.push(PostPolicyCondition::Eq {
+                        field: field_name,
+                        expected: expected.to_string(),
+                    });
                 } else if op == "content-length-range" {
                     // Reject negative values (as_i64 check) and non-integer values
                     let min_i = arr[1].as_i64().ok_or(PostPolicyError::Malformed(
@@ -237,17 +236,75 @@ pub fn validate_post_policy(
                             "content-length-range values must be non-negative",
                         ));
                     }
-                    let min = min_i as u64;
-                    let max = max_i as u64;
-                    let size = file_size as u64;
-                    if size < min || size > max {
-                        return Err(PostPolicyError::ConditionFailed {
-                            condition: "content-length-range",
-                            field: None,
-                        });
-                    }
+                    parsed_conditions.push(PostPolicyCondition::ContentLengthRange {
+                        min: min_i as u64,
+                        max: max_i as u64,
+                    });
                 }
             }
+        }
+    }
+
+    Ok(PreparedPostPolicy {
+        conditions: parsed_conditions,
+    })
+}
+
+/// Decode and validate a POST policy before file ingestion begins.
+///
+/// This checks all field-dependent constraints and expiration, but does not
+/// check `content-length-range` against the final file size.
+pub fn prepare_post_policy(
+    policy_b64: &str,
+    form_fields: &[(&str, &str)],
+    bucket: &str,
+    now_epoch_secs: u64,
+) -> Result<PreparedPostPolicy, PostPolicyError> {
+    let prepared = parse_post_policy(policy_b64, now_epoch_secs)?;
+
+    // Track which field names are covered by policy conditions
+    let mut covered_fields = std::collections::HashSet::new();
+
+    for condition in &prepared.conditions {
+        match condition {
+            PostPolicyCondition::BucketExact(expected) => {
+                covered_fields.insert("bucket".to_string());
+                if bucket != expected {
+                    return Err(PostPolicyError::ConditionFailed {
+                        condition: "bucket",
+                        field: None,
+                    });
+                }
+            }
+            PostPolicyCondition::FieldExact { field, expected } => {
+                covered_fields.insert(field.clone());
+                if find_field(form_fields, field) != Some(expected.as_str()) {
+                    return Err(PostPolicyError::ConditionFailed {
+                        condition: "exact match",
+                        field: Some(field.clone()),
+                    });
+                }
+            }
+            PostPolicyCondition::StartsWith { field, prefix } => {
+                covered_fields.insert(field.clone());
+                let form_val = find_field(form_fields, field).unwrap_or("");
+                if !form_val.starts_with(prefix) {
+                    return Err(PostPolicyError::ConditionFailed {
+                        condition: "starts-with",
+                        field: Some(field.clone()),
+                    });
+                }
+            }
+            PostPolicyCondition::Eq { field, expected } => {
+                covered_fields.insert(field.clone());
+                if find_field(form_fields, field) != Some(expected.as_str()) {
+                    return Err(PostPolicyError::ConditionFailed {
+                        condition: "eq",
+                        field: Some(field.clone()),
+                    });
+                }
+            }
+            PostPolicyCondition::ContentLengthRange { .. } => {}
         }
     }
 
@@ -270,7 +327,40 @@ pub fn validate_post_policy(
         }
     }
 
+    Ok(prepared)
+}
+
+/// Validate the final uploaded file size against a previously prepared policy.
+pub fn validate_prepared_post_policy_size(
+    prepared: &PreparedPostPolicy,
+    file_size: usize,
+) -> Result<(), PostPolicyError> {
+    let size = file_size as u64;
+    for condition in &prepared.conditions {
+        if let PostPolicyCondition::ContentLengthRange { min, max } = condition {
+            if size < *min || size > *max {
+                return Err(PostPolicyError::ConditionFailed {
+                    condition: "content-length-range",
+                    field: None,
+                });
+            }
+        }
+    }
     Ok(())
+}
+
+/// Validate a POST policy document.
+///
+/// Checks expiration, condition matching, and final size constraints.
+pub fn validate_post_policy(
+    policy_b64: &str,
+    form_fields: &[(&str, &str)],
+    file_size: usize,
+    bucket: &str,
+    now_epoch_secs: u64,
+) -> Result<(), PostPolicyError> {
+    let prepared = prepare_post_policy(policy_b64, form_fields, bucket, now_epoch_secs)?;
+    validate_prepared_post_policy_size(&prepared, file_size)
 }
 
 fn find_field<'a>(fields: &[(&'a str, &'a str)], name: &str) -> Option<&'a str> {
@@ -310,6 +400,20 @@ mod tests {
     use super::*;
     use crate::credential::SecretKey;
     use s3_types::AccountIdentity;
+
+    fn assert_split_validation_matches(
+        policy_b64: &str,
+        form_fields: &[(&str, &str)],
+        file_size: usize,
+        bucket: &str,
+        now_epoch_secs: u64,
+    ) {
+        let wrapper =
+            validate_post_policy(policy_b64, form_fields, file_size, bucket, now_epoch_secs);
+        let split = prepare_post_policy(policy_b64, form_fields, bucket, now_epoch_secs)
+            .and_then(|prepared| validate_prepared_post_policy_size(&prepared, file_size));
+        assert_eq!(wrapper, split, "wrapper and split validation diverged");
+    }
 
     fn test_store() -> CredentialStore {
         let mut store = CredentialStore::new();
@@ -545,6 +649,49 @@ mod tests {
     fn policy_invalid_base64() {
         let err = validate_post_policy("!!!not-base64!!!", &[], 0, "b", 0).unwrap_err();
         assert!(matches!(err, PostPolicyError::Malformed("invalid base64")));
+    }
+
+    #[test]
+    fn split_validation_matches_wrapper_for_established_cases() {
+        let uncovered_fields = vec![("key", "obj"), ("acl", "public-read")];
+        let uncovered_policy = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!({"key": "obj"}),
+        ]);
+        let multiple_ranges_policy = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["content-length-range", 0, 1024]),
+            serde_json::json!(["content-length-range", 10, 100]),
+        ]);
+        let min_gt_max_policy = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["content-length-range", 100, 10]),
+        ]);
+        let malformed_args_policy = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["content-length-range", 0]),
+        ]);
+        let expired_policy = future_policy_b64(&[serde_json::json!({"bucket": "b"})]);
+
+        let cases = [
+            (&multiple_ranges_policy, Vec::new(), 5usize, "b", 0u64),
+            (&multiple_ranges_policy, Vec::new(), 50usize, "b", 0u64),
+            (&multiple_ranges_policy, Vec::new(), 150usize, "b", 0u64),
+            (&min_gt_max_policy, Vec::new(), 50usize, "b", 0u64),
+            (&malformed_args_policy, Vec::new(), 0usize, "b", 0u64),
+            (&uncovered_policy, uncovered_fields, 0usize, "b", 0u64),
+            (&expired_policy, Vec::new(), 0usize, "b", 99_999_999_999u64),
+        ];
+
+        for (policy_b64, form_fields, file_size, bucket, now_epoch_secs) in cases {
+            assert_split_validation_matches(
+                policy_b64,
+                &form_fields,
+                file_size,
+                bucket,
+                now_epoch_secs,
+            );
+        }
     }
 
     #[test]

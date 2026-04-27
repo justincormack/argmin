@@ -63,7 +63,10 @@ pub use credential::{
     AuthorizationProfile, CredentialRecord, CredentialScope, CredentialStore, SecretKey,
 };
 pub use error::AuthError;
-pub use post::{authenticate_post_sigv4, validate_post_policy, PostPolicyError};
+pub use post::{
+    authenticate_post_sigv4, prepare_post_policy, validate_post_policy,
+    validate_prepared_post_policy_size, PostPolicyError, PreparedPostPolicy,
+};
 pub use request::{
     authenticate_request, AuthContext, AuthMode, HeaderSource, StreamingSigningContext,
 };

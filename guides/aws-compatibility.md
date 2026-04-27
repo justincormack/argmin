@@ -63,6 +63,23 @@ The AWS-backed `s3-tests` coverage for this case is allowed to diverge
 explicitly, and should not be treated as a general license to ignore AWS
 results elsewhere.
 
+### Streaming write prepare failures can differ at the transport level
+
+For streaming `PutObject`, `UploadPart`, and streaming `POST Object` flows,
+Argmin distinguishes between:
+
+- auth-layer failures or anonymous denies, where the server closes promptly to
+  avoid letting an unauthenticated client hold request capacity by continuing
+  to stream a body, and
+- authenticated permission denials, where the server prefers to drain/respond
+  so SDK clients see a normal S3 error instead of a transport-level broken
+  pipe while still writing the request body.
+
+The compatibility target remains the same final S3 error code and body.
+However, exact transport timing and whether the connection is closed early can
+still differ slightly from AWS in some edge cases with unread streaming
+bodies.
+
 ## Current known gaps
 
 ### 1. Single-part `ETag` is not AWS MD5

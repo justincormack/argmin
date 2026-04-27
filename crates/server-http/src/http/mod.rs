@@ -3365,6 +3365,25 @@ impl HttpFrontend {
         };
         self.enforce_bucket_region_raw(bucket, effective_auth)?;
 
+        let post_policy = if let Some(policy_b64) = field("policy") {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let mut field_pairs: Vec<(&str, &str)> = form_fields
+                .iter()
+                .filter(|(k, _)| !k.eq_ignore_ascii_case("key"))
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            field_pairs.push(("key", key.as_str()));
+            Some(
+                auth::prepare_post_policy(policy_b64, &field_pairs, bucket, now)
+                    .map_err(Self::map_post_policy_error)?,
+            )
+        } else {
+            None
+        };
+
         // Build metadata headers from form fields.
         let mut header_pairs: Vec<(String, String)> = Vec::new();
         if let Some(ct) = field("Content-Type") {
@@ -3469,8 +3488,7 @@ impl HttpFrontend {
             success_status,
             success_redirect,
             response_location,
-            form_fields: form_fields.to_vec(),
-            policy_b64: field("policy").map(std::string::ToString::to_string),
+            post_policy,
             checksum_sha256_b64: field("x-amz-checksum-sha256")
                 .map(std::string::ToString::to_string),
             sse_customer: sse_customer_request,
@@ -3495,55 +3513,16 @@ impl HttpFrontend {
             ctx.key(),
             total_size
         );
-        // Validate policy (if present) with the actual uploaded file size.
-        if let Some(policy_b64) = ctx.policy_b64.as_deref() {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+        // Validate late size-dependent policy constraints.
+        if let Some(post_policy) = ctx.post_policy.as_ref() {
             let file_size =
                 usize::try_from(total_size).map_err(|_| ServerError::ObjectTooLarge {
                     size: total_size,
                     max: crate::coordinator::MAX_OBJECT_SIZE,
                 })?;
 
-            let mut field_pairs: Vec<(&str, &str)> = ctx
-                .form_fields
-                .iter()
-                .filter(|(k, _)| !k.eq_ignore_ascii_case("key"))
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect();
-            field_pairs.push(("key", ctx.key().as_str()));
-
-            auth::validate_post_policy(
-                policy_b64,
-                &field_pairs,
-                file_size,
-                ctx.bucket().as_str(),
-                now,
-            )
-            .map_err(|e| match &e {
-                // Structural/format errors → 400
-                auth::PostPolicyError::Malformed(_) => ServerError::InvalidRequest {
-                    reason: e.to_string(),
-                },
-                // content-length-range violations → 400
-                auth::PostPolicyError::ConditionFailed {
-                    condition: "content-length-range",
-                    ..
-                } => ServerError::InvalidRequest {
-                    reason: e.to_string(),
-                },
-                // Other condition failures and expiration → 403
-                auth::PostPolicyError::ConditionFailed {
-                    field: Some(field), ..
-                } => ServerError::PostPolicyAccessDenied {
-                    reason: format!("Access denied by POST policy condition on field '{field}'"),
-                },
-                auth::PostPolicyError::Expired | auth::PostPolicyError::ConditionFailed { .. } => {
-                    ServerError::Auth(auth::AuthError::AccessDenied)
-                }
-            })?;
+            auth::validate_prepared_post_policy_size(post_policy, file_size)
+                .map_err(Self::map_post_policy_error)?;
         }
 
         // Validate optional x-amz-checksum-sha256 form field.
@@ -3579,6 +3558,28 @@ impl HttpFrontend {
         );
         apply_sse_customer_write_response_headers(&mut resp, ctx.sse_customer.as_ref());
         Ok(resp)
+    }
+
+    fn map_post_policy_error(error: auth::PostPolicyError) -> ServerError {
+        match error {
+            auth::PostPolicyError::Malformed(_) => ServerError::InvalidRequest {
+                reason: error.to_string(),
+            },
+            auth::PostPolicyError::ConditionFailed {
+                condition: "content-length-range",
+                ..
+            } => ServerError::InvalidRequest {
+                reason: error.to_string(),
+            },
+            auth::PostPolicyError::ConditionFailed {
+                field: Some(field), ..
+            } => ServerError::PostPolicyAccessDenied {
+                reason: format!("Access denied by POST policy condition on field '{field}'"),
+            },
+            auth::PostPolicyError::Expired | auth::PostPolicyError::ConditionFailed { .. } => {
+                ServerError::Auth(auth::AuthError::AccessDenied)
+            }
+        }
     }
 
     /// Append a segment to a streaming POST session.
@@ -4265,8 +4266,7 @@ struct StreamingPostContext {
     success_status: u16,
     success_redirect: Option<String>,
     response_location: Option<String>,
-    form_fields: Vec<(String, String)>,
-    policy_b64: Option<String>,
+    post_policy: Option<auth::PreparedPostPolicy>,
     checksum_sha256_b64: Option<String>,
     sse_customer: Option<SseCustomerRequest>,
     authorized_write: AuthorizedPutObjectWrite,
@@ -5851,6 +5851,78 @@ mod tests {
             ),
         ));
         new_req(http::Method::PUT, "/", "", headers, body.to_vec())
+    }
+
+    fn signed_post_policy_fields(
+        bucket: &str,
+        key: &str,
+        extra_conditions: &[&str],
+        extra_fields: &[(&str, &str)],
+    ) -> Vec<(String, String)> {
+        signed_post_policy_fields_for_region(
+            bucket,
+            key,
+            "us-east-1",
+            extra_conditions,
+            extra_fields,
+        )
+    }
+
+    fn signed_post_policy_fields_for_region(
+        bucket: &str,
+        key: &str,
+        region: &str,
+        extra_conditions: &[&str],
+        extra_fields: &[(&str, &str)],
+    ) -> Vec<(String, String)> {
+        use base64::Engine;
+
+        let (date, amz_date) = current_sigv4_timestamp();
+        let credential = format!("{TEST_SIGV4_ACCESS_KEY}/{date}/{region}/s3/aws4_request");
+        let mut conditions = vec![
+            format!(r#"{{"bucket":"{bucket}"}}"#),
+            format!(r#"{{"key":"{key}"}}"#),
+            r#"{"x-amz-algorithm":"AWS4-HMAC-SHA256"}"#.to_string(),
+            format!(r#"{{"x-amz-credential":"{credential}"}}"#),
+            format!(r#"{{"x-amz-date":"{amz_date}"}}"#),
+        ];
+        conditions.extend(extra_conditions.iter().map(|value| (*value).to_string()));
+        let policy = format!(
+            r#"{{"expiration":"2099-12-31T23:59:59Z","conditions":[{}]}}"#,
+            conditions.join(",")
+        );
+        let policy_b64 = base64::engine::general_purpose::STANDARD.encode(policy.as_bytes());
+        let signing_key = auth::sigv4::derive_signing_key(
+            &SecretKey::new(TEST_SIGV4_SECRET.to_string()),
+            &date,
+            region,
+            "s3",
+        );
+        let signature = hex_lower(
+            hmac::sign(
+                &hmac::Key::new(hmac::HMAC_SHA256, signing_key.as_ref()),
+                policy_b64.as_bytes(),
+            )
+            .as_ref(),
+        );
+
+        let mut fields = vec![
+            ("key".to_string(), key.to_string()),
+            (
+                "x-amz-algorithm".to_string(),
+                "AWS4-HMAC-SHA256".to_string(),
+            ),
+            ("x-amz-credential".to_string(), credential),
+            ("x-amz-date".to_string(), amz_date),
+            ("policy".to_string(), policy_b64),
+            ("x-amz-signature".to_string(), signature),
+        ];
+        fields.extend(
+            extra_fields
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string())),
+        );
+        fields
     }
 
     #[test]
@@ -8987,6 +9059,98 @@ mod tests {
             Err(err) => panic!("expected AccessDenied, got {err:?}"),
             Ok(_) => panic!("expected AccessDenied, got Ok"),
         }
+    }
+
+    #[test]
+    fn prepare_streaming_post_object_denied_policy_does_not_create_session() {
+        let tmp = test_util::tempdir();
+        let mut fe = setup_frontend(tmp.path());
+        fe.credentials.add(
+            TEST_SIGV4_ACCESS_KEY.to_string(),
+            SecretKey::new(TEST_SIGV4_SECRET.to_string()),
+        );
+        create_sigv4_test_bucket(&fe.coordinator, "mybucket", false);
+
+        let req = new_req(
+            http::Method::POST,
+            "/mybucket",
+            "",
+            vec![(
+                "host".to_string(),
+                "examplebucket.s3.amazonaws.com".to_string(),
+            )],
+            vec![],
+        );
+        let fields = signed_post_policy_fields(
+            "mybucket",
+            "mykey",
+            &[r#"{"acl":"private"}"#],
+            &[("acl", "public-read")],
+        );
+
+        match fe.prepare_streaming_post_object(&req, "mybucket", &fields, Some("upload.txt")) {
+            Err(ServerError::PostPolicyAccessDenied { reason }) => {
+                assert!(
+                    reason.contains("'acl'"),
+                    "unexpected denial reason: {reason}"
+                );
+            }
+            Err(err) => panic!("expected PostPolicyAccessDenied, got {err:?}"),
+            Ok(_) => panic!("expected PostPolicyAccessDenied, got Ok"),
+        }
+
+        assert_eq!(
+            fe.coordinator.scavenge_stale_sessions(0),
+            0,
+            "policy-denied POST should not create a stream session"
+        );
+    }
+
+    #[test]
+    fn prepare_streaming_post_object_wrong_region_takes_precedence_over_policy_denial() {
+        let tmp = test_util::tempdir();
+        let mut fe = setup_frontend(tmp.path());
+        fe.credentials.add(
+            TEST_SIGV4_ACCESS_KEY.to_string(),
+            SecretKey::new(TEST_SIGV4_SECRET.to_string()),
+        );
+        create_sigv4_test_bucket(&fe.coordinator, "mybucket", false);
+
+        let req = new_req(
+            http::Method::POST,
+            "/mybucket",
+            "",
+            vec![(
+                "host".to_string(),
+                "examplebucket.s3.amazonaws.com".to_string(),
+            )],
+            vec![],
+        );
+        let fields = signed_post_policy_fields_for_region(
+            "mybucket",
+            "mykey",
+            "us-west-2",
+            &[r#"{"acl":"private"}"#],
+            &[("acl", "public-read")],
+        );
+
+        match fe.prepare_streaming_post_object(&req, "mybucket", &fields, Some("upload.txt")) {
+            Err(ServerError::WrongRegion {
+                provided_region,
+                expected_region,
+            }) => {
+                assert_eq!(provided_region, "us-west-2");
+                assert_eq!(expected_region, "us-east-1");
+            }
+            Err(err) => panic!("expected WrongRegion, got {err:?}"),
+            Ok(_) => panic!("expected WrongRegion, got Ok"),
+        }
+
+        assert_eq!(
+            fe.coordinator.scavenge_stale_sessions(0),
+            0,
+            "wrong-region POST should not create a stream session"
+        );
     }
 
     #[test]

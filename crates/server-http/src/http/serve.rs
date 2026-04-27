@@ -45,6 +45,8 @@ const MAX_STREAMING_POST_ACL_FIELD_BYTES: usize = 128;
 const MAX_STREAMING_POST_STATUS_FIELD_BYTES: usize = 16;
 const MAX_STREAMING_POST_CHECKSUM_FIELD_BYTES: usize = 128;
 const MAX_STREAMING_POST_SSE_FIELD_BYTES: usize = 4 * 1024;
+const MAX_STREAMING_POST_REJECT_DRAIN_BYTES: usize = 64 * 1024;
+const MAX_STREAMING_POST_REJECT_DRAIN_DURATION: Duration = Duration::from_millis(200);
 const MAX_ACL_XML_BYTES: usize = 200 * 1024;
 const MAX_DELETE_OBJECTS_XML_BYTES: usize = 2_048_000;
 const MAX_VERSIONING_CONFIGURATION_BYTES: usize = 1024;
@@ -1664,7 +1666,14 @@ async fn handle_streaming_post_object(
                                 .await;
                                 match ctx_res {
                                     Ok(Ok(c)) => ctx = Some(Arc::new(c)),
-                                    Ok(Err(err)) => return error_response(&err),
+                                    Ok(Err(err)) => {
+                                        return finish_streaming_post_rejection(
+                                            error_response(&err),
+                                            &mut body,
+                                            idle_timeout,
+                                        )
+                                        .await;
+                                    }
                                     Err(_) => return internal_error_response(),
                                 }
                             }
@@ -1679,10 +1688,34 @@ async fn handle_streaming_post_object(
                                 total_size += data.len() as u64;
                                 if total_size > MAX_OBJECT_SIZE {
                                     abort_streaming_post_object(&state, c).await;
-                                    return error_response(&ServerError::ObjectTooLarge {
-                                        size: total_size,
-                                        max: MAX_OBJECT_SIZE,
-                                    });
+                                    return finish_streaming_post_rejection(
+                                        error_response(&ServerError::ObjectTooLarge {
+                                            size: total_size,
+                                            max: MAX_OBJECT_SIZE,
+                                        }),
+                                        &mut body,
+                                        idle_timeout,
+                                    )
+                                    .await;
+                                }
+                                if c.post_policy
+                                    .as_ref()
+                                    .and_then(auth::PreparedPostPolicy::max_content_length)
+                                    .is_some_and(|max| total_size > max)
+                                {
+                                    abort_streaming_post_object(&state, c).await;
+                                    return finish_streaming_post_rejection(
+                                        error_response(&ServerError::InvalidRequest {
+                                            reason: auth::PostPolicyError::ConditionFailed {
+                                                condition: "content-length-range",
+                                                field: None,
+                                            }
+                                            .to_string(),
+                                        }),
+                                        &mut body,
+                                        idle_timeout,
+                                    )
+                                    .await;
                                 }
 
                                 let mut remaining: &[u8] = data.as_ref();
@@ -1866,6 +1899,7 @@ async fn handle_streaming_put(
             inline_checksum_claim = Some(claimed);
         }
     }
+    let has_auth_attempt = request_has_auth_attempt(&s3req);
     let ctx = match spawn_blocking_with_trace(trace, move || {
         let frontend = acquire_frontend(&state2);
         frontend.prepare_streaming_put(
@@ -1879,12 +1913,22 @@ async fn handle_streaming_put(
     {
         Ok(Ok(ctx)) => ctx,
         Ok(Err(err)) => {
-            return finish_streaming_prepare_failure(error_response(&err), &mut body, idle_timeout)
-                .await
+            return finish_streaming_prepare_failure(
+                error_response(&err),
+                &err,
+                has_auth_attempt,
+                &mut body,
+                idle_timeout,
+            )
+            .await
         }
         Err(_) => {
             return finish_streaming_prepare_failure(
                 internal_error_response(),
+                &ServerError::InvalidRequest {
+                    reason: "internal error".to_string(),
+                },
+                has_auth_attempt,
                 &mut body,
                 idle_timeout,
             )
@@ -2522,10 +2566,12 @@ fn close_response_connection(mut resp: S3Response) -> S3Response {
 
 async fn finish_streaming_prepare_failure(
     resp: S3Response,
+    err: &ServerError,
+    has_auth_attempt: bool,
     body: &mut Incoming,
     idle_timeout: Duration,
 ) -> S3Response {
-    if resp.status_code == 403 {
+    if should_close_streaming_prepare_failure(err, has_auth_attempt) {
         close_response_connection(resp)
     } else {
         drain_request_body(body, idle_timeout).await;
@@ -2533,8 +2579,90 @@ async fn finish_streaming_prepare_failure(
     }
 }
 
+/// Decide whether a streaming prepare failure should close the connection
+/// immediately or drain the unread body and return a normal error response.
+///
+/// The important distinction is between:
+/// - auth-layer failures / anonymous-deny cases, where continuing to read the
+///   body would let an unauthenticated client hold request capacity, and
+/// - authenticated permission denials (for example bucket policy
+///   `AccessDenied`), where SDK clients expect a normal S3 error rather than a
+///   transport-level broken pipe while they are still writing the body.
+///
+/// So:
+/// - auth failures always close promptly
+/// - anonymous `AccessDenied` closes promptly
+/// - authenticated `AccessDenied` drains and responds
+fn should_close_streaming_prepare_failure(err: &ServerError, has_auth_attempt: bool) -> bool {
+    match err {
+        ServerError::Auth(_) => true,
+        ServerError::AccessDenied => !has_auth_attempt,
+        _ => false,
+    }
+}
+
+fn request_has_auth_attempt(req: &S3Request) -> bool {
+    req.header("authorization").is_some()
+        || req.query_param_lossy("X-Amz-Algorithm").is_some()
+        || req.query_param_lossy("X-Amz-Credential").is_some()
+        || req.query_param_lossy("X-Amz-Signature").is_some()
+}
+
+async fn finish_streaming_post_rejection(
+    resp: S3Response,
+    body: &mut Incoming,
+    idle_timeout: Duration,
+) -> S3Response {
+    if drain_request_body_bounded(
+        body,
+        idle_timeout,
+        MAX_STREAMING_POST_REJECT_DRAIN_BYTES,
+        MAX_STREAMING_POST_REJECT_DRAIN_DURATION,
+    )
+    .await
+    {
+        resp
+    } else {
+        close_response_connection(resp)
+    }
+}
+
 async fn drain_request_body(body: &mut Incoming, idle_timeout: Duration) {
     while let Ok(Some(Ok(_))) = tokio::time::timeout(idle_timeout, body.frame()).await {}
+}
+
+async fn drain_request_body_bounded(
+    body: &mut Incoming,
+    idle_timeout: Duration,
+    max_bytes: usize,
+    max_duration: Duration,
+) -> bool {
+    let deadline = Instant::now() + max_duration;
+    let mut drained_bytes = 0usize;
+
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let read_timeout = idle_timeout.min(deadline.saturating_duration_since(now));
+        match tokio::time::timeout(read_timeout, body.frame()).await {
+            Ok(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    drained_bytes = match drained_bytes.checked_add(data.len()) {
+                        Some(total) => total,
+                        None => return false,
+                    };
+                    if drained_bytes > max_bytes {
+                        return false;
+                    }
+                }
+            }
+            Ok(Some(Err(_))) => return false,
+            Ok(None) => return true,
+            Err(_) => return false,
+        }
+    }
 }
 
 /// Handle a streaming `UploadPart`: read body frame-by-frame, feed chunks to
@@ -2579,6 +2707,7 @@ async fn handle_streaming_part(
             inline_checksum_claim = Some(claimed);
         }
     }
+    let has_auth_attempt = request_has_auth_attempt(&s3req);
     let ctx = match spawn_blocking_with_trace(trace, move || {
         let frontend = acquire_frontend(&state2);
         frontend.prepare_streaming_part(
@@ -2593,12 +2722,22 @@ async fn handle_streaming_part(
     {
         Ok(Ok(ctx)) => ctx,
         Ok(Err(err)) => {
-            return finish_streaming_prepare_failure(error_response(&err), &mut body, idle_timeout)
-                .await
+            return finish_streaming_prepare_failure(
+                error_response(&err),
+                &err,
+                has_auth_attempt,
+                &mut body,
+                idle_timeout,
+            )
+            .await
         }
         Err(_) => {
             return finish_streaming_prepare_failure(
                 internal_error_response(),
+                &ServerError::InvalidRequest {
+                    reason: "internal error".to_string(),
+                },
+                has_auth_attempt,
                 &mut body,
                 idle_timeout,
             )
@@ -3739,6 +3878,49 @@ mod tests {
         (response, bytes_sent.load(Ordering::Relaxed))
     }
 
+    fn denied_streaming_multipart_request_response(
+        addr: &str,
+        request_head: String,
+        file_prefix: Vec<u8>,
+        file_suffix: Vec<u8>,
+        total_file_bytes: usize,
+    ) -> (String, usize) {
+        const WRITE_CHUNK_BYTES: usize = 1024;
+        const WRITE_CHUNK_DELAY: Duration = Duration::from_millis(20);
+        const RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
+
+        let mut stream = StdTcpStream::connect(addr).unwrap();
+        stream.set_nodelay(true).unwrap();
+
+        let mut writer = stream.try_clone().unwrap();
+        writer.set_nodelay(true).unwrap();
+
+        let bytes_sent = Arc::new(AtomicUsize::new(0));
+        let bytes_sent_writer = Arc::clone(&bytes_sent);
+        let body_chunk = vec![b'x'; WRITE_CHUNK_BYTES];
+        let writer_handle = std::thread::spawn(move || {
+            writer.write_all(request_head.as_bytes()).unwrap();
+            writer.write_all(&file_prefix).unwrap();
+            let mut remaining = total_file_bytes;
+            while remaining > 0 {
+                let next = remaining.min(WRITE_CHUNK_BYTES);
+                match writer.write_all(&body_chunk[..next]) {
+                    Ok(()) => {
+                        bytes_sent_writer.fetch_add(next, Ordering::Relaxed);
+                        remaining -= next;
+                        std::thread::sleep(WRITE_CHUNK_DELAY);
+                    }
+                    Err(_) => return,
+                }
+            }
+            let _ = writer.write_all(&file_suffix);
+        });
+
+        let response = read_http_response(&mut stream, RESPONSE_TIMEOUT);
+        writer_handle.join().unwrap();
+        (response, bytes_sent.load(Ordering::Relaxed))
+    }
+
     fn hmac_sha256(key: &[u8], data: &[u8]) -> hmac::Tag {
         hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), data)
     }
@@ -3837,6 +4019,106 @@ mod tests {
             amz_date: date_long,
             amz_content_sha256: content_sha256,
         }
+    }
+
+    fn sign_post_policy_fields(
+        bucket: &str,
+        key: &str,
+        extra_conditions: &[&str],
+        extra_fields: &[(&str, &str)],
+    ) -> Vec<(String, String)> {
+        use base64::Engine;
+
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let days = secs / 86400;
+        let (year, month, day) = days_to_ymd(days);
+        let time_of_day = secs % 86400;
+        let hour = time_of_day / 3600;
+        let minute = (time_of_day % 3600) / 60;
+        let second = time_of_day % 60;
+        let amz_date = format!(
+            "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+            year, month, day, hour, minute, second
+        );
+        let date = amz_date[..8].to_string();
+        let credential = format!("{TEST_ACCESS_KEY}/{date}/us-east-1/s3/aws4_request");
+        let mut conditions = vec![
+            format!(r#"{{"bucket":"{bucket}"}}"#),
+            format!(r#"{{"key":"{key}"}}"#),
+            r#"{"x-amz-algorithm":"AWS4-HMAC-SHA256"}"#.to_string(),
+            format!(r#"{{"x-amz-credential":"{credential}"}}"#),
+            format!(r#"{{"x-amz-date":"{amz_date}"}}"#),
+        ];
+        conditions.extend(
+            extra_conditions
+                .iter()
+                .map(|condition| (*condition).to_string()),
+        );
+        let policy = format!(
+            r#"{{"expiration":"2099-12-31T23:59:59Z","conditions":[{}]}}"#,
+            conditions.join(",")
+        );
+        let policy_b64 = base64::engine::general_purpose::STANDARD.encode(policy.as_bytes());
+        let signing_key = derive_signing_key(
+            &auth::SecretKey::new(TEST_SECRET_KEY.to_string()),
+            &date,
+            "us-east-1",
+            "s3",
+        );
+        let signature =
+            hex_encode(hmac_sha256(signing_key.as_ref(), policy_b64.as_bytes()).as_ref());
+
+        let mut fields = vec![
+            ("key".to_string(), key.to_string()),
+            (
+                "x-amz-algorithm".to_string(),
+                "AWS4-HMAC-SHA256".to_string(),
+            ),
+            ("x-amz-credential".to_string(), credential),
+            ("x-amz-date".to_string(), amz_date),
+            ("policy".to_string(), policy_b64),
+            ("x-amz-signature".to_string(), signature),
+        ];
+        fields.extend(
+            extra_fields
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string())),
+        );
+        fields
+    }
+
+    fn build_streaming_multipart_parts(
+        fields: &[(String, String)],
+        file_name: &str,
+    ) -> (String, Vec<u8>, Vec<u8>) {
+        let boundary = "----TestBoundary7MA4YWxkTrZu0gW";
+        let mut prefix = Vec::new();
+
+        for (name, value) in fields {
+            prefix.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            prefix.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+            );
+            prefix.extend_from_slice(value.as_bytes());
+            prefix.extend_from_slice(b"\r\n");
+        }
+
+        prefix.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        prefix.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\n")
+                .as_bytes(),
+        );
+        prefix.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+
+        let suffix = format!("\r\n--{boundary}--\r\n").into_bytes();
+        (
+            format!("multipart/form-data; boundary={boundary}"),
+            prefix,
+            suffix,
+        )
     }
 
     #[test]
@@ -4794,6 +5076,118 @@ Connection: keep-alive\r\n\r\n"
         assert!(
             bytes_sent < TOTAL_BODY_BYTES,
             "server read the full denied UploadPart body before responding: sent {bytes_sent} bytes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn denied_streaming_post_policy_closes_before_full_body_is_sent() {
+        const TOTAL_FILE_BYTES: usize = 256 * 1024;
+
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend, "mybucket");
+        let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
+
+        let fields = sign_post_policy_fields(
+            "mybucket",
+            "mykey",
+            &[r#"{"Content-Type":"text/plain"}"#],
+            &[("Content-Type", "image/png")],
+        );
+        let (content_type, prefix, suffix) = build_streaming_multipart_parts(&fields, "test.txt");
+        let content_length = prefix.len() + TOTAL_FILE_BYTES + suffix.len();
+        let request = format!(
+            "POST /mybucket HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Content-Type: {content_type}\r\n\
+Content-Length: {content_length}\r\n\
+Connection: keep-alive\r\n\r\n"
+        );
+        let (response, bytes_sent) = denied_streaming_multipart_request_response(
+            &addr,
+            request,
+            prefix,
+            suffix,
+            TOTAL_FILE_BYTES,
+        );
+
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "expected 403 status, got: {}",
+            response.lines().next().unwrap_or("")
+        );
+        assert!(
+            response.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied body, got: {response}"
+        );
+        assert!(
+            response.to_ascii_lowercase().contains("connection: close"),
+            "expected Connection: close header, got: {response}"
+        );
+        assert!(
+            bytes_sent < TOTAL_FILE_BYTES,
+            "server read the full denied POST body before responding: sent {bytes_sent} bytes"
+        );
+        assert_eq!(
+            frontend.coordinator.scavenge_stale_sessions(0),
+            0,
+            "policy-denied POST should not create a stream session"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_post_content_length_range_max_abort_closes_before_full_body_is_sent() {
+        const TOTAL_FILE_BYTES: usize = 256 * 1024;
+
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend, "mybucket");
+        let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
+
+        let fields = sign_post_policy_fields(
+            "mybucket",
+            "mykey",
+            &[r#"["content-length-range",0,1024]"#],
+            &[],
+        );
+        let (content_type, prefix, suffix) = build_streaming_multipart_parts(&fields, "test.txt");
+        let content_length = prefix.len() + TOTAL_FILE_BYTES + suffix.len();
+        let request = format!(
+            "POST /mybucket HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Content-Type: {content_type}\r\n\
+Content-Length: {content_length}\r\n\
+Connection: keep-alive\r\n\r\n"
+        );
+        let (response, bytes_sent) = denied_streaming_multipart_request_response(
+            &addr,
+            request,
+            prefix,
+            suffix,
+            TOTAL_FILE_BYTES,
+        );
+
+        assert!(
+            response.starts_with("HTTP/1.1 400"),
+            "expected 400 status, got: {}",
+            response.lines().next().unwrap_or("")
+        );
+        assert!(
+            response.contains("content-length-range"),
+            "expected content-length-range failure body, got: {response}"
+        );
+        assert!(
+            response.to_ascii_lowercase().contains("connection: close"),
+            "expected Connection: close header, got: {response}"
+        );
+        assert!(
+            bytes_sent < TOTAL_FILE_BYTES,
+            "server read the full over-max POST body before responding: sent {bytes_sent} bytes"
+        );
+        assert_eq!(
+            frontend.coordinator.scavenge_stale_sessions(0),
+            0,
+            "over-max POST should not leak a stream session"
         );
     }
 }
