@@ -1,4 +1,4 @@
-//! Access-matrix tests for bucket ACL x object ACL behavior.
+//! Public access matrix tests for bucket ACL x object ACL behavior.
 //!
 //! These mirror the old Ceph matrix structure, but the expected write behavior
 //! follows AWS: `public-read-write` allows a different signed account to create

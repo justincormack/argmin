@@ -118,6 +118,7 @@ Do not add broad matrix duplication until these smoke tests have found no gaps.
 - Added the initial `sse_c_acl.rs` smoke coverage early because it was isolated and did not depend on the file-move sequence.
 - Split `public_access_block_acl.rs` out of `public_access_block.rs` for BlockPublicAcls and IgnorePublicAcls behavior over bucket/object ACLs.
 - Split `public_access_policy.rs` out of `public_access_block.rs` for BlockPublicPolicy, RestrictPublicBuckets, and policy-denied PublicAccessBlock behavior.
+- Renamed `access_matrix.rs` to `public_access_acl_matrix.rs` because the file is entirely bucket ACL x object ACL public-access behavior.
 
 ## Verification Checklist
 
