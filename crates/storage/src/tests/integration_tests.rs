@@ -809,7 +809,7 @@ fn versioned_object_lifecycle() {
 
 // ── 5. Object overwrite with reclaim ───────────────────────────────────
 
-/// Put object (gen 1) → record reclaim → overwrite (gen 2) → verify
+/// Put object (gen 1) → record segment reclaim → overwrite (gen 2) → verify
 /// reclaim points to old gen → delete reclaim.
 #[test]
 fn object_overwrite_with_reclaim() {
@@ -848,12 +848,18 @@ fn object_overwrite_with_reclaim() {
 
     // Record reclaim for gen 1 before overwriting.
     store
-        .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
+        .put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             generation_id: gen1,
-            ec: EcShape { k: 4, m: 2 },
             created_at: 100,
+            segments: vec![ObjectSegmentsReclaimSegmentRecord {
+                segment_index: 0,
+                segment_okh: hash1,
+                segment_vid: gen1,
+                shard_pg_id: 0,
+                ec: EcShape { k: 4, m: 2 },
+            }],
         })
         .unwrap();
 
@@ -894,7 +900,7 @@ fn object_overwrite_with_reclaim() {
 
     // Reclaim record for gen 1 still exists.
     let reclaim = store
-        .get_simple_payload_reclaim(&bucket_name("bucket"), &object_key("k"), gen1)
+        .get_object_segments_reclaim(&bucket_name("bucket"), &object_key("k"), gen1)
         .unwrap()
         .expect("reclaim should exist");
     assert_eq!(reclaim.generation_id, gen1);
@@ -908,13 +914,13 @@ fn object_overwrite_with_reclaim() {
 
     // Clean up reclaim, then old shard.
     store
-        .delete_simple_payload_reclaim(&bucket_name("bucket"), &object_key("k"), gen1)
+        .delete_object_segments_reclaim(&bucket_name("bucket"), &object_key("k"), gen1)
         .unwrap();
     store.delete_shard(&sk1).unwrap();
 
     // Reclaim gone.
     assert!(store
-        .get_simple_payload_reclaim(&bucket_name("bucket"), &object_key("k"), gen1)
+        .get_object_segments_reclaim(&bucket_name("bucket"), &object_key("k"), gen1)
         .unwrap()
         .is_none());
 

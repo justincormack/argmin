@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use s3_types::BucketLifecycleConfiguration;
 use storage::{
-    object_key_hash, BucketInfo, BucketName, EcShape, GenerationId, ObjectEncryption, ObjectKey,
+    BucketInfo, BucketName, EcShape, GenerationId, ObjectEncryption, ObjectKey,
     SegmentStoredBytesRequest, StorageCluster, UploadId, UploadState, VersionId,
 };
 
@@ -681,12 +681,7 @@ impl ReadRuntime {
         generation_id: GenerationId,
     ) -> Result<(), ServerError> {
         self.storage_node
-            .reclaim_object_payload_if_unleased(
-                bucket,
-                key,
-                generation_id,
-                object_key_hash(bucket.as_str(), key.as_str()),
-            )
+            .reclaim_object_payload_if_unleased(bucket, key, generation_id)
             .map_err(Coordinator::map_object_pg_action_error)?;
         Ok(())
     }

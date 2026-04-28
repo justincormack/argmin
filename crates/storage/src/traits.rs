@@ -325,28 +325,6 @@ pub trait PgMetadataStore {
         reservation_id: &SessionId,
     ) -> Result<(), MetadataError>;
 
-    /// Insert a durable reclaim record for a simple single-shard-set payload.
-    fn put_simple_payload_reclaim(
-        &self,
-        reclaim: &SimplePayloadReclaimRecord,
-    ) -> Result<(), MetadataError>;
-
-    /// Look up a durable reclaim record for a simple payload generation.
-    fn get_simple_payload_reclaim(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<Option<SimplePayloadReclaimRecord>, MetadataError>;
-
-    /// Delete a durable reclaim record for a simple payload generation.
-    fn delete_simple_payload_reclaim(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<(), MetadataError>;
-
     /// Insert a durable reclaim record for a standard segmented payload.
     fn put_object_segments_reclaim(
         &self,

@@ -225,18 +225,6 @@ CREATE TABLE IF NOT EXISTS object_segments (
     PRIMARY KEY (bucket, key, version_id, segment_index)
 )";
 
-/// Durable reclaim queue for simple single-shard-set payload generations.
-const CREATE_SIMPLE_PAYLOAD_RECLAIMS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS simple_payload_reclaims (
-    bucket        TEXT NOT NULL,
-    key           TEXT NOT NULL,
-    generation_id INTEGER NOT NULL CHECK (generation_id > 0),
-    ec_k          INTEGER NOT NULL,
-    ec_m          INTEGER NOT NULL,
-    created_at    INTEGER NOT NULL,
-    PRIMARY KEY (bucket, key, generation_id)
-)";
-
 /// Durable reclaim queue for standard segmented payload generations.
 const CREATE_CHUNK_MANIFEST_RECLAIMS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS object_segments_reclaims (
@@ -464,7 +452,6 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_STREAM_UPLOADS_TABLE, [])?;
     conn.execute(CREATE_STREAM_UPLOAD_SEGMENTS_TABLE, [])?;
     conn.execute(CREATE_STREAM_OBJECT_CHUNKS_TABLE, [])?;
-    conn.execute(CREATE_SIMPLE_PAYLOAD_RECLAIMS_TABLE, [])?;
     conn.execute(CREATE_CHUNK_MANIFEST_RECLAIMS_TABLE, [])?;
     conn.execute(CREATE_CHUNK_MANIFEST_RECLAIM_CHUNKS_TABLE, [])?;
     conn.execute(CREATE_OBJECT_GENERATION_RESERVATIONS_TABLE, [])?;

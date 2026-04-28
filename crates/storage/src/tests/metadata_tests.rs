@@ -1638,7 +1638,7 @@ fn file_bucket_subresource_operations_on_nonexistent_bucket() {
 // --- DataLayout decode tests ---
 
 #[test]
-fn file_metadata_object_has_inline_legacy_layout() {
+fn file_metadata_object_has_standard_layout() {
     let (_dir, store) = make_pg_store();
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
@@ -6595,12 +6595,18 @@ fn get_bucket_payload_reclaim_root_returns_first_root() {
         })
         .unwrap();
     store
-        .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
+        .put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
             bucket: bucket_name("bucket"),
             key: object_key("a"),
             generation_id: GenerationId::new(3).unwrap(),
-            ec: EcShape { k: 4, m: 2 },
             created_at: 1,
+            segments: vec![ObjectSegmentsReclaimSegmentRecord {
+                segment_index: 0,
+                segment_okh: [0x22; 16],
+                segment_vid: GenerationId::new(21).unwrap(),
+                shard_pg_id: 0,
+                ec: EcShape { k: 4, m: 2 },
+            }],
         })
         .unwrap();
 
@@ -6614,32 +6620,19 @@ fn get_bucket_payload_reclaim_root_returns_first_root() {
 }
 
 #[test]
-fn payload_reclaim_exists_checks_all_reclaim_tables() {
+fn payload_reclaim_exists_checks_segment_and_multipart_reclaims() {
     let (_dir, store) = make_pg_store();
 
-    let simple_generation = GenerationId::new(3).unwrap();
     let segments_generation = GenerationId::new(7).unwrap();
     let multipart_generation = GenerationId::new(11).unwrap();
 
     assert!(!store
-        .payload_reclaim_exists(&bucket_name("bucket"), &object_key("k"), simple_generation)
+        .payload_reclaim_exists(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            segments_generation
+        )
         .unwrap());
-
-    store
-        .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
-            bucket: bucket_name("bucket"),
-            key: object_key("k"),
-            generation_id: simple_generation,
-            ec: EcShape { k: 4, m: 2 },
-            created_at: 1,
-        })
-        .unwrap();
-    assert!(store
-        .payload_reclaim_exists(&bucket_name("bucket"), &object_key("k"), simple_generation)
-        .unwrap());
-    store
-        .delete_simple_payload_reclaim(&bucket_name("bucket"), &object_key("k"), simple_generation)
-        .unwrap();
 
     store
         .put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
@@ -7892,52 +7885,6 @@ fn object_tags_on_delete_marker() {
         ),
         "expected MethodNotAllowedOnDeleteMarker, got {err:?}"
     );
-}
-
-// ── simple payload reclaim round-trip ──────────────────────────────────
-
-#[test]
-fn simple_payload_reclaim_round_trip() {
-    let (_dir, store) = make_pg_store();
-    let gen = GenerationId::new(5).unwrap();
-
-    store
-        .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
-            bucket: bucket_name("bucket"),
-            key: object_key("k"),
-            generation_id: gen,
-            ec: EcShape { k: 4, m: 2 },
-            created_at: 12345,
-        })
-        .unwrap();
-
-    let rec = store
-        .get_simple_payload_reclaim(&bucket_name("bucket"), &object_key("k"), gen)
-        .unwrap();
-    assert!(rec.is_some());
-    let rec = rec.unwrap();
-    assert_eq!(rec.bucket.as_str(), "bucket");
-    assert_eq!(rec.key.as_str(), "k");
-    assert_eq!(rec.generation_id, gen);
-    assert_eq!(rec.ec.k, 4);
-    assert_eq!(rec.ec.m, 2);
-
-    store
-        .delete_simple_payload_reclaim(&bucket_name("bucket"), &object_key("k"), gen)
-        .unwrap();
-    let rec = store
-        .get_simple_payload_reclaim(&bucket_name("bucket"), &object_key("k"), gen)
-        .unwrap();
-    assert!(rec.is_none());
-}
-
-#[test]
-fn simple_payload_reclaim_delete_idempotent() {
-    let (_dir, store) = make_pg_store();
-    // Deleting a nonexistent reclaim should not error
-    store
-        .delete_simple_payload_reclaim(&bucket_name("bucket"), &object_key("k"), GenerationId::MIN)
-        .unwrap();
 }
 
 // ── list_all_stream_uploads ────────────────────────────────────────────

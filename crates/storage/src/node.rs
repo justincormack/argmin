@@ -38,7 +38,7 @@ use crate::types::{
 use crate::types::{
     CreateBucketConfig, ListPartsResp, MultipartReclaimRecord, ObjectPartRecord,
     ObjectSegmentRecord, ObjectSegmentsReclaimRecord, PayloadReclaimRoot, PutLiveObjectReq,
-    SimplePayloadReclaimRecord, StreamUploadRecord, StreamUploadSegmentRecord,
+    StreamUploadRecord, StreamUploadSegmentRecord,
 };
 
 const TRACE_TARGET: &str = "storage";
@@ -842,30 +842,6 @@ impl SharedStorageNode {
         let pg_id = self.test_object_pg_id_for(bucket, key);
         let pg = self.get_pg(pg_id)?;
         Ok(pg.get_object_segments_reclaim(bucket, key, generation_id)?)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_simple_payload_reclaim(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<Option<SimplePayloadReclaimRecord>, ObjectPgActionError> {
-        let pg_id = self.test_object_pg_id_for(bucket, key);
-        let pg = self.get_pg(pg_id)?;
-        Ok(pg.get_simple_payload_reclaim(bucket, key, generation_id)?)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_put_simple_payload_reclaim(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        reclaim: &SimplePayloadReclaimRecord,
-    ) -> Result<(), ObjectPgActionError> {
-        let pg_id = self.test_object_pg_id_for(bucket, key);
-        let pg = self.get_pg(pg_id)?;
-        Ok(pg.put_simple_payload_reclaim(reclaim)?)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

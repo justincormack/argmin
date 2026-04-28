@@ -108,30 +108,6 @@ impl PgTopology {
         BucketPgId::new(PgId::new(self.bucket_pg_for(bucket)))
     }
 
-    /// Derive the current interim data PG for shard payloads.
-    ///
-    /// This is the single-host-era payload placement function. Phase 3 of the
-    /// multihost plan replaces this with bounded object-local data PG selection.
-    pub fn shard_pg(&self, bucket: &str, key: &str, version_id: u64) -> u32 {
-        let mut version_buf = [0u8; 20];
-        let version_bytes = decimal_u64_bytes(version_id, &mut version_buf);
-        let hash = hash_parts(&[bucket.as_bytes(), b"/", key.as_bytes(), b"/", version_bytes]);
-        pick_pg(&self.pg_ids, hash)
-    }
-
-    pub fn shard_pg_for(&self, bucket: &BucketName, key: &ObjectKey, version_id: u64) -> u32 {
-        self.shard_pg(bucket.as_str(), key.as_str(), version_id)
-    }
-
-    pub fn legacy_data_pg_for(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: u64,
-    ) -> DataPgId {
-        DataPgId::new(PgId::new(self.shard_pg_for(bucket, key, version_id)))
-    }
-
     pub fn object_data_pg_set_width(&self) -> usize {
         DEFAULT_OBJECT_DATA_PG_SET_WIDTH.min(self.pg_ids.len())
     }
@@ -293,8 +269,8 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use super::{
-        decimal_u64_bytes, hash_bytes, hash_parts, PgTopology,
-        DEFAULT_OBJECT_DATA_PG_SEGMENT_BAND_SIZE, DEFAULT_OBJECT_DATA_PG_SET_WIDTH,
+        hash_bytes, hash_parts, PgTopology, DEFAULT_OBJECT_DATA_PG_SEGMENT_BAND_SIZE,
+        DEFAULT_OBJECT_DATA_PG_SET_WIDTH,
     };
     use crate::{BucketName, GenerationId, ObjectKey};
 
@@ -363,19 +339,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_data_pg_different_generations_may_differ() {
-        let topo = PgTopology::new(&(0..256).collect::<Vec<_>>()).unwrap();
-        let pg_v0 = topo.shard_pg("bucket", "key", 0);
-        let pg_v1 = topo.shard_pg("bucket", "key", 1);
-        let pg_v2 = topo.shard_pg("bucket", "key", 2);
-
-        assert!(
-            pg_v0 != pg_v1 || pg_v1 != pg_v2,
-            "all generations mapped to same PG"
-        );
-    }
-
-    #[test]
     fn hash_parts_matches_bulk_hash_for_object_pg() {
         let bucket = "bucket";
         let key = "key";
@@ -393,24 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_parts_matches_bulk_hash_for_shard_pg() {
-        let bucket = "bucket";
-        let key = "x".repeat(1024);
-        let version_id = u64::MAX;
-        let expected = hash_bytes(format!("{bucket}/{key}/{version_id}").as_bytes());
-        let mut version_buf = [0u8; 20];
-        let actual = hash_parts(&[
-            bucket.as_bytes(),
-            b"/",
-            key.as_bytes(),
-            b"/",
-            decimal_u64_bytes(version_id, &mut version_buf),
-        ]);
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn typed_pg_wrappers_match_legacy_raw_pg_ids() {
+    fn typed_metadata_pg_wrappers_match_raw_pg_ids() {
         let topo = PgTopology::new(&[1, 2, 8]).unwrap();
         let bucket = BucketName::try_from("bucket").unwrap();
         let key = ObjectKey::try_from("key").unwrap();
@@ -422,10 +368,6 @@ mod tests {
         assert_eq!(
             topo.object_metadata_pg_for(&bucket, &key).get(),
             topo.object_pg_for(&bucket, &key)
-        );
-        assert_eq!(
-            topo.legacy_data_pg_for(&bucket, &key, 42).get(),
-            topo.shard_pg_for(&bucket, &key, 42)
         );
     }
 

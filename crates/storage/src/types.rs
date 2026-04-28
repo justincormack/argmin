@@ -1775,19 +1775,6 @@ pub struct DeleteMarkerRecord {
     pub last_modified: u64,
 }
 
-/// Durable reclaim record for a simple single-shard-set payload generation.
-///
-/// This is used when the namespace-visible object row is removed or replaced
-/// before the old shard set can be physically deleted.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SimplePayloadReclaimRecord {
-    pub bucket: BucketName,
-    pub key: ObjectKey,
-    pub generation_id: GenerationId,
-    pub ec: EcShape,
-    pub created_at: u64,
-}
-
 /// Bucket-scoped reclaim root used for synchronous bucket draining.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PayloadReclaimRoot {

@@ -570,14 +570,9 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-        simple_object_key_hash: [u8; 16],
     ) -> Result<bool, ObjectPgActionError> {
-        self.single_node.reclaim_object_payload_if_unleased(
-            bucket,
-            key,
-            generation_id,
-            simple_object_key_hash,
-        )
+        self.single_node
+            .reclaim_object_payload_if_unleased(bucket, key, generation_id)
     }
 
     pub fn create_put_object_stream_session<T, E>(
@@ -1000,28 +995,6 @@ impl super::StorageCluster {
     ) -> Result<Option<ObjectSegmentsReclaimRecord>, ObjectPgActionError> {
         self.single_node
             .test_get_object_segments_reclaim(bucket, key, generation_id)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_simple_payload_reclaim(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<Option<SimplePayloadReclaimRecord>, ObjectPgActionError> {
-        self.single_node
-            .test_get_simple_payload_reclaim(bucket, key, generation_id)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_put_simple_payload_reclaim(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        reclaim: &SimplePayloadReclaimRecord,
-    ) -> Result<(), ObjectPgActionError> {
-        self.single_node
-            .test_put_simple_payload_reclaim(bucket, key, reclaim)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

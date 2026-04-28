@@ -4,6 +4,7 @@ use super::test_topology::*;
 use super::*;
 use crate::conditional::{DeleteCondition, ReadCondition, SpecificEtag, WriteCondition};
 use crate::sse::SSE_C_CUSTOMER_KEY_LEN;
+use storage::{ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord};
 
 fn create_bucket_with_explicit_writer_grant(
     coord: &Coordinator,
@@ -1265,17 +1266,28 @@ fn delete_bucket_drains_unqueued_payload_reclaim() {
         .unwrap();
 
     let generation_id = GenerationId::new(1).unwrap();
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("ghost");
+    let shard_pg_id = coord
+        .storage_node
+        .test_shard_pg_id_for(&bucket, &key, generation_id);
     coord
         .storage_node
-        .test_put_simple_payload_reclaim(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("ghost"),
-            &SimplePayloadReclaimRecord {
-                bucket: trusted_bucket_name("bucket"),
-                key: trusted_object_key("ghost"),
+        .test_put_object_segments_reclaim(
+            &bucket,
+            &key,
+            &ObjectSegmentsReclaimRecord {
+                bucket: bucket.clone(),
+                key: key.clone(),
                 generation_id,
-                ec: EcShape { k: 4, m: 2 },
                 created_at: 1,
+                segments: vec![ObjectSegmentsReclaimSegmentRecord {
+                    segment_index: 0,
+                    segment_okh: object_key_hash("bucket", "ghost"),
+                    segment_vid: generation_id,
+                    shard_pg_id,
+                    ec: EcShape { k: 4, m: 2 },
+                }],
             },
         )
         .unwrap();
@@ -1290,11 +1302,7 @@ fn delete_bucket_drains_unqueued_payload_reclaim() {
 
     assert!(coord
         .storage_node
-        .test_get_simple_payload_reclaim(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("ghost"),
-            generation_id,
-        )
+        .test_get_object_segments_reclaim(&bucket, &key, generation_id)
         .unwrap()
         .is_none());
 }

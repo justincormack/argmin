@@ -29,10 +29,8 @@ impl SharedStorageNode {
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-        simple_object_key_hash: [u8; 16],
     ) -> Result<bool, ObjectPgActionError> {
         enum ReclaimPayload {
-            Simple(crate::types::SimplePayloadReclaimRecord),
             Segments(ObjectSegmentsReclaimRecord),
             Multipart(MultipartReclaimRecord),
         }
@@ -64,10 +62,6 @@ impl SharedStorageNode {
             }
 
             if let Some(reclaim) =
-                PgMetadataStore::get_simple_payload_reclaim(&*meta_pg, bucket, key, generation_id)?
-            {
-                Some(ReclaimPayload::Simple(reclaim))
-            } else if let Some(reclaim) =
                 PgMetadataStore::get_object_segments_reclaim(&*meta_pg, bucket, key, generation_id)?
             {
                 Some(ReclaimPayload::Segments(reclaim))
@@ -86,18 +80,6 @@ impl SharedStorageNode {
         }
 
         match &reclaim {
-            ReclaimPayload::Simple(reclaim) => {
-                let shard_pg_id =
-                    self.pg_topology
-                        .shard_pg(bucket.as_str(), key.as_str(), generation_id.get());
-                delete_ec_shards(
-                    self,
-                    shard_pg_id,
-                    &simple_object_key_hash,
-                    generation_id,
-                    reclaim.ec,
-                )?;
-            }
             ReclaimPayload::Segments(reclaim) => {
                 for segment in &reclaim.segments {
                     delete_ec_shards(
@@ -143,12 +125,6 @@ impl SharedStorageNode {
         }
 
         match reclaim {
-            ReclaimPayload::Simple(_) => PgMetadataStore::delete_simple_payload_reclaim(
-                &*meta_pg,
-                bucket,
-                key,
-                generation_id,
-            )?,
             ReclaimPayload::Segments(_) => PgMetadataStore::delete_object_segments_reclaim(
                 &*meta_pg,
                 bucket,

@@ -7,7 +7,6 @@ use std::sync::Arc;
 use storage::{
     MultipartReclaimPartRecord, MultipartReclaimRecord, ObjectSegmentsReclaimRecord,
     ObjectSegmentsReclaimSegmentRecord, PgTopology, ReclaimWorkItem, SharedStorageNode,
-    SimplePayloadReclaimRecord,
 };
 
 const TRACE_BUCKET: &str = "bucket";
@@ -33,6 +32,64 @@ fn make_test_read_runtime(dir: &Path) -> ReadRuntime {
         payload_buffer_pool: PayloadBufferPool::new(storage_node.default_ec_shape()),
         sse_c_validator: None,
         managed_key_provider: None,
+    }
+}
+
+fn trace_object_segments_reclaim(
+    runtime: &ReadRuntime,
+    bucket: &str,
+    key: &str,
+    generation_id: GenerationId,
+    created_at: u64,
+) -> ObjectSegmentsReclaimRecord {
+    let bucket_name = trusted_bucket_name(bucket);
+    let object_key = trusted_object_key(key);
+    let shard_pg_id = runtime
+        .pg_topology
+        .object_generation_segment_data_pg(&bucket_name, &object_key, generation_id, 0)
+        .get();
+
+    ObjectSegmentsReclaimRecord {
+        bucket: bucket_name,
+        key: object_key,
+        generation_id,
+        created_at,
+        segments: vec![ObjectSegmentsReclaimSegmentRecord {
+            segment_index: 0,
+            segment_okh: object_key_hash(bucket, key),
+            segment_vid: generation_id,
+            shard_pg_id,
+            ec: EcShape { k: 4, m: 2 },
+        }],
+    }
+}
+
+fn trace_multipart_reclaim(
+    runtime: &ReadRuntime,
+    bucket: &str,
+    key: &str,
+    generation_id: GenerationId,
+    created_at: u64,
+) -> MultipartReclaimRecord {
+    let bucket_name = trusted_bucket_name(bucket);
+    let object_key = trusted_object_key(key);
+    let shard_pg_id = runtime
+        .pg_topology
+        .object_generation_multipart_part_data_pg(&bucket_name, &object_key, generation_id, 1)
+        .get();
+
+    MultipartReclaimRecord {
+        bucket: bucket_name,
+        key: object_key,
+        generation_id,
+        created_at,
+        parts: vec![MultipartReclaimPartRecord::ShardSet {
+            part_number: 1,
+            part_okh: object_key_hash(bucket, key),
+            part_vid: generation_id,
+            shard_pg_id,
+            ec: EcShape { k: 4, m: 2 },
+        }],
     }
 }
 
@@ -85,7 +142,6 @@ impl TraceKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TraceReclaimKind {
-    Simple,
     Segments,
     Multipart,
 }
@@ -103,7 +159,6 @@ enum ReclaimTraceOp {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReclaimKindTraceOp {
-    SeedSimpleMetadata,
     SeedSegmentsMetadata,
     SeedMultipartMetadata,
     AcquireLease,
@@ -131,7 +186,6 @@ impl std::fmt::Display for ReclaimTraceOp {
 impl std::fmt::Display for ReclaimKindTraceOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SeedSimpleMetadata => write!(f, "seed-simple-metadata"),
             Self::SeedSegmentsMetadata => write!(f, "seed-segments-metadata"),
             Self::SeedMultipartMetadata => write!(f, "seed-multipart-metadata"),
             Self::AcquireLease => write!(f, "acquire-lease"),
@@ -243,7 +297,6 @@ impl ReclaimKindTraceModel {
         use ReclaimKindTraceOp::*;
         let mut ops = Vec::new();
         if self.reclaim_kind.is_none() {
-            ops.push(SeedSimpleMetadata);
             ops.push(SeedSegmentsMetadata);
             ops.push(SeedMultipartMetadata);
         }
@@ -270,7 +323,6 @@ impl ReclaimKindTraceModel {
     fn apply(&mut self, op: &ReclaimKindTraceOp) {
         use ReclaimKindTraceOp::*;
         match op {
-            SeedSimpleMetadata => self.reclaim_kind = Some(TraceReclaimKind::Simple),
             SeedSegmentsMetadata => self.reclaim_kind = Some(TraceReclaimKind::Segments),
             SeedMultipartMetadata => self.reclaim_kind = Some(TraceReclaimKind::Multipart),
             AcquireLease => self.lease_held = true,
@@ -774,24 +826,7 @@ impl ReclaimTraceHarness {
         use ReclaimTraceOp::*;
         match op {
             SeedMetadata => {
-                self.runtime
-                    .storage_node
-                    .test_put_simple_payload_reclaim(
-                        &trusted_bucket_name(TRACE_BUCKET),
-                        &trusted_object_key(TRACE_KEY),
-                        &SimplePayloadReclaimRecord {
-                            bucket: trusted_bucket_name(TRACE_BUCKET),
-                            key: trusted_object_key(TRACE_KEY),
-                            generation_id: trace_generation_id(),
-                            ec: EcShape { k: 4, m: 2 },
-                            created_at: 1,
-                        },
-                    )
-                    .map_err(|err| {
-                        TestCaseError::fail(format!(
-                            "test_put_simple_payload_reclaim failed: {err:?}"
-                        ))
-                    })?;
+                self.seed_segments_metadata()?;
             }
             AcquireLease => {
                 self.lease = Some(self.runtime.acquire_object_payload_lease(
@@ -873,6 +908,26 @@ impl ReclaimTraceHarness {
         Ok(())
     }
 
+    fn seed_segments_metadata(&self) -> TestCaseResult {
+        self.runtime
+            .storage_node
+            .test_put_object_segments_reclaim(
+                &trusted_bucket_name(TRACE_BUCKET),
+                &trusted_object_key(TRACE_KEY),
+                &trace_object_segments_reclaim(
+                    &self.runtime,
+                    TRACE_BUCKET,
+                    TRACE_KEY,
+                    trace_generation_id(),
+                    1,
+                ),
+            )
+            .map_err(|err| {
+                TestCaseError::fail(format!("test_put_object_segments_reclaim failed: {err:?}"))
+            })?;
+        Ok(())
+    }
+
     fn metadata_exists(&self) -> bool {
         self.runtime
             .storage_node
@@ -908,7 +963,6 @@ impl ReclaimKindTraceHarness {
     fn execute(&mut self, op: &ReclaimKindTraceOp) -> TestCaseResult {
         use ReclaimKindTraceOp::*;
         match op {
-            SeedSimpleMetadata => self.seed_simple_metadata()?,
             SeedSegmentsMetadata => self.seed_segments_metadata()?,
             SeedMultipartMetadata => self.seed_multipart_metadata()?,
             AcquireLease => {
@@ -988,49 +1042,19 @@ impl ReclaimKindTraceHarness {
         Ok(())
     }
 
-    fn seed_simple_metadata(&self) -> TestCaseResult {
-        self.runtime
-            .storage_node
-            .test_put_simple_payload_reclaim(
-                &trusted_bucket_name(TRACE_BUCKET),
-                &trusted_object_key(TRACE_KEY),
-                &SimplePayloadReclaimRecord {
-                    bucket: trusted_bucket_name(TRACE_BUCKET),
-                    key: trusted_object_key(TRACE_KEY),
-                    generation_id: trace_generation_id(),
-                    ec: EcShape { k: 4, m: 2 },
-                    created_at: 1,
-                },
-            )
-            .map_err(|err| {
-                TestCaseError::fail(format!("test_put_simple_payload_reclaim failed: {err:?}"))
-            })?;
-        Ok(())
-    }
-
     fn seed_segments_metadata(&self) -> TestCaseResult {
         self.runtime
             .storage_node
             .test_put_object_segments_reclaim(
                 &trusted_bucket_name(TRACE_BUCKET),
                 &trusted_object_key(TRACE_KEY),
-                &ObjectSegmentsReclaimRecord {
-                    bucket: trusted_bucket_name(TRACE_BUCKET),
-                    key: trusted_object_key(TRACE_KEY),
-                    generation_id: trace_generation_id(),
-                    created_at: 1,
-                    segments: vec![ObjectSegmentsReclaimSegmentRecord {
-                        segment_index: 0,
-                        segment_okh: object_key_hash(TRACE_BUCKET, TRACE_KEY),
-                        segment_vid: trace_generation_id(),
-                        shard_pg_id: self.runtime.pg_topology.shard_pg(
-                            TRACE_BUCKET,
-                            TRACE_KEY,
-                            trace_generation_id().get(),
-                        ),
-                        ec: EcShape { k: 4, m: 2 },
-                    }],
-                },
+                &trace_object_segments_reclaim(
+                    &self.runtime,
+                    TRACE_BUCKET,
+                    TRACE_KEY,
+                    trace_generation_id(),
+                    1,
+                ),
             )
             .map_err(|err| {
                 TestCaseError::fail(format!("test_put_object_segments_reclaim failed: {err:?}"))
@@ -1044,23 +1068,13 @@ impl ReclaimKindTraceHarness {
             .test_put_multipart_reclaim(
                 &trusted_bucket_name(TRACE_BUCKET),
                 &trusted_object_key(TRACE_KEY),
-                &MultipartReclaimRecord {
-                    bucket: trusted_bucket_name(TRACE_BUCKET),
-                    key: trusted_object_key(TRACE_KEY),
-                    generation_id: trace_generation_id(),
-                    created_at: 1,
-                    parts: vec![MultipartReclaimPartRecord::ShardSet {
-                        part_number: 1,
-                        part_okh: object_key_hash(TRACE_BUCKET, TRACE_KEY),
-                        part_vid: trace_generation_id(),
-                        shard_pg_id: self.runtime.pg_topology.shard_pg(
-                            TRACE_BUCKET,
-                            TRACE_KEY,
-                            trace_generation_id().get(),
-                        ),
-                        ec: EcShape { k: 4, m: 2 },
-                    }],
-                },
+                &trace_multipart_reclaim(
+                    &self.runtime,
+                    TRACE_BUCKET,
+                    TRACE_KEY,
+                    trace_generation_id(),
+                    1,
+                ),
             )
             .map_err(|err| {
                 TestCaseError::fail(format!("test_put_multipart_reclaim failed: {err:?}"))
@@ -1208,24 +1222,25 @@ impl TwoGenerationReclaimTraceHarness {
     }
 
     fn seed_metadata_for(&self, generation: TraceGeneration) -> TestCaseResult {
+        let created_at = match generation {
+            TraceGeneration::Old => 1,
+            TraceGeneration::New => 2,
+        };
         self.runtime
             .storage_node
-            .test_put_simple_payload_reclaim(
+            .test_put_object_segments_reclaim(
                 &trusted_bucket_name(TRACE_BUCKET),
                 &trusted_object_key(TRACE_KEY),
-                &SimplePayloadReclaimRecord {
-                    bucket: trusted_bucket_name(TRACE_BUCKET),
-                    key: trusted_object_key(TRACE_KEY),
-                    generation_id: generation.generation_id(),
-                    ec: EcShape { k: 4, m: 2 },
-                    created_at: match generation {
-                        TraceGeneration::Old => 1,
-                        TraceGeneration::New => 2,
-                    },
-                },
+                &trace_object_segments_reclaim(
+                    &self.runtime,
+                    TRACE_BUCKET,
+                    TRACE_KEY,
+                    generation.generation_id(),
+                    created_at,
+                ),
             )
             .map_err(|err| {
-                TestCaseError::fail(format!("test_put_simple_payload_reclaim failed: {err:?}"))
+                TestCaseError::fail(format!("test_put_object_segments_reclaim failed: {err:?}"))
             })?;
         Ok(())
     }
@@ -1396,24 +1411,25 @@ impl TwoKeyReclaimTraceHarness {
     }
 
     fn seed_metadata_for(&self, key: TraceKey) -> TestCaseResult {
+        let created_at = match key {
+            TraceKey::A => 1,
+            TraceKey::B => 2,
+        };
         self.runtime
             .storage_node
-            .test_put_simple_payload_reclaim(
+            .test_put_object_segments_reclaim(
                 &trusted_bucket_name(TRACE_BUCKET),
                 &trusted_object_key(key.key()),
-                &SimplePayloadReclaimRecord {
-                    bucket: trusted_bucket_name(TRACE_BUCKET),
-                    key: trusted_object_key(key.key()),
-                    generation_id: trace_generation_id(),
-                    ec: EcShape { k: 4, m: 2 },
-                    created_at: match key {
-                        TraceKey::A => 1,
-                        TraceKey::B => 2,
-                    },
-                },
+                &trace_object_segments_reclaim(
+                    &self.runtime,
+                    TRACE_BUCKET,
+                    key.key(),
+                    trace_generation_id(),
+                    created_at,
+                ),
             )
             .map_err(|err| {
-                TestCaseError::fail(format!("test_put_simple_payload_reclaim failed: {err:?}"))
+                TestCaseError::fail(format!("test_put_object_segments_reclaim failed: {err:?}"))
             })?;
         Ok(())
     }

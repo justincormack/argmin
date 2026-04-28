@@ -8,8 +8,9 @@ use crate::system_metadata::SystemMetadata;
 use std::path::Path;
 use std::sync::{Arc, Barrier, MutexGuard};
 use storage::{
-    MultipartPartSegmentRecord, MultipartUploadRecord, PayloadReclaimRoot, PgTopology,
-    StreamUploadRecord, StreamUploadSegmentRecord,
+    MultipartPartSegmentRecord, MultipartUploadRecord, ObjectSegmentsReclaimRecord,
+    ObjectSegmentsReclaimSegmentRecord, PayloadReclaimRoot, PgTopology, StreamUploadRecord,
+    StreamUploadSegmentRecord,
 };
 
 const NO_READ: &ReadCondition = &ReadCondition {
@@ -1351,19 +1352,31 @@ fn final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists() {
     let invariant =
         "the final payload lease drop retries reclaim exactly while durable reclaim metadata still exists";
     let generation_id = GenerationId::new(1).unwrap();
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let shard_pg_id = runtime
+        .pg_topology
+        .object_generation_segment_data_pg(&bucket, &key, generation_id, 0)
+        .get();
 
     {
         runtime
             .storage_node
-            .test_put_simple_payload_reclaim(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                &SimplePayloadReclaimRecord {
-                    bucket: trusted_bucket_name("bucket"),
-                    key: trusted_object_key("key"),
+            .test_put_object_segments_reclaim(
+                &bucket,
+                &key,
+                &ObjectSegmentsReclaimRecord {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
                     generation_id,
-                    ec: EcShape { k: 4, m: 2 },
                     created_at: 1,
+                    segments: vec![ObjectSegmentsReclaimSegmentRecord {
+                        segment_index: 0,
+                        segment_okh: object_key_hash("bucket", "key"),
+                        segment_vid: generation_id,
+                        shard_pg_id,
+                        ec: EcShape { k: 4, m: 2 },
+                    }],
                 },
             )
             .unwrap();

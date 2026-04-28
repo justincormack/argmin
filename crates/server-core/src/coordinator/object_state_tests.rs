@@ -6149,9 +6149,9 @@ fn multipart_get_object_survives_metadata_delete_mid_read() {
     admin
         .create_bucket_for_owner("default-owner", "race-bucket", false)
         .unwrap();
-    let key = find_fresh_key_with_meta_pg_gt_shard_pg(&admin, "race-bucket", "race-key-get");
+    let key = find_fresh_key_with_object_pg_gt_data_pg(&admin, "race-bucket", "race-key-get");
     let (_, expected) = create_completed_multipart_with_streamed_tail(&admin, "race-bucket", &key);
-    assert_object_maps_meta_pg_gt_shard_pg(&admin, "race-bucket", &key);
+    assert_object_maps_object_pg_gt_data_pg(&admin, "race-bucket", &key);
 
     let sync = install_multipart_metadata_race_hooks("race-bucket", &key);
     let reader = make_coord();
@@ -6212,9 +6212,9 @@ fn multipart_get_object_part_survives_metadata_delete_mid_read() {
     admin
         .create_bucket_for_owner("default-owner", "race-bucket", false)
         .unwrap();
-    let key = find_fresh_key_with_meta_pg_gt_shard_pg(&admin, "race-bucket", "race-key-part");
+    let key = find_fresh_key_with_object_pg_gt_data_pg(&admin, "race-bucket", "race-key-part");
     let (_, expected) = create_completed_multipart_with_streamed_tail(&admin, "race-bucket", &key);
-    assert_object_maps_meta_pg_gt_shard_pg(&admin, "race-bucket", &key);
+    assert_object_maps_object_pg_gt_data_pg(&admin, "race-bucket", &key);
     let expected_tail = b"streamed-tail-data".to_vec();
     assert_eq!(
         &expected[expected.len() - expected_tail.len()..],
@@ -6287,7 +6287,7 @@ fn object_segments_get_object_survives_delete_mid_read() {
     admin
         .create_bucket_for_owner("default-owner", "race-bucket", false)
         .unwrap();
-    let key = find_fresh_key_with_meta_pg_gt_shard_pg(&admin, "race-bucket", "race-key-segments");
+    let key = find_fresh_key_with_object_pg_gt_data_pg(&admin, "race-bucket", "race-key-segments");
 
     let session_id = begin_stream_put_test(&admin, "race-bucket", &key).unwrap();
     admin
@@ -6325,7 +6325,7 @@ fn object_segments_get_object_survives_delete_mid_read() {
             requested_object_lock: ObjectLockState::default(),
         })
         .unwrap();
-    assert_object_maps_meta_pg_gt_shard_pg(&admin, "race-bucket", &key);
+    assert_object_maps_object_pg_gt_data_pg(&admin, "race-bucket", &key);
 
     let sync = install_object_segments_delete_race_hooks("race-bucket", &key);
     let reader = make_coord();
@@ -6386,9 +6386,9 @@ fn upload_part_copy_survives_source_metadata_delete_mid_read() {
         .create_bucket_for_owner("default-owner", "race-bucket", false)
         .unwrap();
     let source_key =
-        find_fresh_key_with_meta_pg_gt_shard_pg(&admin, "race-bucket", "race-key-copy");
+        find_fresh_key_with_object_pg_gt_data_pg(&admin, "race-bucket", "race-key-copy");
     create_completed_multipart_with_streamed_tail(&admin, "race-bucket", &source_key);
-    assert_object_maps_meta_pg_gt_shard_pg(&admin, "race-bucket", &source_key);
+    assert_object_maps_object_pg_gt_data_pg(&admin, "race-bucket", &source_key);
     let upload = admin
         .create_multipart_upload(&CreateMultipartUploadRequest {
             object: object_request_with_expected_owner(

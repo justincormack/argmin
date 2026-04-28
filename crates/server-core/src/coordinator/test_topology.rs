@@ -80,7 +80,7 @@ pub(crate) fn find_key_with_object_pg_eq_bucket_pg(
     panic!("failed to find a key with object_pg_id == bucket_pg_id");
 }
 
-pub(crate) fn find_fresh_key_with_meta_pg_gt_shard_pg(
+pub(crate) fn find_fresh_key_with_object_pg_gt_data_pg(
     coord: &Coordinator,
     bucket: &str,
     prefix: &str,
@@ -91,11 +91,15 @@ pub(crate) fn find_fresh_key_with_meta_pg_gt_shard_pg(
             return key;
         }
     }
-    panic!("failed to find a key with meta_pg_id > shard_pg_id");
+    panic!("failed to find a key with object_pg_id > data_pg_id");
 }
 
-pub(crate) fn assert_object_maps_meta_pg_gt_shard_pg(coord: &Coordinator, bucket: &str, key: &str) {
-    let meta_pg_id = object_pg_id(coord, bucket, key);
+pub(crate) fn assert_object_maps_object_pg_gt_data_pg(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+) {
+    let object_pg_id = object_pg_id(coord, bucket, key);
     let generation_id = match coord
         .storage_node
         .test_get_object_meta(&trusted_bucket_name(bucket), &trusted_object_key(key))
@@ -106,10 +110,10 @@ pub(crate) fn assert_object_maps_meta_pg_gt_shard_pg(coord: &Coordinator, bucket
             panic!("expected live object for {bucket}/{key}, got {other:?}")
         }
     };
-    let shard_pg_id = shard_pg_id(coord, bucket, key, generation_id);
+    let data_pg_id = shard_pg_id(coord, bucket, key, generation_id);
     assert!(
-        meta_pg_id > shard_pg_id,
-        "expected test object {bucket}/{key} to map to old read slow path: meta_pg_id={meta_pg_id} shard_pg_id={shard_pg_id}"
+        object_pg_id > data_pg_id,
+        "expected test object {bucket}/{key} to map to object/data cross-PG ordering: object_pg_id={object_pg_id} data_pg_id={data_pg_id}"
     );
 }
 

@@ -322,8 +322,8 @@ Phase 0 implementation notes:
    - derived from bucket name and object key
    - this PG controls object visibility
 5. `DataPgId` means a PG used for payload shard placement.
-   - current code derives this with the legacy `shard_pg` function
-   - Phase 3 replaces that with bounded object-local data PG selection
+   - current code derives this with bounded object-generation data PG selection
+   - Phase 4 maps each data PG and shard index onto node placement
 6. `ShardIndex` means an EC shard position within one stripe.
    - it is not a node ID
    - Phase 4 maps `(DataPgId, ShardIndex)` to a storage `NodeId`
@@ -542,11 +542,6 @@ Phase 3 implementation notes:
    - CompleteMultipartUpload reparents only selected streamed part segment rows
      and removes omitted streamed part metadata rows, so completing a subset of
      uploaded parts does not leave unreachable metadata
-   - residual risk: omitted part shard deletion is still post-commit
-     best-effort. A process crash or persistent shard-delete failure after the
-     metadata commit can leave untracked shard files. This should move to
-     crash-durable reclaim work before multihost cleanup is considered
-     complete.
    - AbortMultipartUpload deletes the staged part metadata and releases the
      reservation with the upload row
 
@@ -731,9 +726,13 @@ Work items:
 3. replace object payload generation leases with cluster-visible read pins or a
    durable expiring lease table
 4. make reclaim work claiming durable and idempotent
-5. make bucket cache freshness depend on PG or cluster notifications rather than
+5. add a physical shard scavenger for unreferenced shard files that can be left
+   by crashes or persistent delete failures after metadata has already stopped
+   referencing a payload, including omitted multipart part shards cleaned up
+   after CompleteMultipartUpload
+6. make bucket cache freshness depend on PG or cluster notifications rather than
    local invalidation alone
-6. audit tests for hidden single-process assumptions
+7. audit tests for hidden single-process assumptions
 
 Exit criteria:
 
@@ -742,6 +741,8 @@ Exit criteria:
 2. reclaim can resume after process restart from durable rows
 3. multipart complete remains serialized for one upload and one destination
 4. in-flight reads are protected from physical cleanup across process boundaries
+5. unreferenced shard files left by best-effort cleanup failures are eventually
+   detected and removed without consulting process-local state
 
 ## Phase 8: Local Multi-Process RPC
 
