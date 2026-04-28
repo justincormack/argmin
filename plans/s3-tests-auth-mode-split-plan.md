@@ -116,7 +116,8 @@ Do not add broad matrix duplication until these smoke tests have found no gaps.
 
 - Added explicit ownership helpers and routed public ACL setup through `create_acl_enabled_bucket`.
 - Added the initial `sse_c_acl.rs` smoke coverage early because it was isolated and did not depend on the file-move sequence.
-- Split `public_access_block_acl.rs` out of `public_access_block.rs` for BlockPublicAcls and IgnorePublicAcls behavior over bucket/object ACLs. `public_access_block.rs` still holds PublicAccessBlock CRUD/canonical XML plus public policy cases; move the latter to `public_access_policy.rs` next.
+- Split `public_access_block_acl.rs` out of `public_access_block.rs` for BlockPublicAcls and IgnorePublicAcls behavior over bucket/object ACLs.
+- Split `public_access_policy.rs` out of `public_access_block.rs` for BlockPublicPolicy, RestrictPublicBuckets, and policy-denied PublicAccessBlock behavior.
 
 ## Verification Checklist
 
