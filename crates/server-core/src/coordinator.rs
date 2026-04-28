@@ -33,9 +33,9 @@ use storage::{BucketEncryptionConfig, EffectiveBucketEncryptionConfig, ObjectLay
 use storage::{BucketName, ObjectKey, StorageCluster};
 #[cfg(test)]
 use storage::{
-    BucketObjectLockConfig, BucketOwnershipControls, BucketState, CreateStreamUploadReq, EcShape,
-    GenerationId, ManagedEncryptionAlgorithm, OwnerIdentity, PublicAccessBlockConfig, SessionId,
-    StoredObject, StreamUploadTarget, UploadId, UploadState, UPLOAD_ID_LEN,
+    BucketObjectLockConfig, BucketOwnershipControls, BucketState, EcShape, GenerationId,
+    ManagedEncryptionAlgorithm, OwnerIdentity, PublicAccessBlockConfig, SessionId, StoredObject,
+    StreamUploadTarget, UploadId, UploadState, UPLOAD_ID_LEN,
 };
 
 use self::authz_results::*;
@@ -104,20 +104,6 @@ fn trusted_upload_id(seed: &str) -> UploadId {
     bytes[..take].copy_from_slice(&encoded.as_bytes()[..take]);
     UploadId::try_from(String::from_utf8(bytes.to_vec()).unwrap())
         .expect("coordinator tests must use valid upload IDs")
-}
-
-#[cfg(test)]
-fn trusted_session_id(seed: &str) -> SessionId {
-    let mut bytes = [b'0'; storage::SESSION_ID_LEN];
-    let mut encoded = String::with_capacity(seed.len() * 2);
-    for byte in seed.bytes() {
-        use std::fmt::Write;
-        write!(encoded, "{byte:02x}").unwrap();
-    }
-    let take = encoded.len().min(storage::SESSION_ID_LEN);
-    bytes[..take].copy_from_slice(&encoded.as_bytes()[..take]);
-    SessionId::try_from(String::from_utf8(bytes.to_vec()).unwrap())
-        .expect("coordinator tests must use valid session IDs")
 }
 
 fn parse_list_object_key(value: &str) -> Result<ObjectKey, ServerError> {

@@ -135,30 +135,17 @@ pub(crate) fn stream_put_session_has_cross_pg_segments(
     data_pg_id != meta_pg_id
 }
 
-pub(crate) fn stream_segment_shard_pg_id(
-    coord: &Coordinator,
-    session_id: &SessionId,
-    segment_index: u32,
-    generation: u64,
-) -> u32 {
-    coord.storage_node.test_stream_segment_shard_pg_id_for(
-        session_id,
-        segment_index,
-        GenerationId::new(generation).unwrap(),
-    )
-}
-
 pub(crate) fn multipart_part_shard_pg_id(
     coord: &Coordinator,
-    upload_id: &UploadId,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    object_generation_id: GenerationId,
     part_number: u32,
-    generation: u32,
-    part_vid: GenerationId,
 ) -> u32 {
     coord.storage_node.test_multipart_part_shard_pg_id_for(
-        upload_id,
+        bucket,
+        key,
+        object_generation_id,
         part_number,
-        generation,
-        part_vid,
     )
 }

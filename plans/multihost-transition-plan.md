@@ -525,11 +525,30 @@ Phase 3 implementation notes:
      PutObject writes cannot collide on the same generation-derived shard keys
    - successful commit, abort, and direct PUT precondition failure release the
      reservation
-4. Multipart part payload placement still uses upload/part generation identity.
-   Completion keeps rooting the final object payload generation in object
-   metadata; revisiting multipart data PG selection can be handled as a later
-   Phase 3 cleanup if we decide multipart parts should be constrained by final
-   object generation rather than upload-local part identity.
+4. Multipart uploads now reserve the final object payload generation when the
+   upload is created.
+   - the reservation is stored on the multipart upload row and included in
+     `next_generation_id`, so concurrent multipart uploads for the same key do
+     not collide
+   - streamed UploadPart segment data PG selection uses the reserved object
+     generation plus `(part_number, segment_index)` banding over the bounded
+     object-local PG set
+   - streamed UploadPart shard keys remain session-unique while staging, so
+     concurrent reuploads of the same part do not overwrite one another before
+     metadata commit decides the winning part generation
+   - CompleteMultipartUpload publishes the reserved generation as the final
+     object generation and releases the reservation in the same metadata
+     transaction
+   - CompleteMultipartUpload reparents only selected streamed part segment rows
+     and removes omitted streamed part metadata rows, so completing a subset of
+     uploaded parts does not leave unreachable metadata
+   - residual risk: omitted part shard deletion is still post-commit
+     best-effort. A process crash or persistent shard-delete failure after the
+     metadata commit can leave untracked shard files. This should move to
+     crash-durable reclaim work before multihost cleanup is considered
+     complete.
+   - AbortMultipartUpload deletes the staged part metadata and releases the
+     reservation with the upload row
 
 ## Phase 4: Node-Aware Shard Placement
 

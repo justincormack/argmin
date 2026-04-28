@@ -211,6 +211,47 @@ impl PgTopology {
         set[band_index as usize % set.len()]
     }
 
+    pub fn object_generation_multipart_part_data_pg(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        part_number: u32,
+    ) -> DataPgId {
+        let part_band_index = u64::from(part_number.saturating_sub(1));
+        self.object_generation_band_data_pg(bucket, key, generation_id, part_band_index)
+    }
+
+    pub fn object_generation_multipart_part_segment_data_pg(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        part_number: u32,
+        segment_index: u32,
+    ) -> DataPgId {
+        let part_band_index = u64::from(part_number.saturating_sub(1));
+        let segment_band_index =
+            u64::from(segment_index / DEFAULT_OBJECT_DATA_PG_SEGMENT_BAND_SIZE);
+        self.object_generation_band_data_pg(
+            bucket,
+            key,
+            generation_id,
+            part_band_index + segment_band_index,
+        )
+    }
+
+    fn object_generation_band_data_pg(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        band_index: u64,
+    ) -> DataPgId {
+        let set = self.object_generation_data_pg_set(bucket, key, generation_id);
+        set[(band_index % set.len() as u64) as usize]
+    }
+
     pub fn for_each_pg<E>(&self, mut f: impl FnMut(u32) -> Result<(), E>) -> Result<(), E> {
         for &pg_id in &*self.pg_ids {
             f(pg_id)?;
@@ -476,6 +517,54 @@ mod tests {
                 width
             ),
             set[0]
+        );
+    }
+
+    #[test]
+    fn object_generation_multipart_part_segment_data_pg_uses_part_and_segment_bands() {
+        let topo = PgTopology::new(&(0..16).collect::<Vec<_>>()).unwrap();
+        let bucket = BucketName::try_from("bucket").unwrap();
+        let key = ObjectKey::try_from("key").unwrap();
+        let generation_id = GenerationId::new(11).unwrap();
+        let set = topo.object_generation_data_pg_set(&bucket, &key, generation_id);
+
+        assert_eq!(
+            topo.object_generation_multipart_part_data_pg(&bucket, &key, generation_id, 1),
+            set[0]
+        );
+        assert_eq!(
+            topo.object_generation_multipart_part_data_pg(&bucket, &key, generation_id, 2),
+            set[1]
+        );
+        assert_eq!(
+            topo.object_generation_multipart_part_segment_data_pg(
+                &bucket,
+                &key,
+                generation_id,
+                1,
+                DEFAULT_OBJECT_DATA_PG_SEGMENT_BAND_SIZE - 1,
+            ),
+            set[0]
+        );
+        assert_eq!(
+            topo.object_generation_multipart_part_segment_data_pg(
+                &bucket,
+                &key,
+                generation_id,
+                1,
+                DEFAULT_OBJECT_DATA_PG_SEGMENT_BAND_SIZE,
+            ),
+            set[1]
+        );
+        assert_eq!(
+            topo.object_generation_multipart_part_segment_data_pg(
+                &bucket,
+                &key,
+                generation_id,
+                2,
+                DEFAULT_OBJECT_DATA_PG_SEGMENT_BAND_SIZE,
+            ),
+            set[2]
         );
     }
 }

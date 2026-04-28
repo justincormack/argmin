@@ -1751,6 +1751,13 @@ fn mpu_create_and_get_upload() {
     assert_eq!(rec.metadata_blob, vec![1, 2, 3].into());
     assert_eq!(rec.initiator, Some(owner_identity("alice")));
     assert_eq!(rec.owner, owner_identity("alice"));
+    assert_eq!(rec.object_generation_id, GenerationId::MIN);
+    assert_eq!(
+        store
+            .next_generation_id(&bucket_name("bucket"), &object_key("k"))
+            .unwrap(),
+        GenerationId::new(2).unwrap()
+    );
     assert!(rec.initiated_at > 0);
 }
 
@@ -2053,6 +2060,15 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
     assert_eq!(completed.bucket.as_str(), "bucket");
     assert_eq!(completed.key.as_str(), "k");
     assert_eq!(completed.owner.principal, "owner");
+    let reservation_count: i64 = store
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM object_generation_reservations WHERE reservation_id = ?1",
+            rusqlite::params![multipart_upload_id("uid-cmc").as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reservation_count, 0);
 }
 
 #[test]
@@ -2444,6 +2460,12 @@ fn mpu_delete_upload_cascades_parts() {
             .unwrap_err(),
         crate::error::MetadataError::NoSuchUpload { .. }
     ));
+    assert_eq!(
+        store
+            .next_generation_id(&bucket_name("bucket"), &object_key("k"))
+            .unwrap(),
+        GenerationId::MIN
+    );
 }
 
 #[test]

@@ -857,20 +857,6 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_stream_segment_shard_pg_id_for(
-        &self,
-        session_id: &SessionId,
-        segment_index: u32,
-        generation_id: GenerationId,
-    ) -> u32 {
-        self.single_node.test_stream_segment_shard_pg_id_for(
-            session_id,
-            segment_index,
-            generation_id,
-        )
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_object_generation_reservation_for(
         &self,
         bucket: &BucketName,
@@ -884,16 +870,16 @@ impl super::StorageCluster {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_multipart_part_shard_pg_id_for(
         &self,
-        upload_id: &UploadId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        object_generation_id: GenerationId,
         part_number: u32,
-        generation: u32,
-        part_vid: GenerationId,
     ) -> u32 {
         self.single_node.test_multipart_part_shard_pg_id_for(
-            upload_id,
+            bucket,
+            key,
+            object_generation_id,
             part_number,
-            generation,
-            part_vid,
         )
     }
 

@@ -4005,6 +4005,8 @@ impl PgMetadataStore for PgStore {
                      UNION ALL
                      SELECT generation_id FROM multipart_reclaims WHERE bucket = ?1 AND key = ?2
                      UNION ALL
+                     SELECT object_generation_id FROM multipart_uploads WHERE bucket = ?1 AND key = ?2
+                     UNION ALL
                      SELECT generation_id FROM object_generation_reservations WHERE bucket = ?1 AND key = ?2
                  )",
                 params![bucket, key],
@@ -4957,41 +4959,86 @@ impl PgMetadataStore for PgStore {
         let encryption_state = req.encryption.encode_state();
         let system_metadata_blob = req.system_metadata_blob.as_slice();
         self.conn
-            .execute(
-                "INSERT INTO multipart_uploads \
-                 (upload_id, bucket, key, initiated_at, state, tags, metadata_blob, system_metadata_blob, owner_principal, owner_canonical_id, \
-                  initiator_principal, initiator_canonical_id, checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
-                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
-                params![
-                    req.upload_id,
-                    req.bucket,
-                    req.key,
-                    now as i64,
-                    tags,
-                    req.metadata_blob.as_slice(),
-                    system_metadata_blob,
-                    req.owner.principal,
-                    req.owner.canonical_id.as_str(),
-                    req.initiator.as_ref().map(|owner| owner.principal.as_str()),
-                    req.initiator
-                        .as_ref()
-                        .map(|owner| owner.canonical_id.as_str()),
-                    algo,
-                    ctype,
-                    encryption_type,
-                    encryption_state,
-                    req.acl_grants.serialized(),
-                    i32::from(req.public_read),
-                    object_lock_retention_mode,
-                    object_lock_retain_until,
-                    object_lock_legal_hold,
-                ],
-            )
+            .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
-                context: "create multipart upload",
+                context: "create multipart upload (begin txn)",
                 source: e,
             })?;
-        Ok(())
+
+        let result: Result<(), MetadataError> = (|| {
+            let object_generation_id = self.next_generation_id(&req.bucket, &req.key)?;
+            self.conn
+                .execute(
+                    "INSERT INTO object_generation_reservations \
+                     (reservation_id, bucket, key, generation_id, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        req.upload_id.as_str(),
+                        req.bucket,
+                        req.key,
+                        object_generation_id.get() as i64,
+                        now as i64,
+                    ],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "create multipart upload (reserve generation)",
+                    source: e,
+                })?;
+            self.conn
+                .execute(
+                    "INSERT INTO multipart_uploads \
+                     (upload_id, bucket, key, initiated_at, state, tags, metadata_blob, system_metadata_blob, owner_principal, owner_canonical_id, \
+                      initiator_principal, initiator_canonical_id, checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_generation_id, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
+                     VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                    params![
+                        req.upload_id,
+                        req.bucket,
+                        req.key,
+                        now as i64,
+                        tags,
+                        req.metadata_blob.as_slice(),
+                        system_metadata_blob,
+                        req.owner.principal,
+                        req.owner.canonical_id.as_str(),
+                        req.initiator.as_ref().map(|owner| owner.principal.as_str()),
+                        req.initiator
+                            .as_ref()
+                            .map(|owner| owner.canonical_id.as_str()),
+                        algo,
+                        ctype,
+                        encryption_type,
+                        encryption_state,
+                        req.acl_grants.serialized(),
+                        i32::from(req.public_read),
+                        object_generation_id.get() as i64,
+                        object_lock_retention_mode,
+                        object_lock_retain_until,
+                        object_lock_legal_hold,
+                    ],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "create multipart upload",
+                    source: e,
+                })?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(MetadataError::Db {
+                        context: "create multipart upload (commit txn)",
+                        source: e,
+                    });
+                }
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
     }
 
     fn get_multipart_upload(
@@ -5002,7 +5049,7 @@ impl PgMetadataStore for PgStore {
             .query_row(
                 "SELECT upload_id, bucket, key, initiated_at, state, tags, metadata_blob, \
                  system_metadata_blob, owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id, \
-                 checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold \
+                 checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold, object_generation_id \
                  FROM multipart_uploads WHERE upload_id = ?1",
                 params![upload_id.as_str()],
                 |row| {
@@ -5085,6 +5132,11 @@ impl PgMetadataStore for PgStore {
                             "multipart acl_grants",
                         )?,
                         public_read: row.get::<_, i64>(17)? != 0,
+                        object_generation_id: Self::parse_generation_id(
+                            row.get::<_, i64>(21)?,
+                            21,
+                            "object_generation_id",
+                        )?,
                         object_lock,
                         checksum,
                         encryption: Self::parse_object_encryption(
@@ -5169,22 +5221,58 @@ impl PgMetadataStore for PgStore {
     }
 
     fn delete_multipart_upload(&self, upload_id: &UploadId) -> Result<(), MetadataError> {
-        let deleted = self
-            .conn
-            .execute(
-                "DELETE FROM multipart_uploads WHERE upload_id = ?1",
-                params![upload_id.as_str()],
-            )
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
-                context: "delete multipart upload",
+                context: "delete multipart upload (begin txn)",
                 source: e,
             })?;
-        if deleted == 0 {
-            return Err(MetadataError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
+
+        let result = (|| -> Result<(), MetadataError> {
+            self.conn
+                .execute(
+                    "DELETE FROM object_generation_reservations \
+                     WHERE reservation_id = ?1",
+                    params![upload_id.as_str()],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "delete multipart upload generation reservation",
+                    source: e,
+                })?;
+            let deleted = self
+                .conn
+                .execute(
+                    "DELETE FROM multipart_uploads WHERE upload_id = ?1",
+                    params![upload_id.as_str()],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "delete multipart upload",
+                    source: e,
+                })?;
+            if deleted == 0 {
+                return Err(MetadataError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(MetadataError::Db {
+                        context: "delete multipart upload (commit txn)",
+                        source: e,
+                    });
+                }
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
         }
-        Ok(())
     }
 
     fn get_completed_multipart_upload(
@@ -5309,7 +5397,7 @@ impl PgMetadataStore for PgStore {
         let sql = format!(
             "SELECT upload_id, bucket, key, initiated_at, state, tags, metadata_blob, \
              system_metadata_blob, owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id, \
-             checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold \
+             checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold, object_generation_id \
              FROM multipart_uploads \
              WHERE {where_str} \
              ORDER BY key ASC, initiated_at ASC, upload_id ASC \
@@ -5400,6 +5488,11 @@ impl PgMetadataStore for PgStore {
                         "multipart acl_grants",
                     )?,
                     public_read: row.get::<_, i64>(17)? != 0,
+                    object_generation_id: Self::parse_generation_id(
+                        row.get::<_, i64>(21)?,
+                        21,
+                        "object_generation_id",
+                    )?,
                     object_lock,
                     checksum,
                     encryption: Self::parse_object_encryption(
@@ -6017,7 +6110,7 @@ impl PgMetadataStore for PgStore {
         completion_order: u64,
         obj: &CommitMultipartReq,
         parts: &[ObjectPartRecord],
-    ) -> Result<(), MetadataError> {
+    ) -> Result<CompleteMultipartCommitCleanup, MetadataError> {
         if parts.is_empty() {
             return Err(MetadataError::Db {
                 context: "complete multipart commit (empty parts)",
@@ -6050,8 +6143,9 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
 
-        let result = (|| -> Result<(), rusqlite::Error> {
+        let result = (|| -> Result<CompleteMultipartCommitCleanup, rusqlite::Error> {
             // Validate part identity matches object.
+            let mut selected_part_numbers = std::collections::BTreeSet::new();
             for part in parts {
                 if part.bucket != obj.bucket
                     || part.key != obj.key
@@ -6061,6 +6155,13 @@ impl PgMetadataStore for PgStore {
                         0,
                         rusqlite::types::Type::Null,
                         Box::from("part does not match object"),
+                    ));
+                }
+                if !selected_part_numbers.insert(part.part_number) {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Null,
+                        Box::from("duplicate multipart completion part"),
                     ));
                 }
             }
@@ -6088,6 +6189,91 @@ impl PgMetadataStore for PgStore {
                     }
                 }
             }
+            let upload_generation_id: i64 = self.conn.query_row(
+                "SELECT object_generation_id FROM multipart_uploads WHERE upload_id = ?1",
+                params![upload_id],
+                |row| row.get(0),
+            )?;
+            if upload_generation_id != obj.generation_id.get() as i64 {
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    Box::from(format!(
+                        "multipart upload generation {} does not match commit generation {}",
+                        upload_generation_id,
+                        obj.generation_id.get()
+                    )),
+                ));
+            }
+
+            let omitted_parts = {
+                let mut stmt = self.conn.prepare(
+                    "SELECT upload_id, part_number, generation, size, etag, etag_kind, \
+                     part_okh, part_vid, ec_k, ec_m, last_modified, checksum \
+                     FROM multipart_parts WHERE upload_id = ?1 ORDER BY part_number ASC",
+                )?;
+                let rows =
+                    stmt.query_map(params![upload_id.as_str()], Self::row_to_multipart_part)?;
+                let mut omitted = Vec::new();
+                for row in rows {
+                    let part = row?;
+                    if !selected_part_numbers.contains(&part.part_number) {
+                        omitted.push(part);
+                    }
+                }
+                omitted
+            };
+
+            let (omitted_streaming_segments, omitted_streaming_part_numbers) = {
+                let mut stmt = self.conn.prepare(
+                    "SELECT bucket, key, upload_id, version_id, part_number, segment_index, \
+                     size, segment_crc64, segment_okh, segment_vid, shard_pg_id, ec_k, ec_m \
+                     FROM multipart_part_segments \
+                     WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3 AND version_id = ?4 \
+                     ORDER BY part_number, segment_index",
+                )?;
+                let rows = stmt.query_map(
+                    params![
+                        obj.bucket,
+                        obj.key,
+                        upload_id.as_str(),
+                        PART_SEGMENT_STAGING_VERSION_ID.to_u64() as i64
+                    ],
+                    |row| {
+                        let okh_blob: Vec<u8> = row.get(8)?;
+                        let segment_okh = PgStore::parse_okh_blob(&okh_blob, 8)?;
+                        Ok(MultipartPartSegmentRecord {
+                            bucket: row.get(0)?,
+                            key: row.get(1)?,
+                            upload_id: row.get(2)?,
+                            version_id: row.get::<_, i64>(3)? as u64,
+                            part_number: row.get(4)?,
+                            segment_index: row.get(5)?,
+                            size: row.get::<_, i64>(6)? as u64,
+                            segment_crc64: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+                            segment_okh,
+                            segment_vid: Self::parse_generation_id(
+                                row.get::<_, i64>(9)?,
+                                9,
+                                "segment_vid",
+                            )?,
+                            shard_pg_id: row.get(10)?,
+                            ec_k: row.get(11)?,
+                            ec_m: row.get(12)?,
+                        })
+                    },
+                )?;
+                let mut omitted = Vec::new();
+                let mut omitted_part_numbers = std::collections::BTreeSet::new();
+                for row in rows {
+                    let segment = row?;
+                    if !selected_part_numbers.contains(&segment.part_number) {
+                        omitted_part_numbers.insert(segment.part_number);
+                        omitted.push(segment);
+                    }
+                }
+                (omitted, omitted_part_numbers)
+            };
             let (object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) =
                 Self::object_lock_sql_values(obj.object_lock)?;
             let write_sequence = self
@@ -6201,23 +6387,44 @@ impl PgMetadataStore for PgStore {
                 ],
             )?;
 
-            // 6. Reparent this upload's segments from staging version_id to
-            //    the real object version_id so reads can find them.
-            self.conn.execute(
-                "UPDATE multipart_part_segments \
-                 SET version_id = ?1 \
-                 WHERE bucket = ?2 AND key = ?3 AND upload_id = ?4 \
-                 AND version_id = ?5",
-                params![
-                    obj.version_id.to_u64() as i64,
-                    obj.bucket,
-                    obj.key,
-                    upload_id,
-                    PART_SEGMENT_STAGING_VERSION_ID.to_u64() as i64,
-                ],
-            )?;
+            // 6. Delete omitted streamed part segment rows. Their shard files
+            //    are returned to the caller for post-commit cleanup.
+            for part_number in &omitted_streaming_part_numbers {
+                self.conn.execute(
+                    "DELETE FROM multipart_part_segments \
+                     WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3 \
+                     AND version_id = ?4 AND part_number = ?5",
+                    params![
+                        obj.bucket,
+                        obj.key,
+                        upload_id.as_str(),
+                        PART_SEGMENT_STAGING_VERSION_ID.to_u64() as i64,
+                        part_number,
+                    ],
+                )?;
+            }
 
-            // 7. Record this upload as completed so AbortMultipartUpload can
+            // 7. Reparent only selected streamed segments from staging
+            //    version_id to the real object version_id so reads can find
+            //    them. Omitted parts must not survive as unreachable rows.
+            for part_number in &selected_part_numbers {
+                self.conn.execute(
+                    "UPDATE multipart_part_segments \
+                     SET version_id = ?1 \
+                     WHERE bucket = ?2 AND key = ?3 AND upload_id = ?4 \
+                     AND version_id = ?5 AND part_number = ?6",
+                    params![
+                        obj.version_id.to_u64() as i64,
+                        obj.bucket,
+                        obj.key,
+                        upload_id.as_str(),
+                        PART_SEGMENT_STAGING_VERSION_ID.to_u64() as i64,
+                        part_number,
+                    ],
+                )?;
+            }
+
+            // 8. Record this upload as completed so AbortMultipartUpload can
             //    remain idempotently successful for the exact completed upload_id.
             let (initiator_principal, initiator_canonical_id): (Option<String>, Option<String>) =
                 self.conn.query_row(
@@ -6243,17 +6450,36 @@ impl PgMetadataStore for PgStore {
                 ],
             )?;
 
-            // 8. Delete in-progress upload + parts (CASCADE).
+            // 9. Release the durable generation reservation now that the
+            //    generation is visible on the committed object row.
+            let released = self.conn.execute(
+                "DELETE FROM object_generation_reservations \
+                 WHERE reservation_id = ?1 AND bucket = ?2 AND key = ?3 AND generation_id = ?4",
+                params![
+                    upload_id,
+                    obj.bucket,
+                    obj.key,
+                    obj.generation_id.get() as i64,
+                ],
+            )?;
+            if released == 0 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+
+            // 10. Delete in-progress upload + parts (CASCADE).
             self.conn.execute(
                 "DELETE FROM multipart_uploads WHERE upload_id = ?1",
                 params![upload_id],
             )?;
 
-            Ok(())
+            Ok(CompleteMultipartCommitCleanup {
+                omitted_parts,
+                omitted_streaming_segments,
+            })
         })();
 
         match result {
-            Ok(()) => {
+            Ok(cleanup) => {
                 if let Err(e) = self.conn.execute_batch("COMMIT") {
                     let _ = self.conn.execute_batch("ROLLBACK");
                     return Err(MetadataError::Db {
@@ -6261,7 +6487,7 @@ impl PgMetadataStore for PgStore {
                         source: e,
                     });
                 }
-                Ok(())
+                Ok(cleanup)
             }
             Err(e) => {
                 let _ = self.conn.execute_batch("ROLLBACK");

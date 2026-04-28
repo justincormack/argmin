@@ -2753,6 +2753,8 @@ pub struct MultipartUploadRecord {
     pub owner: OwnerIdentity,
     pub acl_grants: AclGrants,
     pub public_read: bool,
+    /// Final object payload generation reserved for this upload.
+    pub object_generation_id: GenerationId,
     /// Pending Object Lock state to apply to the committed object version.
     pub object_lock: ObjectLockState,
     /// Validated checksum configuration for this upload.
@@ -2831,6 +2833,7 @@ pub struct CompleteMultipartCommitRequest {
     pub owner: OwnerIdentity,
     pub acl_grants: AclGrants,
     pub public_read: bool,
+    pub generation_id: GenerationId,
     pub size: u64,
     pub etag_crc64: [u8; 8],
     pub tags: Option<SerializedTagSet>,
@@ -2839,6 +2842,12 @@ pub struct CompleteMultipartCommitRequest {
     pub object_lock: ObjectLockState,
     pub encryption: ObjectEncryption,
     pub part_records: Vec<MultipartPartRecord>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CompleteMultipartCommitCleanup {
+    pub omitted_parts: Vec<MultipartPartRecord>,
+    pub omitted_streaming_segments: Vec<MultipartPartSegmentRecord>,
 }
 
 #[derive(Debug, Clone)]

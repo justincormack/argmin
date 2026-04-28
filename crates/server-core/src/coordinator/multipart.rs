@@ -629,6 +629,7 @@ impl Coordinator {
                     owner: upload.owner.clone(),
                     acl_grants: upload.acl_grants.clone(),
                     public_read: upload.public_read,
+                    generation_id: upload.object_generation_id,
                     size: total_size,
                     etag_crc64,
                     tags: upload.tags.clone(),

@@ -405,19 +405,6 @@ impl SharedStorageNode {
         }
     }
 
-    fn stream_segment_shard_pg_id(
-        &self,
-        session_id: &SessionId,
-        segment_index: u32,
-        segment_vid: GenerationId,
-    ) -> u32 {
-        self.pg_topology.shard_pg(
-            format!("segment/{}", session_id.as_str()).as_str(),
-            segment_index.to_string().as_str(),
-            segment_vid.get(),
-        )
-    }
-
     pub fn load_stream_upload_session(
         &self,
         bucket: &BucketName,
@@ -468,16 +455,26 @@ impl SharedStorageNode {
                         .get(),
                 )
             }
-            StreamUploadTarget::UploadPart { .. } => {
+            StreamUploadTarget::UploadPart {
+                ref upload_id,
+                part_number,
+            } => {
+                let upload = Self::load_in_progress_multipart_upload_from_object_pg(
+                    &pg, bucket, key, upload_id,
+                )?;
                 let segment_vid = pg.allocate_stream_segment_vid(&request.session_id)?;
                 (
                     request.segment_okh,
                     segment_vid,
-                    self.stream_segment_shard_pg_id(
-                        &request.session_id,
-                        request.segment_index,
-                        segment_vid,
-                    ),
+                    self.pg_topology
+                        .object_generation_multipart_part_segment_data_pg(
+                            bucket,
+                            key,
+                            upload.object_generation_id,
+                            part_number,
+                            request.segment_index,
+                        )
+                        .get(),
                 )
             }
         };
