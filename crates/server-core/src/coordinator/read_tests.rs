@@ -372,7 +372,7 @@ fn buffered_put_single_segment_skips_stream_session_rows() {
     );
     assert_eq!(segments[0].segment_vid, live.generation_id);
     assert_eq!(
-        segments[0].shard_pg_id,
+        segments[0].data_pg_id,
         topology
             .object_generation_segment_data_pg(
                 &trusted_bucket_name("bucket"),
@@ -441,7 +441,7 @@ fn failed_buffered_put_before_commit_leaves_no_generation_reservation_or_shards(
     let generation_id = GenerationId::MIN;
     let segment_okh = segment_key_hash("bucket", "key", generation_id, 0);
     let topology = PgTopology::new(coord.storage_node.test_pg_ids()).unwrap();
-    let shard_pg_id = topology
+    let data_pg_id = topology
         .object_generation_segment_data_pg(&bucket, &key, generation_id, 0)
         .get();
     let ec = coord.storage_node.default_payload_ec_shape();
@@ -450,7 +450,7 @@ fn failed_buffered_put_before_commit_leaves_no_generation_reservation_or_shards(
         assert!(
             !coord
                 .storage_node
-                .test_shard_exists(shard_pg_id, &shard_key)
+                .test_shard_exists(data_pg_id, &shard_key)
                 .unwrap(),
             "failed direct PUT must not leave shard {shard_index}"
         );

@@ -357,7 +357,7 @@ Raw PG test dependency inventory:
 1. storage unit and integration tests call `SharedStorageNode::get_pg` and
    `lock_two_pgs` directly
 2. coordinator tests use `test_bucket_pg_id_for`, `test_object_pg_id_for`,
-   `test_shard_pg_id_for`, and `test_lock_bucket_pg`
+   `test_data_pg_id_for`, and `test_lock_bucket_pg`
 3. coordinator reclaim and multipart tests use `test_shard_exists`,
    `test_read_shard_raw`, `test_delete_shards`, and `test_register_written_shards`
 4. several tests deliberately find keys where bucket PG and object PG are equal
@@ -481,6 +481,8 @@ Phase 2 implementation notes:
 
 ## Phase 3: Data PG Selection
 
+Status: complete.
+
 Fix the object-to-data-PG mapping before relying on the distributed layout.
 
 Work items:
@@ -544,6 +546,18 @@ Phase 3 implementation notes:
      uploaded parts does not leave unreachable metadata
    - AbortMultipartUpload deletes the staged part metadata and releases the
      reservation with the upload row
+5. Data PG terminology is now reflected in storage metadata, schema columns,
+   request structs, test helpers, and diagnostics as `data_pg_id`.
+   - the previous ambiguous data-placement PG names were removed from active code
+   - shard-specific names remain only for actual EC shard indexes, shard keys,
+     and shard files
+
+Phase 3 completion notes:
+
+1. all Phase 3 exit criteria are met for the current local PG model
+2. physical EC shard placement across nodes starts in Phase 4
+3. crash-durable cleanup of unreferenced shard files remains Phase 7 scavenger
+   work, not Phase 3 data placement work
 
 ## Phase 4: Node-Aware Shard Placement
 

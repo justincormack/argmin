@@ -355,7 +355,7 @@ fn multipart_upload_lifecycle() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            shard_pg_id: 0,
+            data_pg_id: 0,
             checksum: None,
         },
         ObjectPartRecord {
@@ -370,7 +370,7 @@ fn multipart_upload_lifecycle() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            shard_pg_id: 0,
+            data_pg_id: 0,
             checksum: None,
         },
     ];
@@ -446,7 +446,7 @@ fn streaming_put_object_lifecycle() {
             segment_crc64: Some(123),
             segment_okh: hash0,
             segment_vid: GenerationId::MIN,
-            shard_pg_id: 0,
+            data_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
         })
@@ -459,7 +459,7 @@ fn streaming_put_object_lifecycle() {
             segment_crc64: Some(456),
             segment_okh: hash1,
             segment_vid: GenerationId::MIN,
-            shard_pg_id: 0,
+            data_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
         })
@@ -483,7 +483,7 @@ fn streaming_put_object_lifecycle() {
             segment_crc64: Some(123),
             segment_okh: hash0,
             segment_vid: GenerationId::MIN,
-            shard_pg_id: 0,
+            data_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
         },
@@ -496,7 +496,7 @@ fn streaming_put_object_lifecycle() {
             segment_crc64: Some(456),
             segment_okh: hash1,
             segment_vid: GenerationId::MIN,
-            shard_pg_id: 0,
+            data_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
         },
@@ -613,7 +613,7 @@ fn streaming_upload_part_lifecycle() {
             segment_crc64: Some(ack.crc64),
             segment_okh: hash,
             segment_vid: GenerationId::MIN,
-            shard_pg_id: 0,
+            data_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
         })
@@ -631,7 +631,7 @@ fn streaming_upload_part_lifecycle() {
         segment_crc64: Some(ack.crc64),
         segment_okh: hash,
         segment_vid: GenerationId::MIN,
-        shard_pg_id: 0,
+        data_pg_id: 0,
         ec_k: 4,
         ec_m: 2,
     }];
@@ -857,7 +857,7 @@ fn object_overwrite_with_reclaim() {
                 segment_index: 0,
                 segment_okh: hash1,
                 segment_vid: gen1,
-                shard_pg_id: 0,
+                data_pg_id: 0,
                 ec: EcShape { k: 4, m: 2 },
             }],
         })
@@ -1080,7 +1080,7 @@ fn multipart_abort_cleanup() {
         segment_crc64: Some(999),
         segment_okh: hash,
         segment_vid: GenerationId::MIN,
-        shard_pg_id: 0,
+        data_pg_id: 0,
         ec_k: 4,
         ec_m: 2,
     }];
@@ -1311,7 +1311,7 @@ fn persistence_complex_state_through_reopen() {
                 segment_crc64: Some(42),
                 segment_okh: [0xEE; 16],
                 segment_vid: GenerationId::MIN,
-                shard_pg_id: 0,
+                data_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
             })

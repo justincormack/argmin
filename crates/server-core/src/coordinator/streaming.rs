@@ -424,14 +424,14 @@ impl Coordinator {
     #[cfg(test)]
     pub(super) fn write_segment_shards(
         &self,
-        shard_pg_id: u32,
+        data_pg_id: u32,
         segment_okh: &[u8; 16],
         segment_vid: GenerationId,
         data: &[u8],
     ) -> Result<Vec<WrittenShard>, ServerError> {
         Ok(self
             .storage_node
-            .write_stream_segment_payload_shards(shard_pg_id, segment_okh, segment_vid, data)?
+            .write_stream_segment_payload_shards(data_pg_id, segment_okh, segment_vid, data)?
             .into_iter()
             .map(|written| WrittenShard {
                 key: written.key,
@@ -523,7 +523,7 @@ impl Coordinator {
         maybe_run_stream_append_prepare_hook(session_id, segment_index);
 
         let written_shards = self.storage_node.write_stream_segment_payload_shards(
-            segment_record.shard_pg_id,
+            segment_record.data_pg_id,
             &segment_record.segment_okh,
             segment_record.segment_vid,
             data,

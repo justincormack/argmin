@@ -841,14 +841,14 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_shard_pg_id_for(
+    pub fn test_data_pg_id_for(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> u32 {
         self.single_node
-            .test_shard_pg_id_for(bucket, key, generation_id)
+            .test_data_pg_id_for(bucket, key, generation_id)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -863,14 +863,14 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_multipart_part_shard_pg_id_for(
+    pub fn test_multipart_part_data_pg_id_for(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         object_generation_id: GenerationId,
         part_number: u32,
     ) -> u32 {
-        self.single_node.test_multipart_part_shard_pg_id_for(
+        self.single_node.test_multipart_part_data_pg_id_for(
             bucket,
             key,
             object_generation_id,

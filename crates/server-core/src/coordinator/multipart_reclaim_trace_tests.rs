@@ -44,7 +44,7 @@ fn trace_object_segments_reclaim(
 ) -> ObjectSegmentsReclaimRecord {
     let bucket_name = trusted_bucket_name(bucket);
     let object_key = trusted_object_key(key);
-    let shard_pg_id = runtime
+    let data_pg_id = runtime
         .pg_topology
         .object_generation_segment_data_pg(&bucket_name, &object_key, generation_id, 0)
         .get();
@@ -58,7 +58,7 @@ fn trace_object_segments_reclaim(
             segment_index: 0,
             segment_okh: object_key_hash(bucket, key),
             segment_vid: generation_id,
-            shard_pg_id,
+            data_pg_id,
             ec: EcShape { k: 4, m: 2 },
         }],
     }
@@ -73,7 +73,7 @@ fn trace_multipart_reclaim(
 ) -> MultipartReclaimRecord {
     let bucket_name = trusted_bucket_name(bucket);
     let object_key = trusted_object_key(key);
-    let shard_pg_id = runtime
+    let data_pg_id = runtime
         .pg_topology
         .object_generation_multipart_part_data_pg(&bucket_name, &object_key, generation_id, 1)
         .get();
@@ -87,7 +87,7 @@ fn trace_multipart_reclaim(
             part_number: 1,
             part_okh: object_key_hash(bucket, key),
             part_vid: generation_id,
-            shard_pg_id,
+            data_pg_id,
             ec: EcShape { k: 4, m: 2 },
         }],
     }

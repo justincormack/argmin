@@ -179,13 +179,13 @@ impl StorageCluster {
 
     pub fn write_stream_segment_payload_shards(
         &self,
-        shard_pg_id: u32,
+        data_pg_id: u32,
         segment_okh: &[u8; 16],
         segment_vid: GenerationId,
         data: &[u8],
     ) -> Result<Vec<WrittenShardAck>, StoreError> {
         self.single_node
-            .write_stream_segment_shards(shard_pg_id, segment_okh, segment_vid, data)
+            .write_stream_segment_shards(data_pg_id, segment_okh, segment_vid, data)
     }
 
     pub fn commit_stream_segment_append(

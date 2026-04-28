@@ -613,7 +613,7 @@ fn delete_bucket_clears_completed_multipart_upload_records() {
         part_vid: GenerationId::MIN,
         ec_k: 4,
         ec_m: 2,
-        shard_pg_id: 0,
+        data_pg_id: 0,
         checksum: None,
     }];
     store
@@ -1920,7 +1920,7 @@ fn mpu_object_part_checksum_round_trip() {
                 part_vid: GenerationId::MIN,
                 ec_k: 4,
                 ec_m: 2,
-                shard_pg_id: 0,
+                data_pg_id: 0,
                 checksum: Some(checksum_bytes.clone()),
             },
             ObjectPartRecord {
@@ -1935,7 +1935,7 @@ fn mpu_object_part_checksum_round_trip() {
                 part_vid: GenerationId::new(1).unwrap(),
                 ec_k: 4,
                 ec_m: 2,
-                shard_pg_id: 0,
+                data_pg_id: 0,
                 checksum: None,
             },
         ])
@@ -2016,7 +2016,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            shard_pg_id: 0,
+            data_pg_id: 0,
             checksum: Some(cksum.clone()),
         },
         ObjectPartRecord {
@@ -2031,7 +2031,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
             part_vid: GenerationId::new(1).unwrap(),
             ec_k: 4,
             ec_m: 2,
-            shard_pg_id: 0,
+            data_pg_id: 0,
             checksum: None,
         },
     ];
@@ -2131,7 +2131,7 @@ fn completed_multipart_tombstone_survives_null_version_overwrite() {
         part_vid: GenerationId::MIN,
         ec_k: 4,
         ec_m: 2,
-        shard_pg_id: 0,
+        data_pg_id: 0,
         checksum: None,
     }];
     store
@@ -2231,7 +2231,7 @@ fn completed_multipart_tombstone_survives_object_version_delete() {
         part_vid: GenerationId::MIN,
         ec_k: 4,
         ec_m: 2,
-        shard_pg_id: 0,
+        data_pg_id: 0,
         checksum: None,
     }];
     store
@@ -2325,7 +2325,7 @@ fn completed_multipart_upload_list_reports_global_completion_orders() {
                     part_vid: GenerationId::MIN,
                     ec_k: 4,
                     ec_m: 2,
-                    shard_pg_id: 0,
+                    data_pg_id: 0,
                     checksum: None,
                 }],
             )
@@ -2926,7 +2926,7 @@ fn mpu_corrupted_object_part_okh_returns_error() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            shard_pg_id: 0,
+            data_pg_id: 0,
             checksum: None,
         }])
         .unwrap();
@@ -3116,7 +3116,7 @@ fn mpu_commit_object_parts_rollback_on_duplicate() {
         part_vid: GenerationId::MIN,
         ec_k: 4,
         ec_m: 2,
-        shard_pg_id: 0,
+        data_pg_id: 0,
         checksum: None,
     };
 
@@ -3160,7 +3160,7 @@ fn mpu_commit_and_get_object_parts() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            shard_pg_id: 0,
+            data_pg_id: 0,
             checksum: None,
         },
         ObjectPartRecord {
@@ -3175,7 +3175,7 @@ fn mpu_commit_and_get_object_parts() {
             part_vid: GenerationId::new(1).unwrap(),
             ec_k: 4,
             ec_m: 2,
-            shard_pg_id: 0,
+            data_pg_id: 0,
             checksum: None,
         },
     ];
@@ -3225,7 +3225,7 @@ fn get_object_parts_overlapping_range_returns_only_overlapping_parts() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            shard_pg_id: 0,
+            data_pg_id: 0,
             checksum: None,
         },
         ObjectPartRecord {
@@ -3240,7 +3240,7 @@ fn get_object_parts_overlapping_range_returns_only_overlapping_parts() {
             part_vid: GenerationId::new(2).unwrap(),
             ec_k: 4,
             ec_m: 2,
-            shard_pg_id: 0,
+            data_pg_id: 0,
             checksum: None,
         },
         ObjectPartRecord {
@@ -3255,7 +3255,7 @@ fn get_object_parts_overlapping_range_returns_only_overlapping_parts() {
             part_vid: GenerationId::new(3).unwrap(),
             ec_k: 4,
             ec_m: 2,
-            shard_pg_id: 0,
+            data_pg_id: 0,
             checksum: None,
         },
     ];
@@ -3308,7 +3308,7 @@ fn mpu_delete_object_parts() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            shard_pg_id: 0,
+            data_pg_id: 0,
             checksum: None,
         }])
         .unwrap();
@@ -3444,7 +3444,7 @@ fn mpu_commit_partial_batch_failure_rolls_back_all() {
         part_vid: GenerationId::MIN,
         ec_k: 4,
         ec_m: 2,
-        shard_pg_id: 0,
+        data_pg_id: 0,
         checksum: None,
     };
     store
@@ -3643,7 +3643,7 @@ fn mpu_commit_object_parts_connection_usable_after_multiple_failures() {
         part_vid: GenerationId::MIN,
         ec_k: 4,
         ec_m: 2,
-        shard_pg_id: 0,
+        data_pg_id: 0,
         checksum: None,
     };
 
@@ -3825,7 +3825,7 @@ fn mpu_commit_object_parts_commit_failure_via_lock_contention() {
         part_vid: GenerationId::MIN,
         ec_k: 4,
         ec_m: 2,
-        shard_pg_id: 0,
+        data_pg_id: 0,
         checksum: None,
     };
     let err = store
@@ -5043,7 +5043,7 @@ fn stream_segment_append_and_list() {
                 segment_crc64: Some((i as u64) + 10),
                 segment_okh: [i as u8; 16],
                 segment_vid: GenerationId::new(42).unwrap(),
-                shard_pg_id: i,
+                data_pg_id: i,
                 ec_k: 4,
                 ec_m: 2,
             })
@@ -5063,7 +5063,7 @@ fn stream_segment_append_and_list() {
     assert_eq!(segments[0].segment_crc64, Some(10));
     assert_eq!(segments[2].segment_crc64, Some(12));
     assert_eq!(segments[0].segment_okh, [0u8; 16]);
-    assert_eq!(segments[2].shard_pg_id, 2);
+    assert_eq!(segments[2].data_pg_id, 2);
 }
 
 #[test]
@@ -5101,7 +5101,7 @@ fn stream_segment_publish_with_shards_same_pg_is_atomic() {
         segment_crc64: Some(99),
         segment_okh: [0x44; 16],
         segment_vid: GenerationId::new(1).unwrap(),
-        shard_pg_id: 0,
+        data_pg_id: 0,
         ec_k: 4,
         ec_m: 2,
     };
@@ -5141,7 +5141,7 @@ fn stream_segment_cascade_delete() {
             segment_crc64: None,
             segment_okh: [0xAA; 16],
             segment_vid: GenerationId::new(1).unwrap(),
-            shard_pg_id: 0,
+            data_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
         })
@@ -5181,7 +5181,7 @@ fn commit_stream_put_atomic() {
             segment_crc64: None,
             segment_okh: [0x11; 16],
             segment_vid: GenerationId::new(1).unwrap(),
-            shard_pg_id: 0,
+            data_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
         })
@@ -5195,7 +5195,7 @@ fn commit_stream_put_atomic() {
             segment_crc64: None,
             segment_okh: [0x22; 16],
             segment_vid: GenerationId::new(1).unwrap(),
-            shard_pg_id: 1,
+            data_pg_id: 1,
             ec_k: 4,
             ec_m: 2,
         })
@@ -5230,7 +5230,7 @@ fn commit_stream_put_atomic() {
             segment_crc64: Some(11),
             segment_okh: [0x11; 16],
             segment_vid: GenerationId::new(1).unwrap(),
-            shard_pg_id: 0,
+            data_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
         },
@@ -5243,7 +5243,7 @@ fn commit_stream_put_atomic() {
             segment_crc64: Some(22),
             segment_okh: [0x22; 16],
             segment_vid: GenerationId::new(1).unwrap(),
-            shard_pg_id: 1,
+            data_pg_id: 1,
             ec_k: 4,
             ec_m: 2,
         },
@@ -5270,11 +5270,11 @@ fn commit_stream_put_atomic() {
     assert_eq!(segments[0].size, 4_000_000);
     assert_eq!(segments[0].segment_crc64, Some(11));
     assert_eq!(segments[0].segment_okh, [0x11; 16]);
-    assert_eq!(segments[0].shard_pg_id, 0);
+    assert_eq!(segments[0].data_pg_id, 0);
     assert_eq!(segments[1].segment_index, 1);
     assert_eq!(segments[1].size, 2_000_000);
     assert_eq!(segments[1].segment_crc64, Some(22));
-    assert_eq!(segments[1].shard_pg_id, 1);
+    assert_eq!(segments[1].data_pg_id, 1);
 
     // Staging rows are cleaned up
     let err = store
@@ -5333,7 +5333,7 @@ fn commit_stream_put_overwrite_unversioned() {
                 segment_crc64: None,
                 segment_okh: [1; 16],
                 segment_vid: GenerationId::new(1).unwrap(),
-                shard_pg_id: 0,
+                data_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
             }],
@@ -5379,7 +5379,7 @@ fn commit_stream_put_overwrite_unversioned() {
                 segment_crc64: None,
                 segment_okh: [2; 16],
                 segment_vid: GenerationId::new(2).unwrap(),
-                shard_pg_id: 1,
+                data_pg_id: 1,
                 ec_k: 4,
                 ec_m: 2,
             }],
@@ -5435,7 +5435,7 @@ fn put_object_with_segments_persists_manifest() {
                     segment_crc64: None,
                     segment_okh: [0x11; 16],
                     segment_vid: GenerationId::MIN,
-                    shard_pg_id: 0,
+                    data_pg_id: 0,
                     ec_k: 4,
                     ec_m: 2,
                 },
@@ -5448,7 +5448,7 @@ fn put_object_with_segments_persists_manifest() {
                     segment_crc64: None,
                     segment_okh: [0x22; 16],
                     segment_vid: GenerationId::MIN,
-                    shard_pg_id: 0,
+                    data_pg_id: 0,
                     ec_k: 4,
                     ec_m: 2,
                 },
@@ -5504,7 +5504,7 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 segment_crc64: None,
                 segment_okh: [1; 16],
                 segment_vid: GenerationId::MIN,
-                shard_pg_id: 0,
+                data_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
             }],
@@ -5540,7 +5540,7 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 segment_crc64: None,
                 segment_okh: [2; 16],
                 segment_vid: GenerationId::MIN,
-                shard_pg_id: 1,
+                data_pg_id: 1,
                 ec_k: 4,
                 ec_m: 2,
             }],
@@ -5602,7 +5602,7 @@ fn delete_object_segments_cleanup() {
                 segment_crc64: None,
                 segment_okh: [1; 16],
                 segment_vid: GenerationId::new(1).unwrap(),
-                shard_pg_id: 0,
+                data_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
             }],
@@ -5685,7 +5685,7 @@ fn multipart_part_segments_crud() {
     conn.execute(
         "INSERT INTO multipart_part_segments \
          (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_okh, \
-          segment_vid, shard_pg_id, ec_k, ec_m) \
+          segment_vid, data_pg_id, ec_k, ec_m) \
          VALUES ('bucket', 'k', ?1, 1, 1, 0, 4000000, X'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 10, 0, 4, 2)",
         [multipart_upload_id("uid-1").into_string()],
     )
@@ -5693,7 +5693,7 @@ fn multipart_part_segments_crud() {
     conn.execute(
         "INSERT INTO multipart_part_segments \
          (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_okh, \
-          segment_vid, shard_pg_id, ec_k, ec_m) \
+          segment_vid, data_pg_id, ec_k, ec_m) \
          VALUES ('bucket', 'k', ?1, 1, 1, 1, 2000000, X'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', 10, 1, 4, 2)",
         [multipart_upload_id("uid-1").into_string()],
     )
@@ -5781,7 +5781,7 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
         segment_crc64: Some(u64::from(fill) + u64::from(segment_index)),
         segment_okh: [fill; 16],
         segment_vid: GenerationId::MIN,
-        shard_pg_id: 0,
+        data_pg_id: 0,
         ec_k: 4,
         ec_m: 2,
     };
@@ -5884,7 +5884,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
             segment_crc64: None,
             segment_okh: [0x11; 16],
             segment_vid: GenerationId::new(1).unwrap(),
-            shard_pg_id: i,
+            data_pg_id: i,
             ec_k: 4,
             ec_m: 2,
         })
@@ -5933,7 +5933,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
         segment_crc64: None,
         segment_okh: [0x22; 16],
         segment_vid: GenerationId::new(2).unwrap(),
-        shard_pg_id: 0,
+        data_pg_id: 0,
         ec_k: 4,
         ec_m: 2,
     }];
@@ -6193,7 +6193,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
                     segment_crc64: None,
                     segment_okh: [0x11; 16],
                     segment_vid: GenerationId::new(1).unwrap(),
-                    shard_pg_id: 0,
+                    data_pg_id: 0,
                     ec_k: 4,
                     ec_m: 2,
                 },
@@ -6208,7 +6208,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
                     segment_crc64: None,
                     segment_okh: [0x22; 16],
                     segment_vid: GenerationId::new(1).unwrap(),
-                    shard_pg_id: 1,
+                    data_pg_id: 1,
                     ec_k: 4,
                     ec_m: 2,
                 },
@@ -6321,7 +6321,7 @@ fn commit_stream_put_rejects_mismatched_segment_target() {
                 segment_crc64: None,
                 segment_okh: [1; 16],
                 segment_vid: GenerationId::new(1).unwrap(),
-                shard_pg_id: 0,
+                data_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
             }],
@@ -6351,14 +6351,14 @@ fn object_segments_reclaim_round_trip() {
                 segment_index: 0,
                 segment_okh: [0x11; 16],
                 segment_vid: GenerationId::new(11).unwrap(),
-                shard_pg_id: 1,
+                data_pg_id: 1,
                 ec: EcShape { k: 4, m: 2 },
             },
             ObjectSegmentsReclaimSegmentRecord {
                 segment_index: 1,
                 segment_okh: [0x22; 16],
                 segment_vid: GenerationId::new(12).unwrap(),
-                shard_pg_id: 2,
+                data_pg_id: 2,
                 ec: EcShape { k: 6, m: 3 },
             },
         ],
@@ -6395,7 +6395,7 @@ fn next_generation_id_skips_object_segments_reclaim_generation() {
                 segment_index: 0,
                 segment_okh: [0x33; 16],
                 segment_vid: GenerationId::new(13).unwrap(),
-                shard_pg_id: 0,
+                data_pg_id: 0,
                 ec: EcShape { k: 4, m: 2 },
             }],
         })
@@ -6503,7 +6503,7 @@ fn multipart_reclaim_round_trip() {
                 part_number: 1,
                 part_okh: [0x44; 16],
                 part_vid: GenerationId::new(21).unwrap(),
-                shard_pg_id: 3,
+                data_pg_id: 3,
                 ec: EcShape { k: 4, m: 2 },
             },
             MultipartReclaimPartRecord::Segments {
@@ -6514,7 +6514,7 @@ fn multipart_reclaim_round_trip() {
                         segment_index: 0,
                         segment_okh: [0x55; 16],
                         segment_vid: GenerationId::new(22).unwrap(),
-                        shard_pg_id: 4,
+                        data_pg_id: 4,
                         ec: EcShape { k: 6, m: 3 },
                     },
                     MultipartReclaimPartSegmentRecord {
@@ -6522,7 +6522,7 @@ fn multipart_reclaim_round_trip() {
                         segment_index: 1,
                         segment_okh: [0x66; 16],
                         segment_vid: GenerationId::new(23).unwrap(),
-                        shard_pg_id: 5,
+                        data_pg_id: 5,
                         ec: EcShape { k: 5, m: 2 },
                     },
                 ],
@@ -6561,7 +6561,7 @@ fn next_generation_id_skips_multipart_reclaim_generation() {
                 part_number: 1,
                 part_okh: [0x77; 16],
                 part_vid: GenerationId::new(24).unwrap(),
-                shard_pg_id: 0,
+                data_pg_id: 0,
                 ec: EcShape { k: 4, m: 2 },
             }],
         })
@@ -6589,7 +6589,7 @@ fn get_bucket_payload_reclaim_root_returns_first_root() {
                 part_number: 1,
                 part_okh: [0x11; 16],
                 part_vid: GenerationId::new(21).unwrap(),
-                shard_pg_id: 0,
+                data_pg_id: 0,
                 ec: EcShape { k: 4, m: 2 },
             }],
         })
@@ -6604,7 +6604,7 @@ fn get_bucket_payload_reclaim_root_returns_first_root() {
                 segment_index: 0,
                 segment_okh: [0x22; 16],
                 segment_vid: GenerationId::new(21).unwrap(),
-                shard_pg_id: 0,
+                data_pg_id: 0,
                 ec: EcShape { k: 4, m: 2 },
             }],
         })
@@ -6644,7 +6644,7 @@ fn payload_reclaim_exists_checks_segment_and_multipart_reclaims() {
                 segment_index: 0,
                 segment_okh: [0x12; 16],
                 segment_vid: GenerationId::new(21).unwrap(),
-                shard_pg_id: 0,
+                data_pg_id: 0,
                 ec: EcShape { k: 4, m: 2 },
             }],
         })
@@ -6674,7 +6674,7 @@ fn payload_reclaim_exists_checks_segment_and_multipart_reclaims() {
                 part_number: 1,
                 part_okh: [0x34; 16],
                 part_vid: GenerationId::new(22).unwrap(),
-                shard_pg_id: 0,
+                data_pg_id: 0,
                 ec: EcShape { k: 4, m: 2 },
             }],
         })
@@ -6768,7 +6768,7 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
                 segment_crc64: None,
                 segment_okh: [1; 16],
                 segment_vid: GenerationId::new(1).unwrap(),
-                shard_pg_id: 0,
+                data_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
             }],
@@ -6848,7 +6848,7 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
                 segment_crc64: None,
                 segment_okh: [1; 16],
                 segment_vid: GenerationId::new(1).unwrap(),
-                shard_pg_id: 0,
+                data_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
             }],
@@ -6872,7 +6872,7 @@ fn malformed_segment_okh_returns_db_error() {
     conn.execute(
         "INSERT INTO object_segments \
          (bucket, key, version_id, segment_index, size, segment_okh, segment_vid, \
-          shard_pg_id, ec_k, ec_m) \
+          data_pg_id, ec_k, ec_m) \
          VALUES ('bucket', 'k', 0, 0, 100, X'AABB', 1, 0, 4, 2)",
         [],
     )
@@ -6896,7 +6896,7 @@ fn malformed_multipart_segment_okh_returns_db_error() {
     conn.execute(
         "INSERT INTO multipart_part_segments \
          (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_okh, \
-          segment_vid, shard_pg_id, ec_k, ec_m) \
+          segment_vid, data_pg_id, ec_k, ec_m) \
          VALUES ('bucket', 'k', ?1, 0, 1, 0, 100, X'AABB', 1, 0, 4, 2)",
         [multipart_upload_id("mpu-bad").into_string()],
     )
@@ -7981,7 +7981,7 @@ fn delete_multipart_part_segments_by_upload_id_cleans_up() {
     conn.execute(
         "INSERT INTO multipart_part_segments \
          (bucket, key, upload_id, version_id, part_number, segment_index, size, \
-          segment_okh, segment_vid, shard_pg_id, ec_k, ec_m) \
+          segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
          VALUES ('bucket', 'k', ?1, 0, 1, 0, 100, X'00112233445566778899AABBCCDDEEFF', 1, 0, 4, 2)",
         [multipart_upload_id("mpu-seg").into_string()],
     )
@@ -8267,7 +8267,7 @@ fn complete_multipart_commit_no_such_upload() {
         part_vid: GenerationId::MIN,
         ec_k: 4,
         ec_m: 2,
-        shard_pg_id: 0,
+        data_pg_id: 0,
         checksum: None,
     }];
     // Should fail — upload "nonexistent" does not exist.
@@ -8596,7 +8596,7 @@ fn multipart_upload_object_lock_round_trip_and_commit_copies_state() {
         part_vid: GenerationId::MIN,
         ec_k: 4,
         ec_m: 2,
-        shard_pg_id: 0,
+        data_pg_id: 0,
         checksum: None,
     }];
 

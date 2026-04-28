@@ -632,7 +632,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_shard_pg_id_for(
+    pub fn test_data_pg_id_for(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -655,7 +655,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_multipart_part_shard_pg_id_for(
+    pub fn test_multipart_part_data_pg_id_for(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1263,7 +1263,7 @@ impl SharedStorageNode {
             TRACE_TARGET,
             "SharedStorageNode::read_segment_stored_bytes_into",
             "pg_id={} segment_vid={} stored_size={} k={} m={}",
-            req.shard_pg_id,
+            req.data_pg_id,
             req.segment_vid.get(),
             req.stored_size,
             req.ec.k,
@@ -1303,7 +1303,7 @@ impl SharedStorageNode {
                 ShardKey::new(&req.segment_okh, req.segment_vid.get(), shard_index as u8);
             let start = shard_index * shard_size;
             let end = start + shard_size;
-            match self.read_shard_file_into(req.shard_pg_id, &shard_key, &mut dst[start..end]) {
+            match self.read_shard_file_into(req.data_pg_id, &shard_key, &mut dst[start..end]) {
                 Ok(()) => {}
                 Err(StoreError::PgNotFound { pg_id }) => {
                     return Err(StoreError::PgNotFound { pg_id });
@@ -1330,7 +1330,7 @@ impl SharedStorageNode {
         let padded = req.stored_size.div_ceil(k) * k;
         let shard_size = padded / k;
         let all_shards = self.load_segment_shards_for_recovery(
-            req.shard_pg_id,
+            req.data_pg_id,
             &req.segment_okh,
             req.segment_vid,
             req.ec.k,
@@ -1409,7 +1409,7 @@ impl SharedStorageNode {
     /// storage.
     fn load_segment_shards_for_recovery(
         &self,
-        shard_pg_id: u32,
+        data_pg_id: u32,
         segment_okh: &[u8; 16],
         segment_vid: GenerationId,
         ec_k: u8,
@@ -1419,12 +1419,12 @@ impl SharedStorageNode {
             TRACE_TARGET,
             "SharedStorageNode::load_segment_shards_for_recovery",
             "pg_id={} segment_vid={} k={} m={}",
-            shard_pg_id,
+            data_pg_id,
             segment_vid.get(),
             ec_k,
             ec_m
         );
-        let pg = self.get_pg(shard_pg_id)?;
+        let pg = self.get_pg(data_pg_id)?;
         let k = ec_k as usize;
         let m = ec_m as usize;
         let mut all_shards = vec![None; k + m];
@@ -2176,14 +2176,14 @@ mod tests {
                 let (_, record) = node
                     .prepare_stream_segment_append(&bucket, &key, &request)
                     .unwrap();
-                (record.shard_pg_id != meta_pg_id).then_some((session_id, request, record))
+                (record.data_pg_id != meta_pg_id).then_some((session_id, request, record))
             })
             .expect("expected a cross-PG streaming segment routing case");
 
         let shard_key = ShardKey::new(&loser_record.segment_okh, loser_record.segment_vid.get(), 0);
         let ack = {
-            let shard_pg = node.get_pg(loser_record.shard_pg_id).unwrap();
-            shard_pg.write_shard(&shard_key, b"hello").unwrap()
+            let data_pg = node.get_pg(loser_record.data_pg_id).unwrap();
+            data_pg.write_shard(&shard_key, b"hello").unwrap()
         };
         let shard_batch = vec![(&shard_key, ack)];
 
@@ -2198,7 +2198,7 @@ mod tests {
                     segment_crc64: request.segment_crc64,
                     segment_okh: [0x55; 16],
                     segment_vid: winner_vid,
-                    shard_pg_id: meta_pg_id,
+                    data_pg_id: meta_pg_id,
                     ec_k: node.default_ec_shape.k,
                     ec_m: node.default_ec_shape.m,
                 })
@@ -2222,9 +2222,9 @@ mod tests {
                 if reason == "duplicate segment_index 0"
         ));
 
-        let shard_pg = node.get_pg(loser_record.shard_pg_id).unwrap();
+        let data_pg = node.get_pg(loser_record.data_pg_id).unwrap();
         assert!(matches!(
-            shard_pg.read_shard(&shard_key),
+            data_pg.read_shard(&shard_key),
             Err(crate::error::StoreError::NotFound)
         ));
         let meta_pg = node.get_pg(meta_pg_id).unwrap();
@@ -2617,7 +2617,7 @@ mod tests {
         let mut buf = Vec::new();
         node.read_segment_stored_bytes_into(
             SegmentStoredBytesRequest {
-                shard_pg_id: 0,
+                data_pg_id: 0,
                 segment_okh,
                 segment_vid,
                 stored_size: data.len(),

@@ -41,7 +41,7 @@ impl SharedStorageNode {
         Ok(())
     }
 
-    fn multipart_part_shard_pg_id(
+    fn multipart_part_data_pg_id(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -322,7 +322,7 @@ impl SharedStorageNode {
                     segment_index: segment.segment_index,
                     segment_okh: segment.segment_okh,
                     segment_vid: segment.segment_vid,
-                    shard_pg_id: segment.shard_pg_id,
+                    data_pg_id: segment.data_pg_id,
                     ec: EcShape {
                         k: segment.ec_k,
                         m: segment.ec_m,
@@ -354,7 +354,7 @@ impl SharedStorageNode {
                     segment_index: segment.segment_index,
                     segment_okh: segment.segment_okh,
                     segment_vid: segment.segment_vid,
-                    shard_pg_id: segment.shard_pg_id,
+                    data_pg_id: segment.data_pg_id,
                     ec: EcShape {
                         k: segment.ec_k,
                         m: segment.ec_m,
@@ -382,7 +382,7 @@ impl SharedStorageNode {
                             part_number: part.part_number,
                             part_okh: part.part_okh,
                             part_vid: part.part_vid,
-                            shard_pg_id: part.shard_pg_id,
+                            data_pg_id: part.data_pg_id,
                             ec: EcShape {
                                 k: part.ec_k,
                                 m: part.ec_m,
@@ -456,7 +456,7 @@ impl SharedStorageNode {
             .part_records
             .iter()
             .map(|part| {
-                let shard_pg_id = self.multipart_part_shard_pg_id(
+                let data_pg_id = self.multipart_part_data_pg_id(
                     &req.bucket,
                     &req.key,
                     generation_id,
@@ -474,7 +474,7 @@ impl SharedStorageNode {
                     part_vid: part.part_vid,
                     ec_k: part.ec_k,
                     ec_m: part.ec_m,
-                    shard_pg_id,
+                    data_pg_id,
                     checksum: part.checksum.clone(),
                 }
             })
@@ -731,13 +731,13 @@ impl SharedStorageNode {
 
     fn delete_segment_shard_set(
         &self,
-        shard_pg_id: u32,
+        data_pg_id: u32,
         segment_okh: &[u8; 16],
         segment_vid: GenerationId,
         ec_k: u8,
         ec_m: u8,
     ) -> Result<(), ObjectPgActionError> {
-        let pg = self.get_pg(shard_pg_id)?;
+        let pg = self.get_pg(data_pg_id)?;
         let total = ec_k as usize + ec_m as usize;
         for i in 0..total {
             let shard_key = ShardKey::new(segment_okh, segment_vid.get(), i as u8);
@@ -752,7 +752,7 @@ impl SharedStorageNode {
     ) -> Result<(), ObjectPgActionError> {
         for segment in segments {
             self.delete_segment_shard_set(
-                segment.shard_pg_id,
+                segment.data_pg_id,
                 &segment.segment_okh,
                 segment.segment_vid,
                 segment.ec_k,
@@ -765,7 +765,7 @@ impl SharedStorageNode {
     fn delete_streaming_segment_shards_best_effort(&self, segments: &[MultipartPartSegmentRecord]) {
         for segment in segments {
             let _ = self.delete_segment_shard_set(
-                segment.shard_pg_id,
+                segment.data_pg_id,
                 &segment.segment_okh,
                 segment.segment_vid,
                 segment.ec_k,
@@ -785,19 +785,15 @@ impl SharedStorageNode {
             if part.part_okh == [0u8; 16] {
                 continue;
             }
-            let shard_pg_id = self.multipart_part_shard_pg_id(
-                bucket,
-                key,
-                object_generation_id,
-                part.part_number,
-            );
-            let Ok(shard_pg) = self.get_pg(shard_pg_id) else {
+            let data_pg_id =
+                self.multipart_part_data_pg_id(bucket, key, object_generation_id, part.part_number);
+            let Ok(data_pg) = self.get_pg(data_pg_id) else {
                 continue;
             };
             let total = part.ec_k as usize + part.ec_m as usize;
             for i in 0..total {
                 let shard_key = ShardKey::new(&part.part_okh, part.part_vid.get(), i as u8);
-                let _ = shard_pg.delete_shard(&shard_key);
+                let _ = data_pg.delete_shard(&shard_key);
             }
         }
     }
@@ -822,14 +818,14 @@ impl SharedStorageNode {
         displaced_segments: &[MultipartPartSegmentRecord],
     ) {
         if let Some(existing_part) = existing_part.filter(|part| part.part_okh != [0u8; 16]) {
-            let shard_pg_id = self.multipart_part_shard_pg_id(
+            let data_pg_id = self.multipart_part_data_pg_id(
                 &upload.bucket,
                 &upload.key,
                 upload.object_generation_id,
                 existing_part.part_number,
             );
             let _ = self.delete_segment_shard_set(
-                shard_pg_id,
+                data_pg_id,
                 &existing_part.part_okh,
                 existing_part.part_vid,
                 existing_part.ec_k,

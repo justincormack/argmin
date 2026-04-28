@@ -193,7 +193,7 @@ impl Coordinator {
                 segment_crc64: Some(checksum::crc64::checksum(&storage_bytes)),
                 segment_okh,
                 segment_vid,
-                shard_pg_id: written_segment.shard_pg_id,
+                data_pg_id: written_segment.data_pg_id,
             };
             #[cfg(test)]
             if should_probe_direct_put_commit(authorized.bucket()) {

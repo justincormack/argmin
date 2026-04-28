@@ -1057,7 +1057,7 @@ impl Coordinator {
                             segment_crc64: segment.segment_crc64,
                             segment_okh: segment.segment_okh,
                             segment_vid: segment.segment_vid,
-                            shard_pg_id: segment.shard_pg_id,
+                            data_pg_id: segment.data_pg_id,
                             ec_k: segment.ec_k,
                             ec_m: segment.ec_m,
                         })

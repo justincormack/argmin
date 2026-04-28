@@ -485,7 +485,7 @@ impl PgStore {
             self.conn
                 .execute(
                     "INSERT INTO stream_upload_segments \
-                     (session_id, segment_index, size, segment_crc64, segment_okh, segment_vid, shard_pg_id, ec_k, ec_m) \
+                     (session_id, segment_index, size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     params![
                         segment.session_id,
@@ -494,7 +494,7 @@ impl PgStore {
                         segment.segment_crc64.map(|v| v as i64),
                         segment.segment_okh.as_slice(),
                         segment.segment_vid.get() as i64,
-                        segment.shard_pg_id,
+                        segment.data_pg_id,
                         segment.ec_k,
                         segment.ec_m,
                     ],
@@ -543,7 +543,7 @@ impl PgStore {
             part_vid: Self::parse_generation_id(row.get::<_, i64>(8)?, 8, "part_vid")?,
             ec_k: row.get::<_, u8>(9)?,
             ec_m: row.get::<_, u8>(10)?,
-            shard_pg_id: row.get::<_, i64>(11)? as u32,
+            data_pg_id: row.get::<_, i64>(11)? as u32,
             checksum,
         })
     }
@@ -4181,7 +4181,7 @@ impl PgMetadataStore for PgStore {
                     .execute(
                         "INSERT OR REPLACE INTO object_segment_reclaim_segments \
                          (bucket, key, generation_id, segment_index, segment_okh, segment_vid, \
-                          shard_pg_id, ec_k, ec_m) \
+                          data_pg_id, ec_k, ec_m) \
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                         params![
                             reclaim.bucket,
@@ -4190,7 +4190,7 @@ impl PgMetadataStore for PgStore {
                             segment.segment_index as i64,
                             &segment.segment_okh[..],
                             segment.segment_vid.get() as i64,
-                            segment.shard_pg_id as i64,
+                            segment.data_pg_id as i64,
                             segment.ec.k,
                             segment.ec.m,
                         ],
@@ -4256,7 +4256,7 @@ impl PgMetadataStore for PgStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT segment_index, segment_okh, segment_vid, shard_pg_id, ec_k, ec_m \
+                "SELECT segment_index, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
                  FROM object_segment_reclaim_segments \
                  WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3 \
                  ORDER BY segment_index ASC",
@@ -4282,7 +4282,7 @@ impl PgMetadataStore for PgStore {
                         2,
                         "segment_vid",
                     )?,
-                    shard_pg_id: row.get::<_, i64>(3)? as u32,
+                    data_pg_id: row.get::<_, i64>(3)? as u32,
                     ec: EcShape {
                         k: row.get(4)?,
                         m: row.get(5)?,
@@ -4358,14 +4358,14 @@ impl PgMetadataStore for PgStore {
                         part_number,
                         part_okh,
                         part_vid,
-                        shard_pg_id,
+                        data_pg_id,
                         ec,
                     } => {
                         self.conn
                             .execute(
                                 "INSERT OR REPLACE INTO multipart_reclaim_parts \
                                  (bucket, key, generation_id, part_number, storage_kind, part_okh, \
-                                  part_vid, shard_pg_id, ec_k, ec_m) \
+                                  part_vid, data_pg_id, ec_k, ec_m) \
                                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                                 params![
                                     reclaim.bucket,
@@ -4375,7 +4375,7 @@ impl PgMetadataStore for PgStore {
                                     MultipartReclaimPartKind::ShardSet as u8,
                                     &part_okh[..],
                                     part_vid.get() as i64,
-                                    *shard_pg_id as i64,
+                                    *data_pg_id as i64,
                                     ec.k,
                                     ec.m,
                                 ],
@@ -4393,7 +4393,7 @@ impl PgMetadataStore for PgStore {
                             .execute(
                                 "INSERT OR REPLACE INTO multipart_reclaim_parts \
                                  (bucket, key, generation_id, part_number, storage_kind, part_okh, \
-                                  part_vid, shard_pg_id, ec_k, ec_m) \
+                                  part_vid, data_pg_id, ec_k, ec_m) \
                                  VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL)",
                                 params![
                                     reclaim.bucket,
@@ -4413,7 +4413,7 @@ impl PgMetadataStore for PgStore {
                                 .execute(
                                     "INSERT OR REPLACE INTO multipart_reclaim_part_segments \
                                      (bucket, key, generation_id, part_number, segment_index, \
-                                      segment_okh, segment_vid, shard_pg_id, ec_k, ec_m) \
+                                      segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
                                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                                     params![
                                         reclaim.bucket,
@@ -4423,7 +4423,7 @@ impl PgMetadataStore for PgStore {
                                         segment.segment_index as i64,
                                         &segment.segment_okh[..],
                                         segment.segment_vid.get() as i64,
-                                        segment.shard_pg_id as i64,
+                                        segment.data_pg_id as i64,
                                         segment.ec.k,
                                         segment.ec.m,
                                     ],
@@ -4492,7 +4492,7 @@ impl PgMetadataStore for PgStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT part_number, storage_kind, part_okh, part_vid, shard_pg_id, ec_k, ec_m \
+                "SELECT part_number, storage_kind, part_okh, part_vid, data_pg_id, ec_k, ec_m \
                  FROM multipart_reclaim_parts \
                  WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3 \
                  ORDER BY part_number ASC",
@@ -4526,7 +4526,7 @@ impl PgMetadataStore for PgStore {
 
         let mut parts = Vec::new();
         for row in rows {
-            let (part_number, kind, part_okh, part_vid, shard_pg_id, ec_k, ec_m) =
+            let (part_number, kind, part_okh, part_vid, data_pg_id, ec_k, ec_m) =
                 row.map_err(|e| MetadataError::Db {
                     context: "get multipart reclaim (part row)",
                     source: e,
@@ -4554,12 +4554,12 @@ impl PgMetadataStore for PgStore {
                             Box::from("shard-set reclaim part missing part_vid"),
                         ),
                     })?;
-                    let shard_pg_id = shard_pg_id.ok_or_else(|| MetadataError::Db {
-                        context: "get multipart reclaim (missing shard_pg_id)",
+                    let data_pg_id = data_pg_id.ok_or_else(|| MetadataError::Db {
+                        context: "get multipart reclaim (missing data_pg_id)",
                         source: rusqlite::Error::FromSqlConversionFailure(
                             4,
                             rusqlite::types::Type::Null,
-                            Box::from("shard-set reclaim part missing shard_pg_id"),
+                            Box::from("shard-set reclaim part missing data_pg_id"),
                         ),
                     })?;
                     let ec_k = ec_k.ok_or_else(|| MetadataError::Db {
@@ -4587,7 +4587,7 @@ impl PgMetadataStore for PgStore {
                                 source: e,
                             },
                         )?,
-                        shard_pg_id: shard_pg_id as u32,
+                        data_pg_id: data_pg_id as u32,
                         ec: EcShape { k: ec_k, m: ec_m },
                     });
                 }
@@ -4595,7 +4595,7 @@ impl PgMetadataStore for PgStore {
                     let mut segment_stmt = self
                         .conn
                         .prepare(
-                            "SELECT part_number, segment_index, segment_okh, segment_vid, shard_pg_id, ec_k, ec_m \
+                            "SELECT part_number, segment_index, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
                              FROM multipart_reclaim_part_segments \
                              WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3 AND part_number = ?4 \
                              ORDER BY segment_index ASC",
@@ -4619,7 +4619,7 @@ impl PgMetadataStore for PgStore {
                                         3,
                                         "segment_vid",
                                     )?,
-                                    shard_pg_id: row.get::<_, i64>(4)? as u32,
+                                    data_pg_id: row.get::<_, i64>(4)? as u32,
                                     ec: EcShape {
                                         k: row.get(5)?,
                                         m: row.get(6)?,
@@ -5562,7 +5562,7 @@ impl PgMetadataStore for PgStore {
 
                 let mut prev_stmt = self.conn.prepare(
                     "SELECT bucket, key, upload_id, version_id, part_number, segment_index, size, \
-                 segment_crc64, segment_okh, segment_vid, shard_pg_id, ec_k, ec_m \
+                 segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
                  FROM multipart_part_segments \
                  WHERE upload_id = ?1 AND version_id = ?2 AND part_number = ?3 \
                  ORDER BY segment_index ASC",
@@ -5591,7 +5591,7 @@ impl PgMetadataStore for PgStore {
                                 9,
                                 "segment_vid",
                             )?,
-                            shard_pg_id: row.get(10)?,
+                            data_pg_id: row.get(10)?,
                             ec_k: row.get(11)?,
                             ec_m: row.get(12)?,
                         })
@@ -5633,7 +5633,7 @@ impl PgMetadataStore for PgStore {
                 let mut stmt = self.conn.prepare(
                     "INSERT INTO multipart_part_segments \
                  (bucket, key, upload_id, version_id, part_number, segment_index, size, \
-                  segment_crc64, segment_okh, segment_vid, shard_pg_id, ec_k, ec_m) \
+                  segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 )?;
                 for segment in segments {
@@ -5658,7 +5658,7 @@ impl PgMetadataStore for PgStore {
                         segment.segment_crc64.map(|v| v as i64),
                         segment.segment_okh.as_slice(),
                         segment.segment_vid.get() as i64,
-                        segment.shard_pg_id,
+                        segment.data_pg_id,
                         segment.ec_k,
                         segment.ec_m,
                     ])?;
@@ -5814,7 +5814,7 @@ impl PgMetadataStore for PgStore {
             let mut stmt = self.conn.prepare(
                 "INSERT INTO object_parts \
                  (bucket, key, version_id, part_number, object_offset_start, size, etag, etag_kind, \
-                  part_okh, part_vid, ec_k, ec_m, shard_pg_id, checksum) \
+                  part_okh, part_vid, ec_k, ec_m, data_pg_id, checksum) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             )?;
 
@@ -5835,7 +5835,7 @@ impl PgMetadataStore for PgStore {
                     part.part_vid.get() as i64,
                     part.ec_k,
                     part.ec_m,
-                    part.shard_pg_id,
+                    part.data_pg_id,
                     part.checksum.as_ref().map(|checksum| checksum.as_slice()),
                 ])?;
                 object_offset_start += part.size;
@@ -5874,7 +5874,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare(
                 "SELECT bucket, key, version_id, part_number, size, etag, etag_kind, \
-                 part_okh, part_vid, ec_k, ec_m, shard_pg_id, checksum \
+                 part_okh, part_vid, ec_k, ec_m, data_pg_id, checksum \
                  FROM object_parts \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
                  ORDER BY part_number ASC",
@@ -5920,7 +5920,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare(
                 "SELECT bucket, key, version_id, part_number, size, etag, etag_kind, \
-                 part_okh, part_vid, ec_k, ec_m, shard_pg_id, checksum, object_offset_start \
+                 part_okh, part_vid, ec_k, ec_m, data_pg_id, checksum, object_offset_start \
                  FROM object_parts \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
                    AND object_offset_start <= ?4 \
@@ -5959,7 +5959,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare(
                 "SELECT bucket, key, version_id, part_number, size, etag, etag_kind, \
-                 part_okh, part_vid, ec_k, ec_m, shard_pg_id, checksum, object_offset_start \
+                 part_okh, part_vid, ec_k, ec_m, data_pg_id, checksum, object_offset_start \
                  FROM object_parts \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
                    AND part_number > ?4 \
@@ -6139,7 +6139,7 @@ impl PgMetadataStore for PgStore {
             let (omitted_streaming_segments, omitted_streaming_part_numbers) = {
                 let mut stmt = self.conn.prepare(
                     "SELECT bucket, key, upload_id, version_id, part_number, segment_index, \
-                     size, segment_crc64, segment_okh, segment_vid, shard_pg_id, ec_k, ec_m \
+                     size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
                      FROM multipart_part_segments \
                      WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3 AND version_id = ?4 \
                      ORDER BY part_number, segment_index",
@@ -6169,7 +6169,7 @@ impl PgMetadataStore for PgStore {
                                 9,
                                 "segment_vid",
                             )?,
-                            shard_pg_id: row.get(10)?,
+                            data_pg_id: row.get(10)?,
                             ec_k: row.get(11)?,
                             ec_m: row.get(12)?,
                         })
@@ -6259,7 +6259,7 @@ impl PgMetadataStore for PgStore {
                 let mut stmt = self.conn.prepare(
                     "INSERT INTO object_parts \
                      (bucket, key, version_id, part_number, object_offset_start, size, etag, etag_kind, \
-                      part_okh, part_vid, ec_k, ec_m, shard_pg_id, checksum) \
+                      part_okh, part_vid, ec_k, ec_m, data_pg_id, checksum) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 )?;
                 let mut ordered_parts: Vec<&ObjectPartRecord> = parts.iter().collect();
@@ -6279,7 +6279,7 @@ impl PgMetadataStore for PgStore {
                         part.part_vid.get() as i64,
                         part.ec_k,
                         part.ec_m,
-                        part.shard_pg_id,
+                        part.data_pg_id,
                         part.checksum.as_ref().map(|checksum| checksum.as_slice()),
                     ])?;
                     object_offset_start += part.size;
@@ -6672,7 +6672,7 @@ impl PgMetadataStore for PgStore {
         self.conn
             .execute(
                 "INSERT INTO stream_upload_segments \
-                 (session_id, segment_index, size, segment_crc64, segment_okh, segment_vid, shard_pg_id, ec_k, ec_m) \
+                 (session_id, segment_index, size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     segment.session_id,
@@ -6681,7 +6681,7 @@ impl PgMetadataStore for PgStore {
                     segment.segment_crc64.map(|v| v as i64),
                     segment.segment_okh.as_slice(),
                     segment.segment_vid.get() as i64,
-                    segment.shard_pg_id,
+                    segment.data_pg_id,
                     segment.ec_k,
                     segment.ec_m,
                 ],
@@ -6700,7 +6700,7 @@ impl PgMetadataStore for PgStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT session_id, segment_index, size, segment_okh, segment_vid, shard_pg_id, \
+                "SELECT session_id, segment_index, size, segment_okh, segment_vid, data_pg_id, \
                  segment_crc64, ec_k, ec_m FROM stream_upload_segments \
                  WHERE session_id = ?1 ORDER BY segment_index ASC",
             )
@@ -6724,7 +6724,7 @@ impl PgMetadataStore for PgStore {
                         4,
                         "segment_vid",
                     )?,
-                    shard_pg_id: row.get(5)?,
+                    data_pg_id: row.get(5)?,
                     ec_k: row.get(7)?,
                     ec_m: row.get(8)?,
                 })
@@ -6924,7 +6924,7 @@ impl PgMetadataStore for PgStore {
                     .prepare(
                         "INSERT INTO object_segments \
                          (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, segment_vid, \
-                          shard_pg_id, ec_k, ec_m) \
+                          data_pg_id, ec_k, ec_m) \
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     )
                     .map_err(|e| MetadataError::Db {
@@ -6949,7 +6949,7 @@ impl PgMetadataStore for PgStore {
                         segment.segment_crc64.map(|v| v as i64),
                         segment.segment_okh.as_slice(),
                         segment.segment_vid.get() as i64,
-                        segment.shard_pg_id,
+                        segment.data_pg_id,
                         segment.ec_k,
                         segment.ec_m,
                     ])
@@ -7132,7 +7132,7 @@ impl PgMetadataStore for PgStore {
                 .prepare(
                     "INSERT INTO object_segments \
                      (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, segment_vid, \
-                      shard_pg_id, ec_k, ec_m) \
+                      data_pg_id, ec_k, ec_m) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 )
                 .map_err(|e| MetadataError::Db {
@@ -7162,7 +7162,7 @@ impl PgMetadataStore for PgStore {
                     segment.segment_crc64.map(|v| v as i64),
                     segment.segment_okh.as_slice(),
                     segment.segment_vid.get() as i64,
-                    segment.shard_pg_id,
+                    segment.data_pg_id,
                     segment.ec_k,
                     segment.ec_m,
                 ])
@@ -7331,7 +7331,7 @@ impl PgMetadataStore for PgStore {
                     .conn
                     .prepare(
                         "SELECT bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, segment_okh, \
-                         segment_vid, shard_pg_id, ec_k, ec_m FROM multipart_part_segments \
+                         segment_vid, data_pg_id, ec_k, ec_m FROM multipart_part_segments \
                          WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3 AND part_number = ?4 \
                          ORDER BY segment_index ASC",
                     )
@@ -7361,7 +7361,7 @@ impl PgMetadataStore for PgStore {
                                     9,
                                     "segment_vid",
                                 )?,
-                                shard_pg_id: row.get(10)?,
+                                data_pg_id: row.get(10)?,
                                 ec_k: row.get(11)?,
                                 ec_m: row.get(12)?,
                             })
@@ -7403,7 +7403,7 @@ impl PgMetadataStore for PgStore {
                     .prepare(
                         "INSERT INTO multipart_part_segments \
                          (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, segment_okh, \
-                          segment_vid, shard_pg_id, ec_k, ec_m) \
+                          segment_vid, data_pg_id, ec_k, ec_m) \
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     )
                     .map_err(|e| MetadataError::Db {
@@ -7432,7 +7432,7 @@ impl PgMetadataStore for PgStore {
                         segment.segment_crc64.map(|v| v as i64),
                         segment.segment_okh.as_slice(),
                         segment.segment_vid.get() as i64,
-                        segment.shard_pg_id,
+                        segment.data_pg_id,
                         segment.ec_k,
                         segment.ec_m,
                     ])
@@ -7485,7 +7485,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare(
                 "SELECT bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, segment_vid, \
-                 shard_pg_id, ec_k, ec_m FROM object_segments \
+                 data_pg_id, ec_k, ec_m FROM object_segments \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
                  ORDER BY segment_index ASC",
             )
@@ -7511,7 +7511,7 @@ impl PgMetadataStore for PgStore {
                         7,
                         "segment_vid",
                     )?,
-                    shard_pg_id: row.get(8)?,
+                    data_pg_id: row.get(8)?,
                     ec_k: row.get(9)?,
                     ec_m: row.get(10)?,
                 })
@@ -7561,7 +7561,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare(
                 "SELECT bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, segment_okh, \
-                 segment_vid, shard_pg_id, ec_k, ec_m FROM multipart_part_segments \
+                 segment_vid, data_pg_id, ec_k, ec_m FROM multipart_part_segments \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND part_number = ?4 \
                  ORDER BY segment_index ASC",
             )
@@ -7591,7 +7591,7 @@ impl PgMetadataStore for PgStore {
                             9,
                             "segment_vid",
                         )?,
-                        shard_pg_id: row.get(10)?,
+                        data_pg_id: row.get(10)?,
                         ec_k: row.get(11)?,
                         ec_m: row.get(12)?,
                     })
@@ -7639,7 +7639,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare(
                 "SELECT bucket, key, upload_id, version_id, part_number, segment_index, \
-                 size, segment_crc64, segment_okh, segment_vid, shard_pg_id, ec_k, ec_m \
+                 size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
                  FROM multipart_part_segments \
                  WHERE upload_id = ?1 \
                  ORDER BY part_number, segment_index",
@@ -7667,7 +7667,7 @@ impl PgMetadataStore for PgStore {
                         9,
                         "segment_vid",
                     )?,
-                    shard_pg_id: row.get(10)?,
+                    data_pg_id: row.get(10)?,
                     ec_k: row.get(11)?,
                     ec_m: row.get(12)?,
                 })

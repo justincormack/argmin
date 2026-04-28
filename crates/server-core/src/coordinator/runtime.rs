@@ -737,7 +737,7 @@ impl ReadRuntime {
         let mut buf = self.payload_buffer_pool.checkout(padded);
         self.storage_node.read_segment_payload_stored_bytes_into(
             SegmentStoredBytesRequest {
-                shard_pg_id: segment.shard_pg_id,
+                data_pg_id: segment.data_pg_id,
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.segment_vid,
                 stored_size: segment.stored_size(),
@@ -865,7 +865,7 @@ impl SegmentListReader {
                         TRACE_TARGET,
                         "read_segment_layout",
                         Some(format_args!(
-                            "bucket={:?} key={:?} part_order={} part_number={} part_object_offset_start={} part_object_offset_len={} part_object_offset_end_exclusive={} segment_index={} segment_size={} segment_object_offset_start={} segment_object_offset_end_exclusive={} read_object_offset_start={} read_object_offset_len={} read_object_offset_end_exclusive={} read_segment_offset_start={} read_segment_offset_len={} read_segment_offset_end_exclusive={} shard_pg_id={} ec_k={} ec_m={}",
+                            "bucket={:?} key={:?} part_order={} part_number={} part_object_offset_start={} part_object_offset_len={} part_object_offset_end_exclusive={} segment_index={} segment_size={} segment_object_offset_start={} segment_object_offset_end_exclusive={} read_object_offset_start={} read_object_offset_len={} read_object_offset_end_exclusive={} read_segment_offset_start={} read_segment_offset_len={} read_segment_offset_end_exclusive={} data_pg_id={} ec_k={} ec_m={}",
                             self.bucket,
                             self.key,
                             part_order,
@@ -883,7 +883,7 @@ impl SegmentListReader {
                             slice.start_offset,
                             read_segment_offset_len,
                             slice.end_offset,
-                            slice.payload.shard_pg_id,
+                            slice.payload.data_pg_id,
                             slice.payload.ec_k,
                             slice.payload.ec_m,
                         )),
@@ -894,7 +894,7 @@ impl SegmentListReader {
                         TRACE_TARGET,
                         "read_segment_layout",
                         Some(format_args!(
-                            "bucket={:?} key={:?} segment_index={} segment_size={} segment_object_offset_start={} segment_object_offset_end_exclusive={} read_object_offset_start={} read_object_offset_len={} read_object_offset_end_exclusive={} read_segment_offset_start={} read_segment_offset_len={} read_segment_offset_end_exclusive={} shard_pg_id={} ec_k={} ec_m={}",
+                            "bucket={:?} key={:?} segment_index={} segment_size={} segment_object_offset_start={} segment_object_offset_end_exclusive={} read_object_offset_start={} read_object_offset_len={} read_object_offset_end_exclusive={} read_segment_offset_start={} read_segment_offset_len={} read_segment_offset_end_exclusive={} data_pg_id={} ec_k={} ec_m={}",
                             self.bucket,
                             self.key,
                             slice.segment_index,
@@ -907,7 +907,7 @@ impl SegmentListReader {
                             slice.start_offset,
                             read_segment_offset_len,
                             slice.end_offset,
-                            slice.payload.shard_pg_id,
+                            slice.payload.data_pg_id,
                             slice.payload.ec_k,
                             slice.payload.ec_m,
                         )),

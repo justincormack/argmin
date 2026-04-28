@@ -3554,7 +3554,7 @@ fn delete_object_eventually_reclaims_simple_shards() {
     )
     .unwrap();
 
-    let (generation_id, ec, shard_pg_id, okh, segment_vid) = {
+    let (generation_id, ec, data_pg_id, okh, segment_vid) = {
         match coord
             .storage_node
             .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
@@ -3575,7 +3575,7 @@ fn delete_object_eventually_reclaims_simple_shards() {
                 (
                     record.generation_id,
                     record.ec,
-                    segment.shard_pg_id,
+                    segment.data_pg_id,
                     segment.segment_okh,
                     segment.segment_vid,
                 )
@@ -3598,7 +3598,7 @@ fn delete_object_eventually_reclaims_simple_shards() {
         .unwrap();
 
     reclaim_object_payload(&coord, "bucket", "key", generation_id);
-    assert_shard_set_deleted(&coord, shard_pg_id, &okh, segment_vid, ec);
+    assert_shard_set_deleted(&coord, data_pg_id, &okh, segment_vid, ec);
 }
 
 #[test]
@@ -3950,7 +3950,7 @@ fn shard_file_path(
     key: &str,
     shard_index: u8,
 ) -> PathBuf {
-    let (shard_pg_id, okh, generation_id) = {
+    let (data_pg_id, okh, generation_id) = {
         let bucket_name = trusted_bucket_name(bucket);
         let object_key = trusted_object_key(key);
         let record = coord
@@ -3962,15 +3962,11 @@ fn shard_file_path(
             .test_get_object_segments(&bucket_name, &object_key, record.version_id())
             .unwrap();
         if let Some(segment) = segments.first() {
-            (
-                segment.shard_pg_id,
-                segment.segment_okh,
-                segment.segment_vid,
-            )
+            (segment.data_pg_id, segment.segment_okh, segment.segment_vid)
         } else {
             let live = record.as_live().expect("expected live object");
             (
-                shard_pg_id(
+                object_data_pg_id(
                     coord,
                     bucket_name.as_str(),
                     object_key.as_str(),
@@ -3983,7 +3979,7 @@ fn shard_file_path(
     };
     let shard_key = ShardKey::new(&okh, generation_id.get(), shard_index);
     data_dir
-        .join(format!("pg-{shard_pg_id:04}"))
+        .join(format!("pg-{data_pg_id:04}"))
         .join("shards")
         .join(shard_key.hex_prefix())
         .join(shard_key.hex())
@@ -4523,7 +4519,7 @@ fn ec_healthy_read_skips_corrupt_parity_shards() {
     assert!(
         coord
             .storage_node
-            .test_shard_exists(segment.shard_pg_id, &parity_key)
+            .test_shard_exists(segment.data_pg_id, &parity_key)
             .unwrap(),
         "healthy-path read should not touch parity shard 4"
     );
@@ -4594,7 +4590,7 @@ fn ec_reconstruction_stops_after_first_needed_parity_shard() {
     assert!(
         coord
             .storage_node
-            .test_shard_exists(segment.shard_pg_id, &parity_key)
+            .test_shard_exists(segment.data_pg_id, &parity_key)
             .unwrap(),
         "reconstruction should stop once enough shards are present"
     );

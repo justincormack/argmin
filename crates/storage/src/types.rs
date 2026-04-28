@@ -1441,7 +1441,7 @@ pub struct EcShape {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentStoredBytesRequest {
-    pub shard_pg_id: u32,
+    pub data_pg_id: u32,
     pub segment_okh: [u8; 16],
     pub segment_vid: GenerationId,
     pub stored_size: usize,
@@ -1789,7 +1789,7 @@ pub struct ObjectSegmentsReclaimSegmentRecord {
     pub segment_index: u32,
     pub segment_okh: [u8; 16],
     pub segment_vid: GenerationId,
-    pub shard_pg_id: u32,
+    pub data_pg_id: u32,
     pub ec: EcShape,
 }
 
@@ -1830,7 +1830,7 @@ pub struct MultipartReclaimPartSegmentRecord {
     pub segment_index: u32,
     pub segment_okh: [u8; 16],
     pub segment_vid: GenerationId,
-    pub shard_pg_id: u32,
+    pub data_pg_id: u32,
     pub ec: EcShape,
 }
 
@@ -1841,7 +1841,7 @@ pub enum MultipartReclaimPartRecord {
         part_number: u32,
         part_okh: [u8; 16],
         part_vid: GenerationId,
-        shard_pg_id: u32,
+        data_pg_id: u32,
         ec: EcShape,
     },
     Segments {
@@ -2522,7 +2522,7 @@ pub struct WrittenShardAck {
 
 #[derive(Debug, Clone)]
 pub struct DirectPutWrittenSegment {
-    pub shard_pg_id: u32,
+    pub data_pg_id: u32,
     pub ec: EcShape,
     pub written_shards: Vec<WrittenShardAck>,
 }
@@ -2550,7 +2550,7 @@ pub struct CommitDirectPutObjectReq {
     pub segment_crc64: Option<u64>,
     pub segment_okh: [u8; 16],
     pub segment_vid: GenerationId,
-    pub shard_pg_id: u32,
+    pub data_pg_id: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -2861,7 +2861,7 @@ pub struct ObjectPartRecord {
     pub ec_k: u8,
     pub ec_m: u8,
     /// PG where this part's shards are stored.
-    pub shard_pg_id: u32,
+    pub data_pg_id: u32,
     /// Raw checksum bytes for this part (None if no checksum).
     pub checksum: Option<ChecksumBytes>,
 }
@@ -3070,7 +3070,7 @@ pub struct StreamUploadSegmentRecord {
     /// Payload generation for shard keys.
     pub segment_vid: GenerationId,
     /// PG where this segment's shards are stored.
-    pub shard_pg_id: u32,
+    pub data_pg_id: u32,
     pub ec_k: u8,
     pub ec_m: u8,
 }
@@ -3108,7 +3108,7 @@ pub struct ObjectSegmentRecord {
     pub segment_crc64: Option<u64>,
     pub segment_okh: [u8; 16],
     pub segment_vid: GenerationId,
-    pub shard_pg_id: u32,
+    pub data_pg_id: u32,
     pub ec_k: u8,
     pub ec_m: u8,
 }
@@ -3127,7 +3127,7 @@ pub struct MultipartPartSegmentRecord {
     pub segment_crc64: Option<u64>,
     pub segment_okh: [u8; 16],
     pub segment_vid: GenerationId,
-    pub shard_pg_id: u32,
+    pub data_pg_id: u32,
     pub ec_k: u8,
     pub ec_m: u8,
 }

@@ -1268,9 +1268,9 @@ fn delete_bucket_drains_unqueued_payload_reclaim() {
     let generation_id = GenerationId::new(1).unwrap();
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("ghost");
-    let shard_pg_id = coord
+    let data_pg_id = coord
         .storage_node
-        .test_shard_pg_id_for(&bucket, &key, generation_id);
+        .test_data_pg_id_for(&bucket, &key, generation_id);
     coord
         .storage_node
         .test_put_object_segments_reclaim(
@@ -1285,7 +1285,7 @@ fn delete_bucket_drains_unqueued_payload_reclaim() {
                     segment_index: 0,
                     segment_okh: object_key_hash("bucket", "ghost"),
                     segment_vid: generation_id,
-                    shard_pg_id,
+                    data_pg_id,
                     ec: EcShape { k: 4, m: 2 },
                 }],
             },
@@ -1589,7 +1589,7 @@ fn upload_part_first_upload() {
     assert_eq!(segments[0].size, 11);
     let topology = storage::PgTopology::new(coord.storage_node.test_pg_ids()).unwrap();
     assert_eq!(
-        segments[0].shard_pg_id,
+        segments[0].data_pg_id,
         topology
             .object_generation_multipart_part_segment_data_pg(
                 &bucket,
@@ -2291,7 +2291,7 @@ fn complete_multipart_upload_happy_path() {
     let topology = storage::PgTopology::new(coord.storage_node.test_pg_ids()).unwrap();
     for part in &committed {
         assert_eq!(
-            part.shard_pg_id,
+            part.data_pg_id,
             topology
                 .object_generation_multipart_part_data_pg(
                     &bucket,
@@ -2380,7 +2380,7 @@ fn delete_multipart_object_eventually_reclaims_part_shards() {
     for part in parts_to_reclaim {
         assert_shard_set_deleted(
             &coord,
-            part.shard_pg_id,
+            part.data_pg_id,
             &part.part_okh,
             part.part_vid,
             EcShape {
@@ -3136,7 +3136,7 @@ fn abort_multipart_upload_reclaims_uploaded_and_streamed_part_shards() {
 
     assert_shard_set_deleted(
         &coord,
-        multipart_part_shard_pg_id(
+        multipart_part_data_pg_id(
             &coord,
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -3153,7 +3153,7 @@ fn abort_multipart_upload_reclaims_uploaded_and_streamed_part_shards() {
     for segment in streamed_segments {
         assert_shard_set_deleted(
             &coord,
-            segment.shard_pg_id,
+            segment.data_pg_id,
             &segment.segment_okh,
             segment.segment_vid,
             EcShape {
@@ -7029,7 +7029,7 @@ fn stream_put_multiple_segments_correct_manifest() {
             storage::segment_key_hash("bucket", "key", live.generation_id, segment_index)
         );
         assert_eq!(
-            segment.shard_pg_id,
+            segment.data_pg_id,
             topology
                 .object_generation_segment_data_pg(
                     &trusted_bucket_name("bucket"),
@@ -7066,7 +7066,7 @@ fn stream_put_abort_cleans_up_shards() {
         .unwrap();
     assert_eq!(segments.len(), 1);
     let segment = segments[0].clone();
-    let shard_pg_id = segment.shard_pg_id;
+    let data_pg_id = segment.data_pg_id;
 
     coord
         .abort_stream_put("bucket", "key", &session_id)
@@ -7079,7 +7079,7 @@ fn stream_put_abort_cleans_up_shards() {
         assert!(
             !coord
                 .storage_node
-                .test_shard_exists(shard_pg_id, &shard_key)
+                .test_shard_exists(data_pg_id, &shard_key)
                 .unwrap(),
             "shard {i} should have been deleted"
         );
@@ -7300,7 +7300,7 @@ fn stream_put_delete_eventually_reclaims_segment_shards() {
     for segment in segments {
         assert_shard_set_deleted(
             &coord,
-            segment.shard_pg_id,
+            segment.data_pg_id,
             &segment.segment_okh,
             segment.segment_vid,
             EcShape {
@@ -7721,7 +7721,7 @@ fn stream_segment_cleanup_only_deletes_matching_segment_vid() {
     let segment_okh = storage::stream_segment_key_hash(&session_id, 0);
     let winner_vid = GenerationId::new(1).unwrap();
     let loser_vid = GenerationId::new(2).unwrap();
-    let winner_pg_id = shard_pg_id(&coord, "bucket", "key", generation_id);
+    let winner_pg_id = object_data_pg_id(&coord, "bucket", "key", generation_id);
     let loser_pg_id = winner_pg_id;
     let winner_shards = coord
         .write_segment_shards(winner_pg_id, &segment_okh, winner_vid, b"winner-data")
@@ -8020,7 +8020,7 @@ fn complete_multipart_upload_omits_streamed_part_cleanup() {
         .flat_map(|segment| {
             (0..(segment.ec_k + segment.ec_m)).map(|shard_index| {
                 (
-                    segment.shard_pg_id,
+                    segment.data_pg_id,
                     ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), shard_index),
                 )
             })

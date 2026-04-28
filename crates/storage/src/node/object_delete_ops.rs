@@ -36,16 +36,16 @@ impl SharedStorageNode {
         }
 
         let delete_ec_shards = |node: &SharedStorageNode,
-                                shard_pg_id: u32,
+                                data_pg_id: u32,
                                 okh: &[u8; 16],
                                 generation_id: GenerationId,
                                 ec: EcShape|
          -> Result<(), ObjectPgActionError> {
-            let shard_pg = node.get_pg(shard_pg_id)?;
+            let data_pg = node.get_pg(data_pg_id)?;
             let total = ec.k as usize + ec.m as usize;
             for i in 0..total {
                 let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
-                shard_pg.delete_shard(&shard_key)?;
+                data_pg.delete_shard(&shard_key)?;
             }
             Ok(())
         };
@@ -84,7 +84,7 @@ impl SharedStorageNode {
                 for segment in &reclaim.segments {
                     delete_ec_shards(
                         self,
-                        segment.shard_pg_id,
+                        segment.data_pg_id,
                         &segment.segment_okh,
                         segment.segment_vid,
                         segment.ec,
@@ -97,17 +97,17 @@ impl SharedStorageNode {
                         MultipartReclaimPartRecord::ShardSet {
                             part_okh,
                             part_vid,
-                            shard_pg_id,
+                            data_pg_id,
                             ec,
                             ..
                         } => {
-                            delete_ec_shards(self, *shard_pg_id, part_okh, *part_vid, *ec)?;
+                            delete_ec_shards(self, *data_pg_id, part_okh, *part_vid, *ec)?;
                         }
                         MultipartReclaimPartRecord::Segments { segments, .. } => {
                             for segment in segments {
                                 delete_ec_shards(
                                     self,
-                                    segment.shard_pg_id,
+                                    segment.data_pg_id,
                                     &segment.segment_okh,
                                     segment.segment_vid,
                                     segment.ec,
@@ -157,7 +157,7 @@ impl SharedStorageNode {
                     segment_index: segment.segment_index,
                     segment_okh: segment.segment_okh,
                     segment_vid: segment.segment_vid,
-                    shard_pg_id: segment.shard_pg_id,
+                    data_pg_id: segment.data_pg_id,
                     ec: EcShape {
                         k: segment.ec_k,
                         m: segment.ec_m,
@@ -188,7 +188,7 @@ impl SharedStorageNode {
                     segment_index: segment.segment_index,
                     segment_okh: segment.segment_okh,
                     segment_vid: segment.segment_vid,
-                    shard_pg_id: segment.shard_pg_id,
+                    data_pg_id: segment.data_pg_id,
                     ec: EcShape {
                         k: segment.ec_k,
                         m: segment.ec_m,
@@ -211,7 +211,7 @@ impl SharedStorageNode {
                         part_number: part.part_number,
                         part_okh: part.part_okh,
                         part_vid: part.part_vid,
-                        shard_pg_id: part.shard_pg_id,
+                        data_pg_id: part.data_pg_id,
                         ec: EcShape {
                             k: part.ec_k,
                             m: part.ec_m,

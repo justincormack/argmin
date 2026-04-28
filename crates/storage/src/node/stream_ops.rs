@@ -25,7 +25,7 @@ enum StaleObjectPayloadMetadata {
 impl SharedStorageNode {
     fn write_erasure_coded_segment_shards(
         &self,
-        shard_pg_id: u32,
+        data_pg_id: u32,
         segment_okh: &[u8; 16],
         segment_vid: GenerationId,
         data: &[u8],
@@ -76,7 +76,7 @@ impl SharedStorageNode {
                     shard_payload.as_slice(),
                 ));
             }
-            self.write_shard_files(shard_pg_id, &shard_batch)?
+            self.write_shard_files(data_pg_id, &shard_batch)?
         } else {
             let parity_len = m.checked_mul(shard_size).ok_or(StoreError::ErasureCoding {
                 context: "size parity scratch",
@@ -109,7 +109,7 @@ impl SharedStorageNode {
                     shard_payload,
                 ));
             }
-            self.write_shard_files(shard_pg_id, &shard_batch)?
+            self.write_shard_files(data_pg_id, &shard_batch)?
         };
 
         Ok(written_shards
@@ -148,19 +148,19 @@ impl SharedStorageNode {
         data: &[u8],
     ) -> Result<DirectPutWrittenSegment, StoreError> {
         let ec = self.default_ec_shape();
-        let shard_pg_id = self
+        let data_pg_id = self
             .pg_topology
             .object_generation_segment_data_pg(bucket, key, generation_id, segment_index)
             .get();
         let written_shards = self.write_erasure_coded_segment_shards(
-            shard_pg_id,
+            data_pg_id,
             segment_okh,
             generation_id,
             data,
             ec,
         )?;
         Ok(DirectPutWrittenSegment {
-            shard_pg_id,
+            data_pg_id,
             ec,
             written_shards,
         })
@@ -168,13 +168,13 @@ impl SharedStorageNode {
 
     pub fn write_stream_segment_shards(
         &self,
-        shard_pg_id: u32,
+        data_pg_id: u32,
         segment_okh: &[u8; 16],
         segment_vid: GenerationId,
         data: &[u8],
     ) -> Result<Vec<WrittenShardAck>, StoreError> {
         let ec = self.default_ec_shape();
-        self.write_erasure_coded_segment_shards(shard_pg_id, segment_okh, segment_vid, data, ec)
+        self.write_erasure_coded_segment_shards(data_pg_id, segment_okh, segment_vid, data, ec)
     }
 
     pub fn commit_direct_put_object<E>(
@@ -184,14 +184,14 @@ impl SharedStorageNode {
         action: impl FnOnce(DirectPutCommitSnapshot) -> Result<(), E>,
     ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, ObjectPgActionError> {
         let meta_pg_id = self.pg_topology.object_pg_for(&req.bucket, &req.key);
-        let (meta_pg, shard_pg) = match self.lock_two_pgs(meta_pg_id, req.shard_pg_id) {
+        let (meta_pg, data_pg) = match self.lock_two_pgs(meta_pg_id, req.data_pg_id) {
             Ok(guards) => guards,
             Err(error) => {
                 let shard_keys: Vec<ShardKey> = written_shards
                     .iter()
                     .map(|written| written.key.clone())
                     .collect();
-                self.delete_shards_best_effort(req.shard_pg_id, &shard_keys);
+                self.delete_shards_best_effort(req.data_pg_id, &shard_keys);
                 let _ = self.release_object_generation_reservation(
                     &req.bucket,
                     &req.key,
@@ -200,7 +200,7 @@ impl SharedStorageNode {
                 return Err(ObjectPgActionError::Store(error));
             }
         };
-        let shard_pg = shard_pg.as_deref().unwrap_or(&meta_pg);
+        let data_pg = data_pg.as_deref().unwrap_or(&meta_pg);
         let shard_keys: Vec<ShardKey> = written_shards
             .iter()
             .map(|written| written.key.clone())
@@ -221,12 +221,12 @@ impl SharedStorageNode {
         ) {
             Ok(generation_id) => generation_id,
             Err(error) => {
-                Self::cleanup_shards_locked(shard_pg, &shard_keys);
+                Self::cleanup_shards_locked(data_pg, &shard_keys);
                 return Err(error.into());
             }
         };
         if reserved_generation != req.generation_id {
-            Self::cleanup_shards_locked(shard_pg, &shard_keys);
+            Self::cleanup_shards_locked(data_pg, &shard_keys);
             let _ = release_reservation(&meta_pg);
             return Err(ObjectPgActionError::InvalidRequest {
                 reason: format!(
@@ -242,14 +242,14 @@ impl SharedStorageNode {
             Ok(stored) => stored.as_live().map(|record| record.etag.format()),
             Err(crate::error::MetadataError::ObjectNotFound) => None,
             Err(other) => {
-                Self::cleanup_shards_locked(shard_pg, &shard_keys);
+                Self::cleanup_shards_locked(data_pg, &shard_keys);
                 let _ = release_reservation(&meta_pg);
                 return Err(other.into());
             }
         };
 
         if let Err(error) = action(DirectPutCommitSnapshot { existing_etag }) {
-            Self::cleanup_shards_locked(shard_pg, shard_keys.as_slice());
+            Self::cleanup_shards_locked(data_pg, shard_keys.as_slice());
             let _ = release_reservation(&meta_pg);
             return Ok(Err(error));
         }
@@ -258,7 +258,7 @@ impl SharedStorageNode {
             match PgMetadataStore::next_version_id(&*meta_pg, &req.bucket, &req.key) {
                 Ok(version_id) => version_id,
                 Err(error) => {
-                    Self::cleanup_shards_locked(shard_pg, shard_keys.as_slice());
+                    Self::cleanup_shards_locked(data_pg, shard_keys.as_slice());
                     let _ = release_reservation(&meta_pg);
                     return Err(error.into());
                 }
@@ -275,7 +275,7 @@ impl SharedStorageNode {
             ) {
                 Ok(stale_payload) => stale_payload,
                 Err(error) => {
-                    Self::cleanup_shards_locked(shard_pg, shard_keys.as_slice());
+                    Self::cleanup_shards_locked(data_pg, shard_keys.as_slice());
                     let _ = release_reservation(&meta_pg);
                     return Err(error.into());
                 }
@@ -288,8 +288,8 @@ impl SharedStorageNode {
             .iter()
             .map(|written| (&written.key, written.ack))
             .collect();
-        if let Err(err) = shard_pg.register_written_shards_batch(&shard_batch) {
-            Self::cleanup_shards_locked(shard_pg, shard_keys.as_slice());
+        if let Err(err) = data_pg.register_written_shards_batch(&shard_batch) {
+            Self::cleanup_shards_locked(data_pg, shard_keys.as_slice());
             let _ = release_reservation(&meta_pg);
             return Err(err.into());
         }
@@ -303,7 +303,7 @@ impl SharedStorageNode {
             segment_crc64: req.segment_crc64,
             segment_okh: req.segment_okh,
             segment_vid: req.segment_vid,
-            shard_pg_id: req.shard_pg_id,
+            data_pg_id: req.data_pg_id,
             ec_k: req.ec.k,
             ec_m: req.ec.m,
         };
@@ -327,7 +327,7 @@ impl SharedStorageNode {
         };
 
         if let Err(err) = meta_pg.put_object_with_segments(&live_req, &[segment_record]) {
-            Self::cleanup_shards_locked(shard_pg, shard_keys.as_slice());
+            Self::cleanup_shards_locked(data_pg, shard_keys.as_slice());
             let _ = release_reservation(&meta_pg);
             return Err(err.into());
         }
@@ -399,9 +399,9 @@ impl SharedStorageNode {
         Ok(())
     }
 
-    fn cleanup_shards_locked(shard_pg: &PgStore, shard_keys: &[ShardKey]) {
+    fn cleanup_shards_locked(data_pg: &PgStore, shard_keys: &[ShardKey]) {
         for shard_key in shard_keys {
-            let _ = shard_pg.delete_shard(shard_key);
+            let _ = data_pg.delete_shard(shard_key);
         }
     }
 
@@ -432,7 +432,7 @@ impl SharedStorageNode {
             &request.session_id,
             request.segment_index,
         )?;
-        let (segment_okh, segment_vid, shard_pg_id) = match session.target {
+        let (segment_okh, segment_vid, data_pg_id) = match session.target {
             StreamUploadTarget::PutObject => {
                 let generation_id =
                     pg.get_object_generation_reservation(bucket, key, &request.session_id)?;
@@ -485,7 +485,7 @@ impl SharedStorageNode {
             segment_crc64: request.segment_crc64,
             segment_okh,
             segment_vid,
-            shard_pg_id,
+            data_pg_id,
             ec_k: self.default_ec_shape.k,
             ec_m: self.default_ec_shape.m,
         };
@@ -502,14 +502,14 @@ impl SharedStorageNode {
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), ObjectPgActionError> {
         let meta_pg_id = self.pg_topology.object_pg_for(bucket, key);
-        let (meta_pg, shard_pg) = self.lock_two_pgs(meta_pg_id, segment_record.shard_pg_id)?;
+        let (meta_pg, data_pg) = self.lock_two_pgs(meta_pg_id, segment_record.data_pg_id)?;
         let shard_keys: Vec<ShardKey> = shard_batch
             .iter()
             .map(|(shard_key, _)| (*shard_key).clone())
             .collect();
 
-        let cleanup = |shard_pg: &PgStore| Self::cleanup_shards_locked(shard_pg, &shard_keys);
-        let cleanup_target = shard_pg.as_deref().unwrap_or(&*meta_pg);
+        let cleanup = |data_pg: &PgStore| Self::cleanup_shards_locked(data_pg, &shard_keys);
+        let cleanup_target = data_pg.as_deref().unwrap_or(&*meta_pg);
 
         let session = match meta_pg.get_stream_upload(session_id) {
             Ok(session) => session,
@@ -529,7 +529,7 @@ impl SharedStorageNode {
             return Err(err);
         }
 
-        match shard_pg {
+        match data_pg {
             None => {
                 if let Err(err) = meta_pg
                     .register_written_shards_and_append_stream_segment(shard_batch, segment_record)
@@ -538,13 +538,13 @@ impl SharedStorageNode {
                     return Err(err.into());
                 }
             }
-            Some(shard_pg) => {
-                if let Err(err) = shard_pg.register_written_shards_batch(shard_batch) {
-                    cleanup(&shard_pg);
+            Some(data_pg) => {
+                if let Err(err) = data_pg.register_written_shards_batch(shard_batch) {
+                    cleanup(&data_pg);
                     return Err(err.into());
                 }
                 if let Err(err) = meta_pg.append_stream_segment(segment_record) {
-                    cleanup(&shard_pg);
+                    cleanup(&data_pg);
                     return Err(err.into());
                 }
             }
@@ -629,12 +629,12 @@ impl SharedStorageNode {
         drop(pg);
 
         for segment in &staging_segments {
-            if let Ok(shard_pg) = self.get_pg(segment.shard_pg_id) {
+            if let Ok(data_pg) = self.get_pg(segment.data_pg_id) {
                 let total = segment.ec_k as usize + segment.ec_m as usize;
                 for i in 0..total {
                     let shard_key =
                         ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
-                    let _ = shard_pg.delete_shard(&shard_key);
+                    let _ = data_pg.delete_shard(&shard_key);
                 }
             }
         }
@@ -642,11 +642,11 @@ impl SharedStorageNode {
         Ok(())
     }
 
-    pub fn delete_shards_best_effort(&self, shard_pg_id: u32, shard_keys: &[ShardKey]) {
-        let Ok(shard_pg) = self.get_pg(shard_pg_id) else {
+    pub fn delete_shards_best_effort(&self, data_pg_id: u32, shard_keys: &[ShardKey]) {
+        let Ok(data_pg) = self.get_pg(data_pg_id) else {
             return;
         };
-        Self::cleanup_shards_locked(&shard_pg, shard_keys);
+        Self::cleanup_shards_locked(&data_pg, shard_keys);
     }
 
     pub fn list_all_stream_uploads_best_effort(&self) -> Vec<StreamUploadRecord> {
@@ -721,7 +721,7 @@ impl SharedStorageNode {
                         segment_crc64: segment.segment_crc64,
                         segment_okh: segment.segment_okh,
                         segment_vid: segment.segment_vid,
-                        shard_pg_id: segment.shard_pg_id,
+                        data_pg_id: segment.data_pg_id,
                         ec_k: segment.ec_k,
                         ec_m: segment.ec_m,
                     })
@@ -923,7 +923,7 @@ impl SharedStorageNode {
                     segment_index: segment.segment_index,
                     segment_okh: segment.segment_okh,
                     segment_vid: segment.segment_vid,
-                    shard_pg_id: segment.shard_pg_id,
+                    data_pg_id: segment.data_pg_id,
                     ec: EcShape {
                         k: segment.ec_k,
                         m: segment.ec_m,
@@ -954,7 +954,7 @@ impl SharedStorageNode {
                     segment_index: segment.segment_index,
                     segment_okh: segment.segment_okh,
                     segment_vid: segment.segment_vid,
-                    shard_pg_id: segment.shard_pg_id,
+                    data_pg_id: segment.data_pg_id,
                     ec: EcShape {
                         k: segment.ec_k,
                         m: segment.ec_m,
@@ -977,7 +977,7 @@ impl SharedStorageNode {
                         part_number: part.part_number,
                         part_okh: part.part_okh,
                         part_vid: part.part_vid,
-                        shard_pg_id: part.shard_pg_id,
+                        data_pg_id: part.data_pg_id,
                         ec: EcShape {
                             k: part.ec_k,
                             m: part.ec_m,

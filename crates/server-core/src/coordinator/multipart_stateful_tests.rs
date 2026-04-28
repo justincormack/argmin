@@ -373,7 +373,7 @@ fn assert_segment_shards_exist(
             assert!(
                 coord
                     .storage_node
-                    .test_shard_exists(segment.shard_pg_id, &shard_key)
+                    .test_shard_exists(segment.data_pg_id, &shard_key)
                     .unwrap(),
                 "{invariant}: shard {i} should exist {phase}"
             );
@@ -394,7 +394,7 @@ fn assert_segment_shards_deleted(
             assert!(
                 !coord
                     .storage_node
-                    .test_shard_exists(segment.shard_pg_id, &shard_key)
+                    .test_shard_exists(segment.data_pg_id, &shard_key)
                     .unwrap(),
                 "{invariant}: shard {i} should be deleted {phase}"
             );
@@ -653,7 +653,7 @@ fn streamed_part_reupload_replaces_displaced_shards_without_orphans() {
             assert!(
                 coord
                     .storage_node
-                    .test_shard_exists(segment.shard_pg_id, &shard_key)
+                    .test_shard_exists(segment.data_pg_id, &shard_key)
                     .unwrap(),
                 "{invariant}: displaced shard {i} should exist before the reupload commits"
             );
@@ -698,7 +698,7 @@ fn streamed_part_reupload_replaces_displaced_shards_without_orphans() {
             assert!(
                 !coord
                     .storage_node
-                    .test_shard_exists(segment.shard_pg_id, &shard_key)
+                    .test_shard_exists(segment.data_pg_id, &shard_key)
                     .unwrap(),
                 "{invariant}: displaced shard {i} should be deleted after the reupload commits"
             );
@@ -711,7 +711,7 @@ fn streamed_part_reupload_replaces_displaced_shards_without_orphans() {
             assert!(
                 coord
                     .storage_node
-                    .test_shard_exists(segment.shard_pg_id, &shard_key)
+                    .test_shard_exists(segment.data_pg_id, &shard_key)
                     .unwrap(),
                 "{invariant}: current shard {i} should remain after reupload"
             );
@@ -777,7 +777,7 @@ fn aborting_streamed_multipart_upload_cleans_committed_segments_and_shards() {
             assert!(
                 coord
                     .storage_node
-                    .test_shard_exists(segment.shard_pg_id, &shard_key)
+                    .test_shard_exists(segment.data_pg_id, &shard_key)
                     .unwrap(),
                 "{invariant}: shard {i} should exist before abort"
             );
@@ -809,7 +809,7 @@ fn aborting_streamed_multipart_upload_cleans_committed_segments_and_shards() {
             assert!(
                 !coord
                     .storage_node
-                    .test_shard_exists(segment.shard_pg_id, &shard_key)
+                    .test_shard_exists(segment.data_pg_id, &shard_key)
                     .unwrap(),
                 "{invariant}: shard {i} should be deleted after abort"
             );
@@ -1354,7 +1354,7 @@ fn final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists() {
     let generation_id = GenerationId::new(1).unwrap();
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let shard_pg_id = runtime
+    let data_pg_id = runtime
         .pg_topology
         .object_generation_segment_data_pg(&bucket, &key, generation_id, 0)
         .get();
@@ -1374,7 +1374,7 @@ fn final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists() {
                         segment_index: 0,
                         segment_okh: object_key_hash("bucket", "key"),
                         segment_vid: generation_id,
-                        shard_pg_id,
+                        data_pg_id,
                         ec: EcShape { k: 4, m: 2 },
                     }],
                 },

@@ -162,7 +162,7 @@ CREATE TABLE IF NOT EXISTS object_parts (
     part_vid         INTEGER NOT NULL CHECK (part_vid > 0),
     ec_k             INTEGER NOT NULL,
     ec_m             INTEGER NOT NULL,
-    shard_pg_id      INTEGER NOT NULL,
+    data_pg_id      INTEGER NOT NULL,
     PRIMARY KEY (bucket, key, version_id, part_number)
 )";
 
@@ -201,7 +201,7 @@ CREATE TABLE IF NOT EXISTS stream_upload_segments (
     segment_crc64 INTEGER,
     segment_okh   BLOB NOT NULL,
     segment_vid   INTEGER NOT NULL CHECK (segment_vid > 0),
-    shard_pg_id   INTEGER NOT NULL,
+    data_pg_id   INTEGER NOT NULL,
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
     PRIMARY KEY (session_id, segment_index),
@@ -219,7 +219,7 @@ CREATE TABLE IF NOT EXISTS object_segments (
     segment_crc64 INTEGER,
     segment_okh   BLOB NOT NULL,
     segment_vid   INTEGER NOT NULL CHECK (segment_vid > 0),
-    shard_pg_id   INTEGER NOT NULL,
+    data_pg_id   INTEGER NOT NULL,
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
     PRIMARY KEY (bucket, key, version_id, segment_index)
@@ -244,7 +244,7 @@ CREATE TABLE IF NOT EXISTS object_segment_reclaim_segments (
     segment_index   INTEGER NOT NULL,
     segment_okh     BLOB NOT NULL,
     segment_vid     INTEGER NOT NULL CHECK (segment_vid > 0),
-    shard_pg_id   INTEGER NOT NULL,
+    data_pg_id   INTEGER NOT NULL,
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
     PRIMARY KEY (bucket, key, generation_id, segment_index),
@@ -284,7 +284,7 @@ CREATE TABLE IF NOT EXISTS multipart_reclaim_parts (
     storage_kind  INTEGER NOT NULL CHECK (storage_kind IN (0, 1)),
     part_okh      BLOB,
     part_vid      INTEGER,
-    shard_pg_id   INTEGER,
+    data_pg_id   INTEGER,
     ec_k          INTEGER,
     ec_m          INTEGER,
     PRIMARY KEY (bucket, key, generation_id, part_number),
@@ -292,8 +292,8 @@ CREATE TABLE IF NOT EXISTS multipart_reclaim_parts (
         REFERENCES multipart_reclaims(bucket, key, generation_id)
         ON DELETE CASCADE,
     CHECK (
-        (storage_kind = 0 AND part_okh IS NOT NULL AND part_vid IS NOT NULL AND shard_pg_id IS NOT NULL AND ec_k IS NOT NULL AND ec_m IS NOT NULL) OR
-        (storage_kind = 1 AND part_okh IS NULL AND part_vid IS NULL AND shard_pg_id IS NULL AND ec_k IS NULL AND ec_m IS NULL)
+        (storage_kind = 0 AND part_okh IS NOT NULL AND part_vid IS NOT NULL AND data_pg_id IS NOT NULL AND ec_k IS NOT NULL AND ec_m IS NOT NULL) OR
+        (storage_kind = 1 AND part_okh IS NULL AND part_vid IS NULL AND data_pg_id IS NULL AND ec_k IS NULL AND ec_m IS NULL)
     )
 )";
 
@@ -307,7 +307,7 @@ CREATE TABLE IF NOT EXISTS multipart_reclaim_part_segments (
     segment_index   INTEGER NOT NULL,
     segment_okh     BLOB NOT NULL,
     segment_vid     INTEGER NOT NULL CHECK (segment_vid > 0),
-    shard_pg_id   INTEGER NOT NULL,
+    data_pg_id   INTEGER NOT NULL,
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
     PRIMARY KEY (bucket, key, generation_id, part_number, segment_index),
@@ -329,7 +329,7 @@ CREATE TABLE IF NOT EXISTS multipart_part_segments (
     segment_crc64 INTEGER,
     segment_okh   BLOB NOT NULL,
     segment_vid   INTEGER NOT NULL CHECK (segment_vid > 0),
-    shard_pg_id   INTEGER NOT NULL,
+    data_pg_id   INTEGER NOT NULL,
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
     PRIMARY KEY (bucket, key, upload_id, part_number, segment_index)

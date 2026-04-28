@@ -415,7 +415,7 @@ pub(crate) fn reclaim_object_payload(
 
 pub(crate) fn assert_shard_set_deleted(
     coord: &Coordinator,
-    shard_pg_id: u32,
+    data_pg_id: u32,
     okh: &[u8; 16],
     generation_id: GenerationId,
     ec: EcShape,
@@ -425,7 +425,7 @@ pub(crate) fn assert_shard_set_deleted(
             let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
             !coord
                 .storage_node
-                .test_shard_exists(shard_pg_id, &shard_key)
+                .test_shard_exists(data_pg_id, &shard_key)
                 .unwrap()
         }),
         "expected shard-set to be reclaimed for generation {generation_id:?}"
