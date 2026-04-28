@@ -4004,6 +4004,8 @@ impl PgMetadataStore for PgStore {
                      SELECT generation_id FROM object_segments_reclaims WHERE bucket = ?1 AND key = ?2
                      UNION ALL
                      SELECT generation_id FROM multipart_reclaims WHERE bucket = ?1 AND key = ?2
+                     UNION ALL
+                     SELECT generation_id FROM object_generation_reservations WHERE bucket = ?1 AND key = ?2
                  )",
                 params![bucket, key],
                 |row| row.get(0),
@@ -4044,6 +4046,106 @@ impl PgMetadataStore for PgStore {
                 Box::from("next generation id must be nonzero"),
             ),
         })
+    }
+
+    fn reserve_object_generation(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> Result<GenerationId, MetadataError> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| MetadataError::Db {
+                context: "reserve object generation (begin txn)",
+                source: e,
+            })?;
+
+        let result: Result<GenerationId, MetadataError> = (|| {
+            let generation_id = self.next_generation_id(bucket, key)?;
+            self.conn
+                .execute(
+                    "INSERT INTO object_generation_reservations \
+                     (reservation_id, bucket, key, generation_id, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        reservation_id.as_str(),
+                        bucket,
+                        key,
+                        generation_id.get() as i64,
+                        PgStore::now_millis() as i64,
+                    ],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "reserve object generation (insert reservation)",
+                    source: e,
+                })?;
+            Ok(generation_id)
+        })();
+
+        match result {
+            Ok(generation_id) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(MetadataError::Db {
+                        context: "reserve object generation (commit txn)",
+                        source: e,
+                    });
+                }
+                Ok(generation_id)
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
+    fn get_object_generation_reservation(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> Result<GenerationId, MetadataError> {
+        let raw: i64 = self
+            .conn
+            .query_row(
+                "SELECT generation_id FROM object_generation_reservations \
+                 WHERE reservation_id = ?1 AND bucket = ?2 AND key = ?3",
+                params![reservation_id.as_str(), bucket, key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get object generation reservation",
+                source: e,
+            })?
+            .ok_or_else(|| MetadataError::ObjectGenerationReservationNotFound {
+                reservation_id: reservation_id.as_str().to_owned(),
+            })?;
+        Self::parse_generation_id(raw, 0, "generation_id").map_err(|source| MetadataError::Db {
+            context: "parse object generation reservation",
+            source,
+        })
+    }
+
+    fn delete_object_generation_reservation(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM object_generation_reservations \
+                 WHERE reservation_id = ?1 AND bucket = ?2 AND key = ?3",
+                params![reservation_id.as_str(), bucket, key],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete object generation reservation",
+                source: e,
+            })?;
+        Ok(())
     }
 
     fn put_simple_payload_reclaim(
@@ -6310,6 +6412,15 @@ impl PgMetadataStore for PgStore {
                 context: "delete stream upload",
                 source: e,
             })?;
+        self.conn
+            .execute(
+                "DELETE FROM object_generation_reservations WHERE reservation_id = ?1",
+                params![session_id.as_str()],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete stream upload generation reservation",
+                source: e,
+            })?;
         Ok(())
     }
 
@@ -6719,6 +6830,16 @@ impl PgMetadataStore for PgStore {
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "commit stream put (delete staging)",
+                    source: e,
+                })?;
+            self.conn
+                .execute(
+                    "DELETE FROM object_generation_reservations \
+                     WHERE reservation_id = ?1 AND bucket = ?2 AND key = ?3",
+                    params![session_id.as_str(), obj.bucket, obj.key],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "commit stream put (delete generation reservation)",
                     source: e,
                 })?;
 

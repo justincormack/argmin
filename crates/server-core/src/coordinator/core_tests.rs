@@ -3554,23 +3554,37 @@ fn delete_object_eventually_reclaims_simple_shards() {
     )
     .unwrap();
 
-    let (generation_id, ec) = {
+    let (generation_id, ec, shard_pg_id, okh, segment_vid) = {
         match coord
             .storage_node
             .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
             .unwrap()
         {
-            StoredObject::Live(record) => (record.generation_id, record.ec),
+            StoredObject::Live(record) => {
+                let segments = coord
+                    .storage_node
+                    .test_get_object_segments(
+                        &trusted_bucket_name("bucket"),
+                        &trusted_object_key("key"),
+                        record.version_id,
+                    )
+                    .unwrap();
+                let segment = segments
+                    .first()
+                    .expect("direct put should store one segment");
+                (
+                    record.generation_id,
+                    record.ec,
+                    segment.shard_pg_id,
+                    segment.segment_okh,
+                    segment.segment_vid,
+                )
+            }
             other @ StoredObject::DeleteMarker(_) => {
                 panic!("expected live object, got {other:?}")
             }
         }
     };
-    let shard_pg_id = shard_pg_id(&coord, "bucket", "key", generation_id);
-    let okh = object_key_hash(
-        trusted_bucket_name("bucket").as_str(),
-        trusted_object_key("key").as_str(),
-    );
 
     coord
         .delete_object(&delete_object_request(
@@ -3584,7 +3598,7 @@ fn delete_object_eventually_reclaims_simple_shards() {
         .unwrap();
 
     reclaim_object_payload(&coord, "bucket", "key", generation_id);
-    assert_shard_set_deleted(&coord, shard_pg_id, &okh, generation_id, ec);
+    assert_shard_set_deleted(&coord, shard_pg_id, &okh, segment_vid, ec);
 }
 
 #[test]

@@ -6973,9 +6973,33 @@ fn stream_put_multiple_segments_correct_manifest() {
         )
         .unwrap();
     assert_eq!(committed.len(), 3);
+    let live = coord
+        .storage_node
+        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+        .unwrap()
+        .as_live()
+        .expect("stream put should create a live object")
+        .clone();
+    let topology = storage::PgTopology::new(coord.storage_node.test_pg_ids()).unwrap();
     for (i, segment) in committed.iter().enumerate() {
-        assert_eq!(segment.segment_index, i as u32);
+        let segment_index = i as u32;
+        assert_eq!(segment.segment_index, segment_index);
         assert_eq!(segment.size, 3); // "aaa", "bbb", "ccc" are all 3 bytes
+        assert_eq!(
+            segment.segment_okh,
+            storage::segment_key_hash("bucket", "key", live.generation_id, segment_index)
+        );
+        assert_eq!(
+            segment.shard_pg_id,
+            topology
+                .object_generation_segment_data_pg(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("key"),
+                    live.generation_id,
+                    segment_index,
+                )
+                .get()
+        );
     }
 }
 

@@ -511,9 +511,25 @@ Phase 3 implementation notes:
 2. The storage crate owns PG placement and shard-key hash derivation.
    `server-core` reuses `storage::PgTopology` and storage hash helpers instead
    of carrying duplicate coordinator-side implementations.
-3. The first slice only adds the placement primitive and tests. Existing direct
-   PUT, stream PUT, and multipart write paths still use the legacy placement
-   while generation reservation and staged-write wiring are worked through.
+3. PutObject writes now reserve an object payload generation before writing
+   shard payloads.
+   - direct PUT uses the reserved generation for the segment shard key and data
+     PG selection before metadata commit
+   - streaming PutObject sessions reserve the final object generation at session
+     creation, and staged segments use generation-derived segment hashes and
+     bounded object-local data PG selection
+   - streaming staged segments keep a per-append `segment_vid` so concurrent
+     duplicate appends do not collide on identical shard file names before the
+     metadata conflict is detected
+   - reservations are included in `next_generation_id`, so concurrent in-flight
+     PutObject writes cannot collide on the same generation-derived shard keys
+   - successful commit, abort, and direct PUT precondition failure release the
+     reservation
+4. Multipart part payload placement still uses upload/part generation identity.
+   Completion keeps rooting the final object payload generation in object
+   metadata; revisiting multipart data PG selection can be handled as a later
+   Phase 3 cleanup if we decide multipart parts should be constrained by final
+   object generation rather than upload-local part identity.
 
 ## Phase 4: Node-Aware Shard Placement
 

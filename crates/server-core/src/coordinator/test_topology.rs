@@ -119,10 +119,20 @@ pub(crate) fn stream_put_session_has_cross_pg_segments(
     key: &str,
     session_id: &SessionId,
 ) -> bool {
-    let meta_pg_id = object_pg_id(coord, bucket, key);
-    let first_vid_pg = stream_segment_shard_pg_id(coord, session_id, 0, 1);
-    let second_vid_pg = stream_segment_shard_pg_id(coord, session_id, 0, 2);
-    first_vid_pg != meta_pg_id || second_vid_pg != meta_pg_id
+    let bucket_name = trusted_bucket_name(bucket);
+    let object_key = trusted_object_key(key);
+    let meta_pg_id = coord
+        .storage_node
+        .test_object_pg_id_for(&bucket_name, &object_key);
+    let generation_id = coord
+        .storage_node
+        .test_object_generation_reservation_for(&bucket_name, &object_key, session_id)
+        .unwrap();
+    let data_pg_id =
+        coord
+            .storage_node
+            .test_shard_pg_id_for(&bucket_name, &object_key, generation_id);
+    data_pg_id != meta_pg_id
 }
 
 pub(crate) fn stream_segment_shard_pg_id(

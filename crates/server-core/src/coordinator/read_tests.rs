@@ -2,7 +2,7 @@ use super::test_helpers;
 use super::test_support::*;
 use super::*;
 use ec::EcConfig;
-use storage::PgTopology;
+use storage::{segment_key_hash, GenerationId, PgTopology, ShardKey};
 
 #[test]
 fn stream_put_get_object_readable() {
@@ -358,6 +358,30 @@ fn buffered_put_single_segment_skips_stream_session_rows() {
         )
         .unwrap();
     assert_eq!(segments.len(), 1);
+    let live = coord
+        .storage_node
+        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+        .unwrap()
+        .as_live()
+        .expect("buffered put should create a live object")
+        .clone();
+    let topology = PgTopology::new(coord.storage_node.test_pg_ids()).unwrap();
+    assert_eq!(
+        segments[0].segment_okh,
+        segment_key_hash("bucket", "key", live.generation_id, 0)
+    );
+    assert_eq!(segments[0].segment_vid, live.generation_id);
+    assert_eq!(
+        segments[0].shard_pg_id,
+        topology
+            .object_generation_segment_data_pg(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                live.generation_id,
+                0,
+            )
+            .get()
+    );
     assert!(coord
         .storage_node
         .test_list_all_stream_uploads()
@@ -378,6 +402,85 @@ fn buffered_put_single_segment_skips_stream_session_rows() {
         })
         .unwrap();
     assert_eq!(get.body.read_all().unwrap(), b"tiny-data");
+}
+
+#[test]
+fn failed_buffered_put_before_commit_leaves_no_generation_reservation_or_shards() {
+    let dir = test_util::tempdir();
+    let coord = setup_coordinator(dir.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let oversized_value = "x".repeat(u16::MAX as usize + 1);
+    let oversized_metadata =
+        MetadataBlob::from_headers(&[("x-amz-meta-too-large", oversized_value.as_str())]).unwrap();
+    let err = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"tiny-data",
+            metadata: &oversized_metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: &WriteCondition::default(),
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, ServerError::MetadataBlobError { .. }),
+        "expected metadata serialization failure, got {err:?}"
+    );
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let generation_id = GenerationId::MIN;
+    let segment_okh = segment_key_hash("bucket", "key", generation_id, 0);
+    let topology = PgTopology::new(coord.storage_node.test_pg_ids()).unwrap();
+    let shard_pg_id = topology
+        .object_generation_segment_data_pg(&bucket, &key, generation_id, 0)
+        .get();
+    let ec = coord.storage_node.default_payload_ec_shape();
+    for shard_index in 0..ec.k + ec.m {
+        let shard_key = ShardKey::new(&segment_okh, generation_id.get(), shard_index);
+        assert!(
+            !coord
+                .storage_node
+                .test_shard_exists(shard_pg_id, &shard_key)
+                .unwrap(),
+            "failed direct PUT must not leave shard {shard_index}"
+        );
+    }
+
+    let result = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"tiny-data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: &WriteCondition::default(),
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let live = coord
+        .storage_node
+        .test_get_object_meta(&bucket, &key)
+        .unwrap()
+        .as_live()
+        .expect("second put should create a live object")
+        .clone();
+    assert_eq!(live.version_id, result.version_id);
+    assert_eq!(live.generation_id, GenerationId::MIN);
 }
 
 #[test]

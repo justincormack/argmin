@@ -6388,6 +6388,85 @@ fn next_generation_id_skips_object_segments_reclaim_generation() {
 }
 
 #[test]
+fn object_generation_reservation_round_trip() {
+    let (_dir, store) = make_pg_store();
+    let bucket = bucket_name("bucket");
+    let key = object_key("k");
+    let reservation_id = stream_session_id("gen-reserve");
+
+    let generation_id = store
+        .reserve_object_generation(&bucket, &key, &reservation_id)
+        .unwrap();
+    assert_eq!(generation_id, GenerationId::MIN);
+    assert_eq!(
+        store
+            .get_object_generation_reservation(&bucket, &key, &reservation_id)
+            .unwrap(),
+        generation_id
+    );
+
+    store
+        .delete_object_generation_reservation(&bucket, &key, &reservation_id)
+        .unwrap();
+    assert!(matches!(
+        store
+            .get_object_generation_reservation(&bucket, &key, &reservation_id)
+            .unwrap_err(),
+        crate::MetadataError::ObjectGenerationReservationNotFound { .. }
+    ));
+}
+
+#[test]
+fn next_generation_id_skips_object_generation_reservation() {
+    let (_dir, store) = make_pg_store();
+    let bucket = bucket_name("bucket");
+    let key = object_key("k");
+
+    let first = store
+        .reserve_object_generation(&bucket, &key, &stream_session_id("reserve-1"))
+        .unwrap();
+    let second = store
+        .reserve_object_generation(&bucket, &key, &stream_session_id("reserve-2"))
+        .unwrap();
+
+    assert_eq!(first, GenerationId::new(1).unwrap());
+    assert_eq!(second, GenerationId::new(2).unwrap());
+    assert_eq!(
+        store.next_generation_id(&bucket, &key).unwrap(),
+        GenerationId::new(3).unwrap()
+    );
+}
+
+#[test]
+fn delete_stream_upload_removes_matching_object_generation_reservation() {
+    let (_dir, store) = make_pg_store();
+    let bucket = bucket_name("bucket");
+    let key = object_key("k");
+    let session_id = stream_session_id("reserve-stream");
+
+    store
+        .reserve_object_generation(&bucket, &key, &session_id)
+        .unwrap();
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: StreamUploadTarget::PutObject,
+            encryption: ObjectEncryption::None,
+        })
+        .unwrap();
+    store.delete_stream_upload(&session_id).unwrap();
+
+    assert!(matches!(
+        store
+            .get_object_generation_reservation(&bucket, &key, &session_id)
+            .unwrap_err(),
+        crate::MetadataError::ObjectGenerationReservationNotFound { .. }
+    ));
+}
+
+#[test]
 fn multipart_reclaim_round_trip() {
     let (_dir, store) = make_pg_store();
 

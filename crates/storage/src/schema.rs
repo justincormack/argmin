@@ -264,6 +264,17 @@ CREATE TABLE IF NOT EXISTS object_segment_reclaim_segments (
         ON DELETE CASCADE
 )";
 
+/// Durable object payload generation reservations for in-flight PutObject writes.
+const CREATE_OBJECT_GENERATION_RESERVATIONS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS object_generation_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    bucket         TEXT NOT NULL,
+    key            TEXT NOT NULL,
+    generation_id  INTEGER NOT NULL CHECK (generation_id > 0),
+    created_at     INTEGER NOT NULL,
+    UNIQUE (bucket, key, generation_id)
+)";
+
 /// Durable reclaim queue for multipart payload generations.
 const CREATE_MULTIPART_RECLAIMS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS multipart_reclaims (
@@ -455,6 +466,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_SIMPLE_PAYLOAD_RECLAIMS_TABLE, [])?;
     conn.execute(CREATE_CHUNK_MANIFEST_RECLAIMS_TABLE, [])?;
     conn.execute(CREATE_CHUNK_MANIFEST_RECLAIM_CHUNKS_TABLE, [])?;
+    conn.execute(CREATE_OBJECT_GENERATION_RESERVATIONS_TABLE, [])?;
     conn.execute(CREATE_MULTIPART_RECLAIMS_TABLE, [])?;
     conn.execute(CREATE_MULTIPART_RECLAIM_PARTS_TABLE, [])?;
     conn.execute(CREATE_MULTIPART_RECLAIM_PART_CHUNKS_TABLE, [])?;

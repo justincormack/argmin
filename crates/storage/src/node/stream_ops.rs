@@ -118,24 +118,44 @@ impl SharedStorageNode {
             .collect())
     }
 
+    pub fn reserve_put_object_generation(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> Result<GenerationId, ObjectPgActionError> {
+        let object_pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        Ok(object_pg.reserve_object_generation(bucket, key, reservation_id)?)
+    }
+
+    pub fn release_object_generation_reservation(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> Result<(), ObjectPgActionError> {
+        let object_pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        Ok(object_pg.delete_object_generation_reservation(bucket, key, reservation_id)?)
+    }
+
     pub fn write_direct_put_segment_shards(
         &self,
-        transient_segment_id: &SessionId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
         segment_index: u32,
-        segment_vid: GenerationId,
         segment_okh: &[u8; 16],
         data: &[u8],
     ) -> Result<DirectPutWrittenSegment, StoreError> {
         let ec = self.default_ec_shape();
-        let shard_pg_id = self.pg_topology.shard_pg(
-            &format!("segment/{}", transient_segment_id.as_str()),
-            &segment_index.to_string(),
-            segment_vid.get(),
-        );
+        let shard_pg_id = self
+            .pg_topology
+            .object_generation_segment_data_pg(bucket, key, generation_id, segment_index)
+            .get();
         let written_shards = self.write_erasure_coded_segment_shards(
             shard_pg_id,
             segment_okh,
-            segment_vid,
+            generation_id,
             data,
             ec,
         )?;
@@ -172,6 +192,11 @@ impl SharedStorageNode {
                     .map(|written| written.key.clone())
                     .collect();
                 self.delete_shards_best_effort(req.shard_pg_id, &shard_keys);
+                let _ = self.release_object_generation_reservation(
+                    &req.bucket,
+                    &req.key,
+                    &req.generation_reservation_id,
+                );
                 return Err(ObjectPgActionError::Store(error));
             }
         };
@@ -181,18 +206,51 @@ impl SharedStorageNode {
             .map(|written| written.key.clone())
             .collect();
 
+        let release_reservation = |meta_pg: &PgStore| {
+            meta_pg.delete_object_generation_reservation(
+                &req.bucket,
+                &req.key,
+                &req.generation_reservation_id,
+            )
+        };
+
+        let reserved_generation = match meta_pg.get_object_generation_reservation(
+            &req.bucket,
+            &req.key,
+            &req.generation_reservation_id,
+        ) {
+            Ok(generation_id) => generation_id,
+            Err(error) => {
+                Self::cleanup_shards_locked(shard_pg, &shard_keys);
+                return Err(error.into());
+            }
+        };
+        if reserved_generation != req.generation_id {
+            Self::cleanup_shards_locked(shard_pg, &shard_keys);
+            let _ = release_reservation(&meta_pg);
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: format!(
+                    "object generation reservation mismatch: reserved {} but commit requested {}",
+                    reserved_generation.get(),
+                    req.generation_id.get()
+                ),
+            });
+        }
+
         let existing_etag = match PgMetadataStore::get_object_meta(&*meta_pg, &req.bucket, &req.key)
         {
             Ok(stored) => stored.as_live().map(|record| record.etag.format()),
             Err(crate::error::MetadataError::ObjectNotFound) => None,
             Err(other) => {
                 Self::cleanup_shards_locked(shard_pg, &shard_keys);
+                let _ = release_reservation(&meta_pg);
                 return Err(other.into());
             }
         };
 
         if let Err(error) = action(DirectPutCommitSnapshot { existing_etag }) {
             Self::cleanup_shards_locked(shard_pg, shard_keys.as_slice());
+            let _ = release_reservation(&meta_pg);
             return Ok(Err(error));
         }
 
@@ -201,20 +259,14 @@ impl SharedStorageNode {
                 Ok(version_id) => version_id,
                 Err(error) => {
                     Self::cleanup_shards_locked(shard_pg, shard_keys.as_slice());
+                    let _ = release_reservation(&meta_pg);
                     return Err(error.into());
                 }
             }
         } else {
             VersionId::Null
         };
-        let generation_id =
-            match PgMetadataStore::next_generation_id(&*meta_pg, &req.bucket, &req.key) {
-                Ok(generation_id) => generation_id,
-                Err(error) => {
-                    Self::cleanup_shards_locked(shard_pg, shard_keys.as_slice());
-                    return Err(error.into());
-                }
-            };
+        let generation_id = req.generation_id;
         let stale_payload = if version_id.is_null() {
             match Self::snapshot_overwritten_null_version_payload_from_object_pg(
                 &meta_pg,
@@ -224,6 +276,7 @@ impl SharedStorageNode {
                 Ok(stale_payload) => stale_payload,
                 Err(error) => {
                     Self::cleanup_shards_locked(shard_pg, shard_keys.as_slice());
+                    let _ = release_reservation(&meta_pg);
                     return Err(error.into());
                 }
             }
@@ -237,6 +290,7 @@ impl SharedStorageNode {
             .collect();
         if let Err(err) = shard_pg.register_written_shards_batch(&shard_batch) {
             Self::cleanup_shards_locked(shard_pg, shard_keys.as_slice());
+            let _ = release_reservation(&meta_pg);
             return Err(err.into());
         }
 
@@ -274,8 +328,10 @@ impl SharedStorageNode {
 
         if let Err(err) = meta_pg.put_object_with_segments(&live_req, &[segment_record]) {
             Self::cleanup_shards_locked(shard_pg, shard_keys.as_slice());
+            let _ = release_reservation(&meta_pg);
             return Err(err.into());
         }
+        release_reservation(&meta_pg)?;
         Self::finalize_stream_put_stale_payload_metadata(
             &meta_pg,
             &req.bucket,
@@ -389,19 +445,50 @@ impl SharedStorageNode {
             &request.session_id,
             request.segment_index,
         )?;
-        let segment_vid = pg.allocate_stream_segment_vid(&request.session_id)?;
+        let (segment_okh, segment_vid, shard_pg_id) = match session.target {
+            StreamUploadTarget::PutObject => {
+                let generation_id =
+                    pg.get_object_generation_reservation(bucket, key, &request.session_id)?;
+                let segment_vid = pg.allocate_stream_segment_vid(&request.session_id)?;
+                (
+                    crate::segment_key_hash(
+                        bucket.as_str(),
+                        key.as_str(),
+                        generation_id,
+                        request.segment_index,
+                    ),
+                    segment_vid,
+                    self.pg_topology
+                        .object_generation_segment_data_pg(
+                            bucket,
+                            key,
+                            generation_id,
+                            request.segment_index,
+                        )
+                        .get(),
+                )
+            }
+            StreamUploadTarget::UploadPart { .. } => {
+                let segment_vid = pg.allocate_stream_segment_vid(&request.session_id)?;
+                (
+                    request.segment_okh,
+                    segment_vid,
+                    self.stream_segment_shard_pg_id(
+                        &request.session_id,
+                        request.segment_index,
+                        segment_vid,
+                    ),
+                )
+            }
+        };
         let segment_record = StreamUploadSegmentRecord {
             session_id: request.session_id.clone(),
             segment_index: request.segment_index,
             size: request.size,
             segment_crc64: request.segment_crc64,
-            segment_okh: request.segment_okh,
+            segment_okh,
             segment_vid,
-            shard_pg_id: self.stream_segment_shard_pg_id(
-                &request.session_id,
-                request.segment_index,
-                segment_vid,
-            ),
+            shard_pg_id,
             ec_k: self.default_ec_shape.k,
             ec_m: self.default_ec_shape.m,
         };
@@ -477,13 +564,18 @@ impl SharedStorageNode {
         encryption: crate::types::ObjectEncryption,
     ) -> Result<(), ObjectPgActionError> {
         let object_pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
-        object_pg.create_stream_upload(&CreateStreamUploadReq {
+        object_pg.reserve_object_generation(bucket, key, session_id)?;
+        let create_result = object_pg.create_stream_upload(&CreateStreamUploadReq {
             session_id: session_id.clone(),
             bucket: bucket.clone(),
             key: key.clone(),
             target: StreamUploadTarget::PutObject,
             encryption,
-        })?;
+        });
+        if let Err(error) = create_result {
+            let _ = object_pg.delete_object_generation_reservation(bucket, key, session_id);
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -503,7 +595,15 @@ impl SharedStorageNode {
                 Self::load_existing_live_object_from_object_pg(&object_pg, bucket, key)?;
             let result = match action(snapshot, existing_object) {
                 Ok((value, create)) => {
-                    object_pg.create_stream_upload(&create)?;
+                    object_pg.reserve_object_generation(bucket, key, &create.session_id)?;
+                    if let Err(error) = object_pg.create_stream_upload(&create) {
+                        let _ = object_pg.delete_object_generation_reservation(
+                            bucket,
+                            key,
+                            &create.session_id,
+                        );
+                        return Err(error.into());
+                    }
                     Ok(value)
                 }
                 Err(error) => Err(error),
@@ -603,7 +703,8 @@ impl SharedStorageNode {
                 } else {
                     VersionId::Null
                 };
-                let generation_id = PgMetadataStore::next_generation_id(&*pg, bucket, key)?;
+                let generation_id =
+                    pg.get_object_generation_reservation(bucket, key, session_id)?;
                 let stale_payload = if version_id.is_null() {
                     Self::snapshot_overwritten_null_version_payload_from_object_pg(
                         &pg, bucket, key,

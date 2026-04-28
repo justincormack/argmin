@@ -2544,10 +2544,12 @@ pub struct DirectPutWrittenSegment {
 pub struct CommitDirectPutObjectReq {
     pub bucket: BucketName,
     pub key: ObjectKey,
+    pub generation_reservation_id: SessionId,
     pub versioning: BucketVersioningState,
     pub owner: OwnerIdentity,
     pub acl_grants: AclGrants,
     pub public_read: bool,
+    pub generation_id: GenerationId,
     pub size: u64,
     /// CRC64-NVME of the object data.
     pub etag_crc64: u64,

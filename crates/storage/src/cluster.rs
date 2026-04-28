@@ -99,19 +99,41 @@ impl StorageCluster {
 
     pub fn write_direct_put_segment_payload_shards(
         &self,
-        transient_segment_id: &SessionId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
         segment_index: u32,
-        segment_vid: GenerationId,
         segment_okh: &[u8; 16],
         data: &[u8],
     ) -> Result<DirectPutWrittenSegment, StoreError> {
         self.single_node.write_direct_put_segment_shards(
-            transient_segment_id,
+            bucket,
+            key,
+            generation_id,
             segment_index,
-            segment_vid,
             segment_okh,
             data,
         )
+    }
+
+    pub fn reserve_put_object_generation(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> Result<GenerationId, ObjectPgActionError> {
+        self.single_node
+            .reserve_put_object_generation(bucket, key, reservation_id)
+    }
+
+    pub fn release_object_generation_reservation(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> Result<(), ObjectPgActionError> {
+        self.single_node
+            .release_object_generation_reservation(bucket, key, reservation_id)
     }
 
     pub fn commit_direct_put_object_from_payload_shards<E>(

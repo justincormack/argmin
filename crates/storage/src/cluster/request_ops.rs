@@ -871,6 +871,17 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_object_generation_reservation_for(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> Result<GenerationId, ObjectPgActionError> {
+        self.single_node
+            .test_object_generation_reservation_for(bucket, key, reservation_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_multipart_part_shard_pg_id_for(
         &self,
         upload_id: &UploadId,

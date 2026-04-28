@@ -113,6 +113,9 @@ pub enum MetadataError {
     #[error("stream session not in InProgress state (current: {state})")]
     StreamSessionNotInProgress { state: u8 },
 
+    #[error("object generation reservation not found: {reservation_id}")]
+    ObjectGenerationReservationNotFound { reservation_id: String },
+
     #[error("not implemented: {context}")]
     NotImplemented { context: &'static str },
 

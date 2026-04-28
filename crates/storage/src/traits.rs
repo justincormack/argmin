@@ -301,6 +301,30 @@ pub trait PgMetadataStore {
         key: &ObjectKey,
     ) -> Result<GenerationId, MetadataError>;
 
+    /// Reserve a unique internal payload generation for an in-flight object write.
+    fn reserve_object_generation(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> Result<GenerationId, MetadataError>;
+
+    /// Look up an in-flight object payload generation reservation.
+    fn get_object_generation_reservation(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> Result<GenerationId, MetadataError>;
+
+    /// Release an object payload generation reservation.
+    fn delete_object_generation_reservation(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> Result<(), MetadataError>;
+
     /// Insert a durable reclaim record for a simple single-shard-set payload.
     fn put_simple_payload_reclaim(
         &self,

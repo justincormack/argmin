@@ -524,7 +524,7 @@ impl Coordinator {
 
         let written_shards = self.storage_node.write_stream_segment_payload_shards(
             segment_record.shard_pg_id,
-            &segment_okh,
+            &segment_record.segment_okh,
             segment_record.segment_vid,
             data,
         )?;

@@ -1,6 +1,6 @@
 use storage::{
-    stream_segment_key_hash, BucketName, CommitDirectPutObjectReq, CreateStreamUploadReq,
-    GenerationId, ObjectKey, SessionId, StreamPutFinalizeSnapshot, StreamUploadTarget,
+    segment_key_hash, BucketName, CommitDirectPutObjectReq, CreateStreamUploadReq, ObjectKey,
+    SessionId, StreamPutFinalizeSnapshot, StreamUploadTarget,
 };
 
 use super::bucket_handles::{BucketHandleLoader, BucketHandleRequest};
@@ -120,23 +120,6 @@ impl Coordinator {
                 &bucket_info,
                 authorized.requested_object_lock(),
             )?;
-
-            let transient_segment_id =
-                Self::random_session_id("failed to generate direct put segment ID")?;
-
-            let segment_index = 0;
-            let segment_okh = stream_segment_key_hash(&transient_segment_id, segment_index);
-            let segment_vid = GenerationId::MIN;
-            let storage_bytes = write_encryption.encrypt_segment(segment_index, req.data)?;
-
-            let written_segment = self.storage_node.write_direct_put_segment_payload_shards(
-                &transient_segment_id,
-                segment_index,
-                segment_vid,
-                &segment_okh,
-                &storage_bytes,
-            )?;
-
             let system_metadata = Self::object_system_metadata_with_default_checksum(
                 req.system_metadata,
                 write_encryption,
@@ -149,13 +132,55 @@ impl Coordinator {
             let (system_metadata_blob, encryption) =
                 Self::prepare_stored_system_metadata(&system_metadata, write_encryption)?;
             let metadata_blob = storage::SerializedMetadataBlob::from(req.metadata.serialize()?);
+
+            let transient_segment_id =
+                Self::random_session_id("failed to generate direct put segment ID")?;
+
+            let segment_index = 0;
+            let storage_bytes = write_encryption.encrypt_segment(segment_index, req.data)?;
+            let generation_id = self
+                .storage_node
+                .reserve_put_object_generation(
+                    authorized.bucket_typed(),
+                    authorized.key_typed(),
+                    &transient_segment_id,
+                )
+                .map_err(Coordinator::map_object_pg_action_error)?;
+            let segment_okh = segment_key_hash(
+                authorized.bucket(),
+                authorized.key(),
+                generation_id,
+                segment_index,
+            );
+            let segment_vid = generation_id;
+
+            let written_segment = match self.storage_node.write_direct_put_segment_payload_shards(
+                authorized.bucket_typed(),
+                authorized.key_typed(),
+                generation_id,
+                segment_index,
+                &segment_okh,
+                &storage_bytes,
+            ) {
+                Ok(written_segment) => written_segment,
+                Err(error) => {
+                    let _ = self.storage_node.release_object_generation_reservation(
+                        authorized.bucket_typed(),
+                        authorized.key_typed(),
+                        &transient_segment_id,
+                    );
+                    return Err(error.into());
+                }
+            };
             let commit_req = CommitDirectPutObjectReq {
                 bucket: authorized.bucket_typed().clone(),
                 key: authorized.key_typed().clone(),
+                generation_reservation_id: transient_segment_id,
                 versioning: bucket_info.versioning,
                 owner,
                 acl_grants,
                 public_read,
+                generation_id,
                 size: req.data.len() as u64,
                 etag_crc64: object_crc64,
                 ec: written_segment.ec,

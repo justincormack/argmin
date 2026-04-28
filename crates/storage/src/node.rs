@@ -639,7 +639,8 @@ impl SharedStorageNode {
         generation_id: GenerationId,
     ) -> u32 {
         self.pg_topology
-            .shard_pg(bucket.as_str(), key.as_str(), generation_id.get())
+            .object_generation_segment_data_pg(bucket, key, generation_id, 0)
+            .get()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -654,6 +655,17 @@ impl SharedStorageNode {
             &segment_index.to_string(),
             generation_id.get(),
         )
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_object_generation_reservation_for(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> Result<GenerationId, ObjectPgActionError> {
+        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        Ok(pg.get_object_generation_reservation(bucket, key, reservation_id)?)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
