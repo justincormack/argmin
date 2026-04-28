@@ -5,12 +5,11 @@ use std::ops::Deref;
 pub(in crate::coordinator) struct NonBoeLoadedBucketHandle<'a>(&'a LoadedBucketHandle);
 
 impl<'a> NonBoeLoadedBucketHandle<'a> {
-    pub(in crate::coordinator) fn new(bucket: &'a LoadedBucketHandle) -> Option<Self> {
-        if Coordinator::is_bucket_owner_enforced(bucket.bucket().ownership_controls.as_ref()) {
-            None
-        } else {
-            Some(Self(bucket))
-        }
+    pub(super) fn assume_non_boe(bucket: &'a LoadedBucketHandle) -> Self {
+        debug_assert!(!Coordinator::is_bucket_owner_enforced(
+            bucket.bucket().ownership_controls.as_ref()
+        ));
+        Self(bucket)
     }
 }
 
@@ -120,27 +119,7 @@ impl Coordinator {
         )? {
             return Err(ServerError::AccessDenied);
         }
-        let write_encryption = self.resolve_write_encryption(&bucket_info, req.encryption)?;
-        if write_encryption.is_sse_customer() && bucket_info.encryption.sse_c_blocked {
-            return Err(ServerError::SseCBlockedAccessDenied {
-                requester_principal: Self::requester_principal_required(req.object.requester())?
-                    .to_string(),
-                action: "s3:PutObject".to_string(),
-                resource: format!("arn:aws:s3:::{}/{}", bucket_info.name, key),
-            });
-        }
-        Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
-        Self::validate_requested_object_lock_state(&bucket_info, req.object_lock)?;
-        Ok(AuthorizedPutObjectWrite {
-            bucket: req.object.bucket.name_typed().clone(),
-            key: req.object.key_typed().clone(),
-            requester: req.object.requester().clone(),
-            expected_bucket_owner: req.object.expected_bucket_owner().map(str::to_string),
-            acl: AuthorizedPutObjectWriteAcl::from_parsed(&req.acl),
-            requested_object_lock: req.object_lock,
-            tags: req.tags.map(str::to_string),
-            write_encryption,
-        })
+        self.finalize_authorized_put_object_write_after_auth(req, &bucket_info)
     }
 
     pub(super) fn authorize_delete_object_impl_non_boe(
@@ -499,33 +478,7 @@ impl Coordinator {
         )? {
             return Err(ServerError::AccessDenied);
         }
-        Self::ensure_sse_c_allowed(
-            &bucket_info,
-            req.encryption.sse_customer_request().is_some(),
-        )?;
-        let write_encryption = self.resolve_write_encryption(&bucket_info, req.encryption)?;
-        Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
-        let initiator = Self::requester_owner_identity(req.object.requester());
-        let owner =
-            Self::effective_put_object_owner(&bucket_info, req.object.requester(), &req.acl);
-        let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &req.acl);
-        let public_read = Self::acl_grants_public_read(&acl_grants);
-        Self::validate_requested_object_lock_state(&bucket_info, req.object_lock)?;
-        Self::ensure_sse_c_allowed(&bucket_info, write_encryption.is_sse_customer())?;
-
-        Ok(AuthorizedCreateMultipartUpload {
-            bucket_info: bucket_info.into_inner(),
-            bucket: req.object.bucket.name_typed().clone(),
-            key: req.object.key_typed().clone(),
-            tags: req.tags.map(str::to_string),
-            checksum: req.checksum,
-            initiator,
-            owner,
-            acl_grants,
-            public_read,
-            object_lock: req.object_lock,
-            write_encryption,
-        })
+        self.finalize_authorized_create_multipart_upload_after_auth(req, &bucket_info)
     }
 
     #[cfg(test)]

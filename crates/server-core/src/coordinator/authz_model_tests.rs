@@ -2328,8 +2328,7 @@ mod harness {
             modern_bucket_summary(fixtures, bucket, scenario.bucket, policy.as_ref());
         let action = modern_read_action(scenario.action, version_id);
 
-        let bucket =
-            BoeBucketSummary::new(&bucket_summary).expect("BOE modern read requires BOE bucket");
+        let bucket = BoeBucketSummary::assume_boe(&bucket_summary);
         let bucket_tags = PreloadedBucketTags::new(None);
         Coordinator::modern_read_object_authorization_with_bucket_policy(
             &requester,
@@ -3807,8 +3806,7 @@ mod phase4_harness {
                 PutObjectPolicyContext::default()
             }
         };
-        let bucket =
-            BoeBucketSummary::new(&bucket_summary).expect("modern BOE write requires BOE bucket");
+        let bucket = BoeBucketSummary::assume_boe(&bucket_summary);
         let bucket_tags = PreloadedBucketTags::new(None);
         Coordinator::modern_put_object_authorization_with_bucket_policy(
             &requester,
