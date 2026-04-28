@@ -128,6 +128,7 @@ Do not add broad matrix duplication until these smoke tests have found no gaps.
 - Split object ACL CRUD, canned ACL, explicit grant, and cross-account object ACL matrix coverage from `object_crud.rs` into `object_crud_acl.rs`.
 - Moved public object ACL create/PutObjectAcl/header-grant cases from `object_crud_acl.rs` into `public_access_acl.rs`.
 - Moved bucket CreateBucket/recreate/header ACL cases from `bucket_crud.rs` into `bucket_acl.rs`.
+- Split public/anonymous header behavior from `headers.rs` into `public_access_headers.rs`, and moved bad ACL header coverage into `headers_acl.rs`.
 
 ## Verification Checklist
 

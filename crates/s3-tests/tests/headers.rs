@@ -2,7 +2,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use auth::canonical::{canonical_query_string, uri_encode};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::ObjectCannedAcl;
 use base64::Engine;
 use ring::{digest, hmac};
 use s3_tests::{unique_bucket, CTX};
@@ -63,10 +62,6 @@ async fn setup_bucket() -> String {
         .await
         .unwrap();
     bucket
-}
-
-async fn setup_public_bucket() -> String {
-    s3_tests::create_public_bucket(CTX.client()).await
 }
 
 async fn cleanup(bucket: &str, keys: &[&str]) {
@@ -360,32 +355,6 @@ fn signed_get(bucket: &str, key: &str, query: &str) -> (u16, Vec<(String, String
         .header("x-amz-content-sha256", &s.amz_content_sha256)
         .call()
         .expect("transport error");
-    let status = resp.status().as_u16();
-    let headers = resp
-        .headers()
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.as_str().to_string(),
-                value
-                    .to_str()
-                    .expect("response header is valid utf-8")
-                    .to_string(),
-            )
-        })
-        .collect();
-    let body = resp.body_mut().read_to_string().unwrap_or_default();
-    (status, headers, body)
-}
-
-fn anonymous_get(bucket: &str, key: &str, query: &str) -> (u16, Vec<(String, String)>, String) {
-    let path = format!("/{}/{}", bucket, key);
-    let url = if query.is_empty() {
-        format!("{}{}", CTX.endpoint(), path)
-    } else {
-        format!("{}{}?{}", CTX.endpoint(), path, query)
-    };
-    let mut resp = agent().get(&url).call().expect("transport error");
     let status = resp.status().as_u16();
     let headers = resp
         .headers()
@@ -972,144 +941,7 @@ fn test_get_invalid_response_override_headers_sanitized_or_ignored() {
     });
 }
 
-#[test]
-fn test_get_response_override_headers_require_signed_requests() {
-    s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = setup_public_bucket().await;
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .acl(ObjectCannedAcl::PublicRead)
-            .content_type("application/octet-stream")
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
-
-        let query = "response-content-type=text%2Fplain";
-
-        let (signed_status, signed_headers, signed_body) = signed_get(&bucket, "obj", query);
-        assert_eq!(signed_status, 200);
-        assert_eq!(signed_body, "data");
-        assert_eq!(
-            response_header(&signed_headers, "Content-Type"),
-            Some("text/plain".to_string())
-        );
-
-        let (anon_status, anon_headers, anon_body) = anonymous_get(&bucket, "obj", query);
-        assert_eq!(
-            anon_status, 400,
-            "unexpected anonymous response status={anon_status} body={anon_body}"
-        );
-        assert!(
-            anon_body.contains("<Code>InvalidRequest</Code>"),
-            "unexpected anonymous response body: {anon_body}"
-        );
-        assert!(
-            anon_body.contains(
-                "Request specific response headers cannot be used for anonymous GET requests."
-            ),
-            "unexpected anonymous response body: {anon_body}"
-        );
-        assert!(response_header(&anon_headers, "Content-Type").is_some());
-
-        cleanup(&bucket, &["obj"]).await;
-    });
-}
-
 // ── Group 4: Date Header ────────────────────────────────────────────────
-
-/// x-amz-date without Authorization → AWS returns 403 (incomplete signed request).
-#[test]
-fn test_get_date_empty_anonymous() {
-    s3_tests::run(async {
-        let bucket = setup_public_bucket().await;
-        let client = CTX.client();
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
-
-        let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
-        let resp = agent()
-            .get(&url)
-            .header("x-amz-date", "")
-            .call()
-            .expect("transport error");
-        assert_eq!(
-            resp.status().as_u16(),
-            403,
-            "x-amz-date without Authorization is rejected"
-        );
-        cleanup(&bucket, &["obj"]).await;
-    });
-}
-
-/// x-amz-date without Authorization → AWS returns 403 (incomplete signed request).
-#[test]
-fn test_get_date_invalid_anonymous() {
-    s3_tests::run(async {
-        let bucket = setup_public_bucket().await;
-        let client = CTX.client();
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
-
-        let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
-        let resp = agent()
-            .get(&url)
-            .header("x-amz-date", "garbage")
-            .call()
-            .expect("transport error");
-        assert_eq!(
-            resp.status().as_u16(),
-            403,
-            "x-amz-date without Authorization is rejected"
-        );
-        cleanup(&bucket, &["obj"]).await;
-    });
-}
-
-/// x-amz-date without Authorization → AWS returns 403 (incomplete signed request).
-#[test]
-fn test_get_date_before_epoch_anonymous() {
-    s3_tests::run(async {
-        let bucket = setup_public_bucket().await;
-        let client = CTX.client();
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
-
-        let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
-        let resp = agent()
-            .get(&url)
-            .header("x-amz-date", "19690101T000000Z")
-            .call()
-            .expect("transport error");
-        assert_eq!(
-            resp.status().as_u16(),
-            403,
-            "x-amz-date without Authorization is rejected"
-        );
-        cleanup(&bucket, &["obj"]).await;
-    });
-}
 
 #[test]
 fn test_put_date_skew_past() {
@@ -1336,30 +1168,6 @@ fn test_put_expect_garbage() {
         assert_eq!(status, 200, "expected 200, got {}", status);
         // Object may have been created if status was 200
         cleanup(&bucket, &["obj"]).await;
-    });
-}
-
-// ── Group 7: ACL Header ─────────────────────────────────────────────────
-
-#[test]
-fn test_bucket_create_bad_acl() {
-    s3_tests::run(async {
-        let bucket = unique_bucket();
-        let path = format!("/{}", bucket);
-        let s = Signer::new("PUT", &path).body_hash(&sha256_hex(b"")).sign();
-        let url = format!("{}{}", CTX.endpoint(), path);
-        let mut resp = agent()
-            .put(&url)
-            .header("Authorization", &s.authorization)
-            .header("x-amz-date", &s.amz_date)
-            .header("x-amz-content-sha256", &s.amz_content_sha256)
-            .header("x-amz-acl", "garbage")
-            .send(b"" as &[u8])
-            .expect("transport error");
-        let status = resp.status().as_u16();
-        let rbody = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(status, 403, "expected 403, got {}", status);
-        assert_error_code(&rbody, "AccessDenied");
     });
 }
 
