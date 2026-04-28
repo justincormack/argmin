@@ -2,11 +2,14 @@ use std::time::Duration;
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    CompletedMultipartUpload, CompletedPart, Grant, ObjectCannedAcl, ObjectOwnership, Permission,
+    CompletedMultipartUpload, CompletedPart, Grant, ObjectCannedAcl, ObjectOwnership,
+    OwnershipControls, OwnershipControlsRule, Permission,
 };
 use s3_tests::{
-    assert_s3_err_code, content_md5_header, create_acl_enabled_bucket, err_status, CTX,
+    assert_s3_err_code, content_md5_header, create_acl_enabled_bucket,
+    disable_bucket_public_access_block, err_status, send_signed_request, unique_bucket, CTX,
 };
+use s3_types::ANONYMOUS_UPLOAD_CANONICAL_USER_ID;
 
 const ALL_USERS_GROUP_URI: &str = "http://acs.amazonaws.com/groups/global/AllUsers";
 const AUTHENTICATED_USERS_GROUP_URI: &str =
@@ -135,6 +138,137 @@ async fn alt_get_object_eventually(
     unreachable!()
 }
 
+async fn owner_get_object_eventually(
+    bucket: &str,
+    key: &str,
+    description: &str,
+) -> aws_sdk_s3::operation::get_object::GetObjectOutput {
+    const MAX_ATTEMPTS: usize = 30;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match CTX
+            .client()
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(output) => return output,
+            Err(_) if attempt + 1 < MAX_ATTEMPTS => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(err) => panic!(
+                "{description} did not converge to allowed GetObject for {bucket}/{key}: {err:?}"
+            ),
+        }
+    }
+
+    unreachable!()
+}
+
+async fn owner_get_object_access_denied_eventually(bucket: &str, key: &str) {
+    const MAX_ATTEMPTS: usize = 30;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = CTX
+            .client()
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
+        if result.is_err() && err_status(&result) == 403 && {
+            assert_s3_err_code(&result, "AccessDenied");
+            true
+        } {
+            return;
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!(
+            "bucket-owner GetObject did not converge to AccessDenied for {bucket}/{key}: {:?}",
+            result
+        );
+    }
+
+    unreachable!()
+}
+
+async fn owner_head_object_access_denied_eventually(bucket: &str, key: &str) {
+    const MAX_ATTEMPTS: usize = 30;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = CTX
+            .client()
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
+        if result.is_err() && err_status(&result) == 403 && {
+            assert_s3_err_code(&result, "AccessDenied");
+            true
+        } {
+            return;
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!(
+            "bucket-owner HeadObject did not converge to AccessDenied for {bucket}/{key}: {:?}",
+            result
+        );
+    }
+
+    unreachable!()
+}
+
+async fn bucket_owner_id(bucket: &str) -> String {
+    CTX.client()
+        .get_bucket_acl()
+        .bucket(bucket)
+        .send()
+        .await
+        .unwrap()
+        .owner()
+        .and_then(|owner| owner.id())
+        .expect("expected owner ID in GetBucketAcl")
+        .to_string()
+}
+
+async fn object_owner_id(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -> String {
+    client
+        .get_object_acl()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap()
+        .owner()
+        .and_then(|owner| owner.id())
+        .expect("expected owner ID in GetObjectAcl")
+        .to_string()
+}
+
+async fn set_bucket_ownership(bucket: &str, ownership: ObjectOwnership) {
+    let rule = OwnershipControlsRule::builder()
+        .object_ownership(ownership)
+        .build()
+        .unwrap();
+    let controls = OwnershipControls::builder().rules(rule).build().unwrap();
+    CTX.client()
+        .put_bucket_ownership_controls()
+        .bucket(bucket)
+        .ownership_controls(controls)
+        .send()
+        .await
+        .unwrap();
+}
+
 fn has_grant(
     grants: &[Grant],
     permission: Permission,
@@ -184,6 +318,206 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
         let _ = client.delete_object().bucket(bucket).key(*key).send().await;
     }
     client.delete_bucket().bucket(bucket).send().await.unwrap();
+}
+
+#[test]
+fn test_anonymous_public_write_put_uses_special_anonymous_owner_id() {
+    s3_tests::run(async {
+        let bucket = setup_public_write_bucket().await;
+        let key = "anonymous-owner";
+        let url = format!("{}/{bucket}/{key}", CTX.endpoint());
+
+        let (status, body) = anonymous_put(&url, b"data", &[]);
+        assert_eq!(status, 200, "unexpected body: {body}");
+
+        let acl_url = format!("{}/{bucket}/{key}?acl", CTX.endpoint());
+        let mut acl = agent().get(&acl_url).call().expect("transport error");
+        let acl_status = acl.status().as_u16();
+        let acl_body = acl.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(acl_status, 200, "unexpected body: {acl_body}");
+        assert!(
+            acl_body.contains(&format!(
+                "<Owner><ID>{ANONYMOUS_UPLOAD_CANONICAL_USER_ID}</ID></Owner>"
+            )),
+            "unexpected body: {acl_body}"
+        );
+        assert!(
+            acl_body.contains(&format!(
+                "<Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\"><ID>{ANONYMOUS_UPLOAD_CANONICAL_USER_ID}</ID></Grantee><Permission>FULL_CONTROL</Permission>"
+            )),
+            "unexpected body: {acl_body}"
+        );
+
+        owner_head_object_access_denied_eventually(&bucket, key).await;
+        owner_get_object_access_denied_eventually(&bucket, key).await;
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_anonymous_public_write_put_object_acl_denied_for_anonymous_owner() {
+    s3_tests::run(async {
+        let bucket = setup_public_write_bucket().await;
+        let key = "anonymous-owner-acl-write";
+        let object_url = format!("{}/{bucket}/{key}", CTX.endpoint());
+        let acl_url = format!("{object_url}?acl");
+
+        let (status, body) = anonymous_put(&object_url, b"data", &[]);
+        assert_eq!(status, 200, "unexpected body: {body}");
+
+        let acl_put = anonymous_put(
+            &acl_url,
+            b"",
+            &[("x-amz-acl".to_string(), "public-read".to_string())],
+        );
+        assert_eq!(acl_put.0, 403, "unexpected body: {}", acl_put.1);
+        assert!(
+            acl_put
+                .1
+                .contains("Anonymous users cannot invoke this API. Please authenticate."),
+            "unexpected body: {}",
+            acl_put.1
+        );
+
+        let mut acl = agent().get(&acl_url).call().expect("transport error");
+        let acl_status = acl.status().as_u16();
+        let acl_body = acl.body_mut().read_to_string().unwrap_or_default();
+
+        cleanup(&bucket, &[key]).await;
+
+        assert_eq!(acl_status, 200, "unexpected body: {acl_body}");
+        assert!(
+            !acl_body.contains(
+                "<URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee><Permission>READ</Permission>"
+            ),
+            "unexpected body: {acl_body}"
+        );
+    });
+}
+
+#[test]
+fn test_anonymous_public_write_put_bucket_owner_full_control_makes_bucket_owner_object_owner() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_public_write_bucket().await;
+        let key = "anonymous-owner-bofc";
+        let object_url = format!("{}/{bucket}/{key}", CTX.endpoint());
+        let bucket_owner = bucket_owner_id(&bucket).await;
+
+        let put = anonymous_put(
+            &object_url,
+            b"data",
+            &[(
+                "x-amz-acl".to_string(),
+                "bucket-owner-full-control".to_string(),
+            )],
+        );
+        assert_eq!(put.0, 200, "unexpected body: {}", put.1);
+
+        assert_eq!(object_owner_id(client, &bucket, key).await, bucket_owner);
+        let body = owner_get_object_eventually(
+            &bucket,
+            key,
+            "anonymous public-write bucket-owner-full-control owner read",
+        )
+        .await
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+        assert_eq!(&body[..], b"data");
+
+        let acl = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            acl.owner().and_then(|owner| owner.id()),
+            Some(bucket_owner.as_str())
+        );
+        assert!(
+            has_grant(
+                acl.grants(),
+                Permission::FullControl,
+                Some(&bucket_owner),
+                None
+            ),
+            "expected bucket owner FULL_CONTROL grant, got {:?}",
+            acl.grants()
+        );
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_owner_enforced_disables_legacy_public_read_object_acl() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket_request(client, &bucket)
+            .object_ownership(ObjectOwnership::ObjectWriter)
+            .send()
+            .await
+            .unwrap();
+        disable_bucket_public_access_block(client, &bucket).await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("pre-boe-public")
+            .acl(ObjectCannedAcl::PublicRead)
+            .body(ByteStream::from_static(b"public"))
+            .send()
+            .await
+            .unwrap();
+
+        let object_url = format!("{}/{}/pre-boe-public", CTX.endpoint(), bucket);
+
+        let body = anon_get_status_eventually(&object_url, 200, "anonymous GET before BOE").await;
+        assert_eq!(body.as_bytes(), b"public");
+
+        set_bucket_ownership(&bucket, ObjectOwnership::BucketOwnerEnforced).await;
+
+        anon_get_status_eventually(&object_url, 403, "anonymous GET after BOE").await;
+
+        cleanup(&bucket, &["pre-boe-public"]).await;
+    });
+}
+
+#[test]
+fn test_public_read_bucket_acl_blocks_bucket_owner_enforced_transition() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_public_bucket().await;
+        let body = b"<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>";
+        let url = format!("{}/{}?ownershipControls", CTX.endpoint(), bucket);
+
+        let put = send_signed_request("PUT", &url, body, std::iter::empty::<(String, String)>());
+        assert_eq!(put.status, 400, "unexpected body: {}", put.body);
+        assert!(
+            put.body
+                .contains("<Code>InvalidBucketAclWithObjectOwnership</Code>"),
+            "unexpected body: {}",
+            put.body
+        );
+
+        client
+            .put_bucket_acl()
+            .bucket(&bucket)
+            .acl(aws_sdk_s3::types::BucketCannedAcl::Private)
+            .send()
+            .await
+            .unwrap();
+        set_bucket_ownership(&bucket, ObjectOwnership::BucketOwnerEnforced).await;
+
+        cleanup(&bucket, &[]).await;
+    });
 }
 
 #[test]

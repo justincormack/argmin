@@ -3,50 +3,17 @@ use std::time::Duration;
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    BucketCannedAcl, BucketLocationConstraint, CompletedMultipartUpload, CompletedPart,
-    CreateBucketConfiguration, Grant, ObjectAttributes, ObjectCannedAcl, ObjectOwnership,
-    OwnershipControls, OwnershipControlsRule, Permission, Tag, Tagging,
+    AccessControlPolicy, BucketCannedAcl, BucketLocationConstraint, CompletedMultipartUpload,
+    CompletedPart, CreateBucketConfiguration, Grant, Grantee, ObjectAttributes, ObjectCannedAcl,
+    ObjectOwnership, Owner, OwnershipControls, OwnershipControlsRule, Permission, Tag, Tagging,
+    Type,
 };
-use s3_tests::{
-    assert_s3_err_code, content_md5_header, create_public_write_bucket,
-    disable_bucket_public_access_block, err_status, unique_bucket, CTX,
-};
-use s3_types::ANONYMOUS_UPLOAD_CANONICAL_USER_ID;
+use s3_tests::{assert_s3_err_code, content_md5_header, err_status, unique_bucket, CTX};
 use serde_json::json;
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
 fn agent() -> s3_tests::Agent {
     s3_tests::test_agent()
-}
-
-fn anonymous_get_status(url: &str) -> u16 {
-    let mut resp = agent().get(url).call().expect("transport error");
-    let status = resp.status().as_u16();
-    let _ = resp.body_mut().read_to_string();
-    status
-}
-
-fn anonymous_put(url: &str, body: &'static [u8]) -> (u16, String) {
-    let mut resp = agent().put(url).send(body).expect("transport error");
-    let status = resp.status().as_u16();
-    let body = resp.body_mut().read_to_string().unwrap_or_default();
-    (status, body)
-}
-
-fn anonymous_put_with_headers(
-    url: &str,
-    body: &[u8],
-    headers: &[(String, String)],
-) -> (u16, String) {
-    let request = headers
-        .iter()
-        .fold(agent().put(url), |request, (name, value)| {
-            request.header(name, value)
-        });
-    let mut resp = request.send(body).expect("transport error");
-    let status = resp.status().as_u16();
-    let body = resp.body_mut().read_to_string().unwrap_or_default();
-    (status, body)
 }
 
 /// Cleanup helper.
@@ -181,6 +148,44 @@ async fn canonical_owner_id(client: &aws_sdk_s3::Client) -> String {
         .to_string();
     client.delete_bucket().bucket(&bucket).send().await.unwrap();
     owner_id
+}
+
+fn canonical_user_grant(canonical_user_id: &str, permission: Permission) -> Grant {
+    Grant::builder()
+        .grantee(
+            Grantee::builder()
+                .r#type(Type::CanonicalUser)
+                .id(canonical_user_id)
+                .build()
+                .expect("canonical grantee"),
+        )
+        .permission(permission)
+        .build()
+}
+
+fn bucket_acl_policy(owner_id: &str, grants: Vec<Grant>) -> AccessControlPolicy {
+    AccessControlPolicy::builder()
+        .owner(Owner::builder().id(owner_id).build())
+        .set_grants(Some(grants))
+        .build()
+}
+
+async fn set_bucket_acl_with_alt_read_grant(bucket: &str) {
+    let owner_id = bucket_owner_id(bucket).await;
+    let alt_owner_id = canonical_owner_id(CTX.alt_client()).await;
+    CTX.client()
+        .put_bucket_acl()
+        .bucket(bucket)
+        .access_control_policy(bucket_acl_policy(
+            &owner_id,
+            vec![
+                canonical_user_grant(&owner_id, Permission::FullControl),
+                canonical_user_grant(&alt_owner_id, Permission::Read),
+            ],
+        ))
+        .send()
+        .await
+        .unwrap();
 }
 
 #[test]
@@ -322,159 +327,6 @@ fn has_grant(grants: &[Grant], permission: Permission, canonical_user_id: &str) 
                 .grantee()
                 .is_some_and(|grantee| grantee.id() == Some(canonical_user_id))
     })
-}
-
-#[test]
-fn test_anonymous_public_write_put_uses_special_anonymous_owner_id() {
-    s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = create_public_write_bucket(client).await;
-        let key = "anonymous-owner";
-        let url = format!("{}/{bucket}/{key}", CTX.endpoint());
-
-        let (status, body) = anonymous_put(&url, b"data");
-        assert_eq!(status, 200, "unexpected body: {body}");
-
-        let acl_url = format!("{}/{bucket}/{key}?acl", CTX.endpoint());
-        let mut acl = agent().get(&acl_url).call().expect("transport error");
-        let acl_status = acl.status().as_u16();
-        let acl_body = acl.body_mut().read_to_string().unwrap_or_default();
-        assert_eq!(acl_status, 200, "unexpected body: {acl_body}");
-        assert!(
-            acl_body.contains(&format!(
-                "<Owner><ID>{ANONYMOUS_UPLOAD_CANONICAL_USER_ID}</ID></Owner>"
-            )),
-            "unexpected body: {acl_body}"
-        );
-        assert!(
-            acl_body.contains(&format!(
-                "<Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\"><ID>{ANONYMOUS_UPLOAD_CANONICAL_USER_ID}</ID></Grantee><Permission>FULL_CONTROL</Permission>"
-            )),
-            "unexpected body: {acl_body}"
-        );
-
-        owner_head_object_access_denied_eventually(&bucket, key).await;
-        owner_get_object_access_denied_eventually(&bucket, key).await;
-
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
-    });
-}
-
-#[test]
-fn test_anonymous_public_write_put_object_acl_denied_for_anonymous_owner() {
-    s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = create_public_write_bucket(client).await;
-        let key = "anonymous-owner-acl-write";
-        let object_url = format!("{}/{bucket}/{key}", CTX.endpoint());
-        let acl_url = format!("{object_url}?acl");
-
-        let (status, body) = anonymous_put(&object_url, b"data");
-        assert_eq!(status, 200, "unexpected body: {body}");
-
-        let acl_put = anonymous_put_with_headers(
-            &acl_url,
-            b"",
-            &[("x-amz-acl".to_string(), "public-read".to_string())],
-        );
-        assert_eq!(acl_put.0, 403, "unexpected body: {}", acl_put.1);
-        assert!(
-            acl_put
-                .1
-                .contains("Anonymous users cannot invoke this API. Please authenticate."),
-            "unexpected body: {}",
-            acl_put.1
-        );
-
-        let mut acl = agent().get(&acl_url).call().expect("transport error");
-        let acl_status = acl.status().as_u16();
-        let acl_body = acl.body_mut().read_to_string().unwrap_or_default();
-
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
-
-        assert_eq!(acl_status, 200, "unexpected body: {acl_body}");
-        assert!(
-            !acl_body.contains(
-                "<URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee><Permission>READ</Permission>"
-            ),
-            "unexpected body: {acl_body}"
-        );
-    });
-}
-
-#[test]
-fn test_anonymous_public_write_put_bucket_owner_full_control_makes_bucket_owner_object_owner() {
-    s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = create_public_write_bucket(client).await;
-        let key = "anonymous-owner-bofc";
-        let object_url = format!("{}/{bucket}/{key}", CTX.endpoint());
-        let bucket_owner = bucket_owner_id(&bucket).await;
-
-        let put = anonymous_put_with_headers(
-            &object_url,
-            b"data",
-            &[(
-                "x-amz-acl".to_string(),
-                "bucket-owner-full-control".to_string(),
-            )],
-        );
-        assert_eq!(put.0, 200, "unexpected body: {}", put.1);
-
-        assert_eq!(object_owner_id(client, &bucket, key).await, bucket_owner);
-        let body = owner_get_object_eventually(
-            &bucket,
-            key,
-            "anonymous public-write bucket-owner-full-control owner read",
-        )
-        .await
-        .body
-        .collect()
-        .await
-        .unwrap()
-        .into_bytes();
-        assert_eq!(&body[..], b"data");
-
-        let acl = client
-            .get_object_acl()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            acl.owner().and_then(|owner| owner.id()),
-            Some(bucket_owner.as_str())
-        );
-        assert!(
-            has_grant(acl.grants(), Permission::FullControl, &bucket_owner),
-            "expected bucket owner FULL_CONTROL grant, got {:?}",
-            acl.grants()
-        );
-
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
-    });
 }
 
 fn assert_acl_not_supported<T, E: std::fmt::Debug>(
@@ -723,7 +575,7 @@ fn test_bucket_owner_cannot_get_private_object_written_by_other_user() {
     s3_tests::run(async {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
-        let bucket = create_public_write_bucket(client).await;
+        let bucket = create_bucket_with_alt_object_access(ObjectOwnership::ObjectWriter).await;
 
         alt_client
             .put_object()
@@ -1919,24 +1771,31 @@ fn test_create_bucket_bucket_owner_enforced() {
     });
 }
 
-// ── test_put_bucket_ownership_enforced_rejects_public_acl ───────────
+// ── test_put_bucket_ownership_enforced_rejects_external_bucket_acl ──
 
-/// PUT ownership controls on a public-read bucket should fail with
-/// InvalidBucketAclWithObjectOwnership. Setting ACL to private first, then
-/// setting ownership to BucketOwnerEnforced should succeed.
+/// PUT ownership controls on a bucket with a non-owner ACL grant should fail
+/// with InvalidBucketAclWithObjectOwnership. Setting ACL to private first,
+/// then setting ownership to BucketOwnerEnforced should succeed.
 #[test]
-fn test_put_bucket_ownership_enforced_rejects_public_acl() {
+fn test_put_bucket_ownership_enforced_rejects_external_bucket_acl() {
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = s3_tests::create_public_bucket(client).await;
+        let bucket = unique_bucket();
+        create_bucket_in_test_region_with_ownership(
+            client,
+            &bucket,
+            ObjectOwnership::BucketOwnerPreferred,
+        )
+        .await;
+        set_bucket_acl_with_alt_read_grant(&bucket).await;
 
-        // PUT BucketOwnerEnforced should fail — bucket is public-read
+        // PUT BucketOwnerEnforced should fail while the bucket ACL grants another account.
         let oc_url = format!("{}/{}?ownershipControls", CTX.endpoint(), bucket);
         let body = b"<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>";
         let status = send_signed_put(&oc_url, body, &[]);
         assert_eq!(
             status, 400,
-            "expected 400 for BucketOwnerEnforced on public bucket, got {}",
+            "expected 400 for BucketOwnerEnforced on externally granted bucket, got {}",
             status
         );
 
@@ -1978,6 +1837,7 @@ fn test_put_bucket_ownership_enforced_rejects_public_acl() {
 fn test_bucket_owner_enforced_rejects_object_acl() {
     s3_tests::run(async {
         let client = CTX.client();
+        let alt_owner = canonical_owner_id(CTX.alt_client()).await;
         let bucket = unique_bucket();
         s3_tests::create_bucket_request(client, &bucket)
             .object_ownership(ObjectOwnership::BucketOwnerEnforced)
@@ -1985,9 +1845,10 @@ fn test_bucket_owner_enforced_rejects_object_acl() {
             .await
             .unwrap();
 
-        // PutObject with x-amz-acl: public-read should fail
+        // PutObject with an explicit non-owner ACL grant should fail.
         let obj_url = format!("{}/{}/testkey", CTX.endpoint(), bucket);
-        let status = send_signed_put(&obj_url, b"hello", &[("x-amz-acl", "public-read")]);
+        let grant_read = format!("id=\"{alt_owner}\"");
+        let status = send_signed_put(&obj_url, b"hello", &[("x-amz-grant-read", &grant_read)]);
         assert_eq!(
             status, 400,
             "expected 400 for PutObject with ACL on BucketOwnerEnforced, got {}",
@@ -2057,24 +1918,32 @@ fn test_bucket_owner_enforced_allows_bucket_owner_full_control() {
 // ── test_put_bucket_ownership_bucket_owner_enforced ──────────────────
 
 /// Mirrors Ceph test_put_bucket_ownership_bucket_owner_enforced:
-/// 1. Create bucket with public-read ACL
+/// 1. Create bucket with a non-owner canonical-user bucket ACL grant
 /// 2. PutBucketOwnershipControls BOE fails (InvalidBucketAclWithObjectOwnership)
 /// 3. Set ACL to private
 /// 4. PutBucketOwnershipControls BOE succeeds
 /// 5. Verify BOE behavior: PutObject/CopyObject ACL blocked, PutBucketAcl blocked
 #[test]
-fn test_put_bucket_ownership_bucket_owner_enforced() {
+fn test_put_bucket_ownership_bucket_owner_enforced_rejects_external_bucket_acl() {
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = s3_tests::create_public_bucket(client).await;
+        let alt_owner = canonical_owner_id(CTX.alt_client()).await;
+        let bucket = unique_bucket();
+        create_bucket_in_test_region_with_ownership(
+            client,
+            &bucket,
+            ObjectOwnership::BucketOwnerPreferred,
+        )
+        .await;
+        set_bucket_acl_with_alt_read_grant(&bucket).await;
 
-        // PutBucketOwnershipControls BOE should fail — bucket is public-read
+        // PutBucketOwnershipControls BOE should fail while the bucket ACL grants another account.
         let oc_url = format!("{}/{}?ownershipControls", CTX.endpoint(), bucket);
         let oc_body = b"<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>";
         let status = send_signed_put(&oc_url, oc_body, &[]);
         assert_eq!(
             status, 400,
-            "BOE on public-read bucket should fail, got {status}"
+            "BOE on externally granted bucket should fail, got {status}"
         );
 
         // Set ACL to private
@@ -2125,12 +1994,13 @@ fn test_put_bucket_ownership_bucket_owner_enforced() {
             .await
             .unwrap();
 
-        // PutObject with ACL=public-read should fail
-        let obj_url2 = format!("{}/{}/put-object-public", CTX.endpoint(), bucket);
-        let status = send_signed_put(&obj_url2, b"data", &[("x-amz-acl", "public-read")]);
+        // PutObject with an explicit non-owner ACL grant should fail.
+        let obj_url2 = format!("{}/{}/put-object-grant-read", CTX.endpoint(), bucket);
+        let grant_read = format!("id=\"{alt_owner}\"");
+        let status = send_signed_put(&obj_url2, b"data", &[("x-amz-grant-read", &grant_read)]);
         assert_eq!(
             status, 400,
-            "PutObject with ACL=public-read should fail under BOE, got {status}"
+            "PutObject with explicit ACL grant should fail under BOE, got {status}"
         );
 
         let _copy_private = client
@@ -2399,36 +2269,6 @@ async fn owner_get_object_access_denied_after_boe_removal_eventually(
     unreachable!()
 }
 
-async fn owner_head_object_access_denied_eventually(bucket: &str, key: &str) {
-    const MAX_ATTEMPTS: usize = 30;
-
-    for attempt in 0..MAX_ATTEMPTS {
-        let result = CTX
-            .client()
-            .head_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await;
-        if result.is_err() && err_status(&result) == 403 && {
-            assert_s3_err_code(&result, "AccessDenied");
-            true
-        } {
-            return;
-        }
-        if attempt + 1 < MAX_ATTEMPTS {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            continue;
-        }
-        panic!(
-            "bucket-owner HeadObject did not converge to AccessDenied for {bucket}/{key}: {:?}",
-            result
-        );
-    }
-
-    unreachable!()
-}
-
 async fn owner_get_object_eventually(
     bucket: &str,
     key: &str,
@@ -2453,48 +2293,6 @@ async fn owner_get_object_eventually(
                 "{description} did not converge to allowed GetObject for {bucket}/{key}: {err:?}"
             ),
         }
-    }
-
-    unreachable!()
-}
-
-async fn anonymous_get_status_eventually(url: &str, expected_status: u16, description: &str) {
-    const MAX_ATTEMPTS: usize = 10;
-
-    for attempt in 0..MAX_ATTEMPTS {
-        let status = anonymous_get_status(url);
-        if status == expected_status {
-            return;
-        }
-        if attempt + 1 < MAX_ATTEMPTS {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            continue;
-        }
-        panic!(
-            "{description} did not converge to HTTP {expected_status} for {url}, last status {status}"
-        );
-    }
-
-    unreachable!()
-}
-
-async fn anonymous_get_body_eventually(url: &str, expected_body: &str, description: &str) {
-    const MAX_ATTEMPTS: usize = 10;
-
-    for attempt in 0..MAX_ATTEMPTS {
-        let mut resp = agent().get(url).call().expect("transport error");
-        let status = resp.status().as_u16();
-        let body = resp.body_mut().read_to_string().unwrap_or_default();
-        if status == 200 && body == expected_body {
-            return;
-        }
-        if attempt + 1 < MAX_ATTEMPTS {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            continue;
-        }
-        panic!(
-            "{description} did not converge to anonymous GET 200 with expected body for {url}, last status {status}, last body {body}"
-        );
     }
 
     unreachable!()
@@ -2906,40 +2704,6 @@ fn test_bucket_owner_enforced_acl_read_and_restore_semantics() {
         owner_get_object_access_denied_eventually(&bucket, "pre-boe").await;
 
         cleanup_keys(&bucket, &["pre-boe", "during-boe"]).await;
-    });
-}
-
-#[test]
-fn test_bucket_owner_enforced_disables_legacy_public_read_object_acl() {
-    s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = unique_bucket();
-        s3_tests::create_bucket_request(client, &bucket)
-            .object_ownership(ObjectOwnership::ObjectWriter)
-            .send()
-            .await
-            .unwrap();
-        disable_bucket_public_access_block(client, &bucket).await;
-
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("pre-boe-public")
-            .acl(ObjectCannedAcl::PublicRead)
-            .body(ByteStream::from_static(b"public"))
-            .send()
-            .await
-            .unwrap();
-
-        let object_url = format!("{}/{}/pre-boe-public", CTX.endpoint(), bucket);
-
-        anonymous_get_body_eventually(&object_url, "public", "anonymous GET before BOE").await;
-
-        set_bucket_ownership(&bucket, ObjectOwnership::BucketOwnerEnforced).await;
-
-        anonymous_get_status_eventually(&object_url, 403, "anonymous GET after BOE").await;
-
-        cleanup_keys(&bucket, &["pre-boe-public"]).await;
     });
 }
 

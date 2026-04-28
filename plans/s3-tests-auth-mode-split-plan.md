@@ -134,6 +134,7 @@ Do not add broad matrix duplication until these smoke tests have found no gaps.
 - Split public-bucket CORS actual request and presigned preflight coverage from `cors.rs` into `public_access_cors.rs`; private-bucket and ordinary CORS coverage remains in `cors.rs`.
 - Split bucket/object ACL expected-owner cases from `expected_bucket_owner.rs` into `expected_bucket_owner_acl.rs`.
 - Split versioned object ACL grant behavior from `versioning.rs` into `versioning_acl.rs`.
+- Moved anonymous/public-read ownership behavior from `ownership.rs` into `public_access_acl.rs`, kept public-read bucket ACL BOE-transition coverage there, and rewrote ownership bucket ACL rejection setup to use explicit alternate-account grants instead of public bucket ACLs.
 
 ## Verification Checklist
 
