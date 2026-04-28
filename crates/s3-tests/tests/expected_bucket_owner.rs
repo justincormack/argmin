@@ -5,13 +5,13 @@ use aws_sdk_s3::operation::delete_objects::builders::DeleteObjectsFluentBuilder;
 use aws_sdk_s3::operation::delete_objects::{DeleteObjectsError, DeleteObjectsOutput};
 use aws_sdk_s3::primitives::{ByteStream, DateTime};
 use aws_sdk_s3::types::{
-    BucketCannedAcl, BucketVersioningStatus, CompletedMultipartUpload, CompletedPart,
-    CorsConfiguration, CorsRule, DefaultRetention, Delete, ObjectAttributes, ObjectCannedAcl,
-    ObjectIdentifier, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold,
-    ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode, ObjectLockRule,
-    ObjectOwnership, OwnershipControls, OwnershipControlsRule, PublicAccessBlockConfiguration,
-    ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
-    ServerSideEncryptionRule, Tag, Tagging, VersioningConfiguration,
+    BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, CorsConfiguration, CorsRule,
+    DefaultRetention, Delete, ObjectAttributes, ObjectIdentifier, ObjectLockConfiguration,
+    ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention,
+    ObjectLockRetentionMode, ObjectLockRule, ObjectOwnership, OwnershipControls,
+    OwnershipControlsRule, PublicAccessBlockConfiguration, ServerSideEncryption,
+    ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
+    Tag, Tagging, VersioningConfiguration,
 };
 use base64::Engine;
 use md5_legacy::Digest;
@@ -97,22 +97,6 @@ fn simple_public_access_block() -> PublicAccessBlockConfiguration {
 fn simple_ownership_controls() -> OwnershipControls {
     let rule = OwnershipControlsRule::builder()
         .object_ownership(ObjectOwnership::BucketOwnerPreferred)
-        .build()
-        .unwrap();
-    OwnershipControls::builder().rules(rule).build().unwrap()
-}
-
-fn bucket_owner_preferred_controls() -> OwnershipControls {
-    let rule = OwnershipControlsRule::builder()
-        .object_ownership(ObjectOwnership::BucketOwnerPreferred)
-        .build()
-        .unwrap();
-    OwnershipControls::builder().rules(rule).build().unwrap()
-}
-
-fn object_writer_ownership_controls() -> OwnershipControls {
-    let rule = OwnershipControlsRule::builder()
-        .object_ownership(ObjectOwnership::ObjectWriter)
         .build()
         .unwrap();
     OwnershipControls::builder().rules(rule).build().unwrap()
@@ -207,16 +191,6 @@ async fn create_object_lock_bucket() -> String {
         .await
         .unwrap();
     bucket
-}
-
-async fn set_object_writer_ownership(bucket: &str) {
-    CTX.client()
-        .put_bucket_ownership_controls()
-        .bucket(bucket)
-        .ownership_controls(object_writer_ownership_controls())
-        .send()
-        .await
-        .unwrap();
 }
 
 async fn put_object_bytes(bucket: &str, key: &str, body: &[u8]) {
@@ -708,64 +682,6 @@ fn test_bucket_policy_expected_bucket_owner() {
         expect_owner_ok!(client.delete_bucket_policy().bucket(&bucket));
 
         cleanup_bucket(&bucket, &[]).await;
-    });
-}
-
-#[test]
-fn test_bucket_acl_expected_bucket_owner() {
-    s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = create_bucket().await;
-
-        client
-            .put_bucket_ownership_controls()
-            .bucket(&bucket)
-            .ownership_controls(bucket_owner_preferred_controls())
-            .send()
-            .await
-            .unwrap();
-
-        expect_owner_denied!(client
-            .put_bucket_acl()
-            .bucket(&bucket)
-            .acl(BucketCannedAcl::Private));
-        expect_owner_ok!(client
-            .put_bucket_acl()
-            .bucket(&bucket)
-            .acl(BucketCannedAcl::Private));
-
-        expect_owner_denied!(client.get_bucket_acl().bucket(&bucket));
-        expect_owner_ok!(client.get_bucket_acl().bucket(&bucket));
-
-        cleanup_bucket(&bucket, &[]).await;
-    });
-}
-
-#[test]
-fn test_object_acl_expected_bucket_owner() {
-    s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = create_bucket().await;
-        let key = "obj";
-
-        set_object_writer_ownership(&bucket).await;
-        put_object_bytes(&bucket, key, b"acl").await;
-
-        expect_owner_denied!(client
-            .put_object_acl()
-            .bucket(&bucket)
-            .key(key)
-            .acl(ObjectCannedAcl::Private));
-        expect_owner_ok!(client
-            .put_object_acl()
-            .bucket(&bucket)
-            .key(key)
-            .acl(ObjectCannedAcl::Private));
-
-        expect_owner_denied!(client.get_object_acl().bucket(&bucket).key(key));
-        expect_owner_ok!(client.get_object_acl().bucket(&bucket).key(key));
-
-        cleanup_bucket(&bucket, &[key]).await;
     });
 }
 

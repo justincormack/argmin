@@ -132,6 +132,8 @@ Do not add broad matrix duplication until these smoke tests have found no gaps.
 - Split anonymous public-write POST object behavior from `post_object.rs` into `public_access_post_object.rs`.
 - Split anonymous public bucket listing success cases from `bucket_list.rs` into `public_access_bucket_list.rs`; private anonymous-denied listing cases remain in `bucket_list.rs`.
 - Split public-bucket CORS actual request and presigned preflight coverage from `cors.rs` into `public_access_cors.rs`; private-bucket and ordinary CORS coverage remains in `cors.rs`.
+- Split bucket/object ACL expected-owner cases from `expected_bucket_owner.rs` into `expected_bucket_owner_acl.rs`.
+- Split versioned object ACL grant behavior from `versioning.rs` into `versioning_acl.rs`.
 
 ## Verification Checklist
 

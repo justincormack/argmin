@@ -1,0 +1,279 @@
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{
+    AccessControlPolicy, BucketVersioningStatus, Grant, Grantee, ObjectOwnership, Owner,
+    OwnershipControls, OwnershipControlsRule, Permission, Type, VersioningConfiguration,
+};
+use s3_tests::{assert_s3_err_code, cleanup_versioned_bucket, unique_bucket, CTX};
+
+fn assert_canonical_owner_id(id: &str) {
+    assert_eq!(
+        id.len(),
+        64,
+        "expected 64-char canonical owner ID, got {id}"
+    );
+    assert!(
+        id.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "expected lowercase hex canonical owner ID, got {id}"
+    );
+}
+
+async fn setup_versioned_acl_bucket() -> String {
+    let client = CTX.client();
+    let bucket = unique_bucket();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
+    let ownership_rule = OwnershipControlsRule::builder()
+        .object_ownership(ObjectOwnership::ObjectWriter)
+        .build()
+        .unwrap();
+    let controls = OwnershipControls::builder()
+        .rules(ownership_rule)
+        .build()
+        .unwrap();
+    client
+        .put_bucket_ownership_controls()
+        .bucket(&bucket)
+        .ownership_controls(controls)
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_bucket_versioning()
+        .bucket(&bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    bucket
+}
+
+async fn canonical_owner_id(client: &aws_sdk_s3::Client) -> String {
+    let bucket = unique_bucket();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
+    let owner_id = client
+        .get_bucket_acl()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap()
+        .owner()
+        .and_then(|owner| owner.id())
+        .expect("expected owner ID in GetBucketAcl")
+        .to_string();
+    client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    owner_id
+}
+
+fn canonical_user_grant(canonical_user_id: &str, permission: Permission) -> Grant {
+    Grant::builder()
+        .grantee(
+            Grantee::builder()
+                .id(canonical_user_id)
+                .r#type(Type::CanonicalUser)
+                .build()
+                .expect("canonical grantee"),
+        )
+        .permission(permission)
+        .build()
+}
+
+fn access_control_policy(owner_id: &str, grants: Vec<Grant>) -> AccessControlPolicy {
+    AccessControlPolicy::builder()
+        .owner(Owner::builder().id(owner_id).build())
+        .set_grants(Some(grants))
+        .build()
+}
+
+async fn create_multiple_versions(
+    bucket: &str,
+    key: &str,
+    num: usize,
+) -> (Vec<String>, Vec<String>) {
+    let client = CTX.client();
+    let mut version_ids = Vec::new();
+    let mut contents = Vec::new();
+    for i in 0..num {
+        let body = format!("content-{}", i);
+        let resp = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(body.clone().into_bytes()))
+            .send()
+            .await
+            .unwrap();
+        version_ids.push(resp.version_id().unwrap().to_string());
+        contents.push(body);
+    }
+    (version_ids, contents)
+}
+
+#[test]
+fn test_versioned_object_acl() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = setup_versioned_acl_bucket().await;
+        let key = "xyz";
+        let (version_ids, contents) = create_multiple_versions(&bucket, key, 3).await;
+        let older_version_id = version_ids[0].clone();
+        let target_version_id = version_ids[1].clone();
+        let current_version_id = version_ids[2].clone();
+
+        let owner_id = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap()
+            .owner()
+            .and_then(|owner| owner.id())
+            .expect("expected owner ID in GetObjectAcl")
+            .to_string();
+        assert_canonical_owner_id(&owner_id);
+        let alt_owner_id = canonical_owner_id(alt_client).await;
+        assert_canonical_owner_id(&alt_owner_id);
+
+        client
+            .put_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&target_version_id)
+            .access_control_policy(access_control_policy(
+                &owner_id,
+                vec![
+                    canonical_user_grant(&owner_id, Permission::FullControl),
+                    canonical_user_grant(&alt_owner_id, Permission::Read),
+                ],
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let target = alt_client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&target_version_id)
+            .send()
+            .await
+            .unwrap();
+        let target_body = target.body.collect().await.unwrap().into_bytes();
+        assert!(
+            std::str::from_utf8(&target_body).unwrap() == contents[1],
+            "expected alternate client to read target version content {}, got {:?}",
+            contents[1],
+            target_body,
+        );
+
+        let current = alt_client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&current_version_id)
+            .send()
+            .await;
+        assert_s3_err_code(&current, "AccessDenied");
+
+        let older = alt_client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&older_version_id)
+            .send()
+            .await;
+        assert_s3_err_code(&older, "AccessDenied");
+
+        let head = alt_client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await;
+        assert_s3_err_code(&head, "AccessDenied");
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_versioned_object_acl_no_version_specified() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = setup_versioned_acl_bucket().await;
+        let key = "xyz";
+        let (version_ids, contents) = create_multiple_versions(&bucket, key, 3).await;
+        let older_version_id = version_ids[0].clone();
+        let current_version_id = version_ids[2].clone();
+        let owner_id = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap()
+            .owner()
+            .and_then(|owner| owner.id())
+            .expect("expected owner ID in GetObjectAcl")
+            .to_string();
+        let alt_owner_id = canonical_owner_id(alt_client).await;
+
+        client
+            .put_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .access_control_policy(access_control_policy(
+                &owner_id,
+                vec![
+                    canonical_user_grant(&owner_id, Permission::FullControl),
+                    canonical_user_grant(&alt_owner_id, Permission::Read),
+                ],
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let current = alt_client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let current_body = current.body.collect().await.unwrap().into_bytes();
+        assert_eq!(std::str::from_utf8(&current_body).unwrap(), contents[2]);
+
+        let current_version = alt_client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&current_version_id)
+            .send()
+            .await
+            .unwrap();
+        let current_version_body = current_version.body.collect().await.unwrap().into_bytes();
+        assert_eq!(
+            std::str::from_utf8(&current_version_body).unwrap(),
+            contents[2]
+        );
+
+        let older = alt_client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&older_version_id)
+            .send()
+            .await;
+        assert_s3_err_code(&older, "AccessDenied");
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
