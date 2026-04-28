@@ -1723,7 +1723,7 @@ fn test_set_multipart_tagging() {
 // ── Bucket policy tagging access control ──────────────────────────────
 
 #[test]
-fn test_get_tags_acl_public() {
+fn test_bucket_policy_get_object_tagging_alt_account() {
     let _guard = BUCKET_POLICY_TEST_GUARD
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -1785,7 +1785,7 @@ fn test_get_tags_acl_public() {
 }
 
 #[test]
-fn test_put_tags_acl_public() {
+fn test_bucket_policy_put_object_tagging_alt_account() {
     let _guard = BUCKET_POLICY_TEST_GUARD
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -1847,7 +1847,7 @@ fn test_put_tags_acl_public() {
 }
 
 #[test]
-fn test_delete_tags_obj_public() {
+fn test_bucket_policy_delete_object_tagging_alt_account() {
     let _guard = BUCKET_POLICY_TEST_GUARD
         .lock()
         .unwrap_or_else(|e| e.into_inner());
