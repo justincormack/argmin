@@ -592,6 +592,97 @@ fn test_multipart_upload_public_read_acl_allows_anonymous_get() {
 }
 
 #[test]
+fn test_copy_object_public_read_acl_allows_cross_account_get() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_acl_enabled_bucket(client, ObjectOwnership::ObjectWriter).await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("foo123bar")
+            .body(ByteStream::from_static(b"foo"))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .copy_object()
+            .bucket(&bucket)
+            .key("bar321foo")
+            .copy_source(format!("{}/foo123bar", bucket))
+            .acl(ObjectCannedAcl::PublicRead)
+            .send()
+            .await
+            .unwrap();
+
+        let copied = alt_client
+            .get_object()
+            .bucket(&bucket)
+            .key("bar321foo")
+            .send()
+            .await
+            .unwrap();
+        let copied_body = copied.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&copied_body[..], b"foo");
+
+        let copied_acl = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key("bar321foo")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            has_grant(
+                copied_acl.grants(),
+                Permission::Read,
+                "http://acs.amazonaws.com/groups/global/AllUsers",
+            ),
+            "expected READ grant for AllUsers, got {:?}",
+            copied_acl.grants()
+        );
+
+        client
+            .copy_object()
+            .bucket(&bucket)
+            .key("foo123bar")
+            .copy_source(format!("{}/bar321foo", bucket))
+            .acl(ObjectCannedAcl::PublicRead)
+            .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+            .metadata("abc", "def")
+            .send()
+            .await
+            .unwrap();
+
+        let overwritten = alt_client
+            .get_object()
+            .bucket(&bucket)
+            .key("foo123bar")
+            .send()
+            .await
+            .unwrap();
+        let overwritten_body = overwritten.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&overwritten_body[..], b"foo");
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key("foo123bar")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            head.metadata().and_then(|meta| meta.get("abc")),
+            Some(&"def".to_string())
+        );
+
+        cleanup(&bucket, &["foo123bar", "bar321foo"]).await;
+    });
+}
+
+#[test]
 fn test_anon_create_multipart_upload_public_write_bucket_fail() {
     s3_tests::run(async {
         let bucket = setup_public_write_bucket().await;

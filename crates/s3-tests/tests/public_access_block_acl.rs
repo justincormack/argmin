@@ -804,6 +804,59 @@ fn test_block_public_object_canned_acls() {
 }
 
 #[test]
+fn test_block_public_copy_object_canned_acl() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket_request(client, &bucket)
+            .object_ownership(ObjectOwnership::BucketOwnerPreferred)
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("src")
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
+            .block_public_acls(true)
+            .build();
+        client
+            .put_public_access_block()
+            .bucket(&bucket)
+            .public_access_block_configuration(pab)
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(format!("{}/src", bucket))
+            .acl(ObjectCannedAcl::PublicRead)
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 403);
+        assert_s3_err_code(&result, "AccessDenied");
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("src")
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket).await;
+    });
+}
+
+#[test]
 fn test_block_public_object_authenticated_users_grant_header() {
     s3_tests::run(async {
         let bucket = setup_acl_enabled_bucket().await;
