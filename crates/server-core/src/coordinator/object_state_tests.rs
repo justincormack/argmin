@@ -3139,7 +3139,7 @@ fn put_object_retention_bucket_policy_requires_explicit_bypass_allow_cross_accou
 }
 
 #[test]
-fn authorize_put_object_retention_requires_explicit_bypass_allow_cross_account() {
+fn put_object_retention_requires_explicit_bypass_allow_cross_account_real_api() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
     let owner = AccountIdentity::from_principal("owner-a");
@@ -3198,7 +3198,7 @@ fn authorize_put_object_retention_requires_explicit_bypass_allow_cross_account()
             .unwrap();
 
     let err = coord
-        .authorize_put_object_retention(&PutObjectRetentionRequest {
+        .put_object_retention(&PutObjectRetentionRequest {
             object: object_version_request("bucket", "key", Some(put.version_id), other_requester),
             retention: ObjectRetention {
                 mode: ObjectLockMode::Governance,
@@ -3368,7 +3368,7 @@ fn put_object_retention_allows_same_account_owner_account() {
 }
 
 #[test]
-fn put_object_legal_hold_bucket_policy_allows_cross_account() {
+fn put_object_legal_hold_bucket_policy_allows_cross_account_real_api() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
     let owner = AccountIdentity::from_principal("owner-a");
@@ -3504,7 +3504,7 @@ fn put_object_legal_hold_allows_same_account_owner_account() {
 }
 
 #[test]
-fn authorize_put_object_legal_hold_bucket_policy_allows_cross_account() {
+fn put_object_legal_hold_bucket_policy_allows_cross_account_direct_api() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
     let owner = AccountIdentity::from_principal("owner-a");
@@ -3547,8 +3547,8 @@ fn authorize_put_object_legal_hold_bucket_policy_allows_cross_account() {
                 owner_requester, None)
             .unwrap();
 
-    let authorized = coord
-        .authorize_put_object_legal_hold(&PutObjectLegalHoldRequest {
+    coord
+        .put_object_legal_hold(&PutObjectLegalHoldRequest {
             object: object_version_request(
                 "bucket",
                 "key",
@@ -3558,8 +3558,15 @@ fn authorize_put_object_legal_hold_bucket_policy_allows_cross_account() {
             legal_hold: LegalHoldStatus::On,
         })
         .unwrap();
-    assert_eq!(authorized.version_id, put.version_id);
-    assert_eq!(authorized.legal_hold, StoredLegalHoldStatus::On);
+    let fetched = get_object_legal_hold_test(
+        &coord,
+        "bucket",
+        "key",
+        Some(put.version_id),
+        test_helpers::requester("other-user"),
+    )
+    .unwrap();
+    assert_eq!(fetched, Some(LegalHoldStatus::On));
 }
 
 #[test]

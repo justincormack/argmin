@@ -2671,7 +2671,7 @@ fn begin_stream_put_bucket_policy_deny_on_public_acl() {
 }
 
 #[test]
-fn get_object_acl_bucket_policy_existing_tag_controls_access() {
+fn get_object_acl_bucket_policy_existing_tag_controls_access_real_api() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
     coord
@@ -2765,7 +2765,7 @@ fn get_object_acl_bucket_policy_existing_tag_controls_access() {
 }
 
 #[test]
-fn authorize_get_object_acl_bucket_policy_existing_tag_controls_access() {
+fn get_object_acl_bucket_policy_existing_tag_controls_access_direct_api() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
     coord
@@ -2800,8 +2800,8 @@ fn authorize_get_object_acl_bucket_policy_existing_tag_controls_access() {
     )
     .unwrap();
 
-    let authorized = coord
-        .authorize_get_object_acl(&object_version_request_with_expected_owner(
+    let acl = coord
+        .get_object_acl(&object_version_request_with_expected_owner(
             "bucket",
             "publictag",
             None,
@@ -2809,7 +2809,7 @@ fn authorize_get_object_acl_bucket_policy_existing_tag_controls_access() {
             None,
         ))
         .unwrap();
-    assert_eq!(authorized.result.version_id, VersionId::Null);
+    assert_eq!(acl.version_id, VersionId::Null);
 }
 
 #[test]
@@ -5594,7 +5594,7 @@ fn bucket_owner_enforced_admin_tagging_preserves_delete_marker_and_missing_versi
 }
 
 #[test]
-fn get_object_tags_rejects_public_read_for_anonymous() {
+fn get_object_tags_rejects_public_read_for_anonymous_real_api() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
     coord
@@ -5631,7 +5631,7 @@ fn get_object_tags_rejects_public_read_for_anonymous() {
 }
 
 #[test]
-fn authorize_get_object_tags_rejects_public_read_for_anonymous() {
+fn get_object_tags_rejects_public_read_for_anonymous_direct_api() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
     coord
@@ -5662,7 +5662,7 @@ fn authorize_get_object_tags_rejects_public_read_for_anonymous() {
     .unwrap();
 
     let err = coord
-        .authorize_get_object_tags(&object_version_request_with_expected_owner(
+        .get_object_tags(&object_version_request_with_expected_owner(
             "bucket",
             "key",
             None,

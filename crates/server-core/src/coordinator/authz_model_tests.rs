@@ -7208,11 +7208,9 @@ mod phase7_harness {
         );
 
         let result = match scenario.action {
-            ObjectLockActionShape::GetRetention => {
-                coord.authorize_get_object_retention(&object).map(|_| ())
-            }
+            ObjectLockActionShape::GetRetention => coord.get_object_retention(&object).map(|_| ()),
             ObjectLockActionShape::PutRetention => coord
-                .authorize_put_object_retention(&PutObjectRetentionRequest {
+                .put_object_retention(&PutObjectRetentionRequest {
                     object,
                     retention: ObjectRetention {
                         mode: ObjectLockMode::Governance,
@@ -7223,11 +7221,9 @@ mod phase7_harness {
                     bypass_governance: scenario.bypass_governance,
                 })
                 .map(|_| ()),
-            ObjectLockActionShape::GetLegalHold => {
-                coord.authorize_get_object_legal_hold(&object).map(|_| ())
-            }
+            ObjectLockActionShape::GetLegalHold => coord.get_object_legal_hold(&object).map(|_| ()),
             ObjectLockActionShape::PutLegalHold => coord
-                .authorize_put_object_legal_hold(&PutObjectLegalHoldRequest {
+                .put_object_legal_hold(&PutObjectLegalHoldRequest {
                     object,
                     legal_hold: LegalHoldStatus::On,
                 })

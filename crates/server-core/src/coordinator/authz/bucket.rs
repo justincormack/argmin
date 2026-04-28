@@ -1,0 +1,947 @@
+use super::*;
+
+impl Coordinator {
+    pub(in crate::coordinator) fn authorize_create_bucket(
+        &self,
+        req: &CreateBucketRequest,
+    ) -> Result<AuthorizedCreateBucket, ServerError> {
+        let owner_account = req.requester.account().ok_or(ServerError::AccessDenied)?;
+        let locked_to_account_region =
+            self.validate_create_bucket_namespace(&req.name, req.namespace, owner_account)?;
+        if req.ownership == BucketObjectOwnership::BucketOwnerEnforced && req.acl.is_explicit() {
+            return Err(ServerError::InvalidBucketAclWithObjectOwnership);
+        }
+        let owner = OwnerIdentity::new(
+            owner_account.principal(),
+            owner_account.canonical_user_id().clone(),
+        );
+        let acl_grants = match &req.acl {
+            CreateBucketAcl::DefaultPrivate => Self::owner_full_control_grants(&owner),
+            CreateBucketAcl::Canned(acl) => Self::bucket_acl_grants_from_canned(&owner, *acl)?,
+            CreateBucketAcl::Grants(acl_grants) => {
+                Self::ensure_supported_bucket_acl_grants(acl_grants)?;
+                acl_grants.clone()
+            }
+        };
+        if Self::acl_grants_grant_public_read(&acl_grants)
+            || Self::acl_grants_grant_public_write(&acl_grants)
+        {
+            return Err(ServerError::InvalidBucketAclWithBlockPublicAccessError);
+        }
+        Ok(AuthorizedCreateBucket {
+            name: req.name.clone(),
+            requester: req.requester.clone(),
+            owner,
+            locked_to_account_region,
+            acl: req.acl.clone(),
+            ownership: req.ownership,
+            object_lock_enabled: req.object_lock_enabled,
+            acl_grants,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_head_bucket(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedHeadBucket, ServerError> {
+        let bucket = self.load_bucket_handle_for_bucket_policy_read(req)?;
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let bucket_read_fallback = || {
+            Self::requester_can_read_bucket(
+                req.requester(),
+                bucket.bucket(),
+                &bucket.bucket().owner_principal,
+                &bucket.bucket().acl_grants,
+                Self::effective_public_read(bucket.bucket()),
+            )
+        };
+        let list_decision = self.bucket_policy_decision_for_loaded_handle(
+            req.requester(),
+            &bucket,
+            auth::PolicyAction::ListBucket,
+            bucket_policy.as_deref(),
+        )?;
+        let location_decision = self.bucket_policy_decision_for_loaded_handle(
+            req.requester(),
+            &bucket,
+            auth::PolicyAction::GetBucketLocation,
+            bucket_policy.as_deref(),
+        )?;
+        let list_allowed = Self::bucket_policy_allows_with_fallback(
+            req.requester(),
+            bucket.bucket(),
+            list_decision,
+            bucket_read_fallback,
+        );
+        let location_allowed = Self::bucket_policy_allows_with_fallback(
+            req.requester(),
+            bucket.bucket(),
+            location_decision,
+            bucket_read_fallback,
+        );
+        if !(list_allowed && location_allowed) {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedHeadBucket {
+            bucket_info: bucket.bucket().clone(),
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_delete_bucket(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedDeleteBucket, ServerError> {
+        let _bucket = self.authorize_loaded_bucket_write_action_for(
+            req,
+            auth::PolicyAction::DeleteBucket,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        Ok(AuthorizedDeleteBucket {
+            name: req.name_typed().clone(),
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_put_bucket_cors(
+        &self,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourcePut, ServerError> {
+        let _bucket = self.authorize_loaded_bucket_write_action_for(
+            &req.bucket,
+            auth::PolicyAction::PutBucketCors,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        Ok(AuthorizedBucketSubresourcePut {
+            bucket: req.bucket.name_typed().clone(),
+            kind: storage::BucketSubresourceKind::Cors,
+            body: req.config.to_string(),
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_get_bucket_cors(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourceBodyGet, ServerError> {
+        let bucket = self.load_bucket_handle_for_bucket_read(
+            req,
+            BucketHandleRequest::new().requiring_cors_view(),
+        )?;
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let allowed = self.requester_can_bucket_action_with_preloaded_tags_with_bucket_policy(
+            &req.requester,
+            bucket.bucket(),
+            Self::loaded_bucket_tags_for_policy(&bucket)?.as_deref(),
+            auth::PolicyAction::GetBucketCors,
+            bucket_policy.as_deref(),
+            Self::requester_can_bucket_owner_account_admin(&req.requester, bucket.bucket()),
+        )?;
+        if !allowed {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedBucketSubresourceBodyGet {
+            body: Self::loaded_bucket_subresource_body(bucket.cors())?,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_get_bucket_tagging(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourceBodyGet, ServerError> {
+        let bucket = self.load_bucket_handle_for_bucket_read(
+            req,
+            BucketHandleRequest::new().requiring_bucket_tags(),
+        )?;
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let policy_decision = self.bucket_policy_decision_for_loaded_handle(
+            &req.requester,
+            &bucket,
+            auth::PolicyAction::GetBucketTagging,
+            bucket_policy.as_deref(),
+        )?;
+        if !Self::bucket_policy_allows_with_fallback(
+            &req.requester,
+            bucket.bucket(),
+            policy_decision,
+            || Self::requester_can_bucket_owner_account_admin(&req.requester, bucket.bucket()),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedBucketSubresourceBodyGet {
+            body: Self::loaded_bucket_subresource_body(bucket.tags())?,
+        })
+    }
+
+    /// Creates an internal authorization token for HTTP CORS evaluation.
+    ///
+    /// This intentionally bypasses normal bucket-config authorization because
+    /// CORS preflight handling and actual-response header decoration need the
+    /// stored CORS rules without turning those paths into authenticated bucket
+    /// config reads.
+    pub(in crate::coordinator) fn authorize_load_bucket_cors_config_for(
+        &self,
+        name: &BucketName,
+    ) -> AuthorizedBucketSubresourceGet {
+        AuthorizedBucketSubresourceGet {
+            bucket: name.clone(),
+            kind: storage::BucketSubresourceKind::Cors,
+        }
+    }
+
+    pub(in crate::coordinator) fn authorize_delete_bucket_cors(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
+        let _bucket = self.authorize_loaded_bucket_write_action_for(
+            req,
+            auth::PolicyAction::PutBucketCors,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        Ok(AuthorizedBucketSubresourceDelete {
+            bucket: req.name_typed().clone(),
+            kind: storage::BucketSubresourceKind::Cors,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_put_bucket_tagging(
+        &self,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourcePut, ServerError> {
+        let bucket = self.authorize_loaded_bucket_write_action_for(
+            &req.bucket,
+            auth::PolicyAction::PutBucketTagging,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        if bucket.bucket().bucket_abac_enabled {
+            return Err(ServerError::BadRequest {
+                reason: "This S3 general purpose bucket has attribute-based access control (ABAC) enabled. To add tags to this bucket, initiate a TagResource request. To delete tags from this bucket, initiate an UntagResource request.".to_string(),
+            });
+        }
+        Ok(AuthorizedBucketSubresourcePut {
+            bucket: req.bucket.name_typed().clone(),
+            kind: storage::BucketSubresourceKind::Tagging,
+            body: req.config.to_string(),
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_delete_bucket_tagging(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
+        let bucket = self.authorize_loaded_bucket_write_action_for(
+            req,
+            auth::PolicyAction::PutBucketTagging,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        if bucket.bucket().bucket_abac_enabled {
+            return Err(ServerError::BadRequest {
+                reason: "This S3 general purpose bucket has attribute-based access control (ABAC) enabled. To delete tags from this bucket, initiate an UntagResource request.".to_string(),
+            });
+        }
+        Ok(AuthorizedBucketSubresourceDelete {
+            bucket: req.name_typed().clone(),
+            kind: storage::BucketSubresourceKind::Tagging,
+        })
+    }
+
+    fn validate_tag_resource_account_id(
+        bucket_info: &BucketSummary,
+        account_id: &str,
+    ) -> Result<(), ServerError> {
+        if aws_account_id_from_principal(&bucket_info.owner_principal) == Some(account_id) {
+            return Ok(());
+        }
+        Err(ServerError::AccessDenied)
+    }
+
+    pub(in crate::coordinator) fn authorize_bucket_tag_control(
+        &self,
+        req: &BucketTagControlRequest<'_>,
+    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
+        let bucket = self.authorize_loaded_bucket_owner_account_admin_write_for(&req.bucket)?;
+        Self::validate_tag_resource_account_id(bucket.bucket(), req.account_id)?;
+        Ok(AuthorizedBucketConfigAccess {
+            bucket: req.bucket.name_typed().clone(),
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_put_bucket_abac(
+        &self,
+        req: &PutBucketAbacRequest<'_>,
+    ) -> Result<AuthorizedPutBucketAbac, ServerError> {
+        let _bucket = self.authorize_loaded_bucket_owner_account_admin_write_for(&req.bucket)?;
+        Ok(AuthorizedPutBucketAbac {
+            bucket: req.bucket.name_typed().clone(),
+            enabled: req.enabled,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_get_bucket_abac(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketAbac, ServerError> {
+        let bucket = self.bucket_handle_loader().load_bucket(
+            req.name_typed(),
+            req.expected_bucket_owner(),
+            BucketHandleRequest::new(),
+        )?;
+        if !Self::requester_can_bucket_owner_account_admin(&req.requester, bucket.bucket()) {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedGetBucketAbac {
+            enabled: bucket.bucket().bucket_abac_enabled,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_put_bucket_policy(
+        &self,
+        req: &PutBucketPolicyRequest<'_>,
+    ) -> Result<AuthorizedPutBucketPolicy, ServerError> {
+        let bucket = self.authorize_loaded_bucket_write_policy_action_for(
+            &req.bucket,
+            auth::PolicyAction::PutBucketPolicy,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        let parsed_policy =
+            auth::parse_bucket_policy(req.config).map_err(|e| ServerError::MalformedPolicy {
+                reason: e.reason().to_string(),
+            })?;
+        parsed_policy
+            .validate_evaluable_object_conditions()
+            .map_err(|e| ServerError::MalformedPolicy {
+                reason: e.reason().to_string(),
+            })?;
+        let normalized_policy = parsed_policy.normalized_json();
+        if normalized_policy.len() > auth::bucket_policy::MAX_BUCKET_POLICY_BYTES {
+            return Err(ServerError::MalformedPolicy {
+                reason: format!(
+                    "Normalized policy document exceeds the maximum allowed size of {} bytes",
+                    auth::bucket_policy::MAX_BUCKET_POLICY_BYTES
+                ),
+            });
+        }
+        let policy_is_public = parsed_policy.is_public();
+        if Self::blocks_public_policy(bucket.bucket().public_access_block.as_ref())
+            && policy_is_public
+        {
+            return Err(ServerError::BlockPublicPolicyAccessDenied {
+                requester_principal: Self::requester_principal_required(&req.bucket.requester)?
+                    .to_string(),
+                bucket: req.bucket.name.to_string(),
+            });
+        }
+        Ok(AuthorizedPutBucketPolicy {
+            bucket: req.bucket.name_typed().clone(),
+            body: normalized_policy,
+            policy_is_public,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_get_bucket_policy(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourceBodyGet, ServerError> {
+        let bucket = self.authorize_loaded_bucket_policy_action_for(
+            req,
+            auth::PolicyAction::GetBucketPolicy,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        Ok(AuthorizedBucketSubresourceBodyGet {
+            body: Self::loaded_bucket_subresource_body(bucket.policy())?,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_delete_bucket_policy(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
+        let _bucket = self.authorize_loaded_bucket_write_policy_action_for(
+            req,
+            auth::PolicyAction::DeleteBucketPolicy,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        Ok(AuthorizedBucketSubresourceDelete {
+            bucket: req.name_typed().clone(),
+            kind: storage::BucketSubresourceKind::Policy,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_put_bucket_public_access_block(
+        &self,
+        req: &PutBucketPublicAccessBlockRequest<'_>,
+    ) -> Result<AuthorizedPutBucketPublicAccessBlock, ServerError> {
+        let _bucket = self.authorize_loaded_bucket_write_action_for(
+            &req.bucket,
+            auth::PolicyAction::PutBucketPublicAccessBlock,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        Ok(AuthorizedPutBucketPublicAccessBlock {
+            bucket: req.bucket.name_typed().clone(),
+            config: req.config,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_get_bucket_public_access_block(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketPublicAccessBlock, ServerError> {
+        let bucket = self.authorize_loaded_bucket_action_for(
+            req,
+            auth::PolicyAction::GetBucketPublicAccessBlock,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        Ok(AuthorizedGetBucketPublicAccessBlock {
+            config: bucket.bucket().public_access_block,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_delete_bucket_public_access_block(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
+        let _bucket = self.authorize_loaded_bucket_write_action_for(
+            req,
+            auth::PolicyAction::PutBucketPublicAccessBlock,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        Ok(AuthorizedBucketConfigAccess {
+            bucket: req.name_typed().clone(),
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_put_bucket_ownership_controls(
+        &self,
+        req: &PutBucketOwnershipControlsRequest<'_>,
+    ) -> Result<AuthorizedPutBucketOwnershipControls, ServerError> {
+        let bucket = self.authorize_loaded_bucket_write_action_for(
+            &req.bucket,
+            auth::PolicyAction::PutBucketOwnershipControls,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        if Self::is_bucket_owner_enforced(Some(&req.config))
+            && !Self::acl_grants_owner_full_control_only(
+                &bucket.bucket().owner_canonical_id,
+                &bucket.bucket().acl_grants,
+            )
+        {
+            return Err(ServerError::InvalidBucketAclWithObjectOwnership);
+        }
+        Ok(AuthorizedPutBucketOwnershipControls {
+            bucket: req.bucket.name_typed().clone(),
+            config: req.config,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_get_bucket_ownership_controls(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketOwnershipControls, ServerError> {
+        let bucket = self.authorize_loaded_bucket_action_for(
+            req,
+            auth::PolicyAction::GetBucketOwnershipControls,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        Ok(AuthorizedGetBucketOwnershipControls {
+            config: bucket.bucket().ownership_controls,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_delete_bucket_ownership_controls(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
+        let _bucket = self.authorize_loaded_bucket_write_action_for(
+            req,
+            auth::PolicyAction::PutBucketOwnershipControls,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        Ok(AuthorizedBucketConfigAccess {
+            bucket: req.name_typed().clone(),
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_put_bucket_lifecycle(
+        &self,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<AuthorizedPutBucketLifecycle, ServerError> {
+        let _bucket = self.authorize_loaded_bucket_write_action_for(
+            &req.bucket,
+            auth::PolicyAction::PutLifecycleConfiguration,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        s3_types::parse_lifecycle_configuration_xml(req.config.as_bytes()).map_err(|error| {
+            match error {
+                LifecycleConfigError::MalformedXml { reason } => {
+                    ServerError::MalformedXML { reason }
+                }
+                LifecycleConfigError::InvalidRequest { reason } => {
+                    ServerError::InvalidRequest { reason }
+                }
+                LifecycleConfigError::InvalidArgument { reason } => {
+                    ServerError::InvalidArgument { reason }
+                }
+                LifecycleConfigError::NotImplemented { feature } => {
+                    ServerError::NotImplemented { feature }
+                }
+            }
+        })?;
+        Ok(AuthorizedPutBucketLifecycle {
+            bucket: req.bucket.name_typed().clone(),
+            body: req.config.to_string(),
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_get_bucket_lifecycle(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourceBodyGet, ServerError> {
+        let bucket = self.load_bucket_handle_for_bucket_read(
+            req,
+            BucketHandleRequest::new().requiring_lifecycle_view(),
+        )?;
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let allowed = self.requester_can_bucket_action_with_preloaded_tags_with_bucket_policy(
+            &req.requester,
+            bucket.bucket(),
+            Self::loaded_bucket_tags_for_policy(&bucket)?.as_deref(),
+            auth::PolicyAction::GetLifecycleConfiguration,
+            bucket_policy.as_deref(),
+            Self::requester_can_bucket_owner_account_admin(&req.requester, bucket.bucket()),
+        )?;
+        if !allowed {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedBucketSubresourceBodyGet {
+            body: Self::loaded_bucket_subresource_body(bucket.lifecycle())?,
+        })
+    }
+
+    /// Creates an internal authorization token for lifecycle state loads.
+    ///
+    /// This intentionally bypasses request auth because the coordinator is
+    /// loading already-authoritative stored lifecycle state for internal
+    /// lifecycle evaluation such as response-header computation.
+    pub(in crate::coordinator) fn authorize_load_bucket_lifecycle_for(
+        &self,
+        name: &BucketName,
+    ) -> AuthorizedBucketSubresourceGet {
+        AuthorizedBucketSubresourceGet {
+            bucket: name.clone(),
+            kind: storage::BucketSubresourceKind::Lifecycle,
+        }
+    }
+
+    pub(in crate::coordinator) fn authorize_delete_bucket_lifecycle(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
+        let _bucket = self.authorize_loaded_bucket_write_action_for(
+            req,
+            auth::PolicyAction::PutLifecycleConfiguration,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        Ok(AuthorizedBucketSubresourceDelete {
+            bucket: req.name_typed().clone(),
+            kind: storage::BucketSubresourceKind::Lifecycle,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_put_bucket_encryption(
+        &self,
+        req: &PutBucketEncryptionRequest<'_>,
+    ) -> Result<AuthorizedPutBucketEncryption, ServerError> {
+        let _bucket = self.authorize_loaded_bucket_write_action_for(
+            &req.bucket,
+            auth::PolicyAction::PutEncryptionConfiguration,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        Ok(AuthorizedPutBucketEncryption {
+            bucket: req.bucket.name_typed().clone(),
+            config: req.config,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_put_bucket_versioning(
+        &self,
+        req: &PutBucketVersioningRequest<'_>,
+    ) -> Result<AuthorizedPutBucketVersioning, ServerError> {
+        let bucket = self.authorize_loaded_bucket_write_action_for(
+            &req.bucket,
+            auth::PolicyAction::PutBucketVersioning,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        if bucket.bucket().object_lock.enabled && req.state != BucketVersioningState::Enabled {
+            return Err(ServerError::InvalidBucketState);
+        }
+        Ok(AuthorizedPutBucketVersioning {
+            bucket: req.bucket.name_typed().clone(),
+            state: req.state,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_get_bucket_versioning(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketVersioning, ServerError> {
+        let bucket = self.load_bucket_handle_for_bucket_policy_read(req)?;
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let policy_decision = self.bucket_policy_decision_for_loaded_handle(
+            &req.requester,
+            &bucket,
+            auth::PolicyAction::GetBucketVersioning,
+            bucket_policy.as_deref(),
+        )?;
+        if !Self::bucket_policy_allows_with_fallback(
+            &req.requester,
+            bucket.bucket(),
+            policy_decision,
+            || Self::requester_can_bucket_owner_account_admin(&req.requester, bucket.bucket()),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedGetBucketVersioning {
+            state: bucket.bucket().versioning,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_get_bucket_location(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketLocation, ServerError> {
+        let bucket = self.load_bucket_handle_for_bucket_policy_read(req)?;
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let policy_decision = self.bucket_policy_decision_for_loaded_handle(
+            &req.requester,
+            &bucket,
+            auth::PolicyAction::GetBucketLocation,
+            bucket_policy.as_deref(),
+        )?;
+        if !Self::bucket_policy_allows_with_fallback(
+            &req.requester,
+            bucket.bucket(),
+            policy_decision,
+            || Self::requester_can_bucket_owner_account_admin(&req.requester, bucket.bucket()),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedGetBucketLocation)
+    }
+
+    pub(in crate::coordinator) fn authorize_list_objects_v2(
+        &self,
+        req: &ListObjectsV2Request<'_>,
+    ) -> Result<AuthorizedListObjectsV2, ServerError> {
+        let bucket = self.load_bucket_handle_for_bucket_policy_read(&req.bucket)?;
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let policy_decision = self.bucket_policy_decision_for_loaded_handle(
+            &req.bucket.requester,
+            &bucket,
+            auth::PolicyAction::ListBucket,
+            bucket_policy.as_deref(),
+        )?;
+        if !Self::bucket_policy_allows_with_fallback(
+            &req.bucket.requester,
+            bucket.bucket(),
+            policy_decision,
+            || {
+                Self::requester_can_read_bucket(
+                    &req.bucket.requester,
+                    bucket.bucket(),
+                    &bucket.bucket().owner_principal,
+                    &bucket.bucket().acl_grants,
+                    Self::effective_public_read(bucket.bucket()),
+                )
+            },
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedListObjectsV2 {
+            bucket_info: bucket.bucket().clone(),
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_list_buckets(
+        &self,
+        req: &ListBucketsRequest,
+    ) -> Result<AuthorizedListBuckets, ServerError> {
+        let requester = req.requester.account().ok_or(ServerError::AccessDenied)?;
+        Ok(AuthorizedListBuckets {
+            owner_canonical_id: requester.canonical_user_id().clone(),
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_list_object_versions(
+        &self,
+        req: &ListObjectVersionsRequest<'_>,
+    ) -> Result<AuthorizedListObjectVersions, ServerError> {
+        let bucket = self.load_bucket_handle_for_bucket_policy_read(&req.bucket)?;
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let policy_decision = self.bucket_policy_decision_for_loaded_handle(
+            &req.bucket.requester,
+            &bucket,
+            auth::PolicyAction::ListBucketVersions,
+            bucket_policy.as_deref(),
+        )?;
+        if !Self::bucket_policy_allows_with_fallback(
+            &req.bucket.requester,
+            bucket.bucket(),
+            policy_decision,
+            || {
+                Self::requester_can_read_bucket(
+                    &req.bucket.requester,
+                    bucket.bucket(),
+                    &bucket.bucket().owner_principal,
+                    &bucket.bucket().acl_grants,
+                    Self::effective_public_read(bucket.bucket()),
+                )
+            },
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedListObjectVersions {
+            bucket_info: bucket.bucket().clone(),
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_list_multipart_uploads(
+        &self,
+        req: &ListMultipartUploadsRequest<'_>,
+    ) -> Result<AuthorizedListMultipartUploads, ServerError> {
+        let bucket = self.load_bucket_handle_for_bucket_policy_read(&req.bucket)?;
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let policy_decision = self.bucket_policy_decision_for_loaded_handle(
+            &req.bucket.requester,
+            &bucket,
+            auth::PolicyAction::ListBucketMultipartUploads,
+            bucket_policy.as_deref(),
+        )?;
+        if !Self::bucket_policy_allows_with_fallback(
+            &req.bucket.requester,
+            bucket.bucket(),
+            policy_decision,
+            || {
+                Self::requester_can_read_bucket(
+                    &req.bucket.requester,
+                    bucket.bucket(),
+                    &bucket.bucket().owner_principal,
+                    &bucket.bucket().acl_grants,
+                    Self::effective_public_read(bucket.bucket()),
+                )
+            },
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedListMultipartUploads {
+            bucket: bucket.bucket().name.clone(),
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_put_bucket_object_lock_configuration(
+        &self,
+        req: &PutBucketObjectLockConfigurationRequest<'_>,
+    ) -> Result<AuthorizedPutBucketObjectLockConfiguration, ServerError> {
+        let bucket = self.authorize_loaded_bucket_write_action_for(
+            &req.bucket,
+            auth::PolicyAction::PutBucketObjectLockConfiguration,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        if bucket.bucket().versioning != BucketVersioningState::Enabled {
+            return Err(ServerError::InvalidBucketState);
+        }
+
+        let final_enabled =
+            bucket.bucket().object_lock.enabled || req.config.object_lock_enabled.is_some();
+        if !final_enabled {
+            return Err(ServerError::InvalidRequest {
+                reason: "Object Lock must be enabled before configuring this bucket".to_string(),
+            });
+        }
+
+        Ok(AuthorizedPutBucketObjectLockConfiguration {
+            bucket: req.bucket.name_typed().clone(),
+            config: BucketObjectLockConfig {
+                enabled: true,
+                default_retention: req.config.default_retention,
+            },
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_get_bucket_encryption(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketEncryption, ServerError> {
+        let bucket = self.authorize_loaded_bucket_action_for(
+            req,
+            auth::PolicyAction::GetEncryptionConfiguration,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        Ok(AuthorizedGetBucketEncryption {
+            config: bucket.bucket().encryption,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_delete_bucket_encryption(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedDeleteBucketEncryption, ServerError> {
+        let _bucket = self.authorize_loaded_bucket_write_action_for(
+            req,
+            auth::PolicyAction::PutEncryptionConfiguration,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        Ok(AuthorizedDeleteBucketEncryption {
+            bucket: req.name_typed().clone(),
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_get_bucket_object_lock_configuration(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketObjectLockConfiguration, ServerError> {
+        let bucket = self.authorize_loaded_bucket_action_for(
+            req,
+            auth::PolicyAction::GetBucketObjectLockConfiguration,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        if !bucket.bucket().object_lock.enabled {
+            return Err(ServerError::ObjectLockConfigurationNotFound {
+                bucket: req.name.to_string(),
+            });
+        }
+        Ok(AuthorizedGetBucketObjectLockConfiguration {
+            config: bucket.bucket().object_lock,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_get_bucket_policy_status(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketPolicyStatus, ServerError> {
+        let bucket = self.load_bucket_handle_for_bucket_policy_read(req)?;
+        if !bucket.bucket().bucket_policy_present {
+            if !Self::requester_can_bucket_admin(&req.requester, &bucket.bucket().owner_principal) {
+                return Err(ServerError::AccessDenied);
+            }
+            return Err(ServerError::NoSuchBucketPolicy {
+                bucket: req.name.to_string(),
+            });
+        }
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let policy_decision = self.bucket_policy_decision_for_loaded_handle(
+            &req.requester,
+            &bucket,
+            auth::PolicyAction::GetBucketPolicyStatus,
+            bucket_policy.as_deref(),
+        )?;
+        if !Self::bucket_policy_allows_with_fallback(
+            &req.requester,
+            bucket.bucket(),
+            policy_decision,
+            || Self::requester_can_bucket_admin(&req.requester, &bucket.bucket().owner_principal),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedGetBucketPolicyStatus {
+            is_public: bucket.bucket().bucket_policy_public,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_get_bucket_acl(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketAcl, ServerError> {
+        let bucket = self.load_bucket_handle_for_bucket_policy_read(req)?;
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let policy_decision = self.bucket_policy_decision_for_loaded_handle(
+            &req.requester,
+            &bucket,
+            auth::PolicyAction::GetBucketAcl,
+            bucket_policy.as_deref(),
+        )?;
+        if !Self::bucket_policy_allows_with_fallback(
+            &req.requester,
+            bucket.bucket(),
+            policy_decision,
+            || Self::requester_can_read_bucket_acl(&req.requester, bucket.bucket()),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
+        let result = if Self::is_bucket_owner_enforced(bucket.bucket().ownership_controls.as_ref())
+        {
+            let owner = Self::bucket_owner_identity(bucket.bucket());
+            GetBucketAclResult {
+                owner_principal: owner.principal,
+                owner_canonical_id: owner.canonical_id.clone(),
+                acl_grants: AclGrants::new(vec![AclGrant::new(
+                    AclGrantee::CanonicalUser(owner.canonical_id),
+                    AclPermission::FullControl,
+                )]),
+            }
+        } else {
+            let bucket = bucket.bucket().clone();
+            GetBucketAclResult {
+                owner_principal: bucket.owner_principal,
+                owner_canonical_id: bucket.owner_canonical_id,
+                acl_grants: bucket.acl_grants,
+            }
+        };
+        Ok(AuthorizedGetBucketAcl { result })
+    }
+
+    pub(in crate::coordinator) fn authorize_put_bucket_acl(
+        &self,
+        req: &PutBucketAclRequest<'_>,
+    ) -> Result<AuthorizedPutBucketAcl, ServerError> {
+        let bucket = self.with_bucket_write_handle_for(
+            &req.bucket,
+            BucketHandleRequest::new()
+                .requiring_policy_view()
+                .requiring_bucket_tags_if_abac_enabled(),
+            |bucket| {
+                let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+                let policy_decision = self.bucket_policy_decision_for_loaded_handle_with_context(
+                    &req.bucket.requester,
+                    &bucket,
+                    auth::PolicyAction::PutBucketAcl,
+                    req.authorization_policy_context()?,
+                    bucket_policy.as_deref(),
+                )?;
+                if !Self::bucket_policy_allows_with_fallback(
+                    &req.bucket.requester,
+                    bucket.bucket(),
+                    policy_decision,
+                    || Self::requester_can_write_bucket_acl(&req.bucket.requester, bucket.bucket()),
+                ) {
+                    return Err(ServerError::AccessDenied);
+                }
+                Ok(bucket)
+            },
+        )?;
+        let owner = Self::bucket_owner_identity(bucket.bucket());
+        let acl_grants = match &req.acl {
+            PutBucketAclInput::Canned(acl) => {
+                Self::ensure_put_bucket_acl_supported(bucket.bucket(), *acl)?;
+                Self::bucket_acl_grants_from_canned(&owner, *acl)?
+            }
+            PutBucketAclInput::Grants(acl_grants) => {
+                if Self::is_bucket_owner_enforced(bucket.bucket().ownership_controls.as_ref()) {
+                    return Err(ServerError::AccessControlListNotSupported);
+                }
+                Self::ensure_supported_bucket_acl_grants(acl_grants)?;
+                acl_grants.clone()
+            }
+        };
+        let public_read = Self::acl_grants_public_read(&acl_grants);
+        let public_write = Self::acl_grants_public_write(&acl_grants);
+        if Self::blocks_public_acls(bucket.bucket().public_access_block.as_ref())
+            && (Self::acl_grants_grant_public_read(&acl_grants)
+                || Self::acl_grants_grant_public_write(&acl_grants))
+        {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedPutBucketAcl {
+            bucket: req.bucket.name_typed().clone(),
+            acl_grants,
+            public_read,
+            public_write,
+        })
+    }
+}

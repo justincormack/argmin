@@ -7,13 +7,9 @@ use checksum::MultipartChecksumConfig;
 
 use super::authz_types::{ActiveWriteEncryption, AuthorizedPutObjectWrite, ValidatedBucket};
 use super::request_types::{CreateBucketAcl, Requester};
-#[cfg(test)]
-use super::response_types::GetObjectAclResult;
 use super::response_types::{BucketSummary, GetBucketAclResult};
 use crate::sse::SseCustomerWriteContext;
 use s3_types::{AclGrants, BucketVersioningState, CanonicalUserId, VersionId};
-#[cfg(test)]
-use s3_types::{LegalHoldStatus, ObjectRetention, StoredLegalHoldStatus};
 use storage::BucketObjectOwnership;
 use storage::{
     BucketEncryptionConfig, BucketName, BucketObjectLockConfig, BucketOwnershipControls,
@@ -177,65 +173,9 @@ pub(super) struct AuthorizedPutBucketAcl {
     pub(super) public_write: bool,
 }
 
-#[cfg(test)]
-pub(super) struct AuthorizedObjectTagsAccess {
-    pub(super) bucket: BucketName,
-    pub(super) key: ObjectKey,
-    pub(super) version_id: VersionId,
-}
-
-#[cfg(test)]
-pub(super) struct AuthorizedPutObjectRetention {
-    pub(super) bucket: BucketName,
-    pub(super) key: ObjectKey,
-    pub(super) version_id: VersionId,
-    pub(super) retention: ObjectRetention,
-}
-
-#[cfg(test)]
-pub(super) struct AuthorizedGetObjectRetention {
-    pub(super) retention: Option<ObjectRetention>,
-}
-
-#[cfg(test)]
-pub(super) struct AuthorizedPutObjectLegalHold {
-    pub(super) bucket: BucketName,
-    pub(super) key: ObjectKey,
-    pub(super) version_id: VersionId,
-    pub(super) legal_hold: StoredLegalHoldStatus,
-}
-
-#[cfg(test)]
-pub(super) struct AuthorizedGetObjectLegalHold {
-    pub(super) legal_hold: Option<LegalHoldStatus>,
-}
-
-#[cfg(test)]
-pub(super) struct AuthorizedPutObjectAclUpdate {
-    pub(super) bucket: BucketName,
-    pub(super) key: ObjectKey,
-    pub(super) version_id: VersionId,
-    pub(super) acl_grants: AclGrants,
-    pub(super) public_read: bool,
-}
-
-#[derive(Debug)]
-#[cfg(test)]
-pub(super) struct AuthorizedGetObjectAcl {
-    pub(super) result: GetObjectAclResult,
-}
-
 pub(super) struct AuthorizedObjectRead {
     pub(super) bucket: BucketSummary,
     pub(super) snapshot: ObjectReadSnapshot,
-}
-
-#[cfg(test)]
-pub(super) struct LoadedObjectState {
-    pub(super) bucket_info: ValidatedBucket,
-    pub(super) bucket_policy: Option<Arc<BucketPolicy>>,
-    pub(super) bucket_tags: Option<Vec<(String, String)>>,
-    pub(super) record: storage::StoredObject,
 }
 
 pub(super) struct AuthorizedCopyObject {
@@ -353,54 +293,6 @@ pub(super) enum AuthorizedDeleteObject {
         bucket_policy: Option<Arc<BucketPolicy>>,
         bucket_tags: Option<Vec<(String, String)>>,
     },
-}
-
-#[cfg(test)]
-impl std::fmt::Debug for AuthorizedObjectTagsAccess {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AuthorizedObjectTagsAccess")
-            .field("bucket", &self.bucket)
-            .field("key", &self.key)
-            .field("version_id", &self.version_id)
-            .finish_non_exhaustive()
-    }
-}
-
-#[cfg(test)]
-impl std::fmt::Debug for AuthorizedPutObjectRetention {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AuthorizedPutObjectRetention")
-            .field("bucket", &self.bucket)
-            .field("key", &self.key)
-            .field("version_id", &self.version_id)
-            .field("retention", &self.retention)
-            .finish_non_exhaustive()
-    }
-}
-
-#[cfg(test)]
-impl std::fmt::Debug for AuthorizedPutObjectLegalHold {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AuthorizedPutObjectLegalHold")
-            .field("bucket", &self.bucket)
-            .field("key", &self.key)
-            .field("version_id", &self.version_id)
-            .field("legal_hold", &self.legal_hold)
-            .finish_non_exhaustive()
-    }
-}
-
-#[cfg(test)]
-impl std::fmt::Debug for AuthorizedPutObjectAclUpdate {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AuthorizedPutObjectAclUpdate")
-            .field("bucket", &self.bucket)
-            .field("key", &self.key)
-            .field("version_id", &self.version_id)
-            .field("acl_grants", &self.acl_grants)
-            .field("public_read", &self.public_read)
-            .finish_non_exhaustive()
-    }
 }
 
 impl std::fmt::Debug for AuthorizedObjectRead {
