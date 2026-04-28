@@ -11,14 +11,14 @@ use super::response_types::{BucketSummary, ModernBucketSummary};
 use super::runtime::{LifecycleSweeper, ReclaimSweeper};
 #[cfg(test)]
 use super::trusted_bucket_name;
-use super::{shared_caches_for_storage_node, Coordinator, CoordinatorSharedCaches};
+use super::{shared_caches_for_storage_cluster, Coordinator, CoordinatorSharedCaches};
 use crate::error::ServerError;
 #[cfg(test)]
 use crate::pg::PgTopology;
 use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
 use storage::{
     BucketFastPathInfo, BucketInfo, BucketName, BucketState, ReclaimWorkItem, SessionId,
-    SharedStorageNode,
+    SharedStorageNode, StorageCluster,
 };
 
 impl Coordinator {
@@ -225,13 +225,26 @@ impl Coordinator {
         region: String,
         sse_c_validator: Option<SseCustomerValidatorConfig>,
     ) -> Result<Self, ServerError> {
+        Self::new_with_storage_cluster(
+            StorageCluster::shared_single_node(storage_node),
+            region,
+            sse_c_validator,
+        )
+    }
+
+    /// Create a new coordinator over a cluster-shaped storage handle.
+    pub fn new_with_storage_cluster(
+        storage_cluster: Arc<StorageCluster>,
+        region: String,
+        sse_c_validator: Option<SseCustomerValidatorConfig>,
+    ) -> Result<Self, ServerError> {
         let lifecycle_sweeper_factory =
-            |storage_node: &Arc<SharedStorageNode>, read_runtime: ReadRuntime| {
-                LifecycleSweeper::acquire_shared(storage_node, read_runtime)
+            |storage_cluster: &Arc<StorageCluster>, read_runtime: ReadRuntime| {
+                LifecycleSweeper::acquire_shared(storage_cluster, read_runtime)
             };
         Self::new_with_shared_caches_and_lifecycle_sweeper_factory(
-            Arc::clone(&storage_node),
-            shared_caches_for_storage_node(&storage_node),
+            Arc::clone(&storage_cluster),
+            shared_caches_for_storage_cluster(&storage_cluster),
             region,
             sse_c_validator,
             None,
@@ -246,13 +259,28 @@ impl Coordinator {
         sse_c_validator: Option<SseCustomerValidatorConfig>,
         managed_key_provider: StaticManagedKeyProvider,
     ) -> Result<Self, ServerError> {
+        Self::new_with_managed_key_provider_for_storage_cluster(
+            StorageCluster::shared_single_node(storage_node),
+            region,
+            sse_c_validator,
+            managed_key_provider,
+        )
+    }
+
+    /// Create a new coordinator with managed encryption over a cluster-shaped storage handle.
+    pub fn new_with_managed_key_provider_for_storage_cluster(
+        storage_cluster: Arc<StorageCluster>,
+        region: String,
+        sse_c_validator: Option<SseCustomerValidatorConfig>,
+        managed_key_provider: StaticManagedKeyProvider,
+    ) -> Result<Self, ServerError> {
         let lifecycle_sweeper_factory =
-            |storage_node: &Arc<SharedStorageNode>, read_runtime: ReadRuntime| {
-                LifecycleSweeper::acquire_shared(storage_node, read_runtime)
+            |storage_cluster: &Arc<StorageCluster>, read_runtime: ReadRuntime| {
+                LifecycleSweeper::acquire_shared(storage_cluster, read_runtime)
             };
         Self::new_with_shared_caches_and_lifecycle_sweeper_factory(
-            Arc::clone(&storage_node),
-            shared_caches_for_storage_node(&storage_node),
+            Arc::clone(&storage_cluster),
+            shared_caches_for_storage_cluster(&storage_cluster),
             region,
             sse_c_validator,
             Some(managed_key_provider),
@@ -269,14 +297,12 @@ impl Coordinator {
         lifecycle_sweeper_factory: F,
     ) -> Result<Self, ServerError>
     where
-        F: FnOnce(
-            &Arc<SharedStorageNode>,
-            ReadRuntime,
-        ) -> Result<Arc<LifecycleSweeper>, ServerError>,
+        F: FnOnce(&Arc<StorageCluster>, ReadRuntime) -> Result<Arc<LifecycleSweeper>, ServerError>,
     {
+        let storage_cluster = StorageCluster::shared_single_node(storage_node);
         Self::new_with_shared_caches_and_lifecycle_sweeper_factory(
-            Arc::clone(&storage_node),
-            shared_caches_for_storage_node(&storage_node),
+            Arc::clone(&storage_cluster),
+            shared_caches_for_storage_cluster(&storage_cluster),
             region,
             sse_c_validator,
             managed_key_provider,
@@ -285,7 +311,7 @@ impl Coordinator {
     }
 
     pub(super) fn new_with_shared_caches_and_lifecycle_sweeper_factory<F>(
-        storage_node: Arc<SharedStorageNode>,
+        storage_cluster: Arc<StorageCluster>,
         shared_caches: Arc<CoordinatorSharedCaches>,
         region: String,
         sse_c_validator: Option<SseCustomerValidatorConfig>,
@@ -293,20 +319,17 @@ impl Coordinator {
         lifecycle_sweeper_factory: F,
     ) -> Result<Self, ServerError>
     where
-        F: FnOnce(
-            &Arc<SharedStorageNode>,
-            ReadRuntime,
-        ) -> Result<Arc<LifecycleSweeper>, ServerError>,
+        F: FnOnce(&Arc<StorageCluster>, ReadRuntime) -> Result<Arc<LifecycleSweeper>, ServerError>,
     {
         #[cfg(test)]
-        let pg_topology = PgTopology::new(storage_node.pg_ids()).map_err(|reason| {
+        let pg_topology = PgTopology::new(storage_cluster.pg_ids()).map_err(|reason| {
             ServerError::InternalError {
                 reason: reason.to_string(),
             }
         })?;
-        let payload_buffer_pool = PayloadBufferPool::new(storage_node.default_ec_shape());
+        let payload_buffer_pool = PayloadBufferPool::new(storage_cluster.default_ec_shape());
         let read_runtime = ReadRuntime {
-            storage_node: Arc::clone(&storage_node),
+            storage_node: Arc::clone(&storage_cluster),
             #[cfg(test)]
             pg_topology: pg_topology.clone(),
             payload_buffer_pool: Arc::clone(&payload_buffer_pool),
@@ -315,7 +338,7 @@ impl Coordinator {
         };
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
-        let worker_node = Arc::clone(&storage_node);
+        let worker_node = Arc::clone(storage_cluster.single_node_compat_handle());
         let reclaim_runtime = read_runtime.clone();
         let handle = std::thread::Builder::new()
             .name("argmin-reclaim".to_string())
@@ -338,10 +361,10 @@ impl Coordinator {
             .map_err(|e| ServerError::InternalError {
                 reason: format!("failed to start reclaim worker: {e}"),
             })?;
-        let lifecycle_sweeper = lifecycle_sweeper_factory(&storage_node, read_runtime.clone())?;
-        let sweeper_storage_node = Arc::clone(&storage_node);
+        let lifecycle_sweeper = lifecycle_sweeper_factory(&storage_cluster, read_runtime.clone())?;
+        let sweeper_storage_node = Arc::clone(storage_cluster.single_node_compat_handle());
         Ok(Self {
-            storage_node,
+            storage_node: storage_cluster,
             shared_caches,
             payload_buffer_pool,
             region,

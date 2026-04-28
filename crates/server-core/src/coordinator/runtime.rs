@@ -7,7 +7,7 @@ use std::time::Duration;
 use s3_types::BucketLifecycleConfiguration;
 use storage::{
     BucketInfo, BucketName, EcShape, GenerationId, ObjectEncryption, ObjectKey,
-    SegmentStoredBytesRequest, SharedStorageNode, UploadId, UploadState, VersionId,
+    SegmentStoredBytesRequest, SharedStorageNode, StorageCluster, UploadId, UploadState, VersionId,
 };
 
 use super::payload::SharedPayloadBuffer;
@@ -76,7 +76,7 @@ impl Drop for LifecycleSweeper {
 
 impl LifecycleSweeper {
     pub(super) fn acquire_shared(
-        storage_node: &Arc<SharedStorageNode>,
+        storage_cluster: &Arc<StorageCluster>,
         runtime: ReadRuntime,
     ) -> Result<Arc<Self>, ServerError> {
         let registry = LIFECYCLE_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
@@ -84,7 +84,7 @@ impl LifecycleSweeper {
             lock_mutex_unpoisoned(registry);
         registry.retain(|_, sweeper| sweeper.upgrade().is_some());
 
-        let key = Arc::as_ptr(storage_node) as usize;
+        let key = storage_cluster.single_node_compat_key();
         if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
             return Ok(existing);
         }

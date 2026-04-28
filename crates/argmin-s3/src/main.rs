@@ -13,6 +13,7 @@ use server_core::sse::{
 };
 use storage::CanonicalUserId;
 use storage::SharedStorageNode;
+use storage::StorageCluster;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
@@ -114,13 +115,14 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let storage_cluster = StorageCluster::shared_single_node(storage_node);
 
-    // Build frontend pool sharing the same storage node
+    // Build frontend pool sharing the same storage cluster
     // (PG access serialized by mutex).
     let mut frontends = Vec::with_capacity(config.workers as usize);
     for _ in 0..config.workers {
-        let coordinator = Coordinator::new_with_managed_key_provider(
-            Arc::clone(&storage_node),
+        let coordinator = Coordinator::new_with_managed_key_provider_for_storage_cluster(
+            Arc::clone(&storage_cluster),
             config.region.clone(),
             sse_c_validator.clone(),
             managed_key_provider.clone(),

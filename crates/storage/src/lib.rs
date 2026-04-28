@@ -26,6 +26,7 @@
 ///
 /// All IO is synchronous. Single-node, single-process for v1-minimal.
 pub mod clock;
+pub mod cluster;
 pub mod error;
 pub mod node;
 pub mod pg_store;
@@ -34,6 +35,7 @@ pub mod schema;
 pub mod traits;
 pub mod types;
 
+pub use cluster::StorageCluster;
 pub use error::{
     BucketSnapshotLoadError, BucketWriteDrainError, MetadataError, ObjectPgActionError, StoreError,
 };

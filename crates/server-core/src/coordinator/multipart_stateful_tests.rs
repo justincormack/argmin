@@ -42,8 +42,9 @@ fn setup_coordinator(dir: &Path) -> Coordinator {
 
 fn setup_coordinator_with_shared_storage(storage_node: Arc<SharedStorageNode>) -> Coordinator {
     let shared_caches = shared_caches_for_storage_node(&storage_node);
+    let storage_cluster = StorageCluster::shared_single_node(storage_node);
     Coordinator::new_with_shared_caches_and_lifecycle_sweeper_factory(
-        storage_node,
+        storage_cluster,
         shared_caches,
         "us-east-1".to_string(),
         None,
@@ -202,7 +203,7 @@ fn create_upload_with_parts(
 fn make_test_read_runtime(dir: &Path) -> ReadRuntime {
     let storage_node = Arc::new(SharedStorageNode::open(dir, &[0]).unwrap());
     ReadRuntime {
-        storage_node: Arc::clone(&storage_node),
+        storage_node: StorageCluster::shared_single_node(Arc::clone(&storage_node)),
         #[cfg(test)]
         pg_topology: PgTopology::new(&[0]).unwrap(),
         payload_buffer_pool: PayloadBufferPool::new(storage_node.default_ec_shape()),

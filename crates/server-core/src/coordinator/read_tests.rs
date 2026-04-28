@@ -130,7 +130,7 @@ fn segment_list_reader_next_chunk_moves_whole_loaded_segment() {
     let dir = test_util::tempdir();
     let storage_node = Arc::new(SharedStorageNode::open(dir.path(), &[0]).unwrap());
     let runtime = ReadRuntime {
-        storage_node: Arc::clone(&storage_node),
+        storage_node: StorageCluster::shared_single_node(Arc::clone(&storage_node)),
         #[cfg(test)]
         pg_topology: PgTopology::new(&[0]).unwrap(),
         payload_buffer_pool: PayloadBufferPool::new(storage_node.default_ec_shape()),

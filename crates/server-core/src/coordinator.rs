@@ -28,7 +28,7 @@ use storage::ShardKey;
 use storage::SimplePayloadReclaimRecord;
 #[cfg(test)]
 use storage::{BucketEncryptionConfig, EffectiveBucketEncryptionConfig, ObjectLayout};
-use storage::{BucketName, ObjectKey, SharedStorageNode};
+use storage::{BucketName, ObjectKey, SharedStorageNode, StorageCluster};
 #[cfg(test)]
 use storage::{
     BucketObjectLockConfig, BucketOwnershipControls, BucketState, CreateStreamUploadReq, EcShape,
@@ -361,23 +361,32 @@ pub(super) struct CoordinatorSharedCaches {
     bucket_fast_path: RwLock<BucketFastPathCache>,
 }
 
-fn shared_caches_for_storage_node(
-    storage_node: &Arc<SharedStorageNode>,
+fn shared_caches_for_storage_cluster(
+    storage_cluster: &Arc<StorageCluster>,
 ) -> Arc<CoordinatorSharedCaches> {
     static SHARED_COORDINATOR_CACHES: OnceLock<
         Mutex<HashMap<usize, Weak<CoordinatorSharedCaches>>>,
     > = OnceLock::new();
 
-    let key = Arc::as_ptr(storage_node) as usize;
+    let key = storage_cluster.single_node_compat_key();
     let registry = SHARED_COORDINATOR_CACHES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = lock_mutex_unpoisoned(registry);
     if let Some(existing) = guard.get(&key).and_then(Weak::upgrade) {
         return existing;
     }
     let shared = Arc::new(CoordinatorSharedCaches::default());
-    spawn_bucket_fast_path_watcher(&shared, storage_node);
+    spawn_bucket_fast_path_watcher(&shared, storage_cluster.single_node_compat_handle());
     guard.insert(key, Arc::downgrade(&shared));
     shared
+}
+
+#[cfg(test)]
+fn shared_caches_for_storage_node(
+    storage_node: &Arc<SharedStorageNode>,
+) -> Arc<CoordinatorSharedCaches> {
+    shared_caches_for_storage_cluster(&StorageCluster::shared_single_node(Arc::clone(
+        storage_node,
+    )))
 }
 
 fn spawn_bucket_fast_path_watcher(
@@ -429,7 +438,7 @@ fn spawn_bucket_fast_path_watcher(
 }
 
 pub struct Coordinator {
-    storage_node: Arc<SharedStorageNode>,
+    storage_node: Arc<StorageCluster>,
     shared_caches: Arc<CoordinatorSharedCaches>,
     payload_buffer_pool: Arc<PayloadBufferPool>,
     region: String,

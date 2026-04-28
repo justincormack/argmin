@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use storage::{
     BucketName, GenerationId, MultipartPartSegmentRecord, ObjectEncryption, ObjectKey,
-    ObjectPartRecord, ObjectSegmentRecord, SharedStorageNode,
+    ObjectPartRecord, ObjectSegmentRecord, StorageCluster,
 };
 
 use super::object_state::SnapshottedMultipartPart;
@@ -22,7 +22,7 @@ pub struct ReadChunk {
 
 #[derive(Clone)]
 pub(super) struct ReadRuntime {
-    pub(super) storage_node: Arc<SharedStorageNode>,
+    pub(super) storage_node: Arc<StorageCluster>,
     #[cfg(test)]
     pub(super) pg_topology: PgTopology,
     pub(super) payload_buffer_pool: Arc<PayloadBufferPool>,

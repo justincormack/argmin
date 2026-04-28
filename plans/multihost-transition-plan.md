@@ -381,13 +381,39 @@ Work items:
 4. preserve current S3 behavior exactly
 5. keep tests focused on behavior rather than raw local PG implementation where
    possible
+6. replace the temporary `Deref<Target = SharedStorageNode>` delegation with
+   explicit `StorageCluster` request APIs before Phase 1 is complete
+7. narrow the single-node compatibility helpers to background/local transition
+   code, then remove them as soon as routing and placement have cluster-owned
+   entry points
 
 Exit criteria:
 
 1. existing local S3 and storage tests pass
-2. coordinator code no longer needs to know whether storage is single-node or
-   cluster-shaped
+2. coordinator request paths use explicit cluster-shaped APIs rather than
+   relying on transparent local-node delegation
 3. no distributed behavior is claimed yet
+
+Phase 1 implementation notes:
+
+1. `storage::StorageCluster` is the first cluster-shaped storage handle.
+   - it is currently backed by one `Arc<SharedStorageNode>`
+   - it deliberately preserves the existing single-node behavior
+   - it still has transitional `Deref` delegation to `SharedStorageNode`
+   - it exposes `single_node_compat_*` helpers for background workers and cache
+     registries that still share local-node state
+   - this is a first slice, not the final Phase 1 boundary
+2. `Coordinator` now owns an `Arc<StorageCluster>` internally.
+   - existing `Coordinator::new` and `Coordinator::new_with_managed_key_provider`
+     remain compatibility shims from `Arc<SharedStorageNode>`
+   - new cluster-shaped constructors accept `Arc<StorageCluster>`
+   - read runtime carries the cluster handle, but cache and lifecycle registries
+     still use the single-node compatibility key until a real opaque cluster
+     identity exists
+3. `argmin-s3` now builds one explicit `StorageCluster` and shares that across
+   worker coordinators.
+4. No request routing, placement, PG ownership, or distributed behavior has
+   changed yet.
 
 ## Phase 2: In-Process Multi-Node Harness
 

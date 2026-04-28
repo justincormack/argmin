@@ -207,8 +207,9 @@ pub(crate) fn setup_coordinator_with_shared_storage(
     storage_node: Arc<SharedStorageNode>,
 ) -> Coordinator {
     let shared_caches = shared_caches_for_storage_node(&storage_node);
+    let storage_cluster = StorageCluster::shared_single_node(storage_node);
     Coordinator::new_with_shared_caches_and_lifecycle_sweeper_factory(
-        storage_node,
+        storage_cluster,
         shared_caches,
         "us-east-1".to_string(),
         None,
@@ -222,8 +223,9 @@ pub(crate) fn setup_coordinator_with_shared_storage_without_lifecycle_sweeper(
     storage_node: Arc<SharedStorageNode>,
 ) -> Coordinator {
     let shared_caches = shared_caches_for_storage_node(&storage_node);
+    let storage_cluster = StorageCluster::shared_single_node(storage_node);
     Coordinator::new_with_shared_caches_and_lifecycle_sweeper_factory(
-        storage_node,
+        storage_cluster,
         shared_caches,
         "us-east-1".to_string(),
         None,
