@@ -1,6 +1,6 @@
 use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
 
-use crate::types::{BucketName, ObjectKey};
+use crate::types::{BucketName, BucketPgId, DataPgId, ObjectKey, ObjectMetadataPgId, PgId};
 
 const RAPIDHASH_SECRETS: RapidSecrets = RapidSecrets::seed(0);
 const PG_HASH_STACK_LIMIT: usize = 63 + 1 + 1024 + 1 + 20;
@@ -64,6 +64,10 @@ impl PgTopology {
         self.pg_ids.len() as u32
     }
 
+    /// Derive the object metadata PG for `(bucket, key)`.
+    ///
+    /// This PG owns object namespace metadata. It is not necessarily the data PG
+    /// that stores payload shards for the object's segments.
     pub fn object_pg(&self, bucket: &str, key: &str) -> u32 {
         let hash = hash_parts(&[bucket.as_bytes(), b"/", key.as_bytes()]);
         pick_pg(&self.pg_ids, hash)
@@ -73,6 +77,18 @@ impl PgTopology {
         self.object_pg(bucket.as_str(), key.as_str())
     }
 
+    pub fn object_metadata_pg_for(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> ObjectMetadataPgId {
+        ObjectMetadataPgId::new(PgId::new(self.object_pg_for(bucket, key)))
+    }
+
+    /// Derive the bucket metadata PG for `bucket`.
+    ///
+    /// Bucket rows and bucket subresources remain PG-sharded. They do not move
+    /// back to a global service in the multihost transition.
     pub fn bucket_pg(&self, bucket: &str) -> u32 {
         let hash = hash_parts(&[b"bucket/", bucket.as_bytes()]);
         pick_pg(&self.pg_ids, hash)
@@ -82,6 +98,14 @@ impl PgTopology {
         self.bucket_pg(bucket.as_str())
     }
 
+    pub fn bucket_metadata_pg_for(&self, bucket: &BucketName) -> BucketPgId {
+        BucketPgId::new(PgId::new(self.bucket_pg_for(bucket)))
+    }
+
+    /// Derive the current interim data PG for shard payloads.
+    ///
+    /// This is the single-host-era payload placement function. Phase 3 of the
+    /// multihost plan replaces this with bounded object-local data PG selection.
     pub fn shard_pg(&self, bucket: &str, key: &str, version_id: u64) -> u32 {
         let mut version_buf = [0u8; 20];
         let version_bytes = decimal_u64_bytes(version_id, &mut version_buf);
@@ -91,6 +115,15 @@ impl PgTopology {
 
     pub fn shard_pg_for(&self, bucket: &BucketName, key: &ObjectKey, version_id: u64) -> u32 {
         self.shard_pg(bucket.as_str(), key.as_str(), version_id)
+    }
+
+    pub fn legacy_data_pg_for(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: u64,
+    ) -> DataPgId {
+        DataPgId::new(PgId::new(self.shard_pg_for(bucket, key, version_id)))
     }
 
     pub fn for_each_pg<E>(&self, mut f: impl FnMut(u32) -> Result<(), E>) -> Result<(), E> {
@@ -131,6 +164,26 @@ mod tests {
         assert_eq!(
             topo.object_pg_for(&bucket, &key),
             topo.object_pg("bucket", "key")
+        );
+    }
+
+    #[test]
+    fn typed_pg_wrappers_match_legacy_raw_pg_ids() {
+        let topo = PgTopology::new(&[1, 2, 8]).unwrap();
+        let bucket = BucketName::try_from("bucket").unwrap();
+        let key = ObjectKey::try_from("key").unwrap();
+
+        assert_eq!(
+            topo.bucket_metadata_pg_for(&bucket).get(),
+            topo.bucket_pg_for(&bucket)
+        );
+        assert_eq!(
+            topo.object_metadata_pg_for(&bucket, &key).get(),
+            topo.object_pg_for(&bucket, &key)
+        );
+        assert_eq!(
+            topo.legacy_data_pg_for(&bucket, &key, 42).get(),
+            topo.shard_pg_for(&bucket, &key, 42)
         );
     }
 }

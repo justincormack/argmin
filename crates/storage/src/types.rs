@@ -40,6 +40,182 @@ impl std::fmt::Display for GenerationId {
     }
 }
 
+/// Monotonic cluster-map epoch used to fence distributed PG and shard actions.
+///
+/// This is deliberately separate from [`GenerationId`]. `GenerationId` names an
+/// immutable object payload generation; `ClusterEpoch` names a cluster topology
+/// and PG ownership generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ClusterEpoch(NonZeroU64);
+
+impl ClusterEpoch {
+    /// First static epoch for the initial local multihost harness.
+    pub const INITIAL: Self = Self(NonZeroU64::MIN);
+
+    #[must_use]
+    pub fn new(v: u64) -> Option<Self> {
+        NonZeroU64::new(v).map(Self)
+    }
+
+    #[must_use]
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl std::fmt::Display for ClusterEpoch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.get())
+    }
+}
+
+/// Raw placement-group identifier.
+///
+/// Prefer one of the role-specific wrappers below at new cluster boundaries.
+/// Existing single-node internals still use raw `u32` PG IDs until the storage
+/// cluster boundary is introduced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PgId(u32);
+
+impl PgId {
+    #[must_use]
+    pub const fn new(id: u32) -> Self {
+        Self(id)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl From<u32> for PgId {
+    fn from(value: u32) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<PgId> for u32 {
+    fn from(value: PgId) -> Self {
+        value.get()
+    }
+}
+
+impl std::fmt::Display for PgId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.get())
+    }
+}
+
+/// PG containing bucket metadata for one bucket name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BucketPgId(PgId);
+
+impl BucketPgId {
+    #[must_use]
+    pub const fn new(pg_id: PgId) -> Self {
+        Self(pg_id)
+    }
+
+    #[must_use]
+    pub const fn pg_id(self) -> PgId {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl From<BucketPgId> for PgId {
+    fn from(value: BucketPgId) -> Self {
+        value.pg_id()
+    }
+}
+
+/// PG containing object metadata for one `(bucket, key)` namespace entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ObjectMetadataPgId(PgId);
+
+impl ObjectMetadataPgId {
+    #[must_use]
+    pub const fn new(pg_id: PgId) -> Self {
+        Self(pg_id)
+    }
+
+    #[must_use]
+    pub const fn pg_id(self) -> PgId {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl From<ObjectMetadataPgId> for PgId {
+    fn from(value: ObjectMetadataPgId) -> Self {
+        value.pg_id()
+    }
+}
+
+/// PG containing payload shard data for an object segment or multipart part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DataPgId(PgId);
+
+impl DataPgId {
+    #[must_use]
+    pub const fn new(pg_id: PgId) -> Self {
+        Self(pg_id)
+    }
+
+    #[must_use]
+    pub const fn pg_id(self) -> PgId {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl From<DataPgId> for PgId {
+    fn from(value: DataPgId) -> Self {
+        value.pg_id()
+    }
+}
+
+/// EC shard index within one stripe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ShardIndex(u8);
+
+impl ShardIndex {
+    #[must_use]
+    pub const fn new(index: u8) -> Self {
+        Self(index)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl From<u8> for ShardIndex {
+    fn from(value: u8) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<ShardIndex> for u8 {
+    fn from(value: ShardIndex) -> Self {
+        value.get()
+    }
+}
+
 // ── String newtypes ───────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -2962,6 +3138,40 @@ pub struct MultipartPartSegmentRecord {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn cluster_epoch_is_distinct_from_generation_id() {
+        let epoch = ClusterEpoch::new(1).unwrap();
+        let generation = GenerationId::new(1).unwrap();
+
+        assert_eq!(epoch, ClusterEpoch::INITIAL);
+        assert_eq!(epoch.get(), generation.get());
+        assert!(ClusterEpoch::new(0).is_none());
+        assert!(GenerationId::new(0).is_none());
+    }
+
+    #[test]
+    fn typed_pg_ids_preserve_raw_id_but_not_role() {
+        let raw = PgId::new(7);
+        let bucket_pg = BucketPgId::new(raw);
+        let object_pg = ObjectMetadataPgId::new(raw);
+        let data_pg = DataPgId::new(raw);
+
+        assert_eq!(bucket_pg.get(), 7);
+        assert_eq!(object_pg.get(), 7);
+        assert_eq!(data_pg.get(), 7);
+        assert_eq!(PgId::from(bucket_pg), raw);
+        assert_eq!(PgId::from(object_pg), raw);
+        assert_eq!(PgId::from(data_pg), raw);
+    }
+
+    #[test]
+    fn shard_index_round_trips() {
+        let index = ShardIndex::new(31);
+        assert_eq!(index.get(), 31);
+        assert_eq!(u8::from(index), 31);
+        assert_eq!(ShardIndex::from(31), index);
+    }
 
     #[test]
     fn shard_status_from_u8_live() {

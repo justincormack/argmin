@@ -72,7 +72,7 @@ impl PgTopology {
         self.pg_ids.len() as u32
     }
 
-    /// Derive the PG ID for a given bucket and key.
+    /// Derive the object metadata PG ID for a given bucket and key.
     pub fn object_pg(&self, bucket: &str, key: &str) -> u32 {
         let hash = hash_parts(&[bucket.as_bytes(), b"/", key.as_bytes()]);
         pick_pg(&self.pg_ids, hash)
@@ -82,7 +82,7 @@ impl PgTopology {
         self.object_pg(bucket.as_str(), key.as_str())
     }
 
-    /// Derive the PG ID for bucket metadata placement.
+    /// Derive the bucket metadata PG ID for bucket metadata placement.
     pub fn bucket_pg(&self, bucket: &str) -> u32 {
         let hash = hash_parts(&[b"bucket/", bucket.as_bytes()]);
         pick_pg(&self.pg_ids, hash)
@@ -92,7 +92,7 @@ impl PgTopology {
         self.bucket_pg(bucket.as_str())
     }
 
-    /// Derive the shard PG ID.
+    /// Derive the current legacy data PG ID for shard payload placement.
     pub fn shard_pg(&self, bucket: &str, key: &str, version_id: u64) -> u32 {
         let mut version_buf = [0u8; 20];
         let version_bytes = decimal_u64_bytes(version_id, &mut version_buf);
@@ -118,7 +118,7 @@ fn pick_pg(pg_ids: &[u32], hash: u64) -> u32 {
     pg_ids[idx]
 }
 
-/// Derive the PG ID for a given bucket and key.
+/// Derive the object metadata PG ID for a given bucket and key.
 ///
 /// pg_id = rapidhash(bucket + "/" + key) % pg_count
 #[cfg(test)]
@@ -127,7 +127,7 @@ pub(crate) fn derive_pg(bucket: &str, key: &str, pg_count: u32) -> u32 {
     (hash % u64::from(pg_count)) as u32
 }
 
-/// Derive the PG ID for bucket metadata placement.
+/// Derive the bucket metadata PG ID for bucket metadata placement.
 ///
 /// pg_id = rapidhash("bucket/" + bucket_name) % pg_count
 #[cfg(test)]
@@ -136,7 +136,7 @@ pub(crate) fn derive_bucket_pg(bucket: &str, pg_count: u32) -> u32 {
     (hash % u64::from(pg_count)) as u32
 }
 
-/// Derive the PG ID for shard data placement.
+/// Derive the current legacy data PG ID for shard data placement.
 ///
 /// Includes the version_id so different versions of the same key
 /// can have their shards distributed across different PGs.

@@ -239,6 +239,12 @@ The distributed boundary should make these concepts explicit and hard to confuse
 `GenerationId` should remain object-payload terminology. It should not be reused
 for cluster-map versions.
 
+Phase 0 adds the storage-layer newtypes that are useful before behavior changes:
+`ClusterEpoch`, `PgId`, `BucketPgId`, `ObjectMetadataPgId`, `DataPgId`, and
+`ShardIndex`. `NodeId` already exists in the placement crate. `ShardLocation` is
+deferred until node-aware shard placement can include the actual `NodeId` and
+epoch/acting-set information it needs.
+
 ## Placement Model
 
 The target placement model should keep these rules:
@@ -297,6 +303,69 @@ Exit criteria:
 1. terminology is documented in this plan or a follow-up design note
 2. no runtime behavior change
 3. existing tests still pass if code is touched
+
+Phase 0 implementation notes:
+
+1. `ClusterEpoch` is a nonzero storage-layer newtype.
+   - `ClusterEpoch::INITIAL` is epoch `1`
+   - it is distinct from `GenerationId`
+   - `GenerationId` remains only an object payload generation identifier
+2. `PgId` is the raw PG identifier.
+   - existing single-host internals may keep using raw `u32` temporarily
+   - new cluster-boundary APIs should use typed PG roles
+3. `BucketPgId` means the PG that owns bucket metadata and bucket subresources.
+   - derived from bucket name
+   - bucket metadata remains PG-sharded
+   - this is not a global-service table
+4. `ObjectMetadataPgId` means the PG that owns object namespace metadata for a
+   `(bucket, key)` pair.
+   - derived from bucket name and object key
+   - this PG controls object visibility
+5. `DataPgId` means a PG used for payload shard placement.
+   - current code derives this with the legacy `shard_pg` function
+   - Phase 3 replaces that with bounded object-local data PG selection
+6. `ShardIndex` means an EC shard position within one stripe.
+   - it is not a node ID
+   - Phase 4 maps `(DataPgId, ShardIndex)` to a storage `NodeId`
+7. `NodeId` already exists in the placement crate.
+   - do not introduce a separate incompatible storage `NodeId`
+   - wire the existing placement type into storage when Phase 2/4 needs it
+8. `ShardLocation` is deferred until node-aware placement exists.
+   - it should include at least `DataPgId`, `ShardIndex`, and `NodeId`
+   - it may also need `ClusterEpoch` or a PG acting-set reference
+
+First static local cluster config decision:
+
+1. the first multihost harness should be configured as a static cluster map at
+   process startup
+2. the default remains the current single-node shape
+3. local multi-node mode should use explicit node records with:
+   - `NodeId`
+   - data directory
+   - weight
+   - topology key, initially at least rack and machine
+4. if a compact environment format is used for early development, prefer one
+   value containing node records over a spread of loosely coupled variables
+5. each local node store must have a distinct directory below or beside
+   `ARGMIN_DATA_DIR`
+6. the cluster epoch is static `ClusterEpoch::INITIAL` until Phase 5
+7. the parser for this config should live near server startup at first, but the
+   validated cluster-map representation should be storage/control-plane shaped
+
+Raw PG test dependency inventory:
+
+1. storage unit and integration tests call `SharedStorageNode::get_pg` and
+   `lock_two_pgs` directly
+2. coordinator tests use `test_bucket_pg_id_for`, `test_object_pg_id_for`,
+   `test_shard_pg_id_for`, and `test_lock_bucket_pg`
+3. coordinator reclaim and multipart tests use `test_shard_exists`,
+   `test_read_shard_raw`, `test_delete_shards`, and `test_register_written_shards`
+4. several tests deliberately find keys where bucket PG and object PG are equal
+   or different to exercise lock ordering and deadlock behavior
+5. sparse PG topology tests depend on explicit PG ID fanout behavior
+6. these tests are valid for the current single-process implementation, but they
+   should move behind cluster-shaped deterministic helpers as Phase 1 and Phase 2
+   hide raw PG access from coordinator-facing APIs
 
 ## Phase 1: Introduce The Storage Cluster Boundary
 
