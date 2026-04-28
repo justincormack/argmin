@@ -121,6 +121,7 @@ Do not add broad matrix duplication until these smoke tests have found no gaps.
 - Renamed `access_matrix.rs` to `public_access_acl_matrix.rs` because the file is entirely bucket ACL x object ACL public-access behavior.
 - Split public ACL anonymous access cases out of `bucket_anon.rs` into `public_access_acl.rs`; `bucket_anon.rs` now keeps private/default and nonexistent anonymous bucket behavior.
 - Moved anonymous public ACL object-tagging checks from `tagging.rs` into `public_access_acl.rs`; bucket-policy tagging checks remain in `tagging.rs`.
+- Moved explicit public-write ACL multipart access checks from `multipart.rs` into `public_access_acl.rs`; cross-account multipart ownership/admin ACL cases remain in `multipart.rs` pending a later `multipart_acl.rs` split.
 
 ## Verification Checklist
 

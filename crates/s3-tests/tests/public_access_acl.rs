@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::ObjectCannedAcl;
-use s3_tests::{content_md5_header, CTX};
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, ObjectCannedAcl};
+use s3_tests::{assert_s3_err_code, content_md5_header, err_status, CTX};
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
 fn agent() -> s3_tests::Agent {
@@ -498,5 +498,127 @@ fn test_anonymous_public_write_object_put_object_tagging_behavior() {
             owner_view.unwrap().tag_set().is_empty(),
             "anonymous PutObjectTagging should not write tags"
         );
+    });
+}
+
+#[test]
+fn test_anon_create_multipart_upload_public_write_bucket_fail() {
+    s3_tests::run(async {
+        let bucket = setup_public_write_bucket().await;
+        let url = format!("{}/{}/anon-multipart?uploads", CTX.endpoint(), bucket);
+        let mut resp = agent()
+            .post(&url)
+            .send(b"" as &[u8])
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(
+            status, 403,
+            "expected 403 for anonymous CreateMultipartUpload on public-read-write bucket, got {} body={}",
+            status, body
+        );
+        assert!(
+            body.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied in body: {body}"
+        );
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_signed_create_multipart_upload_public_write_bucket_rejects_existing_owner_key() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = setup_public_write_bucket().await;
+        let key = "multipart-existing-owner-key";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"owner-body"))
+            .send()
+            .await
+            .unwrap();
+
+        let create = alt_client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await;
+        assert_eq!(err_status(&create), 403);
+        assert_s3_err_code(&create, "AccessDenied");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_upload_allows_owner_key_created_after_public_write_initiation() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = setup_public_write_bucket().await;
+        let key = "multipart-public-write-race";
+
+        let create = alt_client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"owner-body"))
+            .send()
+            .await
+            .unwrap();
+
+        let data = vec![b'x'; 1024];
+        let upload_part = alt_client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(data.clone()))
+            .send()
+            .await
+            .unwrap();
+
+        let complete = alt_client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(upload_part.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            complete.e_tag().is_some(),
+            "expected CompleteMultipartUpload to return an ETag"
+        );
+
+        cleanup(&bucket, &[key]).await;
     });
 }
