@@ -10,15 +10,10 @@ use s3_tests::{
 };
 use std::time::Duration;
 
-const ALL_USERS_GROUP_URI: &str = "http://acs.amazonaws.com/groups/global/AllUsers";
 const AUTHENTICATED_USERS_GROUP_URI: &str =
     "http://acs.amazonaws.com/groups/global/AuthenticatedUsers";
 const AWS_EXEC_READ_CANONICAL_ID: &str =
     "6aa5a366c34c1cbe25dc49211496e913e0351eb0e8c37aa3477e40942ec6b97c";
-
-fn agent() -> s3_tests::Agent {
-    s3_tests::test_agent()
-}
 
 /// Create a bucket, returning its name. Tests are responsible for cleanup.
 async fn setup_bucket() -> String {
@@ -511,47 +506,6 @@ fn test_object_acl_default() {
 }
 
 #[test]
-fn test_object_acl_canned_during_create() {
-    s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = setup_acl_enabled_bucket().await;
-
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("foo")
-            .acl(ObjectCannedAcl::PublicRead)
-            .body(ByteStream::from_static(b"bar"))
-            .send()
-            .await
-            .unwrap();
-
-        let acl = client
-            .get_object_acl()
-            .bucket(&bucket)
-            .key("foo")
-            .send()
-            .await
-            .unwrap();
-        let owner_id = acl
-            .owner()
-            .and_then(|owner| owner.id())
-            .expect("expected owner ID in GetObjectAcl")
-            .to_string();
-        assert_exact_grants(
-            acl.grants(),
-            &[
-                (Permission::Read, None, Some(ALL_USERS_GROUP_URI)),
-                (Permission::FullControl, Some(owner_id.as_str()), None),
-            ],
-            "public-read object ACL during create",
-        );
-
-        delete_all_and_bucket(client, &bucket, &["foo".to_string()]).await;
-    });
-}
-
-#[test]
 fn test_put_object_acl_canned_private_round_trip() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -593,116 +547,6 @@ fn test_put_object_acl_canned_private_round_trip() {
             &[(Permission::FullControl, Some(owner_id.as_str()), None)],
             "private object ACL via PutObjectAcl",
         );
-
-        delete_all_and_bucket(client, &bucket, &["foo".to_string()]).await;
-    });
-}
-
-#[test]
-fn test_put_object_acl_canned_public_read_write_round_trip() {
-    s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = setup_acl_enabled_bucket().await;
-
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("foo")
-            .body(ByteStream::from_static(b"bar"))
-            .send()
-            .await
-            .unwrap();
-
-        client
-            .put_object_acl()
-            .bucket(&bucket)
-            .key("foo")
-            .acl(ObjectCannedAcl::PublicReadWrite)
-            .send()
-            .await
-            .unwrap();
-
-        let acl = client
-            .get_object_acl()
-            .bucket(&bucket)
-            .key("foo")
-            .send()
-            .await
-            .unwrap();
-        let owner_id = acl
-            .owner()
-            .and_then(|owner| owner.id())
-            .expect("expected owner ID in GetObjectAcl")
-            .to_string();
-        assert_exact_grants(
-            acl.grants(),
-            &[
-                (Permission::Read, None, Some(ALL_USERS_GROUP_URI)),
-                (Permission::Write, None, Some(ALL_USERS_GROUP_URI)),
-                (Permission::FullControl, Some(owner_id.as_str()), None),
-            ],
-            "public-read-write object ACL via PutObjectAcl",
-        );
-
-        let mut anon_get = agent()
-            .get(&format!("{}/{}/foo", CTX.endpoint(), bucket))
-            .call()
-            .expect("anonymous GET transport error");
-        assert_eq!(anon_get.status().as_u16(), 200);
-        assert_eq!(anon_get.body_mut().read_to_string().unwrap(), "bar");
-
-        delete_all_and_bucket(client, &bucket, &["foo".to_string()]).await;
-    });
-}
-
-#[test]
-fn test_put_object_acl_canned_authenticated_read_round_trip() {
-    s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = setup_acl_enabled_bucket().await;
-
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("foo")
-            .body(ByteStream::from_static(b"bar"))
-            .send()
-            .await
-            .unwrap();
-
-        client
-            .put_object_acl()
-            .bucket(&bucket)
-            .key("foo")
-            .acl(ObjectCannedAcl::AuthenticatedRead)
-            .send()
-            .await
-            .unwrap();
-
-        let acl = client
-            .get_object_acl()
-            .bucket(&bucket)
-            .key("foo")
-            .send()
-            .await
-            .unwrap();
-        let owner_id = acl
-            .owner()
-            .and_then(|owner| owner.id())
-            .expect("expected owner ID in GetObjectAcl")
-            .to_string();
-        assert_exact_grants(
-            acl.grants(),
-            &[
-                (Permission::Read, None, Some(AUTHENTICATED_USERS_GROUP_URI)),
-                (Permission::FullControl, Some(owner_id.as_str()), None),
-            ],
-            "authenticated-read object ACL via PutObjectAcl",
-        );
-
-        let get = alt_get_object_eventually(&bucket, "foo").await;
-        let body = get.body.collect().await.unwrap().into_bytes();
-        assert_eq!(body.as_ref(), b"bar");
 
         delete_all_and_bucket(client, &bucket, &["foo".to_string()]).await;
     });
@@ -913,59 +757,6 @@ fn test_put_object_acl_canned_bucket_owner_full_control_round_trip() {
 }
 
 #[test]
-fn test_put_object_acl_without_content_length_header() {
-    s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = setup_acl_enabled_bucket().await;
-
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("foo")
-            .body(ByteStream::from_static(b"bar"))
-            .send()
-            .await
-            .unwrap();
-
-        client
-            .put_object_acl()
-            .bucket(&bucket)
-            .key("foo")
-            .acl(ObjectCannedAcl::PublicRead)
-            .customize()
-            .mutate_request(|req| {
-                req.headers_mut().remove("content-length");
-            })
-            .send()
-            .await
-            .unwrap();
-
-        let acl = client
-            .get_object_acl()
-            .bucket(&bucket)
-            .key("foo")
-            .send()
-            .await
-            .unwrap();
-        let owner_id = acl
-            .owner()
-            .and_then(|owner| owner.id())
-            .expect("expected owner ID in GetObjectAcl")
-            .to_string();
-        assert_exact_grants(
-            acl.grants(),
-            &[
-                (Permission::Read, None, Some(ALL_USERS_GROUP_URI)),
-                (Permission::FullControl, Some(owner_id.as_str()), None),
-            ],
-            "PutObjectAcl without Content-Length",
-        );
-
-        delete_all_and_bucket(client, &bucket, &["foo".to_string()]).await;
-    });
-}
-
-#[test]
 fn test_put_object_acl_full_control_verify_attributes() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -1041,61 +832,6 @@ fn test_object_header_acl_grants_streaming_put() {
     s3_tests::run(async {
         let body = vec![0x5Au8; server_core::coordinator::INTERNAL_SEGMENT_SIZE + 1];
         run_object_header_acl_grants_case("streaming-testobj", body).await;
-    });
-}
-
-#[test]
-fn test_object_header_acl_grants_authenticated_users_read() {
-    s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = setup_acl_enabled_bucket().await;
-        let key = "auth-users-header-grant";
-
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"authenticated-read"))
-            .customize()
-            .mutate_request(move |req| {
-                req.headers_mut().insert(
-                    "x-amz-grant-read",
-                    format!("uri=\"{}\"", AUTHENTICATED_USERS_GROUP_URI),
-                );
-            })
-            .send()
-            .await
-            .unwrap();
-
-        let acl = client
-            .get_object_acl()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap();
-        assert_exact_grants(
-            acl.grants(),
-            &[(Permission::Read, None, Some(AUTHENTICATED_USERS_GROUP_URI))],
-            "authenticated users object ACL via header grant",
-        );
-
-        let resp = alt_get_object_eventually(&bucket, key).await;
-        let body = resp.body.collect().await.unwrap().into_bytes();
-        assert_eq!(body.as_ref(), b"authenticated-read");
-
-        let mut anon = agent()
-            .get(&format!("{}/{}/{}", CTX.endpoint(), bucket, key))
-            .call()
-            .expect("anonymous GET transport error");
-        assert_eq!(anon.status().as_u16(), 403);
-        let anon_body = anon.body_mut().read_to_string().unwrap();
-        assert!(
-            anon_body.contains("AccessDenied"),
-            "expected AccessDenied for anonymous GET, got {anon_body}"
-        );
-
-        delete_all_and_bucket(client, &bucket, &[key.to_string()]).await;
     });
 }
 
