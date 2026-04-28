@@ -1,8 +1,12 @@
 use std::time::Duration;
 
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, ObjectCannedAcl};
-use s3_tests::{assert_s3_err_code, content_md5_header, err_status, CTX};
+use aws_sdk_s3::types::{
+    CompletedMultipartUpload, CompletedPart, ObjectCannedAcl, ObjectOwnership, Permission,
+};
+use s3_tests::{
+    assert_s3_err_code, content_md5_header, create_acl_enabled_bucket, err_status, CTX,
+};
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
 fn agent() -> s3_tests::Agent {
@@ -99,6 +103,13 @@ fn anonymous_put(url: &str, body: &[u8], headers: &[(String, String)]) -> (u16, 
     let status = resp.status().as_u16();
     let body = resp.body_mut().read_to_string().unwrap_or_default();
     (status, body)
+}
+
+fn has_grant(grants: &[aws_sdk_s3::types::Grant], permission: Permission, uri: &str) -> bool {
+    grants.iter().any(|grant| {
+        grant.permission() == Some(&permission)
+            && grant.grantee().and_then(|grantee| grantee.uri()) == Some(uri)
+    })
 }
 
 /// Create a public-read bucket, returning its name.
@@ -498,6 +509,85 @@ fn test_anonymous_public_write_object_put_object_tagging_behavior() {
             owner_view.unwrap().tag_set().is_empty(),
             "anonymous PutObjectTagging should not write tags"
         );
+    });
+}
+
+#[test]
+fn test_multipart_upload_public_read_acl_allows_anonymous_get() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_acl_enabled_bucket(client, ObjectOwnership::ObjectWriter).await;
+        let key = "multipart-public-read";
+        let body = vec![b'x'; 1024];
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .acl(ObjectCannedAcl::PublicRead)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let part = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(body.clone()))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(part.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let acl = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            has_grant(
+                acl.grants(),
+                Permission::Read,
+                "http://acs.amazonaws.com/groups/global/AllUsers",
+            ),
+            "expected READ grant for AllUsers, got {:?}",
+            acl.grants()
+        );
+
+        let get_url = format!("{}/{bucket}/{key}", CTX.endpoint());
+        let mut resp = agent().get(&get_url).call().expect("transport error");
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "expected anonymous GET for multipart public-read object"
+        );
+        let data = resp.body_mut().read_to_vec().unwrap();
+        assert_eq!(&data[..], body.as_slice());
+
+        cleanup(&bucket, &[key]).await;
     });
 }
 

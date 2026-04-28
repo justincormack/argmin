@@ -122,6 +122,7 @@ Do not add broad matrix duplication until these smoke tests have found no gaps.
 - Split public ACL anonymous access cases out of `bucket_anon.rs` into `public_access_acl.rs`; `bucket_anon.rs` now keeps private/default and nonexistent anonymous bucket behavior.
 - Moved anonymous public ACL object-tagging checks from `tagging.rs` into `public_access_acl.rs`; bucket-policy tagging checks remain in `tagging.rs`.
 - Moved explicit public-write ACL multipart access checks from `multipart.rs` into `public_access_acl.rs`; cross-account multipart ownership/admin ACL cases remain in `multipart.rs` pending a later `multipart_acl.rs` split.
+- Split remaining multipart ACL ownership/admin cases into `multipart_acl.rs`, and moved the public-read multipart ACL anonymous GET case into `public_access_acl.rs`.
 
 ## Verification Checklist
 
