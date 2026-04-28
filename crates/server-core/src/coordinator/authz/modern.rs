@@ -881,7 +881,7 @@ fn bucket_policy_decision_for_put_object_action_modern(
     Ok(policy.evaluate(&policy_request))
 }
 
-pub(super) fn write_multipart_upload_with_bucket_policy(
+pub(in crate::coordinator) fn write_multipart_upload_with_bucket_policy(
     requester: &Requester,
     bucket: BoeBucketSummary<'_>,
     bucket_tags: PreloadedBucketTags<'_>,
@@ -916,7 +916,7 @@ pub(super) fn write_multipart_upload_with_bucket_policy(
     })
 }
 
-pub(super) fn put_object_authorization_with_bucket_policy(
+pub(in crate::coordinator) fn put_object_authorization_with_bucket_policy(
     requester: &Requester,
     bucket: BoeBucketSummary<'_>,
     bucket_tags: PreloadedBucketTags<'_>,
@@ -983,7 +983,7 @@ pub(super) fn put_object_authorization_with_bucket_policy(
     Ok(ModernObjectWriteAuthorization::Allowed)
 }
 
-pub(super) fn delete_object_authorization_with_bucket_policy(
+pub(in crate::coordinator) fn delete_object_authorization_with_bucket_policy(
     requester: &Requester,
     bucket: BoeBucketSummary<'_>,
     bucket_tags: PreloadedBucketTags<'_>,
@@ -1124,7 +1124,7 @@ fn combine_modern_read_authorization(
     }
 }
 
-pub(super) fn read_object_authorization_with_bucket_policy(
+pub(in crate::coordinator) fn read_object_authorization_with_bucket_policy(
     requester: &Requester,
     bucket: BoeBucketSummary<'_>,
     bucket_tags: PreloadedBucketTags<'_>,
@@ -1209,4 +1209,417 @@ pub(super) fn copy_source_read_authorization_with_bucket_policy(
     } else {
         ModernObjectReadAuthorization::Denied
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use s3_types::{AccountIdentity, ObjectLockState};
+    use storage::{
+        BucketName, BucketObjectLockConfig, BucketObjectOwnership, BucketOwnershipControls,
+        BucketVersioningState, CanonicalUserId, EcShape, EffectiveBucketEncryptionConfig,
+        GenerationId, ObjectEncryption, ObjectEtag, ObjectKey, ObjectLayout, OwnerIdentity,
+        PublicAccessBlockConfig, StorageClass,
+    };
+
+    fn modern_bucket(ownership: Option<BucketObjectOwnership>) -> ModernBucketSummary {
+        ModernBucketSummary {
+            name: BucketName::try_from("test-bucket").unwrap(),
+            owner_principal: "arn:aws:iam::111122223333:user/bucket-owner".to_string(),
+            owner_canonical_id: CanonicalUserId::from_principal(
+                "arn:aws:iam::111122223333:user/bucket-owner",
+            ),
+            created_at: 0,
+            versioning: BucketVersioningState::Suspended,
+            object_lock: BucketObjectLockConfig::default(),
+            public_access_block: None,
+            ownership_controls: ownership
+                .map(|object_ownership| BucketOwnershipControls { object_ownership }),
+            bucket_policy_present: false,
+            bucket_policy_public: false,
+            bucket_policy_generation: 0,
+            bucket_lifecycle_present: false,
+            bucket_lifecycle_generation: 0,
+            bucket_abac_enabled: false,
+            encryption: EffectiveBucketEncryptionConfig::default(),
+        }
+    }
+
+    fn modern_bucket_with_abac(
+        ownership: Option<BucketObjectOwnership>,
+        bucket_abac_enabled: bool,
+    ) -> ModernBucketSummary {
+        let mut bucket = modern_bucket(ownership);
+        bucket.bucket_abac_enabled = bucket_abac_enabled;
+        bucket
+    }
+
+    fn stored_live_object(owner_principal: &str) -> StoredObject {
+        StoredObject::Live(storage::LiveObjectRecord {
+            bucket: BucketName::try_from("test-bucket").unwrap(),
+            key: ObjectKey::try_from("key").unwrap(),
+            version_id: VersionId::Null,
+            owner: OwnerIdentity::from_principal(owner_principal),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::MIN,
+            size: 4,
+            etag: ObjectEtag::single_part(1),
+            last_modified: 0,
+            became_noncurrent_at: None,
+            storage_class: StorageClass::Standard,
+            ec: EcShape { k: 1, m: 0 },
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        })
+    }
+
+    fn requester(principal: &str) -> Requester {
+        Requester::authenticated(AccountIdentity::from_principal(principal))
+    }
+
+    fn owner_admin_requester() -> Requester {
+        Requester::authenticated_owner_account_admin(AccountIdentity::from_principal(
+            "arn:aws:iam::111122223333:user/owner-admin",
+        ))
+    }
+
+    fn shared_canonical_owner_admin_requester() -> Requester {
+        let owner_canonical =
+            CanonicalUserId::from_principal("arn:aws:iam::111122223333:user/bucket-owner");
+        Requester::authenticated_owner_account_admin(AccountIdentity::new(
+            "arn:aws:iam::111122223333:user/shared-other",
+            owner_canonical,
+            "shared-other",
+        ))
+    }
+
+    fn parse_policy(body: &str) -> auth::BucketPolicy {
+        auth::parse_bucket_policy(body).unwrap()
+    }
+
+    fn preloaded_bucket_tags<'a>(tags: Option<&'a [(String, String)]>) -> PreloadedBucketTags<'a> {
+        PreloadedBucketTags::new(tags)
+    }
+
+    #[test]
+    fn modern_read_auth_allows_explicit_policy_allow_on_boe_bucket() {
+        let bucket = modern_bucket(Some(BucketObjectOwnership::BucketOwnerEnforced));
+        let object = stored_live_object("arn:aws:iam::444455556666:user/object-owner");
+        let requester = requester("arn:aws:iam::777788889999:user/other");
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::777788889999:user/other"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::test-bucket/*"}]}"#,
+        );
+
+        let outcome = read_object_authorization_with_bucket_policy(
+            &requester,
+            BoeBucketSummary::assume_boe(&bucket),
+            preloaded_bucket_tags(None),
+            &object,
+            ModernReadAction::ReadCurrent,
+            Some(&policy),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ModernObjectReadAuthorization::Allowed);
+    }
+
+    #[test]
+    fn modern_read_auth_denies_without_policy_on_boe_bucket() {
+        let bucket = modern_bucket(Some(BucketObjectOwnership::BucketOwnerEnforced));
+        let object = stored_live_object("arn:aws:iam::444455556666:user/object-owner");
+        let requester = requester("arn:aws:iam::777788889999:user/other");
+
+        let outcome = read_object_authorization_with_bucket_policy(
+            &requester,
+            BoeBucketSummary::assume_boe(&bucket),
+            preloaded_bucket_tags(None),
+            &object,
+            ModernReadAction::ReadCurrent,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ModernObjectReadAuthorization::Denied);
+    }
+
+    #[test]
+    fn modern_read_auth_denies_explicit_policy_deny_on_boe_bucket() {
+        let bucket = modern_bucket(Some(BucketObjectOwnership::BucketOwnerEnforced));
+        let object = stored_live_object("arn:aws:iam::444455556666:user/object-owner");
+        let requester = requester("arn:aws:iam::777788889999:user/other");
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"arn:aws:iam::777788889999:user/other"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::test-bucket/*"}]}"#,
+        );
+
+        let outcome = read_object_authorization_with_bucket_policy(
+            &requester,
+            BoeBucketSummary::assume_boe(&bucket),
+            preloaded_bucket_tags(None),
+            &object,
+            ModernReadAction::ReadCurrent,
+            Some(&policy),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ModernObjectReadAuthorization::Denied);
+    }
+
+    #[test]
+    fn modern_read_auth_denies_explicit_policy_deny_for_shared_canonical_owner_admin_on_boe_bucket()
+    {
+        let bucket = modern_bucket(Some(BucketObjectOwnership::BucketOwnerEnforced));
+        let object = stored_live_object("arn:aws:iam::111122223333:user/bucket-owner");
+        let requester = shared_canonical_owner_admin_requester();
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"arn:aws:iam::111122223333:user/shared-other"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::test-bucket/*"}]}"#,
+        );
+
+        let outcome = read_object_authorization_with_bucket_policy(
+            &requester,
+            BoeBucketSummary::assume_boe(&bucket),
+            preloaded_bucket_tags(None),
+            &object,
+            ModernReadAction::ReadCurrent,
+            Some(&policy),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ModernObjectReadAuthorization::Denied);
+    }
+
+    #[test]
+    fn modern_read_auth_denies_explicit_policy_deny_for_bucket_owner_root_on_boe_bucket() {
+        let bucket = modern_bucket(Some(BucketObjectOwnership::BucketOwnerEnforced));
+        let object = stored_live_object("arn:aws:iam::111122223333:user/bucket-owner");
+        let requester = Requester::authenticated_owner_account_admin(
+            AccountIdentity::from_principal("arn:aws:iam::111122223333:root"),
+        );
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"arn:aws:iam::111122223333:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::test-bucket/*"}]}"#,
+        );
+
+        let outcome = read_object_authorization_with_bucket_policy(
+            &requester,
+            BoeBucketSummary::assume_boe(&bucket),
+            preloaded_bucket_tags(None),
+            &object,
+            ModernReadAction::ReadCurrent,
+            Some(&policy),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ModernObjectReadAuthorization::Denied);
+    }
+
+    #[test]
+    fn modern_read_auth_denies_non_owner_without_policy_on_boe_bucket() {
+        let bucket = modern_bucket(Some(BucketObjectOwnership::BucketOwnerEnforced));
+        let object = stored_live_object("arn:aws:iam::444455556666:user/object-owner");
+        let requester = requester("arn:aws:iam::444455556666:user/other");
+
+        let outcome = read_object_authorization_with_bucket_policy(
+            &requester,
+            BoeBucketSummary::assume_boe(&bucket),
+            preloaded_bucket_tags(None),
+            &object,
+            ModernReadAction::ReadCurrent,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ModernObjectReadAuthorization::Denied);
+    }
+
+    #[test]
+    fn modern_read_auth_allows_bucket_owner_admin_on_boe_bucket() {
+        let bucket = modern_bucket(Some(BucketObjectOwnership::BucketOwnerEnforced));
+        let object = stored_live_object("arn:aws:iam::444455556666:user/object-owner");
+        let requester = owner_admin_requester();
+
+        let outcome = read_object_authorization_with_bucket_policy(
+            &requester,
+            BoeBucketSummary::assume_boe(&bucket),
+            preloaded_bucket_tags(None),
+            &object,
+            ModernReadAction::ReadCurrent,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ModernObjectReadAuthorization::Allowed);
+    }
+
+    #[test]
+    fn modern_read_auth_ignores_public_policy_when_restrict_public_buckets_blocks_it() {
+        let mut bucket = modern_bucket(Some(BucketObjectOwnership::BucketOwnerEnforced));
+        bucket.bucket_policy_public = true;
+        bucket.public_access_block = Some(PublicAccessBlockConfig {
+            block_public_acls: false,
+            ignore_public_acls: false,
+            block_public_policy: false,
+            restrict_public_buckets: true,
+        });
+        let object = stored_live_object("arn:aws:iam::111122223333:user/object-owner");
+        let requester = requester("arn:aws:iam::777788889999:user/other");
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::test-bucket/*"}]}"#,
+        );
+
+        let outcome = read_object_authorization_with_bucket_policy(
+            &requester,
+            BoeBucketSummary::assume_boe(&bucket),
+            preloaded_bucket_tags(None),
+            &object,
+            ModernReadAction::ReadCurrent,
+            Some(&policy),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ModernObjectReadAuthorization::Denied);
+    }
+
+    #[test]
+    fn modern_read_auth_bucket_tag_condition_controls_boe_get_and_head_path() {
+        let bucket =
+            modern_bucket_with_abac(Some(BucketObjectOwnership::BucketOwnerEnforced), true);
+        let object = stored_live_object("arn:aws:iam::444455556666:user/object-owner");
+        let requester = requester("arn:aws:iam::777788889999:user/other");
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::777788889999:user/other"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::test-bucket/*","Condition":{"StringEquals":{"s3:BucketTag/environment":"prod"}}}]}"#,
+        );
+        let matching_tags = vec![("environment".to_string(), "prod".to_string())];
+        let non_matching_tags = vec![("environment".to_string(), "dev".to_string())];
+        let bucket = BoeBucketSummary::assume_boe(&bucket);
+
+        let allowed = read_object_authorization_with_bucket_policy(
+            &requester,
+            bucket,
+            preloaded_bucket_tags(Some(&matching_tags)),
+            &object,
+            ModernReadAction::ReadCurrent,
+            Some(&policy),
+        )
+        .unwrap();
+        let denied = read_object_authorization_with_bucket_policy(
+            &requester,
+            bucket,
+            preloaded_bucket_tags(Some(&non_matching_tags)),
+            &object,
+            ModernReadAction::ReadCurrent,
+            Some(&policy),
+        )
+        .unwrap();
+
+        assert_eq!(allowed, ModernObjectReadAuthorization::Allowed);
+        assert_eq!(denied, ModernObjectReadAuthorization::Denied);
+    }
+
+    #[test]
+    fn modern_write_auth_bucket_tag_condition_controls_boe_put_family() {
+        let bucket =
+            modern_bucket_with_abac(Some(BucketObjectOwnership::BucketOwnerEnforced), true);
+        let requester = requester("arn:aws:iam::777788889999:user/other");
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::777788889999:user/other"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::test-bucket/*","Condition":{"StringEquals":{"s3:BucketTag/environment":"prod"}}}]}"#,
+        );
+        let matching_tags = vec![("environment".to_string(), "prod".to_string())];
+        let non_matching_tags = vec![("environment".to_string(), "dev".to_string())];
+        let bucket = BoeBucketSummary::assume_boe(&bucket);
+
+        for action in [
+            ModernWriteAction::PutObject,
+            ModernWriteAction::CreateMultipartUpload,
+        ] {
+            let allowed = put_object_authorization_with_bucket_policy(
+                &requester,
+                bucket,
+                preloaded_bucket_tags(Some(&matching_tags)),
+                "key",
+                action,
+                &PutObjectPolicyContext::default(),
+                Some(&policy),
+            )
+            .unwrap();
+            let denied = put_object_authorization_with_bucket_policy(
+                &requester,
+                bucket,
+                preloaded_bucket_tags(Some(&non_matching_tags)),
+                "key",
+                action,
+                &PutObjectPolicyContext::default(),
+                Some(&policy),
+            )
+            .unwrap();
+
+            assert_eq!(allowed, ModernObjectWriteAuthorization::Allowed);
+            assert_eq!(denied, ModernObjectWriteAuthorization::Denied);
+        }
+    }
+
+    #[test]
+    fn modern_delete_auth_bucket_tag_condition_controls_boe_delete() {
+        let bucket =
+            modern_bucket_with_abac(Some(BucketObjectOwnership::BucketOwnerEnforced), true);
+        let requester = requester("arn:aws:iam::777788889999:user/other");
+        let object = stored_live_object("arn:aws:iam::444455556666:user/object-owner");
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::777788889999:user/other"},"Action":"s3:DeleteObject","Resource":"arn:aws:s3:::test-bucket/*","Condition":{"StringEquals":{"s3:BucketTag/environment":"prod"}}}]}"#,
+        );
+        let matching_tags = vec![("environment".to_string(), "prod".to_string())];
+        let non_matching_tags = vec![("environment".to_string(), "dev".to_string())];
+        let bucket = BoeBucketSummary::assume_boe(&bucket);
+
+        let allowed = delete_object_authorization_with_bucket_policy(
+            &requester,
+            bucket,
+            preloaded_bucket_tags(Some(&matching_tags)),
+            "key",
+            Some(&object),
+            auth::PolicyAction::DeleteObject,
+            Some(&policy),
+        )
+        .unwrap();
+        let denied = delete_object_authorization_with_bucket_policy(
+            &requester,
+            bucket,
+            preloaded_bucket_tags(Some(&non_matching_tags)),
+            "key",
+            Some(&object),
+            auth::PolicyAction::DeleteObject,
+            Some(&policy),
+        )
+        .unwrap();
+
+        assert!(allowed);
+        assert!(!denied);
+    }
+
+    #[test]
+    fn modern_bucket_tags_fail_closed_when_boe_abac_policy_needs_tags() {
+        let bucket =
+            modern_bucket_with_abac(Some(BucketObjectOwnership::BucketOwnerEnforced), true);
+        let object = stored_live_object("arn:aws:iam::444455556666:user/object-owner");
+        let requester = requester("arn:aws:iam::777788889999:user/other");
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::777788889999:user/other"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::test-bucket/*","Condition":{"StringEquals":{"s3:BucketTag/environment":"prod"}}}]}"#,
+        );
+        let bucket = BoeBucketSummary::assume_boe(&bucket);
+
+        let error = read_object_authorization_with_bucket_policy(
+            &requester,
+            bucket,
+            preloaded_bucket_tags(None),
+            &object,
+            ModernReadAction::ReadCurrent,
+            Some(&policy),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ServerError::InternalError { .. }));
+    }
 }

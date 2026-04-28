@@ -1,5 +1,5 @@
-use super::authz::{
-    BoeBucketSummary, ModernObjectReadAuthorization, ModernObjectWriteAuthorization,
+use super::authz::modern::{
+    self, BoeBucketSummary, ModernObjectReadAuthorization, ModernObjectWriteAuthorization,
     ModernReadAction, ModernWriteAction, PreloadedBucketTags,
 };
 use super::response_types::ModernBucketSummary;
@@ -2330,7 +2330,7 @@ mod harness {
 
         let bucket = BoeBucketSummary::assume_boe(&bucket_summary);
         let bucket_tags = PreloadedBucketTags::new(None);
-        Coordinator::modern_read_object_authorization_with_bucket_policy(
+        modern::read_object_authorization_with_bucket_policy(
             &requester,
             bucket,
             bucket_tags,
@@ -3808,7 +3808,7 @@ mod phase4_harness {
         };
         let bucket = BoeBucketSummary::assume_boe(&bucket_summary);
         let bucket_tags = PreloadedBucketTags::new(None);
-        Coordinator::modern_put_object_authorization_with_bucket_policy(
+        modern::put_object_authorization_with_bucket_policy(
             &requester,
             bucket,
             bucket_tags,
