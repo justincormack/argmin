@@ -112,6 +112,12 @@ Do not add broad matrix duplication until these smoke tests have found no gaps.
 5. Add the remaining first-priority ACL smoke tests.
 6. Re-run local `cargo test -p s3-tests`, then AWS `./scripts/aws-tests` before committing.
 
+## Progress
+
+- Added explicit ownership helpers and routed public ACL setup through `create_acl_enabled_bucket`.
+- Added the initial `sse_c_acl.rs` smoke coverage early because it was isolated and did not depend on the file-move sequence.
+- Split `public_access_block_acl.rs` out of `public_access_block.rs` for BlockPublicAcls and IgnorePublicAcls behavior over bucket/object ACLs. `public_access_block.rs` still holds PublicAccessBlock CRUD/canonical XML plus public policy cases; move the latter to `public_access_policy.rs` next.
+
 ## Verification Checklist
 
 - `cargo fmt`
@@ -127,4 +133,3 @@ cargo test -p s3-tests -- --list 2>&1 | rg ': test$' | sort > /tmp/s3-tests.befo
 cargo test -p s3-tests -- --list 2>&1 | rg ': test$' | sort > /tmp/s3-tests.after
 diff -u /tmp/s3-tests.before /tmp/s3-tests.after
 ```
-
