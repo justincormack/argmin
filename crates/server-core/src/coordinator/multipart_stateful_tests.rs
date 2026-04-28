@@ -3,14 +3,13 @@ use super::test_topology::*;
 use super::*;
 use crate::conditional::ReadCondition;
 use crate::metadata_blob::MetadataBlob;
-use crate::pg::PgTopology;
 use crate::sse::ManagedWrappingKeyConfig;
 use crate::system_metadata::SystemMetadata;
 use std::path::Path;
 use std::sync::{Arc, Barrier, MutexGuard};
 use storage::{
-    MultipartPartSegmentRecord, MultipartUploadRecord, PayloadReclaimRoot, StreamUploadRecord,
-    StreamUploadSegmentRecord,
+    MultipartPartSegmentRecord, MultipartUploadRecord, PayloadReclaimRoot, PgTopology,
+    StreamUploadRecord, StreamUploadSegmentRecord,
 };
 
 const NO_READ: &ReadCondition = &ReadCondition {

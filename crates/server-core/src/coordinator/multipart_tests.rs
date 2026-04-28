@@ -7649,7 +7649,7 @@ fn stream_segment_cleanup_only_deletes_matching_segment_vid() {
         .unwrap();
 
     let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
-    let segment_okh = crate::pg::stream_segment_key_hash(&session_id, 0);
+    let segment_okh = storage::stream_segment_key_hash(&session_id, 0);
     let winner_vid = GenerationId::new(1).unwrap();
     let loser_vid = GenerationId::new(2).unwrap();
     let winner_pg_id = stream_segment_shard_pg_id(&coord, &session_id, 0, winner_vid.get());

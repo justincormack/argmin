@@ -1,6 +1,6 @@
 use storage::{
-    BucketName, CommitDirectPutObjectReq, CreateStreamUploadReq, GenerationId, ObjectKey,
-    SessionId, StreamPutFinalizeSnapshot, StreamUploadTarget,
+    stream_segment_key_hash, BucketName, CommitDirectPutObjectReq, CreateStreamUploadReq,
+    GenerationId, ObjectKey, SessionId, StreamPutFinalizeSnapshot, StreamUploadTarget,
 };
 
 use super::bucket_handles::{BucketHandleLoader, BucketHandleRequest};
@@ -17,7 +17,6 @@ use super::{
 };
 use crate::error::ServerError;
 use crate::etag::format_etag;
-use crate::pg::stream_segment_key_hash;
 use crate::sse::SseCustomerRequest;
 
 impl Coordinator {

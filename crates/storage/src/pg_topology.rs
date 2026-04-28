@@ -1,9 +1,15 @@
+use std::num::NonZeroUsize;
+
 use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
 
-use crate::types::{BucketName, BucketPgId, DataPgId, ObjectKey, ObjectMetadataPgId, PgId};
+use crate::types::{
+    BucketName, BucketPgId, DataPgId, GenerationId, ObjectKey, ObjectMetadataPgId, PgId,
+};
 
 const RAPIDHASH_SECRETS: RapidSecrets = RapidSecrets::seed(0);
-const PG_HASH_STACK_LIMIT: usize = 63 + 1 + 1024 + 1 + 20;
+const PG_HASH_STACK_LIMIT: usize = 32 + 63 + 1 + 1024 + 1 + 20 + 1 + 10;
+pub const DEFAULT_OBJECT_DATA_PG_SET_WIDTH: usize = 4;
+pub const DEFAULT_OBJECT_DATA_PG_SEGMENT_BAND_SIZE: u32 = 16;
 
 #[inline]
 fn hash_bytes(data: &[u8]) -> u64 {
@@ -126,6 +132,85 @@ impl PgTopology {
         DataPgId::new(PgId::new(self.shard_pg_for(bucket, key, version_id)))
     }
 
+    pub fn object_data_pg_set_width(&self) -> usize {
+        DEFAULT_OBJECT_DATA_PG_SET_WIDTH.min(self.pg_ids.len())
+    }
+
+    pub fn object_generation_data_pg_set(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Vec<DataPgId> {
+        self.object_generation_data_pg_set_with_width(
+            bucket,
+            key,
+            generation_id,
+            NonZeroUsize::new(DEFAULT_OBJECT_DATA_PG_SET_WIDTH)
+                .expect("default data PG set width must be nonzero"),
+        )
+    }
+
+    pub fn object_generation_data_pg_set_with_width(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        width: NonZeroUsize,
+    ) -> Vec<DataPgId> {
+        let width = width.get().min(self.pg_ids.len());
+        let mut ranked: Vec<(u64, u32)> = self
+            .pg_ids
+            .iter()
+            .map(|&pg_id| {
+                (
+                    object_generation_pg_score(bucket, key, generation_id, pg_id),
+                    pg_id,
+                )
+            })
+            .collect();
+        ranked.sort_unstable_by(|(left_score, left_pg), (right_score, right_pg)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| left_pg.cmp(right_pg))
+        });
+        ranked
+            .into_iter()
+            .take(width)
+            .map(|(_, pg_id)| DataPgId::new(PgId::new(pg_id)))
+            .collect()
+    }
+
+    pub fn object_generation_segment_data_pg(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        segment_index: u32,
+    ) -> DataPgId {
+        self.object_generation_segment_data_pg_with_width(
+            bucket,
+            key,
+            generation_id,
+            segment_index,
+            NonZeroUsize::new(DEFAULT_OBJECT_DATA_PG_SET_WIDTH)
+                .expect("default data PG set width must be nonzero"),
+        )
+    }
+
+    pub fn object_generation_segment_data_pg_with_width(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        segment_index: u32,
+        width: NonZeroUsize,
+    ) -> DataPgId {
+        let set = self.object_generation_data_pg_set_with_width(bucket, key, generation_id, width);
+        let band_index = segment_index / DEFAULT_OBJECT_DATA_PG_SEGMENT_BAND_SIZE;
+        set[band_index as usize % set.len()]
+    }
+
     pub fn for_each_pg<E>(&self, mut f: impl FnMut(u32) -> Result<(), E>) -> Result<(), E> {
         for &pg_id in &*self.pg_ids {
             f(pg_id)?;
@@ -139,10 +224,38 @@ fn pick_pg(pg_ids: &[u32], hash: u64) -> u32 {
     pg_ids[idx]
 }
 
+fn object_generation_pg_score(
+    bucket: &BucketName,
+    key: &ObjectKey,
+    generation_id: GenerationId,
+    pg_id: u32,
+) -> u64 {
+    let mut generation_buf = [0u8; 20];
+    let generation_bytes = decimal_u64_bytes(generation_id.get(), &mut generation_buf);
+    let mut pg_buf = [0u8; 20];
+    let pg_bytes = decimal_u64_bytes(u64::from(pg_id), &mut pg_buf);
+    hash_parts(&[
+        b"object-generation-data-pg/",
+        bucket.as_str().as_bytes(),
+        b"/",
+        key.as_str().as_bytes(),
+        b"/",
+        generation_bytes,
+        b"/",
+        pg_bytes,
+    ])
+}
+
 #[cfg(test)]
 mod tests {
-    use super::PgTopology;
-    use crate::{BucketName, ObjectKey};
+    use std::collections::BTreeSet;
+    use std::num::NonZeroUsize;
+
+    use super::{
+        decimal_u64_bytes, hash_bytes, hash_parts, PgTopology,
+        DEFAULT_OBJECT_DATA_PG_SEGMENT_BAND_SIZE, DEFAULT_OBJECT_DATA_PG_SET_WIDTH,
+    };
+    use crate::{BucketName, GenerationId, ObjectKey};
 
     #[test]
     fn topology_rejects_empty() {
@@ -168,6 +281,94 @@ mod tests {
     }
 
     #[test]
+    fn bucket_and_object_pg_stay_within_configured_ids() {
+        let pg_ids: Vec<u32> = (0..16).collect();
+        let topo = PgTopology::new(&pg_ids).unwrap();
+
+        for i in 0..100 {
+            let bucket = format!("bucket-{i}");
+            let key = format!("key-{i}");
+            assert!(pg_ids.contains(&topo.bucket_pg(&bucket)));
+            assert!(pg_ids.contains(&topo.object_pg(&bucket, &key)));
+        }
+    }
+
+    #[test]
+    fn bucket_and_object_pg_distribute_over_configured_ids() {
+        let pg_ids: Vec<u32> = (0..16).collect();
+        let topo = PgTopology::new(&pg_ids).unwrap();
+        let mut bucket_counts = vec![0u32; pg_ids.len()];
+        let mut object_counts = vec![0u32; pg_ids.len()];
+
+        for i in 0..1000 {
+            let bucket = format!("bucket-{i}");
+            let key = format!("object-{i}");
+            bucket_counts[topo.bucket_pg(&bucket) as usize] += 1;
+            object_counts[topo.object_pg("test-bucket", &key) as usize] += 1;
+        }
+
+        for count in &bucket_counts {
+            assert!(
+                *count > 0,
+                "at least one PG got no buckets: {bucket_counts:?}"
+            );
+        }
+        for count in &object_counts {
+            assert!(
+                *count > 0,
+                "at least one PG got no objects: {object_counts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_data_pg_different_generations_may_differ() {
+        let topo = PgTopology::new(&(0..256).collect::<Vec<_>>()).unwrap();
+        let pg_v0 = topo.shard_pg("bucket", "key", 0);
+        let pg_v1 = topo.shard_pg("bucket", "key", 1);
+        let pg_v2 = topo.shard_pg("bucket", "key", 2);
+
+        assert!(
+            pg_v0 != pg_v1 || pg_v1 != pg_v2,
+            "all generations mapped to same PG"
+        );
+    }
+
+    #[test]
+    fn hash_parts_matches_bulk_hash_for_object_pg() {
+        let bucket = "bucket";
+        let key = "key";
+        let expected = hash_bytes(format!("{bucket}/{key}").as_bytes());
+        let actual = hash_parts(&[bucket.as_bytes(), b"/", key.as_bytes()]);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn hash_parts_matches_bulk_hash_for_bucket_pg() {
+        let bucket = "bucket";
+        let expected = hash_bytes(format!("bucket/{bucket}").as_bytes());
+        let actual = hash_parts(&[b"bucket/", bucket.as_bytes()]);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn hash_parts_matches_bulk_hash_for_shard_pg() {
+        let bucket = "bucket";
+        let key = "x".repeat(1024);
+        let version_id = u64::MAX;
+        let expected = hash_bytes(format!("{bucket}/{key}/{version_id}").as_bytes());
+        let mut version_buf = [0u8; 20];
+        let actual = hash_parts(&[
+            bucket.as_bytes(),
+            b"/",
+            key.as_bytes(),
+            b"/",
+            decimal_u64_bytes(version_id, &mut version_buf),
+        ]);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn typed_pg_wrappers_match_legacy_raw_pg_ids() {
         let topo = PgTopology::new(&[1, 2, 8]).unwrap();
         let bucket = BucketName::try_from("bucket").unwrap();
@@ -184,6 +385,97 @@ mod tests {
         assert_eq!(
             topo.legacy_data_pg_for(&bucket, &key, 42).get(),
             topo.shard_pg_for(&bucket, &key, 42)
+        );
+    }
+
+    #[test]
+    fn object_generation_data_pg_set_is_deterministic_and_bounded() {
+        let pg_ids: Vec<u32> = (0..16).collect();
+        let topo = PgTopology::new(&pg_ids).unwrap();
+        let bucket = BucketName::try_from("bucket").unwrap();
+        let key = ObjectKey::try_from("key").unwrap();
+        let generation_id = GenerationId::new(7).unwrap();
+
+        let first = topo.object_generation_data_pg_set(&bucket, &key, generation_id);
+        let second = topo.object_generation_data_pg_set(&bucket, &key, generation_id);
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), DEFAULT_OBJECT_DATA_PG_SET_WIDTH);
+        assert_eq!(
+            first
+                .iter()
+                .map(|pg_id| pg_id.get())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            first.len()
+        );
+        assert!(first.iter().all(|pg_id| pg_ids.contains(&pg_id.get())));
+    }
+
+    #[test]
+    fn object_generation_data_pg_set_width_clamps_to_topology_size() {
+        let topo = PgTopology::new(&[2, 4]).unwrap();
+        let bucket = BucketName::try_from("bucket").unwrap();
+        let key = ObjectKey::try_from("key").unwrap();
+        let generation_id = GenerationId::new(1).unwrap();
+
+        assert_eq!(topo.object_data_pg_set_width(), 2);
+        assert_eq!(
+            topo.object_generation_data_pg_set(&bucket, &key, generation_id)
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn object_generation_segment_data_pg_uses_bands_over_bounded_set() {
+        let topo = PgTopology::new(&(0..16).collect::<Vec<_>>()).unwrap();
+        let bucket = BucketName::try_from("bucket").unwrap();
+        let key = ObjectKey::try_from("key").unwrap();
+        let generation_id = GenerationId::new(9).unwrap();
+        let width = NonZeroUsize::new(3).unwrap();
+        let set =
+            topo.object_generation_data_pg_set_with_width(&bucket, &key, generation_id, width);
+
+        assert_eq!(
+            topo.object_generation_segment_data_pg_with_width(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                width
+            ),
+            set[0]
+        );
+        assert_eq!(
+            topo.object_generation_segment_data_pg_with_width(
+                &bucket,
+                &key,
+                generation_id,
+                DEFAULT_OBJECT_DATA_PG_SEGMENT_BAND_SIZE - 1,
+                width
+            ),
+            set[0]
+        );
+        assert_eq!(
+            topo.object_generation_segment_data_pg_with_width(
+                &bucket,
+                &key,
+                generation_id,
+                DEFAULT_OBJECT_DATA_PG_SEGMENT_BAND_SIZE,
+                width
+            ),
+            set[1]
+        );
+        assert_eq!(
+            topo.object_generation_segment_data_pg_with_width(
+                &bucket,
+                &key,
+                generation_id,
+                DEFAULT_OBJECT_DATA_PG_SEGMENT_BAND_SIZE * 3,
+                width
+            ),
+            set[0]
         );
     }
 }

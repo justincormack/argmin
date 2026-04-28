@@ -145,12 +145,12 @@ use crate::etag::format_etag;
 #[cfg(test)]
 use crate::metadata_blob::MetadataBlob;
 #[cfg(test)]
-use crate::pg::object_key_hash;
-#[cfg(test)]
 use crate::sse::SSE_C_SEGMENT_TAG_LEN;
 use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
 #[cfg(test)]
 use crate::system_metadata::SystemMetadata;
+#[cfg(test)]
+use storage::object_key_hash;
 
 const TRACE_TARGET: &str = "server_core";
 const COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT: usize = 10_000;

@@ -1,5 +1,4 @@
 use super::*;
-use crate::pg::PgTopology;
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestCaseResult};
 use std::fmt::Write as _;
@@ -7,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use storage::{
     MultipartReclaimPartRecord, MultipartReclaimRecord, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, ReclaimWorkItem, SharedStorageNode,
+    ObjectSegmentsReclaimSegmentRecord, PgTopology, ReclaimWorkItem, SharedStorageNode,
     SimplePayloadReclaimRecord,
 };
 

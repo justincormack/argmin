@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use s3_types::BucketLifecycleConfiguration;
 use storage::{
-    BucketInfo, BucketName, EcShape, GenerationId, ObjectEncryption, ObjectKey,
+    object_key_hash, BucketInfo, BucketName, EcShape, GenerationId, ObjectEncryption, ObjectKey,
     SegmentStoredBytesRequest, StorageCluster, UploadId, UploadState, VersionId,
 };
 
@@ -22,7 +22,6 @@ use super::{lock_mutex_unpoisoned, Coordinator, LIFECYCLE_SWEEP_INTERVAL_MILLIS}
 #[cfg(test)]
 use super::{trusted_bucket_name, trusted_object_key};
 use crate::error::ServerError;
-use crate::pg::object_key_hash;
 use crate::sse::{
     decrypt_managed_encryption_segment, decrypt_sse_customer_segment, SseCustomerRequest,
     SseCustomerSegmentScope,

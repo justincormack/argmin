@@ -13,9 +13,9 @@ use super::runtime::{LifecycleSweeper, ReclaimSweeper};
 use super::trusted_bucket_name;
 use super::{shared_caches_for_storage_cluster, Coordinator, CoordinatorSharedCaches};
 use crate::error::ServerError;
-#[cfg(test)]
-use crate::pg::PgTopology;
 use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
+#[cfg(test)]
+use storage::PgTopology;
 use storage::{
     BucketFastPathInfo, BucketInfo, BucketName, BucketState, ReclaimWorkItem, SessionId,
     SharedStorageNode, StorageCluster,

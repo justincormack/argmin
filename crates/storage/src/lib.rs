@@ -32,6 +32,7 @@ pub mod node;
 pub mod pg_store;
 pub mod pg_topology;
 pub mod schema;
+pub mod shard_key_hash;
 pub mod traits;
 pub mod types;
 
@@ -52,6 +53,10 @@ pub use pg_store::PgStore;
 pub use pg_topology::PgTopology;
 pub use placement::NodeId;
 pub use s3_types::lifecycle::*;
+pub use shard_key_hash::{
+    multipart_part_segment_key_hash, object_key_hash, part_key_hash, segment_key_hash,
+    stream_segment_key_hash,
+};
 pub use traits::{PgMetadataStore, ShardStore, StorageNode};
 pub use types::*;
 

@@ -499,6 +499,22 @@ Exit criteria:
 3. placement tests cover determinism, fan-out bounds, and stability
 4. reclaim remains rooted in object generation identity
 
+Phase 3 implementation notes:
+
+1. `PgTopology` now has a bounded object-generation data-PG selection primitive.
+   - default object-local data PG-set width is `4`, clamped by topology size
+   - default segment band size is `16` segments
+   - the selected set is derived from `(bucket, key, generation_id)` using a
+     deterministic ranked hash over the configured PG IDs
+   - segment data PG selection maps `segment_index / band_size` over that
+     bounded set
+2. The storage crate owns PG placement and shard-key hash derivation.
+   `server-core` reuses `storage::PgTopology` and storage hash helpers instead
+   of carrying duplicate coordinator-side implementations.
+3. The first slice only adds the placement primitive and tests. Existing direct
+   PUT, stream PUT, and multipart write paths still use the legacy placement
+   while generation reservation and staged-write wiring are worked through.
+
 ## Phase 4: Node-Aware Shard Placement
 
 Change data writes so EC shards are distributed across nodes.

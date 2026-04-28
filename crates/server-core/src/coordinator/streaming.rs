@@ -1,7 +1,7 @@
 #[cfg(test)]
 use storage::GenerationId;
 use storage::{
-    BucketName, ManagedEncryptionAlgorithm, ObjectEncryption, ObjectKey,
+    stream_segment_key_hash, BucketName, ManagedEncryptionAlgorithm, ObjectEncryption, ObjectKey,
     PrepareStreamUploadSegmentAppendReq, SessionId, ShardKey, StreamUploadTarget,
 };
 
@@ -15,7 +15,6 @@ use super::{
     ActiveWriteEncryption, BucketSummary, Coordinator, WriteEncryptionRequest, TRACE_TARGET,
 };
 use crate::error::ServerError;
-use crate::pg::stream_segment_key_hash;
 use crate::sse::{
     prepare_managed_encryption_write, prepare_sse_customer_write, resume_managed_encryption_write,
     resume_sse_customer_write, validate_sse_customer_read, ManagedEncryptionWriteContext,

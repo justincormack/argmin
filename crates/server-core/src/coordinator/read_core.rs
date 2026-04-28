@@ -9,9 +9,9 @@ use super::object_state::SnapshottedMultipartPart;
 use super::payload::{PayloadBufferPool, SharedPayloadBuffer};
 use super::TRACE_TARGET;
 use crate::error::ServerError;
-#[cfg(test)]
-use crate::pg::PgTopology;
 use crate::sse::{SseCustomerRequest, SseCustomerValidatorConfig, StaticManagedKeyProvider};
+#[cfg(test)]
+use storage::PgTopology;
 
 #[derive(Debug, Clone)]
 pub struct ReadChunk {

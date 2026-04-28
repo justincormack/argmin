@@ -1,8 +1,8 @@
 use super::test_helpers;
 use super::test_support::*;
 use super::*;
-use crate::pg::PgTopology;
 use ec::EcConfig;
+use storage::PgTopology;
 
 #[test]
 fn stream_put_get_object_readable() {
