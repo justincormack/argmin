@@ -1,5 +1,10 @@
 use std::sync::Arc;
 
+use placement::NodeId;
+
+pub use local::{LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig};
+
+use crate::error::ClusterBuildError;
 use crate::error::StoreError;
 use crate::node::SharedStorageNode;
 use crate::types::{
@@ -10,6 +15,7 @@ use crate::types::{
 };
 use crate::ObjectPgActionError;
 
+mod local;
 mod request_ops;
 
 /// Cluster-shaped storage handle.
@@ -21,15 +27,62 @@ mod request_ops;
 #[derive(Clone)]
 pub struct StorageCluster {
     single_node: Arc<SharedStorageNode>,
+    local_map: Arc<LocalClusterMap>,
 }
 
 impl StorageCluster {
     pub fn single_node(single_node: Arc<SharedStorageNode>) -> Self {
-        Self { single_node }
+        let local_map = Arc::new(LocalClusterMap::single_node(
+            NodeId::new(0),
+            Arc::clone(&single_node),
+        ));
+        Self {
+            single_node,
+            local_map,
+        }
     }
 
     pub fn shared_single_node(single_node: Arc<SharedStorageNode>) -> Arc<Self> {
         Arc::new(Self::single_node(single_node))
+    }
+
+    pub fn open_local_nodes(
+        data_dir: &std::path::Path,
+        node_ids: &[NodeId],
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
+        let local_map = Arc::new(LocalClusterMap::open(
+            data_dir,
+            node_ids,
+            pg_ids,
+            default_ec_shape,
+        )?);
+        Self::from_local_map(local_map)
+    }
+
+    pub fn from_local_map(local_map: Arc<LocalClusterMap>) -> Result<Arc<Self>, ClusterBuildError> {
+        let single_node = Arc::clone(local_map.metadata_primary().storage_node());
+        Ok(Arc::new(Self {
+            single_node,
+            local_map,
+        }))
+    }
+
+    pub fn cluster_epoch(&self) -> crate::ClusterEpoch {
+        self.local_map.epoch()
+    }
+
+    pub fn metadata_node_id(&self) -> NodeId {
+        self.local_map.metadata_primary_node_id()
+    }
+
+    pub fn local_node_count(&self) -> usize {
+        self.local_map.node_count()
+    }
+
+    pub fn local_node_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.local_map.node_ids()
     }
 
     /// Temporary process-local registry key for shared coordinator workers.
@@ -37,7 +90,7 @@ impl StorageCluster {
     /// Multiple `StorageCluster` handles backed by the same local node keep
     /// sharing process-local workers until a real cluster identity exists.
     pub fn process_local_registry_key(&self) -> usize {
-        Arc::as_ptr(&self.single_node) as usize
+        self.local_map.process_local_registry_key()
     }
 
     pub fn default_payload_ec_shape(&self) -> EcShape {

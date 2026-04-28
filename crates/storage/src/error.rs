@@ -1,4 +1,6 @@
 /// Storage layer error types.
+use std::path::PathBuf;
+
 /// Shard-level storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -32,6 +34,34 @@ pub enum StoreError {
     ErasureCoding {
         context: &'static str,
         reason: String,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ClusterBuildError {
+    #[error("cluster map must contain at least one local node")]
+    EmptyCluster,
+
+    #[error("duplicate local node id {id}")]
+    DuplicateNodeId { id: u32 },
+
+    #[error("metadata primary node {id} is not present in the local cluster map")]
+    MetadataPrimaryNotFound { id: u32 },
+
+    #[error(
+        "local node {duplicate_node_id} shares data directory {data_dir:?} with local node {first_node_id}"
+    )]
+    DuplicateDataDir {
+        first_node_id: u32,
+        duplicate_node_id: u32,
+        data_dir: PathBuf,
+    },
+
+    #[error("failed to open local node {node_id}: {source}")]
+    OpenLocalNode {
+        node_id: u32,
+        #[source]
+        source: StoreError,
     },
 }
 

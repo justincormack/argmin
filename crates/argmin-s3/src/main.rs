@@ -11,9 +11,7 @@ use server_core::coordinator::Coordinator;
 use server_core::sse::{
     ManagedWrappingKeyConfig, SseCustomerValidatorConfig, StaticManagedKeyProvider,
 };
-use storage::CanonicalUserId;
-use storage::SharedStorageNode;
-use storage::StorageCluster;
+use storage::{CanonicalUserId, NodeId, SharedStorageNode, StorageCluster};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
@@ -100,22 +98,32 @@ async fn main() {
                 std::process::exit(1);
             });
 
-    // Create one shared storage node for all workers.
-    let storage_node = match SharedStorageNode::open_with_default_ec_shape(
-        data_dir,
-        &pg_ids,
-        storage::EcShape {
-            k: ec_config.data_shards,
-            m: ec_config.parity_shards,
-        },
-    ) {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            eprintln!("failed to open storage: {e}");
-            std::process::exit(1);
+    let ec_shape = storage::EcShape {
+        k: ec_config.data_shards,
+        m: ec_config.parity_shards,
+    };
+
+    let storage_cluster = if config.local_node_count == 1 {
+        // Preserve the existing default on-disk layout for single-node runs.
+        let storage_node =
+            match SharedStorageNode::open_with_default_ec_shape(data_dir, &pg_ids, ec_shape) {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    eprintln!("failed to open storage: {e}");
+                    std::process::exit(1);
+                }
+            };
+        StorageCluster::shared_single_node(storage_node)
+    } else {
+        let node_ids: Vec<NodeId> = (0..config.local_node_count).map(NodeId::new).collect();
+        match StorageCluster::open_local_nodes(data_dir, &node_ids, &pg_ids, ec_shape) {
+            Ok(cluster) => cluster,
+            Err(e) => {
+                eprintln!("failed to open local storage cluster: {e}");
+                std::process::exit(1);
+            }
         }
     };
-    let storage_cluster = StorageCluster::shared_single_node(storage_node);
 
     // Build frontend pool sharing the same storage cluster
     // (PG access serialized by mutex).

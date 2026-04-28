@@ -11,6 +11,7 @@ test-hooks = []
 checksum = { path = "../checksum", default-features = false }
 ec = { path = "../ec", default-features = false }
 observability = { path = "../observability" }
+placement = { path = "../placement" }
 s3-types = { path = "../s3-types" }
 rapidhash = "4.4"
 rusqlite = { version = "0.33", features = ["bundled"] }

@@ -7,6 +7,7 @@ pub(crate) struct ServerConfig {
     pub(crate) tls_key_path: Option<String>,
     pub(crate) data_dir: String,
     pub(crate) pg_count: u32,
+    pub(crate) local_node_count: u32,
     pub(crate) ec_k: u8,
     pub(crate) ec_m: u8,
     pub(crate) account_id: String,
@@ -33,6 +34,7 @@ impl ServerConfig {
     ///   `ARGMIN_TLS_CERT_PATH` / `ARGMIN_TLS_KEY_PATH` (unset)
     ///   `ARGMIN_DATA_DIR` (./data)
     ///   `ARGMIN_PG_COUNT` (16)
+    ///   `ARGMIN_LOCAL_NODE_COUNT` (1)
     ///   `ARGMIN_EC_K` (4)
     ///   `ARGMIN_EC_M` (2)
     ///   `ARGMIN_REGION` (us-east-1)
@@ -69,6 +71,10 @@ impl ServerConfig {
             .unwrap_or_else(|| "16".to_string())
             .parse()
             .map_err(|e| format!("invalid ARGMIN_PG_COUNT: {e}"))?;
+        let local_node_count: u32 = get("ARGMIN_LOCAL_NODE_COUNT")
+            .unwrap_or_else(|| "1".to_string())
+            .parse()
+            .map_err(|e| format!("invalid ARGMIN_LOCAL_NODE_COUNT: {e}"))?;
         let ec_k: u8 = get("ARGMIN_EC_K")
             .unwrap_or_else(|| "4".to_string())
             .parse()
@@ -97,6 +103,9 @@ impl ServerConfig {
 
         if pg_count == 0 {
             return Err("ARGMIN_PG_COUNT must be > 0".to_string());
+        }
+        if local_node_count == 0 {
+            return Err("ARGMIN_LOCAL_NODE_COUNT must be > 0".to_string());
         }
         if workers == 0 {
             return Err("ARGMIN_WORKERS must be > 0".to_string());
@@ -138,6 +147,7 @@ impl ServerConfig {
             tls_key_path,
             data_dir,
             pg_count,
+            local_node_count,
             ec_k,
             ec_m,
             account_id,
@@ -245,6 +255,7 @@ mod tests {
         assert_eq!(cfg.tls_key_path, None);
         assert_eq!(cfg.data_dir, "./data");
         assert_eq!(cfg.pg_count, 16);
+        assert_eq!(cfg.local_node_count, 1);
         assert_eq!(cfg.ec_k, 4);
         assert_eq!(cfg.ec_m, 2);
         assert_eq!(cfg.account_id, "111122223333");
@@ -280,6 +291,7 @@ mod tests {
             ("ARGMIN_TLS_KEY_PATH", "/tmp/key.pem"),
             ("ARGMIN_DATA_DIR", "/tmp/storage"),
             ("ARGMIN_PG_COUNT", "32"),
+            ("ARGMIN_LOCAL_NODE_COUNT", "3"),
             ("ARGMIN_EC_K", "8"),
             ("ARGMIN_EC_M", "4"),
             ("ARGMIN_REGION", "eu-west-1"),
@@ -290,6 +302,7 @@ mod tests {
         assert_eq!(cfg.tls_key_path.as_deref(), Some("/tmp/key.pem"));
         assert_eq!(cfg.data_dir, "/tmp/storage");
         assert_eq!(cfg.pg_count, 32);
+        assert_eq!(cfg.local_node_count, 3);
         assert_eq!(cfg.ec_k, 8);
         assert_eq!(cfg.ec_m, 4);
         assert_eq!(cfg.account_id, "444455556666");
@@ -357,6 +370,21 @@ mod tests {
         let err =
             ServerConfig::from_lookup(make_required_env(&[("ARGMIN_PG_COUNT", "0")])).unwrap_err();
         assert!(err.contains("ARGMIN_PG_COUNT must be > 0"));
+    }
+
+    #[test]
+    fn invalid_local_node_count_non_integer() {
+        let err =
+            ServerConfig::from_lookup(make_required_env(&[("ARGMIN_LOCAL_NODE_COUNT", "abc")]))
+                .unwrap_err();
+        assert!(err.contains("ARGMIN_LOCAL_NODE_COUNT"));
+    }
+
+    #[test]
+    fn local_node_count_zero() {
+        let err = ServerConfig::from_lookup(make_required_env(&[("ARGMIN_LOCAL_NODE_COUNT", "0")]))
+            .unwrap_err();
+        assert!(err.contains("ARGMIN_LOCAL_NODE_COUNT must be > 0"));
     }
 
     #[test]

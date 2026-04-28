@@ -1920,6 +1920,7 @@ dependencies = [
  "checksum",
  "ec",
  "observability",
+ "placement",
  "proptest",
  "rapidhash",
  "rusqlite",

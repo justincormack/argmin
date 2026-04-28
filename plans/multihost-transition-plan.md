@@ -458,6 +458,27 @@ Exit criteria:
 4. no code path depends on shared process state between node stores except the
    explicit test harness and static control plane
 
+Phase 2 implementation notes:
+
+1. `storage::LocalClusterMap` is the initial static in-process control-plane
+   shape.
+   - it carries `ClusterEpoch::INITIAL`
+   - it assigns stable placement `NodeId`s to local stores
+   - node 0 is the default metadata primary for the initial harness
+2. `StorageCluster::open_local_nodes` opens one independent
+   `SharedStorageNode` per local node under `node-<id>` subdirectories.
+   - duplicate node IDs are rejected
+   - duplicate/canonical-equivalent data directories are rejected
+   - every local node gets its own SQLite and shard directories
+3. The existing one-node constructors still create a one-node static map and
+   preserve the process-local registry sharing behavior for compatibility.
+4. `argmin-s3` keeps the old single-node data layout by default. Setting
+   `ARGMIN_LOCAL_NODE_COUNT` above `1` opens the Phase 2 local cluster harness
+   below the configured data directory.
+5. Request routing is still metadata-primary/single-node for this slice.
+   `ShardNodeClient` and node-aware shard writes/reads remain the next Phase 2
+   step.
+
 ## Phase 3: Data PG Selection
 
 Fix the object-to-data-PG mapping before relying on the distributed layout.

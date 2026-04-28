@@ -35,9 +35,10 @@ pub mod schema;
 pub mod traits;
 pub mod types;
 
-pub use cluster::StorageCluster;
+pub use cluster::{LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, StorageCluster};
 pub use error::{
-    BucketSnapshotLoadError, BucketWriteDrainError, MetadataError, ObjectPgActionError, StoreError,
+    BucketSnapshotLoadError, BucketWriteDrainError, ClusterBuildError, MetadataError,
+    ObjectPgActionError, StoreError,
 };
 #[cfg(feature = "test-hooks")]
 pub use node::{
@@ -49,6 +50,7 @@ pub use node::{
 };
 pub use pg_store::PgStore;
 pub use pg_topology::PgTopology;
+pub use placement::NodeId;
 pub use s3_types::lifecycle::*;
 pub use traits::{PgMetadataStore, ShardStore, StorageNode};
 pub use types::*;
