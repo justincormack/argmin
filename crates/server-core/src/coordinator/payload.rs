@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
-use storage::{EcShape, SharedStorageNode};
+use storage::{EcShape, StorageCluster};
 
 use super::lock_mutex_unpoisoned;
 use super::read_core::{PayloadLease, ReadChunk, SegmentPayloadRecord};
@@ -242,7 +242,7 @@ impl Drop for PayloadLease {
 }
 
 impl PayloadLease {
-    fn storage_node(&self) -> &SharedStorageNode {
+    fn storage_node(&self) -> &StorageCluster {
         &self.runtime.storage_node
     }
 }

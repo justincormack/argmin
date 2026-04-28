@@ -130,7 +130,7 @@ impl Coordinator {
             let segment_vid = GenerationId::MIN;
             let storage_bytes = write_encryption.encrypt_segment(segment_index, req.data)?;
 
-            let written_segment = self.storage_node.write_direct_put_segment_shards(
+            let written_segment = self.storage_node.write_direct_put_segment_payload_shards(
                 &transient_segment_id,
                 segment_index,
                 segment_vid,
@@ -189,7 +189,7 @@ impl Coordinator {
             }
             let outcome = self
                 .storage_node
-                .commit_direct_put_object(
+                .commit_direct_put_object_from_payload_shards(
                     &commit_req,
                     &written_segment.written_shards,
                     |snapshot| {

@@ -1,0 +1,1167 @@
+use std::collections::HashSet;
+#[cfg(any(test, feature = "test-hooks"))]
+use std::sync::atomic::AtomicBool;
+
+use crate::*;
+
+// Phase 1 forwards through the local single-node implementation while making
+// the coordinator's storage dependency explicit at the cluster boundary.
+impl super::StorageCluster {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn default_ec_shape(&self) -> EcShape {
+        self.single_node.default_ec_shape()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn pg_ids(&self) -> &[u32] {
+        self.single_node.pg_ids()
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn try_probe_bucket_pg_available(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        self.single_node.try_probe_bucket_pg_available(bucket)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn try_probe_object_pg_available(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<bool, ObjectPgActionError> {
+        self.single_node.try_probe_object_pg_available(bucket, key)
+    }
+
+    pub fn create_bucket_with_config_and_load_info(
+        &self,
+        config: &CreateBucketConfig<'_>,
+    ) -> Result<BucketCreateAttemptOutcome, BucketSnapshotLoadError> {
+        self.single_node
+            .create_bucket_with_config_and_load_info(config)
+    }
+
+    pub fn load_bucket_snapshot(
+        &self,
+        bucket: &BucketName,
+        request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
+        self.single_node.load_bucket_snapshot(bucket, request)
+    }
+
+    pub fn with_bucket_write_snapshot<T, E>(
+        &self,
+        bucket: &BucketName,
+        request: BucketSnapshotRequest,
+        action: impl FnOnce(BucketSnapshot) -> Result<T, E>,
+    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        self.single_node
+            .with_bucket_write_snapshot(bucket, request, action)
+    }
+
+    pub fn load_bucket_snapshot_pair(
+        &self,
+        source: (&BucketName, BucketSnapshotRequest),
+        destination: (&BucketName, BucketSnapshotRequest),
+    ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
+        self.single_node
+            .load_bucket_snapshot_pair(source, destination)
+    }
+
+    pub fn begin_bucket_delete(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
+        self.single_node.begin_bucket_delete(bucket)
+    }
+
+    pub fn try_finalize_bucket_delete(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
+        self.single_node.try_finalize_bucket_delete(bucket)
+    }
+
+    pub fn head_bucket_info(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.single_node.head_bucket_info(bucket)
+    }
+
+    pub fn get_bucket_subresource(
+        &self,
+        bucket: &BucketName,
+        kind: BucketSubresourceKind,
+    ) -> Result<Option<String>, BucketSnapshotLoadError> {
+        self.single_node.get_bucket_subresource(bucket, kind)
+    }
+
+    pub fn put_bucket_versioning_and_load_info(
+        &self,
+        bucket: &BucketName,
+        state: BucketVersioningState,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.single_node
+            .put_bucket_versioning_and_load_info(bucket, state)
+    }
+
+    pub fn put_bucket_object_lock_and_load_info(
+        &self,
+        bucket: &BucketName,
+        config: BucketObjectLockConfig,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.single_node
+            .put_bucket_object_lock_and_load_info(bucket, config)
+    }
+
+    pub fn put_bucket_encryption_and_load_info(
+        &self,
+        bucket: &BucketName,
+        config: BucketEncryptionConfig,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.single_node
+            .put_bucket_encryption_and_load_info(bucket, config)
+    }
+
+    pub fn put_bucket_public_access_block_and_load_info(
+        &self,
+        bucket: &BucketName,
+        config: PublicAccessBlockConfig,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.single_node
+            .put_bucket_public_access_block_and_load_info(bucket, config)
+    }
+
+    pub fn delete_bucket_public_access_block_and_load_info(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.single_node
+            .delete_bucket_public_access_block_and_load_info(bucket)
+    }
+
+    pub fn put_bucket_ownership_controls_and_load_info(
+        &self,
+        bucket: &BucketName,
+        config: BucketOwnershipControls,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.single_node
+            .put_bucket_ownership_controls_and_load_info(bucket, config)
+    }
+
+    pub fn delete_bucket_ownership_controls_and_load_info(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.single_node
+            .delete_bucket_ownership_controls_and_load_info(bucket)
+    }
+
+    pub fn put_bucket_abac_enabled_and_load_info(
+        &self,
+        bucket: &BucketName,
+        enabled: bool,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.single_node
+            .put_bucket_abac_enabled_and_load_info(bucket, enabled)
+    }
+
+    pub fn put_bucket_acl_and_load_info(
+        &self,
+        bucket: &BucketName,
+        acl_grants: &AclGrants,
+        public_read: bool,
+        public_write: bool,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.single_node
+            .put_bucket_acl_and_load_info(bucket, acl_grants, public_read, public_write)
+    }
+
+    pub fn put_bucket_subresource_and_load_info(
+        &self,
+        bucket: &BucketName,
+        req: PutBucketSubresource<'_>,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.single_node
+            .put_bucket_subresource_and_load_info(bucket, req)
+    }
+
+    pub fn delete_bucket_subresource_and_load_info(
+        &self,
+        bucket: &BucketName,
+        kind: BucketSubresourceKind,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.single_node
+            .delete_bucket_subresource_and_load_info(bucket, kind)
+    }
+
+    pub fn list_buckets_for_owner(
+        &self,
+        owner_canonical_id: &str,
+    ) -> Result<Vec<BucketInfo>, ObjectPgActionError> {
+        self.single_node.list_buckets_for_owner(owner_canonical_id)
+    }
+
+    pub fn prune_completed_multipart_uploads_for_bucket_with_limit(
+        &self,
+        bucket: &BucketName,
+        keep: usize,
+    ) -> Result<(), ObjectPgActionError> {
+        self.single_node
+            .prune_completed_multipart_uploads_for_bucket_with_limit(bucket, keep)
+    }
+
+    pub fn list_lifecycle_sweep_buckets(
+        &self,
+    ) -> Result<LifecycleSweepBuckets, ObjectPgActionError> {
+        self.single_node.list_lifecycle_sweep_buckets()
+    }
+
+    pub fn list_all_objects_for_bucket(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Vec<StoredObject>, ObjectPgActionError> {
+        self.single_node.list_all_objects_for_bucket(bucket)
+    }
+
+    pub fn list_all_object_versions_for_bucket(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Vec<StoredObject>, ObjectPgActionError> {
+        self.single_node.list_all_object_versions_for_bucket(bucket)
+    }
+
+    pub fn list_all_multipart_uploads_for_bucket(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Vec<MultipartUploadRecord>, ObjectPgActionError> {
+        self.single_node
+            .list_all_multipart_uploads_for_bucket(bucket)
+    }
+
+    pub fn list_objects_for_bucket(
+        &self,
+        bucket: &BucketName,
+        prefix: Option<&ObjectKey>,
+        delimiter: Option<&str>,
+        continuation_token: Option<&ObjectKey>,
+        record_cap: usize,
+        max_keys: u32,
+    ) -> Result<ListedBucketObjects, ObjectPgActionError> {
+        self.single_node.list_objects_for_bucket(
+            bucket,
+            prefix,
+            delimiter,
+            continuation_token,
+            record_cap,
+            max_keys,
+        )
+    }
+
+    pub fn list_object_versions_for_bucket(
+        &self,
+        bucket: &BucketName,
+        prefix: Option<&ObjectKey>,
+        key_marker: Option<&ObjectKey>,
+        version_id_marker: Option<VersionId>,
+        max_keys: u32,
+    ) -> Result<ListedBucketObjectVersions, ObjectPgActionError> {
+        self.single_node.list_object_versions_for_bucket(
+            bucket,
+            prefix,
+            key_marker,
+            version_id_marker,
+            max_keys,
+        )
+    }
+
+    pub fn load_object_if<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        action: impl FnOnce(&StoredObject) -> Result<T, E>,
+    ) -> Result<Result<T, E>, ObjectPgActionError> {
+        self.single_node
+            .load_object_if(bucket, key, version_id, action)
+    }
+
+    pub fn load_existing_live_object(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Option<StoredObject>, ObjectPgActionError> {
+        self.single_node.load_existing_live_object(bucket, key)
+    }
+
+    pub fn load_object_read_snapshot_if<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        snapshot_mode: ObjectReadSnapshotMode,
+        action: impl FnOnce(&StoredObject) -> Result<T, E>,
+    ) -> Result<Result<ObjectReadSnapshotOutcome<T>, E>, ObjectPgActionError> {
+        self.single_node.load_object_read_snapshot_if(
+            bucket,
+            key,
+            version_id,
+            snapshot_mode,
+            action,
+        )
+    }
+
+    pub fn payload_reclaim_exists(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<bool, ObjectPgActionError> {
+        self.single_node
+            .payload_reclaim_exists(bucket, key, generation_id)
+    }
+
+    pub fn get_object_tags_if<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
+    ) -> Result<Result<Option<String>, E>, ObjectPgActionError> {
+        self.single_node
+            .get_object_tags_if(bucket, key, version_id, action)
+    }
+
+    pub fn put_object_tags_if<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        tags: &str,
+        action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
+    ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
+        self.single_node
+            .put_object_tags_if(bucket, key, version_id, tags, action)
+    }
+
+    pub fn delete_object_tags_if<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
+    ) -> Result<Result<(), E>, ObjectPgActionError> {
+        self.single_node
+            .delete_object_tags_if(bucket, key, version_id, action)
+    }
+
+    pub fn put_object_retention_if<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        retention: ObjectRetention,
+        action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
+    ) -> Result<Result<(), E>, ObjectPgActionError> {
+        self.single_node
+            .put_object_retention_if(bucket, key, version_id, retention, action)
+    }
+
+    pub fn put_object_legal_hold_if<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        legal_hold: StoredLegalHoldStatus,
+        action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
+    ) -> Result<Result<(), E>, ObjectPgActionError> {
+        self.single_node
+            .put_object_legal_hold_if(bucket, key, version_id, legal_hold, action)
+    }
+
+    pub fn put_object_acl_if<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        action: impl FnOnce(&StoredObject) -> Result<(VersionId, AclGrants, bool), E>,
+    ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
+        self.single_node
+            .put_object_acl_if(bucket, key, version_id, action)
+    }
+
+    pub fn get_object_legal_hold_if<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        action: impl FnOnce(&StoredObject) -> Result<Option<LegalHoldStatus>, E>,
+    ) -> Result<Result<Option<LegalHoldStatus>, E>, ObjectPgActionError> {
+        self.single_node
+            .get_object_legal_hold_if(bucket, key, version_id, action)
+    }
+
+    pub fn get_object_retention_if<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        action: impl FnOnce(&StoredObject) -> Result<Option<ObjectRetention>, E>,
+    ) -> Result<Result<Option<ObjectRetention>, E>, ObjectPgActionError> {
+        self.single_node
+            .get_object_retention_if(bucket, key, version_id, action)
+    }
+
+    pub fn delete_specific_object_version_if<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        action: impl FnOnce(Option<&StoredObject>) -> Result<T, E>,
+    ) -> Result<Result<DeleteSpecificObjectVersionOutcome<T>, E>, ObjectPgActionError> {
+        self.single_node
+            .delete_specific_object_version_if(bucket, key, version_id, action)
+    }
+
+    pub fn delete_current_object_if<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        action: impl FnOnce(Option<&StoredObject>) -> Result<T, E>,
+    ) -> Result<Result<DeleteCurrentObjectOutcome<T>, E>, ObjectPgActionError> {
+        self.single_node
+            .delete_current_object_if(bucket, key, action)
+    }
+
+    pub fn insert_current_delete_marker_if<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        owner: OwnerIdentity,
+        action: impl FnOnce(Option<&StoredObject>) -> Result<T, E>,
+    ) -> Result<Result<InsertCurrentDeleteMarkerOutcome<T>, E>, ObjectPgActionError> {
+        self.single_node
+            .insert_current_delete_marker_if(bucket, key, owner, action)
+    }
+
+    pub fn expire_current_object_if_due<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        expected_version_id: VersionId,
+        should_expire: impl FnOnce(Option<&str>, &LiveObjectRecord) -> Result<bool, E>,
+    ) -> Result<Result<Option<ExpireCurrentObjectOutcome>, E>, ObjectPgActionError> {
+        self.single_node.expire_current_object_if_due(
+            bucket,
+            key,
+            expected_version_id,
+            should_expire,
+        )
+    }
+
+    pub fn delete_noncurrent_live_versions_if_due<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        select_versions: impl FnOnce(Option<&str>, &[StoredObject]) -> Result<HashSet<VersionId>, E>,
+    ) -> Result<Result<Vec<GenerationId>, E>, ObjectPgActionError> {
+        self.single_node
+            .delete_noncurrent_live_versions_if_due(bucket, key, select_versions)
+    }
+
+    pub fn delete_expired_delete_marker_if_due<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        expected_version_id: VersionId,
+        should_delete: impl FnOnce(Option<&str>, &[StoredObject]) -> Result<bool, E>,
+    ) -> Result<Result<bool, E>, ObjectPgActionError> {
+        self.single_node.delete_expired_delete_marker_if_due(
+            bucket,
+            key,
+            expected_version_id,
+            should_delete,
+        )
+    }
+
+    pub fn acquire_object_payload_lease(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) {
+        self.single_node
+            .acquire_object_payload_lease(bucket, key, generation_id);
+    }
+
+    pub fn release_object_payload_lease(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> usize {
+        self.single_node
+            .release_object_payload_lease(bucket, key, generation_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn object_payload_lease_count(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> usize {
+        self.single_node
+            .object_payload_lease_count(bucket, key, generation_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize {
+        self.single_node.bucket_object_payload_lease_count(bucket)
+    }
+
+    pub fn enqueue_object_payload_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) {
+        self.single_node
+            .enqueue_object_payload_reclaim(bucket, key, generation_id);
+    }
+
+    pub fn enqueue_bucket_delete_finalize(&self, bucket: &BucketName) {
+        self.single_node.enqueue_bucket_delete_finalize(bucket);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn try_take_reclaim_work(&self) -> Option<ReclaimWorkItem> {
+        self.single_node.try_take_reclaim_work()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn wait_for_reclaim_work(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
+        self.single_node.wait_for_reclaim_work(stop)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn wake_reclaim_workers(&self) {
+        self.single_node.wake_reclaim_workers();
+    }
+
+    pub fn reclaim_object_payload_if_unleased(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        simple_object_key_hash: [u8; 16],
+    ) -> Result<bool, ObjectPgActionError> {
+        self.single_node.reclaim_object_payload_if_unleased(
+            bucket,
+            key,
+            generation_id,
+            simple_object_key_hash,
+        )
+    }
+
+    pub fn create_put_object_stream_session<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: BucketSnapshotRequest,
+        action: impl FnOnce(
+            BucketSnapshot,
+            Option<StoredObject>,
+        ) -> Result<(T, CreateStreamUploadReq), E>,
+    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        self.single_node
+            .create_put_object_stream_session(bucket, key, request, action)
+    }
+
+    pub fn finalize_put_object_stream<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        total_size: u64,
+        action: impl FnOnce(StreamPutFinalizeSnapshot) -> Result<PreparedStreamPutCommit<T>, E>,
+    ) -> Result<Result<FinalizeStreamPutOutcome<T>, E>, ObjectPgActionError> {
+        self.single_node
+            .finalize_put_object_stream(bucket, key, session_id, total_size, action)
+    }
+
+    pub fn create_multipart_upload<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: BucketSnapshotRequest,
+        action: impl FnOnce(
+            BucketSnapshot,
+            Option<StoredObject>,
+        ) -> Result<(T, CreateMultipartUploadReq), E>,
+    ) -> Result<Result<CreateMultipartUploadOutcome<T>, E>, BucketSnapshotLoadError> {
+        self.single_node
+            .create_multipart_upload(bucket, key, request, action)
+    }
+
+    pub fn load_multipart_upload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, BucketSnapshotLoadError> {
+        self.single_node
+            .load_multipart_upload(bucket, key, upload_id)
+    }
+
+    pub fn begin_upload_part_stream_session<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        part_number: u32,
+        session_id: &SessionId,
+        action: impl FnOnce(&MultipartUploadRecord) -> Result<T, E>,
+    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        self.single_node.begin_upload_part_stream_session(
+            bucket,
+            key,
+            upload_id,
+            part_number,
+            session_id,
+            action,
+        )
+    }
+
+    pub fn create_upload_part_stream_session(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        part_number: u32,
+        session_id: &SessionId,
+    ) -> Result<SessionId, ObjectPgActionError> {
+        self.single_node.create_upload_part_stream_session(
+            bucket,
+            key,
+            upload_id,
+            part_number,
+            session_id,
+        )
+    }
+
+    pub fn load_in_progress_multipart_upload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
+        self.single_node
+            .load_in_progress_multipart_upload(bucket, key, upload_id)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn try_load_in_progress_multipart_upload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<Option<MultipartUploadRecord>, ObjectPgActionError> {
+        self.single_node
+            .try_load_in_progress_multipart_upload(bucket, key, upload_id)
+    }
+
+    pub fn load_in_progress_multipart_upload_for_listing(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
+        self.single_node
+            .load_in_progress_multipart_upload_for_listing(bucket, key, upload_id)
+    }
+
+    pub fn load_multipart_completion_snapshot(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        requested_part_numbers: &[u32],
+    ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError> {
+        self.single_node.load_multipart_completion_snapshot(
+            bucket,
+            key,
+            upload_id,
+            requested_part_numbers,
+        )
+    }
+
+    pub fn load_multipart_completion_preflight(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<MultipartCompletionPreflight, ObjectPgActionError> {
+        self.single_node
+            .load_multipart_completion_preflight(bucket, key, upload_id)
+    }
+
+    pub fn complete_multipart_upload_commit_serialized(
+        &self,
+        req: CompleteMultipartCommitRequest,
+        keep_completed_uploads: usize,
+    ) -> Result<CompleteMultipartCommitOutcome, ObjectPgActionError> {
+        self.single_node
+            .complete_multipart_upload_commit_serialized(req, keep_completed_uploads)
+    }
+
+    pub fn finalize_upload_part_stream<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        session_id: &SessionId,
+        part_number: u32,
+        action: impl FnOnce(StreamUploadPartSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
+    ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, ObjectPgActionError> {
+        self.single_node.finalize_upload_part_stream(
+            bucket,
+            key,
+            upload_id,
+            session_id,
+            part_number,
+            action,
+        )
+    }
+
+    pub fn list_multipart_uploads_for_bucket(
+        &self,
+        bucket: &BucketName,
+        prefix: Option<&ObjectKey>,
+        key_marker: Option<&ObjectKey>,
+        upload_id_marker: Option<&UploadId>,
+        record_cap: usize,
+        max_uploads: u32,
+    ) -> Result<ListedBucketMultipartUploads, ObjectPgActionError> {
+        self.single_node.list_multipart_uploads_for_bucket(
+            bucket,
+            prefix,
+            key_marker,
+            upload_id_marker,
+            record_cap,
+            max_uploads,
+        )
+    }
+
+    pub fn list_multipart_parts_for_upload<E, F>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        part_number_marker: Option<u32>,
+        max_parts: u32,
+        authorize: F,
+    ) -> Result<Result<ListedMultipartParts, E>, ObjectPgActionError>
+    where
+        F: FnOnce(&MultipartUploadRecord) -> Result<(), E>,
+    {
+        self.single_node.list_multipart_parts_for_upload(
+            bucket,
+            key,
+            upload_id,
+            part_number_marker,
+            max_parts,
+            authorize,
+        )
+    }
+
+    pub fn lookup_abort_multipart_upload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<AbortMultipartUploadLookup, ObjectPgActionError> {
+        self.single_node
+            .lookup_abort_multipart_upload(bucket, key, upload_id)
+    }
+
+    pub fn abort_multipart_upload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<bool, ObjectPgActionError> {
+        self.single_node
+            .abort_multipart_upload(bucket, key, upload_id)
+    }
+
+    pub fn abort_multipart_upload_if_due<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        should_abort: impl FnOnce(Option<&str>, &MultipartUploadRecord) -> Result<bool, E>,
+    ) -> Result<Result<bool, E>, ObjectPgActionError> {
+        self.single_node
+            .abort_multipart_upload_if_due(bucket, key, upload_id, should_abort)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_ec_scratch_allocation_count(&self, shape: EcShape) -> usize {
+        self.single_node.test_ec_scratch_allocation_count(shape)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_bucket_pg_id_for(&self, bucket: &BucketName) -> u32 {
+        self.single_node.test_bucket_pg_id_for(bucket)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_head_bucket_raw(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.single_node.test_head_bucket_raw(bucket)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_object_pg_id_for(&self, bucket: &BucketName, key: &ObjectKey) -> u32 {
+        self.single_node.test_object_pg_id_for(bucket, key)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_shard_pg_id_for(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> u32 {
+        self.single_node
+            .test_shard_pg_id_for(bucket, key, generation_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_stream_segment_shard_pg_id_for(
+        &self,
+        session_id: &SessionId,
+        segment_index: u32,
+        generation_id: GenerationId,
+    ) -> u32 {
+        self.single_node.test_stream_segment_shard_pg_id_for(
+            session_id,
+            segment_index,
+            generation_id,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_multipart_part_shard_pg_id_for(
+        &self,
+        upload_id: &UploadId,
+        part_number: u32,
+        generation: u32,
+        part_vid: GenerationId,
+    ) -> u32 {
+        self.single_node.test_multipart_part_shard_pg_id_for(
+            upload_id,
+            part_number,
+            generation,
+            part_vid,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_get_object_meta(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<StoredObject, ObjectPgActionError> {
+        self.single_node.test_get_object_meta(bucket, key)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_get_multipart_upload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
+        self.single_node
+            .test_get_multipart_upload(bucket, key, upload_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_get_multipart_part(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        part_number: u16,
+    ) -> Result<MultipartPartRecord, ObjectPgActionError> {
+        self.single_node
+            .test_get_multipart_part(bucket, key, upload_id, part_number)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_list_multipart_parts(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        req: &ListPartsReq,
+    ) -> Result<ListPartsResp, ObjectPgActionError> {
+        self.single_node.test_list_multipart_parts(bucket, key, req)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_list_multipart_uploads_for_bucket(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Vec<MultipartUploadRecord>, ObjectPgActionError> {
+        self.single_node
+            .test_list_multipart_uploads_for_bucket(bucket)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_get_object_segments(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<Vec<ObjectSegmentRecord>, ObjectPgActionError> {
+        self.single_node
+            .test_get_object_segments(bucket, key, version_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_replace_live_object_segments(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        segments: &[ObjectSegmentRecord],
+    ) -> Result<(), ObjectPgActionError> {
+        self.single_node
+            .test_replace_live_object_segments(bucket, key, version_id, segments)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_get_object_parts(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<Vec<ObjectPartRecord>, ObjectPgActionError> {
+        self.single_node
+            .test_get_object_parts(bucket, key, version_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_replace_object_parts(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        parts: &[ObjectPartRecord],
+    ) -> Result<(), ObjectPgActionError> {
+        self.single_node
+            .test_replace_object_parts(bucket, key, version_id, parts)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_get_object_version(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<StoredObject, ObjectPgActionError> {
+        self.single_node
+            .test_get_object_version(bucket, key, version_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_get_object_segments_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<Option<ObjectSegmentsReclaimRecord>, ObjectPgActionError> {
+        self.single_node
+            .test_get_object_segments_reclaim(bucket, key, generation_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_get_simple_payload_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<Option<SimplePayloadReclaimRecord>, ObjectPgActionError> {
+        self.single_node
+            .test_get_simple_payload_reclaim(bucket, key, generation_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_put_simple_payload_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reclaim: &SimplePayloadReclaimRecord,
+    ) -> Result<(), ObjectPgActionError> {
+        self.single_node
+            .test_put_simple_payload_reclaim(bucket, key, reclaim)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_put_object_segments_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reclaim: &ObjectSegmentsReclaimRecord,
+    ) -> Result<(), ObjectPgActionError> {
+        self.single_node
+            .test_put_object_segments_reclaim(bucket, key, reclaim)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_put_multipart_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reclaim: &MultipartReclaimRecord,
+    ) -> Result<(), ObjectPgActionError> {
+        self.single_node
+            .test_put_multipart_reclaim(bucket, key, reclaim)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_payload_reclaim_exists(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<bool, ObjectPgActionError> {
+        self.single_node
+            .test_payload_reclaim_exists(bucket, key, generation_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_list_bucket_payload_reclaim_roots(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Vec<PayloadReclaimRoot>, ObjectPgActionError> {
+        self.single_node
+            .test_list_bucket_payload_reclaim_roots(bucket)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_force_became_noncurrent_at(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        became_noncurrent_at: u64,
+    ) -> Result<(), ObjectPgActionError> {
+        self.single_node.test_force_became_noncurrent_at(
+            bucket,
+            key,
+            version_id,
+            became_noncurrent_at,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_create_deleting_bucket(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<(), BucketWriteDrainError> {
+        self.single_node.test_create_deleting_bucket(bucket)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_get_all_multipart_part_segments_for_upload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<Vec<MultipartPartSegmentRecord>, ObjectPgActionError> {
+        self.single_node
+            .test_get_all_multipart_part_segments_for_upload(bucket, key, upload_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_set_upload_state(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        state: UploadState,
+    ) -> Result<(), ObjectPgActionError> {
+        self.single_node
+            .test_set_upload_state(bucket, key, upload_id, state)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_list_stream_segments(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError> {
+        self.single_node
+            .test_list_stream_segments(bucket, key, session_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_force_stream_upload_created_at(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        created_at: u64,
+    ) -> Result<(), ObjectPgActionError> {
+        self.single_node
+            .test_force_stream_upload_created_at(bucket, key, session_id, created_at)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_list_all_stream_uploads(
+        &self,
+    ) -> Result<Vec<StreamUploadRecord>, ObjectPgActionError> {
+        self.single_node.test_list_all_stream_uploads()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_create_stream_upload(
+        &self,
+        req: &CreateStreamUploadReq,
+    ) -> Result<(), ObjectPgActionError> {
+        self.single_node.test_create_stream_upload(req)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_shard_exists(&self, pg_id: u32, key: &ShardKey) -> Result<bool, StoreError> {
+        self.single_node.test_shard_exists(pg_id, key)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_register_written_shards(
+        &self,
+        pg_id: u32,
+        written_shards: &[(ShardKey, WriteAck)],
+    ) -> Result<(), StoreError> {
+        self.single_node
+            .test_register_written_shards(pg_id, written_shards)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_delete_shards(&self, pg_id: u32, keys: &[ShardKey]) -> Result<(), StoreError> {
+        self.single_node.test_delete_shards(pg_id, keys)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_lock_bucket_pg(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<crate::node::BucketPgTestGuard<'_>, StoreError> {
+        self.single_node.test_lock_bucket_pg(bucket)
+    }
+}

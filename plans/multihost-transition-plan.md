@@ -399,10 +399,10 @@ Phase 1 implementation notes:
 1. `storage::StorageCluster` is the first cluster-shaped storage handle.
    - it is currently backed by one `Arc<SharedStorageNode>`
    - it deliberately preserves the existing single-node behavior
-   - it still has transitional `Deref` delegation to `SharedStorageNode`
+   - transparent `Deref` delegation to `SharedStorageNode` has been removed
    - it exposes `single_node_compat_*` helpers for background workers and cache
      registries that still share local-node state
-   - this is a first slice, not the final Phase 1 boundary
+   - this is still a single-node implementation, not the final Phase 1 boundary
 2. `Coordinator` now owns an `Arc<StorageCluster>` internally.
    - existing `Coordinator::new` and `Coordinator::new_with_managed_key_provider`
      remain compatibility shims from `Arc<SharedStorageNode>`
@@ -412,7 +412,22 @@ Phase 1 implementation notes:
      identity exists
 3. `argmin-s3` now builds one explicit `StorageCluster` and shares that across
    worker coordinators.
-4. No request routing, placement, PG ownership, or distributed behavior has
+4. explicit request APIs on `StorageCluster` now cover the coordinator
+   production request surface:
+   - direct PUT segment shard writes and metadata commit
+   - stream segment shard writes and append commit
+   - stream upload session load, abort, and stale-session listing
+   - read-side segment payload reconstruction
+   - default payload EC shape lookup
+   - bucket and object metadata operations
+   - authorization snapshot loaders
+   - multipart state transitions
+   - lifecycle and reclaim operations
+5. cluster compatibility wrappers also expose existing coordinator test hooks so
+   tests no longer depend on transparent local-node delegation. These helpers
+   should be narrowed or replaced with behavior-shaped cluster test utilities as
+   multi-node coverage is added.
+6. No request routing, placement, PG ownership, or distributed behavior has
    changed yet.
 
 ## Phase 2: In-Process Multi-Node Harness

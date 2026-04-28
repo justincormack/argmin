@@ -741,7 +741,7 @@ impl ReadRuntime {
         }
 
         let mut buf = self.payload_buffer_pool.checkout(padded);
-        self.storage_node.read_segment_stored_bytes_into(
+        self.storage_node.read_segment_payload_stored_bytes_into(
             SegmentStoredBytesRequest {
                 shard_pg_id: segment.shard_pg_id,
                 segment_okh: segment.segment_okh,

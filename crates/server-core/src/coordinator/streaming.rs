@@ -432,7 +432,7 @@ impl Coordinator {
     ) -> Result<Vec<WrittenShard>, ServerError> {
         Ok(self
             .storage_node
-            .write_stream_segment_shards(shard_pg_id, segment_okh, segment_vid, data)?
+            .write_stream_segment_payload_shards(shard_pg_id, segment_okh, segment_vid, data)?
             .into_iter()
             .map(|written| WrittenShard {
                 key: written.key,
@@ -523,7 +523,7 @@ impl Coordinator {
         #[cfg(test)]
         maybe_run_stream_append_prepare_hook(session_id, segment_index);
 
-        let written_shards = self.storage_node.write_stream_segment_shards(
+        let written_shards = self.storage_node.write_stream_segment_payload_shards(
             segment_record.shard_pg_id,
             &segment_okh,
             segment_record.segment_vid,
@@ -610,7 +610,7 @@ impl Coordinator {
         let cutoff = now.saturating_sub(max_age_ms);
         let mut count = 0;
 
-        for session in self.storage_node.list_all_stream_uploads_best_effort() {
+        for session in self.storage_node.list_stream_upload_sessions_best_effort() {
             if session.created_at < cutoff
                 && self
                     .abort_stream_put_for(&session.bucket, &session.key, &session.session_id)

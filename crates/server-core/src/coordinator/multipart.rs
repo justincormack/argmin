@@ -1067,7 +1067,7 @@ impl Coordinator {
                         .unwrap_or_default()
                         .as_millis() as u64;
                     let ec = staging_segments.first().map_or(
-                        self.storage_node.default_ec_shape(),
+                        self.storage_node.default_payload_ec_shape(),
                         |segment| storage::EcShape {
                             k: segment.ec_k,
                             m: segment.ec_m,

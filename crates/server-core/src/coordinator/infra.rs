@@ -327,7 +327,8 @@ impl Coordinator {
                 reason: reason.to_string(),
             }
         })?;
-        let payload_buffer_pool = PayloadBufferPool::new(storage_cluster.default_ec_shape());
+        let payload_buffer_pool =
+            PayloadBufferPool::new(storage_cluster.default_payload_ec_shape());
         let read_runtime = ReadRuntime {
             storage_node: Arc::clone(&storage_cluster),
             #[cfg(test)]
