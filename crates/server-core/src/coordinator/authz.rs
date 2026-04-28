@@ -15,6 +15,7 @@ use storage::{
     ObjectReadSnapshotMode, OwnerIdentity, PublicAccessBlockConfig, StoredObject, UploadState,
 };
 
+use self::acl::NonBoeLoadedBucketHandle;
 pub(super) use self::modern::{
     BoeBucketSummary, ModernObjectReadAuthorization, ModernObjectWriteAuthorization,
     ModernReadAction, ModernWriteAction, PreloadedBucketTags,
@@ -168,6 +169,840 @@ struct AuthorizedObjectReadSnapshotRequest<'a> {
     missing_discovery: MissingObjectDiscovery,
     modern_action: ModernReadAction,
     snapshot_mode: ObjectReadSnapshotMode,
+}
+
+impl Coordinator {
+    pub(in crate::coordinator) fn authorize_put_object_write_with_existing_object(
+        &self,
+        req: &AuthorizePutObjectRequest<'_>,
+        bucket: &LoadedBucketHandle,
+        existing_object: Option<&StoredObject>,
+    ) -> Result<AuthorizedPutObjectWrite, ServerError> {
+        if Self::is_bucket_owner_enforced(bucket.bucket().ownership_controls.as_ref()) {
+            self.authorize_put_object_write_with_existing_object_boe(req, bucket)
+        } else {
+            let bucket =
+                NonBoeLoadedBucketHandle::new(bucket).expect("dispatcher requires non-BOE bucket");
+            self.authorize_put_object_write_with_existing_object_non_boe(
+                req,
+                bucket,
+                existing_object,
+            )
+        }
+    }
+
+    fn authorize_put_object_write_with_existing_object_boe(
+        &self,
+        req: &AuthorizePutObjectRequest<'_>,
+        bucket: &LoadedBucketHandle,
+    ) -> Result<AuthorizedPutObjectWrite, ServerError> {
+        let key = req.object.key();
+        let bucket_info = ValidatedBucket(bucket.bucket().clone());
+        let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
+        let modern_bucket =
+            BoeBucketSummary::new(&modern_bucket_info).expect("BOE path requires BOE bucket");
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(bucket)?;
+        let bucket_tags = Self::loaded_bucket_tags_for_policy(bucket)?;
+        let modern_bucket_tags = PreloadedBucketTags::new(bucket_tags.as_deref());
+        if Self::modern_put_object_authorization_with_bucket_policy(
+            req.object.requester(),
+            modern_bucket,
+            modern_bucket_tags,
+            key,
+            ModernWriteAction::PutObject,
+            &req.policy_context,
+            bucket_policy.as_deref(),
+        )? != ModernObjectWriteAuthorization::Allowed
+        {
+            return Err(ServerError::AccessDenied);
+        }
+        let write_encryption = self.resolve_write_encryption(&bucket_info, req.encryption)?;
+        if write_encryption.is_sse_customer() && bucket_info.encryption.sse_c_blocked {
+            return Err(ServerError::SseCBlockedAccessDenied {
+                requester_principal: Self::requester_principal_required(req.object.requester())?
+                    .to_string(),
+                action: "s3:PutObject".to_string(),
+                resource: format!("arn:aws:s3:::{}/{}", bucket_info.name, key),
+            });
+        }
+        Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
+        Self::validate_requested_object_lock_state(&bucket_info, req.object_lock)?;
+        Ok(AuthorizedPutObjectWrite {
+            bucket: req.object.bucket.name_typed().clone(),
+            key: req.object.key_typed().clone(),
+            requester: req.object.requester().clone(),
+            expected_bucket_owner: req.object.expected_bucket_owner().map(str::to_string),
+            acl: AuthorizedPutObjectWriteAcl::from_parsed(&req.acl),
+            requested_object_lock: req.object_lock,
+            tags: req.tags.map(str::to_string),
+            write_encryption,
+        })
+    }
+
+    fn authorize_delete_object_impl(
+        &self,
+        object: &ObjectVersionRequest<'_>,
+        bypass_governance: bool,
+    ) -> Result<AuthorizedDeleteObject, ServerError> {
+        let bucket_handle = self.load_bucket_handle_for_object_policy_read(
+            object.bucket_name_typed(),
+            object.expected_bucket_owner(),
+        )?;
+        if Self::is_bucket_owner_enforced(bucket_handle.bucket().ownership_controls.as_ref()) {
+            self.authorize_delete_object_impl_boe(object, bypass_governance, &bucket_handle)
+        } else {
+            let bucket_handle = NonBoeLoadedBucketHandle::new(&bucket_handle)
+                .expect("dispatcher requires non-BOE bucket");
+            self.authorize_delete_object_impl_non_boe(object, bypass_governance, bucket_handle)
+        }
+    }
+
+    fn authorize_delete_object_impl_boe(
+        &self,
+        object: &ObjectVersionRequest<'_>,
+        bypass_governance: bool,
+        bucket_handle: &LoadedBucketHandle,
+    ) -> Result<AuthorizedDeleteObject, ServerError> {
+        let bucket = object.bucket_name_typed();
+        let key = object.key_typed();
+        let key_str = key.as_str();
+        let request_version_id = object.version_id();
+        let requester = object.requester();
+        let bucket_info = ValidatedBucket(bucket_handle.bucket().clone());
+        let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
+        let modern_bucket =
+            BoeBucketSummary::new(&modern_bucket_info).expect("BOE path requires BOE bucket");
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(bucket_handle)?;
+        let bucket_tags = Self::loaded_bucket_tags_for_policy(bucket_handle)?;
+        let modern_bucket_tags = PreloadedBucketTags::new(bucket_tags.as_deref());
+        #[cfg(test)]
+        if should_probe_delete_object_lookup(bucket.as_str()) {
+            let object_pg_ready = self
+                .storage_node
+                .try_probe_object_pg_available(bucket, key)
+                .map_err(Self::map_object_pg_action_error)?;
+            if !object_pg_ready {
+                return Err(ServerError::InternalError {
+                    reason: "test probe: object pg still locked before delete_object lookup"
+                        .to_string(),
+                });
+            }
+        }
+
+        match (bucket_info.versioning, request_version_id) {
+            (BucketVersioningState::Disabled, _) => {
+                match self
+                    .storage_node
+                    .load_object_if(bucket, key, None, |stored| {
+                        let allowed = Self::modern_delete_object_authorization_with_bucket_policy(
+                            requester,
+                            modern_bucket,
+                            modern_bucket_tags,
+                            key_str,
+                            Some(stored),
+                            Self::delete_object_policy_action(None),
+                            bucket_policy.as_deref(),
+                        )?;
+                        if !allowed {
+                            return Err(ServerError::AccessDenied);
+                        }
+                        Ok(())
+                    }) {
+                    Ok(Ok(())) => Ok(AuthorizedDeleteObject::UnversionedDelete {
+                        bucket: object.bucket_name_typed().clone(),
+                        key: object.key_typed().clone(),
+                        requester: requester.clone(),
+                        bucket_info,
+                        bucket_policy,
+                        bucket_tags,
+                    }),
+                    Ok(Err(error)) => Err(error),
+                    Err(storage::ObjectPgActionError::Metadata(
+                        storage::MetadataError::ObjectNotFound,
+                    )) => {
+                        let allowed = Self::modern_delete_object_authorization_with_bucket_policy(
+                            requester,
+                            modern_bucket,
+                            modern_bucket_tags,
+                            key_str,
+                            None,
+                            Self::delete_object_policy_action(None),
+                            bucket_policy.as_deref(),
+                        )?;
+                        if !allowed {
+                            return Err(ServerError::AccessDenied);
+                        }
+                        Ok(AuthorizedDeleteObject::UnversionedDelete {
+                            bucket: object.bucket_name_typed().clone(),
+                            key: object.key_typed().clone(),
+                            requester: requester.clone(),
+                            bucket_info,
+                            bucket_policy,
+                            bucket_tags,
+                        })
+                    }
+                    Err(other) => Err(Self::map_object_pg_action_error(other)),
+                }
+            }
+            (_, Some(version_id)) => {
+                match self
+                    .storage_node
+                    .load_object_if(bucket, key, Some(version_id), |stored| {
+                        let allowed = Self::modern_delete_object_authorization_with_bucket_policy(
+                            requester,
+                            modern_bucket,
+                            modern_bucket_tags,
+                            key_str,
+                            Some(stored),
+                            Self::delete_object_policy_action(Some(version_id)),
+                            bucket_policy.as_deref(),
+                        )?;
+                        if !allowed {
+                            return Err(ServerError::AccessDenied);
+                        }
+                        if let StoredObject::Live(record) = stored {
+                            let can_bypass_governance = self
+                                .requester_can_bypass_governance_retention_with_bucket_policy(
+                                    requester,
+                                    &bucket_info,
+                                    bucket_tags.as_deref(),
+                                    stored,
+                                    bucket_policy.as_deref(),
+                                )?;
+                            Self::validate_delete_against_object_lock(
+                                record.object_lock,
+                                bypass_governance,
+                                can_bypass_governance,
+                                Self::current_unix_seconds()?,
+                            )?;
+                        }
+                        Ok(())
+                    }) {
+                    Ok(Ok(())) => Ok(AuthorizedDeleteObject::SpecificVersion {
+                        bucket: object.bucket_name_typed().clone(),
+                        key: object.key_typed().clone(),
+                        version_id,
+                        requester: requester.clone(),
+                        bucket_info,
+                        bucket_policy,
+                        bucket_tags,
+                        bypass_governance,
+                    }),
+                    Ok(Err(error)) => Err(error),
+                    Err(storage::ObjectPgActionError::Metadata(
+                        storage::MetadataError::ObjectNotFound,
+                    )) => {
+                        let allowed = Self::modern_delete_object_authorization_with_bucket_policy(
+                            requester,
+                            modern_bucket,
+                            modern_bucket_tags,
+                            key_str,
+                            None,
+                            Self::delete_object_policy_action(Some(version_id)),
+                            bucket_policy.as_deref(),
+                        )?;
+                        if !allowed {
+                            return Err(ServerError::AccessDenied);
+                        }
+                        if bucket_info.object_lock.enabled
+                            && bypass_governance
+                            && !self.requester_can_bypass_governance_retention_for_missing_version_with_bucket_policy(
+                                requester,
+                                &bucket_info,
+                                bucket_tags.as_deref(),
+                                key_str,
+                                bucket_policy.as_deref(),
+                            )?
+                        {
+                            return Err(ServerError::AccessDenied);
+                        }
+                        Ok(AuthorizedDeleteObject::SpecificVersionMissing { version_id })
+                    }
+                    Err(other) => Err(Self::map_object_pg_action_error(other)),
+                }
+            }
+            (_, None) => {
+                let owner =
+                    Self::effective_object_owner(&bucket_info, requester, PutObjectAcl::None);
+                match self
+                    .storage_node
+                    .load_object_if(bucket, key, None, |stored| {
+                        let allowed = Self::modern_delete_object_authorization_with_bucket_policy(
+                            requester,
+                            modern_bucket,
+                            modern_bucket_tags,
+                            key_str,
+                            Some(stored),
+                            Self::delete_object_policy_action(None),
+                            bucket_policy.as_deref(),
+                        )?;
+                        if !allowed {
+                            return Err(ServerError::AccessDenied);
+                        }
+                        Ok(())
+                    }) {
+                    Ok(Ok(())) => Ok(AuthorizedDeleteObject::CurrentDeleteMarkerInsert {
+                        bucket: object.bucket_name_typed().clone(),
+                        key: object.key_typed().clone(),
+                        owner,
+                        requester: requester.clone(),
+                        bucket_info,
+                        bucket_policy,
+                        bucket_tags,
+                    }),
+                    Ok(Err(error)) => Err(error),
+                    Err(storage::ObjectPgActionError::Metadata(
+                        storage::MetadataError::ObjectNotFound,
+                    )) => {
+                        let allowed = Self::modern_delete_object_authorization_with_bucket_policy(
+                            requester,
+                            modern_bucket,
+                            modern_bucket_tags,
+                            key_str,
+                            None,
+                            Self::delete_object_policy_action(None),
+                            bucket_policy.as_deref(),
+                        )?;
+                        if !allowed {
+                            return Err(ServerError::AccessDenied);
+                        }
+                        Ok(AuthorizedDeleteObject::CurrentDeleteMarkerInsert {
+                            bucket: object.bucket_name_typed().clone(),
+                            key: object.key_typed().clone(),
+                            owner,
+                            requester: requester.clone(),
+                            bucket_info,
+                            bucket_policy,
+                            bucket_tags,
+                        })
+                    }
+                    Err(other) => Err(Self::map_object_pg_action_error(other)),
+                }
+            }
+        }
+    }
+
+    pub(in crate::coordinator) fn authorize_create_multipart_upload_with_existing_object(
+        &self,
+        req: &CreateMultipartUploadRequest<'_>,
+        bucket: &LoadedBucketHandle,
+        existing_object: Option<&StoredObject>,
+    ) -> Result<AuthorizedCreateMultipartUpload, ServerError> {
+        if Self::is_bucket_owner_enforced(bucket.bucket().ownership_controls.as_ref()) {
+            self.authorize_create_multipart_upload_with_existing_object_boe(req, bucket)
+        } else {
+            let bucket =
+                NonBoeLoadedBucketHandle::new(bucket).expect("dispatcher requires non-BOE bucket");
+            self.authorize_create_multipart_upload_with_existing_object_non_boe(
+                req,
+                bucket,
+                existing_object,
+            )
+        }
+    }
+
+    fn authorize_create_multipart_upload_with_existing_object_boe(
+        &self,
+        req: &CreateMultipartUploadRequest<'_>,
+        bucket: &LoadedBucketHandle,
+    ) -> Result<AuthorizedCreateMultipartUpload, ServerError> {
+        let key = req.object.key();
+        let policy_context = req.effective_policy_context()?;
+        let bucket_info = ValidatedBucket(bucket.bucket().clone());
+        if req.object.requester().is_anonymous() {
+            return Err(ServerError::AccessDenied);
+        }
+        let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
+        let modern_bucket =
+            BoeBucketSummary::new(&modern_bucket_info).expect("BOE path requires BOE bucket");
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(bucket)?;
+        let bucket_tags = Self::loaded_bucket_tags_for_policy(bucket)?;
+        let modern_bucket_tags = PreloadedBucketTags::new(bucket_tags.as_deref());
+        if Self::modern_put_object_authorization_with_bucket_policy(
+            req.object.requester(),
+            modern_bucket,
+            modern_bucket_tags,
+            key,
+            ModernWriteAction::CreateMultipartUpload,
+            &policy_context,
+            bucket_policy.as_deref(),
+        )? != ModernObjectWriteAuthorization::Allowed
+        {
+            return Err(ServerError::AccessDenied);
+        }
+        Self::ensure_sse_c_allowed(
+            &bucket_info,
+            req.encryption.sse_customer_request().is_some(),
+        )?;
+        let write_encryption = self.resolve_write_encryption(&bucket_info, req.encryption)?;
+        Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
+        let initiator = Self::requester_owner_identity(req.object.requester());
+        let owner =
+            Self::effective_put_object_owner(&bucket_info, req.object.requester(), &req.acl);
+        let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &req.acl);
+        let public_read = Self::acl_grants_public_read(&acl_grants);
+        Self::validate_requested_object_lock_state(&bucket_info, req.object_lock)?;
+        Self::ensure_sse_c_allowed(&bucket_info, write_encryption.is_sse_customer())?;
+
+        Ok(AuthorizedCreateMultipartUpload {
+            bucket_info: bucket_info.into_inner(),
+            bucket: req.object.bucket.name_typed().clone(),
+            key: req.object.key_typed().clone(),
+            tags: req.tags.map(str::to_string),
+            checksum: req.checksum,
+            initiator,
+            owner,
+            acl_grants,
+            public_read,
+            object_lock: req.object_lock,
+            write_encryption,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_upload_part_copy(
+        &self,
+        req: &UploadPartCopyRequest<'_>,
+    ) -> Result<AuthorizedUploadPartCopy, ServerError> {
+        let dst_bucket_handle = self.load_bucket_handle_for_object_policy_read(
+            req.upload.bucket_name_typed(),
+            req.expected_bucket_owner(),
+        )?;
+        if Self::is_bucket_owner_enforced(dst_bucket_handle.bucket().ownership_controls.as_ref()) {
+            self.authorize_upload_part_copy_boe(req, &dst_bucket_handle)
+        } else {
+            let dst_bucket_handle = NonBoeLoadedBucketHandle::new(&dst_bucket_handle)
+                .expect("dispatcher requires non-BOE bucket");
+            self.authorize_upload_part_copy_non_boe(req, dst_bucket_handle)
+        }
+    }
+
+    fn authorize_upload_part_copy_boe(
+        &self,
+        req: &UploadPartCopyRequest<'_>,
+        dst_bucket_handle: &LoadedBucketHandle,
+    ) -> Result<AuthorizedUploadPartCopy, ServerError> {
+        let src_version_id = req.source.version_id;
+        let dst_bucket = req.upload.bucket_name_typed();
+        let dst_key = req.upload.key_typed();
+        let upload_id = req.upload.upload_id_typed();
+        let part_number = req.part_number;
+        let requester = req.upload.requester();
+        let copy_source_policy_value = req.source.version_id.map_or_else(
+            || format!("{}/{}", req.source.bucket, req.source.key),
+            |version_id| {
+                format!(
+                    "{}/{}?versionId={}",
+                    req.source.bucket, req.source.key, version_id
+                )
+            },
+        );
+        let policy_context =
+            PutObjectPolicyContext::new(Some(copy_source_policy_value.as_str()), None, None)
+                .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm));
+        let dst_bucket_info = ValidatedBucket(dst_bucket_handle.bucket().clone());
+        let modern_bucket_info = ModernBucketSummary::from(&*dst_bucket_info);
+        let modern_bucket =
+            BoeBucketSummary::new(&modern_bucket_info).expect("BOE path requires BOE bucket");
+        let dst_bucket_policy = self.cached_bucket_policy_for_loaded_handle(dst_bucket_handle)?;
+        let dst_bucket_tags = Self::loaded_bucket_tags_for_policy(dst_bucket_handle)?;
+        let dst_upload = self
+            .storage_node
+            .load_in_progress_multipart_upload(dst_bucket, dst_key, upload_id)
+            .map_err(Self::map_object_pg_action_error)?;
+        let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
+            policy_context,
+            &dst_upload,
+        );
+        let modern_bucket_tags = PreloadedBucketTags::new(dst_bucket_tags.as_deref());
+        if Self::modern_write_multipart_upload_with_bucket_policy(
+            requester,
+            modern_bucket,
+            modern_bucket_tags,
+            &dst_upload,
+            &policy_context,
+            dst_bucket_policy.as_deref(),
+        )? != ModernObjectWriteAuthorization::Allowed
+        {
+            return Err(ServerError::AccessDenied);
+        }
+        Self::ensure_sse_c_allowed(
+            &dst_bucket_info,
+            dst_upload.encryption.uses_sse_customer_headers(),
+        )?;
+        self.ensure_write_encryption_supported(&dst_upload.encryption)?;
+        let sse_customer = self.prepare_existing_sse_customer_write_context(
+            &dst_upload.encryption,
+            req.sse_customer,
+            SseCustomerSegmentScope::multipart_part(part_number)?,
+            true,
+        )?;
+        let source = self.authorize_copy_source_read_snapshot(CopySourceReadSnapshotRequest {
+            requester,
+            bucket: &req.source.bucket,
+            key: &req.source.key,
+            version_id: src_version_id,
+            expected_bucket_owner: req.source.expected_bucket_owner(),
+            policy_action: Self::get_object_policy_action(src_version_id),
+            existing_object_tags_mode: ExistingObjectTagsMode::Available,
+        })?;
+        Ok(AuthorizedUploadPartCopy {
+            source,
+            destination: AuthorizedMultipartPartWrite {
+                bucket: req.upload.bucket_name_typed().clone(),
+                key: req.upload.key_typed().clone(),
+                upload_id: dst_upload.upload_id.clone(),
+                part_number,
+                upload: dst_upload,
+                sse_customer,
+            },
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_begin_stream_part_with_upload(
+        &self,
+        req: &BeginStreamPartRequest<'_>,
+        bucket_handle: &LoadedBucketHandle,
+        upload: &MultipartUploadRecord,
+    ) -> Result<AuthorizedBeginStreamPart, ServerError> {
+        if Self::is_bucket_owner_enforced(bucket_handle.bucket().ownership_controls.as_ref()) {
+            self.authorize_begin_stream_part_with_upload_boe(req, bucket_handle, upload)
+        } else {
+            let bucket_handle = NonBoeLoadedBucketHandle::new(bucket_handle)
+                .expect("dispatcher requires non-BOE bucket");
+            self.authorize_begin_stream_part_with_upload_non_boe(req, bucket_handle, upload)
+        }
+    }
+
+    fn authorize_begin_stream_part_with_upload_boe(
+        &self,
+        req: &BeginStreamPartRequest<'_>,
+        bucket_handle: &LoadedBucketHandle,
+        upload: &MultipartUploadRecord,
+    ) -> Result<AuthorizedBeginStreamPart, ServerError> {
+        let bucket = req.upload.bucket_name_typed();
+        let key = req.upload.key_typed();
+        let upload_id = req.upload.upload_id_typed();
+        let part_number = req.part_number;
+        let policy_context = req.effective_policy_context();
+        let bucket_info = ValidatedBucket(bucket_handle.bucket().clone());
+        let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
+        let modern_bucket =
+            BoeBucketSummary::new(&modern_bucket_info).expect("BOE path requires BOE bucket");
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(bucket_handle)?;
+        let bucket_tags = Self::loaded_bucket_tags_for_policy(bucket_handle)?;
+        if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+        if upload.state != UploadState::InProgress {
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+        let policy_context =
+            Self::with_multipart_upload_managed_encryption_policy_context(policy_context, upload);
+        let modern_bucket_tags = PreloadedBucketTags::new(bucket_tags.as_deref());
+        if Self::modern_write_multipart_upload_with_bucket_policy(
+            req.upload.requester(),
+            modern_bucket,
+            modern_bucket_tags,
+            upload,
+            &policy_context,
+            bucket_policy.as_deref(),
+        )? != ModernObjectWriteAuthorization::Allowed
+        {
+            return Err(ServerError::AccessDenied);
+        }
+        Self::ensure_sse_c_allowed(&bucket_info, upload.encryption.uses_sse_customer_headers())?;
+        self.ensure_write_encryption_supported(&upload.encryption)?;
+        let sse_customer = self.prepare_existing_sse_customer_write_context(
+            &upload.encryption,
+            req.sse_customer,
+            SseCustomerSegmentScope::multipart_part(part_number)?,
+            true,
+        )?;
+
+        Ok(AuthorizedBeginStreamPart {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id: upload.upload_id.clone(),
+            part_number,
+            upload: upload.clone(),
+            sse_customer,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_complete_multipart_upload(
+        &self,
+        req: &CompleteMultipartUploadRequest<'_>,
+    ) -> Result<AuthorizedCompleteMultipartUpload, ServerError> {
+        let request = BucketHandleRequest::new()
+            .requiring_policy_view()
+            .requiring_bucket_tags_if_abac_enabled();
+        self.with_bucket_write_handle_for(&req.upload, request, |bucket_handle| {
+            if Self::is_bucket_owner_enforced(bucket_handle.bucket().ownership_controls.as_ref()) {
+                self.authorize_complete_multipart_upload_boe(req, &bucket_handle)
+            } else {
+                let bucket_handle = NonBoeLoadedBucketHandle::new(&bucket_handle)
+                    .expect("dispatcher requires non-BOE bucket");
+                self.authorize_complete_multipart_upload_non_boe(req, bucket_handle)
+            }
+        })
+    }
+
+    fn authorize_complete_multipart_upload_boe(
+        &self,
+        req: &CompleteMultipartUploadRequest<'_>,
+        bucket_handle: &LoadedBucketHandle,
+    ) -> Result<AuthorizedCompleteMultipartUpload, ServerError> {
+        let bucket = req.upload.bucket_name_typed();
+        let key = req.upload.key_typed();
+        let upload_id = req.upload.upload_id_typed();
+        let bucket_info = ValidatedBucket(bucket_handle.bucket().clone());
+        let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
+        let modern_bucket =
+            BoeBucketSummary::new(&modern_bucket_info).expect("BOE path requires BOE bucket");
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(bucket_handle)?;
+        let bucket_tags = Self::loaded_bucket_tags_for_policy(bucket_handle)?;
+        #[cfg(test)]
+        let upload = if should_probe_multipart_complete_auth_lookup(bucket.as_str(), key.as_str()) {
+            self.storage_node
+                .try_load_in_progress_multipart_upload(bucket, key, upload_id)
+                .map_err(Self::map_object_pg_action_error)
+                .and_then(|upload| {
+                    upload.ok_or_else(|| ServerError::InternalError {
+                        reason: "multipart complete auth lookup would block".to_string(),
+                    })
+                })?
+        } else {
+            self.storage_node
+                .load_in_progress_multipart_upload(bucket, key, upload_id)
+                .map_err(Self::map_object_pg_action_error)?
+        };
+        #[cfg(not(test))]
+        let upload = self
+            .storage_node
+            .load_in_progress_multipart_upload(bucket, key, upload_id)
+            .map_err(Self::map_object_pg_action_error)?;
+        let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
+            PutObjectPolicyContext::default()
+                .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm)),
+            &upload,
+        );
+        let modern_bucket_tags = PreloadedBucketTags::new(bucket_tags.as_deref());
+        if Self::modern_write_multipart_upload_with_bucket_policy(
+            req.upload.requester(),
+            modern_bucket,
+            modern_bucket_tags,
+            &upload,
+            &policy_context,
+            bucket_policy.as_deref(),
+        )? != ModernObjectWriteAuthorization::Allowed
+        {
+            return Err(ServerError::AccessDenied);
+        }
+        Self::ensure_sse_c_allowed(&bucket_info, upload.encryption.uses_sse_customer_headers())?;
+        let multipart_write_encryption = self.resume_write_encryption(
+            &upload.encryption,
+            req.sse_customer,
+            SseCustomerSegmentScope::object(),
+            false,
+        )?;
+
+        Ok(AuthorizedCompleteMultipartUpload {
+            bucket_info: bucket_info.into_inner(),
+            bucket: req.upload.bucket_name_typed().clone(),
+            key: req.upload.key_typed().clone(),
+            upload_id: upload.upload_id.clone(),
+            upload,
+            multipart_write_encryption,
+        })
+    }
+
+    fn authorize_object_read_snapshot(
+        &self,
+        req: AuthorizedObjectReadSnapshotRequest<'_>,
+    ) -> Result<(BucketSummary, storage::ObjectReadSnapshot), ServerError> {
+        let bucket =
+            self.load_bucket_handle_for_modern_object_read(req.bucket, req.expected_bucket_owner)?;
+        if Self::is_bucket_owner_enforced(bucket.bucket().ownership_controls.as_ref()) {
+            self.authorize_object_read_snapshot_boe(req, &bucket)
+        } else {
+            let bucket =
+                NonBoeLoadedBucketHandle::new(&bucket).expect("dispatcher requires non-BOE bucket");
+            self.authorize_object_read_snapshot_non_boe(req, bucket)
+        }
+    }
+
+    fn authorize_copy_source_read_snapshot(
+        &self,
+        req: CopySourceReadSnapshotRequest<'_>,
+    ) -> Result<storage::ObjectReadSnapshot, ServerError> {
+        let bucket =
+            self.load_bucket_handle_for_object_policy_read(req.bucket, req.expected_bucket_owner)?;
+        if Self::is_bucket_owner_enforced(bucket.bucket().ownership_controls.as_ref()) {
+            self.authorize_copy_source_read_snapshot_boe(req, &bucket)
+        } else {
+            let bucket =
+                NonBoeLoadedBucketHandle::new(&bucket).expect("dispatcher requires non-BOE bucket");
+            self.authorize_copy_source_read_snapshot_non_boe(req, bucket)
+        }
+    }
+
+    fn authorize_copy_source_read_snapshot_boe(
+        &self,
+        req: CopySourceReadSnapshotRequest<'_>,
+        bucket: &LoadedBucketHandle,
+    ) -> Result<storage::ObjectReadSnapshot, ServerError> {
+        let bucket_info = ValidatedBucket(bucket.bucket().clone());
+        let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
+        let modern_bucket =
+            BoeBucketSummary::new(&modern_bucket_info).expect("BOE path requires BOE bucket");
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(bucket)?;
+        let bucket_tags = if bucket_policy.is_some() {
+            Self::loaded_bucket_tags_for_policy(bucket)?
+        } else {
+            None
+        };
+        let modern_bucket_tags = PreloadedBucketTags::new(bucket_tags.as_deref());
+        let can_discover_missing = MissingObjectDiscovery::ReadBucket
+            .requester_can_discover_missing(
+                self,
+                BucketPolicyAccess {
+                    requester: req.requester,
+                    bucket: &bucket_info,
+                    bucket_tags: bucket_tags.as_deref(),
+                    policy: bucket_policy.as_deref(),
+                },
+                req.key.as_str(),
+                req.version_id,
+            )?;
+        let outcome = self
+            .storage_node
+            .load_object_read_snapshot_if(
+                &bucket.bucket().name,
+                req.key,
+                req.version_id,
+                ObjectReadSnapshotMode::FullPayloadLayout,
+                |stored| {
+                    let allowed = matches!(
+                        Self::modern_copy_source_read_authorization_with_bucket_policy(
+                            req.requester,
+                            modern_bucket,
+                            modern_bucket_tags,
+                            stored,
+                            req.policy_action,
+                            req.existing_object_tags_mode,
+                            bucket_policy.as_deref(),
+                        )?,
+                        ModernObjectReadAuthorization::Allowed
+                    );
+                    if allowed {
+                        Ok(())
+                    } else {
+                        Err(ServerError::AccessDenied)
+                    }
+                },
+            )
+            .map_err(|error| {
+                Self::map_object_read_snapshot_error(
+                    &bucket.bucket().name,
+                    req.key,
+                    req.version_id,
+                    can_discover_missing,
+                    error,
+                )
+            })??;
+        Ok(outcome.snapshot)
+    }
+
+    fn authorize_object_read_snapshot_boe(
+        &self,
+        req: AuthorizedObjectReadSnapshotRequest<'_>,
+        bucket: &LoadedBucketHandle,
+    ) -> Result<(BucketSummary, storage::ObjectReadSnapshot), ServerError> {
+        let bucket_summary = bucket.bucket().clone();
+        let bucket_info = ValidatedBucket(bucket.bucket().clone());
+        let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
+        let modern_bucket =
+            BoeBucketSummary::new(&modern_bucket_info).expect("BOE path requires BOE bucket");
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(bucket)?;
+        let bucket_tags = if bucket_policy.is_some() {
+            Self::loaded_bucket_tags_for_policy(bucket)?
+        } else {
+            None
+        };
+        let modern_bucket_tags = PreloadedBucketTags::new(bucket_tags.as_deref());
+        let can_discover_missing = req.missing_discovery.requester_can_discover_missing(
+            self,
+            BucketPolicyAccess {
+                requester: req.requester,
+                bucket: &bucket_info,
+                bucket_tags: bucket_tags.as_deref(),
+                policy: bucket_policy.as_deref(),
+            },
+            req.key.as_str(),
+            req.version_id,
+        )?;
+        #[cfg(test)]
+        if should_probe_object_read_snapshot(bucket.bucket().name.as_str()) {
+            let object_pg_ready = self
+                .storage_node
+                .try_probe_object_pg_available(&bucket.bucket().name, req.key)
+                .map_err(|error| {
+                    Self::map_object_read_snapshot_error(
+                        &bucket.bucket().name,
+                        req.key,
+                        req.version_id,
+                        can_discover_missing,
+                        error,
+                    )
+                })?;
+            if !object_pg_ready {
+                return Err(ServerError::InternalError {
+                    reason: "test probe: object pg still locked before object read snapshot"
+                        .to_string(),
+                });
+            }
+        }
+        let outcome = self
+            .storage_node
+            .load_object_read_snapshot_if(
+                &bucket.bucket().name,
+                req.key,
+                req.version_id,
+                req.snapshot_mode,
+                |stored| {
+                    let allowed = matches!(
+                        Self::modern_read_object_authorization_with_bucket_policy(
+                            req.requester,
+                            modern_bucket,
+                            modern_bucket_tags,
+                            stored,
+                            req.modern_action,
+                            bucket_policy.as_deref(),
+                        )?,
+                        ModernObjectReadAuthorization::Allowed
+                    );
+                    if allowed {
+                        Ok(())
+                    } else {
+                        Err(ServerError::AccessDenied)
+                    }
+                },
+            )
+            .map_err(|error| {
+                Self::map_object_read_snapshot_error(
+                    &bucket.bucket().name,
+                    req.key,
+                    req.version_id,
+                    can_discover_missing,
+                    error,
+                )
+            })??;
+        Ok((bucket_summary, outcome.snapshot))
+    }
 }
 
 impl Coordinator {
@@ -1024,6 +1859,26 @@ impl Coordinator {
             bucket_tags,
             object,
             action,
+            policy,
+        )
+    }
+
+    fn modern_copy_source_read_authorization_with_bucket_policy(
+        requester: &Requester,
+        bucket: BoeBucketSummary<'_>,
+        bucket_tags: PreloadedBucketTags<'_>,
+        object: &StoredObject,
+        action: auth::PolicyAction,
+        existing_object_tags_mode: ExistingObjectTagsMode,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<ModernObjectReadAuthorization, ServerError> {
+        modern::copy_source_read_authorization_with_bucket_policy(
+            requester,
+            bucket,
+            bucket_tags,
+            object,
+            action,
+            existing_object_tags_mode,
             policy,
         )
     }

@@ -507,3 +507,43 @@ pub(super) fn read_object_authorization_with_bucket_policy(
         ),
     }
 }
+
+pub(super) fn copy_source_read_authorization_with_bucket_policy(
+    requester: &Requester,
+    bucket: BoeBucketSummary<'_>,
+    bucket_tags: PreloadedBucketTags<'_>,
+    object: &StoredObject,
+    action: auth::PolicyAction,
+    existing_object_tags_mode: ExistingObjectTagsMode,
+    policy: Option<&auth::BucketPolicy>,
+) -> Result<ModernObjectReadAuthorization, ServerError> {
+    debug_assert!(matches!(
+        action,
+        auth::PolicyAction::GetObject | auth::PolicyAction::GetObjectVersion
+    ));
+    let decision = bucket_policy_decision_for_object_with_preloaded_tags_modern(
+        requester,
+        bucket,
+        bucket_tags,
+        object,
+        action,
+        policy,
+        existing_object_tags_mode,
+    )?;
+    let allowed = match decision {
+        auth::PolicyEvaluation::ExplicitDeny => false,
+        auth::PolicyEvaluation::ExplicitAllow
+            if modern_bucket_policy_allow_survives_restrict_public_buckets(requester, bucket) =>
+        {
+            true
+        }
+        auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
+            requester_can_modern_bucket_owner_account_admin(requester, bucket)
+        }
+    };
+    Ok(if allowed {
+        ModernObjectReadAuthorization::Allowed
+    } else {
+        ModernObjectReadAuthorization::Denied
+    })
+}

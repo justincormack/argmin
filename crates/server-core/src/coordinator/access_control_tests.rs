@@ -1590,6 +1590,206 @@ fn copy_object_bucket_policy_copy_source_controls_access() {
 }
 
 #[test]
+fn copy_object_boe_source_bucket_policy_controls_access() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("owner-a", "src", false)
+        .unwrap();
+    put_bucket_ownership_controls_test(
+        &coord,
+        "src",
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+    coord
+        .create_bucket_for_owner("other-user", "dst", false)
+        .unwrap();
+    put_bucket_policy_test(
+        &coord,
+        "src",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::src/public/*"}]}"#,
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+
+    for (key, body) in [
+        ("public/foo", b"public-foo".as_slice()),
+        ("private/foo", b"private-foo".as_slice()),
+    ] {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "src",
+                    key,
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                data: body,
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+    }
+
+    let copied = coord
+        .copy_object(&CopyObjectRequest {
+            source: copy_source("src", "public/foo", None),
+            destination: object_request_with_expected_owner(
+                "dst",
+                "copied",
+                test_helpers::requester("other-user"),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: None,
+            tagging: TaggingDirective::Copy,
+            acl: PutObjectAcl::None.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            destination_encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+        })
+        .unwrap();
+    assert_eq!(copied.version_id, VersionId::Null);
+
+    let denied = coord
+        .copy_object(&CopyObjectRequest {
+            source: copy_source("src", "private/foo", None),
+            destination: object_request_with_expected_owner(
+                "dst",
+                "denied",
+                test_helpers::requester("other-user"),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: None,
+            tagging: TaggingDirective::Copy,
+            acl: PutObjectAcl::None.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            destination_encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+        })
+        .unwrap_err();
+    assert!(matches!(denied, ServerError::AccessDenied));
+}
+
+#[test]
+fn copy_object_boe_source_restrict_public_buckets_blocks_public_policy() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("owner-a", "src", false)
+        .unwrap();
+    put_bucket_ownership_controls_test(
+        &coord,
+        "src",
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+    coord
+        .create_bucket_for_owner("other-user", "dst", false)
+        .unwrap();
+    put_bucket_policy_test(
+        &coord,
+        "src",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::src/*"}]}"#,
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                "src",
+                "public/foo",
+                test_helpers::requester("owner-a"),
+                None,
+            ),
+            data: b"public-foo",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    coord
+        .copy_object(&CopyObjectRequest {
+            source: copy_source("src", "public/foo", None),
+            destination: object_request_with_expected_owner(
+                "dst",
+                "copied-before-rpb",
+                test_helpers::requester("other-user"),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: None,
+            tagging: TaggingDirective::Copy,
+            acl: PutObjectAcl::None.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            destination_encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+        })
+        .unwrap();
+
+    put_bucket_public_access_block_test(
+        &coord,
+        "src",
+        "<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+
+    let denied = coord
+        .copy_object(&CopyObjectRequest {
+            source: copy_source("src", "public/foo", None),
+            destination: object_request_with_expected_owner(
+                "dst",
+                "copied-after-rpb",
+                test_helpers::requester("other-user"),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: None,
+            tagging: TaggingDirective::Copy,
+            acl: PutObjectAcl::None.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            destination_encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+        })
+        .unwrap_err();
+    assert!(matches!(denied, ServerError::AccessDenied));
+}
+
+#[test]
 fn copy_object_bucket_policy_requires_explicit_copy_metadata_directive() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
@@ -2399,6 +2599,142 @@ fn upload_part_copy_bucket_policy_copy_source_controls_access() {
             part_number: 2,
             copy_source_range: None,
 
+            source_sse_customer: None,
+            sse_customer: None,
+        })
+        .unwrap_err();
+    assert!(matches!(denied, ServerError::AccessDenied));
+}
+
+#[test]
+fn upload_part_copy_boe_source_bucket_tag_abac_controls_access() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    let owner = "111122223333";
+    let requester = "444455556666";
+    coord.create_bucket_for_owner(owner, "src", false).unwrap();
+    put_bucket_ownership_controls_test(
+        &coord,
+        "src",
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        test_helpers::requester(owner),
+        None,
+    )
+    .unwrap();
+    coord
+        .create_bucket_for_owner(requester, "dst", false)
+        .unwrap();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                "src",
+                "public/foo",
+                test_helpers::requester(owner),
+                None,
+            ),
+            data: b"public-foo",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    coord
+        .put_bucket_tags(&PutBucketConfigRequest {
+            bucket: bucket_request_with_expected_owner(
+                "src",
+                test_helpers::requester(owner),
+                None,
+            ),
+            config:
+                "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+        })
+        .unwrap();
+    coord
+        .put_bucket_abac(&PutBucketAbacRequest {
+            bucket: bucket_request_with_expected_owner("src", test_helpers::requester(owner), None),
+            enabled: true,
+        })
+        .unwrap();
+    put_bucket_policy_test(
+        &coord,
+        "src",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::src/*","Condition":{"StringEquals":{"s3:BucketTag/security":"public"}}}]}"#,
+        test_helpers::requester(owner),
+        None,
+    )
+    .unwrap();
+
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(
+                "dst",
+                "copied",
+                test_helpers::requester(requester),
+                None,
+            ),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let copied_part = coord
+        .upload_part_copy(&UploadPartCopyRequest {
+            source: copy_source("src", "public/foo", None),
+            upload: multipart_object_request_with_expected_owner(
+                "dst",
+                "copied",
+                &upload.upload_id,
+                test_helpers::requester(requester),
+                None,
+            ),
+            part_number: 1,
+            copy_source_range: None,
+            source_sse_customer: None,
+            sse_customer: None,
+        })
+        .unwrap();
+    assert!(!copied_part.etag.is_empty());
+
+    coord
+        .put_bucket_tags_for_tag_resource(&PutBucketTagControlRequest {
+            control: BucketTagControlRequest {
+                bucket: bucket_request_with_expected_owner(
+                    "src",
+                    test_helpers::requester(owner),
+                    None,
+                ),
+                account_id: owner,
+            },
+            config:
+                "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
+        })
+        .unwrap();
+
+    let denied = coord
+        .upload_part_copy(&UploadPartCopyRequest {
+            source: copy_source("src", "public/foo", None),
+            upload: multipart_object_request_with_expected_owner(
+                "dst",
+                "copied",
+                &upload.upload_id,
+                test_helpers::requester(requester),
+                None,
+            ),
+            part_number: 2,
+            copy_source_range: None,
             source_sse_customer: None,
             sse_customer: None,
         })
