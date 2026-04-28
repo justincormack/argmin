@@ -1,6 +1,23 @@
 ## Coordinator / Storage Capability Refactor
 
-Status: in progress
+Status: completed
+
+This plan is archived as completed.
+
+The boundary and capability refactor work described here is complete. The
+remaining optimization-only follow-up that used to live here as Phase 11
+(policy residualization) and Phase 12 (lifecycle fast-path specialization) has
+been extracted to:
+
+- `plans/coordinator-storage-hot-path-optimization-plan.md`
+
+The original in-progress file has been retired so the remaining work is scoped
+only to those optimization stages.
+
+This archived document intentionally retains the full original plan text below
+for historical review context.
+
+## Archived Original Text
 
 This plan follows the now-completed PG serialization work in
 `plans/completed/pg-serialization-and-crc-verification.md` and the earlier
