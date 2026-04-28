@@ -129,6 +129,9 @@ Do not add broad matrix duplication until these smoke tests have found no gaps.
 - Moved public object ACL create/PutObjectAcl/header-grant cases from `object_crud_acl.rs` into `public_access_acl.rs`.
 - Moved bucket CreateBucket/recreate/header ACL cases from `bucket_crud.rs` into `bucket_acl.rs`.
 - Split public/anonymous header behavior from `headers.rs` into `public_access_headers.rs`, and moved bad ACL header coverage into `headers_acl.rs`.
+- Split anonymous public-write POST object behavior from `post_object.rs` into `public_access_post_object.rs`.
+- Split anonymous public bucket listing success cases from `bucket_list.rs` into `public_access_bucket_list.rs`; private anonymous-denied listing cases remain in `bucket_list.rs`.
+- Split public-bucket CORS actual request and presigned preflight coverage from `cors.rs` into `public_access_cors.rs`; private-bucket and ordinary CORS coverage remains in `cors.rs`.
 
 ## Verification Checklist
 
