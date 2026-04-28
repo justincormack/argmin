@@ -1,5 +1,4 @@
-use std::collections::HashSet;
-#[cfg(any(test, feature = "test-hooks"))]
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 
 use crate::*;
@@ -8,12 +7,7 @@ use crate::*;
 // the coordinator's storage dependency explicit at the cluster boundary.
 impl super::StorageCluster {
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn default_ec_shape(&self) -> EcShape {
-        self.single_node.default_ec_shape()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn pg_ids(&self) -> &[u32] {
+    pub fn test_pg_ids(&self) -> &[u32] {
         self.single_node.pg_ids()
     }
 
@@ -48,6 +42,31 @@ impl super::StorageCluster {
         request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
         self.single_node.load_bucket_snapshot(bucket, request)
+    }
+
+    pub fn load_available_bucket_execution_generation_batches(
+        &self,
+        buckets: &[BucketName],
+    ) -> Vec<(Vec<BucketName>, HashMap<BucketName, u64>)> {
+        let mut buckets_by_pg = HashMap::<u32, Vec<BucketName>>::new();
+        for bucket in buckets {
+            buckets_by_pg
+                .entry(self.single_node.bucket_pg_id_for(bucket))
+                .or_default()
+                .push(bucket.clone());
+        }
+
+        let mut batches = Vec::new();
+        for (pg_id, buckets) in buckets_by_pg {
+            let Ok(generations) = self
+                .single_node
+                .load_bucket_execution_generations_for_pg(pg_id, &buckets)
+            else {
+                continue;
+            };
+            batches.push((buckets, generations));
+        }
+        batches
     }
 
     pub fn with_bucket_write_snapshot<T, E>(
@@ -538,12 +557,10 @@ impl super::StorageCluster {
         self.single_node.try_take_reclaim_work()
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
     pub fn wait_for_reclaim_work(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
         self.single_node.wait_for_reclaim_work(stop)
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
     pub fn wake_reclaim_workers(&self) {
         self.single_node.wake_reclaim_workers();
     }

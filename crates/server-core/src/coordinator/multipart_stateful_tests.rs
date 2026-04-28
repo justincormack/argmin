@@ -41,8 +41,8 @@ fn setup_coordinator(dir: &Path) -> Coordinator {
 }
 
 fn setup_coordinator_with_shared_storage(storage_node: Arc<SharedStorageNode>) -> Coordinator {
-    let shared_caches = shared_caches_for_storage_node(&storage_node);
     let storage_cluster = StorageCluster::shared_single_node(storage_node);
+    let shared_caches = shared_caches_for_storage_cluster(&storage_cluster);
     Coordinator::new_with_shared_caches_and_lifecycle_sweeper_factory(
         storage_cluster,
         shared_caches,

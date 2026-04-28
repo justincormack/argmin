@@ -7,7 +7,7 @@ use std::time::Duration;
 use s3_types::BucketLifecycleConfiguration;
 use storage::{
     BucketInfo, BucketName, EcShape, GenerationId, ObjectEncryption, ObjectKey,
-    SegmentStoredBytesRequest, SharedStorageNode, StorageCluster, UploadId, UploadState, VersionId,
+    SegmentStoredBytesRequest, StorageCluster, UploadId, UploadState, VersionId,
 };
 
 use super::payload::SharedPayloadBuffer;
@@ -33,7 +33,7 @@ static LIFECYCLE_SWEEPER_REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<LifecycleS
 
 /// The coordinator ties together EC, storage, and metadata.
 pub(super) struct ReclaimSweeper {
-    pub(super) storage_node: Arc<SharedStorageNode>,
+    pub(super) storage_node: Arc<StorageCluster>,
     pub(super) stop: Arc<AtomicBool>,
     pub(super) handle: Option<JoinHandle<()>>,
 }
@@ -84,7 +84,7 @@ impl LifecycleSweeper {
             lock_mutex_unpoisoned(registry);
         registry.retain(|_, sweeper| sweeper.upgrade().is_some());
 
-        let key = storage_cluster.single_node_compat_key();
+        let key = storage_cluster.process_local_registry_key();
         if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
             return Ok(existing);
         }

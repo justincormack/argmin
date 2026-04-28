@@ -2335,6 +2335,93 @@ fn production_constructors_share_bucket_fast_path_cache_across_coordinators() {
 }
 
 #[test]
+fn bucket_fast_path_watcher_survives_first_compat_cluster_handle_drop() {
+    let tmp = test_util::tempdir();
+    let bucket = "bucket-fast-path-watch-first-handle-drop";
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+    let admin = setup_direct_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let reader = setup_direct_coordinator_with_shared_storage(Arc::clone(&storage_node));
+
+    admin
+        .create_bucket_for_owner("111122223333", bucket, false)
+        .unwrap();
+    put_bucket_ownership_controls_test(
+        &admin,
+        bucket,
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+    put_bucket_policy_test(
+        &admin,
+        bucket,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket-fast-path-watch-first-handle-drop/*"}]}"#,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+    test_helpers::put_object(
+        &admin,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                bucket,
+                "key",
+                test_helpers::requester("111122223333"),
+                None,
+            ),
+            data: b"data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    reader
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "key",
+                None,
+                test_helpers::requester("444455556666"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    let bucket_name = trusted_bucket_name(bucket);
+    assert_eq!(
+        reader.bucket_fast_path_is_fresh_for_test(&bucket_name),
+        Some(true)
+    );
+
+    drop(admin);
+    storage_node
+        .delete_bucket_subresource_and_load_info(
+            &bucket_name,
+            storage::BucketSubresourceKind::Policy,
+        )
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    while reader.bucket_fast_path_is_fresh_for_test(&bucket_name) != Some(false) {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "bucket fast path watcher stopped after first compatibility cluster handle was dropped"
+        );
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn bucket_fast_path_watcher_observes_direct_storage_policy_mutation() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-fast-path-watch-direct-policy";
@@ -4069,7 +4156,7 @@ fn ec_degraded_read_reuses_reconstruction_scratch() {
     delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj-reconstruct", 0);
 
     assert_eq!(coord.payload_buffer_pool.allocation_count(), 0);
-    let ec = coord.storage_node.default_ec_shape();
+    let ec = coord.storage_node.default_payload_ec_shape();
     assert_eq!(coord.storage_node.test_ec_scratch_allocation_count(ec), 1);
 
     let first = coord

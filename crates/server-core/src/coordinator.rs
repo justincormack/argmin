@@ -25,10 +25,12 @@ use storage::ObjectLockState;
 #[cfg(test)]
 use storage::ShardKey;
 #[cfg(test)]
+use storage::SharedStorageNode;
+#[cfg(test)]
 use storage::SimplePayloadReclaimRecord;
 #[cfg(test)]
 use storage::{BucketEncryptionConfig, EffectiveBucketEncryptionConfig, ObjectLayout};
-use storage::{BucketName, ObjectKey, SharedStorageNode, StorageCluster};
+use storage::{BucketName, ObjectKey, StorageCluster};
 #[cfg(test)]
 use storage::{
     BucketObjectLockConfig, BucketOwnershipControls, BucketState, CreateStreamUploadReq, EcShape,
@@ -368,33 +370,24 @@ fn shared_caches_for_storage_cluster(
         Mutex<HashMap<usize, Weak<CoordinatorSharedCaches>>>,
     > = OnceLock::new();
 
-    let key = storage_cluster.single_node_compat_key();
+    let key = storage_cluster.process_local_registry_key();
     let registry = SHARED_COORDINATOR_CACHES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = lock_mutex_unpoisoned(registry);
     if let Some(existing) = guard.get(&key).and_then(Weak::upgrade) {
         return existing;
     }
     let shared = Arc::new(CoordinatorSharedCaches::default());
-    spawn_bucket_fast_path_watcher(&shared, storage_cluster.single_node_compat_handle());
+    spawn_bucket_fast_path_watcher(&shared, storage_cluster);
     guard.insert(key, Arc::downgrade(&shared));
     shared
 }
 
-#[cfg(test)]
-fn shared_caches_for_storage_node(
-    storage_node: &Arc<SharedStorageNode>,
-) -> Arc<CoordinatorSharedCaches> {
-    shared_caches_for_storage_cluster(&StorageCluster::shared_single_node(Arc::clone(
-        storage_node,
-    )))
-}
-
 fn spawn_bucket_fast_path_watcher(
     shared: &Arc<CoordinatorSharedCaches>,
-    storage_node: &Arc<SharedStorageNode>,
+    storage_cluster: &Arc<StorageCluster>,
 ) {
     let shared = Arc::downgrade(shared);
-    let storage_node = Arc::downgrade(storage_node);
+    let storage_cluster = Arc::clone(storage_cluster);
     std::thread::Builder::new()
         .name("argmin-bucket-fast-path-watch".to_string())
         .spawn(move || loop {
@@ -404,27 +397,14 @@ fn spawn_bucket_fast_path_watcher(
             let Some(shared) = shared.upgrade() else {
                 break;
             };
-            let Some(storage_node) = storage_node.upgrade() else {
-                break;
-            };
             let buckets =
                 { read_rwlock_unpoisoned(&shared.bucket_fast_path).snapshot_bucket_names() };
             if buckets.is_empty() {
                 continue;
             }
-            let mut buckets_by_pg = HashMap::<u32, Vec<BucketName>>::new();
-            for bucket in buckets {
-                buckets_by_pg
-                    .entry(storage_node.bucket_pg_id_for(&bucket))
-                    .or_default()
-                    .push(bucket);
-            }
-            for (pg_id, buckets) in buckets_by_pg {
-                let generations =
-                    match storage_node.load_bucket_execution_generations_for_pg(pg_id, &buckets) {
-                        Ok(generations) => generations,
-                        Err(_) => continue,
-                    };
+            for (buckets, generations) in
+                storage_cluster.load_available_bucket_execution_generation_batches(&buckets)
+            {
                 let mut cache = write_rwlock_unpoisoned(&shared.bucket_fast_path);
                 for bucket in buckets {
                     match generations.get(&bucket) {

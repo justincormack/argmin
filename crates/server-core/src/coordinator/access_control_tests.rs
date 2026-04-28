@@ -3680,7 +3680,14 @@ fn lifecycle_sweeper_drops_with_last_coordinator() {
     drop(coord);
 
     assert!(lifecycle_sweeper.upgrade().is_none());
-    assert!(storage_node.upgrade().is_none());
+    let start = std::time::Instant::now();
+    while storage_node.upgrade().is_some() {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "storage cluster stayed alive after shared-cache watcher shutdown"
+        );
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 #[test]

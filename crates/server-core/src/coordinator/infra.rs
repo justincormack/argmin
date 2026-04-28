@@ -322,7 +322,7 @@ impl Coordinator {
         F: FnOnce(&Arc<StorageCluster>, ReadRuntime) -> Result<Arc<LifecycleSweeper>, ServerError>,
     {
         #[cfg(test)]
-        let pg_topology = PgTopology::new(storage_cluster.pg_ids()).map_err(|reason| {
+        let pg_topology = PgTopology::new(storage_cluster.test_pg_ids()).map_err(|reason| {
             ServerError::InternalError {
                 reason: reason.to_string(),
             }
@@ -339,7 +339,7 @@ impl Coordinator {
         };
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
-        let worker_node = Arc::clone(storage_cluster.single_node_compat_handle());
+        let worker_node = Arc::clone(&storage_cluster);
         let reclaim_runtime = read_runtime.clone();
         let handle = std::thread::Builder::new()
             .name("argmin-reclaim".to_string())
@@ -363,7 +363,7 @@ impl Coordinator {
                 reason: format!("failed to start reclaim worker: {e}"),
             })?;
         let lifecycle_sweeper = lifecycle_sweeper_factory(&storage_cluster, read_runtime.clone())?;
-        let sweeper_storage_node = Arc::clone(storage_cluster.single_node_compat_handle());
+        let sweeper_storage_node = Arc::clone(&storage_cluster);
         Ok(Self {
             storage_node: storage_cluster,
             shared_caches,
@@ -384,7 +384,7 @@ impl Coordinator {
         ReadRuntime {
             storage_node: Arc::clone(&self.storage_node),
             #[cfg(test)]
-            pg_topology: PgTopology::new(self.storage_node.pg_ids())
+            pg_topology: PgTopology::new(self.storage_node.test_pg_ids())
                 .expect("coordinator storage node should expose a valid PG topology"),
             payload_buffer_pool: Arc::clone(&self.payload_buffer_pool),
             sse_c_validator: self.sse_c_validator.clone(),

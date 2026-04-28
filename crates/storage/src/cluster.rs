@@ -16,9 +16,8 @@ mod request_ops;
 ///
 /// Phase 1 keeps this backed by one local shared node so existing storage
 /// behavior remains unchanged while coordinator code stops owning the local
-/// implementation type directly. The single-node compatibility helpers are
-/// transitional and should remain limited to local background workers and cache
-/// registries until cluster-owned routing/lifecycle entry points exist.
+/// implementation type directly. Process-local identity remains based on the
+/// underlying local node until cluster-owned identity exists.
 #[derive(Clone)]
 pub struct StorageCluster {
     single_node: Arc<SharedStorageNode>,
@@ -33,11 +32,11 @@ impl StorageCluster {
         Arc::new(Self::single_node(single_node))
     }
 
-    pub fn single_node_compat_handle(&self) -> &Arc<SharedStorageNode> {
-        &self.single_node
-    }
-
-    pub fn single_node_compat_key(&self) -> usize {
+    /// Temporary process-local registry key for shared coordinator workers.
+    ///
+    /// Multiple `StorageCluster` handles backed by the same local node keep
+    /// sharing process-local workers until a real cluster identity exists.
+    pub fn process_local_registry_key(&self) -> usize {
         Arc::as_ptr(&self.single_node) as usize
     }
 

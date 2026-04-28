@@ -400,16 +400,19 @@ Phase 1 implementation notes:
    - it is currently backed by one `Arc<SharedStorageNode>`
    - it deliberately preserves the existing single-node behavior
    - transparent `Deref` delegation to `SharedStorageNode` has been removed
-   - it exposes `single_node_compat_*` helpers for background workers and cache
-     registries that still share local-node state
-   - this is still a single-node implementation, not the final Phase 1 boundary
+   - process-local worker and cache registries use a cluster-owned local
+     registry key that still maps to the backing local node until a real cluster
+     identity exists
+   - this is still a single-node implementation, but coordinator production
+     paths no longer hold raw single-node handles for background workers
 2. `Coordinator` now owns an `Arc<StorageCluster>` internally.
    - existing `Coordinator::new` and `Coordinator::new_with_managed_key_provider`
      remain compatibility shims from `Arc<SharedStorageNode>`
    - new cluster-shaped constructors accept `Arc<StorageCluster>`
-   - read runtime carries the cluster handle, but cache and lifecycle registries
-     still use the single-node compatibility key until a real opaque cluster
-     identity exists
+   - read runtime, reclaim workers, lifecycle registries, and bucket fast-path
+     watchers all carry cluster handles
+   - cache and lifecycle registries still intentionally share state for handles
+     backed by the same local node until a real opaque cluster identity exists
 3. `argmin-s3` now builds one explicit `StorageCluster` and shares that across
    worker coordinators.
 4. explicit request APIs on `StorageCluster` now cover the coordinator
@@ -423,10 +426,10 @@ Phase 1 implementation notes:
    - authorization snapshot loaders
    - multipart state transitions
    - lifecycle and reclaim operations
-5. cluster compatibility wrappers also expose existing coordinator test hooks so
-   tests no longer depend on transparent local-node delegation. These helpers
-   should be narrowed or replaced with behavior-shaped cluster test utilities as
-   multi-node coverage is added.
+5. cluster compatibility wrappers also expose existing coordinator test hooks
+   with `test_*` names so tests no longer depend on transparent local-node
+   delegation. These helpers should be narrowed or replaced with
+   behavior-shaped cluster test utilities as multi-node coverage is added.
 6. No request routing, placement, PG ownership, or distributed behavior has
    changed yet.
 
