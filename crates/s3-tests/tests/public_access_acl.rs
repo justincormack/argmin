@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::ObjectCannedAcl;
-use s3_tests::CTX;
+use s3_tests::{content_md5_header, CTX};
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
 fn agent() -> s3_tests::Agent {
@@ -80,6 +80,25 @@ async fn anon_put_status_eventually(
         );
     }
     unreachable!()
+}
+
+fn anonymous_get(url: &str) -> (u16, String) {
+    let mut resp = agent().get(url).call().expect("transport error");
+    let status = resp.status().as_u16();
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    (status, body)
+}
+
+fn anonymous_put(url: &str, body: &[u8], headers: &[(String, String)]) -> (u16, String) {
+    let request = headers
+        .iter()
+        .fold(agent().put(url), |request, (name, value)| {
+            request.header(name, value)
+        });
+    let mut resp = request.send(body).expect("transport error");
+    let status = resp.status().as_u16();
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    (status, body)
 }
 
 /// Create a public-read bucket, returning its name.
@@ -359,5 +378,125 @@ fn test_anon_put_bucket_acl_public_write_bucket_fail() {
         );
 
         cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_public_read_object_does_not_make_get_object_tagging_public() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_public_bucket().await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .acl(ObjectCannedAcl::PublicRead)
+            .tagging("env=public")
+            .body(ByteStream::from_static(b"hello"))
+            .send()
+            .await
+            .unwrap();
+
+        let url = format!("{}/{}/obj?tagging", CTX.endpoint(), bucket);
+        let mut resp = agent().get(&url).call().expect("transport error");
+        assert_eq!(
+            resp.status().as_u16(),
+            403,
+            "expected anonymous GetObjectTagging to be denied for public-read object, got {}",
+            resp.status().as_u16()
+        );
+
+        let body = resp.body_mut().read_to_string().unwrap();
+        assert!(
+            body.contains("AccessDenied"),
+            "expected AccessDenied response body, got {body}"
+        );
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_anonymous_public_write_object_get_object_tagging_behavior() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_public_write_bucket().await;
+        let key = "anonymous-owner-tagging";
+        let object_url = format!("{}/{bucket}/{key}", CTX.endpoint());
+        let tagging_url = format!("{object_url}?tagging");
+
+        let put = anonymous_put(&object_url, b"hello", &[]);
+        assert_eq!(put.0, 200, "unexpected anonymous PUT body: {}", put.1);
+
+        let owner_view = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert!(owner_view.tag_set().is_empty());
+
+        let anonymous_get = anonymous_get(&tagging_url);
+
+        cleanup(&bucket, &[key]).await;
+
+        assert_eq!(
+            anonymous_get.0, 403,
+            "unexpected anonymous GetObjectTagging body={}",
+            anonymous_get.1
+        );
+        assert!(
+            anonymous_get.1.contains("AccessDenied"),
+            "unexpected anonymous GetObjectTagging body={}",
+            anonymous_get.1
+        );
+    });
+}
+
+#[test]
+fn test_anonymous_public_write_object_put_object_tagging_behavior() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_public_write_bucket().await;
+        let key = "anonymous-owner-put-tagging";
+        let object_url = format!("{}/{bucket}/{key}", CTX.endpoint());
+        let tagging_url = format!("{object_url}?tagging");
+
+        let put = anonymous_put(&object_url, b"hello", &[]);
+        assert_eq!(put.0, 200, "unexpected anonymous PUT body: {}", put.1);
+
+        let tagging_body =
+            br#"<Tagging><TagSet><Tag><Key>env</Key><Value>anon</Value></Tag></TagSet></Tagging>"#;
+        let tagging_put = anonymous_put(
+            &tagging_url,
+            tagging_body,
+            &[content_md5_header(tagging_body)],
+        );
+
+        let owner_view = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await;
+
+        cleanup(&bucket, &[key]).await;
+
+        assert_eq!(
+            tagging_put.0, 403,
+            "unexpected anonymous PutObjectTagging body={}",
+            tagging_put.1
+        );
+        assert!(
+            tagging_put.1.contains("AccessDenied"),
+            "unexpected anonymous PutObjectTagging body={}",
+            tagging_put.1
+        );
+        assert!(
+            owner_view.unwrap().tag_set().is_empty(),
+            "anonymous PutObjectTagging should not write tags"
+        );
     });
 }
