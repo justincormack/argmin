@@ -127,6 +127,7 @@ Do not add broad matrix duplication until these smoke tests have found no gaps.
 - Split bucket/object ACL checksum subresource tests from `request_checksums.rs` into `request_checksums_acl.rs`.
 - Split object ACL CRUD, canned ACL, explicit grant, and cross-account object ACL matrix coverage from `object_crud.rs` into `object_crud_acl.rs`.
 - Moved public object ACL create/PutObjectAcl/header-grant cases from `object_crud_acl.rs` into `public_access_acl.rs`.
+- Moved bucket CreateBucket/recreate/header ACL cases from `bucket_crud.rs` into `bucket_acl.rs`.
 
 ## Verification Checklist
 

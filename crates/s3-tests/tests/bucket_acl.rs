@@ -16,6 +16,19 @@ const ALL_USERS_GROUP_URI: &str = "http://acs.amazonaws.com/groups/global/AllUse
 const AUTHENTICATED_USERS_GROUP_URI: &str =
     "http://acs.amazonaws.com/groups/global/AuthenticatedUsers";
 
+fn assert_canonical_owner_id(id: &str) {
+    assert_eq!(
+        id.len(),
+        64,
+        "expected 64-char canonical owner ID, got {id}"
+    );
+    assert!(
+        id.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "expected lowercase hex canonical owner ID, got {id}"
+    );
+}
+
 fn sdk_err_status<E: std::fmt::Debug>(err: &aws_sdk_s3::error::SdkError<E>) -> u16 {
     err.raw_response()
         .map(|response| response.status().as_u16())
@@ -59,6 +72,15 @@ async fn setup_acl_enabled_bucket() -> String {
         .await
         .unwrap();
     bucket
+}
+
+async fn setup_named_acl_enabled_bucket(client: &aws_sdk_s3::Client, bucket: &str) {
+    s3_tests::create_bucket_request(client, bucket)
+        .object_ownership(ObjectOwnership::ObjectWriter)
+        .send()
+        .await
+        .unwrap();
+    disable_bucket_public_access_block(client, bucket).await;
 }
 
 async fn cleanup(bucket: &str) {
@@ -110,6 +132,18 @@ fn has_grant(
                 .grantee()
                 .is_some_and(|grantee| grantee.id() == canonical_user_id && grantee.uri() == uri)
     })
+}
+
+fn has_canonical_user_grant(
+    grants: &[Grant],
+    canonical_user_id: &str,
+    permission: Permission,
+) -> bool {
+    has_grant(grants, permission, Some(canonical_user_id), None)
+}
+
+fn has_group_grant(grants: &[Grant], uri: &str, permission: Permission) -> bool {
+    has_grant(grants, permission, None, Some(uri))
 }
 
 fn assert_exact_grants(
@@ -313,6 +347,278 @@ async fn assert_alt_put_bucket_acl_denied(bucket: &str) {
         .send()
         .await;
     assert_eq!(err_status(&result), 403);
+}
+
+#[test]
+fn test_bucket_recreate_overwrite_acl() {
+    run_bucket_acl_test(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+
+        setup_named_acl_enabled_bucket(client, &bucket).await;
+        client
+            .put_bucket_acl()
+            .bucket(&bucket)
+            .acl(BucketCannedAcl::PublicRead)
+            .send()
+            .await
+            .unwrap();
+
+        let result = s3_tests::create_bucket_request(client, &bucket)
+            .send()
+            .await;
+
+        let acl = client
+            .get_bucket_acl()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let owner_id = acl
+            .owner()
+            .and_then(|owner| owner.id())
+            .expect("expected owner ID in GetBucketAcl");
+        if CTX.region() == "us-east-1" {
+            result.unwrap();
+            assert_eq!(acl.grants().len(), 1);
+            assert!(has_canonical_user_grant(
+                acl.grants(),
+                owner_id,
+                Permission::FullControl
+            ));
+            assert!(!has_group_grant(
+                acl.grants(),
+                ALL_USERS_GROUP_URI,
+                Permission::Read
+            ));
+        } else {
+            assert_eq!(err_status(&result), 409);
+            assert_s3_err_code(&result, "BucketAlreadyOwnedByYou");
+            assert_eq!(acl.grants().len(), 2);
+            assert!(has_group_grant(
+                acl.grants(),
+                ALL_USERS_GROUP_URI,
+                Permission::Read
+            ));
+        }
+
+        cleanup(&bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_recreate_new_acl() {
+    run_bucket_acl_test(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+
+        setup_named_acl_enabled_bucket(client, &bucket).await;
+
+        let result = s3_tests::create_bucket_request(client, &bucket)
+            .acl(BucketCannedAcl::PublicRead)
+            .object_ownership(ObjectOwnership::ObjectWriter)
+            .send()
+            .await;
+
+        let acl = client
+            .get_bucket_acl()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let owner_id = acl
+            .owner()
+            .and_then(|owner| owner.id())
+            .expect("expected owner ID in GetBucketAcl");
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidBucketAclWithBlockPublicAccessError");
+        assert_eq!(acl.grants().len(), 1);
+        assert!(has_canonical_user_grant(
+            acl.grants(),
+            owner_id,
+            Permission::FullControl
+        ));
+        assert!(!has_group_grant(
+            acl.grants(),
+            ALL_USERS_GROUP_URI,
+            Permission::Read
+        ));
+
+        cleanup(&bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_create_public_read_acl_rejected() {
+    run_bucket_acl_test(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+
+        let result = s3_tests::create_bucket_request(client, &bucket)
+            .acl(BucketCannedAcl::PublicRead)
+            .object_ownership(ObjectOwnership::ObjectWriter)
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidBucketAclWithBlockPublicAccessError");
+    });
+}
+
+#[test]
+fn test_bucket_recreate_new_header_grants() {
+    run_bucket_acl_test(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+
+        setup_named_acl_enabled_bucket(client, &bucket).await;
+        let owner_id = bucket_owner_id(&bucket).await;
+        let alt_owner_id = alt_canonical_owner_id().await;
+
+        let result = s3_tests::create_bucket_request(client, &bucket)
+            .object_ownership(ObjectOwnership::ObjectWriter)
+            .customize()
+            .mutate_request({
+                let owner_id = owner_id.clone();
+                let alt_owner_id = alt_owner_id.clone();
+                move |req| {
+                    let headers = req.headers_mut();
+                    headers.insert("x-amz-grant-full-control", format!("id={owner_id}"));
+                    headers.insert("x-amz-grant-read", format!("id={alt_owner_id}"));
+                }
+            })
+            .send()
+            .await;
+
+        let acl = client
+            .get_bucket_acl()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        if CTX.region() == "us-east-1" {
+            result.unwrap();
+            assert_eq!(acl.grants().len(), 2);
+            assert!(has_canonical_user_grant(
+                acl.grants(),
+                &owner_id,
+                Permission::FullControl
+            ));
+            assert!(has_canonical_user_grant(
+                acl.grants(),
+                &alt_owner_id,
+                Permission::Read
+            ));
+        } else {
+            assert_eq!(err_status(&result), 409);
+            assert_s3_err_code(&result, "BucketAlreadyOwnedByYou");
+            assert_eq!(acl.grants().len(), 1);
+            assert!(has_canonical_user_grant(
+                acl.grants(),
+                &owner_id,
+                Permission::FullControl
+            ));
+            assert!(!has_canonical_user_grant(
+                acl.grants(),
+                &alt_owner_id,
+                Permission::Read
+            ));
+        }
+
+        cleanup(&bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_header_acl_grants() {
+    run_bucket_acl_test(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let alt_owner_id = alt_canonical_owner_id().await;
+        assert_canonical_owner_id(&alt_owner_id);
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket_request(client, &bucket)
+            .object_ownership(ObjectOwnership::ObjectWriter)
+            .customize()
+            .mutate_request({
+                let alt_owner_id = alt_owner_id.clone();
+                move |req| {
+                    let headers = req.headers_mut();
+                    headers.insert("x-amz-grant-read", format!("id={alt_owner_id}"));
+                    headers.insert("x-amz-grant-write", format!("id={alt_owner_id}"));
+                    headers.insert("x-amz-grant-read-acp", format!("id={alt_owner_id}"));
+                    headers.insert("x-amz-grant-write-acp", format!("id={alt_owner_id}"));
+                    headers.insert("x-amz-grant-full-control", format!("id={alt_owner_id}"));
+                }
+            })
+            .send()
+            .await
+            .unwrap();
+
+        let acl = client
+            .get_bucket_acl()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let owner_id = acl
+            .owner()
+            .and_then(|owner| owner.id())
+            .expect("expected owner ID in GetBucketAcl");
+        assert_canonical_owner_id(owner_id);
+        let grants = acl.grants();
+        assert_eq!(
+            grants.len(),
+            5,
+            "expected exact alternate-user grants without implicit owner FULL_CONTROL, got {grants:?}"
+        );
+        assert!(
+            has_canonical_user_grant(grants, &alt_owner_id, Permission::Read),
+            "expected READ grant for alternate owner in {grants:?}"
+        );
+        assert!(
+            has_canonical_user_grant(grants, &alt_owner_id, Permission::Write),
+            "expected WRITE grant for alternate owner in {grants:?}"
+        );
+        assert!(
+            has_canonical_user_grant(grants, &alt_owner_id, Permission::ReadAcp),
+            "expected READ_ACP grant for alternate owner in {grants:?}"
+        );
+        assert!(
+            has_canonical_user_grant(grants, &alt_owner_id, Permission::WriteAcp),
+            "expected WRITE_ACP grant for alternate owner in {grants:?}"
+        );
+        assert!(
+            has_canonical_user_grant(grants, &alt_owner_id, Permission::FullControl),
+            "expected FULL_CONTROL grant for alternate owner in {grants:?}"
+        );
+        assert!(
+            !has_canonical_user_grant(grants, owner_id, Permission::FullControl),
+            "did not expect implicit owner FULL_CONTROL grant in {grants:?}"
+        );
+
+        alt_client
+            .get_bucket_acl()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key("granted-key")
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(
+                b"granted-write",
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        cleanup_object_if_present(&bucket, "granted-key").await;
+        cleanup(&bucket).await;
+    });
 }
 
 /// Verify default ACL on a new bucket: owner gets FULL_CONTROL only.
