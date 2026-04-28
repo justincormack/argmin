@@ -124,6 +124,7 @@ Do not add broad matrix duplication until these smoke tests have found no gaps.
 - Moved explicit public-write ACL multipart access checks from `multipart.rs` into `public_access_acl.rs`; cross-account multipart ownership/admin ACL cases remain in `multipart.rs` pending a later `multipart_acl.rs` split.
 - Split remaining multipart ACL ownership/admin cases into `multipart_acl.rs`, and moved the public-read multipart ACL anonymous GET case into `public_access_acl.rs`.
 - Split CopyObject ACL coverage by mechanism: cross-account ObjectWriter ACL copy behavior moved to `copy_object_acl.rs`, public-read CopyObject ACL behavior moved to `public_access_acl.rs`, and BlockPublicAcls CopyObject rejection moved to `public_access_block_acl.rs`.
+- Split bucket/object ACL checksum subresource tests from `request_checksums.rs` into `request_checksums_acl.rs`.
 
 ## Verification Checklist
 

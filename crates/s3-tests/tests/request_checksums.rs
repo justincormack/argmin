@@ -146,29 +146,6 @@ async fn bucket_owner_id(bucket: &str) -> String {
         .to_string()
 }
 
-async fn object_owner_id(bucket: &str, key: &str) -> String {
-    CTX.client()
-        .get_object_acl()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await
-        .unwrap()
-        .owner()
-        .and_then(|owner| owner.id())
-        .unwrap()
-        .to_string()
-}
-
-fn canonical_user_full_control_acl_xml(owner_id: &str) -> String {
-    format!(
-        "<AccessControlPolicy><Owner><ID>{owner_id}</ID></Owner><AccessControlList>\
-         <Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\">\
-         <ID>{owner_id}</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant>\
-         </AccessControlList></AccessControlPolicy>"
-    )
-}
-
 fn valid_bucket_policy_json(bucket: &str) -> String {
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Sid\":\"AllowOwnerList\",\"Effect\":\"Allow\",\"Principal\":{{\"AWS\":\"arn:aws:iam::{}:root\"}},\"Action\":\"s3:ListBucket\",\"Resource\":\"arn:aws:s3:::{}\"}}]}}",
@@ -371,46 +348,6 @@ fn test_bucket_subresource_request_checksum_matrix() {
 }
 
 #[test]
-fn test_bucket_acl_checksum_requirements() {
-    s3_tests::run(async {
-        let bucket =
-            create_bucket_in_test_region(Some(ObjectOwnership::BucketOwnerPreferred), false).await;
-        let url = format!("{}/{}?acl", CTX.endpoint(), bucket);
-        let owner_id = bucket_owner_id(&bucket).await;
-        let body = canonical_user_full_control_acl_xml(&owner_id);
-
-        assert_request_succeeds("PutBucketAcl XML", "PUT", &url, body.as_bytes(), &[]);
-        let md5_headers = [content_md5_header(body.as_bytes())];
-        assert_request_succeeds(
-            "PutBucketAcl XML",
-            "PUT",
-            &url,
-            body.as_bytes(),
-            &md5_headers,
-        );
-        let sdk_headers = sdk_checksum_headers(body.as_bytes());
-        assert_request_succeeds(
-            "PutBucketAcl XML",
-            "PUT",
-            &url,
-            body.as_bytes(),
-            &sdk_headers,
-        );
-
-        let header_only_headers = vec![("x-amz-acl".to_string(), "private".to_string())];
-        assert_request_succeeds(
-            "PutBucketAcl header-only",
-            "PUT",
-            &url,
-            b"",
-            &header_only_headers,
-        );
-
-        cleanup_bucket(&bucket).await;
-    });
-}
-
-#[test]
 fn test_object_subresource_request_checksum_matrix() {
     s3_tests::run(async {
         let key = "obj";
@@ -526,56 +463,6 @@ fn test_object_subresource_request_checksum_matrix() {
             &sdk_headers,
         );
         cleanup_object_lock_bucket_with_version(&bucket, key, &version_id).await;
-    });
-}
-
-#[test]
-fn test_object_acl_checksum_requirements() {
-    s3_tests::run(async {
-        let bucket =
-            create_bucket_in_test_region(Some(ObjectOwnership::BucketOwnerPreferred), false).await;
-        let key = "obj";
-        CTX.client()
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"hello"))
-            .send()
-            .await
-            .unwrap();
-
-        let acl_url = format!("{}/{}/{}?acl", CTX.endpoint(), bucket, key);
-        let owner_id = object_owner_id(&bucket, key).await;
-        let body = canonical_user_full_control_acl_xml(&owner_id);
-
-        assert_request_succeeds("PutObjectAcl XML", "PUT", &acl_url, body.as_bytes(), &[]);
-        let md5_headers = [content_md5_header(body.as_bytes())];
-        assert_request_succeeds(
-            "PutObjectAcl XML",
-            "PUT",
-            &acl_url,
-            body.as_bytes(),
-            &md5_headers,
-        );
-        let sdk_headers = sdk_checksum_headers(body.as_bytes());
-        assert_request_succeeds(
-            "PutObjectAcl XML",
-            "PUT",
-            &acl_url,
-            body.as_bytes(),
-            &sdk_headers,
-        );
-
-        let header_only_headers = vec![("x-amz-acl".to_string(), "private".to_string())];
-        assert_request_succeeds(
-            "PutObjectAcl header-only",
-            "PUT",
-            &acl_url,
-            b"",
-            &header_only_headers,
-        );
-
-        cleanup_bucket_with_keys(&bucket, &[key]).await;
     });
 }
 
