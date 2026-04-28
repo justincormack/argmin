@@ -13,9 +13,10 @@ use aws_sdk_s3::operation::put_bucket_lifecycle_configuration::{
 };
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    BlockedEncryptionTypes, BucketLifecycleConfiguration, BucketLocationConstraint,
-    CreateBucketConfiguration, Delete, EncryptionType, ServerSideEncryption,
-    ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
+    BlockedEncryptionTypes, BucketCannedAcl, BucketLifecycleConfiguration,
+    BucketLocationConstraint, CreateBucketConfiguration, Delete, EncryptionType, ObjectOwnership,
+    ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
+    ServerSideEncryptionRule,
 };
 use aws_sdk_s3::Client;
 use base64::Engine;
@@ -109,6 +110,61 @@ async fn create_test_bucket(client: &Client, bucket: &str) {
         );
     }
     request.send().await.expect("create bucket");
+}
+
+async fn create_test_bucket_with_ownership(
+    client: &Client,
+    bucket: &str,
+    ownership: ObjectOwnership,
+) {
+    let mut request = client
+        .create_bucket()
+        .bucket(bucket)
+        .object_ownership(ownership);
+    if CTX.region() != "us-east-1" {
+        request = request.create_bucket_configuration(
+            CreateBucketConfiguration::builder()
+                .location_constraint(BucketLocationConstraint::from(CTX.region()))
+                .build(),
+        );
+    }
+    request.send().await.expect("create bucket with ownership");
+}
+
+/// Create a bucket through the default S3 ownership path.
+///
+/// Current AWS behavior and this server's frontend default new buckets to
+/// `BucketOwnerEnforced` when `x-amz-object-ownership` is absent. Use this
+/// helper when a test intentionally exercises the modern BOE path.
+pub async fn create_boe_bucket(client: &Client) -> String {
+    let bucket = unique_bucket();
+    create_test_bucket(client, &bucket).await;
+    bucket
+}
+
+/// Create a bucket with an explicit object ownership mode.
+pub async fn create_bucket_with_ownership(client: &Client, ownership: ObjectOwnership) -> String {
+    let bucket = unique_bucket();
+    create_test_bucket_with_ownership(client, &bucket, ownership).await;
+    bucket
+}
+
+/// Create a bucket in legacy ACL mode and disable bucket-level public access block.
+///
+/// This helper is for tests that intentionally exercise ACL authorization. It
+/// accepts `ObjectWriter` and `BucketOwnerPreferred`, but rejects BOE because
+/// BOE disables ACL writes by design.
+pub async fn create_acl_enabled_bucket(client: &Client, ownership: ObjectOwnership) -> String {
+    assert!(
+        matches!(
+            ownership,
+            ObjectOwnership::ObjectWriter | ObjectOwnership::BucketOwnerPreferred
+        ),
+        "ACL-enabled test buckets must use ObjectWriter or BucketOwnerPreferred"
+    );
+    let bucket = create_bucket_with_ownership(client, ownership).await;
+    disable_bucket_public_access_block(client, &bucket).await;
+    bucket
 }
 
 async fn wait_for_bucket_public_access_block_disabled(client: &Client, bucket: &str) {
@@ -269,34 +325,8 @@ pub async fn create_objects_with_keys(client: &Client, keys: &[&str]) -> (String
 /// account-level BlockPublicAccess (if enabled) can still override
 /// bucket-level settings and cause these calls to fail.
 pub async fn create_public_bucket(client: &Client) -> String {
-    use aws_sdk_s3::types::{BucketCannedAcl, ObjectOwnership, OwnershipControlsRule};
+    let bucket = create_acl_enabled_bucket(client, ObjectOwnership::BucketOwnerPreferred).await;
 
-    let bucket = unique_bucket();
-
-    // 1. Create the bucket (private, default ownership)
-    create_test_bucket(client, &bucket).await;
-
-    // 2. Disable BlockPublicAccess on this bucket
-    disable_bucket_public_access_block(client, &bucket).await;
-
-    // 3. Set ownership to BucketOwnerPreferred (required to use canned ACLs)
-    let ownership_rule = OwnershipControlsRule::builder()
-        .object_ownership(ObjectOwnership::BucketOwnerPreferred)
-        .build()
-        .unwrap();
-    let ownership = aws_sdk_s3::types::OwnershipControls::builder()
-        .rules(ownership_rule)
-        .build()
-        .unwrap();
-    client
-        .put_bucket_ownership_controls()
-        .bucket(&bucket)
-        .ownership_controls(ownership)
-        .send()
-        .await
-        .expect("set ownership controls");
-
-    // 4. Apply public-read ACL
     client
         .put_bucket_acl()
         .bucket(&bucket)
@@ -313,29 +343,7 @@ pub async fn create_public_bucket(client: &Client) -> String {
 /// Disables bucket-level BlockPublicAccess, sets ObjectOwnership to
 /// BucketOwnerPreferred, then applies the public-read-write ACL.
 pub async fn create_public_write_bucket(client: &Client) -> String {
-    use aws_sdk_s3::types::{BucketCannedAcl, ObjectOwnership, OwnershipControlsRule};
-
-    let bucket = unique_bucket();
-
-    create_test_bucket(client, &bucket).await;
-
-    disable_bucket_public_access_block(client, &bucket).await;
-
-    let ownership_rule = OwnershipControlsRule::builder()
-        .object_ownership(ObjectOwnership::BucketOwnerPreferred)
-        .build()
-        .unwrap();
-    let ownership = aws_sdk_s3::types::OwnershipControls::builder()
-        .rules(ownership_rule)
-        .build()
-        .unwrap();
-    client
-        .put_bucket_ownership_controls()
-        .bucket(&bucket)
-        .ownership_controls(ownership)
-        .send()
-        .await
-        .expect("set ownership controls");
+    let bucket = create_acl_enabled_bucket(client, ObjectOwnership::BucketOwnerPreferred).await;
 
     client
         .put_bucket_acl()

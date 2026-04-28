@@ -1,9 +1,9 @@
 use aws_sdk_s3::types::{
     AccessControlPolicy, BucketCannedAcl, Grant, Grantee, ObjectCannedAcl, ObjectOwnership, Owner,
-    OwnershipControls, OwnershipControlsRule, Permission, Type,
+    Permission, Type,
 };
 use s3_tests::{
-    assert_s3_err_code, content_md5_header, disable_bucket_public_access_block, err_status,
+    assert_s3_err_code, content_md5_header, create_acl_enabled_bucket, err_status,
     send_signed_request, unique_bucket, CTX,
 };
 use std::time::Duration;
@@ -71,28 +71,7 @@ async fn cleanup(bucket: &str) {
 }
 
 async fn setup_acl_enabled_bucket() -> String {
-    let client = CTX.client();
-    let bucket = unique_bucket();
-    s3_tests::create_bucket(client, &bucket).await.unwrap();
-    disable_bucket_public_access_block(client, &bucket).await;
-    let rule = OwnershipControlsRule::builder()
-        .object_ownership(ObjectOwnership::ObjectWriter)
-        .build()
-        .unwrap();
-    let controls = OwnershipControls::builder().rules(rule).build().unwrap();
-    client
-        .put_bucket_ownership_controls()
-        .bucket(&bucket)
-        .ownership_controls(controls)
-        .send()
-        .await
-        .unwrap();
-    client
-        .get_bucket_ownership_controls()
-        .bucket(&bucket)
-        .send()
-        .await
-        .unwrap();
+    let bucket = create_acl_enabled_bucket(CTX.client(), ObjectOwnership::ObjectWriter).await;
     wait_for_bucket_ownership_controls(&bucket, ObjectOwnership::ObjectWriter).await;
     bucket
 }

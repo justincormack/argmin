@@ -7,7 +7,8 @@ pub mod server;
 pub use aws_sdk_s3;
 pub use helpers::{
     assert_s3_err_code, bucket_prefix, cleanup_versioned_bucket, content_md5_header,
-    copy_source_with_version, create_bucket_with_sse_c_enabled, create_objects,
+    copy_source_with_version, create_acl_enabled_bucket, create_boe_bucket,
+    create_bucket_with_ownership, create_bucket_with_sse_c_enabled, create_objects,
     create_objects_with_keys, create_public_bucket, create_public_write_bucket,
     delete_all_and_bucket, delete_objects_with_md5, disable_bucket_public_access_block,
     enable_bucket_sse_c, err_status, object_url, presign_url, presign_url_with_credentials,
