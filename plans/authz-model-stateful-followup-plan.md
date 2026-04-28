@@ -142,9 +142,13 @@ Acceptance criteria:
   - current-read authorization outcomes after transition-driven state changes
   - current-delete execution outcomes, including delete-marker vs non-marker
     results across versioning modes
-- Remaining gap: Phase 13 execution coverage is still focused on end-to-end
-  delete outcome plus resulting current-read visibility, not direct
-  `apply_authorized_delete_object(...)` TOCTOU-style recheck races
+- Implemented direct BOE `apply_authorized_delete_object(...)` execution
+  recheck tests covering:
+  - current delete conditional rechecks after current-object mutation
+  - versioned current delete-marker insert conditional rechecks after
+    current-object mutation
+  - specific-version object-lock rechecks after authorization
+  - missing-specific-version bypass-governance rechecks at execution
 
 ## Verification
 
