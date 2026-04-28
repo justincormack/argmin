@@ -1,6 +1,6 @@
 ## Authz Model Stateful Follow-up
 
-Status: in progress
+Status: completed
 
 This is a deliberately small follow-up to
 `plans/completed/authz-model-testing-plan.md`.
