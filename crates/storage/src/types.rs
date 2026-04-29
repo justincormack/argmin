@@ -188,6 +188,26 @@ impl From<DataPgId> for PgId {
     }
 }
 
+/// Placement-group availability state for one cluster epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PgState {
+    Active,
+    Peering,
+    Degraded,
+    Backfilling,
+}
+
+impl std::fmt::Display for PgState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Active => f.write_str("active"),
+            Self::Peering => f.write_str("peering"),
+            Self::Degraded => f.write_str("degraded"),
+            Self::Backfilling => f.write_str("backfilling"),
+        }
+    }
+}
+
 /// EC shard index within one stripe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ShardIndex(u8);

@@ -838,6 +838,26 @@ Exit criteria:
 3. no operation can silently mutate metadata or shard state without an epoch at
    the cluster boundary
 
+Phase 5 implementation notes:
+
+1. Step 5.1 adds an explicit static PG route table to `LocalClusterMap`.
+   - every configured PG has a `LocalPgRoute` with `ClusterEpoch::INITIAL`, a
+     primary node, an acting set, and `PgState::Active`
+   - the initial local acting set is all configured local nodes, with the
+     existing metadata-primary node as the static primary
+   - `PgState` includes `active`, `peering`, `degraded`, and `backfilling` even
+     though only active routes are constructed initially
+   - placed shard placement and IO now reject unknown or non-active PGs through
+     the route table before touching a node store
+   - local cluster startup rejects empty and duplicate PG sets before preparing
+     node directories or opening SQLite stores
+   - shard IO errors include node, PG, and epoch context so stale or misrouted
+     operations fail with enough information for later peering and repair work
+   - placed-segment reads and EC recovery treat only physical shard absence,
+     checksum failure, or shard length corruption as recoverable shard loss; PG
+     route errors such as peering, stale epoch, or misrouted nodes propagate
+     instead of collapsing to object-not-found behavior
+
 ## Phase 6: PG Metadata Replication
 
 Turn per-PG metadata mutation into primary-owned replicated commands.

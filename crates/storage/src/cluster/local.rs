@@ -7,7 +7,10 @@ use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
 use super::ShardLocation;
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 use crate::traits::ShardStore;
-use crate::{ClusterEpoch, DataPgId, EcShape, ShardIndex, ShardKey, SharedStorageNode, WriteAck};
+use crate::{
+    ClusterEpoch, DataPgId, EcShape, PgId, PgState, ShardIndex, ShardKey, SharedStorageNode,
+    WriteAck,
+};
 
 const PAYLOAD_SHARD_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin/payload-shard-placement/v1";
 
@@ -73,31 +76,23 @@ impl std::fmt::Debug for LocalNodeStore {
 
 struct LocalShardNodeClient<'a> {
     node: &'a LocalNodeStore,
+    cluster_epoch: ClusterEpoch,
+    data_pg_id: DataPgId,
 }
 
 impl LocalShardNodeClient<'_> {
-    fn write_shard(
-        &self,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-        data: &[u8],
-    ) -> Result<WriteAck, ShardIoError> {
+    fn write_shard(&self, key: &ShardKey, data: &[u8]) -> Result<WriteAck, ShardIoError> {
         self.node
             .storage_node()
-            .write_shard_file(data_pg_id.get(), key, data)
+            .write_shard_file(self.data_pg_id.get(), key, data)
             .map_err(|source| self.store_error(source))
     }
 
-    fn read_shard(
-        &self,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-        expected: WriteAck,
-    ) -> Result<Vec<u8>, ShardIoError> {
+    fn read_shard(&self, key: &ShardKey, expected: WriteAck) -> Result<Vec<u8>, ShardIoError> {
         let data = self
             .node
             .storage_node()
-            .read_shard_file(data_pg_id.get(), key)
+            .read_shard_file(self.data_pg_id.get(), key)
             .map_err(|source| self.store_error(source))?;
         self.verify_read_ack(expected, &data)?;
         Ok(data)
@@ -105,7 +100,6 @@ impl LocalShardNodeClient<'_> {
 
     fn read_shard_into(
         &self,
-        data_pg_id: DataPgId,
         key: &ShardKey,
         expected: WriteAck,
         dst: &mut [u8],
@@ -118,16 +112,16 @@ impl LocalShardNodeClient<'_> {
         }
         self.node
             .storage_node()
-            .read_shard_file_into(data_pg_id.get(), key, dst)
+            .read_shard_file_into(self.data_pg_id.get(), key, dst)
             .map_err(|source| self.store_error(source))?;
         self.verify_read_ack(expected, dst)
     }
 
-    fn delete_shard(&self, data_pg_id: DataPgId, key: &ShardKey) -> Result<(), ShardIoError> {
+    fn delete_shard(&self, key: &ShardKey) -> Result<(), ShardIoError> {
         let pg = self
             .node
             .storage_node()
-            .get_pg(data_pg_id.get())
+            .get_pg(self.data_pg_id.get())
             .map_err(|source| self.store_error(source))?;
         pg.delete_shard(key)
             .map_err(|source| self.store_error(source))
@@ -136,6 +130,8 @@ impl LocalShardNodeClient<'_> {
     fn store_error(&self, source: StoreError) -> ShardIoError {
         ShardIoError::Store {
             node_id: self.node.node_id().as_u32(),
+            pg_id: self.data_pg_id.get(),
+            cluster_epoch: self.cluster_epoch,
             source,
         }
     }
@@ -158,11 +154,66 @@ impl LocalShardNodeClient<'_> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalPgRoute {
+    cluster_epoch: ClusterEpoch,
+    pg_id: PgId,
+    primary_node_id: NodeId,
+    acting_set: Arc<[NodeId]>,
+    state: PgState,
+}
+
+impl LocalPgRoute {
+    fn active(
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        primary_node_id: NodeId,
+        acting_set: Arc<[NodeId]>,
+    ) -> Self {
+        Self {
+            cluster_epoch,
+            pg_id,
+            primary_node_id,
+            acting_set,
+            state: PgState::Active,
+        }
+    }
+
+    pub fn cluster_epoch(&self) -> ClusterEpoch {
+        self.cluster_epoch
+    }
+
+    pub fn pg_id(&self) -> PgId {
+        self.pg_id
+    }
+
+    pub fn primary_node_id(&self) -> NodeId {
+        self.primary_node_id
+    }
+
+    pub fn acting_set(&self) -> &[NodeId] {
+        &self.acting_set
+    }
+
+    pub fn state(&self) -> PgState {
+        self.state
+    }
+
+    fn is_active(&self) -> bool {
+        self.state == PgState::Active
+    }
+
+    fn contains_node(&self, node_id: NodeId) -> bool {
+        self.acting_set.contains(&node_id)
+    }
+}
+
 #[derive(Debug)]
 pub struct LocalClusterMap {
     epoch: ClusterEpoch,
     metadata_primary_node_id: NodeId,
     nodes: BTreeMap<NodeId, LocalNodeStore>,
+    pg_routes: BTreeMap<PgId, LocalPgRoute>,
     placement_map: placement::ClusterMap,
     process_local_registry_key: usize,
 }
@@ -210,6 +261,7 @@ impl LocalClusterMap {
                 id: metadata_primary_node_id.as_u32(),
             });
         }
+        let pg_ids = validate_local_pg_ids(pg_ids)?;
         let placement_map = build_local_placement_map(node_ids.iter().copied())?;
         validate_local_payload_placement(&placement_map, default_ec_shape)?;
 
@@ -230,11 +282,20 @@ impl LocalClusterMap {
             validated_configs.push((config.node_id, canonical_data_dir));
         }
 
+        let acting_set = Arc::<[NodeId]>::from(node_ids.iter().copied().collect::<Vec<_>>());
+        let pg_routes = build_static_pg_routes(
+            ClusterEpoch::INITIAL,
+            metadata_primary_node_id,
+            Arc::clone(&acting_set),
+            &pg_ids,
+        );
+        let storage_pg_ids: Vec<u32> = pg_ids.iter().map(|pg_id| pg_id.get()).collect();
+
         let mut nodes = BTreeMap::new();
         for (node_id, canonical_data_dir) in validated_configs {
             let storage_node = SharedStorageNode::open_with_default_ec_shape(
                 &canonical_data_dir,
-                pg_ids,
+                &storage_pg_ids,
                 default_ec_shape,
             )
             .map_err(|source| ClusterBuildError::OpenLocalNode {
@@ -254,6 +315,7 @@ impl LocalClusterMap {
         Ok(Self {
             epoch: ClusterEpoch::INITIAL,
             metadata_primary_node_id,
+            pg_routes,
             placement_map,
             process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
             nodes,
@@ -286,6 +348,14 @@ impl LocalClusterMap {
         self.nodes.get(&node_id)
     }
 
+    pub fn pg_route(&self, pg_id: PgId) -> Option<&LocalPgRoute> {
+        self.pg_routes.get(&pg_id)
+    }
+
+    pub fn pg_routes(&self) -> impl Iterator<Item = &LocalPgRoute> + '_ {
+        self.pg_routes.values()
+    }
+
     pub fn process_local_registry_key(&self) -> usize {
         self.process_local_registry_key
     }
@@ -296,6 +366,7 @@ impl LocalClusterMap {
         ec_shape: EcShape,
         stable_placement_key: &[u8],
     ) -> Result<Vec<ShardLocation>, ClusterBuildError> {
+        self.require_active_pg_for_placement(data_pg_id.pg_id())?;
         let ec_config = ec_config_for_shape(ec_shape)?;
         let total_shards = ec_config.total_shards();
         let placer = local_payload_placer(&self.placement_map, ec_shape)?;
@@ -344,7 +415,7 @@ impl LocalClusterMap {
         data: &[u8],
     ) -> Result<WriteAck, ShardIoError> {
         self.shard_node_client(location, key)?
-            .write_shard(location.data_pg_id(), key, data)
+            .write_shard(key, data)
     }
 
     pub fn read_payload_shard(
@@ -354,7 +425,7 @@ impl LocalClusterMap {
         expected: WriteAck,
     ) -> Result<Vec<u8>, ShardIoError> {
         self.shard_node_client(location, key)?
-            .read_shard(location.data_pg_id(), key, expected)
+            .read_shard(key, expected)
     }
 
     pub fn read_payload_shard_into(
@@ -364,12 +435,8 @@ impl LocalClusterMap {
         expected: WriteAck,
         dst: &mut [u8],
     ) -> Result<(), ShardIoError> {
-        self.shard_node_client(location, key)?.read_shard_into(
-            location.data_pg_id(),
-            key,
-            expected,
-            dst,
-        )
+        self.shard_node_client(location, key)?
+            .read_shard_into(key, expected, dst)
     }
 
     pub fn delete_payload_shard(
@@ -377,8 +444,7 @@ impl LocalClusterMap {
         location: ShardLocation,
         key: &ShardKey,
     ) -> Result<(), ShardIoError> {
-        self.shard_node_client(location, key)?
-            .delete_shard(location.data_pg_id(), key)
+        self.shard_node_client(location, key)?.delete_shard(key)
     }
 
     fn shard_node_client(
@@ -388,14 +454,28 @@ impl LocalClusterMap {
     ) -> Result<LocalShardNodeClient<'_>, ShardIoError> {
         if location.cluster_epoch() != self.epoch {
             return Err(ShardIoError::StaleLocation {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
                 location_epoch: location.cluster_epoch(),
                 current_epoch: self.epoch,
             });
         }
         if location.shard_index() != key.shard_index() {
             return Err(ShardIoError::ShardIndexMismatch {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: self.epoch,
                 location_shard_index: location.shard_index().get(),
                 key_shard_index: key.shard_index().get(),
+            });
+        }
+        let route =
+            self.require_active_pg_for_shard_io(location.data_pg_id().pg_id(), location.node_id())?;
+        if !route.contains_node(location.node_id()) {
+            return Err(ShardIoError::NodeNotInActingSet {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: self.epoch,
             });
         }
 
@@ -404,9 +484,93 @@ impl LocalClusterMap {
             .get(&location.node_id())
             .ok_or(ShardIoError::NodeNotFound {
                 node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: self.epoch,
             })?;
-        Ok(LocalShardNodeClient { node })
+        Ok(LocalShardNodeClient {
+            node,
+            cluster_epoch: self.epoch,
+            data_pg_id: location.data_pg_id(),
+        })
     }
+
+    fn require_active_pg_for_placement(&self, pg_id: PgId) -> Result<(), ClusterBuildError> {
+        let route = self
+            .pg_routes
+            .get(&pg_id)
+            .ok_or(ClusterBuildError::PgNotFound {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.epoch,
+            })?;
+        if !route.is_active() {
+            return Err(ClusterBuildError::PgNotActive {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.epoch,
+                state: route.state(),
+            });
+        }
+        Ok(())
+    }
+
+    fn require_active_pg_for_shard_io(
+        &self,
+        pg_id: PgId,
+        node_id: NodeId,
+    ) -> Result<&LocalPgRoute, ShardIoError> {
+        let route = self.pg_routes.get(&pg_id).ok_or(ShardIoError::PgNotFound {
+            node_id: node_id.as_u32(),
+            pg_id: pg_id.get(),
+            cluster_epoch: self.epoch,
+        })?;
+        if !route.is_active() {
+            return Err(ShardIoError::PgNotActive {
+                node_id: node_id.as_u32(),
+                pg_id: pg_id.get(),
+                cluster_epoch: self.epoch,
+                state: route.state(),
+            });
+        }
+        Ok(route)
+    }
+}
+
+fn build_static_pg_routes(
+    cluster_epoch: ClusterEpoch,
+    primary_node_id: NodeId,
+    acting_set: Arc<[NodeId]>,
+    pg_ids: &[PgId],
+) -> BTreeMap<PgId, LocalPgRoute> {
+    pg_ids
+        .iter()
+        .copied()
+        .map(|pg_id| {
+            (
+                pg_id,
+                LocalPgRoute::active(
+                    cluster_epoch,
+                    pg_id,
+                    primary_node_id,
+                    Arc::clone(&acting_set),
+                ),
+            )
+        })
+        .collect()
+}
+
+fn validate_local_pg_ids(pg_ids: &[u32]) -> Result<Vec<PgId>, ClusterBuildError> {
+    if pg_ids.is_empty() {
+        return Err(ClusterBuildError::EmptyPgSet);
+    }
+    let mut seen = BTreeSet::new();
+    let mut validated = Vec::with_capacity(pg_ids.len());
+    for &raw_pg_id in pg_ids {
+        let pg_id = PgId::new(raw_pg_id);
+        if !seen.insert(pg_id) {
+            return Err(ClusterBuildError::DuplicatePgId { pg_id: raw_pg_id });
+        }
+        validated.push(pg_id);
+    }
+    Ok(validated)
 }
 
 fn validate_local_payload_placement(
@@ -517,6 +681,82 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
+    struct CommittedDirectSegment {
+        generation_id: crate::GenerationId,
+        segment_okh: [u8; 16],
+        payload: Vec<u8>,
+        written: crate::DirectPutWrittenSegment,
+        locations: Vec<ShardLocation>,
+    }
+
+    fn write_committed_direct_segment(
+        cluster: &crate::StorageCluster,
+        payload: &[u8],
+    ) -> CommittedDirectSegment {
+        let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+        let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+        let reservation_id = crate::SessionId::try_from("01".repeat(16)).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        let segment_okh = [41; 16];
+        let written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                payload,
+            )
+            .unwrap();
+        let commit_req = crate::CommitDirectPutObjectReq {
+            bucket,
+            key,
+            generation_reservation_id: reservation_id,
+            versioning: crate::BucketVersioningState::Disabled,
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            generation_id,
+            size: payload.len() as u64,
+            etag_crc64: checksum::crc64::checksum(payload),
+            ec: written.ec,
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            object_lock: crate::ObjectLockState::default(),
+            encryption: crate::ObjectEncryption::None,
+            segment_index: 0,
+            segment_crc64: Some(checksum::crc64::checksum(payload)),
+            segment_okh,
+            segment_vid: generation_id,
+            data_pg_id: written.data_pg_id,
+        };
+        cluster
+            .commit_direct_put_object_from_payload_shards(
+                &commit_req,
+                &written.written_shards,
+                |_| Ok::<(), ()>(()),
+            )
+            .unwrap()
+            .unwrap();
+        let data_pg_id = DataPgId::new(PgId::new(written.data_pg_id));
+        let placement_key =
+            super::super::segment_payload_placement_key(&segment_okh, generation_id);
+        let locations = cluster
+            .place_payload_shards(data_pg_id, written.ec, &placement_key)
+            .unwrap();
+
+        CommittedDirectSegment {
+            generation_id,
+            segment_okh,
+            payload: payload.to_vec(),
+            written,
+            locations,
+        }
+    }
+
     #[test]
     fn opens_distinct_local_node_stores_with_static_epoch() {
         let tmp = test_util::tempdir();
@@ -528,6 +768,13 @@ mod tests {
         assert_eq!(map.metadata_primary_node_id(), NodeId::new(0));
         assert_eq!(map.node_count(), 3);
         assert_eq!(map.node_ids().collect::<Vec<_>>(), node_ids);
+        assert_eq!(map.pg_routes().count(), 4);
+        let route = map.pg_route(PgId::new(2)).unwrap();
+        assert_eq!(route.cluster_epoch(), ClusterEpoch::INITIAL);
+        assert_eq!(route.pg_id(), PgId::new(2));
+        assert_eq!(route.primary_node_id(), NodeId::new(0));
+        assert_eq!(route.state(), PgState::Active);
+        assert_eq!(route.acting_set(), node_ids);
 
         for node_id in node_ids {
             let node = map.node(node_id).unwrap();
@@ -567,6 +814,12 @@ mod tests {
         assert_eq!(cluster.metadata_node_id(), NodeId::new(0));
         assert_eq!(cluster.local_node_count(), 6);
         assert_eq!(cluster.local_node_ids().collect::<Vec<_>>(), node_ids);
+        let routes = cluster.local_pg_routes().collect::<Vec<_>>();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(
+            cluster.local_pg_route(PgId::new(1)).unwrap().acting_set(),
+            node_ids
+        );
     }
 
     #[test]
@@ -674,6 +927,42 @@ mod tests {
                 data_shards: 4,
                 parity_shards: 2,
                 shard_index: 6,
+            }
+        ));
+    }
+
+    #[test]
+    fn place_payload_shards_rejects_unknown_pg() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let map = LocalClusterMap::open(
+            tmp.path(),
+            &node_ids,
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap();
+
+        let err = map
+            .place_payload_shards(
+                DataPgId::new(PgId::new(99)),
+                SharedStorageNode::DEFAULT_EC_SHAPE,
+                b"stable-payload-key",
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ClusterBuildError::PgNotFound {
+                pg_id: 99,
+                cluster_epoch: ClusterEpoch::INITIAL,
             }
         ));
     }
@@ -792,6 +1081,7 @@ mod tests {
             ShardIoError::ShardIndexMismatch {
                 location_shard_index: 3,
                 key_shard_index: 0,
+                ..
             }
         ));
         assert!(matches!(
@@ -817,6 +1107,7 @@ mod tests {
             Err(ShardIoError::ShardIndexMismatch {
                 location_shard_index: 3,
                 key_shard_index: 0,
+                ..
             })
         ));
         assert!(matches!(
@@ -824,6 +1115,7 @@ mod tests {
             Err(ShardIoError::ShardIndexMismatch {
                 location_shard_index: 3,
                 key_shard_index: 0,
+                ..
             })
         ));
         assert_eq!(
@@ -869,13 +1161,14 @@ mod tests {
             ShardIoError::StaleLocation {
                 location_epoch,
                 current_epoch,
+                ..
             } if location_epoch == ClusterEpoch::new(2).unwrap()
                 && current_epoch == ClusterEpoch::INITIAL
         ));
     }
 
     #[test]
-    fn payload_shard_io_rejects_unknown_local_node() {
+    fn payload_shard_io_rejects_node_outside_acting_set() {
         let tmp = test_util::tempdir();
         let node_ids = [
             NodeId::new(0),
@@ -904,7 +1197,174 @@ mod tests {
             .write_payload_shard(location, &key, b"unknown")
             .unwrap_err();
 
-        assert!(matches!(err, ShardIoError::NodeNotFound { node_id: 99 }));
+        assert!(matches!(
+            err,
+            ShardIoError::NodeNotInActingSet {
+                node_id: 99,
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+            }
+        ));
+    }
+
+    #[test]
+    fn placed_segment_recovery_propagates_non_active_pg_route() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+        let mut map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let segment = write_committed_direct_segment(&cluster, b"phase-five-route-read");
+        let data_pg_id = DataPgId::new(PgId::new(segment.written.data_pg_id));
+        drop(cluster);
+
+        Arc::get_mut(&mut map)
+            .unwrap()
+            .pg_routes
+            .get_mut(&data_pg_id.pg_id())
+            .unwrap()
+            .state = PgState::Peering;
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let shard_size = segment
+            .payload
+            .len()
+            .div_ceil(usize::from(segment.written.ec.k));
+        let mut all_shards = vec![None; usize::from(segment.written.ec.k + segment.written.ec.m)];
+        let mut present_count = 0;
+
+        let err = cluster
+            .try_load_placed_segment_shard(
+                segment.written.data_pg_id,
+                &segment.segment_okh,
+                segment.generation_id,
+                &segment.locations,
+                0,
+                shard_size,
+                &mut all_shards,
+                &mut present_count,
+            )
+            .unwrap_err();
+
+        match err {
+            StoreError::Io { context, source } => {
+                assert_eq!(context, "recover placed segment shard");
+                assert!(
+                    source.to_string().contains("peering"),
+                    "expected PG state in propagated error, got {source}"
+                );
+            }
+            other => panic!("expected non-active PG route to propagate, got {other:?}"),
+        }
+        assert_eq!(present_count, 0);
+        assert!(all_shards.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn placed_segment_recovery_treats_length_corrupt_shard_as_recoverable() {
+        for extra_length in [false, true] {
+            let tmp = test_util::tempdir();
+            let node_ids = [
+                NodeId::new(0),
+                NodeId::new(1),
+                NodeId::new(2),
+                NodeId::new(3),
+                NodeId::new(4),
+                NodeId::new(5),
+            ];
+            let cluster = crate::StorageCluster::open_local_nodes(
+                tmp.path(),
+                &node_ids,
+                &[0],
+                SharedStorageNode::DEFAULT_EC_SHAPE,
+            )
+            .unwrap();
+            let segment =
+                write_committed_direct_segment(&cluster, b"phase-five-length-corrupt-payload");
+            let shard_size = segment
+                .payload
+                .len()
+                .div_ceil(usize::from(segment.written.ec.k));
+            let corrupt_len = if extra_length { shard_size + 1 } else { 1 };
+            let shard_path = cluster
+                .test_payload_shard_file_path(
+                    segment.written.data_pg_id,
+                    segment.written.ec,
+                    &segment.segment_okh,
+                    segment.generation_id,
+                    0,
+                )
+                .unwrap();
+            std::fs::write(&shard_path, vec![0xAB; corrupt_len]).unwrap();
+
+            let mut recovered = Vec::new();
+            cluster
+                .read_segment_payload_stored_bytes_into(
+                    crate::SegmentStoredBytesRequest {
+                        data_pg_id: segment.written.data_pg_id,
+                        segment_okh: segment.segment_okh,
+                        segment_vid: segment.generation_id,
+                        stored_size: segment.payload.len(),
+                        segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+                        ec: segment.written.ec,
+                    },
+                    &mut recovered,
+                )
+                .unwrap();
+
+            assert_eq!(
+                recovered, segment.payload,
+                "failed to recover when corrupt shard extra_length={extra_length}"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_shard_io_rejects_unknown_pg_before_touching_node_store() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let map = LocalClusterMap::open(
+            tmp.path(),
+            &node_ids,
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap();
+        let location = ShardLocation::new(
+            ClusterEpoch::INITIAL,
+            DataPgId::new(PgId::new(99)),
+            ShardIndex::new(0),
+            NodeId::new(0),
+        );
+        let key = ShardKey::new(&[37; 16], 1, 0);
+
+        let err = map
+            .write_payload_shard(location, &key, b"unknown pg")
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ShardIoError::PgNotFound {
+                node_id: 0,
+                pg_id: 99,
+                cluster_epoch: ClusterEpoch::INITIAL,
+            }
+        ));
+        assert!(!tmp.path().join("node-0000").join("pg-0099").exists());
     }
 
     #[test]
@@ -985,6 +1445,44 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, ClusterBuildError::DuplicateNodeId { id: 0 }));
+    }
+
+    #[test]
+    fn rejects_empty_pg_set_before_preparing_dirs() {
+        let tmp = test_util::tempdir();
+        let node_dir = tmp.path().join("node-0000");
+        let err = LocalClusterMap::open_with_configs(
+            NodeId::new(0),
+            [LocalNodeStoreConfig::new(NodeId::new(0), &node_dir)],
+            &[],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ClusterBuildError::EmptyPgSet));
+        assert!(
+            !node_dir.exists(),
+            "PG validation must run before preparing local node directories"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_pg_ids_before_preparing_dirs() {
+        let tmp = test_util::tempdir();
+        let node_dir = tmp.path().join("node-0000");
+        let err = LocalClusterMap::open_with_configs(
+            NodeId::new(0),
+            [LocalNodeStoreConfig::new(NodeId::new(0), &node_dir)],
+            &[0, 1, 1],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ClusterBuildError::DuplicatePgId { pg_id: 1 }));
+        assert!(
+            !node_dir.exists(),
+            "PG validation must run before preparing local node directories"
+        );
     }
 
     #[test]

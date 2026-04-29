@@ -1,7 +1,7 @@
 /// Storage layer error types.
 use std::path::PathBuf;
 
-use crate::types::ClusterEpoch;
+use crate::types::{ClusterEpoch, PgState};
 
 /// Shard-level storage errors.
 #[derive(Debug, thiserror::Error)]
@@ -42,27 +42,62 @@ pub enum StoreError {
 #[derive(Debug, thiserror::Error)]
 pub enum ShardIoError {
     #[error(
-        "shard location epoch {location_epoch} does not match current cluster epoch {current_epoch}"
+        "shard location for local node {node_id} PG {pg_id} has epoch {location_epoch}, current cluster epoch is {current_epoch}"
     )]
     StaleLocation {
+        node_id: u32,
+        pg_id: u32,
         location_epoch: ClusterEpoch,
         current_epoch: ClusterEpoch,
     },
 
-    #[error("shard location references unknown local node {node_id}")]
-    NodeNotFound { node_id: u32 },
+    #[error("shard location references unknown local node {node_id} for PG {pg_id} in epoch {cluster_epoch}")]
+    NodeNotFound {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+
+    #[error("PG {pg_id} for local node {node_id} is not present in cluster epoch {cluster_epoch}")]
+    PgNotFound {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+
+    #[error("PG {pg_id} for local node {node_id} is {state} in cluster epoch {cluster_epoch}")]
+    PgNotActive {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        state: PgState,
+    },
 
     #[error(
-        "shard location index {location_shard_index} does not match shard key index {key_shard_index}"
+        "local node {node_id} is not in the acting set for PG {pg_id} in cluster epoch {cluster_epoch}"
+    )]
+    NodeNotInActingSet {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+
+    #[error(
+        "shard location for local node {node_id} PG {pg_id} epoch {cluster_epoch} has index {location_shard_index}, shard key has index {key_shard_index}"
     )]
     ShardIndexMismatch {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
         location_shard_index: u8,
         key_shard_index: u8,
     },
 
-    #[error("shard IO failed on local node {node_id}: {source}")]
+    #[error("shard IO failed on local node {node_id} PG {pg_id} epoch {cluster_epoch}: {source}")]
     Store {
         node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
         #[source]
         source: StoreError,
     },
@@ -78,6 +113,12 @@ pub enum ClusterBuildError {
 
     #[error("metadata primary node {id} is not present in the local cluster map")]
     MetadataPrimaryNotFound { id: u32 },
+
+    #[error("local cluster map must contain at least one PG")]
+    EmptyPgSet,
+
+    #[error("duplicate PG id {pg_id}")]
+    DuplicatePgId { pg_id: u32 },
 
     #[error("invalid EC shape k={data_shards} m={parity_shards}: {reason}")]
     InvalidEcShape {
@@ -104,6 +145,19 @@ pub enum ClusterBuildError {
         data_shards: u8,
         parity_shards: u8,
         shard_index: u8,
+    },
+
+    #[error("PG {pg_id} is not present in cluster epoch {cluster_epoch}")]
+    PgNotFound {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+
+    #[error("PG {pg_id} is {state} in cluster epoch {cluster_epoch}")]
+    PgNotActive {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        state: PgState,
     },
 
     #[error(

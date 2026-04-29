@@ -5,7 +5,7 @@ use std::sync::{Mutex, OnceLock};
 use ec::{EcConfig, ErasureCodec};
 use placement::NodeId;
 
-pub use local::{LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig};
+pub use local::{LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute};
 
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 use crate::node::{DirectPutCommitError, SharedStorageNode};
@@ -140,6 +140,14 @@ impl StorageCluster {
 
     pub fn local_node_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.local_map.node_ids()
+    }
+
+    pub fn local_pg_route(&self, pg_id: PgId) -> Option<&LocalPgRoute> {
+        self.local_map.pg_route(pg_id)
+    }
+
+    pub fn local_pg_routes(&self) -> impl Iterator<Item = &LocalPgRoute> + '_ {
+        self.local_map.pg_routes()
     }
 
     /// Temporary process-local registry key for shared coordinator workers.
@@ -549,11 +557,10 @@ impl StorageCluster {
             let end = start + shard_size;
             match self.read_payload_shard_into(*location, &shard_key, ack, &mut dst[start..end]) {
                 Ok(()) => {}
-                Err(ShardIoError::Store {
-                    source: StoreError::PgNotFound { pg_id },
-                    ..
-                }) => return Err(StoreError::PgNotFound { pg_id }),
-                Err(_) => return Ok(false),
+                Err(error) => {
+                    placed_segment_recoverable_shard_error(error, "read placed segment shard")?;
+                    return Ok(false);
+                }
             }
         }
 
@@ -702,11 +709,9 @@ impl StorageCluster {
                 all_shards[shard_index] = Some(shard);
                 *present_count += 1;
             }
-            Err(ShardIoError::Store {
-                source: StoreError::PgNotFound { pg_id },
-                ..
-            }) => return Err(StoreError::PgNotFound { pg_id }),
-            Err(_) => {}
+            Err(error) => {
+                placed_segment_recoverable_shard_error(error, "recover placed segment shard")?;
+            }
         }
         Ok(())
     }
@@ -976,18 +981,56 @@ fn erasure_codec_for_shape(ec: EcShape, context: &'static str) -> Result<Erasure
 }
 
 fn cluster_build_error_to_store(error: ClusterBuildError) -> StoreError {
-    StoreError::Io {
-        context: "place payload shards",
-        source: std::io::Error::other(error.to_string()),
+    match error {
+        ClusterBuildError::PgNotFound { pg_id, .. } => StoreError::PgNotFound { pg_id },
+        other => StoreError::Io {
+            context: "place payload shards",
+            source: std::io::Error::other(other.to_string()),
+        },
     }
 }
 
 fn shard_io_error_to_store(error: ShardIoError, context: &'static str) -> StoreError {
     match error {
         ShardIoError::Store { source, .. } => source,
+        ShardIoError::PgNotFound { pg_id, .. } => StoreError::PgNotFound { pg_id },
         other => StoreError::Io {
             context,
             source: std::io::Error::other(other.to_string()),
         },
     }
+}
+
+fn placed_segment_recoverable_shard_error(
+    error: ShardIoError,
+    context: &'static str,
+) -> Result<(), StoreError> {
+    match error {
+        ShardIoError::Store {
+            source: StoreError::NotFound,
+            ..
+        }
+        | ShardIoError::Store {
+            source: StoreError::IntegrityError { .. },
+            ..
+        } => Ok(()),
+        ShardIoError::Store {
+            source: StoreError::Io { context, source },
+            ..
+        } if is_recoverable_physical_shard_io_error(context, source.kind()) => Ok(()),
+        other => Err(shard_io_error_to_store(other, context)),
+    }
+}
+
+fn is_recoverable_physical_shard_io_error(context: &'static str, kind: std::io::ErrorKind) -> bool {
+    matches!(
+        (context, kind),
+        (
+            "read payload shard size mismatch",
+            std::io::ErrorKind::InvalidData
+        ) | (
+            "read shard file length mismatch",
+            std::io::ErrorKind::InvalidData
+        ) | ("read shard file", std::io::ErrorKind::UnexpectedEof)
+    )
 }
