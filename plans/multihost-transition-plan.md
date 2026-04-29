@@ -561,6 +561,8 @@ Phase 3 completion notes:
 
 ## Phase 4: Node-Aware Shard Placement
 
+Status: planned.
+
 Change data writes so EC shards are distributed across nodes.
 
 Work items:
@@ -575,6 +577,47 @@ Work items:
 7. reject startup or configuration changes that would make the current EC shape
    unplaceable
 8. preserve existing read reconstruction and checksum behavior
+
+Implementation order:
+
+- [ ] 4.1 Validate local placement shape before opening node stores.
+  - build the local placement view from configured node IDs and EC shape
+  - reject `k + m` shapes that cannot be placed on distinct active nodes
+  - add startup/config tests for too few local nodes and the first valid shape
+- [ ] 4.2 Add a cluster-level shard placement helper.
+  - map `(data_pg_id, shard index, EC shape, stable placement key)` to `NodeId`
+  - keep this in `StorageCluster`/`LocalClusterMap`, not coordinator code
+  - test deterministic, distinct-node placement for each shard in a stripe
+- [ ] 4.3 Add cluster-owned local shard IO dispatch.
+  - write, read, and delete one shard on its assigned local node
+  - keep the API shaped like the later remote-node boundary
+  - leave metadata operations on the current metadata primary for this phase
+- [ ] 4.4 Move direct PutObject payload writes to per-shard node placement.
+  - publish object metadata only after all required shard writes complete
+  - clean up already-written shards on pre-commit errors
+  - test shard files landing under multiple `node-XXXX` stores
+- [ ] 4.5 Move reads to fetch shards from assigned nodes.
+  - preserve the existing direct-read and recovery behavior
+  - test missing shard reconstruction and corrupt shard handling in local
+    multi-node mode
+- [ ] 4.6 Move streaming PutObject segment writes and commit cleanup.
+  - write staged segment shards to assigned nodes
+  - register/publish metadata only after the required shard writes complete
+  - test failed commit cleanup across local nodes
+- [ ] 4.7 Move multipart direct and streamed part payloads.
+  - direct UploadPart should follow the direct PutObject shape
+  - streamed UploadPart should reuse the streaming segment placement path
+  - test abort, part reupload, subset completion, and omitted part cleanup in
+    multi-node mode
+- [ ] 4.8 Move delete and reclaim cleanup to placement-aware shard deletion.
+  - recompute per-shard node placement from stored `data_pg_id`, EC shape, and
+    shard identity
+  - keep crash-durable scavenger work in the later scavenger phase
+- [ ] 4.9 Do a Phase 4 boundary sweep.
+  - active payload reads/writes/deletes should no longer assume all EC shards live
+    in one local PG store
+  - keep S3-visible behavior unchanged
+  - run the full suite and clippy before marking Phase 4 complete
 
 Exit criteria:
 
