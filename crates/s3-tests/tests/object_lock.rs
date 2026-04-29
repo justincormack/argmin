@@ -3,17 +3,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::{ByteStream, DateTime, DateTimeFormat};
 use aws_sdk_s3::types::{
-    AbacStatus, BucketAbacStatus, BucketCannedAcl, BucketVersioningStatus,
-    CompletedMultipartUpload, CompletedPart, DefaultRetention, Delete, ObjectIdentifier,
-    ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
-    ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode, ObjectLockRule, ObjectOwnership,
-    OwnershipControls, OwnershipControlsRule, Tag, Tagging, VersioningConfiguration,
+    AbacStatus, BucketAbacStatus, BucketVersioningStatus, CompletedMultipartUpload, CompletedPart,
+    DefaultRetention, Delete, ObjectIdentifier, ObjectLockConfiguration, ObjectLockEnabled,
+    ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention,
+    ObjectLockRetentionMode, ObjectLockRule, Tag, Tagging, VersioningConfiguration,
 };
 use base64::Engine;
 use ring::hmac;
 use s3_tests::{
-    assert_s3_err_code, content_md5_header, disable_bucket_public_access_block, err_status,
-    send_signed_request, unique_bucket, CTX,
+    assert_s3_err_code, content_md5_header, err_status, send_signed_request, unique_bucket, CTX,
 };
 use serde_json::json;
 
@@ -28,29 +26,6 @@ const COMPLIANCE_RETENTION_SECS: u64 = 3;
 
 fn agent() -> s3_tests::Agent {
     s3_tests::test_agent()
-}
-
-fn anonymous_get(url: &str) -> (u16, String) {
-    let mut resp = agent().get(url).call().expect("transport error");
-    let status = resp.status().as_u16();
-    let body = resp.body_mut().read_to_string().unwrap_or_default();
-    (status, body)
-}
-
-fn anonymous_put_with_headers(
-    url: &str,
-    body: &[u8],
-    headers: &[(String, String)],
-) -> (u16, String) {
-    let request = headers
-        .iter()
-        .fold(agent().put(url), |request, (name, value)| {
-            request.header(name, value)
-        });
-    let mut resp = request.send(body).expect("transport error");
-    let status = resp.status().as_u16();
-    let body = resp.body_mut().read_to_string().unwrap_or_default();
-    (status, body)
 }
 
 fn future_date(seconds_from_now: u64) -> DateTime {
@@ -83,64 +58,6 @@ async fn setup_object_lock_bucket() -> String {
         .send()
         .await
         .unwrap();
-    bucket
-}
-
-async fn setup_public_write_object_lock_bucket() -> String {
-    let client = CTX.client();
-    let bucket = unique_bucket();
-    s3_tests::create_bucket_request(client, &bucket)
-        .object_lock_enabled_for_bucket(true)
-        .send()
-        .await
-        .unwrap();
-
-    disable_bucket_public_access_block(client, &bucket).await;
-
-    let ownership_rule = OwnershipControlsRule::builder()
-        .object_ownership(ObjectOwnership::BucketOwnerPreferred)
-        .build()
-        .unwrap();
-    let ownership = OwnershipControls::builder()
-        .rules(ownership_rule)
-        .build()
-        .unwrap();
-    client
-        .put_bucket_ownership_controls()
-        .bucket(&bucket)
-        .ownership_controls(ownership)
-        .send()
-        .await
-        .unwrap();
-    client
-        .put_bucket_acl()
-        .bucket(&bucket)
-        .acl(BucketCannedAcl::PublicReadWrite)
-        .send()
-        .await
-        .unwrap();
-
-    // Match the public bucket helpers and give AWS one read-back pass after the
-    // control-plane writes before issuing cross-account data-plane requests.
-    client
-        .get_public_access_block()
-        .bucket(&bucket)
-        .send()
-        .await
-        .unwrap();
-    client
-        .get_bucket_ownership_controls()
-        .bucket(&bucket)
-        .send()
-        .await
-        .unwrap();
-    client
-        .get_bucket_acl()
-        .bucket(&bucket)
-        .send()
-        .await
-        .unwrap();
-
     bucket
 }
 
@@ -1227,29 +1144,29 @@ fn test_object_lock_bucket_policy_get_obj_retention_bucket_tag_condition_when_ab
         let retain_until = governance_retain_until();
         let retention = retention(ObjectLockRetentionMode::Governance, retain_until);
 
-        let public_bucket = setup_object_lock_bucket().await;
-        put_object_bytes(&public_bucket, key, b"abc").await;
+        let allowed_bucket = setup_object_lock_bucket().await;
+        put_object_bytes(&allowed_bucket, key, b"abc").await;
         client
             .put_object_retention()
-            .bucket(&public_bucket)
+            .bucket(&allowed_bucket)
             .key(key)
             .retention(retention.clone())
             .send()
             .await
             .unwrap();
-        enable_bucket_abac_with_security_tag(&public_bucket, "public").await;
+        enable_bucket_abac_with_security_tag(&allowed_bucket, "allow").await;
         put_bucket_policy_json(
-            &public_bucket,
+            &allowed_bucket,
             json!({
                 "Version": "2012-10-17",
                 "Statement": [{
                     "Effect": "Allow",
                     "Principal": alt_policy_principal(),
                     "Action": "s3:GetObjectRetention",
-                    "Resource": bucket_wildcard_resource(&public_bucket),
+                    "Resource": bucket_wildcard_resource(&allowed_bucket),
                     "Condition": {
                         "StringEquals": {
-                            "s3:BucketTag/security": "public"
+                            "s3:BucketTag/security": "allow"
                         }
                     }
                 }],
@@ -1257,29 +1174,29 @@ fn test_object_lock_bucket_policy_get_obj_retention_bucket_tag_condition_when_ab
         )
         .await;
 
-        let private_bucket = setup_object_lock_bucket().await;
-        put_object_bytes(&private_bucket, key, b"abc").await;
+        let denied_bucket = setup_object_lock_bucket().await;
+        put_object_bytes(&denied_bucket, key, b"abc").await;
         client
             .put_object_retention()
-            .bucket(&private_bucket)
+            .bucket(&denied_bucket)
             .key(key)
             .retention(retention.clone())
             .send()
             .await
             .unwrap();
-        enable_bucket_abac_with_security_tag(&private_bucket, "private").await;
+        enable_bucket_abac_with_security_tag(&denied_bucket, "deny").await;
         put_bucket_policy_json(
-            &private_bucket,
+            &denied_bucket,
             json!({
                 "Version": "2012-10-17",
                 "Statement": [{
                     "Effect": "Allow",
                     "Principal": alt_policy_principal(),
                     "Action": "s3:GetObjectRetention",
-                    "Resource": bucket_wildcard_resource(&private_bucket),
+                    "Resource": bucket_wildcard_resource(&denied_bucket),
                     "Condition": {
                         "StringEquals": {
-                            "s3:BucketTag/security": "public"
+                            "s3:BucketTag/security": "allow"
                         }
                     }
                 }],
@@ -1289,7 +1206,7 @@ fn test_object_lock_bucket_policy_get_obj_retention_bucket_tag_condition_when_ab
 
         let response = alt_client
             .get_object_retention()
-            .bucket(&public_bucket)
+            .bucket(&allowed_bucket)
             .key(key)
             .send()
             .await
@@ -1298,15 +1215,15 @@ fn test_object_lock_bucket_policy_get_obj_retention_bucket_tag_condition_when_ab
 
         let denied = alt_client
             .get_object_retention()
-            .bucket(&private_bucket)
+            .bucket(&denied_bucket)
             .key(key)
             .send()
             .await;
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");
 
-        cleanup_object_lock_bucket(&public_bucket).await;
-        cleanup_object_lock_bucket(&private_bucket).await;
+        cleanup_object_lock_bucket(&allowed_bucket).await;
+        cleanup_object_lock_bucket(&denied_bucket).await;
     });
 }
 
@@ -1321,7 +1238,7 @@ fn test_object_lock_bucket_policy_existing_tag_condition_is_rejected_for_get_ret
             .put_object_tagging()
             .bucket(&bucket)
             .key(key)
-            .tagging(object_tagging("security", "public"))
+            .tagging(object_tagging("security", "allow"))
             .send()
             .await
             .unwrap();
@@ -1339,7 +1256,7 @@ fn test_object_lock_bucket_policy_existing_tag_condition_is_rejected_for_get_ret
                         "Resource": bucket_wildcard_resource(&bucket),
                         "Condition": {
                             "StringEquals": {
-                                "s3:ExistingObjectTag/security": "public"
+                                "s3:ExistingObjectTag/security": "allow"
                             }
                         }
                     }],
@@ -1454,13 +1371,13 @@ fn test_object_lock_bucket_policy_bypass_governance_bucket_tag_condition_when_ab
         let alt_client = CTX.alt_client();
         let key = "file1";
 
-        let public_bucket = setup_object_lock_bucket().await;
-        let public_version_id = put_object_bytes(&public_bucket, key, b"abc").await;
+        let allowed_bucket = setup_object_lock_bucket().await;
+        let allowed_version_id = put_object_bytes(&allowed_bucket, key, b"abc").await;
         client
             .put_object_retention()
-            .bucket(&public_bucket)
+            .bucket(&allowed_bucket)
             .key(key)
-            .version_id(&public_version_id)
+            .version_id(&allowed_version_id)
             .retention(retention(
                 ObjectLockRetentionMode::Governance,
                 governance_retain_until_later(),
@@ -1468,19 +1385,19 @@ fn test_object_lock_bucket_policy_bypass_governance_bucket_tag_condition_when_ab
             .send()
             .await
             .unwrap();
-        enable_bucket_abac_with_security_tag(&public_bucket, "public").await;
+        enable_bucket_abac_with_security_tag(&allowed_bucket, "allow").await;
         put_bucket_policy_json(
-            &public_bucket,
+            &allowed_bucket,
             json!({
                 "Version": "2012-10-17",
                 "Statement": [{
                     "Effect": "Allow",
                     "Principal": alt_policy_principal(),
                     "Action": ["s3:PutObjectRetention", "s3:BypassGovernanceRetention"],
-                    "Resource": bucket_wildcard_resource(&public_bucket),
+                    "Resource": bucket_wildcard_resource(&allowed_bucket),
                     "Condition": {
                         "StringEquals": {
-                            "s3:BucketTag/security": "public"
+                            "s3:BucketTag/security": "allow"
                         }
                     }
                 }],
@@ -1488,13 +1405,13 @@ fn test_object_lock_bucket_policy_bypass_governance_bucket_tag_condition_when_ab
         )
         .await;
 
-        let private_bucket = setup_object_lock_bucket().await;
-        let private_version_id = put_object_bytes(&private_bucket, key, b"abc").await;
+        let denied_bucket = setup_object_lock_bucket().await;
+        let denied_version_id = put_object_bytes(&denied_bucket, key, b"abc").await;
         client
             .put_object_retention()
-            .bucket(&private_bucket)
+            .bucket(&denied_bucket)
             .key(key)
-            .version_id(&private_version_id)
+            .version_id(&denied_version_id)
             .retention(retention(
                 ObjectLockRetentionMode::Governance,
                 governance_retain_until_later(),
@@ -1502,19 +1419,19 @@ fn test_object_lock_bucket_policy_bypass_governance_bucket_tag_condition_when_ab
             .send()
             .await
             .unwrap();
-        enable_bucket_abac_with_security_tag(&private_bucket, "private").await;
+        enable_bucket_abac_with_security_tag(&denied_bucket, "deny").await;
         put_bucket_policy_json(
-            &private_bucket,
+            &denied_bucket,
             json!({
                 "Version": "2012-10-17",
                 "Statement": [{
                     "Effect": "Allow",
                     "Principal": alt_policy_principal(),
                     "Action": ["s3:PutObjectRetention", "s3:BypassGovernanceRetention"],
-                    "Resource": bucket_wildcard_resource(&private_bucket),
+                    "Resource": bucket_wildcard_resource(&denied_bucket),
                     "Condition": {
                         "StringEquals": {
-                            "s3:BucketTag/security": "public"
+                            "s3:BucketTag/security": "allow"
                         }
                     }
                 }],
@@ -1523,9 +1440,9 @@ fn test_object_lock_bucket_policy_bypass_governance_bucket_tag_condition_when_ab
         .await;
 
         wait_for_bypass_retention_update_to_succeed(
-            &public_bucket,
+            &allowed_bucket,
             key,
-            &public_version_id,
+            &allowed_version_id,
             retention(
                 ObjectLockRetentionMode::Governance,
                 governance_retain_until(),
@@ -1535,9 +1452,9 @@ fn test_object_lock_bucket_policy_bypass_governance_bucket_tag_condition_when_ab
 
         let denied = alt_client
             .put_object_retention()
-            .bucket(&private_bucket)
+            .bucket(&denied_bucket)
             .key(key)
-            .version_id(&private_version_id)
+            .version_id(&denied_version_id)
             .retention(retention(
                 ObjectLockRetentionMode::Governance,
                 governance_retain_until(),
@@ -1548,8 +1465,8 @@ fn test_object_lock_bucket_policy_bypass_governance_bucket_tag_condition_when_ab
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");
 
-        cleanup_object_lock_bucket(&public_bucket).await;
-        cleanup_object_lock_bucket(&private_bucket).await;
+        cleanup_object_lock_bucket(&allowed_bucket).await;
+        cleanup_object_lock_bucket(&denied_bucket).await;
     });
 }
 
@@ -1564,7 +1481,7 @@ fn test_object_lock_bucket_policy_existing_tag_condition_is_rejected_for_put_ret
             .put_object_tagging()
             .bucket(&bucket)
             .key(key)
-            .tagging(object_tagging("security", "public"))
+            .tagging(object_tagging("security", "allow"))
             .send()
             .await
             .unwrap();
@@ -1582,7 +1499,7 @@ fn test_object_lock_bucket_policy_existing_tag_condition_is_rejected_for_put_ret
                         "Resource": bucket_wildcard_resource(&bucket),
                         "Condition": {
                             "StringEquals": {
-                                "s3:ExistingObjectTag/security": "public"
+                                "s3:ExistingObjectTag/security": "allow"
                             }
                         }
                     }],
@@ -1609,7 +1526,7 @@ fn test_object_lock_bucket_policy_existing_tag_condition_is_rejected_for_bypass_
             .put_object_tagging()
             .bucket(&bucket)
             .key(key)
-            .tagging(object_tagging("security", "public"))
+            .tagging(object_tagging("security", "allow"))
             .send()
             .await
             .unwrap();
@@ -1627,7 +1544,7 @@ fn test_object_lock_bucket_policy_existing_tag_condition_is_rejected_for_bypass_
                         "Resource": bucket_wildcard_resource(&bucket),
                         "Condition": {
                             "StringEquals": {
-                                "s3:ExistingObjectTag/security": "public"
+                                "s3:ExistingObjectTag/security": "allow"
                             }
                         }
                     }],
@@ -1654,7 +1571,7 @@ fn test_object_lock_bucket_policy_existing_tag_condition_is_rejected_for_put_leg
             .put_object_tagging()
             .bucket(&bucket)
             .key(key)
-            .tagging(object_tagging("security", "public"))
+            .tagging(object_tagging("security", "allow"))
             .send()
             .await
             .unwrap();
@@ -1672,7 +1589,7 @@ fn test_object_lock_bucket_policy_existing_tag_condition_is_rejected_for_put_leg
                         "Resource": bucket_wildcard_resource(&bucket),
                         "Condition": {
                             "StringEquals": {
-                                "s3:ExistingObjectTag/security": "public"
+                                "s3:ExistingObjectTag/security": "allow"
                             }
                         }
                     }],
@@ -1709,7 +1626,7 @@ fn test_object_lock_bucket_policy_request_object_tag_condition_is_rejected_for_p
                         "Resource": bucket_wildcard_resource(&bucket),
                         "Condition": {
                             "StringEquals": {
-                                "s3:RequestObjectTag/security": "public"
+                                "s3:RequestObjectTag/security": "allow"
                             }
                         }
                     }],
@@ -1746,7 +1663,7 @@ fn test_object_lock_bucket_policy_request_object_tag_condition_is_rejected_for_p
                         "Resource": bucket_wildcard_resource(&bucket),
                         "Condition": {
                             "StringEquals": {
-                                "s3:RequestObjectTag/security": "public"
+                                "s3:RequestObjectTag/security": "allow"
                             }
                         }
                     }],
@@ -2800,236 +2717,6 @@ fn test_object_lock_delete_object_with_retention() {
 }
 
 #[test]
-fn test_object_lock_delete_object_bypass_requires_bucket_admin() {
-    s3_tests::run(async {
-        let client = CTX.client();
-        let alt_client = CTX.alt_client();
-        let bucket = setup_public_write_object_lock_bucket().await;
-
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("plain")
-            .body(ByteStream::from_static(b"plain"))
-            .send()
-            .await
-            .unwrap();
-        let delete_marker = alt_client
-            .delete_object()
-            .bucket(&bucket)
-            .key("plain")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(delete_marker.delete_marker(), Some(true));
-
-        let key = "locked";
-        let version_id = put_object_bytes(&bucket, key, b"locked").await;
-        client
-            .put_object_retention()
-            .bucket(&bucket)
-            .key(key)
-            .version_id(&version_id)
-            .retention(retention(
-                ObjectLockRetentionMode::Governance,
-                governance_retain_until(),
-            ))
-            .send()
-            .await
-            .unwrap();
-
-        let result = alt_client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key)
-            .version_id(&version_id)
-            .bypass_governance_retention(true)
-            .send()
-            .await;
-        assert_eq!(err_status(&result), 403);
-        assert_s3_err_code(&result, "AccessDenied");
-
-        delete_version_with_bypass(&bucket, key, &version_id).await;
-        cleanup_object_lock_bucket(&bucket).await;
-    });
-}
-
-#[test]
-fn test_object_lock_anonymous_get_object_retention_denied_message() {
-    s3_tests::run(async {
-        let bucket = setup_public_write_object_lock_bucket().await;
-        let key = "anon-get-retention";
-        put_object_bytes(&bucket, key, b"locked").await;
-
-        let url = format!("{}/{bucket}/{key}?retention", CTX.endpoint());
-        let response = anonymous_get(&url);
-
-        cleanup_object_lock_bucket(&bucket).await;
-
-        assert_eq!(response.0, 403, "unexpected body: {}", response.1);
-        assert!(
-            response.1.contains("AccessDenied"),
-            "unexpected body: {}",
-            response.1
-        );
-    });
-}
-
-#[test]
-fn test_object_lock_anonymous_put_object_retention_denied_message() {
-    s3_tests::run(async {
-        let bucket = setup_public_write_object_lock_bucket().await;
-        let key = "anon-put-retention";
-        put_object_bytes(&bucket, key, b"locked").await;
-
-        let retention_body = format!(
-            "<ObjectLockRetention xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Mode>GOVERNANCE</Mode><RetainUntilDate>{}</RetainUntilDate></ObjectLockRetention>",
-            future_date(GOVERNANCE_RETENTION_SECS)
-                .fmt(DateTimeFormat::DateTime)
-                .unwrap()
-        );
-        let url = format!("{}/{bucket}/{key}?retention", CTX.endpoint());
-        let response = anonymous_put_with_headers(
-            &url,
-            retention_body.as_bytes(),
-            &[content_md5_header(retention_body.as_bytes())],
-        );
-
-        cleanup_object_lock_bucket(&bucket).await;
-
-        assert_eq!(response.0, 403, "unexpected body: {}", response.1);
-        assert!(
-            response.1.contains("AccessDenied"),
-            "unexpected body: {}",
-            response.1
-        );
-    });
-}
-
-#[test]
-fn test_object_lock_anonymous_get_object_legal_hold_denied_message() {
-    s3_tests::run(async {
-        let bucket = setup_public_write_object_lock_bucket().await;
-        let key = "anon-get-legal-hold";
-        put_object_bytes(&bucket, key, b"locked").await;
-
-        let url = format!("{}/{bucket}/{key}?legal-hold", CTX.endpoint());
-        let response = anonymous_get(&url);
-
-        cleanup_object_lock_bucket(&bucket).await;
-
-        assert_eq!(response.0, 403, "unexpected body: {}", response.1);
-        assert!(
-            response.1.contains("AccessDenied"),
-            "unexpected body: {}",
-            response.1
-        );
-    });
-}
-
-#[test]
-fn test_object_lock_anonymous_put_object_legal_hold_denied_message() {
-    s3_tests::run(async {
-        let bucket = setup_public_write_object_lock_bucket().await;
-        let key = "anon-put-legal-hold";
-        put_object_bytes(&bucket, key, b"locked").await;
-
-        let legal_hold_body = br#"<LegalHold xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>ON</Status></LegalHold>"#;
-        let url = format!("{}/{bucket}/{key}?legal-hold", CTX.endpoint());
-        let response = anonymous_put_with_headers(
-            &url,
-            legal_hold_body,
-            &[content_md5_header(legal_hold_body)],
-        );
-
-        cleanup_object_lock_bucket(&bucket).await;
-
-        assert_eq!(response.0, 403, "unexpected body: {}", response.1);
-        assert!(
-            response.1.contains("AccessDenied"),
-            "unexpected body: {}",
-            response.1
-        );
-    });
-}
-
-#[test]
-fn test_object_lock_multi_delete_bypass_requires_bucket_admin() {
-    s3_tests::run(async {
-        use md5_legacy::Digest;
-
-        let client = CTX.client();
-        let alt_client = CTX.alt_client();
-        let bucket = setup_public_write_object_lock_bucket().await;
-
-        let plain_key = "plain";
-        put_object_bytes(&bucket, plain_key, b"plain").await;
-
-        let locked_key = "locked";
-        let locked_version_id = put_object_bytes(&bucket, locked_key, b"locked").await;
-        client
-            .put_object_retention()
-            .bucket(&bucket)
-            .key(locked_key)
-            .version_id(&locked_version_id)
-            .retention(retention(
-                ObjectLockRetentionMode::Governance,
-                governance_retain_until(),
-            ))
-            .send()
-            .await
-            .unwrap();
-
-        let delete = Delete::builder()
-            .objects(ObjectIdentifier::builder().key(plain_key).build().unwrap())
-            .objects(object_id(locked_key, &locked_version_id))
-            .build()
-            .unwrap();
-        let response = alt_client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(delete)
-            .bypass_governance_retention(true)
-            .customize()
-            .mutate_request(|req| {
-                let body = req.body().bytes().expect("DeleteObjects body in memory");
-                let digest = md5_legacy::Md5::digest(body);
-                let content_md5 = base64::engine::general_purpose::STANDARD.encode(&digest[..]);
-                req.headers_mut().insert("content-md5", content_md5);
-            })
-            .send()
-            .await
-            .unwrap();
-
-        assert_eq!(
-            response.deleted().len(),
-            1,
-            "deleted={:?} errors={:?}",
-            response.deleted(),
-            response.errors()
-        );
-        assert_eq!(
-            response.errors().len(),
-            1,
-            "deleted={:?} errors={:?}",
-            response.deleted(),
-            response.errors()
-        );
-        let deleted = &response.deleted()[0];
-        assert_eq!(deleted.key(), Some(plain_key));
-        assert_eq!(deleted.delete_marker(), Some(true));
-        assert!(deleted.delete_marker_version_id().is_some());
-        let failed = &response.errors()[0];
-        assert_eq!(failed.code(), Some("AccessDenied"));
-        assert_eq!(failed.key(), Some(locked_key));
-        assert_eq!(failed.version_id(), Some(locked_version_id.as_str()));
-
-        delete_version_with_bypass(&bucket, locked_key, &locked_version_id).await;
-        cleanup_object_lock_bucket(&bucket).await;
-    });
-}
-
-#[test]
 fn test_object_lock_delete_multipart_object_with_retention() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -3330,29 +3017,29 @@ fn test_object_lock_bucket_policy_get_obj_legal_hold_bucket_tag_condition_when_a
         let key = "file1";
         let hold_on = legal_hold(ObjectLockLegalHoldStatus::On);
 
-        let public_bucket = setup_object_lock_bucket().await;
-        put_object_bytes(&public_bucket, key, b"abc").await;
+        let allowed_bucket = setup_object_lock_bucket().await;
+        put_object_bytes(&allowed_bucket, key, b"abc").await;
         client
             .put_object_legal_hold()
-            .bucket(&public_bucket)
+            .bucket(&allowed_bucket)
             .key(key)
             .legal_hold(hold_on.clone())
             .send()
             .await
             .unwrap();
-        enable_bucket_abac_with_security_tag(&public_bucket, "public").await;
+        enable_bucket_abac_with_security_tag(&allowed_bucket, "allow").await;
         put_bucket_policy_json(
-            &public_bucket,
+            &allowed_bucket,
             json!({
                 "Version": "2012-10-17",
                 "Statement": [{
                     "Effect": "Allow",
                     "Principal": alt_policy_principal(),
                     "Action": "s3:GetObjectLegalHold",
-                    "Resource": bucket_wildcard_resource(&public_bucket),
+                    "Resource": bucket_wildcard_resource(&allowed_bucket),
                     "Condition": {
                         "StringEquals": {
-                            "s3:BucketTag/security": "public"
+                            "s3:BucketTag/security": "allow"
                         }
                     }
                 }],
@@ -3360,29 +3047,29 @@ fn test_object_lock_bucket_policy_get_obj_legal_hold_bucket_tag_condition_when_a
         )
         .await;
 
-        let private_bucket = setup_object_lock_bucket().await;
-        put_object_bytes(&private_bucket, key, b"abc").await;
+        let denied_bucket = setup_object_lock_bucket().await;
+        put_object_bytes(&denied_bucket, key, b"abc").await;
         client
             .put_object_legal_hold()
-            .bucket(&private_bucket)
+            .bucket(&denied_bucket)
             .key(key)
             .legal_hold(hold_on.clone())
             .send()
             .await
             .unwrap();
-        enable_bucket_abac_with_security_tag(&private_bucket, "private").await;
+        enable_bucket_abac_with_security_tag(&denied_bucket, "deny").await;
         put_bucket_policy_json(
-            &private_bucket,
+            &denied_bucket,
             json!({
                 "Version": "2012-10-17",
                 "Statement": [{
                     "Effect": "Allow",
                     "Principal": alt_policy_principal(),
                     "Action": "s3:GetObjectLegalHold",
-                    "Resource": bucket_wildcard_resource(&private_bucket),
+                    "Resource": bucket_wildcard_resource(&denied_bucket),
                     "Condition": {
                         "StringEquals": {
-                            "s3:BucketTag/security": "public"
+                            "s3:BucketTag/security": "allow"
                         }
                     }
                 }],
@@ -3392,7 +3079,7 @@ fn test_object_lock_bucket_policy_get_obj_legal_hold_bucket_tag_condition_when_a
 
         let response = alt_client
             .get_object_legal_hold()
-            .bucket(&public_bucket)
+            .bucket(&allowed_bucket)
             .key(key)
             .send()
             .await
@@ -3401,15 +3088,15 @@ fn test_object_lock_bucket_policy_get_obj_legal_hold_bucket_tag_condition_when_a
 
         let denied = alt_client
             .get_object_legal_hold()
-            .bucket(&private_bucket)
+            .bucket(&denied_bucket)
             .key(key)
             .send()
             .await;
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");
 
-        cleanup_object_lock_bucket(&public_bucket).await;
-        cleanup_object_lock_bucket(&private_bucket).await;
+        cleanup_object_lock_bucket(&allowed_bucket).await;
+        cleanup_object_lock_bucket(&denied_bucket).await;
     });
 }
 
@@ -3422,21 +3109,21 @@ fn test_object_lock_bucket_policy_put_obj_retention_bucket_tag_condition_when_ab
         let retain_until = governance_retain_until();
         let retention = retention(ObjectLockRetentionMode::Governance, retain_until);
 
-        let public_bucket = setup_object_lock_bucket().await;
-        put_object_bytes(&public_bucket, key, b"abc").await;
-        enable_bucket_abac_with_security_tag(&public_bucket, "public").await;
+        let allowed_bucket = setup_object_lock_bucket().await;
+        put_object_bytes(&allowed_bucket, key, b"abc").await;
+        enable_bucket_abac_with_security_tag(&allowed_bucket, "allow").await;
         put_bucket_policy_json(
-            &public_bucket,
+            &allowed_bucket,
             json!({
                 "Version": "2012-10-17",
                 "Statement": [{
                     "Effect": "Allow",
                     "Principal": alt_policy_principal(),
                     "Action": "s3:PutObjectRetention",
-                    "Resource": bucket_wildcard_resource(&public_bucket),
+                    "Resource": bucket_wildcard_resource(&allowed_bucket),
                     "Condition": {
                         "StringEquals": {
-                            "s3:BucketTag/security": "public"
+                            "s3:BucketTag/security": "allow"
                         }
                     }
                 }],
@@ -3444,21 +3131,21 @@ fn test_object_lock_bucket_policy_put_obj_retention_bucket_tag_condition_when_ab
         )
         .await;
 
-        let private_bucket = setup_object_lock_bucket().await;
-        put_object_bytes(&private_bucket, key, b"abc").await;
-        enable_bucket_abac_with_security_tag(&private_bucket, "private").await;
+        let denied_bucket = setup_object_lock_bucket().await;
+        put_object_bytes(&denied_bucket, key, b"abc").await;
+        enable_bucket_abac_with_security_tag(&denied_bucket, "deny").await;
         put_bucket_policy_json(
-            &private_bucket,
+            &denied_bucket,
             json!({
                 "Version": "2012-10-17",
                 "Statement": [{
                     "Effect": "Allow",
                     "Principal": alt_policy_principal(),
                     "Action": "s3:PutObjectRetention",
-                    "Resource": bucket_wildcard_resource(&private_bucket),
+                    "Resource": bucket_wildcard_resource(&denied_bucket),
                     "Condition": {
                         "StringEquals": {
-                            "s3:BucketTag/security": "public"
+                            "s3:BucketTag/security": "allow"
                         }
                     }
                 }],
@@ -3468,7 +3155,7 @@ fn test_object_lock_bucket_policy_put_obj_retention_bucket_tag_condition_when_ab
 
         alt_client
             .put_object_retention()
-            .bucket(&public_bucket)
+            .bucket(&allowed_bucket)
             .key(key)
             .retention(retention.clone())
             .send()
@@ -3476,7 +3163,7 @@ fn test_object_lock_bucket_policy_put_obj_retention_bucket_tag_condition_when_ab
             .unwrap();
         let response = client
             .get_object_retention()
-            .bucket(&public_bucket)
+            .bucket(&allowed_bucket)
             .key(key)
             .send()
             .await
@@ -3485,7 +3172,7 @@ fn test_object_lock_bucket_policy_put_obj_retention_bucket_tag_condition_when_ab
 
         let denied = alt_client
             .put_object_retention()
-            .bucket(&private_bucket)
+            .bucket(&denied_bucket)
             .key(key)
             .retention(retention.clone())
             .send()
@@ -3493,8 +3180,8 @@ fn test_object_lock_bucket_policy_put_obj_retention_bucket_tag_condition_when_ab
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");
 
-        cleanup_object_lock_bucket(&public_bucket).await;
-        cleanup_object_lock_bucket(&private_bucket).await;
+        cleanup_object_lock_bucket(&allowed_bucket).await;
+        cleanup_object_lock_bucket(&denied_bucket).await;
     });
 }
 
@@ -3506,21 +3193,21 @@ fn test_object_lock_bucket_policy_put_obj_legal_hold_bucket_tag_condition_when_a
         let key = "file1";
         let hold_on = legal_hold(ObjectLockLegalHoldStatus::On);
 
-        let public_bucket = setup_object_lock_bucket().await;
-        put_object_bytes(&public_bucket, key, b"abc").await;
-        enable_bucket_abac_with_security_tag(&public_bucket, "public").await;
+        let allowed_bucket = setup_object_lock_bucket().await;
+        put_object_bytes(&allowed_bucket, key, b"abc").await;
+        enable_bucket_abac_with_security_tag(&allowed_bucket, "allow").await;
         put_bucket_policy_json(
-            &public_bucket,
+            &allowed_bucket,
             json!({
                 "Version": "2012-10-17",
                 "Statement": [{
                     "Effect": "Allow",
                     "Principal": alt_policy_principal(),
                     "Action": "s3:PutObjectLegalHold",
-                    "Resource": bucket_wildcard_resource(&public_bucket),
+                    "Resource": bucket_wildcard_resource(&allowed_bucket),
                     "Condition": {
                         "StringEquals": {
-                            "s3:BucketTag/security": "public"
+                            "s3:BucketTag/security": "allow"
                         }
                     }
                 }],
@@ -3528,21 +3215,21 @@ fn test_object_lock_bucket_policy_put_obj_legal_hold_bucket_tag_condition_when_a
         )
         .await;
 
-        let private_bucket = setup_object_lock_bucket().await;
-        put_object_bytes(&private_bucket, key, b"abc").await;
-        enable_bucket_abac_with_security_tag(&private_bucket, "private").await;
+        let denied_bucket = setup_object_lock_bucket().await;
+        put_object_bytes(&denied_bucket, key, b"abc").await;
+        enable_bucket_abac_with_security_tag(&denied_bucket, "deny").await;
         put_bucket_policy_json(
-            &private_bucket,
+            &denied_bucket,
             json!({
                 "Version": "2012-10-17",
                 "Statement": [{
                     "Effect": "Allow",
                     "Principal": alt_policy_principal(),
                     "Action": "s3:PutObjectLegalHold",
-                    "Resource": bucket_wildcard_resource(&private_bucket),
+                    "Resource": bucket_wildcard_resource(&denied_bucket),
                     "Condition": {
                         "StringEquals": {
-                            "s3:BucketTag/security": "public"
+                            "s3:BucketTag/security": "allow"
                         }
                     }
                 }],
@@ -3552,7 +3239,7 @@ fn test_object_lock_bucket_policy_put_obj_legal_hold_bucket_tag_condition_when_a
 
         alt_client
             .put_object_legal_hold()
-            .bucket(&public_bucket)
+            .bucket(&allowed_bucket)
             .key(key)
             .legal_hold(hold_on.clone())
             .send()
@@ -3560,7 +3247,7 @@ fn test_object_lock_bucket_policy_put_obj_legal_hold_bucket_tag_condition_when_a
             .unwrap();
         let response = client
             .get_object_legal_hold()
-            .bucket(&public_bucket)
+            .bucket(&allowed_bucket)
             .key(key)
             .send()
             .await
@@ -3569,7 +3256,7 @@ fn test_object_lock_bucket_policy_put_obj_legal_hold_bucket_tag_condition_when_a
 
         let denied = alt_client
             .put_object_legal_hold()
-            .bucket(&private_bucket)
+            .bucket(&denied_bucket)
             .key(key)
             .legal_hold(hold_on)
             .send()
@@ -3577,8 +3264,8 @@ fn test_object_lock_bucket_policy_put_obj_legal_hold_bucket_tag_condition_when_a
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");
 
-        cleanup_object_lock_bucket(&public_bucket).await;
-        cleanup_object_lock_bucket(&private_bucket).await;
+        cleanup_object_lock_bucket(&allowed_bucket).await;
+        cleanup_object_lock_bucket(&denied_bucket).await;
     });
 }
 
@@ -3593,7 +3280,7 @@ fn test_object_lock_bucket_policy_existing_tag_condition_is_rejected_for_get_leg
             .put_object_tagging()
             .bucket(&bucket)
             .key(key)
-            .tagging(object_tagging("security", "public"))
+            .tagging(object_tagging("security", "allow"))
             .send()
             .await
             .unwrap();
@@ -3611,7 +3298,7 @@ fn test_object_lock_bucket_policy_existing_tag_condition_is_rejected_for_get_leg
                         "Resource": bucket_wildcard_resource(&bucket),
                         "Condition": {
                             "StringEquals": {
-                                "s3:ExistingObjectTag/security": "public"
+                                "s3:ExistingObjectTag/security": "allow"
                             }
                         }
                     }],

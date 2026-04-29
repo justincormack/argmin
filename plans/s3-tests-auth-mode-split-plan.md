@@ -139,6 +139,7 @@ Do not add broad matrix duplication until these smoke tests have found no gaps.
 - Moved the `s3:x-amz-acl=public*` PutObject bucket-policy condition test from `tagging.rs` into `bucket_policy.rs`.
 - Split anonymous public range response-shape and malformed `Range` header coverage from `range.rs` into `public_access_range.rs`.
 - Added `bucket_encryption_acl.rs` ObjectWriter smoke coverage for SSE-C default blocking, explicit blocking, multipart initiation blocking, and explicit unblocking.
+- Split public-write/anonymous object-lock access checks from `object_lock.rs` into `public_access_object_lock.rs`, renamed non-public ABAC tag values there to `security=allow/deny`, and added `object_lock_acl.rs` ObjectWriter smoke coverage for retention, legal hold, PutObject headers, and multipart headers.
 
 ## Verification Checklist
 
