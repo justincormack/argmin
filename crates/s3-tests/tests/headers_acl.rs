@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ring::{digest, hmac};
 use s3_tests::{unique_bucket, CTX};
@@ -126,14 +126,30 @@ fn test_bucket_create_bad_acl() {
         let path = format!("/{}", bucket);
         let signed = sign_put_without_acl_header(&path, b"");
         let url = format!("{}{}", CTX.endpoint(), path);
-        let mut resp = agent()
-            .put(&url)
-            .header("Authorization", &signed.authorization)
-            .header("x-amz-date", &signed.amz_date)
-            .header("x-amz-content-sha256", &signed.amz_content_sha256)
-            .header("x-amz-acl", "garbage")
-            .send(b"" as &[u8])
-            .expect("transport error");
+        const MAX_TRANSPORT_ATTEMPTS: usize = 4;
+        let mut resp = None;
+        for attempt in 0..MAX_TRANSPORT_ATTEMPTS {
+            let result = agent()
+                .put(&url)
+                .header("Authorization", &signed.authorization)
+                .header("x-amz-date", &signed.amz_date)
+                .header("x-amz-content-sha256", &signed.amz_content_sha256)
+                .header("x-amz-acl", "garbage")
+                .send(b"" as &[u8]);
+            match result {
+                Ok(response) => {
+                    resp = Some(response);
+                    break;
+                }
+                Err(_) if attempt + 1 < MAX_TRANSPORT_ATTEMPTS => {
+                    tokio::time::sleep(Duration::from_millis(100u64 << attempt)).await;
+                }
+                Err(err) => {
+                    panic!("transport error after {MAX_TRANSPORT_ATTEMPTS} attempts: {err}");
+                }
+            }
+        }
+        let mut resp = resp.expect("transport retry loop must return or panic");
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 403, "expected 403, got {}", status);

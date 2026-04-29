@@ -136,6 +136,7 @@ Do not add broad matrix duplication until these smoke tests have found no gaps.
 - Split versioned object ACL grant behavior from `versioning.rs` into `versioning_acl.rs`.
 - Moved anonymous/public-read ownership behavior from `ownership.rs` into `public_access_acl.rs`, kept public-read bucket ACL BOE-transition coverage there, and rewrote ownership bucket ACL rejection setup to use explicit alternate-account grants instead of public bucket ACLs.
 - Renamed arbitrary ABAC tag values in `tagging.rs` from `security=public/private` to `security=allow/deny` where no public access behavior is involved.
+- Moved the `s3:x-amz-acl=public*` PutObject bucket-policy condition test from `tagging.rs` into `bucket_policy.rs`.
 
 ## Verification Checklist
 

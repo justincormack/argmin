@@ -8104,6 +8104,89 @@ fn test_bucket_policy_put_object_canned_acl_uses_put_object_permission() {
 }
 
 #[test]
+fn test_bucket_policy_put_object_deny_on_public_acl() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": principal.clone(),
+                    "Action": "s3:PutObject",
+                    "Resource": bucket_wildcard_resource(&bucket),
+                },
+                {
+                    "Effect": "Deny",
+                    "Principal": principal,
+                    "Action": "s3:PutObject",
+                    "Resource": bucket_wildcard_resource(&bucket),
+                    "Condition": {
+                        "StringLike": {
+                            "s3:x-amz-acl": "public*"
+                        }
+                    }
+                }
+            ]
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key("private-key")
+            .body(ByteStream::from_static(b"private-key"))
+            .send()
+            .await
+            .unwrap();
+
+        let denied = alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key("public-key")
+            .acl(ObjectCannedAcl::PublicRead)
+            .body(ByteStream::from_static(b"public-key"))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        let streaming_denied = alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key("public-streaming-key")
+            .acl(ObjectCannedAcl::PublicRead)
+            .body(ByteStream::from(vec![
+                0x5Au8;
+                server_core::coordinator::INTERNAL_SEGMENT_SIZE
+                    + 1
+            ]))
+            .send()
+            .await;
+        assert_eq!(err_status(&streaming_denied), 403);
+        assert_s3_err_code(&streaming_denied, "AccessDenied");
+
+        cleanup(
+            &bucket,
+            &["private-key", "public-key", "public-streaming-key"],
+        )
+        .await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_put_object_acl_null_condition_treats_absent_header_as_null() {
     s3_tests::run(async {
         let principal = alt_policy_principal();
