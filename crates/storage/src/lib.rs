@@ -41,7 +41,7 @@ pub use cluster::{
 };
 pub use error::{
     BucketSnapshotLoadError, BucketWriteDrainError, ClusterBuildError, MetadataError,
-    ObjectPgActionError, StoreError,
+    ObjectPgActionError, ShardIoError, StoreError,
 };
 #[cfg(feature = "test-hooks")]
 pub use node::{

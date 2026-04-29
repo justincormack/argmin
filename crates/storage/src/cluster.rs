@@ -4,8 +4,7 @@ use placement::NodeId;
 
 pub use local::{LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig};
 
-use crate::error::ClusterBuildError;
-use crate::error::StoreError;
+use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 use crate::node::SharedStorageNode;
 use crate::types::{
     BucketName, ClusterEpoch, CommitDirectPutObjectReq, DataPgId, DirectPutCommitSnapshot,
@@ -146,6 +145,43 @@ impl StorageCluster {
     ) -> Result<NodeId, ClusterBuildError> {
         self.local_map
             .payload_shard_node(data_pg_id, shard_index, ec_shape, stable_placement_key)
+    }
+
+    pub fn write_payload_shard(
+        &self,
+        location: ShardLocation,
+        key: &ShardKey,
+        data: &[u8],
+    ) -> Result<WriteAck, ShardIoError> {
+        self.local_map.write_payload_shard(location, key, data)
+    }
+
+    pub fn read_payload_shard(
+        &self,
+        location: ShardLocation,
+        key: &ShardKey,
+        expected: WriteAck,
+    ) -> Result<Vec<u8>, ShardIoError> {
+        self.local_map.read_payload_shard(location, key, expected)
+    }
+
+    pub fn read_payload_shard_into(
+        &self,
+        location: ShardLocation,
+        key: &ShardKey,
+        expected: WriteAck,
+        dst: &mut [u8],
+    ) -> Result<(), ShardIoError> {
+        self.local_map
+            .read_payload_shard_into(location, key, expected, dst)
+    }
+
+    pub fn delete_payload_shard(
+        &self,
+        location: ShardLocation,
+        key: &ShardKey,
+    ) -> Result<(), ShardIoError> {
+        self.local_map.delete_payload_shard(location, key)
     }
 
     pub fn write_direct_put_segment_payload_shards(

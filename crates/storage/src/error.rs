@@ -1,6 +1,8 @@
 /// Storage layer error types.
 use std::path::PathBuf;
 
+use crate::types::ClusterEpoch;
+
 /// Shard-level storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -34,6 +36,35 @@ pub enum StoreError {
     ErasureCoding {
         context: &'static str,
         reason: String,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ShardIoError {
+    #[error(
+        "shard location epoch {location_epoch} does not match current cluster epoch {current_epoch}"
+    )]
+    StaleLocation {
+        location_epoch: ClusterEpoch,
+        current_epoch: ClusterEpoch,
+    },
+
+    #[error("shard location references unknown local node {node_id}")]
+    NodeNotFound { node_id: u32 },
+
+    #[error(
+        "shard location index {location_shard_index} does not match shard key index {key_shard_index}"
+    )]
+    ShardIndexMismatch {
+        location_shard_index: u8,
+        key_shard_index: u8,
+    },
+
+    #[error("shard IO failed on local node {node_id}: {source}")]
+    Store {
+        node_id: u32,
+        #[source]
+        source: StoreError,
     },
 }
 

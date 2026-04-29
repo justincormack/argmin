@@ -1241,6 +1241,11 @@ impl ShardKey {
         &self.0
     }
 
+    /// Return the EC shard index embedded in this shard key.
+    pub fn shard_index(&self) -> ShardIndex {
+        ShardIndex::new(self.0[24])
+    }
+
     /// Hex-encode the full key into a fixed-size ASCII buffer.
     pub fn hex_bytes(&self) -> [u8; SHARD_KEY_HEX_LEN] {
         let mut hex = [0u8; SHARD_KEY_HEX_LEN];
@@ -3426,6 +3431,7 @@ mod tests {
         let bytes = key.as_bytes();
         let key2 = ShardKey::from_bytes(bytes).unwrap();
         assert_eq!(key, key2);
+        assert_eq!(key2.shard_index(), ShardIndex::new(7));
     }
 
     #[test]

@@ -598,7 +598,7 @@ Implementation order:
   - map `(data_pg_id, shard index, EC shape, stable placement key)` to `NodeId`
   - keep this in `StorageCluster`/`LocalClusterMap`, not coordinator code
   - test deterministic, distinct-node placement for each shard in a stripe
-- [ ] 4.3 Add cluster-owned local shard IO dispatch.
+- [x] 4.3 Add cluster-owned local shard IO dispatch.
   - write, read, and delete one shard on its assigned local node
   - keep the API shaped like the later remote-node boundary
   - leave metadata operations on the current metadata primary for this phase
@@ -654,6 +654,19 @@ Phase 4 implementation notes:
      production startup
    - direct `SharedStorageNode` construction remains for storage-node internals
      and narrow metadata-primary test hooks only
+4. Step 4.3 adds cluster-owned local shard IO dispatch.
+   - `StorageCluster` exposes placed payload-shard write, read, read-into, and
+     delete operations that dispatch to the `NodeId` carried by `ShardLocation`
+   - shard IO rejects stale location epochs and unknown local nodes before
+     reaching the local store
+   - placed shard IO rejects mismatches between `ShardLocation::shard_index()`
+     and the shard index embedded in the `ShardKey`, so callers cannot write,
+     read, or delete a shard through another shard's node placement
+   - shard reads take the expected `WriteAck` and validate stored size and
+     CRC64 at the cluster shard boundary
+   - the implementation is still in-process and file-backed, but coordinator
+     request paths can now move to a cluster-shaped shard boundary in Steps
+     4.4-4.8
 
 Exit criteria:
 

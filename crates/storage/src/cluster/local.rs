@@ -5,8 +5,9 @@ use std::sync::Arc;
 use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
 
 use super::ShardLocation;
-use crate::error::{ClusterBuildError, StoreError};
-use crate::{ClusterEpoch, DataPgId, EcShape, ShardIndex, SharedStorageNode};
+use crate::error::{ClusterBuildError, ShardIoError, StoreError};
+use crate::traits::ShardStore;
+use crate::{ClusterEpoch, DataPgId, EcShape, ShardIndex, ShardKey, SharedStorageNode, WriteAck};
 
 const PAYLOAD_SHARD_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin/payload-shard-placement/v1";
 
@@ -67,6 +68,93 @@ impl std::fmt::Debug for LocalNodeStore {
             .field("node_id", &self.node_id)
             .field("data_dir", &self.data_dir)
             .finish_non_exhaustive()
+    }
+}
+
+struct LocalShardNodeClient<'a> {
+    node: &'a LocalNodeStore,
+}
+
+impl LocalShardNodeClient<'_> {
+    fn write_shard(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+        data: &[u8],
+    ) -> Result<WriteAck, ShardIoError> {
+        self.node
+            .storage_node()
+            .write_shard_file(data_pg_id.get(), key, data)
+            .map_err(|source| self.store_error(source))
+    }
+
+    fn read_shard(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+        expected: WriteAck,
+    ) -> Result<Vec<u8>, ShardIoError> {
+        let data = self
+            .node
+            .storage_node()
+            .read_shard_file(data_pg_id.get(), key)
+            .map_err(|source| self.store_error(source))?;
+        self.verify_read_ack(expected, &data)?;
+        Ok(data)
+    }
+
+    fn read_shard_into(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+        expected: WriteAck,
+        dst: &mut [u8],
+    ) -> Result<(), ShardIoError> {
+        if dst.len() as u64 != expected.stored_size {
+            return Err(self.store_error(StoreError::Io {
+                context: "read payload shard buffer size mismatch",
+                source: std::io::Error::from(std::io::ErrorKind::InvalidData),
+            }));
+        }
+        self.node
+            .storage_node()
+            .read_shard_file_into(data_pg_id.get(), key, dst)
+            .map_err(|source| self.store_error(source))?;
+        self.verify_read_ack(expected, dst)
+    }
+
+    fn delete_shard(&self, data_pg_id: DataPgId, key: &ShardKey) -> Result<(), ShardIoError> {
+        let pg = self
+            .node
+            .storage_node()
+            .get_pg(data_pg_id.get())
+            .map_err(|source| self.store_error(source))?;
+        pg.delete_shard(key)
+            .map_err(|source| self.store_error(source))
+    }
+
+    fn store_error(&self, source: StoreError) -> ShardIoError {
+        ShardIoError::Store {
+            node_id: self.node.node_id().as_u32(),
+            source,
+        }
+    }
+
+    fn verify_read_ack(&self, expected: WriteAck, data: &[u8]) -> Result<(), ShardIoError> {
+        if data.len() as u64 != expected.stored_size {
+            return Err(self.store_error(StoreError::Io {
+                context: "read payload shard size mismatch",
+                source: std::io::Error::from(std::io::ErrorKind::InvalidData),
+            }));
+        }
+        let actual = checksum::crc64::checksum(data);
+        if actual != expected.crc64 {
+            return Err(self.store_error(StoreError::IntegrityError {
+                expected: expected.crc64,
+                actual,
+            }));
+        }
+        Ok(())
     }
 }
 
@@ -248,6 +336,77 @@ impl LocalClusterMap {
                 shard_index: shard_index.get(),
             })
     }
+
+    pub fn write_payload_shard(
+        &self,
+        location: ShardLocation,
+        key: &ShardKey,
+        data: &[u8],
+    ) -> Result<WriteAck, ShardIoError> {
+        self.shard_node_client(location, key)?
+            .write_shard(location.data_pg_id(), key, data)
+    }
+
+    pub fn read_payload_shard(
+        &self,
+        location: ShardLocation,
+        key: &ShardKey,
+        expected: WriteAck,
+    ) -> Result<Vec<u8>, ShardIoError> {
+        self.shard_node_client(location, key)?
+            .read_shard(location.data_pg_id(), key, expected)
+    }
+
+    pub fn read_payload_shard_into(
+        &self,
+        location: ShardLocation,
+        key: &ShardKey,
+        expected: WriteAck,
+        dst: &mut [u8],
+    ) -> Result<(), ShardIoError> {
+        self.shard_node_client(location, key)?.read_shard_into(
+            location.data_pg_id(),
+            key,
+            expected,
+            dst,
+        )
+    }
+
+    pub fn delete_payload_shard(
+        &self,
+        location: ShardLocation,
+        key: &ShardKey,
+    ) -> Result<(), ShardIoError> {
+        self.shard_node_client(location, key)?
+            .delete_shard(location.data_pg_id(), key)
+    }
+
+    fn shard_node_client(
+        &self,
+        location: ShardLocation,
+        key: &ShardKey,
+    ) -> Result<LocalShardNodeClient<'_>, ShardIoError> {
+        if location.cluster_epoch() != self.epoch {
+            return Err(ShardIoError::StaleLocation {
+                location_epoch: location.cluster_epoch(),
+                current_epoch: self.epoch,
+            });
+        }
+        if location.shard_index() != key.shard_index() {
+            return Err(ShardIoError::ShardIndexMismatch {
+                location_shard_index: location.shard_index().get(),
+                key_shard_index: key.shard_index().get(),
+            });
+        }
+
+        let node = self
+            .nodes
+            .get(&location.node_id())
+            .ok_or(ShardIoError::NodeNotFound {
+                node_id: location.node_id().as_u32(),
+            })?;
+        Ok(LocalShardNodeClient { node })
+    }
 }
 
 fn validate_local_payload_placement(
@@ -356,6 +515,7 @@ fn prepare_local_node_data_dir(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use std::sync::Arc;
 
     #[test]
     fn opens_distinct_local_node_stores_with_static_epoch() {
@@ -516,6 +676,235 @@ mod tests {
                 shard_index: 6,
             }
         ));
+    }
+
+    #[test]
+    fn storage_cluster_dispatches_payload_shard_io_to_placed_local_node() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+        let map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let data_pg_id = DataPgId::new(crate::PgId::new(1));
+        let location = cluster
+            .place_payload_shards(data_pg_id, ec_shape, b"stable-payload-key")
+            .unwrap()[3];
+        let key = ShardKey::new(&[17; 16], 23, location.shard_index().get());
+
+        let ack = cluster
+            .write_payload_shard(location, &key, b"placed shard")
+            .unwrap();
+
+        assert_eq!(ack.stored_size, b"placed shard".len() as u64);
+        assert_eq!(ack.crc64, checksum::crc64::checksum(b"placed shard"));
+        assert_eq!(
+            cluster.read_payload_shard(location, &key, ack).unwrap(),
+            b"placed shard"
+        );
+        let mut dst = vec![0; b"placed shard".len()];
+        cluster
+            .read_payload_shard_into(location, &key, ack, &mut dst)
+            .unwrap();
+        assert_eq!(dst, b"placed shard");
+        assert!(matches!(
+            cluster.read_payload_shard(
+                location,
+                &key,
+                WriteAck {
+                    crc64: ack.crc64 ^ 1,
+                    stored_size: ack.stored_size,
+                },
+            ),
+            Err(ShardIoError::Store {
+                source: StoreError::IntegrityError { .. },
+                ..
+            })
+        ));
+
+        let assigned_node = map.node(location.node_id()).unwrap();
+        assert_eq!(
+            assigned_node
+                .storage_node()
+                .read_shard_file(data_pg_id.get(), &key)
+                .unwrap(),
+            b"placed shard"
+        );
+        for other_node_id in node_ids {
+            if other_node_id == location.node_id() {
+                continue;
+            }
+            let other_node = map.node(other_node_id).unwrap();
+            assert!(matches!(
+                other_node
+                    .storage_node()
+                    .read_shard_file(data_pg_id.get(), &key),
+                Err(StoreError::NotFound)
+            ));
+        }
+
+        cluster.delete_payload_shard(location, &key).unwrap();
+        assert!(matches!(
+            cluster.read_payload_shard(location, &key, ack),
+            Err(ShardIoError::Store {
+                source: StoreError::NotFound,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn placed_payload_shard_io_rejects_key_location_shard_index_mismatch() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+        let map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let data_pg_id = DataPgId::new(crate::PgId::new(1));
+        let locations = cluster
+            .place_payload_shards(data_pg_id, ec_shape, b"stable-payload-key")
+            .unwrap();
+        let shard_0_location = locations[0];
+        let shard_3_location = locations[3];
+        let shard_0_key = ShardKey::new(&[31; 16], 42, shard_0_location.shard_index().get());
+
+        let err = cluster
+            .write_payload_shard(shard_3_location, &shard_0_key, b"wrong shard")
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ShardIoError::ShardIndexMismatch {
+                location_shard_index: 3,
+                key_shard_index: 0,
+            }
+        ));
+        assert!(matches!(
+            map.node(shard_3_location.node_id())
+                .unwrap()
+                .storage_node()
+                .read_shard_file(data_pg_id.get(), &shard_0_key),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            map.node(shard_0_location.node_id())
+                .unwrap()
+                .storage_node()
+                .read_shard_file(data_pg_id.get(), &shard_0_key),
+            Err(StoreError::NotFound)
+        ));
+
+        let ack = cluster
+            .write_payload_shard(shard_0_location, &shard_0_key, b"right shard")
+            .unwrap();
+        assert!(matches!(
+            cluster.read_payload_shard(shard_3_location, &shard_0_key, ack),
+            Err(ShardIoError::ShardIndexMismatch {
+                location_shard_index: 3,
+                key_shard_index: 0,
+            })
+        ));
+        assert!(matches!(
+            cluster.delete_payload_shard(shard_3_location, &shard_0_key),
+            Err(ShardIoError::ShardIndexMismatch {
+                location_shard_index: 3,
+                key_shard_index: 0,
+            })
+        ));
+        assert_eq!(
+            cluster
+                .read_payload_shard(shard_0_location, &shard_0_key, ack)
+                .unwrap(),
+            b"right shard"
+        );
+    }
+
+    #[test]
+    fn payload_shard_io_rejects_stale_location_epoch() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let map = LocalClusterMap::open(
+            tmp.path(),
+            &node_ids,
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap();
+        let location = ShardLocation::new(
+            ClusterEpoch::new(2).unwrap(),
+            DataPgId::new(crate::PgId::new(0)),
+            ShardIndex::new(0),
+            NodeId::new(0),
+        );
+        let key = ShardKey::new(&[23; 16], 1, 0);
+
+        let err = map
+            .write_payload_shard(location, &key, b"stale")
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ShardIoError::StaleLocation {
+                location_epoch,
+                current_epoch,
+            } if location_epoch == ClusterEpoch::new(2).unwrap()
+                && current_epoch == ClusterEpoch::INITIAL
+        ));
+    }
+
+    #[test]
+    fn payload_shard_io_rejects_unknown_local_node() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let map = LocalClusterMap::open(
+            tmp.path(),
+            &node_ids,
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap();
+        let location = ShardLocation::new(
+            ClusterEpoch::INITIAL,
+            DataPgId::new(crate::PgId::new(0)),
+            ShardIndex::new(0),
+            NodeId::new(99),
+        );
+        let key = ShardKey::new(&[29; 16], 1, 0);
+
+        let err = map
+            .write_payload_shard(location, &key, b"unknown")
+            .unwrap_err();
+
+        assert!(matches!(err, ShardIoError::NodeNotFound { node_id: 99 }));
     }
 
     #[test]
