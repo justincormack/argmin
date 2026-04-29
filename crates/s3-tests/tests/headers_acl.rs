@@ -1,7 +1,8 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aws_sdk_s3::types::ObjectOwnership;
 use ring::{digest, hmac};
-use s3_tests::{unique_bucket, CTX};
+use s3_tests::{create_acl_enabled_bucket, object_url, send_signed_request, unique_bucket, CTX};
 
 fn agent() -> s3_tests::Agent {
     s3_tests::test_agent()
@@ -154,5 +155,50 @@ fn test_bucket_create_bad_acl() {
         let rbody = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 403, "expected 403, got {}", status);
         assert_error_code(&rbody, "AccessDenied");
+    });
+}
+
+#[test]
+fn test_put_object_acl_header_raw_request_succeeds_on_acl_bucket() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_acl_enabled_bucket(client, ObjectOwnership::ObjectWriter).await;
+        let key = "raw-acl-header";
+        let body = b"raw-acl-body";
+        let url = object_url(CTX.endpoint(), &bucket, key, None);
+
+        let response = send_signed_request("PUT", &url, body, [("x-amz-acl", "private")]);
+        assert_eq!(
+            response.status, 200,
+            "unexpected response body: {}",
+            response.body
+        );
+
+        let object = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let stored = object.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&stored[..], body);
+
+        let acl = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            acl.grants().len(),
+            1,
+            "unexpected grants: {:?}",
+            acl.grants()
+        );
+
+        let _ = client.delete_object().bucket(&bucket).key(key).send().await;
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }

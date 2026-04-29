@@ -141,6 +141,7 @@ Do not add broad matrix duplication until these smoke tests have found no gaps.
 - Added `bucket_encryption_acl.rs` ObjectWriter smoke coverage for SSE-C default blocking, explicit blocking, multipart initiation blocking, and explicit unblocking.
 - Split public-write/anonymous object-lock access checks from `object_lock.rs` into `public_access_object_lock.rs`, renamed non-public ABAC tag values there to `security=allow/deny`, and added `object_lock_acl.rs` ObjectWriter smoke coverage for retention, legal hold, PutObject headers, and multipart headers.
 - Added `lifecycle_acl.rs` ObjectWriter lifecycle CRUD smoke coverage and `checksums_acl.rs` ObjectWriter single-part and multipart checksum smoke coverage.
+- Added second-priority ObjectWriter smoke coverage in `conditional_acl.rs` and `website_redirect_acl.rs`, plus a raw signed ACL header acceptance case in `headers_acl.rs`.
 
 ## Verification Checklist
 
