@@ -414,7 +414,7 @@ mod tests {
     use super::*;
     use crate::coordinator::test_support::{
         bucket_request_with_expected_owner, put_bucket_lifecycle_test, put_bucket_policy_test,
-        setup_coordinator_with_pg_count, test_requester,
+        setup_coordinator, setup_coordinator_with_pg_count, test_requester,
     };
     use crate::coordinator::{
         CreateBucketAcl, CreateBucketRequest, PutBucketAbacRequest, PutBucketConfigRequest,
@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn load_bucket_handle_fetches_only_requested_subresources() {
         let tmp = tempdir();
-        let coord = setup_coordinator_with_pg_count(tmp.path(), 4);
+        let coord = setup_coordinator(tmp.path());
         create_bucket(&coord, "bucket");
         put_bucket_policy_test(
             &coord,
@@ -487,7 +487,7 @@ mod tests {
     #[test]
     fn load_bucket_handle_loads_tags_when_abac_enabled() {
         let tmp = tempdir();
-        let coord = setup_coordinator_with_pg_count(tmp.path(), 4);
+        let coord = setup_coordinator(tmp.path());
         create_bucket(&coord, "bucket");
         coord
             .put_bucket_tags(&PutBucketConfigRequest {
@@ -517,7 +517,7 @@ mod tests {
     #[test]
     fn load_bucket_handle_skips_tags_when_abac_disabled() {
         let tmp = tempdir();
-        let coord = setup_coordinator_with_pg_count(tmp.path(), 4);
+        let coord = setup_coordinator(tmp.path());
         create_bucket(&coord, "bucket");
         coord
             .put_bucket_tags(&PutBucketConfigRequest {
@@ -541,7 +541,7 @@ mod tests {
     #[test]
     fn load_bucket_handle_marks_missing_requested_subresources() {
         let tmp = tempdir();
-        let coord = setup_coordinator_with_pg_count(tmp.path(), 4);
+        let coord = setup_coordinator(tmp.path());
         create_bucket(&coord, "bucket");
 
         let loaded = coord
@@ -695,7 +695,7 @@ mod tests {
     #[test]
     fn loaded_object_handle_borrows_bucket_handle() {
         let tmp = tempdir();
-        let coord = setup_coordinator_with_pg_count(tmp.path(), 4);
+        let coord = setup_coordinator(tmp.path());
         create_bucket(&coord, "bucket");
 
         let loaded = coord
@@ -716,7 +716,7 @@ mod tests {
     #[test]
     fn load_bucket_handle_checks_expected_owner() {
         let tmp = tempdir();
-        let coord = setup_coordinator_with_pg_count(tmp.path(), 4);
+        let coord = setup_coordinator(tmp.path());
         create_bucket(&coord, "bucket");
 
         let err = coord

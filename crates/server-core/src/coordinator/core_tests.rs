@@ -1488,7 +1488,7 @@ fn delete_bucket_does_not_wait_for_bucket_lock() {
 #[test]
 fn head_object_lazily_populates_bucket_fast_path_for_boe_bucket() {
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator(tmp.path());
+    let coord = setup_coordinator_with_pg_count(tmp.path(), METADATA_FANOUT_TEST_PG_COUNT);
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
@@ -1550,7 +1550,7 @@ fn head_object_lazily_populates_bucket_fast_path_for_boe_bucket() {
 fn head_object_waits_for_bucket_pg_when_non_boe_bucket_fast_path_is_warm() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-head-fast-no-pg";
-    let pg_ids: Vec<u32> = (0..4).collect();
+    let pg_ids: Vec<u32> = (0..METADATA_FANOUT_TEST_PG_COUNT).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
     let storage_node = storage_cluster.test_metadata_storage_node();
     let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -1644,7 +1644,7 @@ fn head_object_waits_for_bucket_pg_when_non_boe_bucket_fast_path_is_warm() {
 fn head_object_does_not_wait_for_bucket_pg_when_boe_fast_path_is_warm() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-head-boe-fast-no-pg";
-    let pg_ids: Vec<u32> = (0..4).collect();
+    let pg_ids: Vec<u32> = (0..METADATA_FANOUT_TEST_PG_COUNT).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
     let storage_node = storage_cluster.test_metadata_storage_node();
     let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -1742,7 +1742,7 @@ fn head_object_does_not_wait_for_bucket_pg_when_boe_fast_path_is_warm() {
 fn head_object_does_not_wait_for_bucket_pg_when_boe_policy_and_abac_tags_fast_path_is_warm() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-head-policy-abac-fast";
-    let pg_ids: Vec<u32> = (0..4).collect();
+    let pg_ids: Vec<u32> = (0..METADATA_FANOUT_TEST_PG_COUNT).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
     let storage_node = storage_cluster.test_metadata_storage_node();
     let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -2771,7 +2771,7 @@ fn bucket_fast_path_watcher_recovers_after_observing_missing_bucket_before_recre
 fn put_bucket_tags_invalidates_warm_fast_path_tags() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-put-tags-invalidates-fast-path";
-    let coord = setup_coordinator(tmp.path());
+    let coord = setup_coordinator_with_pg_count(tmp.path(), METADATA_FANOUT_TEST_PG_COUNT);
     let owner_account = "111122223333";
     let owner_requester = test_helpers::requester(owner_account);
 
@@ -2889,7 +2889,7 @@ fn put_bucket_tags_invalidates_warm_fast_path_tags() {
 fn delete_object_falls_back_to_storage_load_when_bucket_fast_path_is_acl_free() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-delete-fast-no-pg";
-    let pg_ids: Vec<u32> = (0..4).collect();
+    let pg_ids: Vec<u32> = (0..METADATA_FANOUT_TEST_PG_COUNT).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
     let storage_node = storage_cluster.test_metadata_storage_node();
     let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -3144,7 +3144,7 @@ fn complete_multipart_upload_waits_for_multipart_completion_lock() {
 fn complete_multipart_upload_does_not_deadlock_when_bucket_policy_shares_pg() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-complete-same-pg";
-    let pg_ids: Vec<u32> = (0..4).collect();
+    let pg_ids: Vec<u32> = (0..METADATA_FANOUT_TEST_PG_COUNT).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
     let admin = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
         &storage_cluster,

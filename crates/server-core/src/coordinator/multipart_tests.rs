@@ -3527,7 +3527,7 @@ fn abort_completed_multipart_upload_after_overwrite_succeeds() {
 #[test]
 fn completed_multipart_tombstone_prune_limit_is_global_across_object_pgs() {
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator(tmp.path());
+    let coord = setup_coordinator_with_pg_count(tmp.path(), METADATA_FANOUT_TEST_PG_COUNT);
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();

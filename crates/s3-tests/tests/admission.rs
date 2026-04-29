@@ -39,7 +39,7 @@ async fn start_server(
     let data_path = temp_dir.path().join("data");
     ec::self_test().unwrap();
 
-    let pg_count: u32 = 4;
+    let pg_count: u32 = 1;
     let pg_ids: Vec<u32> = (0..pg_count).collect();
 
     let storage_cluster = s3_tests::server::open_test_storage_cluster(&data_path, &pg_ids);

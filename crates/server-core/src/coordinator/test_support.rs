@@ -79,6 +79,8 @@ pub(crate) fn shards_for_byte_range(
 
 pub(crate) const TEST_SSE_S3_WRAPPING_KEY_B64: &str =
     "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=";
+pub(crate) const DEFAULT_TEST_PG_COUNT: u32 = 1;
+pub(crate) const METADATA_FANOUT_TEST_PG_COUNT: u32 = 2;
 
 pub(crate) fn test_sse_s3_provider() -> StaticManagedKeyProvider {
     StaticManagedKeyProvider::single(
@@ -87,11 +89,11 @@ pub(crate) fn test_sse_s3_provider() -> StaticManagedKeyProvider {
 }
 
 pub(crate) fn setup_coordinator(dir: &Path) -> Coordinator {
-    setup_coordinator_with_pg_count(dir, 4)
+    setup_coordinator_with_pg_count(dir, DEFAULT_TEST_PG_COUNT)
 }
 
 pub(crate) fn setup_coordinator_in_region(dir: &Path, region: &str) -> Coordinator {
-    let pg_ids: Vec<u32> = (0..4).collect();
+    let pg_ids: Vec<u32> = (0..DEFAULT_TEST_PG_COUNT).collect();
     let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
     Coordinator::new_with_managed_key_provider_for_storage_cluster(
         storage_cluster,
@@ -131,13 +133,13 @@ pub(crate) fn setup_coordinator_with_pg_count_without_lifecycle_sweeper(
 }
 
 pub(crate) fn setup_coordinator_without_managed_key_provider(dir: &Path) -> Coordinator {
-    let pg_ids: Vec<u32> = (0..4).collect();
+    let pg_ids: Vec<u32> = (0..DEFAULT_TEST_PG_COUNT).collect();
     let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
     Coordinator::new_with_storage_cluster(storage_cluster, "us-east-1".to_string(), None).unwrap()
 }
 
 pub(crate) fn setup_coordinator_without_lifecycle_sweeper(dir: &Path) -> Coordinator {
-    let pg_ids: Vec<u32> = (0..4).collect();
+    let pg_ids: Vec<u32> = (0..DEFAULT_TEST_PG_COUNT).collect();
     let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
     Coordinator::new_with_lifecycle_sweeper_factory_for_storage_cluster(
         storage_cluster,
@@ -214,7 +216,7 @@ pub(crate) fn setup_coordinators_with_single_pg_without_lifecycle_sweeper(
 pub(crate) fn setup_coordinator_with_sse_c(dir: &Path) -> Coordinator {
     use base64::Engine;
 
-    let pg_ids: Vec<u32> = (0..4).collect();
+    let pg_ids: Vec<u32> = (0..DEFAULT_TEST_PG_COUNT).collect();
     let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
     let validator = SseCustomerValidatorConfig::from_base64(
         1,

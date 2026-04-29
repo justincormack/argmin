@@ -130,7 +130,7 @@ impl TestServer {
         // Run EC self-test once
         ec::self_test().expect("EC self-test");
 
-        let pg_count: u32 = 4;
+        let pg_count: u32 = 1;
         let pg_ids: Vec<u32> = (0..pg_count).collect();
 
         // Create one shared local storage cluster for all frontends.

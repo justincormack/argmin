@@ -31,7 +31,7 @@ fn test_sse_s3_provider() -> StaticManagedKeyProvider {
 }
 
 fn setup_coordinator(dir: &Path) -> Coordinator {
-    let pg_ids: Vec<u32> = (0..4).collect();
+    let pg_ids: Vec<u32> = (0..1).collect();
     let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
     Coordinator::new_with_managed_key_provider_for_storage_cluster(
         storage_cluster,

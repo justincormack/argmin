@@ -667,6 +667,27 @@ Phase 4 implementation notes:
    - the implementation is still in-process and file-backed, but coordinator
      request paths can now move to a cluster-shaped shard boundary in Steps
      4.4-4.8
+5. The test harness uses a split topology while metadata routing is still a
+   Phase 4 bridge.
+   - broad S3, HTTP, auth, and model tests use one metadata PG with the default
+     `k=4,m=2` six-node local cluster, preserving the local cluster shape
+     without opening unused metadata PG stores
+   - those broad request-path tests still use the Phase 4 metadata-primary
+     bridge for metadata and active payload IO until Steps 4.4-4.8 move
+     coordinator paths onto placed shard IO
+   - tests that specifically exercise metadata PG fanout, merge, pagination, or
+     bucket/object PG separation opt into two PGs
+   - sparse topology tests keep explicit PG sets such as `[0, 2, 5]`
+   - placement and shard IO tests use one PG unless the test checks
+     PG-dependent placement
+6. Metadata operations still delegate through the metadata-primary
+   `SharedStorageNode` in Phase 4.
+   - only payload shard placement and IO are node-aware at this point
+   - the other local node stores are not metadata owners or metadata replicas
+     yet
+   - Phase 6 must remove this bridge by routing metadata operations through
+     cluster-owned PG primaries/replica sets instead of
+     `StorageCluster::single_node`
 
 Exit criteria:
 
@@ -712,17 +733,19 @@ before peering and recovery are real.
 
 Work items:
 
-1. define PG metadata commands for bucket, object, multipart, stream, and reclaim
+1. replace the Phase 4 metadata-primary bridge with cluster-owned metadata PG
+   routing
+2. define PG metadata commands for bucket, object, multipart, stream, and reclaim
    mutations
-2. apply commands through the PG primary
-3. replicate commands to PG replicas before acknowledging success
-4. encode commands canonically so all replicas hash the same logical operation
-5. add command checksums and a chained log or equivalent replay state
-6. record each replica's applied log index and state digest
-7. make replicas reject non-primary or stale-epoch commands
-8. make reads use primary-owned metadata until replica-read semantics are
+3. apply commands through the PG primary
+4. replicate commands to PG replicas before acknowledging success
+5. encode commands canonically so all replicas hash the same logical operation
+6. add command checksums and a chained log or equivalent replay state
+7. record each replica's applied log index and state digest
+8. make replicas reject non-primary or stale-epoch commands
+9. make reads use primary-owned metadata until replica-read semantics are
    specified
-9. add peering placeholders but keep failure handling disabled initially
+10. add peering placeholders but keep failure handling disabled initially
 
 Exit criteria:
 
@@ -732,6 +755,8 @@ Exit criteria:
 4. writes fail closed when a required metadata replica is unavailable
 5. command-log checksum mismatch prevents replica acknowledgement
 6. applied-state digest mismatch prevents the PG from being considered clean
+7. no active cluster metadata path mutates or reads PG state by bypassing
+   cluster PG routing through `StorageCluster::single_node`
 
 ## Phase 6a: Metadata Integrity And Divergence Policy
 

@@ -4594,7 +4594,7 @@ mod tests {
     }
 
     fn setup_coordinator(dir: &std::path::Path) -> Coordinator {
-        let pg_ids: Vec<u32> = (0..4).collect();
+        let pg_ids: Vec<u32> = (0..1).collect();
         let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
         let sse_s3_provider = StaticManagedKeyProvider::single(
             ManagedWrappingKeyConfig::from_base64(1, TEST_SSE_S3_WRAPPING_KEY_B64).unwrap(),
