@@ -25,8 +25,6 @@ use storage::ObjectLockState;
 #[cfg(test)]
 use storage::ShardKey;
 #[cfg(test)]
-use storage::SharedStorageNode;
-#[cfg(test)]
 use storage::{BucketEncryptionConfig, EffectiveBucketEncryptionConfig, ObjectLayout};
 use storage::{BucketName, ObjectKey, StorageCluster};
 #[cfg(test)]

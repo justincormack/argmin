@@ -80,27 +80,6 @@ pub struct LocalClusterMap {
 }
 
 impl LocalClusterMap {
-    pub fn single_node(node_id: NodeId, storage_node: Arc<SharedStorageNode>) -> Self {
-        let process_local_registry_key = Arc::as_ptr(&storage_node) as usize;
-        let mut nodes = BTreeMap::new();
-        nodes.insert(
-            node_id,
-            LocalNodeStore::new(
-                node_id,
-                storage_node.data_dir().to_path_buf(),
-                Arc::clone(&storage_node),
-            ),
-        );
-        let placement_map = build_local_placement_map([node_id]).expect("single node is valid");
-        Self {
-            epoch: ClusterEpoch::INITIAL,
-            metadata_primary_node_id: node_id,
-            nodes,
-            placement_map,
-            process_local_registry_key,
-        }
-    }
-
     pub fn open(
         data_dir: &Path,
         node_ids: &[NodeId],

@@ -1311,9 +1311,9 @@ fn delete_bucket_drains_unqueued_payload_reclaim() {
 fn delete_bucket_returns_before_payload_lease_and_reclaim_complete() {
     let tmp = test_util::tempdir();
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let deleter = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let deleter = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     admin
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();

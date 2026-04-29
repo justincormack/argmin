@@ -128,12 +128,13 @@ fn stream_put_get_multi_segment() {
 #[test]
 fn segment_list_reader_next_chunk_moves_whole_loaded_segment() {
     let dir = test_util::tempdir();
-    let storage_node = Arc::new(SharedStorageNode::open(dir.path(), &[0]).unwrap());
+    let storage_cluster = open_test_storage_cluster(dir.path(), &[0]);
+    let ec_shape = storage_cluster.default_payload_ec_shape();
     let runtime = ReadRuntime {
-        storage_node: StorageCluster::shared_single_node(Arc::clone(&storage_node)),
+        storage_node: storage_cluster,
         #[cfg(test)]
         pg_topology: PgTopology::new(&[0]).unwrap(),
-        payload_buffer_pool: PayloadBufferPool::new(storage_node.default_ec_shape()),
+        payload_buffer_pool: PayloadBufferPool::new(ec_shape),
         sse_c_validator: None,
         managed_key_provider: None,
     };

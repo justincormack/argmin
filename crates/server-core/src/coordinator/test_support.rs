@@ -5,6 +5,7 @@ use crate::sse::{ManagedWrappingKeyConfig, StaticManagedKeyProvider, SSE_C_CUSTO
 use ec::EcConfig;
 use std::path::Path;
 use std::sync::Arc;
+use storage::{NodeId, StorageCluster};
 
 pub(crate) const NO_READ: &ReadCondition = &ReadCondition {
     if_match: None,
@@ -91,20 +92,9 @@ pub(crate) fn setup_coordinator(dir: &Path) -> Coordinator {
 
 pub(crate) fn setup_coordinator_in_region(dir: &Path, region: &str) -> Coordinator {
     let pg_ids: Vec<u32> = (0..4).collect();
-    let ec_config = EcConfig::default();
-    let storage_node = Arc::new(
-        SharedStorageNode::open_with_default_ec_shape(
-            dir,
-            &pg_ids,
-            storage::EcShape {
-                k: ec_config.data_shards,
-                m: ec_config.parity_shards,
-            },
-        )
-        .unwrap(),
-    );
-    Coordinator::new_with_managed_key_provider(
-        storage_node,
+    let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
+    Coordinator::new_with_managed_key_provider_for_storage_cluster(
+        storage_cluster,
         region.to_string(),
         None,
         test_sse_s3_provider(),
@@ -114,20 +104,9 @@ pub(crate) fn setup_coordinator_in_region(dir: &Path, region: &str) -> Coordinat
 
 pub(crate) fn setup_coordinator_with_pg_count(dir: &Path, pg_count: u32) -> Coordinator {
     let pg_ids: Vec<u32> = (0..pg_count).collect();
-    let ec_config = EcConfig::default();
-    let storage_node = Arc::new(
-        SharedStorageNode::open_with_default_ec_shape(
-            dir,
-            &pg_ids,
-            storage::EcShape {
-                k: ec_config.data_shards,
-                m: ec_config.parity_shards,
-            },
-        )
-        .unwrap(),
-    );
-    Coordinator::new_with_managed_key_provider(
-        storage_node,
+    let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
+    Coordinator::new_with_managed_key_provider_for_storage_cluster(
+        storage_cluster,
         "us-east-1".to_string(),
         None,
         test_sse_s3_provider(),
@@ -140,20 +119,9 @@ pub(crate) fn setup_coordinator_with_pg_count_without_lifecycle_sweeper(
     pg_count: u32,
 ) -> Coordinator {
     let pg_ids: Vec<u32> = (0..pg_count).collect();
-    let ec_config = EcConfig::default();
-    let storage_node = Arc::new(
-        SharedStorageNode::open_with_default_ec_shape(
-            dir,
-            &pg_ids,
-            storage::EcShape {
-                k: ec_config.data_shards,
-                m: ec_config.parity_shards,
-            },
-        )
-        .unwrap(),
-    );
-    Coordinator::new_with_lifecycle_sweeper_factory(
-        storage_node,
+    let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
+    Coordinator::new_with_lifecycle_sweeper_factory_for_storage_cluster(
+        storage_cluster,
         "us-east-1".to_string(),
         None,
         Some(test_sse_s3_provider()),
@@ -164,37 +132,15 @@ pub(crate) fn setup_coordinator_with_pg_count_without_lifecycle_sweeper(
 
 pub(crate) fn setup_coordinator_without_managed_key_provider(dir: &Path) -> Coordinator {
     let pg_ids: Vec<u32> = (0..4).collect();
-    let ec_config = EcConfig::default();
-    let storage_node = Arc::new(
-        SharedStorageNode::open_with_default_ec_shape(
-            dir,
-            &pg_ids,
-            storage::EcShape {
-                k: ec_config.data_shards,
-                m: ec_config.parity_shards,
-            },
-        )
-        .unwrap(),
-    );
-    Coordinator::new(storage_node, "us-east-1".to_string(), None).unwrap()
+    let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
+    Coordinator::new_with_storage_cluster(storage_cluster, "us-east-1".to_string(), None).unwrap()
 }
 
 pub(crate) fn setup_coordinator_without_lifecycle_sweeper(dir: &Path) -> Coordinator {
     let pg_ids: Vec<u32> = (0..4).collect();
-    let ec_config = EcConfig::default();
-    let storage_node = Arc::new(
-        SharedStorageNode::open_with_default_ec_shape(
-            dir,
-            &pg_ids,
-            storage::EcShape {
-                k: ec_config.data_shards,
-                m: ec_config.parity_shards,
-            },
-        )
-        .unwrap(),
-    );
-    Coordinator::new_with_lifecycle_sweeper_factory(
-        storage_node,
+    let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
+    Coordinator::new_with_lifecycle_sweeper_factory_for_storage_cluster(
+        storage_cluster,
         "us-east-1".to_string(),
         None,
         Some(test_sse_s3_provider()),
@@ -203,10 +149,9 @@ pub(crate) fn setup_coordinator_without_lifecycle_sweeper(dir: &Path) -> Coordin
     .unwrap()
 }
 
-pub(crate) fn setup_coordinator_with_shared_storage(
-    storage_node: Arc<SharedStorageNode>,
+pub(crate) fn setup_coordinator_with_storage_cluster(
+    storage_cluster: Arc<StorageCluster>,
 ) -> Coordinator {
-    let storage_cluster = StorageCluster::shared_single_node(storage_node);
     let shared_caches = shared_caches_for_storage_cluster(&storage_cluster);
     Coordinator::new_with_shared_caches_and_lifecycle_sweeper_factory(
         storage_cluster,
@@ -219,10 +164,9 @@ pub(crate) fn setup_coordinator_with_shared_storage(
     .unwrap()
 }
 
-pub(crate) fn setup_coordinator_with_shared_storage_without_lifecycle_sweeper(
-    storage_node: Arc<SharedStorageNode>,
+pub(crate) fn setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(
+    storage_cluster: Arc<StorageCluster>,
 ) -> Coordinator {
-    let storage_cluster = StorageCluster::shared_single_node(storage_node);
     let shared_caches = shared_caches_for_storage_cluster(&storage_cluster);
     Coordinator::new_with_shared_caches_and_lifecycle_sweeper_factory(
         storage_cluster,
@@ -240,10 +184,10 @@ pub(crate) fn setup_coordinators_with_pg_count(
     pg_count: u32,
 ) -> (Coordinator, Coordinator) {
     let pg_ids: Vec<u32> = (0..pg_count).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
+    let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
     (
-        setup_coordinator_with_shared_storage(Arc::clone(&storage_node)),
-        setup_coordinator_with_shared_storage(storage_node),
+        setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster)),
+        setup_coordinator_with_storage_cluster(storage_cluster),
     )
 }
 
@@ -252,10 +196,12 @@ pub(crate) fn setup_coordinators_with_pg_count_without_lifecycle_sweeper(
     pg_count: u32,
 ) -> (Coordinator, Coordinator) {
     let pg_ids: Vec<u32> = (0..pg_count).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
+    let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
     (
-        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node)),
-        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(storage_node),
+        setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
+            &storage_cluster,
+        )),
+        setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(storage_cluster),
     )
 }
 
@@ -269,19 +215,42 @@ pub(crate) fn setup_coordinator_with_sse_c(dir: &Path) -> Coordinator {
     use base64::Engine;
 
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
+    let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
     let validator = SseCustomerValidatorConfig::from_base64(
         1,
         &base64::engine::general_purpose::STANDARD.encode([9u8; 32]),
     )
     .unwrap();
-    Coordinator::new_with_managed_key_provider(
-        storage_node,
+    Coordinator::new_with_managed_key_provider_for_storage_cluster(
+        storage_cluster,
         "us-east-1".to_string(),
         Some(validator),
         test_sse_s3_provider(),
     )
     .unwrap()
+}
+
+pub(crate) fn open_test_storage_cluster(dir: &Path, pg_ids: &[u32]) -> Arc<StorageCluster> {
+    let ec_config = EcConfig::default();
+    open_test_storage_cluster_with_ec_shape(
+        dir,
+        pg_ids,
+        storage::EcShape {
+            k: ec_config.data_shards,
+            m: ec_config.parity_shards,
+        },
+    )
+}
+
+pub(crate) fn open_test_storage_cluster_with_ec_shape(
+    dir: &Path,
+    pg_ids: &[u32],
+    ec_shape: storage::EcShape,
+) -> Arc<StorageCluster> {
+    let node_count = u32::from(ec_shape.k) + u32::from(ec_shape.m);
+    let node_ids: Vec<NodeId> = (0..node_count).map(NodeId::new).collect();
+    StorageCluster::open_local_nodes(dir, &node_ids, pg_ids, ec_shape)
+        .expect("open local storage cluster")
 }
 
 pub(crate) fn backend_supports_parity_recovery() -> bool {

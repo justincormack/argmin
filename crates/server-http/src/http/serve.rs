@@ -3588,13 +3588,25 @@ mod tests {
     use hyper_util::rt::TokioIo;
     use ring::hmac;
     use server_core::sse::{ManagedWrappingKeyConfig, StaticManagedKeyProvider};
-    use storage::SharedStorageNode;
+    use storage::{NodeId, StorageCluster};
 
     use crate::metadata_blob::MetadataBlob;
 
     const TEST_ACCESS_KEY: &str = "AKID";
     const TEST_SECRET_KEY: &str = "test-secret";
     const TEST_SSE_S3_WRAPPING_KEY_B64: &str = "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=";
+
+    fn open_test_storage_cluster(dir: &std::path::Path, pg_ids: &[u32]) -> Arc<StorageCluster> {
+        let ec_config = ec::EcConfig::default();
+        let ec_shape = storage::EcShape {
+            k: ec_config.data_shards,
+            m: ec_config.parity_shards,
+        };
+        let node_count = u32::from(ec_shape.k) + u32::from(ec_shape.m);
+        let node_ids: Vec<NodeId> = (0..node_count).map(NodeId::new).collect();
+        StorageCluster::open_local_nodes(dir, &node_ids, pg_ids, ec_shape)
+            .expect("open local storage cluster")
+    }
 
     struct ServerGuard(tokio::task::JoinHandle<()>);
 
@@ -3659,12 +3671,13 @@ mod tests {
 
     fn setup_frontend(dir: &std::path::Path) -> Arc<HttpFrontend> {
         let pg_ids: Vec<u32> = (0..4).collect();
-        let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
+        let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
         let sse_s3_provider = StaticManagedKeyProvider::single(
             ManagedWrappingKeyConfig::from_base64(1, TEST_SSE_S3_WRAPPING_KEY_B64).unwrap(),
         );
-        let coordinator = server_core::coordinator::Coordinator::new_with_managed_key_provider(
-            storage_node,
+        let coordinator =
+            server_core::coordinator::Coordinator::new_with_managed_key_provider_for_storage_cluster(
+            storage_cluster,
             "us-east-1".to_string(),
             None,
             sse_s3_provider,

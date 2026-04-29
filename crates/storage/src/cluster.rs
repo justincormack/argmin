@@ -61,10 +61,9 @@ impl ShardLocation {
 
 /// Cluster-shaped storage handle.
 ///
-/// Phase 1 keeps this backed by one local shared node so existing storage
-/// behavior remains unchanged while coordinator code stops owning the local
-/// implementation type directly. Process-local identity remains based on the
-/// underlying local node until cluster-owned identity exists.
+/// The initial local multihost implementation keeps metadata operations on the
+/// static metadata primary while payload placement and IO move behind
+/// cluster-owned APIs.
 #[derive(Clone)]
 pub struct StorageCluster {
     single_node: Arc<SharedStorageNode>,
@@ -72,21 +71,6 @@ pub struct StorageCluster {
 }
 
 impl StorageCluster {
-    pub fn single_node(single_node: Arc<SharedStorageNode>) -> Self {
-        let local_map = Arc::new(LocalClusterMap::single_node(
-            NodeId::new(0),
-            Arc::clone(&single_node),
-        ));
-        Self {
-            single_node,
-            local_map,
-        }
-    }
-
-    pub fn shared_single_node(single_node: Arc<SharedStorageNode>) -> Arc<Self> {
-        Arc::new(Self::single_node(single_node))
-    }
-
     pub fn open_local_nodes(
         data_dir: &std::path::Path,
         node_ids: &[NodeId],
@@ -136,6 +120,11 @@ impl StorageCluster {
 
     pub fn default_payload_ec_shape(&self) -> EcShape {
         self.single_node.default_ec_shape()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_metadata_storage_node(&self) -> Arc<SharedStorageNode> {
+        Arc::clone(&self.single_node)
     }
 
     pub fn place_payload_shards(
@@ -289,11 +278,5 @@ impl StorageCluster {
         dst: &mut Vec<u8>,
     ) -> Result<(), StoreError> {
         self.single_node.read_segment_stored_bytes_into(req, dst)
-    }
-}
-
-impl From<Arc<SharedStorageNode>> for StorageCluster {
-    fn from(single_node: Arc<SharedStorageNode>) -> Self {
-        Self::single_node(single_node)
     }
 }

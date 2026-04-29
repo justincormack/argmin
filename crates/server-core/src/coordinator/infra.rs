@@ -18,7 +18,7 @@ use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
 use storage::PgTopology;
 use storage::{
     BucketFastPathInfo, BucketInfo, BucketName, BucketState, ReclaimWorkItem, SessionId,
-    SharedStorageNode, StorageCluster,
+    StorageCluster,
 };
 
 impl Coordinator {
@@ -219,19 +219,6 @@ impl Coordinator {
         )
     }
 
-    /// Create a new coordinator.
-    pub fn new(
-        storage_node: Arc<SharedStorageNode>,
-        region: String,
-        sse_c_validator: Option<SseCustomerValidatorConfig>,
-    ) -> Result<Self, ServerError> {
-        Self::new_with_storage_cluster(
-            StorageCluster::shared_single_node(storage_node),
-            region,
-            sse_c_validator,
-        )
-    }
-
     /// Create a new coordinator over a cluster-shaped storage handle.
     pub fn new_with_storage_cluster(
         storage_cluster: Arc<StorageCluster>,
@@ -249,21 +236,6 @@ impl Coordinator {
             sse_c_validator,
             None,
             lifecycle_sweeper_factory,
-        )
-    }
-
-    /// Create a new coordinator with a managed object-encryption wrapping-key provider.
-    pub fn new_with_managed_key_provider(
-        storage_node: Arc<SharedStorageNode>,
-        region: String,
-        sse_c_validator: Option<SseCustomerValidatorConfig>,
-        managed_key_provider: StaticManagedKeyProvider,
-    ) -> Result<Self, ServerError> {
-        Self::new_with_managed_key_provider_for_storage_cluster(
-            StorageCluster::shared_single_node(storage_node),
-            region,
-            sse_c_validator,
-            managed_key_provider,
         )
     }
 
@@ -289,8 +261,8 @@ impl Coordinator {
     }
 
     #[cfg(test)]
-    pub(super) fn new_with_lifecycle_sweeper_factory<F>(
-        storage_node: Arc<SharedStorageNode>,
+    pub(super) fn new_with_lifecycle_sweeper_factory_for_storage_cluster<F>(
+        storage_cluster: Arc<StorageCluster>,
         region: String,
         sse_c_validator: Option<SseCustomerValidatorConfig>,
         managed_key_provider: Option<StaticManagedKeyProvider>,
@@ -299,7 +271,6 @@ impl Coordinator {
     where
         F: FnOnce(&Arc<StorageCluster>, ReadRuntime) -> Result<Arc<LifecycleSweeper>, ServerError>,
     {
-        let storage_cluster = StorageCluster::shared_single_node(storage_node);
         Self::new_with_shared_caches_and_lifecycle_sweeper_factory(
             Arc::clone(&storage_cluster),
             shared_caches_for_storage_cluster(&storage_cluster),

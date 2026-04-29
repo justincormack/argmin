@@ -1,12 +1,12 @@
+use super::test_support::open_test_storage_cluster;
 use super::*;
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestCaseResult};
 use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::Arc;
 use storage::{
     MultipartReclaimPartRecord, MultipartReclaimRecord, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, PgTopology, ReclaimWorkItem, SharedStorageNode,
+    ObjectSegmentsReclaimSegmentRecord, PgTopology, ReclaimWorkItem,
 };
 
 const TRACE_BUCKET: &str = "bucket";
@@ -24,12 +24,13 @@ fn trace_generation_id_new() -> GenerationId {
 }
 
 fn make_test_read_runtime(dir: &Path) -> ReadRuntime {
-    let storage_node = Arc::new(SharedStorageNode::open(dir, &[0]).unwrap());
+    let storage_cluster = open_test_storage_cluster(dir, &[0]);
+    let ec_shape = storage_cluster.default_payload_ec_shape();
     ReadRuntime {
-        storage_node: StorageCluster::shared_single_node(Arc::clone(&storage_node)),
+        storage_node: storage_cluster,
         #[cfg(test)]
         pg_topology: PgTopology::new(&[0]).unwrap(),
-        payload_buffer_pool: PayloadBufferPool::new(storage_node.default_ec_shape()),
+        payload_buffer_pool: PayloadBufferPool::new(ec_shape),
         sse_c_validator: None,
         managed_key_provider: None,
     }

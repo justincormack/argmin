@@ -6,12 +6,12 @@ use crate::conditional::{DeleteCondition, SpecificEtag, WriteCondition};
 use crate::coordinator::bucket_handles::BucketHandleRequest;
 use crate::sse::SSE_CUSTOMER_ALGORITHM;
 use std::panic::AssertUnwindSafe;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
-use storage::{install_bucket_scoped_test_hooks, BucketScopedTestHooks};
+use storage::{install_bucket_scoped_test_hooks, BucketScopedTestHooks, StorageCluster};
 
 static STORAGE_TEST_HOOK_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -24,11 +24,11 @@ enum LockWaitEvent {
     CompletedEarly,
 }
 
-fn setup_direct_coordinator_with_shared_storage(
-    storage_node: Arc<SharedStorageNode>,
+fn setup_direct_coordinator_with_storage_cluster(
+    storage_cluster: Arc<StorageCluster>,
 ) -> Coordinator {
-    Coordinator::new_with_managed_key_provider(
-        storage_node,
+    Coordinator::new_with_managed_key_provider_for_storage_cluster(
+        storage_cluster,
         "us-east-1".to_string(),
         None,
         test_sse_s3_provider(),
@@ -793,8 +793,8 @@ fn create_bucket_persists_explicit_grants() {
 #[test]
 fn list_buckets_with_sparse_pg_topology() {
     let tmp = test_util::tempdir();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 2, 5]).unwrap());
-    let coord = setup_coordinator_with_shared_storage(storage_node);
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0, 2, 5]);
+    let coord = setup_coordinator_with_storage_cluster(storage_cluster);
     let bucket = "bucket-sparse";
     coord
         .create_bucket_for_owner("default-owner", bucket, false)
@@ -814,8 +814,8 @@ fn list_buckets_with_sparse_pg_topology() {
 #[test]
 fn list_objects_with_sparse_pg_topology() {
     let tmp = test_util::tempdir();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 2, 5]).unwrap());
-    let coord = setup_coordinator_with_shared_storage(storage_node);
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0, 2, 5]);
+    let coord = setup_coordinator_with_storage_cluster(storage_cluster);
     let bucket = "bucket-sparse";
     coord
         .create_bucket_for_owner("default-owner", bucket, false)
@@ -836,8 +836,8 @@ fn list_objects_with_sparse_pg_topology() {
 #[test]
 fn list_object_versions_with_sparse_pg_topology() {
     let tmp = test_util::tempdir();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 2, 5]).unwrap());
-    let coord = setup_coordinator_with_shared_storage(storage_node);
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0, 2, 5]);
+    let coord = setup_coordinator_with_storage_cluster(storage_cluster);
     let bucket = "bucket-sparse";
     coord
         .create_bucket_for_owner("default-owner", bucket, false)
@@ -913,8 +913,8 @@ fn list_object_versions_clamps_oversized_max_keys() {
 #[test]
 fn list_object_versions_paginates_across_pgs() {
     let tmp = test_util::tempdir();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 2, 5]).unwrap());
-    let coord = setup_coordinator_with_shared_storage(storage_node);
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0, 2, 5]);
+    let coord = setup_coordinator_with_storage_cluster(storage_cluster);
     let metadata = MetadataBlob::new();
     let system_metadata = SystemMetadata::EMPTY;
 
@@ -1045,8 +1045,8 @@ fn list_object_versions_paginates_across_pgs() {
 #[test]
 fn list_multipart_uploads_with_sparse_pg_topology() {
     let tmp = test_util::tempdir();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 2, 5]).unwrap());
-    let coord = setup_coordinator_with_shared_storage(storage_node);
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0, 2, 5]);
+    let coord = setup_coordinator_with_storage_cluster(storage_cluster);
     let bucket = "bucket-sparse";
     let key = "key-sparse";
     coord
@@ -1221,11 +1221,14 @@ fn put_object_does_not_wait_for_bucket_lock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-put-no-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin =
-        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
-    let writer =
-        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let storage_node = storage_cluster.test_metadata_storage_node();
+    let admin = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
+        &storage_cluster,
+    ));
+    let writer = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
+        &storage_cluster,
+    ));
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
@@ -1292,11 +1295,14 @@ fn create_multipart_upload_does_not_wait_for_bucket_lock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-create-mpu-no-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin =
-        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
-    let creator =
-        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let storage_node = storage_cluster.test_metadata_storage_node();
+    let admin = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
+        &storage_cluster,
+    ));
+    let creator = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
+        &storage_cluster,
+    ));
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
@@ -1434,11 +1440,14 @@ fn delete_bucket_does_not_wait_for_bucket_lock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-delete-no-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin =
-        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
-    let deleter =
-        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let storage_node = storage_cluster.test_metadata_storage_node();
+    let admin = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
+        &storage_cluster,
+    ));
+    let deleter = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
+        &storage_cluster,
+    ));
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
@@ -1542,9 +1551,10 @@ fn head_object_waits_for_bucket_pg_when_non_boe_bucket_fast_path_is_warm() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-head-fast-no-pg";
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let reader = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let storage_node = storage_cluster.test_metadata_storage_node();
+    let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let reader = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
@@ -1635,9 +1645,10 @@ fn head_object_does_not_wait_for_bucket_pg_when_boe_fast_path_is_warm() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-head-boe-fast-no-pg";
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let reader = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let storage_node = storage_cluster.test_metadata_storage_node();
+    let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let reader = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
@@ -1732,9 +1743,10 @@ fn head_object_does_not_wait_for_bucket_pg_when_boe_policy_and_abac_tags_fast_pa
     let tmp = test_util::tempdir();
     let bucket = "bucket-head-policy-abac-fast";
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let reader = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let storage_node = storage_cluster.test_metadata_storage_node();
+    let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let reader = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     admin
         .create_bucket_for_owner("111122223333", bucket, false)
@@ -1894,9 +1906,10 @@ fn head_object_fast_path_denies_with_non_matching_boe_abac_bucket_tags() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-head-policy-abac-fast-deny";
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let reader = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let storage_node = storage_cluster.test_metadata_storage_node();
+    let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let reader = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     admin
         .create_bucket_for_owner("111122223333", bucket, false)
@@ -2038,10 +2051,11 @@ fn head_object_reloads_after_boe_policy_mutation_rebuilds_fast_path() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-head-policy-cold-fallback";
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let reader = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let reader_after_reload = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let storage_node = storage_cluster.test_metadata_storage_node();
+    let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let reader = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let reader_after_reload = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
@@ -2220,13 +2234,13 @@ fn head_object_reloads_after_boe_policy_mutation_rebuilds_fast_path() {
 }
 
 #[test]
-fn production_constructors_share_bucket_fast_path_cache_across_coordinators() {
+fn production_storage_cluster_constructors_share_bucket_fast_path_cache_across_coordinators() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-prod-shared-cache";
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin = setup_direct_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let reader = setup_direct_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let admin = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let reader = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     admin
         .create_bucket_for_owner("111122223333", bucket, false)
@@ -2335,13 +2349,14 @@ fn production_constructors_share_bucket_fast_path_cache_across_coordinators() {
 }
 
 #[test]
-fn bucket_fast_path_watcher_survives_first_compat_cluster_handle_drop() {
+fn bucket_fast_path_watcher_survives_first_cluster_handle_drop() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-fast-path-watch-first-handle-drop";
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin = setup_direct_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let reader = setup_direct_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let storage_node = storage_cluster.test_metadata_storage_node();
+    let admin = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let reader = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     admin
         .create_bucket_for_owner("111122223333", bucket, false)
@@ -2415,7 +2430,7 @@ fn bucket_fast_path_watcher_survives_first_compat_cluster_handle_drop() {
     while reader.bucket_fast_path_is_fresh_for_test(&bucket_name) != Some(false) {
         assert!(
             start.elapsed() < std::time::Duration::from_secs(3),
-            "bucket fast path watcher stopped after first compatibility cluster handle was dropped"
+            "bucket fast path watcher stopped after first cluster handle was dropped"
         );
         thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -2426,9 +2441,10 @@ fn bucket_fast_path_watcher_observes_direct_storage_policy_mutation() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-fast-path-watch-direct-policy";
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin = setup_direct_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let reader = setup_direct_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let storage_node = storage_cluster.test_metadata_storage_node();
+    let admin = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let reader = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     admin
         .create_bucket_for_owner("111122223333", bucket, false)
@@ -2543,9 +2559,10 @@ fn bucket_fast_path_watcher_observes_direct_storage_delete_recreate() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-fast-path-watch-direct-recreate";
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin = setup_direct_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let reader = setup_direct_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let storage_node = storage_cluster.test_metadata_storage_node();
+    let admin = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let reader = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     admin
         .create_bucket_for_owner("111122223333", bucket, false)
@@ -2652,9 +2669,10 @@ fn bucket_fast_path_watcher_recovers_after_observing_missing_bucket_before_recre
     let tmp = test_util::tempdir();
     let bucket = "bucket-fast-path-watch-delete-then-recreate";
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin = setup_direct_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let reader = setup_direct_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let storage_node = storage_cluster.test_metadata_storage_node();
+    let admin = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let reader = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     admin
         .create_bucket_for_owner("111122223333", bucket, false)
@@ -2872,9 +2890,10 @@ fn delete_object_falls_back_to_storage_load_when_bucket_fast_path_is_acl_free() 
     let tmp = test_util::tempdir();
     let bucket = "bucket-delete-fast-no-pg";
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let deleter = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let storage_node = storage_cluster.test_metadata_storage_node();
+    let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let deleter = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
@@ -2977,11 +2996,14 @@ fn complete_multipart_upload_does_not_wait_for_bucket_lock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-complete-no-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin =
-        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
-    let completer =
-        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let storage_node = storage_cluster.test_metadata_storage_node();
+    let admin = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
+        &storage_cluster,
+    ));
+    let completer = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
+        &storage_cluster,
+    ));
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
@@ -3051,11 +3073,14 @@ fn complete_multipart_upload_waits_for_multipart_completion_lock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-complete-waits-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin =
-        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
-    let completer =
-        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let storage_node = storage_cluster.test_metadata_storage_node();
+    let admin = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
+        &storage_cluster,
+    ));
+    let completer = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
+        &storage_cluster,
+    ));
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
@@ -3120,11 +3145,13 @@ fn complete_multipart_upload_does_not_deadlock_when_bucket_policy_shares_pg() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-complete-same-pg";
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-    let admin =
-        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
-    let completer =
-        setup_coordinator_with_shared_storage_without_lifecycle_sweeper(Arc::clone(&storage_node));
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let admin = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
+        &storage_cluster,
+    ));
+    let completer = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
+        &storage_cluster,
+    ));
 
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
@@ -3943,13 +3970,8 @@ fn put_get_object_trailing_slash_key() {
 // ── Disk manipulation helpers for EC tests ────────────────────────
 
 /// Compute shard file path on disk for a given object and shard index.
-fn shard_file_path(
-    coord: &Coordinator,
-    data_dir: &Path,
-    bucket: &str,
-    key: &str,
-    shard_index: u8,
-) -> PathBuf {
+fn shard_file_path(coord: &Coordinator, bucket: &str, key: &str, shard_index: u8) -> PathBuf {
+    let metadata_node = coord.storage_node.test_metadata_storage_node();
     let (data_pg_id, okh, generation_id) = {
         let bucket_name = trusted_bucket_name(bucket);
         let object_key = trusted_object_key(key);
@@ -3978,7 +4000,8 @@ fn shard_file_path(
         }
     };
     let shard_key = ShardKey::new(&okh, generation_id.get(), shard_index);
-    data_dir
+    metadata_node
+        .data_dir()
         .join(format!("pg-{data_pg_id:04}"))
         .join("shards")
         .join(shard_key.hex_prefix())
@@ -3986,14 +4009,8 @@ fn shard_file_path(
 }
 
 /// Delete a specific shard file from disk.
-fn delete_shard_on_disk(
-    coord: &Coordinator,
-    data_dir: &Path,
-    bucket: &str,
-    key: &str,
-    shard_index: u8,
-) {
-    let path = shard_file_path(coord, data_dir, bucket, key, shard_index);
+fn delete_shard_on_disk(coord: &Coordinator, bucket: &str, key: &str, shard_index: u8) {
+    let path = shard_file_path(coord, bucket, key, shard_index);
     std::fs::remove_file(&path).unwrap_or_else(|e| {
         panic!(
             "failed to delete shard {shard_index} at {}: {e}",
@@ -4004,14 +4021,8 @@ fn delete_shard_on_disk(
 
 /// Corrupt a specific shard file on disk (flip first byte).
 /// PgStore's read_shard will detect CRC mismatch.
-fn corrupt_shard_on_disk(
-    coord: &Coordinator,
-    data_dir: &Path,
-    bucket: &str,
-    key: &str,
-    shard_index: u8,
-) {
-    let path = shard_file_path(coord, data_dir, bucket, key, shard_index);
+fn corrupt_shard_on_disk(coord: &Coordinator, bucket: &str, key: &str, shard_index: u8) {
+    let path = shard_file_path(coord, bucket, key, shard_index);
     let mut data = std::fs::read(&path).unwrap_or_else(|e| {
         panic!(
             "failed to read shard {shard_index} at {}: {e}",
@@ -4061,7 +4072,7 @@ fn ec_reconstruction_after_shard_loss() {
     .unwrap();
 
     // Delete one data shard using the helper
-    delete_shard_on_disk(&coord, tmp.path(), "bucket", "resilient", 0);
+    delete_shard_on_disk(&coord, "bucket", "resilient", 0);
 
     // Get should still succeed via EC reconstruction
     let obj = coord
@@ -4110,7 +4121,7 @@ fn ec_drop_one_data_shard_get() {
     )
     .unwrap();
 
-    delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj1", 0);
+    delete_shard_on_disk(&coord, "bucket", "obj1", 0);
 
     let obj = coord
         .get_object(&GetObjectRequest {
@@ -4163,7 +4174,7 @@ fn ec_degraded_read_reuses_reconstruction_scratch() {
     )
     .unwrap();
 
-    delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj-reconstruct", 0);
+    delete_shard_on_disk(&coord, "bucket", "obj-reconstruct", 0);
 
     assert_eq!(coord.payload_buffer_pool.allocation_count(), 0);
     let ec = coord.storage_node.default_payload_ec_shape();
@@ -4236,8 +4247,8 @@ fn ec_drop_m_shards_at_limit() {
     .unwrap();
 
     // Delete 2 data shards (indices 0 and 1)
-    delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj2", 0);
-    delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj2", 1);
+    delete_shard_on_disk(&coord, "bucket", "obj2", 0);
+    delete_shard_on_disk(&coord, "bucket", "obj2", 1);
 
     let obj = coord
         .get_object(&GetObjectRequest {
@@ -4284,9 +4295,9 @@ fn ec_drop_m_plus_one_shards_fails() {
     .unwrap();
 
     // Delete 3 shards (indices 0, 1, 2)
-    delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj3", 0);
-    delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj3", 1);
-    delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj3", 2);
+    delete_shard_on_disk(&coord, "bucket", "obj3", 0);
+    delete_shard_on_disk(&coord, "bucket", "obj3", 1);
+    delete_shard_on_disk(&coord, "bucket", "obj3", 2);
 
     let obj = coord
         .get_object(&GetObjectRequest {
@@ -4336,7 +4347,7 @@ fn ec_corrupt_one_data_shard_recovery() {
     )
     .unwrap();
 
-    corrupt_shard_on_disk(&coord, tmp.path(), "bucket", "obj4", 0);
+    corrupt_shard_on_disk(&coord, "bucket", "obj4", 0);
 
     let obj = coord
         .get_object(&GetObjectRequest {
@@ -4385,7 +4396,7 @@ fn ec_range_get_with_missing_shard() {
     .unwrap();
 
     // Delete shard 0 (covers the beginning of the data)
-    delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj5", 0);
+    delete_shard_on_disk(&coord, "bucket", "obj5", 0);
 
     // Range get should still succeed via EC reconstruction
     let result = coord
@@ -4437,7 +4448,7 @@ fn ec_drop_parity_shard_data_still_works() {
     .unwrap();
 
     // Delete first parity shard (index 4, since k=4)
-    delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj6", 4);
+    delete_shard_on_disk(&coord, "bucket", "obj6", 4);
 
     let obj = coord
         .get_object(&GetObjectRequest {
@@ -4498,7 +4509,7 @@ fn ec_healthy_read_skips_corrupt_parity_shards() {
         segments[0].clone()
     };
 
-    corrupt_shard_on_disk(&coord, tmp.path(), "bucket", "obj7", 4);
+    corrupt_shard_on_disk(&coord, "bucket", "obj7", 4);
 
     let obj = coord
         .get_object(&GetObjectRequest {
@@ -4568,8 +4579,8 @@ fn ec_reconstruction_stops_after_first_needed_parity_shard() {
         segments[0].clone()
     };
 
-    delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj8", 0);
-    corrupt_shard_on_disk(&coord, tmp.path(), "bucket", "obj8", 5);
+    delete_shard_on_disk(&coord, "bucket", "obj8", 0);
+    corrupt_shard_on_disk(&coord, "bucket", "obj8", 5);
 
     let obj = coord
         .get_object(&GetObjectRequest {

@@ -30,9 +30,9 @@ fn test_sse_s3_provider() -> StaticManagedKeyProvider {
 
 fn setup_coordinator(dir: &Path) -> Coordinator {
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
-    Coordinator::new_with_managed_key_provider(
-        storage_node,
+    let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
+    Coordinator::new_with_managed_key_provider_for_storage_cluster(
+        storage_cluster,
         "us-east-1".to_string(),
         None,
         test_sse_s3_provider(),
@@ -40,8 +40,19 @@ fn setup_coordinator(dir: &Path) -> Coordinator {
     .unwrap()
 }
 
-fn setup_coordinator_with_shared_storage(storage_node: Arc<SharedStorageNode>) -> Coordinator {
-    let storage_cluster = StorageCluster::shared_single_node(storage_node);
+fn open_test_storage_cluster(dir: &Path, pg_ids: &[u32]) -> Arc<StorageCluster> {
+    let ec_config = ec::EcConfig::default();
+    let ec_shape = storage::EcShape {
+        k: ec_config.data_shards,
+        m: ec_config.parity_shards,
+    };
+    let node_count = u32::from(ec_shape.k) + u32::from(ec_shape.m);
+    let node_ids: Vec<_> = (0..node_count).map(storage::NodeId::new).collect();
+    StorageCluster::open_local_nodes(dir, &node_ids, pg_ids, ec_shape)
+        .expect("open local storage cluster")
+}
+
+fn setup_coordinator_with_storage_cluster(storage_cluster: Arc<StorageCluster>) -> Coordinator {
     let shared_caches = shared_caches_for_storage_cluster(&storage_cluster);
     Coordinator::new_with_shared_caches_and_lifecycle_sweeper_factory(
         storage_cluster,
@@ -201,12 +212,13 @@ fn create_upload_with_parts(
 }
 
 fn make_test_read_runtime(dir: &Path) -> ReadRuntime {
-    let storage_node = Arc::new(SharedStorageNode::open(dir, &[0]).unwrap());
+    let storage_cluster = open_test_storage_cluster(dir, &[0]);
+    let ec_shape = storage_cluster.default_payload_ec_shape();
     ReadRuntime {
-        storage_node: StorageCluster::shared_single_node(Arc::clone(&storage_node)),
+        storage_node: storage_cluster,
         #[cfg(test)]
         pg_topology: PgTopology::new(&[0]).unwrap(),
-        payload_buffer_pool: PayloadBufferPool::new(storage_node.default_ec_shape()),
+        payload_buffer_pool: PayloadBufferPool::new(ec_shape),
         sse_c_validator: None,
         managed_key_provider: None,
     }
@@ -490,10 +502,10 @@ fn begin_stream_put_with_segment_path(
 fn run_stream_duplicate_segment_race_invariant_test(pg_count: u32, require_cross_pg: bool) {
     let dir = test_util::tempdir();
     let pg_ids: Vec<u32> = (0..pg_count).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(dir.path(), &pg_ids).unwrap());
-    let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let writer_a = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let writer_b = setup_coordinator_with_shared_storage(storage_node);
+    let storage_cluster = open_test_storage_cluster(dir.path(), &pg_ids);
+    let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let writer_a = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let writer_b = setup_coordinator_with_storage_cluster(storage_cluster);
     let invariant =
         "duplicate stream appends at the same segment index must leave exactly one staged winner";
     let state = InvariantHarness::new(&admin);
@@ -1070,10 +1082,10 @@ fn completing_multipart_upload_rejects_late_abort_without_state_loss() {
 fn abort_wins_over_complete_after_snapshot_without_leaking_multipart_state() {
     let dir = test_util::tempdir();
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(dir.path(), &pg_ids).unwrap());
-    let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let completer = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
-    let aborter = setup_coordinator_with_shared_storage(storage_node);
+    let storage_cluster = open_test_storage_cluster(dir.path(), &pg_ids);
+    let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let completer = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let aborter = setup_coordinator_with_storage_cluster(storage_cluster);
     let invariant =
         "if abort wins after complete has snapshotted multipart state, the upload is removed without exposing a committed object or leaking multipart state";
     let state = InvariantHarness::new(&admin);

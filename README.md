@@ -1,7 +1,7 @@
 # argmin
 
-S3-compatible object storage written in Rust. Single-node, synchronous IO,
-erasure-coded with native Rust backends.
+S3-compatible object storage written in Rust. Single-process local cluster,
+synchronous IO, erasure-coded with native Rust backends.
 
 This is the v1-minimal implementation: path-style addressing, AWS SigV4
 authentication, per-PG SQLite metadata, and CRC64-NVME integrity checking.

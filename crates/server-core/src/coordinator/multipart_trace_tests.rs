@@ -1,4 +1,5 @@
 use super::test_helpers;
+use super::test_support::open_test_storage_cluster;
 use super::*;
 use crate::conditional::ReadCondition;
 use crate::metadata_blob::MetadataBlob;
@@ -8,7 +9,6 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestCaseResult};
 use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::Arc;
 
 const TRACE_BUCKET: &str = "bucket";
 const TRACE_KEY: &str = "key";
@@ -32,9 +32,9 @@ fn test_sse_s3_provider() -> StaticManagedKeyProvider {
 
 fn setup_coordinator(dir: &Path) -> Coordinator {
     let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
-    Coordinator::new_with_managed_key_provider(
-        storage_node,
+    let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
+    Coordinator::new_with_managed_key_provider_for_storage_cluster(
+        storage_cluster,
         "us-east-1".to_string(),
         None,
         test_sse_s3_provider(),

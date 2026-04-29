@@ -9,7 +9,8 @@ use super::test_hooks::{
     BUCKET_POLICY_LOAD_TEST_SERIAL,
 };
 use super::test_support::{
-    put_bucket_ownership_controls_test, put_bucket_policy_test, NO_DELETE, NO_PUT_OBJECT_ACL,
+    open_test_storage_cluster, put_bucket_ownership_controls_test, put_bucket_policy_test,
+    NO_DELETE, NO_PUT_OBJECT_ACL,
 };
 use super::*;
 use crate::conditional::{ReadCondition, WriteCondition};
@@ -1970,9 +1971,9 @@ mod harness {
 
     pub(super) fn setup_coordinator(dir: &Path) -> Coordinator {
         let pg_ids: Vec<u32> = (0..4).collect();
-        let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
-        Coordinator::new_with_managed_key_provider(
-            storage_node,
+        let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
+        Coordinator::new_with_managed_key_provider_for_storage_cluster(
+            storage_cluster,
             "us-east-1".to_string(),
             None,
             test_sse_s3_provider(),

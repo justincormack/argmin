@@ -42,8 +42,7 @@ async fn start_server(
     let pg_count: u32 = 4;
     let pg_ids: Vec<u32> = (0..pg_count).collect();
 
-    let storage_node =
-        Arc::new(storage::SharedStorageNode::open(&data_path, &pg_ids).expect("open storage"));
+    let storage_cluster = s3_tests::server::open_test_storage_cluster(&data_path, &pg_ids);
 
     let host_id = Arc::<str>::from(server_http::http::new_host_id());
     let frontends: Vec<server_http::http::HttpFrontend> = (0..pool_size)
@@ -54,8 +53,9 @@ async fn start_server(
             )
             .map(StaticManagedKeyProvider::single)
             .expect("valid test SSE-S3 wrapping key");
-            let coordinator = server_core::coordinator::Coordinator::new_with_managed_key_provider(
-                Arc::clone(&storage_node),
+            let coordinator =
+                server_core::coordinator::Coordinator::new_with_managed_key_provider_for_storage_cluster(
+                Arc::clone(&storage_cluster),
                 "us-east-1".to_string(),
                 None,
                 sse_s3_provider,

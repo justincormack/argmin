@@ -47,9 +47,11 @@ failure handling, and internal auth in the same step.
 
 The implemented model is still a local cluster collapsed into one process.
 
-1. `argmin-s3` opens one `SharedStorageNode` and shares it across all worker
+1. `argmin-s3` opens one `StorageCluster` and shares it across all worker
    coordinators.
-2. `SharedStorageNode` opens every configured PG from one local data directory.
+2. The local cluster opens one `SharedStorageNode` per configured local node
+   under `node-<id>` data directories, with node 0 acting as the initial
+   metadata primary.
 3. `PgTopology` is a sorted list of local PG IDs with hash-modulo routing.
 4. Bucket metadata, object metadata, multipart state, stream sessions, shard
    rows, and reclaim rows live in per-PG SQLite databases.
@@ -64,7 +66,8 @@ The implemented model is still a local cluster collapsed into one process.
    leases to protect in-flight reads from physical cleanup.
 9. Reclaim rows are durable, but the active reclaim queue and execution leases are
    process-local.
-10. The placement crate exists, but storage routing does not yet use it.
+10. The placement crate is used to compute shard locations, but payload IO does
+    not yet dispatch shards to those locations.
 
 This model is good for single-host correctness work, but the process boundary is
 currently part of the correctness story. That is the main thing this plan has to
@@ -374,7 +377,7 @@ Introduce a `StorageCluster`-shaped boundary without changing behavior.
 
 Work items:
 
-1. keep the current `SharedStorageNode` behavior as the single-node
+1. keep the current `SharedStorageNode` behavior as the initial local-node
    implementation
 2. make coordinator request paths depend on the cluster boundary rather than on
    local-node implementation details
@@ -406,11 +409,12 @@ Phase 1 implementation notes:
    - process-local worker and cache registries use a cluster-owned local
      registry key that still maps to the backing local node until a real cluster
      identity exists
-   - this is still a single-node implementation, but coordinator production
-     paths no longer hold raw single-node handles for background workers
+   - this is still a single-process metadata-primary implementation, but
+     coordinator production paths no longer hold raw single-node handles for
+     background workers
 2. `Coordinator` now owns an `Arc<StorageCluster>` internally.
-   - existing `Coordinator::new` and `Coordinator::new_with_managed_key_provider`
-     remain compatibility shims from `Arc<SharedStorageNode>`
+   - old public/test harness constructors that accepted `Arc<SharedStorageNode>`
+     have been removed
    - new cluster-shaped constructors accept `Arc<StorageCluster>`
    - read runtime, reclaim workers, lifecycle registries, and bucket fast-path
      watchers all carry cluster handles
@@ -456,7 +460,7 @@ Work items:
 Exit criteria:
 
 1. one process can run with multiple local node stores
-2. current behavior passes with a one-node static map
+2. current behavior passes with a local static cluster map
 3. multi-node mode can be enabled in local tests without RPC
 4. no code path depends on shared process state between node stores except the
    explicit test harness and static control plane
@@ -473,8 +477,11 @@ Phase 2 implementation notes:
    - duplicate node IDs are rejected
    - duplicate/canonical-equivalent data directories are rejected
    - every local node gets its own SQLite and shard directories
-3. The one-node constructors are retained only for narrow tests and transitional
-   internal setup while the cluster-owned APIs replace direct local-node access.
+3. The temporary one-node constructors have been removed.
+   - tests that need direct local-node internals use explicit metadata-primary
+     test hooks
+   - broad coordinator, server-http, and s3-tests harnesses open the local
+     cluster layout
 4. `argmin-s3` opens the Phase 2 local cluster harness below the configured
    data directory by default.
 5. Request routing is still metadata-primary/local-node forwarding for this
@@ -641,6 +648,12 @@ Phase 4 implementation notes:
      caller-provided stable payload key
    - payload IO still uses the existing local-node path until Step 4.3/4.4 moves
      writes and reads onto these locations
+3. The post-4.2 boundary cleanup removed the old single-node coordinator
+   constructors and broad S3 test harness startup paths.
+   - `s3-tests` and `server-http` tests now open the same local cluster layout as
+     production startup
+   - direct `SharedStorageNode` construction remains for storage-node internals
+     and narrow metadata-primary test hooks only
 
 Exit criteria:
 

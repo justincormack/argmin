@@ -29,7 +29,7 @@ const TEST_TLS_KEY_PEM: &[u8] = include_bytes!("../testdata/localhost-key.pem");
 
 /// Number of frontend instances in the pool.
 ///
-/// All frontends share one `SharedStorageNode` (PG access serialized by mutex).
+/// All frontends share one local storage cluster.
 /// This controls the parallelism level for request processing.
 const POOL_SIZE: usize = 4;
 const TEST_MAX_CONNECTIONS: u32 = 512;
@@ -70,6 +70,18 @@ pub struct TestServer {
     control_coordinator: server_core::coordinator::Coordinator,
     _temp_dir: test_util::TempDir,
     _server_task: tokio::task::JoinHandle<()>,
+}
+
+pub fn open_test_storage_cluster(data_path: &Path, pg_ids: &[u32]) -> Arc<storage::StorageCluster> {
+    let ec_config = ec::EcConfig::default();
+    let ec_shape = storage::EcShape {
+        k: ec_config.data_shards,
+        m: ec_config.parity_shards,
+    };
+    let node_count = u32::from(ec_shape.k) + u32::from(ec_shape.m);
+    let node_ids: Vec<storage::NodeId> = (0..node_count).map(storage::NodeId::new).collect();
+    storage::StorageCluster::open_local_nodes(data_path, &node_ids, pg_ids, ec_shape)
+        .expect("open local storage cluster")
 }
 
 impl TestServer {
@@ -121,10 +133,8 @@ impl TestServer {
         let pg_count: u32 = 4;
         let pg_ids: Vec<u32> = (0..pg_count).collect();
 
-        // Create one shared storage node for all frontends.
-        let storage_node = Arc::new(
-            storage::SharedStorageNode::open(&data_path, &pg_ids).expect("open storage node"),
-        );
+        // Create one shared local storage cluster for all frontends.
+        let storage_cluster = open_test_storage_cluster(&data_path, &pg_ids);
         let control_coordinator = {
             let sse_c_validator = server_core::sse::SseCustomerValidatorConfig::from_base64(
                 1,
@@ -137,8 +147,8 @@ impl TestServer {
             )
             .map(server_core::sse::StaticManagedKeyProvider::single)
             .expect("valid test SSE-S3 wrapping key");
-            server_core::coordinator::Coordinator::new_with_managed_key_provider(
-                Arc::clone(&storage_node),
+            server_core::coordinator::Coordinator::new_with_managed_key_provider_for_storage_cluster(
+                Arc::clone(&storage_cluster),
                 region.to_string(),
                 Some(sse_c_validator),
                 sse_s3_provider,
@@ -161,8 +171,8 @@ impl TestServer {
                 .map(server_core::sse::StaticManagedKeyProvider::single)
                 .expect("valid test SSE-S3 wrapping key");
                 let coordinator =
-                    server_core::coordinator::Coordinator::new_with_managed_key_provider(
-                        Arc::clone(&storage_node),
+                    server_core::coordinator::Coordinator::new_with_managed_key_provider_for_storage_cluster(
+                        Arc::clone(&storage_cluster),
                         region.to_string(),
                         Some(sse_c_validator),
                         sse_s3_provider,
