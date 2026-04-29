@@ -8,15 +8,56 @@ use crate::error::ClusterBuildError;
 use crate::error::StoreError;
 use crate::node::SharedStorageNode;
 use crate::types::{
-    BucketName, CommitDirectPutObjectReq, DirectPutCommitSnapshot, DirectPutWrittenSegment,
-    EcShape, FinalizeDirectPutObjectOutcome, GenerationId, ObjectEncryption, ObjectKey,
-    PrepareStreamUploadSegmentAppendReq, SegmentStoredBytesRequest, SessionId, ShardKey,
-    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadTarget, WriteAck, WrittenShardAck,
+    BucketName, ClusterEpoch, CommitDirectPutObjectReq, DataPgId, DirectPutCommitSnapshot,
+    DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
+    ObjectEncryption, ObjectKey, PrepareStreamUploadSegmentAppendReq, SegmentStoredBytesRequest,
+    SessionId, ShardIndex, ShardKey, StreamUploadRecord, StreamUploadSegmentRecord,
+    StreamUploadTarget, WriteAck, WrittenShardAck,
 };
 use crate::ObjectPgActionError;
 
 mod local;
 mod request_ops;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardLocation {
+    cluster_epoch: ClusterEpoch,
+    data_pg_id: DataPgId,
+    shard_index: ShardIndex,
+    node_id: NodeId,
+}
+
+impl ShardLocation {
+    pub(crate) fn new(
+        cluster_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        shard_index: ShardIndex,
+        node_id: NodeId,
+    ) -> Self {
+        Self {
+            cluster_epoch,
+            data_pg_id,
+            shard_index,
+            node_id,
+        }
+    }
+
+    pub fn cluster_epoch(&self) -> ClusterEpoch {
+        self.cluster_epoch
+    }
+
+    pub fn data_pg_id(&self) -> DataPgId {
+        self.data_pg_id
+    }
+
+    pub fn shard_index(&self) -> ShardIndex {
+        self.shard_index
+    }
+
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+}
 
 /// Cluster-shaped storage handle.
 ///
@@ -95,6 +136,27 @@ impl StorageCluster {
 
     pub fn default_payload_ec_shape(&self) -> EcShape {
         self.single_node.default_ec_shape()
+    }
+
+    pub fn place_payload_shards(
+        &self,
+        data_pg_id: DataPgId,
+        ec_shape: EcShape,
+        stable_placement_key: &[u8],
+    ) -> Result<Vec<ShardLocation>, ClusterBuildError> {
+        self.local_map
+            .place_payload_shards(data_pg_id, ec_shape, stable_placement_key)
+    }
+
+    pub fn payload_shard_node(
+        &self,
+        data_pg_id: DataPgId,
+        shard_index: ShardIndex,
+        ec_shape: EcShape,
+        stable_placement_key: &[u8],
+    ) -> Result<NodeId, ClusterBuildError> {
+        self.local_map
+            .payload_shard_node(data_pg_id, shard_index, ec_shape, stable_placement_key)
     }
 
     pub fn write_direct_put_segment_payload_shards(

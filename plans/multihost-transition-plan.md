@@ -587,7 +587,7 @@ Implementation order:
   - build the local placement view from configured node IDs and EC shape
   - reject `k + m` shapes that cannot be placed on distinct active nodes
   - add startup/config tests for too few local nodes and the first valid shape
-- [ ] 4.2 Add a cluster-level shard placement helper.
+- [x] 4.2 Add a cluster-level shard placement helper.
   - map `(data_pg_id, shard index, EC shape, stable placement key)` to `NodeId`
   - keep this in `StorageCluster`/`LocalClusterMap`, not coordinator code
   - test deterministic, distinct-node placement for each shard in a stripe
@@ -632,6 +632,15 @@ Phase 4 implementation notes:
    - configured values must be at least `ARGMIN_EC_K + ARGMIN_EC_M`
    - `LocalClusterMap` performs the same validation before preparing local node
      directories or opening stores, so storage APIs cannot bypass startup checks
+2. Step 4.2 adds cluster-owned payload shard placement.
+   - `StorageCluster` and `LocalClusterMap` expose placement helpers that return
+     `ShardLocation` values for each EC shard in a stripe
+   - `ShardLocation` carries the static cluster epoch, data PG, shard index, and
+     assigned `NodeId`
+   - the placement key is domain-separated and derived from the data PG plus the
+     caller-provided stable payload key
+   - payload IO still uses the existing local-node path until Step 4.3/4.4 moves
+     writes and reads onto these locations
 
 Exit criteria:
 

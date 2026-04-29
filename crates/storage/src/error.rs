@@ -68,6 +68,13 @@ pub enum ClusterBuildError {
     #[error("invalid local placement map: {reason}")]
     InvalidLocalPlacement { reason: String },
 
+    #[error("shard index {shard_index} is outside EC shape k={data_shards} m={parity_shards}")]
+    InvalidShardIndex {
+        data_shards: u8,
+        parity_shards: u8,
+        shard_index: u8,
+    },
+
     #[error(
         "local node {duplicate_node_id} shares data directory {data_dir:?} with local node {first_node_id}"
     )]

@@ -36,7 +36,9 @@ pub mod shard_key_hash;
 pub mod traits;
 pub mod types;
 
-pub use cluster::{LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, StorageCluster};
+pub use cluster::{
+    LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, ShardLocation, StorageCluster,
+};
 pub use error::{
     BucketSnapshotLoadError, BucketWriteDrainError, ClusterBuildError, MetadataError,
     ObjectPgActionError, StoreError,
