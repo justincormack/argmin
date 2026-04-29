@@ -5,7 +5,7 @@ use super::*;
 use crate::conditional::{DeleteCondition, ReadCondition, SpecificEtag, WriteCondition};
 use crate::sse::SSE_C_CUSTOMER_KEY_LEN;
 use storage::{
-    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, PayloadShardStorage,
+    EcShape, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, PayloadShardStorage,
 };
 
 fn create_bucket_with_explicit_writer_grant(
@@ -53,6 +53,27 @@ fn upload_part_stream_session_count(
                 )
         })
         .count()
+}
+
+fn assert_payload_shard_files_state(
+    coord: &Coordinator,
+    data_pg_id: u32,
+    ec: EcShape,
+    okh: &[u8; 16],
+    generation_id: GenerationId,
+    expected: bool,
+    context: &str,
+) {
+    for shard_index in 0..(ec.k + ec.m) {
+        let exists = coord
+            .storage_node
+            .test_payload_shard_file_exists(data_pg_id, ec, okh, generation_id, shard_index)
+            .unwrap();
+        assert_eq!(
+            exists, expected,
+            "{context}: placed shard file {shard_index} state mismatch"
+        );
+    }
 }
 
 #[test]
@@ -3126,6 +3147,21 @@ fn abort_multipart_upload_reclaims_uploaded_and_streamed_part_shards() {
         )
         .unwrap();
     assert!(!streamed_segments.is_empty());
+    for segment in &streamed_segments {
+        assert_eq!(segment.payload_storage, PayloadShardStorage::Placed);
+        assert_payload_shard_files_state(
+            &coord,
+            segment.data_pg_id,
+            EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            },
+            &segment.segment_okh,
+            segment.segment_vid,
+            true,
+            "streamed UploadPart before abort",
+        );
+    }
 
     coord
         .abort_multipart_upload(&multipart_object_request_with_expected_owner(
@@ -7901,6 +7937,28 @@ fn stream_append_accepts_upload_part_session() {
     coord
         .append_plaintext_stream_segment_for_test("bucket", "key", &session.session_id, 0, b"data")
         .unwrap();
+    let segments = coord
+        .storage_node
+        .test_list_stream_segments(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &session.session_id,
+        )
+        .unwrap();
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].payload_storage, PayloadShardStorage::Placed);
+    assert_payload_shard_files_state(
+        &coord,
+        segments[0].data_pg_id,
+        EcShape {
+            k: segments[0].ec_k,
+            m: segments[0].ec_m,
+        },
+        &segments[0].segment_okh,
+        segments[0].segment_vid,
+        true,
+        "streamed UploadPart append",
+    );
 }
 
 #[test]
@@ -8050,6 +8108,10 @@ fn complete_multipart_upload_omits_streamed_part_cleanup() {
         .cloned()
         .collect();
     assert_eq!(part2_segments.len(), 1);
+    assert_eq!(
+        part2_segments[0].payload_storage,
+        PayloadShardStorage::Placed
+    );
     let part2_shards: Vec<_> = part2_segments
         .iter()
         .flat_map(|segment| {
@@ -8061,6 +8123,20 @@ fn complete_multipart_upload_omits_streamed_part_cleanup() {
             })
         })
         .collect();
+    for segment in &part2_segments {
+        assert_payload_shard_files_state(
+            &coord,
+            segment.data_pg_id,
+            EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            },
+            &segment.segment_okh,
+            segment.segment_vid,
+            true,
+            "omitted streamed part before complete",
+        );
+    }
     for (pg_id, shard_key) in &part2_shards {
         assert!(
             coord
@@ -8109,6 +8185,20 @@ fn complete_multipart_upload_omits_streamed_part_cleanup() {
                 .test_shard_exists(*pg_id, shard_key)
                 .unwrap(),
             "omitted part shard should be deleted after complete"
+        );
+    }
+    for segment in &part2_segments {
+        assert_payload_shard_files_state(
+            &coord,
+            segment.data_pg_id,
+            EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            },
+            &segment.segment_okh,
+            segment.segment_vid,
+            false,
+            "omitted streamed part after complete",
         );
     }
 
@@ -8178,6 +8268,34 @@ fn streamed_upload_part_same_part_last_finisher_wins() {
             computed_checksum: None,
         })
         .unwrap();
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let first_segments: Vec<_> = coord
+        .storage_node
+        .test_get_all_multipart_part_segments_for_upload(&bucket, &key, &mpu.upload_id)
+        .unwrap()
+        .into_iter()
+        .filter(|segment| segment.part_number == 1)
+        .collect();
+    assert_eq!(first_segments.len(), 1);
+    assert_eq!(
+        first_segments[0].payload_storage,
+        PayloadShardStorage::Placed
+    );
+    for segment in &first_segments {
+        assert_payload_shard_files_state(
+            &coord,
+            segment.data_pg_id,
+            EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            },
+            &segment.segment_okh,
+            segment.segment_vid,
+            true,
+            "first streamed UploadPart version",
+        );
+    }
     let result_a = coord
         .finalize_stream_part(FinalizeStreamPartRequest {
             upload: multipart_object_request("bucket", "key", &mpu.upload_id, test_requester()),
@@ -8190,6 +8308,46 @@ fn streamed_upload_part_same_part_last_finisher_wins() {
         })
         .unwrap();
     assert_ne!(result_a.etag, result_b.etag);
+    for segment in &first_segments {
+        assert_payload_shard_files_state(
+            &coord,
+            segment.data_pg_id,
+            EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            },
+            &segment.segment_okh,
+            segment.segment_vid,
+            false,
+            "displaced streamed UploadPart version",
+        );
+    }
+    let final_segments: Vec<_> = coord
+        .storage_node
+        .test_get_all_multipart_part_segments_for_upload(&bucket, &key, &mpu.upload_id)
+        .unwrap()
+        .into_iter()
+        .filter(|segment| segment.part_number == 1)
+        .collect();
+    assert_eq!(final_segments.len(), 1);
+    assert_eq!(
+        final_segments[0].payload_storage,
+        PayloadShardStorage::Placed
+    );
+    for segment in &final_segments {
+        assert_payload_shard_files_state(
+            &coord,
+            segment.data_pg_id,
+            EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            },
+            &segment.segment_okh,
+            segment.segment_vid,
+            true,
+            "winning streamed UploadPart version",
+        );
+    }
 
     let parts = coord
         .list_parts(&ListPartsRequest {

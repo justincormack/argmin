@@ -532,6 +532,7 @@ impl PgStore {
             .get::<_, Option<Vec<u8>>>(12)?
             .map(|blob| Self::blob_to_checksum(blob, 12))
             .transpose()?;
+        let payload_storage = Self::parse_payload_storage(row.get::<_, i64>(13)?, 13)?;
         Ok(ObjectPartRecord {
             bucket: row.get(0)?,
             key: row.get(1)?,
@@ -544,6 +545,7 @@ impl PgStore {
             part_vid: Self::parse_generation_id(row.get::<_, i64>(8)?, 8, "part_vid")?,
             ec_k: row.get::<_, u8>(9)?,
             ec_m: row.get::<_, u8>(10)?,
+            payload_storage,
             data_pg_id: row.get::<_, i64>(11)? as u32,
             checksum,
         })
@@ -554,7 +556,7 @@ impl PgStore {
     ) -> rusqlite::Result<ObjectPartRangeRecord> {
         Ok(ObjectPartRangeRecord {
             part: Self::row_to_object_part(row)?,
-            object_offset_start: row.get::<_, i64>(13)? as u64,
+            object_offset_start: row.get::<_, i64>(14)? as u64,
         })
     }
 
@@ -581,6 +583,7 @@ impl PgStore {
             .get::<_, Option<Vec<u8>>>(11)?
             .map(|blob| Self::blob_to_checksum(blob, 11))
             .transpose()?;
+        let payload_storage = Self::parse_payload_storage(row.get::<_, i64>(12)?, 12)?;
         Ok(MultipartPartRecord {
             upload_id: row.get(0)?,
             part_number: row.get::<_, i64>(1)? as u32,
@@ -592,6 +595,7 @@ impl PgStore {
             part_vid: Self::parse_generation_id(row.get::<_, i64>(7)?, 7, "part_vid")?,
             ec_k: row.get::<_, u8>(8)?,
             ec_m: row.get::<_, u8>(9)?,
+            payload_storage,
             last_modified: row.get::<_, i64>(10)? as u64,
             checksum,
         })
@@ -4383,13 +4387,14 @@ impl PgMetadataStore for PgStore {
                         part_vid,
                         data_pg_id,
                         ec,
+                        payload_storage,
                     } => {
                         self.conn
                             .execute(
                                 "INSERT OR REPLACE INTO multipart_reclaim_parts \
                                  (bucket, key, generation_id, part_number, storage_kind, part_okh, \
-                                  part_vid, data_pg_id, ec_k, ec_m) \
-                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                  part_vid, data_pg_id, ec_k, ec_m, payload_storage) \
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                                 params![
                                     reclaim.bucket,
                                     reclaim.key,
@@ -4401,6 +4406,7 @@ impl PgMetadataStore for PgStore {
                                     *data_pg_id as i64,
                                     ec.k,
                                     ec.m,
+                                    *payload_storage as u8,
                                 ],
                             )
                             .map_err(|e| MetadataError::Db {
@@ -4416,14 +4422,15 @@ impl PgMetadataStore for PgStore {
                             .execute(
                                 "INSERT OR REPLACE INTO multipart_reclaim_parts \
                                  (bucket, key, generation_id, part_number, storage_kind, part_okh, \
-                                  part_vid, data_pg_id, ec_k, ec_m) \
-                                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL)",
+                                  part_vid, data_pg_id, ec_k, ec_m, payload_storage) \
+                                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL, ?6)",
                                 params![
                                     reclaim.bucket,
                                     reclaim.key,
                                     reclaim.generation_id.get() as i64,
                                     *part_number as i64,
                                     MultipartReclaimPartKind::Segments as u8,
+                                    PayloadShardStorage::MetadataPrimary as u8,
                                 ],
                             )
                             .map_err(|e| MetadataError::Db {
@@ -4436,8 +4443,8 @@ impl PgMetadataStore for PgStore {
                                 .execute(
                                     "INSERT OR REPLACE INTO multipart_reclaim_part_segments \
                                      (bucket, key, generation_id, part_number, segment_index, \
-                                      segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
-                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                      segment_okh, segment_vid, data_pg_id, ec_k, ec_m, payload_storage) \
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                                     params![
                                         reclaim.bucket,
                                         reclaim.key,
@@ -4449,6 +4456,7 @@ impl PgMetadataStore for PgStore {
                                         segment.data_pg_id as i64,
                                         segment.ec.k,
                                         segment.ec.m,
+                                        segment.payload_storage as u8,
                                     ],
                                 )
                                 .map_err(|e| MetadataError::Db {
@@ -4515,7 +4523,7 @@ impl PgMetadataStore for PgStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT part_number, storage_kind, part_okh, part_vid, data_pg_id, ec_k, ec_m \
+                "SELECT part_number, storage_kind, part_okh, part_vid, data_pg_id, ec_k, ec_m, payload_storage \
                  FROM multipart_reclaim_parts \
                  WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3 \
                  ORDER BY part_number ASC",
@@ -4540,6 +4548,7 @@ impl PgMetadataStore for PgStore {
                     row.get::<_, Option<i64>>(4)?,
                     row.get::<_, Option<u8>>(5)?,
                     row.get::<_, Option<u8>>(6)?,
+                    Self::parse_payload_storage(row.get::<_, i64>(7)?, 7)?,
                 ))
             })
             .map_err(|e| MetadataError::Db {
@@ -4549,7 +4558,7 @@ impl PgMetadataStore for PgStore {
 
         let mut parts = Vec::new();
         for row in rows {
-            let (part_number, kind, part_okh, part_vid, data_pg_id, ec_k, ec_m) =
+            let (part_number, kind, part_okh, part_vid, data_pg_id, ec_k, ec_m, payload_storage) =
                 row.map_err(|e| MetadataError::Db {
                     context: "get multipart reclaim (part row)",
                     source: e,
@@ -4612,13 +4621,14 @@ impl PgMetadataStore for PgStore {
                         )?,
                         data_pg_id: data_pg_id as u32,
                         ec: EcShape { k: ec_k, m: ec_m },
+                        payload_storage,
                     });
                 }
                 MultipartReclaimPartKind::Segments => {
                     let mut segment_stmt = self
                         .conn
                         .prepare(
-                            "SELECT part_number, segment_index, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
+                            "SELECT part_number, segment_index, segment_okh, segment_vid, data_pg_id, ec_k, ec_m, payload_storage \
                              FROM multipart_reclaim_part_segments \
                              WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3 AND part_number = ?4 \
                              ORDER BY segment_index ASC",
@@ -4647,6 +4657,10 @@ impl PgMetadataStore for PgStore {
                                         k: row.get(5)?,
                                         m: row.get(6)?,
                                     },
+                                    payload_storage: Self::parse_payload_storage(
+                                        row.get::<_, i64>(7)?,
+                                        7,
+                                    )?,
                                 })
                             },
                         )
@@ -5498,8 +5512,8 @@ impl PgMetadataStore for PgStore {
             self.conn.execute(
                 "INSERT OR REPLACE INTO multipart_parts \
                  (upload_id, part_number, generation, size, etag, etag_kind, \
-                  part_okh, part_vid, ec_k, ec_m, last_modified, checksum) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                  part_okh, part_vid, ec_k, ec_m, payload_storage, last_modified, checksum) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     part.upload_id,
                     part.part_number,
@@ -5511,6 +5525,7 @@ impl PgMetadataStore for PgStore {
                     part.part_vid.get() as i64,
                     part.ec_k,
                     part.ec_m,
+                    part.payload_storage as u8,
                     part.last_modified as i64,
                     part.checksum.as_ref().map(|checksum| checksum.as_slice()),
                 ],
@@ -5585,7 +5600,7 @@ impl PgMetadataStore for PgStore {
 
                 let mut prev_stmt = self.conn.prepare(
                     "SELECT bucket, key, upload_id, version_id, part_number, segment_index, size, \
-                 segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
+                 segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m, payload_storage \
                  FROM multipart_part_segments \
                  WHERE upload_id = ?1 AND version_id = ?2 AND part_number = ?3 \
                  ORDER BY segment_index ASC",
@@ -5617,6 +5632,10 @@ impl PgMetadataStore for PgStore {
                             data_pg_id: row.get(10)?,
                             ec_k: row.get(11)?,
                             ec_m: row.get(12)?,
+                            payload_storage: Self::parse_payload_storage(
+                                row.get::<_, i64>(13)?,
+                                13,
+                            )?,
                         })
                     },
                 )?;
@@ -5625,8 +5644,8 @@ impl PgMetadataStore for PgStore {
                 self.conn.execute(
                     "INSERT OR REPLACE INTO multipart_parts \
                  (upload_id, part_number, generation, size, etag, etag_kind, \
-                  part_okh, part_vid, ec_k, ec_m, last_modified, checksum) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                  part_okh, part_vid, ec_k, ec_m, payload_storage, last_modified, checksum) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![
                         part.upload_id,
                         part.part_number,
@@ -5638,6 +5657,7 @@ impl PgMetadataStore for PgStore {
                         part.part_vid.get() as i64,
                         part.ec_k,
                         part.ec_m,
+                        part.payload_storage as u8,
                         part.last_modified as i64,
                         part.checksum.as_ref().map(|checksum| checksum.as_slice()),
                     ],
@@ -5656,8 +5676,8 @@ impl PgMetadataStore for PgStore {
                 let mut stmt = self.conn.prepare(
                     "INSERT INTO multipart_part_segments \
                  (bucket, key, upload_id, version_id, part_number, segment_index, size, \
-                  segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                  segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m, payload_storage) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 )?;
                 for segment in segments {
                     if segment.upload_id != part.upload_id
@@ -5684,6 +5704,7 @@ impl PgMetadataStore for PgStore {
                         segment.data_pg_id,
                         segment.ec_k,
                         segment.ec_m,
+                        segment.payload_storage as u8,
                     ])?;
                 }
 
@@ -5726,7 +5747,7 @@ impl PgMetadataStore for PgStore {
         self.conn
             .query_row(
                 "SELECT upload_id, part_number, generation, size, etag, etag_kind, \
-                 part_okh, part_vid, ec_k, ec_m, last_modified, checksum \
+                 part_okh, part_vid, ec_k, ec_m, last_modified, checksum, payload_storage \
                  FROM multipart_parts WHERE upload_id = ?1 AND part_number = ?2",
                 params![upload_id.as_str(), part_number],
                 Self::row_to_multipart_part,
@@ -5770,7 +5791,7 @@ impl PgMetadataStore for PgStore {
             params_vec.push(Box::new(marker));
             params_vec.push(Box::new(limit));
             "SELECT upload_id, part_number, generation, size, etag, etag_kind, \
-             part_okh, part_vid, ec_k, ec_m, last_modified, checksum \
+             part_okh, part_vid, ec_k, ec_m, last_modified, checksum, payload_storage \
              FROM multipart_parts \
              WHERE upload_id = ?1 AND part_number > ?2 \
              ORDER BY part_number ASC LIMIT ?3"
@@ -5778,7 +5799,7 @@ impl PgMetadataStore for PgStore {
         } else {
             params_vec.push(Box::new(limit));
             "SELECT upload_id, part_number, generation, size, etag, etag_kind, \
-             part_okh, part_vid, ec_k, ec_m, last_modified, checksum \
+             part_okh, part_vid, ec_k, ec_m, last_modified, checksum, payload_storage \
              FROM multipart_parts \
              WHERE upload_id = ?1 \
              ORDER BY part_number ASC LIMIT ?2"
@@ -5837,8 +5858,8 @@ impl PgMetadataStore for PgStore {
             let mut stmt = self.conn.prepare(
                 "INSERT INTO object_parts \
                  (bucket, key, version_id, part_number, object_offset_start, size, etag, etag_kind, \
-                  part_okh, part_vid, ec_k, ec_m, data_pg_id, checksum) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                  part_okh, part_vid, ec_k, ec_m, payload_storage, data_pg_id, checksum) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             )?;
 
             let mut ordered_parts: Vec<&ObjectPartRecord> = parts.iter().collect();
@@ -5858,6 +5879,7 @@ impl PgMetadataStore for PgStore {
                     part.part_vid.get() as i64,
                     part.ec_k,
                     part.ec_m,
+                    part.payload_storage as u8,
                     part.data_pg_id,
                     part.checksum.as_ref().map(|checksum| checksum.as_slice()),
                 ])?;
@@ -5897,7 +5919,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare(
                 "SELECT bucket, key, version_id, part_number, size, etag, etag_kind, \
-                 part_okh, part_vid, ec_k, ec_m, data_pg_id, checksum \
+                 part_okh, part_vid, ec_k, ec_m, data_pg_id, checksum, payload_storage \
                  FROM object_parts \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
                  ORDER BY part_number ASC",
@@ -5943,7 +5965,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare(
                 "SELECT bucket, key, version_id, part_number, size, etag, etag_kind, \
-                 part_okh, part_vid, ec_k, ec_m, data_pg_id, checksum, object_offset_start \
+                 part_okh, part_vid, ec_k, ec_m, data_pg_id, checksum, payload_storage, object_offset_start \
                  FROM object_parts \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
                    AND object_offset_start <= ?4 \
@@ -5982,7 +6004,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare(
                 "SELECT bucket, key, version_id, part_number, size, etag, etag_kind, \
-                 part_okh, part_vid, ec_k, ec_m, data_pg_id, checksum, object_offset_start \
+                 part_okh, part_vid, ec_k, ec_m, data_pg_id, checksum, payload_storage, object_offset_start \
                  FROM object_parts \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
                    AND part_number > ?4 \
@@ -6144,7 +6166,7 @@ impl PgMetadataStore for PgStore {
             let omitted_parts = {
                 let mut stmt = self.conn.prepare(
                     "SELECT upload_id, part_number, generation, size, etag, etag_kind, \
-                     part_okh, part_vid, ec_k, ec_m, last_modified, checksum \
+                     part_okh, part_vid, ec_k, ec_m, last_modified, checksum, payload_storage \
                      FROM multipart_parts WHERE upload_id = ?1 ORDER BY part_number ASC",
                 )?;
                 let rows =
@@ -6162,7 +6184,7 @@ impl PgMetadataStore for PgStore {
             let (omitted_streaming_segments, omitted_streaming_part_numbers) = {
                 let mut stmt = self.conn.prepare(
                     "SELECT bucket, key, upload_id, version_id, part_number, segment_index, \
-                     size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
+                     size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m, payload_storage \
                      FROM multipart_part_segments \
                      WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3 AND version_id = ?4 \
                      ORDER BY part_number, segment_index",
@@ -6195,6 +6217,10 @@ impl PgMetadataStore for PgStore {
                             data_pg_id: row.get(10)?,
                             ec_k: row.get(11)?,
                             ec_m: row.get(12)?,
+                            payload_storage: Self::parse_payload_storage(
+                                row.get::<_, i64>(13)?,
+                                13,
+                            )?,
                         })
                     },
                 )?;
@@ -6282,8 +6308,8 @@ impl PgMetadataStore for PgStore {
                 let mut stmt = self.conn.prepare(
                     "INSERT INTO object_parts \
                      (bucket, key, version_id, part_number, object_offset_start, size, etag, etag_kind, \
-                      part_okh, part_vid, ec_k, ec_m, data_pg_id, checksum) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                      part_okh, part_vid, ec_k, ec_m, payload_storage, data_pg_id, checksum) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 )?;
                 let mut ordered_parts: Vec<&ObjectPartRecord> = parts.iter().collect();
                 ordered_parts.sort_by_key(|part| part.part_number);
@@ -6302,6 +6328,7 @@ impl PgMetadataStore for PgStore {
                         part.part_vid.get() as i64,
                         part.ec_k,
                         part.ec_m,
+                        part.payload_storage as u8,
                         part.data_pg_id,
                         part.checksum.as_ref().map(|checksum| checksum.as_slice()),
                     ])?;
@@ -7329,8 +7356,8 @@ impl PgMetadataStore for PgStore {
                 .execute(
                     "INSERT OR REPLACE INTO multipart_parts \
                      (upload_id, part_number, generation, size, etag, etag_kind, \
-                      part_okh, part_vid, ec_k, ec_m, last_modified, checksum) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                      part_okh, part_vid, ec_k, ec_m, payload_storage, last_modified, checksum) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![
                         part.upload_id,
                         part.part_number,
@@ -7342,6 +7369,7 @@ impl PgMetadataStore for PgStore {
                         part.part_vid.get() as i64,
                         part.ec_k,
                         part.ec_m,
+                        part.payload_storage as u8,
                         part.last_modified as i64,
                         part.checksum.as_ref().map(|checksum| checksum.as_slice()),
                     ],
@@ -7358,7 +7386,7 @@ impl PgMetadataStore for PgStore {
                     .conn
                     .prepare(
                         "SELECT bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, segment_okh, \
-                         segment_vid, data_pg_id, ec_k, ec_m FROM multipart_part_segments \
+                         segment_vid, data_pg_id, ec_k, ec_m, payload_storage FROM multipart_part_segments \
                          WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3 AND part_number = ?4 \
                          ORDER BY segment_index ASC",
                     )
@@ -7391,6 +7419,10 @@ impl PgMetadataStore for PgStore {
                                 data_pg_id: row.get(10)?,
                                 ec_k: row.get(11)?,
                                 ec_m: row.get(12)?,
+                                payload_storage: Self::parse_payload_storage(
+                                    row.get::<_, i64>(13)?,
+                                    13,
+                                )?,
                             })
                         },
                     )
@@ -7430,8 +7462,8 @@ impl PgMetadataStore for PgStore {
                     .prepare(
                         "INSERT INTO multipart_part_segments \
                          (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, segment_okh, \
-                          segment_vid, data_pg_id, ec_k, ec_m) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                          segment_vid, data_pg_id, ec_k, ec_m, payload_storage) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                     )
                     .map_err(|e| MetadataError::Db {
                         context: "commit stream part (prepare insert segments)",
@@ -7462,6 +7494,7 @@ impl PgMetadataStore for PgStore {
                         segment.data_pg_id,
                         segment.ec_k,
                         segment.ec_m,
+                        segment.payload_storage as u8,
                     ])
                     .map_err(|e| MetadataError::Db {
                         context: "commit stream part (insert segment)",
@@ -7589,7 +7622,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare(
                 "SELECT bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, segment_okh, \
-                 segment_vid, data_pg_id, ec_k, ec_m FROM multipart_part_segments \
+                 segment_vid, data_pg_id, ec_k, ec_m, payload_storage FROM multipart_part_segments \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND part_number = ?4 \
                  ORDER BY segment_index ASC",
             )
@@ -7622,6 +7655,7 @@ impl PgMetadataStore for PgStore {
                         data_pg_id: row.get(10)?,
                         ec_k: row.get(11)?,
                         ec_m: row.get(12)?,
+                        payload_storage: Self::parse_payload_storage(row.get::<_, i64>(13)?, 13)?,
                     })
                 },
             )
@@ -7667,7 +7701,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare(
                 "SELECT bucket, key, upload_id, version_id, part_number, segment_index, \
-                 size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
+                 size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m, payload_storage \
                  FROM multipart_part_segments \
                  WHERE upload_id = ?1 \
                  ORDER BY part_number, segment_index",
@@ -7698,6 +7732,7 @@ impl PgMetadataStore for PgStore {
                     data_pg_id: row.get(10)?,
                     ec_k: row.get(11)?,
                     ec_m: row.get(12)?,
+                    payload_storage: Self::parse_payload_storage(row.get::<_, i64>(13)?, 13)?,
                 })
             })
             .map_err(|e| MetadataError::Db {

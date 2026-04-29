@@ -397,9 +397,7 @@ impl StorageCluster {
         let (target, mut segment_record) = self
             .single_node
             .prepare_stream_segment_append(bucket, key, request)?;
-        if matches!(target, StreamUploadTarget::PutObject) {
-            segment_record.payload_storage = PayloadShardStorage::Placed;
-        }
+        segment_record.payload_storage = PayloadShardStorage::Placed;
         Ok((target, segment_record))
     }
 

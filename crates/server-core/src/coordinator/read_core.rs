@@ -477,7 +477,7 @@ pub(super) fn snapshotted_multipart_parts_from_storage(
                 data_pg_id: part.data_pg_id,
                 ec_k: part.ec_k,
                 ec_m: part.ec_m,
-                payload_storage: storage::PayloadShardStorage::MetadataPrimary,
+                payload_storage: part.payload_storage,
                 encryption: encryption.clone(),
             }]
         } else {
@@ -494,7 +494,7 @@ pub(super) fn snapshotted_multipart_parts_from_storage(
                     data_pg_id: segment.data_pg_id,
                     ec_k: segment.ec_k,
                     ec_m: segment.ec_m,
-                    payload_storage: storage::PayloadShardStorage::MetadataPrimary,
+                    payload_storage: segment.payload_storage,
                     encryption: encryption.clone(),
                 })
                 .collect()

@@ -1,10 +1,11 @@
 use super::*;
 use crate::clock::current_time_millis;
 use crate::types::{
-    CompleteMultipartCommitOutcome, CompleteMultipartCommitRequest, CompletedMultipartStalePayload,
-    CreateMultipartUploadOutcome, CreateMultipartUploadReq, EcShape, MultipartReclaimPartRecord,
-    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, ObjectLayout, ObjectPartRecord,
-    ObjectSegmentRecord, StoredObject, VersionId,
+    AbortMultipartUploadCleanup, CompleteMultipartCommitCleanup, CompleteMultipartCommitOutcome,
+    CompleteMultipartCommitRequest, CompletedMultipartStalePayload, CreateMultipartUploadOutcome,
+    CreateMultipartUploadReq, EcShape, FinalizeStreamPartCleanup, FinalizeStreamPartStorageOutcome,
+    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
+    ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, StoredObject, VersionId,
 };
 
 impl SharedStorageNode {
@@ -360,6 +361,7 @@ impl SharedStorageNode {
                         k: segment.ec_k,
                         m: segment.ec_m,
                     },
+                    payload_storage: segment.payload_storage,
                 });
         }
 
@@ -388,6 +390,7 @@ impl SharedStorageNode {
                                 k: part.ec_k,
                                 m: part.ec_m,
                             },
+                            payload_storage: part.payload_storage,
                         }
                     }
                 })
@@ -439,7 +442,13 @@ impl SharedStorageNode {
         &self,
         req: CompleteMultipartCommitRequest,
         completion_order: u64,
-    ) -> Result<CompleteMultipartCommitOutcome, ObjectPgActionError> {
+    ) -> Result<
+        (
+            CompleteMultipartCommitOutcome,
+            CompleteMultipartCommitCleanup,
+        ),
+        ObjectPgActionError,
+    > {
         let pg = self.get_pg(self.pg_topology.object_pg_for(&req.bucket, &req.key))?;
         let version_id = if req.versioning == crate::types::BucketVersioningState::Enabled {
             PgMetadataStore::next_version_id(&*pg, &req.bucket, &req.key)?
@@ -475,6 +484,7 @@ impl SharedStorageNode {
                     part_vid: part.part_vid,
                     ec_k: part.ec_k,
                     ec_m: part.ec_m,
+                    payload_storage: part.payload_storage,
                     data_pg_id,
                     checksum: part.checksum.clone(),
                 }
@@ -539,14 +549,20 @@ impl SharedStorageNode {
         );
         self.delete_streaming_segment_shards_best_effort(&cleanup.omitted_streaming_segments);
 
-        Ok(outcome)
+        Ok((outcome, cleanup))
     }
 
     pub fn complete_multipart_upload_commit_serialized(
         &self,
         req: CompleteMultipartCommitRequest,
         keep_completed_uploads: usize,
-    ) -> Result<CompleteMultipartCommitOutcome, ObjectPgActionError> {
+    ) -> Result<
+        (
+            CompleteMultipartCommitOutcome,
+            CompleteMultipartCommitCleanup,
+        ),
+        ObjectPgActionError,
+    > {
         let bucket = req.bucket.clone();
         let _completion_guard = self.lock_multipart_completion_bucket(&req.bucket);
         let completion_order = self
@@ -555,12 +571,13 @@ impl SharedStorageNode {
                 BucketSnapshotLoadError::Store(error) => ObjectPgActionError::Store(error),
                 BucketSnapshotLoadError::Metadata(error) => ObjectPgActionError::Metadata(error),
             })?;
-        let outcome = self.complete_multipart_upload_commit_with_order(req, completion_order)?;
+        let (outcome, cleanup) =
+            self.complete_multipart_upload_commit_with_order(req, completion_order)?;
         self.prune_completed_multipart_uploads_for_bucket_with_limit(
             &bucket,
             keep_completed_uploads,
         )?;
-        Ok(outcome)
+        Ok((outcome, cleanup))
     }
 
     pub fn finalize_upload_part_stream<T, E>(
@@ -571,7 +588,7 @@ impl SharedStorageNode {
         session_id: &SessionId,
         part_number: u32,
         action: impl FnOnce(StreamUploadPartSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
-    ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, ObjectPgActionError> {
+    ) -> Result<FinalizeStreamPartStorageOutcome<T, E>, ObjectPgActionError> {
         let (result, cleanup) = {
             let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
             let session = pg.get_stream_upload(session_id)?;
@@ -603,28 +620,32 @@ impl SharedStorageNode {
                         || existing_part
                             .as_ref()
                             .is_some_and(|part| part.part_okh != [0u8; 16]))
-                    .then_some((upload.clone(), existing_part, displaced_segments));
+                    .then_some(FinalizeStreamPartCleanup {
+                        upload: upload.clone(),
+                        existing_part,
+                        displaced_segments,
+                    });
                     (
-                        Ok(Ok(FinalizeStreamPartOutcome {
+                        Ok(FinalizeStreamPartOutcome {
                             value: prepared.value,
                             last_modified: prepared.part.last_modified,
-                        })),
+                        }),
                         cleanup,
                     )
                 }
-                Err(error) => (Ok(Err(error)), None),
+                Err(error) => (Err(error), None),
             }
         };
 
-        if let Some((upload, existing_part, displaced_segments)) = cleanup {
+        if let Some(cleanup) = cleanup.as_ref() {
             self.delete_replaced_upload_part_best_effort(
-                &upload,
-                existing_part.as_ref(),
-                &displaced_segments,
+                &cleanup.upload,
+                cleanup.existing_part.as_ref(),
+                &cleanup.displaced_segments,
             );
         }
 
-        result
+        Ok(FinalizeStreamPartStorageOutcome { result, cleanup })
     }
 
     pub fn load_in_progress_multipart_upload_for_listing(
@@ -842,13 +863,13 @@ impl SharedStorageNode {
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
-    ) -> Result<bool, ObjectPgActionError> {
+    ) -> Result<Option<AbortMultipartUploadCleanup>, ObjectPgActionError> {
         let (upload, parts, streaming_segments) = {
             let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
             let upload =
                 match Self::load_multipart_upload_from_object_pg(&pg, bucket, key, upload_id) {
                     Ok(upload) => upload,
-                    Err(crate::error::MetadataError::NoSuchUpload { .. }) => return Ok(false),
+                    Err(crate::error::MetadataError::NoSuchUpload { .. }) => return Ok(None),
                     Err(error) => return Err(error.into()),
                 };
 
@@ -856,7 +877,7 @@ impl SharedStorageNode {
                 Ok(()) => {}
                 Err(crate::error::MetadataError::UploadNotInProgress { state })
                     if state == UploadState::Aborting as u8 => {}
-                Err(crate::error::MetadataError::UploadNotInProgress { .. }) => return Ok(false),
+                Err(crate::error::MetadataError::UploadNotInProgress { .. }) => return Ok(None),
                 Err(error) => return Err(error.into()),
             }
 
@@ -881,8 +902,13 @@ impl SharedStorageNode {
             pg.delete_multipart_part_segments_by_upload_id(upload_id)?;
         }
         match pg.delete_multipart_upload(upload_id) {
-            Ok(()) => Ok(true),
-            Err(crate::error::MetadataError::NoSuchUpload { .. }) => Ok(true),
+            Ok(()) | Err(crate::error::MetadataError::NoSuchUpload { .. }) => {
+                Ok(Some(AbortMultipartUploadCleanup {
+                    upload,
+                    parts,
+                    streaming_segments,
+                }))
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -893,18 +919,18 @@ impl SharedStorageNode {
         key: &ObjectKey,
         upload_id: &UploadId,
         should_abort: impl FnOnce(Option<&str>, &MultipartUploadRecord) -> Result<bool, E>,
-    ) -> Result<Result<bool, E>, ObjectPgActionError> {
+    ) -> Result<Result<Option<AbortMultipartUploadCleanup>, E>, ObjectPgActionError> {
         let Some((_bucket_guard, _bucket_info, raw_lifecycle)) =
             self.lock_bucket_and_load_lifecycle_context(bucket)?
         else {
-            return Ok(Ok(false));
+            return Ok(Ok(None));
         };
 
         let upload = match self.load_multipart_upload(bucket, key, upload_id) {
             Ok(upload) => upload,
             Err(crate::error::BucketSnapshotLoadError::Metadata(
                 crate::error::MetadataError::NoSuchUpload { .. },
-            )) => return Ok(Ok(false)),
+            )) => return Ok(Ok(None)),
             Err(crate::error::BucketSnapshotLoadError::Store(error)) => {
                 return Err(error.into());
             }
@@ -917,7 +943,7 @@ impl SharedStorageNode {
             return self.abort_multipart_upload(bucket, key, upload_id).map(Ok);
         }
         if upload.state != UploadState::InProgress || raw_lifecycle.is_none() {
-            return Ok(Ok(false));
+            return Ok(Ok(None));
         }
 
         let should_abort = match should_abort(raw_lifecycle.as_deref(), &upload) {
@@ -925,7 +951,7 @@ impl SharedStorageNode {
             Err(error) => return Ok(Err(error)),
         };
         if !should_abort {
-            return Ok(Ok(false));
+            return Ok(Ok(None));
         }
 
         self.abort_multipart_upload(bucket, key, upload_id).map(Ok)

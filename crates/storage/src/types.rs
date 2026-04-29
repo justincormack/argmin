@@ -1859,6 +1859,7 @@ pub struct MultipartReclaimPartSegmentRecord {
     pub segment_vid: GenerationId,
     pub data_pg_id: u32,
     pub ec: EcShape,
+    pub payload_storage: PayloadShardStorage,
 }
 
 /// Part entry for a durable multipart reclaim record.
@@ -1870,6 +1871,7 @@ pub enum MultipartReclaimPartRecord {
         part_vid: GenerationId,
         data_pg_id: u32,
         ec: EcShape,
+        payload_storage: PayloadShardStorage,
     },
     Segments {
         part_number: u32,
@@ -2808,6 +2810,7 @@ pub struct MultipartPartRecord {
     pub part_vid: GenerationId,
     pub ec_k: u8,
     pub ec_m: u8,
+    pub payload_storage: PayloadShardStorage,
     /// Last modified timestamp (unix milliseconds).
     pub last_modified: u64,
     /// Raw checksum bytes for this part (None if no checksum).
@@ -2887,6 +2890,7 @@ pub struct ObjectPartRecord {
     pub part_vid: GenerationId,
     pub ec_k: u8,
     pub ec_m: u8,
+    pub payload_storage: PayloadShardStorage,
     /// PG where this part's shards are stored.
     pub data_pg_id: u32,
     /// Raw checksum bytes for this part (None if no checksum).
@@ -3124,6 +3128,25 @@ pub struct FinalizeStreamPartOutcome<T> {
     pub last_modified: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct FinalizeStreamPartCleanup {
+    pub upload: MultipartUploadRecord,
+    pub existing_part: Option<MultipartPartRecord>,
+    pub displaced_segments: Vec<MultipartPartSegmentRecord>,
+}
+
+pub struct FinalizeStreamPartStorageOutcome<T, E> {
+    pub result: Result<FinalizeStreamPartOutcome<T>, E>,
+    pub cleanup: Option<FinalizeStreamPartCleanup>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AbortMultipartUploadCleanup {
+    pub upload: MultipartUploadRecord,
+    pub parts: Vec<MultipartPartRecord>,
+    pub streaming_segments: Vec<MultipartPartSegmentRecord>,
+}
+
 /// Committed segment record for a normal PutObject.
 #[derive(Debug, Clone)]
 pub struct ObjectSegmentRecord {
@@ -3159,6 +3182,7 @@ pub struct MultipartPartSegmentRecord {
     pub data_pg_id: u32,
     pub ec_k: u8,
     pub ec_m: u8,
+    pub payload_storage: PayloadShardStorage,
 }
 
 #[cfg(test)]

@@ -637,6 +637,7 @@ impl super::StorageCluster {
                             part_vid,
                             data_pg_id,
                             ec,
+                            payload_storage,
                             ..
                         } => {
                             self.delete_reclaim_shard_set(
@@ -644,7 +645,7 @@ impl super::StorageCluster {
                                 part_okh,
                                 *part_vid,
                                 *ec,
-                                PayloadShardStorage::MetadataPrimary,
+                                *payload_storage,
                             )?;
                         }
                         MultipartReclaimPartRecord::Segments { segments, .. } => {
@@ -654,7 +655,7 @@ impl super::StorageCluster {
                                     &segment.segment_okh,
                                     segment.segment_vid,
                                     segment.ec,
-                                    PayloadShardStorage::MetadataPrimary,
+                                    segment.payload_storage,
                                 )?;
                             }
                         }
@@ -720,6 +721,126 @@ impl super::StorageCluster {
             data_pg.delete_shard(&shard_key)?;
         }
         Ok(())
+    }
+
+    fn delete_complete_multipart_cleanup_best_effort(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        cleanup: &CompleteMultipartCommitCleanup,
+    ) {
+        for part in &cleanup.omitted_parts {
+            if part.part_okh == [0u8; 16] {
+                continue;
+            }
+            let data_pg_id = self
+                .single_node
+                .pg_topology()
+                .object_generation_multipart_part_data_pg(
+                    bucket,
+                    key,
+                    generation_id,
+                    part.part_number,
+                )
+                .get();
+            self.delete_multipart_shard_set_best_effort(
+                data_pg_id,
+                &part.part_okh,
+                part.part_vid,
+                EcShape {
+                    k: part.ec_k,
+                    m: part.ec_m,
+                },
+                part.payload_storage,
+            );
+        }
+        self.delete_multipart_part_segments_best_effort(&cleanup.omitted_streaming_segments);
+    }
+
+    fn delete_finalize_upload_part_cleanup_best_effort(&self, cleanup: &FinalizeStreamPartCleanup) {
+        if let Some(part) = cleanup
+            .existing_part
+            .as_ref()
+            .filter(|part| part.part_okh != [0u8; 16])
+        {
+            let data_pg_id = self
+                .single_node
+                .pg_topology()
+                .object_generation_multipart_part_data_pg(
+                    &cleanup.upload.bucket,
+                    &cleanup.upload.key,
+                    cleanup.upload.object_generation_id,
+                    part.part_number,
+                )
+                .get();
+            self.delete_multipart_shard_set_best_effort(
+                data_pg_id,
+                &part.part_okh,
+                part.part_vid,
+                EcShape {
+                    k: part.ec_k,
+                    m: part.ec_m,
+                },
+                part.payload_storage,
+            );
+        }
+        self.delete_multipart_part_segments_best_effort(&cleanup.displaced_segments);
+    }
+
+    fn delete_abort_multipart_cleanup_best_effort(&self, cleanup: &AbortMultipartUploadCleanup) {
+        for part in &cleanup.parts {
+            if part.part_okh == [0u8; 16] {
+                continue;
+            }
+            let data_pg_id = self
+                .single_node
+                .pg_topology()
+                .object_generation_multipart_part_data_pg(
+                    &cleanup.upload.bucket,
+                    &cleanup.upload.key,
+                    cleanup.upload.object_generation_id,
+                    part.part_number,
+                )
+                .get();
+            self.delete_multipart_shard_set_best_effort(
+                data_pg_id,
+                &part.part_okh,
+                part.part_vid,
+                EcShape {
+                    k: part.ec_k,
+                    m: part.ec_m,
+                },
+                part.payload_storage,
+            );
+        }
+        self.delete_multipart_part_segments_best_effort(&cleanup.streaming_segments);
+    }
+
+    fn delete_multipart_part_segments_best_effort(&self, segments: &[MultipartPartSegmentRecord]) {
+        for segment in segments {
+            self.delete_multipart_shard_set_best_effort(
+                segment.data_pg_id,
+                &segment.segment_okh,
+                segment.segment_vid,
+                EcShape {
+                    k: segment.ec_k,
+                    m: segment.ec_m,
+                },
+                segment.payload_storage,
+            );
+        }
+    }
+
+    fn delete_multipart_shard_set_best_effort(
+        &self,
+        data_pg_id: u32,
+        okh: &[u8; 16],
+        generation_id: GenerationId,
+        ec: EcShape,
+        payload_storage: PayloadShardStorage,
+    ) {
+        let _ = self.delete_reclaim_shard_set(data_pg_id, okh, generation_id, ec, payload_storage);
     }
 
     pub fn create_put_object_stream_session<T, E>(
@@ -869,8 +990,19 @@ impl super::StorageCluster {
         req: CompleteMultipartCommitRequest,
         keep_completed_uploads: usize,
     ) -> Result<CompleteMultipartCommitOutcome, ObjectPgActionError> {
-        self.single_node
-            .complete_multipart_upload_commit_serialized(req, keep_completed_uploads)
+        let cleanup_bucket = req.bucket.clone();
+        let cleanup_key = req.key.clone();
+        let cleanup_generation_id = req.generation_id;
+        let (outcome, cleanup) = self
+            .single_node
+            .complete_multipart_upload_commit_serialized(req, keep_completed_uploads)?;
+        self.delete_complete_multipart_cleanup_best_effort(
+            &cleanup_bucket,
+            &cleanup_key,
+            cleanup_generation_id,
+            &cleanup,
+        );
+        Ok(outcome)
     }
 
     pub fn finalize_upload_part_stream<T, E>(
@@ -882,14 +1014,18 @@ impl super::StorageCluster {
         part_number: u32,
         action: impl FnOnce(StreamUploadPartSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, ObjectPgActionError> {
-        self.single_node.finalize_upload_part_stream(
+        let outcome = self.single_node.finalize_upload_part_stream(
             bucket,
             key,
             upload_id,
             session_id,
             part_number,
             action,
-        )
+        )?;
+        if let Some(cleanup) = outcome.cleanup.as_ref() {
+            self.delete_finalize_upload_part_cleanup_best_effort(cleanup);
+        }
+        Ok(outcome.result)
     }
 
     pub fn list_multipart_uploads_for_bucket(
@@ -949,8 +1085,13 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<bool, ObjectPgActionError> {
-        self.single_node
-            .abort_multipart_upload(bucket, key, upload_id)
+        let cleanup = self
+            .single_node
+            .abort_multipart_upload(bucket, key, upload_id)?;
+        if let Some(cleanup) = cleanup.as_ref() {
+            self.delete_abort_multipart_cleanup_best_effort(cleanup);
+        }
+        Ok(cleanup.is_some())
     }
 
     pub fn abort_multipart_upload_if_due<E>(
@@ -960,8 +1101,19 @@ impl super::StorageCluster {
         upload_id: &UploadId,
         should_abort: impl FnOnce(Option<&str>, &MultipartUploadRecord) -> Result<bool, E>,
     ) -> Result<Result<bool, E>, ObjectPgActionError> {
-        self.single_node
-            .abort_multipart_upload_if_due(bucket, key, upload_id, should_abort)
+        match self.single_node.abort_multipart_upload_if_due(
+            bucket,
+            key,
+            upload_id,
+            should_abort,
+        )? {
+            Ok(Some(cleanup)) => {
+                self.delete_abort_multipart_cleanup_best_effort(&cleanup);
+                Ok(Ok(true))
+            }
+            Ok(None) => Ok(Ok(false)),
+            Err(error) => Ok(Err(error)),
+        }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

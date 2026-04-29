@@ -622,14 +622,19 @@ Implementation order:
   - write staged segment shards to assigned nodes
   - register/publish metadata only after the required shard writes complete
   - test failed commit cleanup across local nodes
-- [ ] 4.7 Move multipart direct and streamed part payloads.
-  - direct UploadPart should follow the direct PutObject shape
-  - streamed UploadPart should reuse the streaming segment placement path
-  - test abort, part reupload, subset completion, and omitted part cleanup in
-    multi-node mode
+- [x] 4.7 Move multipart part payloads.
+  - the active UploadPart path is streaming-based and now reuses the placed
+    streaming segment path
+  - multipart part, object-part, segment, and reclaim metadata records carry a
+    durable payload-storage marker so any future direct multipart shard-set path
+    cannot silently assume metadata-primary storage
+  - abort, part reupload, subset completion, and omitted part cleanup are
+    placement-aware in multi-node mode
 - [ ] 4.8 Move delete and reclaim cleanup to placement-aware shard deletion.
   - recompute per-shard node placement from stored `data_pg_id`, EC shape, and
     shard identity
+  - sweep remaining delete/reclaim paths now that multipart reclaim records also
+    preserve their payload-storage marker
   - keep crash-durable scavenger work in the later scavenger phase
 - [ ] 4.9 Do a Phase 4 boundary sweep.
   - active payload reads/writes/deletes should no longer assume all EC shards live
@@ -733,6 +738,22 @@ Phase 4 implementation notes:
      remaining cleanup continue to move in Steps 4.7-4.8
    - tests that specifically exercise metadata PG fanout, merge, pagination, or
      bucket/object PG separation opt into two PGs
+9. Step 4.7 moves streamed UploadPart payload files onto placed shard IO.
+   - `StorageCluster` now marks both standard stream PutObject segments and
+     streamed UploadPart segments as placed after the metadata-primary prepare
+     step allocates the segment payload ID
+   - multipart manifest, staged-part, object-part, and reclaim rows store
+     `PayloadShardStorage` so reads and cleanup use the durable payload location
+     instead of assuming metadata-primary shard files
+   - multipart reads route direct part shard sets and streamed part segments
+     through the stored marker
+   - abort, reupload replacement cleanup, and completion cleanup for omitted
+     streamed parts delete placed shard files and metadata-primary bridge rows
+     best-effort
+   - there is no separate direct UploadPart request path at this point; the
+     public/test UploadPart helper already uses begin, append, and finalize
+     streaming calls, while the direct multipart shard-set metadata shape is
+     ready if that path is introduced later
    - sparse topology tests keep explicit PG sets such as `[0, 2, 5]`
    - placement and shard IO tests use one PG unless the test checks
      PG-dependent placement
