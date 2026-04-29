@@ -1,9 +1,9 @@
 use super::*;
 use crate::{
     BucketVersioningState, CommitDirectPutObjectReq, CommitStreamPutReq, DirectPutCommitSnapshot,
-    DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, FinalizeStreamPutOutcome,
-    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
-    ObjectEtag, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
+    EcShape, FinalizeDirectPutObjectOutcome, FinalizeStreamPutOutcome, MultipartReclaimPartRecord,
+    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, ObjectEtag, ObjectLayout,
+    ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
     ObjectSegmentsReclaimSegmentRecord, PrepareStreamUploadSegmentAppendReq,
     PreparedStreamPutCommit, PutLiveObjectReq, StreamPutFinalizeSnapshot, StreamUploadRecord,
     StreamUploadSegmentRecord, VersionId, WrittenShardAck,
@@ -158,34 +158,6 @@ impl SharedStorageNode {
         Ok(object_pg.delete_object_generation_reservation(bucket, key, reservation_id)?)
     }
 
-    pub fn write_direct_put_segment_shards(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-        segment_index: u32,
-        segment_okh: &[u8; 16],
-        data: &[u8],
-    ) -> Result<DirectPutWrittenSegment, StoreError> {
-        let ec = self.default_ec_shape();
-        let data_pg_id = self
-            .pg_topology
-            .object_generation_segment_data_pg(bucket, key, generation_id, segment_index)
-            .get();
-        let written_shards = self.write_erasure_coded_segment_shards(
-            data_pg_id,
-            segment_okh,
-            generation_id,
-            data,
-            ec,
-        )?;
-        Ok(DirectPutWrittenSegment {
-            data_pg_id,
-            ec,
-            written_shards,
-        })
-    }
-
     pub fn write_stream_segment_shards(
         &self,
         data_pg_id: u32,
@@ -197,7 +169,7 @@ impl SharedStorageNode {
         self.write_erasure_coded_segment_shards(data_pg_id, segment_okh, segment_vid, data, ec)
     }
 
-    pub fn commit_direct_put_object<E>(
+    pub(crate) fn commit_direct_put_object<E>(
         &self,
         req: &CommitDirectPutObjectReq,
         written_shards: &[WrittenShardAck],
@@ -326,6 +298,7 @@ impl SharedStorageNode {
             data_pg_id: req.data_pg_id,
             ec_k: req.ec.k,
             ec_m: req.ec.m,
+            payload_storage: crate::PayloadShardStorage::Placed,
         };
         let live_req = PutLiveObjectReq {
             bucket: req.bucket.clone(),
@@ -508,6 +481,7 @@ impl SharedStorageNode {
             data_pg_id,
             ec_k: self.default_ec_shape.k,
             ec_m: self.default_ec_shape.m,
+            payload_storage: crate::PayloadShardStorage::MetadataPrimary,
         };
         Ok((session.target, segment_record))
     }
@@ -744,6 +718,7 @@ impl SharedStorageNode {
                         data_pg_id: segment.data_pg_id,
                         ec_k: segment.ec_k,
                         ec_m: segment.ec_m,
+                        payload_storage: segment.payload_storage,
                     })
                     .collect();
 
@@ -948,6 +923,7 @@ impl SharedStorageNode {
                         k: segment.ec_k,
                         m: segment.ec_m,
                     },
+                    payload_storage: segment.payload_storage,
                 })
                 .collect(),
         })

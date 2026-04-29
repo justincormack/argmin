@@ -5046,6 +5046,7 @@ fn stream_segment_append_and_list() {
                 data_pg_id: i,
                 ec_k: 4,
                 ec_m: 2,
+                payload_storage: PayloadShardStorage::MetadataPrimary,
             })
             .unwrap();
     }
@@ -5104,6 +5105,7 @@ fn stream_segment_publish_with_shards_same_pg_is_atomic() {
         data_pg_id: 0,
         ec_k: 4,
         ec_m: 2,
+        payload_storage: PayloadShardStorage::MetadataPrimary,
     };
     let shard_batch = [(&shard, ack)];
 
@@ -5144,6 +5146,7 @@ fn stream_segment_cascade_delete() {
             data_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
+            payload_storage: PayloadShardStorage::MetadataPrimary,
         })
         .unwrap();
 
@@ -5184,6 +5187,7 @@ fn commit_stream_put_atomic() {
             data_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
+            payload_storage: PayloadShardStorage::MetadataPrimary,
         })
         .unwrap();
 
@@ -5198,6 +5202,7 @@ fn commit_stream_put_atomic() {
             data_pg_id: 1,
             ec_k: 4,
             ec_m: 2,
+            payload_storage: PayloadShardStorage::MetadataPrimary,
         })
         .unwrap();
 
@@ -5233,6 +5238,7 @@ fn commit_stream_put_atomic() {
             data_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
+            payload_storage: PayloadShardStorage::MetadataPrimary,
         },
         ObjectSegmentRecord {
             bucket: bucket_name("bucket"),
@@ -5246,6 +5252,7 @@ fn commit_stream_put_atomic() {
             data_pg_id: 1,
             ec_k: 4,
             ec_m: 2,
+            payload_storage: PayloadShardStorage::MetadataPrimary,
         },
     ];
 
@@ -5336,6 +5343,7 @@ fn commit_stream_put_overwrite_unversioned() {
                 data_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
+                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         )
         .unwrap();
@@ -5382,6 +5390,7 @@ fn commit_stream_put_overwrite_unversioned() {
                 data_pg_id: 1,
                 ec_k: 4,
                 ec_m: 2,
+                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         )
         .unwrap();
@@ -5438,6 +5447,7 @@ fn put_object_with_segments_persists_manifest() {
                     data_pg_id: 0,
                     ec_k: 4,
                     ec_m: 2,
+                    payload_storage: PayloadShardStorage::MetadataPrimary,
                 },
                 ObjectSegmentRecord {
                     bucket: bucket_name("bucket"),
@@ -5451,6 +5461,7 @@ fn put_object_with_segments_persists_manifest() {
                     data_pg_id: 0,
                     ec_k: 4,
                     ec_m: 2,
+                    payload_storage: PayloadShardStorage::MetadataPrimary,
                 },
             ],
         )
@@ -5507,6 +5518,7 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 data_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
+                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         )
         .unwrap();
@@ -5543,6 +5555,7 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 data_pg_id: 1,
                 ec_k: 4,
                 ec_m: 2,
+                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         )
         .unwrap();
@@ -5605,6 +5618,7 @@ fn delete_object_segments_cleanup() {
                 data_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
+                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         )
         .unwrap();
@@ -6324,6 +6338,7 @@ fn commit_stream_put_rejects_mismatched_segment_target() {
                 data_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
+                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         )
         .unwrap_err();
@@ -6353,6 +6368,7 @@ fn object_segments_reclaim_round_trip() {
                 segment_vid: GenerationId::new(11).unwrap(),
                 data_pg_id: 1,
                 ec: EcShape { k: 4, m: 2 },
+                payload_storage: PayloadShardStorage::MetadataPrimary,
             },
             ObjectSegmentsReclaimSegmentRecord {
                 segment_index: 1,
@@ -6360,6 +6376,7 @@ fn object_segments_reclaim_round_trip() {
                 segment_vid: GenerationId::new(12).unwrap(),
                 data_pg_id: 2,
                 ec: EcShape { k: 6, m: 3 },
+                payload_storage: PayloadShardStorage::MetadataPrimary,
             },
         ],
     };
@@ -6397,6 +6414,7 @@ fn next_generation_id_skips_object_segments_reclaim_generation() {
                 segment_vid: GenerationId::new(13).unwrap(),
                 data_pg_id: 0,
                 ec: EcShape { k: 4, m: 2 },
+                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         })
         .unwrap();
@@ -6606,6 +6624,7 @@ fn get_bucket_payload_reclaim_root_returns_first_root() {
                 segment_vid: GenerationId::new(21).unwrap(),
                 data_pg_id: 0,
                 ec: EcShape { k: 4, m: 2 },
+                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         })
         .unwrap();
@@ -6646,6 +6665,7 @@ fn payload_reclaim_exists_checks_segment_and_multipart_reclaims() {
                 segment_vid: GenerationId::new(21).unwrap(),
                 data_pg_id: 0,
                 ec: EcShape { k: 4, m: 2 },
+                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         })
         .unwrap();

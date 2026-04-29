@@ -485,8 +485,8 @@ impl PgStore {
             self.conn
                 .execute(
                     "INSERT INTO stream_upload_segments \
-                     (session_id, segment_index, size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     (session_id, segment_index, size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m, payload_storage) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         segment.session_id,
                         segment.segment_index,
@@ -497,6 +497,7 @@ impl PgStore {
                         segment.data_pg_id,
                         segment.ec_k,
                         segment.ec_m,
+                        segment.payload_storage as u8,
                     ],
                 )
                 .map_err(|e| MetadataError::Db {
@@ -639,6 +640,26 @@ impl PgStore {
                 col_idx,
                 rusqlite::types::Type::Integer,
                 Box::from(format!("invalid zero {field_name}")),
+            )
+        })
+    }
+
+    fn parse_payload_storage(
+        raw: i64,
+        col_idx: usize,
+    ) -> Result<PayloadShardStorage, rusqlite::Error> {
+        let value = u8::try_from(raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                col_idx,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid payload_storage value {raw}")),
+            )
+        })?;
+        PayloadShardStorage::from_u8(value).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                col_idx,
+                rusqlite::types::Type::Integer,
+                Box::from(error),
             )
         })
     }
@@ -4181,8 +4202,8 @@ impl PgMetadataStore for PgStore {
                     .execute(
                         "INSERT OR REPLACE INTO object_segment_reclaim_segments \
                          (bucket, key, generation_id, segment_index, segment_okh, segment_vid, \
-                          data_pg_id, ec_k, ec_m) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                          data_pg_id, ec_k, ec_m, payload_storage) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                         params![
                             reclaim.bucket,
                             reclaim.key,
@@ -4193,6 +4214,7 @@ impl PgMetadataStore for PgStore {
                             segment.data_pg_id as i64,
                             segment.ec.k,
                             segment.ec.m,
+                            segment.payload_storage as u8,
                         ],
                     )
                     .map_err(|e| MetadataError::Db {
@@ -4256,7 +4278,7 @@ impl PgMetadataStore for PgStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT segment_index, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
+                "SELECT segment_index, segment_okh, segment_vid, data_pg_id, ec_k, ec_m, payload_storage \
                  FROM object_segment_reclaim_segments \
                  WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3 \
                  ORDER BY segment_index ASC",
@@ -4287,6 +4309,7 @@ impl PgMetadataStore for PgStore {
                         k: row.get(4)?,
                         m: row.get(5)?,
                     },
+                    payload_storage: Self::parse_payload_storage(row.get::<_, i64>(6)?, 6)?,
                 })
             })
             .map_err(|e| MetadataError::Db {
@@ -6672,8 +6695,8 @@ impl PgMetadataStore for PgStore {
         self.conn
             .execute(
                 "INSERT INTO stream_upload_segments \
-                 (session_id, segment_index, size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (session_id, segment_index, size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m, payload_storage) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     segment.session_id,
                     segment.segment_index,
@@ -6684,6 +6707,7 @@ impl PgMetadataStore for PgStore {
                     segment.data_pg_id,
                     segment.ec_k,
                     segment.ec_m,
+                    segment.payload_storage as u8,
                 ],
             )
             .map_err(|e| MetadataError::Db {
@@ -6701,7 +6725,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare(
                 "SELECT session_id, segment_index, size, segment_okh, segment_vid, data_pg_id, \
-                 segment_crc64, ec_k, ec_m FROM stream_upload_segments \
+                 segment_crc64, ec_k, ec_m, payload_storage FROM stream_upload_segments \
                  WHERE session_id = ?1 ORDER BY segment_index ASC",
             )
             .map_err(|e| MetadataError::Db {
@@ -6727,6 +6751,7 @@ impl PgMetadataStore for PgStore {
                     data_pg_id: row.get(5)?,
                     ec_k: row.get(7)?,
                     ec_m: row.get(8)?,
+                    payload_storage: Self::parse_payload_storage(row.get::<_, i64>(9)?, 9)?,
                 })
             })
             .map_err(|e| MetadataError::Db {
@@ -6924,8 +6949,8 @@ impl PgMetadataStore for PgStore {
                     .prepare(
                         "INSERT INTO object_segments \
                          (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, segment_vid, \
-                          data_pg_id, ec_k, ec_m) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                          data_pg_id, ec_k, ec_m, payload_storage) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     )
                     .map_err(|e| MetadataError::Db {
                         context: "commit stream put (prepare insert segments)",
@@ -6952,6 +6977,7 @@ impl PgMetadataStore for PgStore {
                         segment.data_pg_id,
                         segment.ec_k,
                         segment.ec_m,
+                        segment.payload_storage as u8,
                     ])
                     .map_err(|e| MetadataError::Db {
                         context: "commit stream put (insert segment)",
@@ -7132,8 +7158,8 @@ impl PgMetadataStore for PgStore {
                 .prepare(
                     "INSERT INTO object_segments \
                      (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, segment_vid, \
-                      data_pg_id, ec_k, ec_m) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                      data_pg_id, ec_k, ec_m, payload_storage) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "put segment object (prepare insert segments)",
@@ -7165,6 +7191,7 @@ impl PgMetadataStore for PgStore {
                     segment.data_pg_id,
                     segment.ec_k,
                     segment.ec_m,
+                    segment.payload_storage as u8,
                 ])
                 .map_err(|e| MetadataError::Db {
                     context: "put segment object (insert segment)",
@@ -7485,7 +7512,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare(
                 "SELECT bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, segment_vid, \
-                 data_pg_id, ec_k, ec_m FROM object_segments \
+                 data_pg_id, ec_k, ec_m, payload_storage FROM object_segments \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
                  ORDER BY segment_index ASC",
             )
@@ -7514,6 +7541,7 @@ impl PgMetadataStore for PgStore {
                     data_pg_id: row.get(8)?,
                     ec_k: row.get(9)?,
                     ec_m: row.get(10)?,
+                    payload_storage: Self::parse_payload_storage(row.get::<_, i64>(11)?, 11)?,
                 })
             })
             .map_err(|e| MetadataError::Db {

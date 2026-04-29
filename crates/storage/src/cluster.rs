@@ -11,7 +11,7 @@ use crate::traits::ShardStore;
 use crate::types::{
     BucketName, ClusterEpoch, CommitDirectPutObjectReq, DataPgId, DirectPutCommitSnapshot,
     DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
-    ObjectEncryption, ObjectKey, PgId, PrepareStreamUploadSegmentAppendReq,
+    ObjectEncryption, ObjectKey, PayloadShardStorage, PgId, PrepareStreamUploadSegmentAppendReq,
     SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey, StreamUploadRecord,
     StreamUploadSegmentRecord, StreamUploadTarget, WriteAck, WrittenShardAck,
 };
@@ -390,12 +390,16 @@ impl StorageCluster {
         req: SegmentStoredBytesRequest,
         dst: &mut Vec<u8>,
     ) -> Result<(), StoreError> {
-        match self.try_read_placed_segment_stored_bytes_into(req, dst) {
-            Ok(true) => Ok(()),
-            Ok(false) | Err(StoreError::NotFound) => {
+        match req.payload_storage {
+            PayloadShardStorage::MetadataPrimary => {
                 self.single_node.read_segment_stored_bytes_into(req, dst)
             }
-            Err(error) => Err(error),
+            PayloadShardStorage::Placed => {
+                match self.try_read_placed_segment_stored_bytes_into(req, dst)? {
+                    true => Ok(()),
+                    false => Err(StoreError::NotFound),
+                }
+            }
         }
     }
 

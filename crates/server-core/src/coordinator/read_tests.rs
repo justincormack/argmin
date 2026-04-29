@@ -3,7 +3,7 @@ use super::test_support::*;
 use super::*;
 use ec::EcConfig;
 use std::collections::BTreeSet;
-use storage::{segment_key_hash, EcShape, GenerationId, PgTopology, ShardKey};
+use storage::{segment_key_hash, EcShape, GenerationId, PayloadShardStorage, PgTopology, ShardKey};
 
 #[test]
 fn stream_put_get_object_readable() {
@@ -37,6 +37,20 @@ fn stream_put_get_object_readable() {
             requested_object_lock: ObjectLockState::default(),
         })
         .unwrap();
+
+    let segments = coord
+        .storage_node
+        .test_get_object_segments(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            VersionId::Null,
+        )
+        .unwrap();
+    assert_eq!(segments.len(), 1);
+    assert_eq!(
+        segments[0].payload_storage,
+        PayloadShardStorage::MetadataPrimary
+    );
 
     let head = coord
         .head_object(&GetObjectRequest {
@@ -373,6 +387,7 @@ fn buffered_put_single_segment_skips_stream_session_rows() {
         segment_key_hash("bucket", "key", live.generation_id, 0)
     );
     assert_eq!(segments[0].segment_vid, live.generation_id);
+    assert_eq!(segments[0].payload_storage, PayloadShardStorage::Placed);
     assert_eq!(
         segments[0].data_pg_id,
         topology

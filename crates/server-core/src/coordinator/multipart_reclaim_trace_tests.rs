@@ -61,6 +61,7 @@ fn trace_object_segments_reclaim(
             segment_vid: generation_id,
             data_pg_id,
             ec: EcShape { k: 4, m: 2 },
+            payload_storage: storage::PayloadShardStorage::MetadataPrimary,
         }],
     }
 }

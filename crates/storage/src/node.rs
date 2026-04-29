@@ -2201,6 +2201,7 @@ mod tests {
                     data_pg_id: meta_pg_id,
                     ec_k: node.default_ec_shape.k,
                     ec_m: node.default_ec_shape.m,
+                    payload_storage: crate::PayloadShardStorage::MetadataPrimary,
                 })
                 .unwrap();
             winner_vid
@@ -2623,6 +2624,7 @@ mod tests {
                 stored_size: data.len(),
                 segment_crc64: Some(checksum::crc64::checksum(data)),
                 ec,
+                payload_storage: crate::PayloadShardStorage::MetadataPrimary,
             },
             &mut buf,
         )

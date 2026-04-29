@@ -606,11 +606,16 @@ Implementation order:
   - publish object metadata only after all required shard writes complete
   - clean up already-written shards on pre-commit errors
   - test shard files landing under multiple `node-XXXX` stores
-- [ ] 4.5 Finish placed reads for segment producers.
+- [x] 4.5 Finish placed reads for segment producers.
+  - standard segment metadata records carry an explicit payload storage marker,
+    so reads route to either metadata-primary shard files or placed shard files
+    without speculative fallback
   - direct PutObject reads now fetch from assigned nodes using metadata-primary
     shard ack rows as a Phase 4 bridge
-  - preserve direct-read and recovery behavior as streaming and multipart writes
-    move to placed shards
+  - streaming PutObject segment records remain marked as metadata-primary until
+    Step 4.6 moves their writes
+  - multipart payload records remain metadata-primary until Step 4.7 moves
+    direct and streamed UploadPart writes
   - keep missing shard reconstruction and corrupt shard handling covered in
     local multi-node mode
 - [ ] 4.6 Move streaming PutObject segment writes and commit cleanup.
@@ -688,7 +693,21 @@ Phase 4 implementation notes:
    - request-path tests assert direct PutObject shard files land under distinct
      `node-XXXX` stores, and EC fault-injection tests now manipulate the placed
      shard file paths
-6. The test harness uses a split topology while metadata routing is still a
+6. Step 4.5 makes standard segment reads explicit about payload shard storage.
+   - `stream_upload_segments`, `object_segments`, and
+     `object_segment_reclaim_segments` record whether shard files live under the
+     metadata-primary PG store or are placed through the cluster map
+   - direct buffered PutObject records are marked as placed, while existing
+     streaming standard object records remain metadata-primary until Step 4.6
+   - read routing uses that stored marker and no longer tries placed IO before
+     falling back to the metadata-primary node
+   - the old local-node direct PUT shard writer was removed, and the
+     local-node direct commit helper is crate-internal bridge code behind
+     `StorageCluster`
+   - standard object reclaim uses the stored marker to delete placed direct PUT
+     shard files before removing metadata-primary bridge rows; multipart reclaim
+     remains metadata-primary until Step 4.7
+7. The test harness uses a split topology while metadata routing is still a
    Phase 4 bridge.
    - broad S3, HTTP, auth, and model tests use one metadata PG with the default
      `k=4,m=2` six-node local cluster, preserving the local cluster shape
@@ -702,7 +721,7 @@ Phase 4 implementation notes:
    - sparse topology tests keep explicit PG sets such as `[0, 2, 5]`
    - placement and shard IO tests use one PG unless the test checks
      PG-dependent placement
-7. Metadata operations still delegate through the metadata-primary
+8. Metadata operations still delegate through the metadata-primary
    `SharedStorageNode` in Phase 4.
    - only payload shard placement and IO are node-aware at this point
    - the other local node stores are not metadata owners or metadata replicas

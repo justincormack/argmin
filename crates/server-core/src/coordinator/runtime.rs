@@ -746,6 +746,7 @@ impl ReadRuntime {
                     k: segment.ec_k,
                     m: segment.ec_m,
                 },
+                payload_storage: segment.payload_storage,
             },
             &mut buf,
         )?;

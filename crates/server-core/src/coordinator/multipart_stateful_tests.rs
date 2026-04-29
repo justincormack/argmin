@@ -1388,6 +1388,7 @@ fn final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists() {
                         segment_vid: generation_id,
                         data_pg_id,
                         ec: EcShape { k: 4, m: 2 },
+                        payload_storage: storage::PayloadShardStorage::MetadataPrimary,
                     }],
                 },
             )

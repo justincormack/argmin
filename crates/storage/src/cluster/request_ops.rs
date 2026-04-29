@@ -625,6 +625,7 @@ impl super::StorageCluster {
                         &segment.segment_okh,
                         segment.segment_vid,
                         segment.ec,
+                        segment.payload_storage,
                     )?;
                 }
             }
@@ -638,7 +639,13 @@ impl super::StorageCluster {
                             ec,
                             ..
                         } => {
-                            self.delete_reclaim_shard_set(*data_pg_id, part_okh, *part_vid, *ec)?;
+                            self.delete_reclaim_shard_set(
+                                *data_pg_id,
+                                part_okh,
+                                *part_vid,
+                                *ec,
+                                PayloadShardStorage::MetadataPrimary,
+                            )?;
                         }
                         MultipartReclaimPartRecord::Segments { segments, .. } => {
                             for segment in segments {
@@ -647,6 +654,7 @@ impl super::StorageCluster {
                                     &segment.segment_okh,
                                     segment.segment_vid,
                                     segment.ec,
+                                    PayloadShardStorage::MetadataPrimary,
                                 )?;
                             }
                         }
@@ -685,21 +693,24 @@ impl super::StorageCluster {
         okh: &[u8; 16],
         generation_id: GenerationId,
         ec: EcShape,
+        payload_storage: PayloadShardStorage,
     ) -> Result<(), ObjectPgActionError> {
-        let data_pg = DataPgId::new(PgId::new(data_pg_id));
-        let placement_key = super::segment_payload_placement_key(okh, generation_id);
-        let locations = self
-            .place_payload_shards(data_pg, ec, &placement_key)
-            .map_err(super::cluster_build_error_to_store)?;
         let total = ec.k as usize + ec.m as usize;
 
-        for i in 0..total {
-            let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
-            if let Some(location) = locations.get(i).copied() {
-                self.delete_payload_shard(location, &shard_key)
-                    .map_err(|error| {
-                        super::shard_io_error_to_store(error, "delete placed reclaim shard")
-                    })?;
+        if payload_storage == PayloadShardStorage::Placed {
+            let data_pg = DataPgId::new(PgId::new(data_pg_id));
+            let placement_key = super::segment_payload_placement_key(okh, generation_id);
+            let locations = self
+                .place_payload_shards(data_pg, ec, &placement_key)
+                .map_err(super::cluster_build_error_to_store)?;
+            for i in 0..total {
+                let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
+                if let Some(location) = locations.get(i).copied() {
+                    self.delete_payload_shard(location, &shard_key)
+                        .map_err(|error| {
+                            super::shard_io_error_to_store(error, "delete placed reclaim shard")
+                        })?;
+                }
             }
         }
 

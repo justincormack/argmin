@@ -40,6 +40,7 @@ pub(super) struct SegmentPayloadRecord {
     pub(super) data_pg_id: u32,
     pub(super) ec_k: u8,
     pub(super) ec_m: u8,
+    pub(super) payload_storage: storage::PayloadShardStorage,
     pub(super) encryption: ObjectEncryption,
 }
 
@@ -441,6 +442,7 @@ pub(super) fn segment_payloads_from_object_segments(
             data_pg_id: segment.data_pg_id,
             ec_k: segment.ec_k,
             ec_m: segment.ec_m,
+            payload_storage: segment.payload_storage,
             encryption: encryption.clone(),
         })
         .collect()
@@ -475,6 +477,7 @@ pub(super) fn snapshotted_multipart_parts_from_storage(
                 data_pg_id: part.data_pg_id,
                 ec_k: part.ec_k,
                 ec_m: part.ec_m,
+                payload_storage: storage::PayloadShardStorage::MetadataPrimary,
                 encryption: encryption.clone(),
             }]
         } else {
@@ -491,6 +494,7 @@ pub(super) fn snapshotted_multipart_parts_from_storage(
                     data_pg_id: segment.data_pg_id,
                     ec_k: segment.ec_k,
                     ec_m: segment.ec_m,
+                    payload_storage: storage::PayloadShardStorage::MetadataPrimary,
                     encryption: encryption.clone(),
                 })
                 .collect()
