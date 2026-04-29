@@ -1925,11 +1925,11 @@ fn test_bucket_policy_delete_obj_tagging_existing_tag() {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();
-        let public_key = "publictag-delete";
-        let private_key = "privatetag-delete";
+        let allow_key = "allowtag-delete";
+        let deny_key = "denytag-delete";
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
-        for key in [public_key, private_key] {
+        for key in [allow_key, deny_key] {
             client
                 .put_object()
                 .bucket(&bucket)
@@ -1946,7 +1946,7 @@ fn test_bucket_policy_delete_obj_tagging_existing_tag() {
             bucket_wildcard_resource(&bucket),
             Some(json!({
                 "StringEquals": {
-                    "s3:ExistingObjectTag/security": "public"
+                    "s3:ExistingObjectTag/security": "allow"
                 }
             })),
         );
@@ -1961,16 +1961,16 @@ fn test_bucket_policy_delete_obj_tagging_existing_tag() {
         client
             .put_object_tagging()
             .bucket(&bucket)
-            .key(public_key)
-            .tagging(tagging(vec![tag("security", "public"), tag("foo", "bar")]))
+            .key(allow_key)
+            .tagging(tagging(vec![tag("security", "allow"), tag("foo", "bar")]))
             .send()
             .await
             .unwrap();
         client
             .put_object_tagging()
             .bucket(&bucket)
-            .key(private_key)
-            .tagging(tagging(vec![tag("security", "private")]))
+            .key(deny_key)
+            .tagging(tagging(vec![tag("security", "deny")]))
             .send()
             .await
             .unwrap();
@@ -1978,7 +1978,7 @@ fn test_bucket_policy_delete_obj_tagging_existing_tag() {
         alt_client
             .delete_object_tagging()
             .bucket(&bucket)
-            .key(public_key)
+            .key(allow_key)
             .send()
             .await
             .unwrap();
@@ -1986,34 +1986,34 @@ fn test_bucket_policy_delete_obj_tagging_existing_tag() {
         let denied = alt_client
             .delete_object_tagging()
             .bucket(&bucket)
-            .key(private_key)
+            .key(deny_key)
             .send()
             .await;
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");
 
-        let public_tags = client
+        let allow_tags = client
             .get_object_tagging()
             .bucket(&bucket)
-            .key(public_key)
+            .key(allow_key)
             .send()
             .await
             .unwrap();
-        assert!(public_tags.tag_set().is_empty());
+        assert!(allow_tags.tag_set().is_empty());
 
-        let private_tags = client
+        let deny_tags = client
             .get_object_tagging()
             .bucket(&bucket)
-            .key(private_key)
+            .key(deny_key)
             .send()
             .await
             .unwrap();
-        assert!(private_tags
+        assert!(deny_tags
             .tag_set()
             .iter()
-            .any(|tag| tag.key() == "security" && tag.value() == "private"));
+            .any(|tag| tag.key() == "security" && tag.value() == "deny"));
 
-        cleanup(&bucket, &[public_key, private_key]).await;
+        cleanup(&bucket, &[allow_key, deny_key]).await;
     });
 }
 
@@ -2029,7 +2029,7 @@ fn test_bucket_policy_get_obj_existing_tag() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
-        for key in ["publictag", "privatetag", "invalidtag"] {
+        for key in ["allowtag", "denytag", "invalidtag"] {
             client
                 .put_object()
                 .bucket(&bucket)
@@ -2046,7 +2046,7 @@ fn test_bucket_policy_get_obj_existing_tag() {
             bucket_wildcard_resource(&bucket),
             Some(json!({
                 "StringEquals": {
-                    "s3:ExistingObjectTag/security": "public"
+                    "s3:ExistingObjectTag/security": "allow"
                 }
             })),
         );
@@ -2061,16 +2061,16 @@ fn test_bucket_policy_get_obj_existing_tag() {
         client
             .put_object_tagging()
             .bucket(&bucket)
-            .key("publictag")
-            .tagging(tagging(vec![tag("security", "public"), tag("foo", "bar")]))
+            .key("allowtag")
+            .tagging(tagging(vec![tag("security", "allow"), tag("foo", "bar")]))
             .send()
             .await
             .unwrap();
         client
             .put_object_tagging()
             .bucket(&bucket)
-            .key("privatetag")
-            .tagging(tagging(vec![tag("security", "private")]))
+            .key("denytag")
+            .tagging(tagging(vec![tag("security", "deny")]))
             .send()
             .await
             .unwrap();
@@ -2078,7 +2078,7 @@ fn test_bucket_policy_get_obj_existing_tag() {
             .put_object_tagging()
             .bucket(&bucket)
             .key("invalidtag")
-            .tagging(tagging(vec![tag("security1", "public")]))
+            .tagging(tagging(vec![tag("security1", "allow")]))
             .send()
             .await
             .unwrap();
@@ -2086,14 +2086,14 @@ fn test_bucket_policy_get_obj_existing_tag() {
         let response = alt_client
             .get_object()
             .bucket(&bucket)
-            .key("publictag")
+            .key("allowtag")
             .send()
             .await
             .unwrap();
         let body = response.body.collect().await.unwrap().into_bytes();
-        assert_eq!(body.as_ref(), b"publictag");
+        assert_eq!(body.as_ref(), b"allowtag");
 
-        for key in ["privatetag", "invalidtag"] {
+        for key in ["denytag", "invalidtag"] {
             let result = alt_client
                 .get_object()
                 .bucket(&bucket)
@@ -2104,7 +2104,7 @@ fn test_bucket_policy_get_obj_existing_tag() {
             assert_s3_err_code(&result, "AccessDenied");
         }
 
-        cleanup(&bucket, &["publictag", "privatetag", "invalidtag"]).await;
+        cleanup(&bucket, &["allowtag", "denytag", "invalidtag"]).await;
     });
 }
 
@@ -2120,7 +2120,7 @@ fn test_bucket_policy_get_obj_tagging_existing_tag() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
-        for key in ["publictag", "privatetag", "invalidtag"] {
+        for key in ["allowtag", "denytag", "invalidtag"] {
             client
                 .put_object()
                 .bucket(&bucket)
@@ -2137,7 +2137,7 @@ fn test_bucket_policy_get_obj_tagging_existing_tag() {
             bucket_wildcard_resource(&bucket),
             Some(json!({
                 "StringEquals": {
-                    "s3:ExistingObjectTag/security": "public"
+                    "s3:ExistingObjectTag/security": "allow"
                 }
             })),
         );
@@ -2152,16 +2152,16 @@ fn test_bucket_policy_get_obj_tagging_existing_tag() {
         client
             .put_object_tagging()
             .bucket(&bucket)
-            .key("publictag")
-            .tagging(tagging(vec![tag("security", "public"), tag("foo", "bar")]))
+            .key("allowtag")
+            .tagging(tagging(vec![tag("security", "allow"), tag("foo", "bar")]))
             .send()
             .await
             .unwrap();
         client
             .put_object_tagging()
             .bucket(&bucket)
-            .key("privatetag")
-            .tagging(tagging(vec![tag("security", "private")]))
+            .key("denytag")
+            .tagging(tagging(vec![tag("security", "deny")]))
             .send()
             .await
             .unwrap();
@@ -2169,7 +2169,7 @@ fn test_bucket_policy_get_obj_tagging_existing_tag() {
             .put_object_tagging()
             .bucket(&bucket)
             .key("invalidtag")
-            .tagging(tagging(vec![tag("security1", "public")]))
+            .tagging(tagging(vec![tag("security1", "allow")]))
             .send()
             .await
             .unwrap();
@@ -2177,25 +2177,25 @@ fn test_bucket_policy_get_obj_tagging_existing_tag() {
         let response = alt_client
             .get_object_tagging()
             .bucket(&bucket)
-            .key("publictag")
+            .key("allowtag")
             .send()
             .await
             .unwrap();
         assert!(response
             .tag_set()
             .iter()
-            .any(|tag| tag.key() == "security" && tag.value() == "public"));
+            .any(|tag| tag.key() == "security" && tag.value() == "allow"));
 
         let get_object = alt_client
             .get_object()
             .bucket(&bucket)
-            .key("publictag")
+            .key("allowtag")
             .send()
             .await;
         assert_eq!(err_status(&get_object), 403);
         assert_s3_err_code(&get_object, "AccessDenied");
 
-        for key in ["privatetag", "invalidtag"] {
+        for key in ["denytag", "invalidtag"] {
             let result = alt_client
                 .get_object_tagging()
                 .bucket(&bucket)
@@ -2206,7 +2206,7 @@ fn test_bucket_policy_get_obj_tagging_existing_tag() {
             assert_s3_err_code(&result, "AccessDenied");
         }
 
-        cleanup(&bucket, &["publictag", "privatetag", "invalidtag"]).await;
+        cleanup(&bucket, &["allowtag", "denytag", "invalidtag"]).await;
     });
 }
 
@@ -2222,7 +2222,7 @@ fn test_bucket_policy_put_obj_tagging_existing_tag() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
-        for key in ["publictag", "privatetag"] {
+        for key in ["allowtag", "denytag"] {
             client
                 .put_object()
                 .bucket(&bucket)
@@ -2239,7 +2239,7 @@ fn test_bucket_policy_put_obj_tagging_existing_tag() {
             bucket_wildcard_resource(&bucket),
             Some(json!({
                 "StringEquals": {
-                    "s3:ExistingObjectTag/security": "public"
+                    "s3:ExistingObjectTag/security": "allow"
                 }
             })),
         );
@@ -2254,46 +2254,46 @@ fn test_bucket_policy_put_obj_tagging_existing_tag() {
         client
             .put_object_tagging()
             .bucket(&bucket)
-            .key("publictag")
-            .tagging(tagging(vec![tag("security", "public"), tag("foo", "bar")]))
+            .key("allowtag")
+            .tagging(tagging(vec![tag("security", "allow"), tag("foo", "bar")]))
             .send()
             .await
             .unwrap();
         client
             .put_object_tagging()
             .bucket(&bucket)
-            .key("privatetag")
-            .tagging(tagging(vec![tag("security", "private")]))
+            .key("denytag")
+            .tagging(tagging(vec![tag("security", "deny")]))
             .send()
             .await
             .unwrap();
 
-        let public_tags = tagging(vec![tag("security", "public"), tag("foo", "bar")]);
+        let allow_tags = tagging(vec![tag("security", "allow"), tag("foo", "bar")]);
         alt_client
             .put_object_tagging()
             .bucket(&bucket)
-            .key("publictag")
-            .tagging(public_tags.clone())
+            .key("allowtag")
+            .tagging(allow_tags.clone())
             .send()
             .await
             .unwrap();
 
-        let private_result = alt_client
+        let deny_result = alt_client
             .put_object_tagging()
             .bucket(&bucket)
-            .key("privatetag")
-            .tagging(public_tags.clone())
+            .key("denytag")
+            .tagging(allow_tags.clone())
             .send()
             .await;
-        assert_eq!(err_status(&private_result), 403);
-        assert_s3_err_code(&private_result, "AccessDenied");
+        assert_eq!(err_status(&deny_result), 403);
+        assert_s3_err_code(&deny_result, "AccessDenied");
 
-        let private_tags = tagging(vec![tag("security", "private")]);
+        let deny_tags = tagging(vec![tag("security", "deny")]);
         alt_client
             .put_object_tagging()
             .bucket(&bucket)
-            .key("publictag")
-            .tagging(private_tags)
+            .key("allowtag")
+            .tagging(deny_tags)
             .send()
             .await
             .unwrap();
@@ -2301,14 +2301,14 @@ fn test_bucket_policy_put_obj_tagging_existing_tag() {
         let second_result = alt_client
             .put_object_tagging()
             .bucket(&bucket)
-            .key("publictag")
-            .tagging(public_tags)
+            .key("allowtag")
+            .tagging(allow_tags)
             .send()
             .await;
         assert_eq!(err_status(&second_result), 403);
         assert_s3_err_code(&second_result, "AccessDenied");
 
-        cleanup(&bucket, &["publictag", "privatetag"]).await;
+        cleanup(&bucket, &["allowtag", "denytag"]).await;
     });
 }
 
@@ -2322,8 +2322,8 @@ fn test_bucket_policy_get_obj_version_tagging_existing_tag() {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();
-        let public_key = "publictag-version-get";
-        let private_key = "privatetag-version-get";
+        let allow_key = "allowtag-version-get";
+        let deny_key = "denytag-version-get";
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         client
@@ -2338,10 +2338,10 @@ fn test_bucket_policy_get_obj_version_tagging_existing_tag() {
             .await
             .unwrap();
 
-        let public_version = client
+        let allow_version = client
             .put_object()
             .bucket(&bucket)
-            .key(public_key)
+            .key(allow_key)
             .body(ByteStream::from_static(b"data"))
             .send()
             .await
@@ -2349,10 +2349,10 @@ fn test_bucket_policy_get_obj_version_tagging_existing_tag() {
             .version_id()
             .expect("expected version id")
             .to_string();
-        let private_version = client
+        let deny_version = client
             .put_object()
             .bucket(&bucket)
-            .key(private_key)
+            .key(deny_key)
             .body(ByteStream::from_static(b"data"))
             .send()
             .await
@@ -2367,7 +2367,7 @@ fn test_bucket_policy_get_obj_version_tagging_existing_tag() {
             bucket_wildcard_resource(&bucket),
             Some(json!({
                 "StringEquals": {
-                    "s3:ExistingObjectTag/security": "public"
+                    "s3:ExistingObjectTag/security": "allow"
                 }
             })),
         );
@@ -2382,18 +2382,18 @@ fn test_bucket_policy_get_obj_version_tagging_existing_tag() {
         client
             .put_object_tagging()
             .bucket(&bucket)
-            .key(public_key)
-            .version_id(&public_version)
-            .tagging(tagging(vec![tag("security", "public"), tag("foo", "bar")]))
+            .key(allow_key)
+            .version_id(&allow_version)
+            .tagging(tagging(vec![tag("security", "allow"), tag("foo", "bar")]))
             .send()
             .await
             .unwrap();
         client
             .put_object_tagging()
             .bucket(&bucket)
-            .key(private_key)
-            .version_id(&private_version)
-            .tagging(tagging(vec![tag("security", "private")]))
+            .key(deny_key)
+            .version_id(&deny_version)
+            .tagging(tagging(vec![tag("security", "deny")]))
             .send()
             .await
             .unwrap();
@@ -2401,21 +2401,21 @@ fn test_bucket_policy_get_obj_version_tagging_existing_tag() {
         let response = alt_client
             .get_object_tagging()
             .bucket(&bucket)
-            .key(public_key)
-            .version_id(&public_version)
+            .key(allow_key)
+            .version_id(&allow_version)
             .send()
             .await
             .unwrap();
         assert!(response
             .tag_set()
             .iter()
-            .any(|tag| tag.key() == "security" && tag.value() == "public"));
+            .any(|tag| tag.key() == "security" && tag.value() == "allow"));
 
         let denied = alt_client
             .get_object_tagging()
             .bucket(&bucket)
-            .key(private_key)
-            .version_id(&private_version)
+            .key(deny_key)
+            .version_id(&deny_version)
             .send()
             .await;
         assert_eq!(err_status(&denied), 403);
@@ -2435,8 +2435,8 @@ fn test_bucket_policy_put_obj_version_tagging_existing_tag() {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();
-        let public_key = "publictag-version-put";
-        let private_key = "privatetag-version-put";
+        let allow_key = "allowtag-version-put";
+        let deny_key = "denytag-version-put";
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         client
@@ -2451,10 +2451,10 @@ fn test_bucket_policy_put_obj_version_tagging_existing_tag() {
             .await
             .unwrap();
 
-        let public_version = client
+        let allow_version = client
             .put_object()
             .bucket(&bucket)
-            .key(public_key)
+            .key(allow_key)
             .body(ByteStream::from_static(b"data"))
             .send()
             .await
@@ -2462,10 +2462,10 @@ fn test_bucket_policy_put_obj_version_tagging_existing_tag() {
             .version_id()
             .expect("expected version id")
             .to_string();
-        let private_version = client
+        let deny_version = client
             .put_object()
             .bucket(&bucket)
-            .key(private_key)
+            .key(deny_key)
             .body(ByteStream::from_static(b"data"))
             .send()
             .await
@@ -2480,7 +2480,7 @@ fn test_bucket_policy_put_obj_version_tagging_existing_tag() {
             bucket_wildcard_resource(&bucket),
             Some(json!({
                 "StringEquals": {
-                    "s3:ExistingObjectTag/security": "public"
+                    "s3:ExistingObjectTag/security": "allow"
                 }
             })),
         );
@@ -2495,29 +2495,29 @@ fn test_bucket_policy_put_obj_version_tagging_existing_tag() {
         client
             .put_object_tagging()
             .bucket(&bucket)
-            .key(public_key)
-            .version_id(&public_version)
-            .tagging(tagging(vec![tag("security", "public"), tag("foo", "bar")]))
+            .key(allow_key)
+            .version_id(&allow_version)
+            .tagging(tagging(vec![tag("security", "allow"), tag("foo", "bar")]))
             .send()
             .await
             .unwrap();
         client
             .put_object_tagging()
             .bucket(&bucket)
-            .key(private_key)
-            .version_id(&private_version)
-            .tagging(tagging(vec![tag("security", "private")]))
+            .key(deny_key)
+            .version_id(&deny_version)
+            .tagging(tagging(vec![tag("security", "deny")]))
             .send()
             .await
             .unwrap();
 
-        let public_tags = tagging(vec![tag("security", "public"), tag("foo", "bar")]);
+        let allow_tags = tagging(vec![tag("security", "allow"), tag("foo", "bar")]);
         alt_client
             .put_object_tagging()
             .bucket(&bucket)
-            .key(public_key)
-            .version_id(&public_version)
-            .tagging(public_tags.clone())
+            .key(allow_key)
+            .version_id(&allow_version)
+            .tagging(allow_tags.clone())
             .send()
             .await
             .unwrap();
@@ -2525,9 +2525,9 @@ fn test_bucket_policy_put_obj_version_tagging_existing_tag() {
         let denied = alt_client
             .put_object_tagging()
             .bucket(&bucket)
-            .key(private_key)
-            .version_id(&private_version)
-            .tagging(public_tags.clone())
+            .key(deny_key)
+            .version_id(&deny_version)
+            .tagging(allow_tags.clone())
             .send()
             .await;
         assert_eq!(err_status(&denied), 403);
@@ -2565,7 +2565,7 @@ fn test_bucket_policy_put_obj_tagging_request_object_tag() {
             bucket_wildcard_resource(&bucket),
             Some(json!({
                 "StringEquals": {
-                    "s3:RequestObjectTag/security": "public"
+                    "s3:RequestObjectTag/security": "allow"
                 }
             })),
         );
@@ -2577,12 +2577,12 @@ fn test_bucket_policy_put_obj_tagging_request_object_tag() {
             .await
             .unwrap();
 
-        let public_tags = tagging(vec![tag("security", "public"), tag("foo", "bar")]);
+        let allow_tags = tagging(vec![tag("security", "allow"), tag("foo", "bar")]);
         alt_client
             .put_object_tagging()
             .bucket(&bucket)
             .key(key)
-            .tagging(public_tags.clone())
+            .tagging(allow_tags.clone())
             .send()
             .await
             .unwrap();
@@ -2591,7 +2591,7 @@ fn test_bucket_policy_put_obj_tagging_request_object_tag() {
             .put_object_tagging()
             .bucket(&bucket)
             .key(key)
-            .tagging(tagging(vec![tag("security", "private")]))
+            .tagging(tagging(vec![tag("security", "deny")]))
             .send()
             .await;
         assert_eq!(err_status(&denied), 403);
@@ -2604,7 +2604,7 @@ fn test_bucket_policy_put_obj_tagging_request_object_tag() {
             .send()
             .await
             .unwrap();
-        assert_tag_sets_match_unordered(stored.tag_set(), public_tags.tag_set());
+        assert_tag_sets_match_unordered(stored.tag_set(), allow_tags.tag_set());
 
         cleanup(&bucket, &[key]).await;
     });
@@ -2653,7 +2653,7 @@ fn test_bucket_policy_put_obj_version_tagging_request_object_tag() {
             bucket_wildcard_resource(&bucket),
             Some(json!({
                 "StringEquals": {
-                    "s3:RequestObjectTag/security": "public"
+                    "s3:RequestObjectTag/security": "allow"
                 }
             })),
         );
@@ -2665,13 +2665,13 @@ fn test_bucket_policy_put_obj_version_tagging_request_object_tag() {
             .await
             .unwrap();
 
-        let public_tags = tagging(vec![tag("security", "public"), tag("foo", "bar")]);
+        let allow_tags = tagging(vec![tag("security", "allow"), tag("foo", "bar")]);
         alt_client
             .put_object_tagging()
             .bucket(&bucket)
             .key(key)
             .version_id(&version_id)
-            .tagging(public_tags.clone())
+            .tagging(allow_tags.clone())
             .send()
             .await
             .unwrap();
@@ -2681,7 +2681,7 @@ fn test_bucket_policy_put_obj_version_tagging_request_object_tag() {
             .bucket(&bucket)
             .key(key)
             .version_id(&version_id)
-            .tagging(tagging(vec![tag("security", "private")]))
+            .tagging(tagging(vec![tag("security", "deny")]))
             .send()
             .await;
         assert_eq!(err_status(&denied), 403);
@@ -2695,7 +2695,7 @@ fn test_bucket_policy_put_obj_version_tagging_request_object_tag() {
             .send()
             .await
             .unwrap();
-        assert_tag_sets_match_unordered(stored.tag_set(), public_tags.tag_set());
+        assert_tag_sets_match_unordered(stored.tag_set(), allow_tags.tag_set());
 
         cleanup_versioned_bucket(CTX.client(), &bucket).await;
     });
@@ -2711,8 +2711,8 @@ fn test_bucket_policy_delete_obj_version_tagging_existing_tag() {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();
-        let public_key = "publictag-version-delete";
-        let private_key = "privatetag-version-delete";
+        let allow_key = "allowtag-version-delete";
+        let deny_key = "denytag-version-delete";
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         client
@@ -2727,10 +2727,10 @@ fn test_bucket_policy_delete_obj_version_tagging_existing_tag() {
             .await
             .unwrap();
 
-        let public_version = client
+        let allow_version = client
             .put_object()
             .bucket(&bucket)
-            .key(public_key)
+            .key(allow_key)
             .body(ByteStream::from_static(b"data"))
             .send()
             .await
@@ -2738,10 +2738,10 @@ fn test_bucket_policy_delete_obj_version_tagging_existing_tag() {
             .version_id()
             .expect("expected version id")
             .to_string();
-        let private_version = client
+        let deny_version = client
             .put_object()
             .bucket(&bucket)
-            .key(private_key)
+            .key(deny_key)
             .body(ByteStream::from_static(b"data"))
             .send()
             .await
@@ -2756,7 +2756,7 @@ fn test_bucket_policy_delete_obj_version_tagging_existing_tag() {
             bucket_wildcard_resource(&bucket),
             Some(json!({
                 "StringEquals": {
-                    "s3:ExistingObjectTag/security": "public"
+                    "s3:ExistingObjectTag/security": "allow"
                 }
             })),
         );
@@ -2771,18 +2771,18 @@ fn test_bucket_policy_delete_obj_version_tagging_existing_tag() {
         client
             .put_object_tagging()
             .bucket(&bucket)
-            .key(public_key)
-            .version_id(&public_version)
-            .tagging(tagging(vec![tag("security", "public"), tag("foo", "bar")]))
+            .key(allow_key)
+            .version_id(&allow_version)
+            .tagging(tagging(vec![tag("security", "allow"), tag("foo", "bar")]))
             .send()
             .await
             .unwrap();
         client
             .put_object_tagging()
             .bucket(&bucket)
-            .key(private_key)
-            .version_id(&private_version)
-            .tagging(tagging(vec![tag("security", "private")]))
+            .key(deny_key)
+            .version_id(&deny_version)
+            .tagging(tagging(vec![tag("security", "deny")]))
             .send()
             .await
             .unwrap();
@@ -2790,8 +2790,8 @@ fn test_bucket_policy_delete_obj_version_tagging_existing_tag() {
         alt_client
             .delete_object_tagging()
             .bucket(&bucket)
-            .key(public_key)
-            .version_id(&public_version)
+            .key(allow_key)
+            .version_id(&allow_version)
             .send()
             .await
             .unwrap();
@@ -2799,35 +2799,35 @@ fn test_bucket_policy_delete_obj_version_tagging_existing_tag() {
         let denied = alt_client
             .delete_object_tagging()
             .bucket(&bucket)
-            .key(private_key)
-            .version_id(&private_version)
+            .key(deny_key)
+            .version_id(&deny_version)
             .send()
             .await;
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");
 
-        let public_tags = client
+        let allow_tags = client
             .get_object_tagging()
             .bucket(&bucket)
-            .key(public_key)
-            .version_id(&public_version)
+            .key(allow_key)
+            .version_id(&allow_version)
             .send()
             .await
             .unwrap();
-        assert!(public_tags.tag_set().is_empty());
+        assert!(allow_tags.tag_set().is_empty());
 
-        let private_tags = client
+        let deny_tags = client
             .get_object_tagging()
             .bucket(&bucket)
-            .key(private_key)
-            .version_id(&private_version)
+            .key(deny_key)
+            .version_id(&deny_version)
             .send()
             .await
             .unwrap();
-        assert!(private_tags
+        assert!(deny_tags
             .tag_set()
             .iter()
-            .any(|tag| tag.key() == "security" && tag.value() == "private"));
+            .any(|tag| tag.key() == "security" && tag.value() == "deny"));
 
         cleanup_versioned_bucket(CTX.client(), &bucket).await;
     });
@@ -2871,7 +2871,7 @@ fn test_bucket_policy_put_obj_tagging_request_object_tag_on_pretagged_object() {
             bucket_wildcard_resource(&bucket),
             Some(json!({
                 "StringEquals": {
-                    "s3:RequestObjectTag/security": "public"
+                    "s3:RequestObjectTag/security": "allow"
                 }
             })),
         );
@@ -2887,7 +2887,7 @@ fn test_bucket_policy_put_obj_tagging_request_object_tag_on_pretagged_object() {
             .put_object_tagging()
             .bucket(&bucket)
             .key(key)
-            .tagging(tagging(vec![tag("security", "public"), tag("foo", "bar")]))
+            .tagging(tagging(vec![tag("security", "allow"), tag("foo", "bar")]))
             .send()
             .await
             .unwrap();
@@ -2901,7 +2901,7 @@ fn test_bucket_policy_put_obj_tagging_request_object_tag_on_pretagged_object() {
             .unwrap();
         assert_tag_sets_match_unordered(
             stored.tag_set(),
-            tagging(vec![tag("security", "public"), tag("foo", "bar")]).tag_set(),
+            tagging(vec![tag("security", "allow"), tag("foo", "bar")]).tag_set(),
         );
 
         cleanup(&bucket, &[key]).await;
@@ -2936,7 +2936,7 @@ fn test_bucket_policy_put_obj_tagging_request_object_tag_single_tag() {
             bucket_wildcard_resource(&bucket),
             Some(json!({
                 "StringEquals": {
-                    "s3:RequestObjectTag/security": "public"
+                    "s3:RequestObjectTag/security": "allow"
                 }
             })),
         );
@@ -2948,12 +2948,12 @@ fn test_bucket_policy_put_obj_tagging_request_object_tag_single_tag() {
             .await
             .unwrap();
 
-        let public_tags = tagging(vec![tag("security", "public")]);
+        let allow_tags = tagging(vec![tag("security", "allow")]);
         alt_client
             .put_object_tagging()
             .bucket(&bucket)
             .key(key)
-            .tagging(public_tags.clone())
+            .tagging(allow_tags.clone())
             .send()
             .await
             .unwrap();
@@ -2962,7 +2962,7 @@ fn test_bucket_policy_put_obj_tagging_request_object_tag_single_tag() {
             .put_object_tagging()
             .bucket(&bucket)
             .key(key)
-            .tagging(tagging(vec![tag("security", "private")]))
+            .tagging(tagging(vec![tag("security", "deny")]))
             .send()
             .await;
         assert_eq!(err_status(&denied), 403);
@@ -2975,7 +2975,7 @@ fn test_bucket_policy_put_obj_tagging_request_object_tag_single_tag() {
             .send()
             .await
             .unwrap();
-        assert_tag_sets_match_unordered(stored.tag_set(), public_tags.tag_set());
+        assert_tag_sets_match_unordered(stored.tag_set(), allow_tags.tag_set());
 
         cleanup(&bucket, &[key]).await;
     });
@@ -3286,7 +3286,7 @@ fn test_bucket_policy_get_obj_acl_existing_tag() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
-        for key in ["publictag", "privatetag", "invalidtag"] {
+        for key in ["allowtag", "denytag", "invalidtag"] {
             client
                 .put_object()
                 .bucket(&bucket)
@@ -3303,7 +3303,7 @@ fn test_bucket_policy_get_obj_acl_existing_tag() {
             bucket_wildcard_resource(&bucket),
             Some(json!({
                 "StringEquals": {
-                    "s3:ExistingObjectTag/security": "public"
+                    "s3:ExistingObjectTag/security": "allow"
                 }
             })),
         );
@@ -3318,16 +3318,16 @@ fn test_bucket_policy_get_obj_acl_existing_tag() {
         client
             .put_object_tagging()
             .bucket(&bucket)
-            .key("publictag")
-            .tagging(tagging(vec![tag("security", "public"), tag("foo", "bar")]))
+            .key("allowtag")
+            .tagging(tagging(vec![tag("security", "allow"), tag("foo", "bar")]))
             .send()
             .await
             .unwrap();
         client
             .put_object_tagging()
             .bucket(&bucket)
-            .key("privatetag")
-            .tagging(tagging(vec![tag("security", "private")]))
+            .key("denytag")
+            .tagging(tagging(vec![tag("security", "deny")]))
             .send()
             .await
             .unwrap();
@@ -3335,7 +3335,7 @@ fn test_bucket_policy_get_obj_acl_existing_tag() {
             .put_object_tagging()
             .bucket(&bucket)
             .key("invalidtag")
-            .tagging(tagging(vec![tag("security1", "public")]))
+            .tagging(tagging(vec![tag("security1", "allow")]))
             .send()
             .await
             .unwrap();
@@ -3343,7 +3343,7 @@ fn test_bucket_policy_get_obj_acl_existing_tag() {
         alt_client
             .get_object_acl()
             .bucket(&bucket)
-            .key("publictag")
+            .key("allowtag")
             .send()
             .await
             .unwrap();
@@ -3351,13 +3351,13 @@ fn test_bucket_policy_get_obj_acl_existing_tag() {
         let get_object = alt_client
             .get_object()
             .bucket(&bucket)
-            .key("publictag")
+            .key("allowtag")
             .send()
             .await;
         assert_eq!(err_status(&get_object), 403);
         assert_s3_err_code(&get_object, "AccessDenied");
 
-        for key in ["privatetag", "invalidtag"] {
+        for key in ["denytag", "invalidtag"] {
             let result = alt_client
                 .get_object_acl()
                 .bucket(&bucket)
@@ -3368,6 +3368,6 @@ fn test_bucket_policy_get_obj_acl_existing_tag() {
             assert_s3_err_code(&result, "AccessDenied");
         }
 
-        cleanup(&bucket, &["publictag", "privatetag", "invalidtag"]).await;
+        cleanup(&bucket, &["allowtag", "denytag", "invalidtag"]).await;
     });
 }
