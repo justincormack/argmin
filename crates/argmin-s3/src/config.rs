@@ -1,3 +1,5 @@
+use ec::EcConfig;
+
 /// Server configuration, loaded from environment variables.
 /// Configuration for the S3 server.
 #[derive(Debug, Clone)]
@@ -34,9 +36,9 @@ impl ServerConfig {
     ///   `ARGMIN_TLS_CERT_PATH` / `ARGMIN_TLS_KEY_PATH` (unset)
     ///   `ARGMIN_DATA_DIR` (./data)
     ///   `ARGMIN_PG_COUNT` (16)
-    ///   `ARGMIN_LOCAL_NODE_COUNT` (1)
     ///   `ARGMIN_EC_K` (4)
     ///   `ARGMIN_EC_M` (2)
+    ///   `ARGMIN_LOCAL_NODE_COUNT` (`ARGMIN_EC_K + ARGMIN_EC_M`)
     ///   `ARGMIN_REGION` (us-east-1)
     ///   `ARGMIN_WORKERS` (4)
     ///   `ARGMIN_MAX_CONNECTIONS` (512)
@@ -71,10 +73,6 @@ impl ServerConfig {
             .unwrap_or_else(|| "16".to_string())
             .parse()
             .map_err(|e| format!("invalid ARGMIN_PG_COUNT: {e}"))?;
-        let local_node_count: u32 = get("ARGMIN_LOCAL_NODE_COUNT")
-            .unwrap_or_else(|| "1".to_string())
-            .parse()
-            .map_err(|e| format!("invalid ARGMIN_LOCAL_NODE_COUNT: {e}"))?;
         let ec_k: u8 = get("ARGMIN_EC_K")
             .unwrap_or_else(|| "4".to_string())
             .parse()
@@ -83,6 +81,14 @@ impl ServerConfig {
             .unwrap_or_else(|| "2".to_string())
             .parse()
             .map_err(|e| format!("invalid ARGMIN_EC_M: {e}"))?;
+        let ec_config = EcConfig::new(ec_k, ec_m).map_err(|e| format!("invalid EC config: {e}"))?;
+        let local_node_count: u32 = match get("ARGMIN_LOCAL_NODE_COUNT") {
+            Some(value) => value
+                .parse()
+                .map_err(|e| format!("invalid ARGMIN_LOCAL_NODE_COUNT: {e}"))?,
+            None => u32::try_from(ec_config.total_shards())
+                .map_err(|_| "ARGMIN_LOCAL_NODE_COUNT default is too large".to_string())?,
+        };
         let region = get("ARGMIN_REGION").unwrap_or_else(|| "us-east-1".to_string());
         let workers: u32 = get("ARGMIN_WORKERS")
             .unwrap_or_else(|| "4".to_string())
@@ -106,6 +112,14 @@ impl ServerConfig {
         }
         if local_node_count == 0 {
             return Err("ARGMIN_LOCAL_NODE_COUNT must be > 0".to_string());
+        }
+        let local_node_count_usize = usize::try_from(local_node_count)
+            .map_err(|_| "ARGMIN_LOCAL_NODE_COUNT is too large for this platform".to_string())?;
+        if local_node_count_usize < ec_config.total_shards() {
+            return Err(format!(
+                "ARGMIN_LOCAL_NODE_COUNT must be at least ARGMIN_EC_K + ARGMIN_EC_M ({}) for the configured EC shape",
+                ec_config.total_shards()
+            ));
         }
         if workers == 0 {
             return Err("ARGMIN_WORKERS must be > 0".to_string());
@@ -255,7 +269,7 @@ mod tests {
         assert_eq!(cfg.tls_key_path, None);
         assert_eq!(cfg.data_dir, "./data");
         assert_eq!(cfg.pg_count, 16);
-        assert_eq!(cfg.local_node_count, 1);
+        assert_eq!(cfg.local_node_count, 6);
         assert_eq!(cfg.ec_k, 4);
         assert_eq!(cfg.ec_m, 2);
         assert_eq!(cfg.account_id, "111122223333");
@@ -291,7 +305,7 @@ mod tests {
             ("ARGMIN_TLS_KEY_PATH", "/tmp/key.pem"),
             ("ARGMIN_DATA_DIR", "/tmp/storage"),
             ("ARGMIN_PG_COUNT", "32"),
-            ("ARGMIN_LOCAL_NODE_COUNT", "3"),
+            ("ARGMIN_LOCAL_NODE_COUNT", "12"),
             ("ARGMIN_EC_K", "8"),
             ("ARGMIN_EC_M", "4"),
             ("ARGMIN_REGION", "eu-west-1"),
@@ -302,7 +316,7 @@ mod tests {
         assert_eq!(cfg.tls_key_path.as_deref(), Some("/tmp/key.pem"));
         assert_eq!(cfg.data_dir, "/tmp/storage");
         assert_eq!(cfg.pg_count, 32);
-        assert_eq!(cfg.local_node_count, 3);
+        assert_eq!(cfg.local_node_count, 12);
         assert_eq!(cfg.ec_k, 8);
         assert_eq!(cfg.ec_m, 4);
         assert_eq!(cfg.account_id, "444455556666");
@@ -385,6 +399,51 @@ mod tests {
         let err = ServerConfig::from_lookup(make_required_env(&[("ARGMIN_LOCAL_NODE_COUNT", "0")]))
             .unwrap_err();
         assert!(err.contains("ARGMIN_LOCAL_NODE_COUNT must be > 0"));
+    }
+
+    #[test]
+    fn local_node_count_defaults_to_ec_shape_total() {
+        let cfg = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_EC_K", "8"),
+            ("ARGMIN_EC_M", "4"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.local_node_count, 12);
+    }
+
+    #[test]
+    fn local_node_count_one_rejected_for_default_ec_shape() {
+        let err = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_LOCAL_NODE_COUNT", "1"),
+            ("ARGMIN_EC_K", "4"),
+            ("ARGMIN_EC_M", "2"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_LOCAL_NODE_COUNT"));
+        assert!(err.contains("at least ARGMIN_EC_K + ARGMIN_EC_M (6)"));
+    }
+
+    #[test]
+    fn local_node_count_too_small_for_multihost_ec_shape() {
+        let err = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_LOCAL_NODE_COUNT", "5"),
+            ("ARGMIN_EC_K", "4"),
+            ("ARGMIN_EC_M", "2"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_LOCAL_NODE_COUNT"));
+        assert!(err.contains("at least ARGMIN_EC_K + ARGMIN_EC_M (6)"));
+    }
+
+    #[test]
+    fn local_node_count_accepts_first_valid_multihost_ec_shape() {
+        let cfg = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_LOCAL_NODE_COUNT", "6"),
+            ("ARGMIN_EC_K", "4"),
+            ("ARGMIN_EC_M", "2"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.local_node_count, 6);
     }
 
     #[test]

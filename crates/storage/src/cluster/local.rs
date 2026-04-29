@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use placement::NodeId;
+use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
 
 use crate::error::{ClusterBuildError, StoreError};
 use crate::{ClusterEpoch, EcShape, SharedStorageNode};
@@ -137,6 +137,7 @@ impl LocalClusterMap {
                 id: metadata_primary_node_id.as_u32(),
             });
         }
+        validate_local_payload_placement(&node_ids, default_ec_shape)?;
 
         let mut data_dirs = BTreeMap::<PathBuf, NodeId>::new();
         let mut validated_configs = Vec::with_capacity(configs.len());
@@ -215,6 +216,63 @@ impl LocalClusterMap {
     }
 }
 
+fn validate_local_payload_placement(
+    node_ids: &BTreeSet<NodeId>,
+    default_ec_shape: EcShape,
+) -> Result<(), ClusterBuildError> {
+    let ec_config = ec::EcConfig::new(default_ec_shape.k, default_ec_shape.m).map_err(|error| {
+        ClusterBuildError::InvalidEcShape {
+            data_shards: default_ec_shape.k,
+            parity_shards: default_ec_shape.m,
+            reason: error.to_string(),
+        }
+    })?;
+    let total_shards = ec_config.total_shards();
+    let placement_config =
+        placement::PlacementConfig::new(total_shards as u8).map_err(|error| {
+            ClusterBuildError::InvalidEcShape {
+                data_shards: default_ec_shape.k,
+                parity_shards: default_ec_shape.m,
+                reason: error.to_string(),
+            }
+        })?;
+    let placement_nodes: Vec<placement::NodeInfo> = node_ids
+        .iter()
+        .copied()
+        .map(local_placement_node_info)
+        .collect();
+    let placement_map = placement::ClusterMap::new(&placement_nodes).map_err(|error| {
+        ClusterBuildError::InvalidLocalPlacement {
+            reason: error.to_string(),
+        }
+    })?;
+    placement::Placer::new(
+        placement_config,
+        &placement_map,
+        PlacementConstraint::none(),
+    )
+    .map_err(|error| match error {
+        PlacementError::TooFewNodes { shards, nodes } => ClusterBuildError::UnplaceableEcShape {
+            data_shards: default_ec_shape.k,
+            parity_shards: default_ec_shape.m,
+            required_nodes: shards,
+            node_count: nodes,
+        },
+        other => ClusterBuildError::InvalidLocalPlacement {
+            reason: other.to_string(),
+        },
+    })?;
+    Ok(())
+}
+
+fn local_placement_node_info(node_id: NodeId) -> placement::NodeInfo {
+    placement::NodeInfo {
+        id: node_id,
+        location: TopologyKey::rack_machine(node_id.as_u32(), node_id.as_u32()),
+        weight: 1.0,
+    }
+}
+
 fn prepare_local_node_data_dir(
     node_id: NodeId,
     data_dir: &Path,
@@ -245,13 +303,8 @@ mod tests {
     fn opens_distinct_local_node_stores_with_static_epoch() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
-        let map = LocalClusterMap::open(
-            tmp.path(),
-            &node_ids,
-            &[0, 1, 2, 3],
-            SharedStorageNode::DEFAULT_EC_SHAPE,
-        )
-        .unwrap();
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
 
         assert_eq!(map.epoch(), ClusterEpoch::INITIAL);
         assert_eq!(map.metadata_primary_node_id(), NodeId::new(0));
@@ -276,7 +329,14 @@ mod tests {
     #[test]
     fn storage_cluster_opens_local_node_map() {
         let tmp = test_util::tempdir();
-        let node_ids = [NodeId::new(0), NodeId::new(1)];
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
         let cluster = crate::StorageCluster::open_local_nodes(
             tmp.path(),
             &node_ids,
@@ -287,8 +347,71 @@ mod tests {
 
         assert_eq!(cluster.cluster_epoch(), ClusterEpoch::INITIAL);
         assert_eq!(cluster.metadata_node_id(), NodeId::new(0));
-        assert_eq!(cluster.local_node_count(), 2);
+        assert_eq!(cluster.local_node_count(), 6);
         assert_eq!(cluster.local_node_ids().collect::<Vec<_>>(), node_ids);
+    }
+
+    #[test]
+    fn rejects_too_few_local_nodes_for_default_ec_shape_before_preparing_dirs() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+        ];
+        let err = LocalClusterMap::open(
+            tmp.path(),
+            &node_ids,
+            &[0, 1],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ClusterBuildError::UnplaceableEcShape {
+                data_shards: 4,
+                parity_shards: 2,
+                required_nodes: 6,
+                node_count: 5,
+            }
+        ));
+        for node_id in node_ids {
+            assert!(
+                !tmp.path()
+                    .join(format!("node-{:04}", node_id.as_u32()))
+                    .exists(),
+                "placement validation must run before preparing local node directories"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_ec_shape_before_preparing_dirs() {
+        let tmp = test_util::tempdir();
+        let node_dir = tmp.path().join("node-0000");
+        let err = LocalClusterMap::open_with_configs(
+            NodeId::new(0),
+            [LocalNodeStoreConfig::new(NodeId::new(0), &node_dir)],
+            &[0],
+            EcShape { k: 0, m: 2 },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ClusterBuildError::InvalidEcShape {
+                data_shards: 0,
+                parity_shards: 2,
+                ..
+            }
+        ));
+        assert!(
+            !node_dir.exists(),
+            "EC shape validation must run before preparing local node directories"
+        );
     }
 
     #[test]
@@ -319,7 +442,7 @@ mod tests {
                 LocalNodeStoreConfig::new(NodeId::new(1), &shared),
             ],
             &[0],
-            SharedStorageNode::DEFAULT_EC_SHAPE,
+            EcShape { k: 1, m: 1 },
         )
         .unwrap_err();
 

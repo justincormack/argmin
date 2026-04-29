@@ -338,7 +338,8 @@ First static local cluster config decision:
 
 1. the first multihost harness should be configured as a static cluster map at
    process startup
-2. the default remains the current single-node shape
+2. the default local cluster shape should derive from the configured EC shape
+   and include at least one local node per shard
 3. local multi-node mode should use explicit node records with:
    - `NodeId`
    - data directory
@@ -383,9 +384,9 @@ Work items:
    possible
 6. replace the temporary `Deref<Target = SharedStorageNode>` delegation with
    explicit `StorageCluster` request APIs before Phase 1 is complete
-7. narrow the single-node compatibility helpers to background/local transition
-   code, then remove them as soon as routing and placement have cluster-owned
-   entry points
+7. narrow the temporary one-node helper constructors to tests and local
+   transition code, then remove them as soon as routing and placement have
+   cluster-owned entry points
 
 Exit criteria:
 
@@ -397,8 +398,10 @@ Exit criteria:
 Phase 1 implementation notes:
 
 1. `storage::StorageCluster` is the first cluster-shaped storage handle.
-   - it is currently backed by one `Arc<SharedStorageNode>`
-   - it deliberately preserves the existing single-node behavior
+   - it still contains temporary metadata-primary forwarding to
+     `SharedStorageNode`
+   - production startup no longer uses the old root data directory as a
+     compatibility layout
    - transparent `Deref` delegation to `SharedStorageNode` has been removed
    - process-local worker and cache registries use a cluster-owned local
      registry key that still maps to the backing local node until a real cluster
@@ -470,12 +473,12 @@ Phase 2 implementation notes:
    - duplicate node IDs are rejected
    - duplicate/canonical-equivalent data directories are rejected
    - every local node gets its own SQLite and shard directories
-3. The existing one-node constructors still create a one-node static map and
-   preserve the process-local registry sharing behavior for compatibility.
-4. `argmin-s3` keeps the old single-node data layout by default. Setting
-   `ARGMIN_LOCAL_NODE_COUNT` above `1` opens the Phase 2 local cluster harness
-   below the configured data directory.
-5. Request routing is still metadata-primary/single-node for this slice.
+3. The one-node constructors are retained only for narrow tests and transitional
+   internal setup while the cluster-owned APIs replace direct local-node access.
+4. `argmin-s3` opens the Phase 2 local cluster harness below the configured
+   data directory by default.
+5. Request routing is still metadata-primary/local-node forwarding for this
+   slice.
    `ShardNodeClient` and node-aware shard writes/reads remain the next Phase 2
    step.
 
@@ -580,7 +583,7 @@ Work items:
 
 Implementation order:
 
-- [ ] 4.1 Validate local placement shape before opening node stores.
+- [x] 4.1 Validate local placement shape before opening node stores.
   - build the local placement view from configured node IDs and EC shape
   - reject `k + m` shapes that cannot be placed on distinct active nodes
   - add startup/config tests for too few local nodes and the first valid shape
@@ -618,6 +621,17 @@ Implementation order:
     in one local PG store
   - keep S3-visible behavior unchanged
   - run the full suite and clippy before marking Phase 4 complete
+
+Phase 4 implementation notes:
+
+1. Step 4.1 rejects local multihost configs that cannot place all EC shards on
+   distinct local nodes.
+   - the production binary now always opens the local cluster layout under
+     `node-<id>` directories
+   - `ARGMIN_LOCAL_NODE_COUNT` defaults to `ARGMIN_EC_K + ARGMIN_EC_M`
+   - configured values must be at least `ARGMIN_EC_K + ARGMIN_EC_M`
+   - `LocalClusterMap` performs the same validation before preparing local node
+     directories or opening stores, so storage APIs cannot bypass startup checks
 
 Exit criteria:
 

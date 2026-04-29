@@ -36,9 +36,9 @@ The server is configured via environment variables:
 | `ARGMIN_TLS_KEY_PATH` | *(unset)* | PEM private key path for direct HTTPS |
 | `ARGMIN_DATA_DIR` | `./data` | Data directory |
 | `ARGMIN_PG_COUNT` | `16` | Number of placement groups |
-| `ARGMIN_LOCAL_NODE_COUNT` | `1` | In-progress local multihost harness node count |
 | `ARGMIN_EC_K` | `4` | Erasure coding data shards |
 | `ARGMIN_EC_M` | `2` | Erasure coding parity shards |
+| `ARGMIN_LOCAL_NODE_COUNT` | `ARGMIN_EC_K + ARGMIN_EC_M` (`6` with defaults) | In-progress local multihost harness node count |
 | `ARGMIN_REGION` | `us-east-1` | AWS region for auth |
 | `ARGMIN_WORKERS` | `4` | Number of frontend workers |
 | `ARGMIN_MAX_CONNECTIONS` | `512` | Max concurrent TCP connections |
@@ -73,9 +73,8 @@ For an existing data directory, treat these settings as stable:
 
 - `ARGMIN_PG_COUNT` is part of placement. Changing it without migration will
   route buckets and objects to different PGs.
-- `ARGMIN_LOCAL_NODE_COUNT` changes the local data directory shape when set
-  above `1`. There is no migration between the single-node and local
-  multihost layouts yet.
+- `ARGMIN_LOCAL_NODE_COUNT` is part of placement and must be at least
+  `ARGMIN_EC_K + ARGMIN_EC_M`.
 - If you set `ARGMIN_HOST_ID`, keep it stable if you want `HostId` /
   `x-amz-id-2` to remain stable across restarts.
 - `ARGMIN_SSE_S3_WRAPPING_KEY` must remain stable for existing SSE-S3 objects.
@@ -121,11 +120,8 @@ ARGMIN_SSE_C_VALIDATOR_KEY='<base64-encoded-32-byte-secret>'
 ## In-Progress Local Multihost Harness
 
 `ARGMIN_LOCAL_NODE_COUNT` is part of the multihost transition work. The default
-value is `1`, which preserves the existing single-node on-disk layout directly
-under `ARGMIN_DATA_DIR`.
-
-When set above `1`, `argmin-s3` opens multiple independent local storage nodes
-inside the same process. Each node gets its own data directory below
+is derived from the configured EC shape, so the default `4+2` shape starts `6`
+local storage nodes. Each node gets its own data directory below
 `ARGMIN_DATA_DIR`, using stable numeric node IDs:
 
 ```text
@@ -135,10 +131,14 @@ ARGMIN_DATA_DIR/
   node-0002/
 ```
 
+Local multihost mode requires enough local nodes to place the configured EC
+shape on distinct nodes. `ARGMIN_LOCAL_NODE_COUNT` must be at least
+`ARGMIN_EC_K + ARGMIN_EC_M`.
+
 This mode is intended for local development and tests while the distributed
 storage path is being built. It does not yet add RPC, internal auth, failure
 detection, or distributed shard placement. Request routing still uses the
-current metadata-primary/single-node behavior for this phase.
+current metadata-primary/local-node forwarding behavior for this phase.
 
 ## Usage with AWS CLI
 

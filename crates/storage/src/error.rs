@@ -48,6 +48,26 @@ pub enum ClusterBuildError {
     #[error("metadata primary node {id} is not present in the local cluster map")]
     MetadataPrimaryNotFound { id: u32 },
 
+    #[error("invalid EC shape k={data_shards} m={parity_shards}: {reason}")]
+    InvalidEcShape {
+        data_shards: u8,
+        parity_shards: u8,
+        reason: String,
+    },
+
+    #[error(
+        "local cluster with {node_count} active nodes cannot place EC shape k={data_shards} m={parity_shards}; at least {required_nodes} distinct nodes are required"
+    )]
+    UnplaceableEcShape {
+        data_shards: u8,
+        parity_shards: u8,
+        required_nodes: usize,
+        node_count: usize,
+    },
+
+    #[error("invalid local placement map: {reason}")]
+    InvalidLocalPlacement { reason: String },
+
     #[error(
         "local node {duplicate_node_id} shares data directory {data_dir:?} with local node {first_node_id}"
     )]
