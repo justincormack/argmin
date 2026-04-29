@@ -630,7 +630,7 @@ Implementation order:
     cannot silently assume metadata-primary storage
   - abort, part reupload, subset completion, and omitted part cleanup are
     placement-aware in multi-node mode
-- [ ] 4.8 Move delete and reclaim cleanup to placement-aware shard deletion.
+- [x] 4.8 Move delete and reclaim cleanup to placement-aware shard deletion.
   - recompute per-shard node placement from stored `data_pg_id`, EC shape, and
     shard identity
   - sweep remaining delete/reclaim paths now that multipart reclaim records also
@@ -693,8 +693,8 @@ Phase 4 implementation notes:
      best-effort
    - object payload reclaim also deletes metadata-primary shard rows until
      Phase 6 removes the metadata-primary bridge
-   - Step 4.8 still owns the later boundary sweep for remaining cleanup paths
-     introduced by streaming and multipart placement work
+   - Step 4.8 centralizes the later cleanup paths introduced by streaming and
+     multipart placement work
    - request-path tests assert direct PutObject shard files land under distinct
      `node-XXXX` stores, and EC fault-injection tests now manipulate the placed
      shard file paths
@@ -733,9 +733,8 @@ Phase 4 implementation notes:
      `k=4,m=2` six-node local cluster, preserving the local cluster shape
      without opening unused metadata PG stores
    - those broad request-path tests still use the Phase 4 metadata-primary
-     bridge for metadata; direct buffered PutObject and streaming PutObject
-     payload IO now use placed shard files, while multipart payloads and
-     remaining cleanup continue to move in Steps 4.7-4.8
+     bridge for metadata; direct buffered PutObject, streaming PutObject, and
+     multipart payload IO now use placed shard files
    - tests that specifically exercise metadata PG fanout, merge, pagination, or
      bucket/object PG separation opt into two PGs
 9. Step 4.7 moves streamed UploadPart payload files onto placed shard IO.
@@ -757,7 +756,20 @@ Phase 4 implementation notes:
    - sparse topology tests keep explicit PG sets such as `[0, 2, 5]`
    - placement and shard IO tests use one PG unless the test checks
      PG-dependent placement
-9. Metadata operations still delegate through the metadata-primary
+10. Step 4.8 centralizes delete and reclaim cleanup at the cluster boundary.
+   - `StorageCluster` has one marker-aware payload shard-set deletion helper for
+     strict reclaim and a best-effort variant for abort/commit cleanup paths
+   - placed cleanup recomputes each shard's local node from the stored data PG,
+     EC shape, stable payload identity, and shard index before deleting the file
+   - metadata-primary shard rows remain the Phase 4 ack bridge and are deleted by
+     the same helper after placed shard deletion, so cleanup paths do not need
+     separate local-node assumptions
+   - the public single-node reclaim entry point was removed; object payload
+     reclaim must go through `StorageCluster` so placed payloads cannot bypass
+     node-aware deletion
+   - crash-durable cleanup for files that survive process death or delete
+     failures remains deferred to the later scavenger phase
+11. Metadata operations still delegate through the metadata-primary
    `SharedStorageNode` in Phase 4.
    - only payload shard placement and IO are node-aware at this point
    - the other local node stores are not metadata owners or metadata replicas

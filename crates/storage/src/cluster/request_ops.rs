@@ -620,12 +620,13 @@ impl super::StorageCluster {
         match &reclaim {
             ReclaimPayload::Segments(reclaim) => {
                 for segment in &reclaim.segments {
-                    self.delete_reclaim_shard_set(
+                    self.delete_payload_shard_set(
                         segment.data_pg_id,
+                        segment.ec,
                         &segment.segment_okh,
                         segment.segment_vid,
-                        segment.ec,
                         segment.payload_storage,
+                        "delete placed object-segment reclaim shard",
                     )?;
                 }
             }
@@ -640,22 +641,24 @@ impl super::StorageCluster {
                             payload_storage,
                             ..
                         } => {
-                            self.delete_reclaim_shard_set(
+                            self.delete_payload_shard_set(
                                 *data_pg_id,
+                                *ec,
                                 part_okh,
                                 *part_vid,
-                                *ec,
                                 *payload_storage,
+                                "delete placed multipart-part reclaim shard",
                             )?;
                         }
                         MultipartReclaimPartRecord::Segments { segments, .. } => {
                             for segment in segments {
-                                self.delete_reclaim_shard_set(
+                                self.delete_payload_shard_set(
                                     segment.data_pg_id,
+                                    segment.ec,
                                     &segment.segment_okh,
                                     segment.segment_vid,
-                                    segment.ec,
                                     segment.payload_storage,
+                                    "delete placed multipart-segment reclaim shard",
                                 )?;
                             }
                         }
@@ -686,41 +689,6 @@ impl super::StorageCluster {
         }
         self.single_node.enqueue_bucket_delete_finalize(bucket);
         Ok(true)
-    }
-
-    fn delete_reclaim_shard_set(
-        &self,
-        data_pg_id: u32,
-        okh: &[u8; 16],
-        generation_id: GenerationId,
-        ec: EcShape,
-        payload_storage: PayloadShardStorage,
-    ) -> Result<(), ObjectPgActionError> {
-        let total = ec.k as usize + ec.m as usize;
-
-        if payload_storage == PayloadShardStorage::Placed {
-            let data_pg = DataPgId::new(PgId::new(data_pg_id));
-            let placement_key = super::segment_payload_placement_key(okh, generation_id);
-            let locations = self
-                .place_payload_shards(data_pg, ec, &placement_key)
-                .map_err(super::cluster_build_error_to_store)?;
-            for i in 0..total {
-                let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
-                if let Some(location) = locations.get(i).copied() {
-                    self.delete_payload_shard(location, &shard_key)
-                        .map_err(|error| {
-                            super::shard_io_error_to_store(error, "delete placed reclaim shard")
-                        })?;
-                }
-            }
-        }
-
-        let data_pg = self.single_node.get_pg(data_pg_id)?;
-        for i in 0..total {
-            let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
-            data_pg.delete_shard(&shard_key)?;
-        }
-        Ok(())
     }
 
     fn delete_complete_multipart_cleanup_best_effort(
@@ -840,7 +808,13 @@ impl super::StorageCluster {
         ec: EcShape,
         payload_storage: PayloadShardStorage,
     ) {
-        let _ = self.delete_reclaim_shard_set(data_pg_id, okh, generation_id, ec, payload_storage);
+        self.delete_payload_shard_set_best_effort(
+            data_pg_id,
+            ec,
+            okh,
+            generation_id,
+            payload_storage,
+        );
     }
 
     pub fn create_put_object_stream_session<T, E>(

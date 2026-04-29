@@ -636,7 +636,7 @@ impl SharedStorageNode {
         Ok(staging_segments)
     }
 
-    pub fn delete_shards_best_effort(&self, data_pg_id: u32, shard_keys: &[ShardKey]) {
+    fn delete_shards_best_effort(&self, data_pg_id: u32, shard_keys: &[ShardKey]) {
         let Ok(data_pg) = self.get_pg(data_pg_id) else {
             return;
         };

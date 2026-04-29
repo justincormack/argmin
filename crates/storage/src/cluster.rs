@@ -293,12 +293,15 @@ impl StorageCluster {
                             });
                         }
                         Err(error) => {
-                            self.delete_segment_payload_shards_best_effort(
-                                data_pg,
+                            self.delete_payload_shard_keys_best_effort(
+                                data_pg.get(),
                                 ec,
                                 segment_okh,
                                 segment_vid,
-                                &written_for_cleanup,
+                                PayloadShardStorage::Placed,
+                                written_for_cleanup
+                                    .iter()
+                                    .map(|written| written.key.clone()),
                             );
                             return Err(shard_io_error_to_store(error, write_context));
                         }
@@ -358,12 +361,13 @@ impl StorageCluster {
         segment_vid: GenerationId,
         written_shards: &[WrittenShardAck],
     ) {
-        self.delete_segment_payload_shards_best_effort(
-            DataPgId::new(PgId::new(data_pg_id)),
+        self.delete_payload_shard_keys_best_effort(
+            data_pg_id,
             ec,
             segment_okh,
             segment_vid,
-            written_shards,
+            PayloadShardStorage::Placed,
+            written_shards.iter().map(|written| written.key.clone()),
         );
     }
 
@@ -445,15 +449,16 @@ impl StorageCluster {
             segment_record,
             shard_batch,
         );
-        if result.is_err() && segment_record.payload_storage == PayloadShardStorage::Placed {
-            self.delete_segment_payload_shard_keys_best_effort(
-                DataPgId::new(PgId::new(segment_record.data_pg_id)),
+        if result.is_err() {
+            self.delete_payload_shard_keys_best_effort(
+                segment_record.data_pg_id,
                 EcShape {
                     k: segment_record.ec_k,
                     m: segment_record.ec_m,
                 },
                 &segment_record.segment_okh,
                 segment_record.segment_vid,
+                segment_record.payload_storage,
                 shard_batch.iter().map(|(key, _)| (*key).clone()),
             );
         }
@@ -732,43 +737,166 @@ impl StorageCluster {
             .map_err(cluster_build_error_to_store)
     }
 
-    fn delete_segment_payload_shards_best_effort(
+    fn delete_payload_shard_set(
         &self,
-        data_pg_id: DataPgId,
+        data_pg_id: u32,
         ec: EcShape,
-        segment_okh: &[u8; 16],
-        segment_vid: GenerationId,
-        written_shards: &[WrittenShardAck],
+        okh: &[u8; 16],
+        generation_id: GenerationId,
+        payload_storage: PayloadShardStorage,
+        placed_context: &'static str,
+    ) -> Result<(), ObjectPgActionError> {
+        let shard_keys = Self::payload_shard_set_keys(okh, generation_id, ec);
+        if payload_storage == PayloadShardStorage::Placed {
+            self.delete_placed_payload_shard_keys(
+                DataPgId::new(PgId::new(data_pg_id)),
+                ec,
+                okh,
+                generation_id,
+                &shard_keys,
+                placed_context,
+            )?;
+        }
+        self.delete_metadata_primary_payload_shard_keys(data_pg_id, &shard_keys)
+    }
+
+    fn delete_payload_shard_set_best_effort(
+        &self,
+        data_pg_id: u32,
+        ec: EcShape,
+        okh: &[u8; 16],
+        generation_id: GenerationId,
+        payload_storage: PayloadShardStorage,
     ) {
-        self.delete_segment_payload_shard_keys_best_effort(
+        let shard_keys = Self::payload_shard_set_keys(okh, generation_id, ec);
+        self.delete_payload_shard_keys_best_effort(
             data_pg_id,
             ec,
-            segment_okh,
-            segment_vid,
-            written_shards.iter().map(|written| written.key.clone()),
+            okh,
+            generation_id,
+            payload_storage,
+            shard_keys,
         );
     }
 
-    fn delete_segment_payload_shard_keys_best_effort(
+    fn delete_payload_shard_keys_best_effort(
+        &self,
+        data_pg_id: u32,
+        ec: EcShape,
+        okh: &[u8; 16],
+        generation_id: GenerationId,
+        payload_storage: PayloadShardStorage,
+        shard_keys: impl IntoIterator<Item = ShardKey>,
+    ) {
+        let shard_keys: Vec<ShardKey> = shard_keys.into_iter().collect();
+        if payload_storage == PayloadShardStorage::Placed {
+            self.delete_placed_payload_shard_keys_best_effort(
+                DataPgId::new(PgId::new(data_pg_id)),
+                ec,
+                okh,
+                generation_id,
+                &shard_keys,
+            );
+        }
+        self.delete_metadata_primary_payload_shard_keys_best_effort(data_pg_id, &shard_keys);
+    }
+
+    fn delete_placed_payload_shard_keys(
         &self,
         data_pg_id: DataPgId,
         ec: EcShape,
-        segment_okh: &[u8; 16],
-        segment_vid: GenerationId,
-        shard_keys: impl IntoIterator<Item = ShardKey>,
+        okh: &[u8; 16],
+        generation_id: GenerationId,
+        shard_keys: &[ShardKey],
+        placed_context: &'static str,
+    ) -> Result<(), ObjectPgActionError> {
+        let placement_key = segment_payload_placement_key(okh, generation_id);
+        let locations = self
+            .place_payload_shards(data_pg_id, ec, &placement_key)
+            .map_err(|error| ObjectPgActionError::Store(cluster_build_error_to_store(error)))?;
+
+        for shard_key in shard_keys {
+            let location = Self::placed_payload_shard_location(&locations, shard_key)
+                .map_err(ObjectPgActionError::Store)?;
+            self.delete_payload_shard(location, shard_key)
+                .map_err(|error| {
+                    ObjectPgActionError::Store(shard_io_error_to_store(error, placed_context))
+                })?;
+        }
+        Ok(())
+    }
+
+    fn delete_placed_payload_shard_keys_best_effort(
+        &self,
+        data_pg_id: DataPgId,
+        ec: EcShape,
+        okh: &[u8; 16],
+        generation_id: GenerationId,
+        shard_keys: &[ShardKey],
     ) {
-        let placement_key = segment_payload_placement_key(segment_okh, segment_vid);
+        let placement_key = segment_payload_placement_key(okh, generation_id);
         let Ok(locations) = self.place_payload_shards(data_pg_id, ec, &placement_key) else {
             return;
         };
 
         for shard_key in shard_keys {
-            let shard_index = usize::from(shard_key.shard_index().get());
-            let Some(location) = locations.get(shard_index).copied() else {
+            let Ok(location) = Self::placed_payload_shard_location(&locations, shard_key) else {
                 continue;
             };
-            let _ = self.delete_payload_shard(location, &shard_key);
+            let _ = self.delete_payload_shard(location, shard_key);
         }
+    }
+
+    fn delete_metadata_primary_payload_shard_keys(
+        &self,
+        data_pg_id: u32,
+        shard_keys: &[ShardKey],
+    ) -> Result<(), ObjectPgActionError> {
+        let data_pg = self.single_node.get_pg(data_pg_id)?;
+        for shard_key in shard_keys {
+            data_pg.delete_shard(shard_key)?;
+        }
+        Ok(())
+    }
+
+    fn delete_metadata_primary_payload_shard_keys_best_effort(
+        &self,
+        data_pg_id: u32,
+        shard_keys: &[ShardKey],
+    ) {
+        let Ok(data_pg) = self.single_node.get_pg(data_pg_id) else {
+            return;
+        };
+        for shard_key in shard_keys {
+            let _ = data_pg.delete_shard(shard_key);
+        }
+    }
+
+    fn placed_payload_shard_location(
+        locations: &[ShardLocation],
+        shard_key: &ShardKey,
+    ) -> Result<ShardLocation, StoreError> {
+        let shard_index = usize::from(shard_key.shard_index().get());
+        locations
+            .get(shard_index)
+            .copied()
+            .ok_or_else(|| StoreError::Io {
+                context: "resolve placed payload shard index",
+                source: std::io::Error::other(format!(
+                    "shard index {shard_index} outside {} placed shards",
+                    locations.len()
+                )),
+            })
+    }
+
+    fn payload_shard_set_keys(
+        okh: &[u8; 16],
+        generation_id: GenerationId,
+        ec: EcShape,
+    ) -> Vec<ShardKey> {
+        (0..(ec.k + ec.m))
+            .map(|shard_index| ShardKey::new(okh, generation_id.get(), shard_index))
+            .collect()
     }
 
     fn delete_staged_stream_segment_payload_shards_best_effort(
@@ -776,21 +904,16 @@ impl StorageCluster {
         segments: &[StreamUploadSegmentRecord],
     ) {
         for segment in segments {
-            if segment.payload_storage != PayloadShardStorage::Placed {
-                continue;
-            }
             let ec = EcShape {
                 k: segment.ec_k,
                 m: segment.ec_m,
             };
-            self.delete_segment_payload_shard_keys_best_effort(
-                DataPgId::new(PgId::new(segment.data_pg_id)),
+            self.delete_payload_shard_set_best_effort(
+                segment.data_pg_id,
                 ec,
                 &segment.segment_okh,
                 segment.segment_vid,
-                (0..(ec.k + ec.m)).map(|shard_index| {
-                    ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), shard_index)
-                }),
+                segment.payload_storage,
             );
         }
     }
