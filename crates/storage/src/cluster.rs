@@ -1,4 +1,6 @@
 use std::sync::Arc;
+#[cfg(any(test, feature = "test-hooks"))]
+use std::sync::{Mutex, OnceLock};
 
 use ec::{EcConfig, ErasureCodec};
 use placement::NodeId;
@@ -19,6 +21,35 @@ use crate::ObjectPgActionError;
 
 mod local;
 mod request_ops;
+
+#[cfg(any(test, feature = "test-hooks"))]
+type StreamAbortHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
+static BEFORE_STREAM_ABORT_STORAGE_HOOK: OnceLock<Mutex<Option<StreamAbortHook>>> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct StreamAbortTestHookGuard;
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for StreamAbortTestHookGuard {
+    fn drop(&mut self) {
+        let hook = BEFORE_STREAM_ABORT_STORAGE_HOOK.get_or_init(|| Mutex::new(None));
+        *hook.lock().unwrap() = None;
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn maybe_run_before_stream_abort_storage_hook() {
+    let hook = BEFORE_STREAM_ABORT_STORAGE_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardLocation {
@@ -128,6 +159,16 @@ impl StorageCluster {
         Arc::clone(&self.single_node)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_before_stream_abort_storage_hook(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> StreamAbortTestHookGuard {
+        let slot = BEFORE_STREAM_ABORT_STORAGE_HOOK.get_or_init(|| Mutex::new(None));
+        *slot.lock().unwrap() = Some(hook);
+        StreamAbortTestHookGuard
+    }
+
     pub fn place_payload_shards(
         &self,
         data_pg_id: DataPgId,
@@ -203,11 +244,36 @@ impl StorageCluster {
             .get();
         let data_pg = DataPgId::new(PgId::new(data_pg_id));
         let segment_vid = generation_id;
+        let written_shards = self.write_placed_segment_payload_shards(
+            data_pg,
+            ec,
+            segment_okh,
+            segment_vid,
+            data,
+            "write placed direct PUT shard",
+        )?;
+
+        Ok(DirectPutWrittenSegment {
+            data_pg_id,
+            ec,
+            written_shards,
+        })
+    }
+
+    fn write_placed_segment_payload_shards(
+        &self,
+        data_pg: DataPgId,
+        ec: EcShape,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        data: &[u8],
+        write_context: &'static str,
+    ) -> Result<Vec<WrittenShardAck>, StoreError> {
         let placement_key = segment_payload_placement_key(segment_okh, segment_vid);
         let locations = self
             .place_payload_shards(data_pg, ec, &placement_key)
             .map_err(cluster_build_error_to_store)?;
-        let written_shards = self.single_node.write_erasure_coded_segment_shards_with(
+        self.single_node.write_erasure_coded_segment_shards_with(
             segment_okh,
             segment_vid,
             data,
@@ -234,22 +300,13 @@ impl StorageCluster {
                                 segment_vid,
                                 &written_for_cleanup,
                             );
-                            return Err(shard_io_error_to_store(
-                                error,
-                                "write placed direct PUT shard",
-                            ));
+                            return Err(shard_io_error_to_store(error, write_context));
                         }
                     }
                 }
                 Ok(written_acks)
             },
-        )?;
-
-        Ok(DirectPutWrittenSegment {
-            data_pg_id,
-            ec,
-            written_shards,
-        })
+        )
     }
 
     pub fn reserve_put_object_generation(
@@ -337,19 +394,40 @@ impl StorageCluster {
         key: &ObjectKey,
         request: &PrepareStreamUploadSegmentAppendReq,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
-        self.single_node
-            .prepare_stream_segment_append(bucket, key, request)
+        let (target, mut segment_record) = self
+            .single_node
+            .prepare_stream_segment_append(bucket, key, request)?;
+        if matches!(target, StreamUploadTarget::PutObject) {
+            segment_record.payload_storage = PayloadShardStorage::Placed;
+        }
+        Ok((target, segment_record))
     }
 
     pub fn write_stream_segment_payload_shards(
         &self,
-        data_pg_id: u32,
-        segment_okh: &[u8; 16],
-        segment_vid: GenerationId,
+        segment_record: &StreamUploadSegmentRecord,
         data: &[u8],
     ) -> Result<Vec<WrittenShardAck>, StoreError> {
-        self.single_node
-            .write_stream_segment_shards(data_pg_id, segment_okh, segment_vid, data)
+        let ec = EcShape {
+            k: segment_record.ec_k,
+            m: segment_record.ec_m,
+        };
+        match segment_record.payload_storage {
+            PayloadShardStorage::MetadataPrimary => self.single_node.write_stream_segment_shards(
+                segment_record.data_pg_id,
+                &segment_record.segment_okh,
+                segment_record.segment_vid,
+                data,
+            ),
+            PayloadShardStorage::Placed => self.write_placed_segment_payload_shards(
+                DataPgId::new(PgId::new(segment_record.data_pg_id)),
+                ec,
+                &segment_record.segment_okh,
+                segment_record.segment_vid,
+                data,
+                "write placed stream segment shard",
+            ),
+        }
     }
 
     pub fn commit_stream_segment_append(
@@ -361,14 +439,27 @@ impl StorageCluster {
         segment_record: &StreamUploadSegmentRecord,
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), ObjectPgActionError> {
-        self.single_node.commit_stream_segment_append(
+        let result = self.single_node.commit_stream_segment_append(
             bucket,
             key,
             session_id,
             segment_index,
             segment_record,
             shard_batch,
-        )
+        );
+        if result.is_err() && segment_record.payload_storage == PayloadShardStorage::Placed {
+            self.delete_segment_payload_shard_keys_best_effort(
+                DataPgId::new(PgId::new(segment_record.data_pg_id)),
+                EcShape {
+                    k: segment_record.ec_k,
+                    m: segment_record.ec_m,
+                },
+                &segment_record.segment_okh,
+                segment_record.segment_vid,
+                shard_batch.iter().map(|(key, _)| (*key).clone()),
+            );
+        }
+        result
     }
 
     pub fn abort_stream_upload_session(
@@ -377,8 +468,13 @@ impl StorageCluster {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
-        self.single_node
-            .abort_stream_upload_session(bucket, key, session_id)
+        #[cfg(any(test, feature = "test-hooks"))]
+        maybe_run_before_stream_abort_storage_hook();
+        let staged_segments = self
+            .single_node
+            .abort_stream_upload_session(bucket, key, session_id)?;
+        self.delete_staged_stream_segment_payload_shards_best_effort(&staged_segments);
+        Ok(())
     }
 
     pub fn list_stream_upload_sessions_best_effort(&self) -> Vec<StreamUploadRecord> {
@@ -646,17 +742,58 @@ impl StorageCluster {
         segment_vid: GenerationId,
         written_shards: &[WrittenShardAck],
     ) {
+        self.delete_segment_payload_shard_keys_best_effort(
+            data_pg_id,
+            ec,
+            segment_okh,
+            segment_vid,
+            written_shards.iter().map(|written| written.key.clone()),
+        );
+    }
+
+    fn delete_segment_payload_shard_keys_best_effort(
+        &self,
+        data_pg_id: DataPgId,
+        ec: EcShape,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        shard_keys: impl IntoIterator<Item = ShardKey>,
+    ) {
         let placement_key = segment_payload_placement_key(segment_okh, segment_vid);
         let Ok(locations) = self.place_payload_shards(data_pg_id, ec, &placement_key) else {
             return;
         };
 
-        for written in written_shards {
-            let shard_index = usize::from(written.key.shard_index().get());
+        for shard_key in shard_keys {
+            let shard_index = usize::from(shard_key.shard_index().get());
             let Some(location) = locations.get(shard_index).copied() else {
                 continue;
             };
-            let _ = self.delete_payload_shard(location, &written.key);
+            let _ = self.delete_payload_shard(location, &shard_key);
+        }
+    }
+
+    fn delete_staged_stream_segment_payload_shards_best_effort(
+        &self,
+        segments: &[StreamUploadSegmentRecord],
+    ) {
+        for segment in segments {
+            if segment.payload_storage != PayloadShardStorage::Placed {
+                continue;
+            }
+            let ec = EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            };
+            self.delete_segment_payload_shard_keys_best_effort(
+                DataPgId::new(PgId::new(segment.data_pg_id)),
+                ec,
+                &segment.segment_okh,
+                segment.segment_vid,
+                (0..(ec.k + ec.m)).map(|shard_index| {
+                    ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), shard_index)
+                }),
+            );
         }
     }
 

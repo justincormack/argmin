@@ -431,7 +431,8 @@ impl Coordinator {
     ) -> Result<Vec<WrittenShard>, ServerError> {
         Ok(self
             .storage_node
-            .write_stream_segment_payload_shards(data_pg_id, segment_okh, segment_vid, data)?
+            .test_metadata_storage_node()
+            .write_stream_segment_shards(data_pg_id, segment_okh, segment_vid, data)?
             .into_iter()
             .map(|written| WrittenShard {
                 key: written.key,
@@ -522,12 +523,9 @@ impl Coordinator {
         #[cfg(test)]
         maybe_run_stream_append_prepare_hook(session_id, segment_index);
 
-        let written_shards = self.storage_node.write_stream_segment_payload_shards(
-            segment_record.data_pg_id,
-            &segment_record.segment_okh,
-            segment_record.segment_vid,
-            data,
-        )?;
+        let written_shards = self
+            .storage_node
+            .write_stream_segment_payload_shards(&segment_record, data)?;
 
         let shard_batch: Vec<(&ShardKey, storage::WriteAck)> = written_shards
             .iter()

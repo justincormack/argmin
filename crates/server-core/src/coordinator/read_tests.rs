@@ -3,6 +3,7 @@ use super::test_support::*;
 use super::*;
 use ec::EcConfig;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use storage::{segment_key_hash, EcShape, GenerationId, PayloadShardStorage, PgTopology, ShardKey};
 
 #[test]
@@ -47,10 +48,39 @@ fn stream_put_get_object_readable() {
         )
         .unwrap();
     assert_eq!(segments.len(), 1);
-    assert_eq!(
-        segments[0].payload_storage,
-        PayloadShardStorage::MetadataPrimary
-    );
+    assert_eq!(segments[0].payload_storage, PayloadShardStorage::Placed);
+    let segment = &segments[0];
+    let ec = EcShape {
+        k: segment.ec_k,
+        m: segment.ec_m,
+    };
+    let mut placed_node_dirs = BTreeSet::new();
+    for shard_index in 0..ec.k + ec.m {
+        let path = coord
+            .storage_node
+            .test_payload_shard_file_path(
+                segment.data_pg_id,
+                ec,
+                &segment.segment_okh,
+                segment.segment_vid,
+                shard_index,
+            )
+            .unwrap();
+        assert!(
+            path.exists(),
+            "stream PUT shard {shard_index} should exist at {}",
+            path.display()
+        );
+        let node_dir = path
+            .ancestors()
+            .nth(4)
+            .expect("payload shard path should include a node directory")
+            .file_name()
+            .unwrap()
+            .to_owned();
+        placed_node_dirs.insert(node_dir);
+    }
+    assert_eq!(placed_node_dirs.len(), usize::from(ec.k + ec.m));
 
     let head = coord
         .head_object(&GetObjectRequest {
@@ -82,6 +112,177 @@ fn stream_put_get_object_readable() {
         .unwrap();
     assert_eq!(result.body.read_all().unwrap(), b"hello");
     assert_eq!(result.size, 5);
+}
+
+#[test]
+fn failed_stream_put_append_commit_cleans_placed_shards() {
+    let _serial = STREAM_APPEND_TEST_SERIAL
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap();
+    let dir = test_util::tempdir();
+    let coord = setup_coordinator(dir.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let generation_id = coord
+        .storage_node
+        .test_object_generation_reservation_for(&bucket, &key, &session_id)
+        .unwrap();
+    let segment_okh = segment_key_hash("bucket", "key", generation_id, 0);
+    let segment_vid = GenerationId::MIN;
+    let ec = coord.storage_node.default_payload_ec_shape();
+    let data_pg_id = PgTopology::new(coord.storage_node.test_pg_ids())
+        .unwrap()
+        .object_generation_segment_data_pg(&bucket, &key, generation_id, 0)
+        .get();
+    let hook_storage = Arc::clone(&coord.storage_node);
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let hook_session_id = session_id.clone();
+    let _guard = install_stream_append_test_hooks(StreamAppendTestHooks {
+        target: Some((session_id.as_str().to_owned(), 0)),
+        after_prepare: Some(Arc::new(move || {
+            hook_storage
+                .abort_stream_upload_session(&hook_bucket, &hook_key, &hook_session_id)
+                .unwrap();
+        })),
+    });
+
+    let err = coord
+        .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"orphan-me")
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::Metadata(_)),
+        "expected missing stream session after hook abort, got {err:?}"
+    );
+
+    for shard_index in 0..ec.k + ec.m {
+        let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), shard_index);
+        assert!(
+            !coord
+                .storage_node
+                .test_shard_exists(data_pg_id, &shard_key)
+                .unwrap(),
+            "failed stream append must remove shard metadata {shard_index}"
+        );
+        assert!(
+            !coord
+                .storage_node
+                .test_payload_shard_file_exists(
+                    data_pg_id,
+                    ec,
+                    &segment_okh,
+                    segment_vid,
+                    shard_index,
+                )
+                .unwrap(),
+            "failed stream append must remove placed shard file {shard_index}"
+        );
+    }
+}
+
+#[test]
+fn stream_put_abort_cleans_segment_committed_during_abort_window() {
+    let _serial = STREAM_APPEND_TEST_SERIAL
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap();
+    let dir = test_util::tempdir();
+    let coord = setup_coordinator(dir.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let generation_id = coord
+        .storage_node
+        .test_object_generation_reservation_for(&bucket, &key, &session_id)
+        .unwrap();
+    let segment_index = 0;
+    let segment_okh = segment_key_hash("bucket", "key", generation_id, segment_index);
+    let segment_vid = GenerationId::MIN;
+    let ec = coord.storage_node.default_payload_ec_shape();
+    let data_pg_id = PgTopology::new(coord.storage_node.test_pg_ids())
+        .unwrap()
+        .object_generation_segment_data_pg(&bucket, &key, generation_id, segment_index)
+        .get();
+    let hook_storage = Arc::clone(&coord.storage_node);
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let hook_session_id = session_id.clone();
+    let _guard = coord
+        .storage_node
+        .test_install_before_stream_abort_storage_hook(Arc::new(move || {
+            let data = b"race-data";
+            let (_, segment_record) = hook_storage
+                .prepare_stream_segment_append(
+                    &hook_bucket,
+                    &hook_key,
+                    &storage::PrepareStreamUploadSegmentAppendReq {
+                        session_id: hook_session_id.clone(),
+                        segment_index,
+                        size: data.len() as u64,
+                        segment_crc64: Some(checksum::crc64::checksum(data)),
+                        segment_okh: storage::stream_segment_key_hash(
+                            &hook_session_id,
+                            segment_index,
+                        ),
+                    },
+                )
+                .unwrap();
+            let written_shards = hook_storage
+                .write_stream_segment_payload_shards(&segment_record, data)
+                .unwrap();
+            let shard_batch: Vec<(&ShardKey, storage::WriteAck)> = written_shards
+                .iter()
+                .map(|written| (&written.key, written.ack))
+                .collect();
+            hook_storage
+                .commit_stream_segment_append(
+                    &hook_bucket,
+                    &hook_key,
+                    &hook_session_id,
+                    segment_index,
+                    &segment_record,
+                    &shard_batch,
+                )
+                .unwrap();
+        }));
+
+    coord
+        .abort_stream_put("bucket", "key", &session_id)
+        .unwrap();
+
+    for shard_index in 0..ec.k + ec.m {
+        let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), shard_index);
+        assert!(
+            !coord
+                .storage_node
+                .test_shard_exists(data_pg_id, &shard_key)
+                .unwrap(),
+            "abort must remove shard metadata committed during abort window {shard_index}"
+        );
+        assert!(
+            !coord
+                .storage_node
+                .test_payload_shard_file_exists(
+                    data_pg_id,
+                    ec,
+                    &segment_okh,
+                    segment_vid,
+                    shard_index,
+                )
+                .unwrap(),
+            "abort must remove placed shard file committed during abort window {shard_index}"
+        );
+    }
 }
 
 #[test]

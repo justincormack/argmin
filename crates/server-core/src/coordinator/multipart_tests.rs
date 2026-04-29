@@ -4,7 +4,9 @@ use super::test_topology::*;
 use super::*;
 use crate::conditional::{DeleteCondition, ReadCondition, SpecificEtag, WriteCondition};
 use crate::sse::SSE_C_CUSTOMER_KEY_LEN;
-use storage::{ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord};
+use storage::{
+    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, PayloadShardStorage,
+};
 
 fn create_bucket_with_explicit_writer_grant(
     coord: &Coordinator,
@@ -7068,14 +7070,33 @@ fn stream_put_abort_cleans_up_shards() {
     assert_eq!(segments.len(), 1);
     let segment = segments[0].clone();
     let data_pg_id = segment.data_pg_id;
+    assert_eq!(segment.payload_storage, PayloadShardStorage::Placed);
+    let ec = EcShape {
+        k: segment.ec_k,
+        m: segment.ec_m,
+    };
+    for i in 0..ec.k + ec.m {
+        assert!(
+            coord
+                .storage_node
+                .test_payload_shard_file_exists(
+                    data_pg_id,
+                    ec,
+                    &segment.segment_okh,
+                    segment.segment_vid,
+                    i,
+                )
+                .unwrap(),
+            "placed shard {i} should exist before abort"
+        );
+    }
 
     coord
         .abort_stream_put("bucket", "key", &session_id)
         .unwrap();
 
     // Verify shards were cleaned up.
-    for i in 0..6 {
-        // k=4, m=2
+    for i in 0..ec.k + ec.m {
         let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i);
         assert!(
             !coord
@@ -7083,6 +7104,19 @@ fn stream_put_abort_cleans_up_shards() {
                 .test_shard_exists(data_pg_id, &shard_key)
                 .unwrap(),
             "shard {i} should have been deleted"
+        );
+        assert!(
+            !coord
+                .storage_node
+                .test_payload_shard_file_exists(
+                    data_pg_id,
+                    ec,
+                    &segment.segment_okh,
+                    segment.segment_vid,
+                    i,
+                )
+                .unwrap(),
+            "placed shard {i} should have been deleted"
         );
     }
 }

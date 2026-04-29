@@ -608,7 +608,7 @@ impl SharedStorageNode {
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
-    ) -> Result<(), ObjectPgActionError> {
+    ) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError> {
         let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
         let session = pg.get_stream_upload(session_id)?;
         if session.bucket != bucket.as_str() || session.key != key.as_str() {
@@ -633,7 +633,7 @@ impl SharedStorageNode {
             }
         }
 
-        Ok(())
+        Ok(staging_segments)
     }
 
     pub fn delete_shards_best_effort(&self, data_pg_id: u32, shard_keys: &[ShardKey]) {

@@ -618,7 +618,7 @@ Implementation order:
     direct and streamed UploadPart writes
   - keep missing shard reconstruction and corrupt shard handling covered in
     local multi-node mode
-- [ ] 4.6 Move streaming PutObject segment writes and commit cleanup.
+- [x] 4.6 Move streaming PutObject segment writes and commit cleanup.
   - write staged segment shards to assigned nodes
   - register/publish metadata only after the required shard writes complete
   - test failed commit cleanup across local nodes
@@ -707,21 +707,36 @@ Phase 4 implementation notes:
    - standard object reclaim uses the stored marker to delete placed direct PUT
      shard files before removing metadata-primary bridge rows; multipart reclaim
      remains metadata-primary until Step 4.7
-7. The test harness uses a split topology while metadata routing is still a
+7. Step 4.6 moves streaming PutObject staged segment files onto placed shard IO.
+   - the cluster wrapper marks `StreamUploadTarget::PutObject` segment records as
+     placed after the metadata-primary prepare step allocates their segment ID
+   - streamed UploadPart segment records remain metadata-primary until Step 4.7
+   - stream segment writes use the same placed shard writer as direct PutObject,
+     while metadata-primary shard ack rows remain the Phase 4 bridge for reads
+     and recovery
+   - abort cleanup uses the exact staged segment rows removed by the
+     metadata-primary abort operation, so a segment that commits during the
+     abort window cannot lose its metadata row while keeping placed shard files
+   - append-commit failure cleanup deletes placed staged segment files after the
+     metadata-primary bridge removes shard ack rows
+   - tests cover placed stream shard fanout, abort cleanup, abort racing with a
+     segment commit, and a post-write commit failure that would otherwise orphan
+     placed staged shard files
+8. The test harness uses a split topology while metadata routing is still a
    Phase 4 bridge.
    - broad S3, HTTP, auth, and model tests use one metadata PG with the default
      `k=4,m=2` six-node local cluster, preserving the local cluster shape
      without opening unused metadata PG stores
    - those broad request-path tests still use the Phase 4 metadata-primary
-     bridge for metadata; direct buffered PutObject payload IO now uses placed
-     shard files, while streaming, multipart, and payload cleanup continue to
-     move in Steps 4.6-4.8
+     bridge for metadata; direct buffered PutObject and streaming PutObject
+     payload IO now use placed shard files, while multipart payloads and
+     remaining cleanup continue to move in Steps 4.7-4.8
    - tests that specifically exercise metadata PG fanout, merge, pagination, or
      bucket/object PG separation opt into two PGs
    - sparse topology tests keep explicit PG sets such as `[0, 2, 5]`
    - placement and shard IO tests use one PG unless the test checks
      PG-dependent placement
-8. Metadata operations still delegate through the metadata-primary
+9. Metadata operations still delegate through the metadata-primary
    `SharedStorageNode` in Phase 4.
    - only payload shard placement and IO are node-aware at this point
    - the other local node stores are not metadata owners or metadata replicas
