@@ -42,6 +42,16 @@ pub enum StoreError {
 #[derive(Debug, thiserror::Error)]
 pub enum ShardIoError {
     #[error(
+        "shard operation for local node {node_id} PG {pg_id} has epoch {operation_epoch}, current cluster epoch is {current_epoch}"
+    )]
+    StaleOperationEpoch {
+        node_id: u32,
+        pg_id: u32,
+        operation_epoch: ClusterEpoch,
+        current_epoch: ClusterEpoch,
+    },
+
+    #[error(
         "shard location for local node {node_id} PG {pg_id} has epoch {location_epoch}, current cluster epoch is {current_epoch}"
     )]
     StaleLocation {
@@ -145,6 +155,14 @@ pub enum ClusterBuildError {
         data_shards: u8,
         parity_shards: u8,
         shard_index: u8,
+    },
+
+    #[error(
+        "operation has cluster epoch {operation_epoch}, current cluster epoch is {current_epoch}"
+    )]
+    StaleEpoch {
+        operation_epoch: ClusterEpoch,
+        current_epoch: ClusterEpoch,
     },
 
     #[error("PG {pg_id} is not present in cluster epoch {cluster_epoch}")]

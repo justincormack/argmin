@@ -857,6 +857,22 @@ Phase 5 implementation notes:
      checksum failure, or shard length corruption as recoverable shard loss; PG
      route errors such as peering, stale epoch, or misrouted nodes propagate
      instead of collapsing to object-not-found behavior
+2. Step 5.2 makes operation epochs explicit on the local payload boundary.
+   - local map payload placement, node lookup, shard read, shard write, and
+     shard delete APIs now require the caller's operation epoch instead of
+     silently using the current cluster epoch
+   - `StorageCluster` carries an operation epoch on the handle; production
+     constructors bind it to the current static local map epoch, tests can
+     construct a stale handle to verify fail-closed behavior, and cluster-level
+     payload APIs always use the handle epoch instead of accepting an
+     independent epoch argument
+   - stale operation epochs fail before placement or node-store IO, distinct
+     from stale shard locations that were produced by an older route table
+   - current production paths still bind the handle to the static epoch at
+     construction; later Phase 5 work should thread the request epoch through
+     the broader metadata bridge before Phase 6 replaces that bridge
+   - tests cover stale-epoch rejection for both placement and shard mutation
+     without creating or modifying shard files
 
 ## Phase 6: PG Metadata Replication
 

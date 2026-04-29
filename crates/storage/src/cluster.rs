@@ -100,6 +100,7 @@ impl ShardLocation {
 pub struct StorageCluster {
     single_node: Arc<SharedStorageNode>,
     local_map: Arc<LocalClusterMap>,
+    operation_epoch: ClusterEpoch,
 }
 
 impl StorageCluster {
@@ -119,15 +120,35 @@ impl StorageCluster {
     }
 
     pub fn from_local_map(local_map: Arc<LocalClusterMap>) -> Result<Arc<Self>, ClusterBuildError> {
+        Self::from_local_map_with_epoch(Arc::clone(&local_map), local_map.epoch())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_from_local_map_with_epoch(
+        local_map: Arc<LocalClusterMap>,
+        operation_epoch: ClusterEpoch,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
+        Self::from_local_map_with_epoch(local_map, operation_epoch)
+    }
+
+    fn from_local_map_with_epoch(
+        local_map: Arc<LocalClusterMap>,
+        operation_epoch: ClusterEpoch,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
         let single_node = Arc::clone(local_map.metadata_primary().storage_node());
         Ok(Arc::new(Self {
             single_node,
             local_map,
+            operation_epoch,
         }))
     }
 
     pub fn cluster_epoch(&self) -> crate::ClusterEpoch {
         self.local_map.epoch()
+    }
+
+    pub fn operation_epoch(&self) -> ClusterEpoch {
+        self.operation_epoch
     }
 
     pub fn metadata_node_id(&self) -> NodeId {
@@ -187,8 +208,12 @@ impl StorageCluster {
         ec_shape: EcShape,
         stable_placement_key: &[u8],
     ) -> Result<Vec<ShardLocation>, ClusterBuildError> {
-        self.local_map
-            .place_payload_shards(data_pg_id, ec_shape, stable_placement_key)
+        self.local_map.place_payload_shards(
+            self.operation_epoch(),
+            data_pg_id,
+            ec_shape,
+            stable_placement_key,
+        )
     }
 
     pub fn payload_shard_node(
@@ -198,8 +223,13 @@ impl StorageCluster {
         ec_shape: EcShape,
         stable_placement_key: &[u8],
     ) -> Result<NodeId, ClusterBuildError> {
-        self.local_map
-            .payload_shard_node(data_pg_id, shard_index, ec_shape, stable_placement_key)
+        self.local_map.payload_shard_node(
+            self.operation_epoch(),
+            data_pg_id,
+            shard_index,
+            ec_shape,
+            stable_placement_key,
+        )
     }
 
     pub fn write_payload_shard(
@@ -208,7 +238,8 @@ impl StorageCluster {
         key: &ShardKey,
         data: &[u8],
     ) -> Result<WriteAck, ShardIoError> {
-        self.local_map.write_payload_shard(location, key, data)
+        self.local_map
+            .write_payload_shard(self.operation_epoch(), location, key, data)
     }
 
     pub fn read_payload_shard(
@@ -217,7 +248,8 @@ impl StorageCluster {
         key: &ShardKey,
         expected: WriteAck,
     ) -> Result<Vec<u8>, ShardIoError> {
-        self.local_map.read_payload_shard(location, key, expected)
+        self.local_map
+            .read_payload_shard(self.operation_epoch(), location, key, expected)
     }
 
     pub fn read_payload_shard_into(
@@ -228,7 +260,7 @@ impl StorageCluster {
         dst: &mut [u8],
     ) -> Result<(), ShardIoError> {
         self.local_map
-            .read_payload_shard_into(location, key, expected, dst)
+            .read_payload_shard_into(self.operation_epoch(), location, key, expected, dst)
     }
 
     pub fn delete_payload_shard(
@@ -236,7 +268,8 @@ impl StorageCluster {
         location: ShardLocation,
         key: &ShardKey,
     ) -> Result<(), ShardIoError> {
-        self.local_map.delete_payload_shard(location, key)
+        self.local_map
+            .delete_payload_shard(self.operation_epoch(), location, key)
     }
 
     pub fn write_direct_put_segment_payload_shards(
