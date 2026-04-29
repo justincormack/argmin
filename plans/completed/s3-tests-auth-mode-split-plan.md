@@ -8,7 +8,9 @@ Make the external `s3-tests` ownership mode explicit and easy to audit:
 - Public access tests should live in public-access-focused files instead of being scattered through feature files.
 - Add targeted ACL-mode coverage for important feature surfaces that are currently covered mostly through the BOE default path.
 
-This is a test-suite organization and coverage project. It should not change server behavior.
+This is primarily a test-suite organization and coverage project. The main
+split work should not change server behavior; the final AWS verification did
+uncover one S3 conformance fix for `PutObject` without `Content-Length`.
 
 ## Definitions
 
@@ -17,52 +19,34 @@ This is a test-suite organization and coverage project. It should not change ser
 - **Public access test**: the operation under test checks anonymous access, AllUsers or AuthenticatedUsers grants, public canned ACLs, public bucket policies, or PublicAccessBlock interaction with public access.
 - **Transition test**: the operation under test changes ownership mode or checks behavior before/after BOE enablement. These should stay with ownership-focused tests unless the scenario is mainly a public-access case.
 
-## Current Shape
+## Final Shape
 
 The main helper `s3_tests::create_bucket` builds a normal create request and does not set an ownership override. The HTTP frontend defaults missing `x-amz-object-ownership` to `BucketOwnerEnforced`, so most ordinary tests are already BOE/default.
 
-ACL-mode tests currently appear in several places:
+ACL-mode tests now have explicit homes:
 
-- `access_matrix.rs`: bucket ACL x object ACL matrix; entirely legacy/public ACL oriented.
-- `bucket_acl.rs`: bucket ACL surface; mostly ACL-mode, with one BOE/default rejection case.
-- `bucket_anon.rs`: anonymous/private/public behavior; public ACL helper driven.
-- `public_access_block.rs`: mixes PAB configuration tests, public ACL blocking, ignore-public-ACL behavior, and public policy restriction.
-- Feature files with ACL-mode cases mixed in: `object_crud.rs`, `multipart.rs`, `copy_object.rs`, `versioning.rs`, `range.rs`, `post_object.rs`, `tagging.rs`, `request_checksums.rs`, `expected_bucket_owner.rs`, `bucket_crud.rs`, `bucket_policy.rs`, and `ownership.rs`.
+- `bucket_acl.rs`: bucket ACL surface and bucket ACL setup/recreate behavior.
+- `object_crud_acl.rs`, `multipart_acl.rs`, `copy_object_acl.rs`, `versioning_acl.rs`, `request_checksums_acl.rs`, and `expected_bucket_owner_acl.rs`: legacy object/subresource ACL behavior split out of feature files.
+- `sse_c_acl.rs`, `bucket_encryption_acl.rs`, `object_lock_acl.rs`, `lifecycle_acl.rs`, `checksums_acl.rs`, `conditional_acl.rs`, `website_redirect_acl.rs`, and `headers_acl.rs`: focused ACL-mode smoke coverage for feature surfaces whose broad coverage remains in BOE/default files.
+- `bucket_policy.rs`: bucket-policy condition coverage remains there, including ACL-related condition keys, because the feature under test is policy evaluation.
+- `ownership.rs`: ownership-control and ownership-transition behavior remains there; public-access-specific ownership cases moved out.
 
-## Target File Layout
+Public access tests now have explicit homes:
 
-Use suffixes for auth-mode-specific tests:
-
-- Keep feature files such as `object_crud.rs`, `multipart.rs`, `sse_c.rs`, and `versioning.rs` for BOE/default behavior.
-- Move legacy ACL-mode cases into `*_acl.rs` files:
-  - `object_crud_acl.rs`
-  - `multipart_acl.rs`
-  - `copy_object_acl.rs`
-  - `versioning_acl.rs`
-  - `request_checksums_acl.rs`
-  - `expected_bucket_owner_acl.rs`
-  - `bucket_crud_acl.rs`
-- Rename or replace ACL-dominant files:
-  - `access_matrix.rs` -> `public_access_acl_matrix.rs`
-  - `bucket_acl.rs` stays as `bucket_acl.rs`, but move BOE-only rejection coverage to ownership or BOE files if it grows.
-- Keep ownership transition behavior in `ownership.rs`, or split later into:
-  - `ownership_create.rs`
-  - `ownership_transition.rs`
-  - `ownership_cross_account_acl.rs`
-
-Public access should be grouped by mechanism:
-
-- `public_access_acl.rs`: anonymous access via public bucket/object ACLs, including public-read/public-read-write and AuthenticatedUsers ACL behavior.
+- `public_access_acl.rs`: anonymous access via public bucket/object ACLs, public-read/public-read-write, AuthenticatedUsers, and public ACL ownership edge cases.
 - `public_access_acl_matrix.rs`: bucket ACL x object ACL matrix.
-- `public_access_block.rs`: CRUD and canonical XML for the PublicAccessBlock subresource.
+- `public_access_block.rs`: PublicAccessBlock CRUD and canonical XML.
 - `public_access_block_acl.rs`: BlockPublicAcls and IgnorePublicAcls behavior for bucket/object ACLs.
 - `public_access_policy.rs`: public bucket policy behavior, BlockPublicPolicy, and RestrictPublicBuckets.
+- `public_access_headers.rs`, `public_access_post_object.rs`, `public_access_bucket_list.rs`, `public_access_cors.rs`, `public_access_range.rs`, and `public_access_object_lock.rs`: feature-specific anonymous/public access behavior split out of the ordinary feature files.
 
-Avoid moving ABAC tests merely because they use a tag value such as `security=public`; those are bucket-policy condition tests, not public-access tests.
+ABAC/tag-condition tests were not moved merely because they used a tag value
+that looked public. Non-public arbitrary tag values were renamed to
+`security=allow/deny` to avoid implying public-access semantics.
 
 ## Helper Cleanup
 
-Add explicit test helpers in `crates/s3-tests/src/helpers.rs` before moving tests:
+Added explicit test helpers in `crates/s3-tests/src/helpers.rs`:
 
 - `create_boe_bucket(client) -> String`
   - Creates a bucket through the default path and documents that BOE is expected.
@@ -73,11 +57,14 @@ Add explicit test helpers in `crates/s3-tests/src/helpers.rs` before moving test
   - Creates or switches a bucket into `ObjectWriter` or `BucketOwnerPreferred` and disables bucket-level PublicAccessBlock when ACL grants need to be public.
 - Keep `create_public_bucket` and `create_public_write_bucket`, but reimplement them through the new ACL helper so setup is consistent.
 
-This should remove local duplicate helpers like `setup_acl_enabled_bucket` and `set_object_writer_ownership` over time.
+Some local duplicate helpers remain in older files, but the shared helpers now
+exist and new split files use them where practical.
 
 ## Coverage Additions
 
-Add focused ACL-mode smoke coverage for surfaces currently dominated by BOE/default tests. These should be small, not a duplicate of every BOE case.
+Added focused ACL-mode smoke coverage for surfaces previously dominated by
+BOE/default tests. These are intentionally small and do not duplicate every BOE
+case.
 
 First priority:
 
@@ -105,15 +92,18 @@ Do not add broad matrix duplication until these smoke tests have found no gaps.
 
 ## Migration Order
 
-1. Add shared helper functions and update a small number of existing tests to use them.
-2. Move public access tests out of unrelated feature files into `public_access_*` files. Run `cargo test -p s3-tests -- --list` before and after and verify the total count is unchanged.
-3. Move ACL-mode cases out of mixed feature files into `*_acl.rs`. Again verify test count and names.
-4. Add `sse_c_acl.rs` and the first priority ACL-mode smoke tests.
-5. Add the remaining first-priority ACL smoke tests.
-6. Re-run local `cargo test -p s3-tests`, then AWS `./scripts/aws-tests` before committing.
+Completed:
+
+1. Added shared helper functions and updated representative tests to use them.
+2. Moved public access tests out of unrelated feature files into `public_access_*` files.
+3. Moved ACL-mode cases out of mixed feature files into `*_acl.rs` files where mode is relevant.
+4. Added `sse_c_acl.rs` and first-priority ACL-mode smoke tests.
+5. Added second-priority ACL smoke tests.
+6. Ran local `s3-tests` and targeted AWS reruns for failing groups after the final fixes.
 
 ## Progress
 
+- Plan implementation is complete as of commit `0e6ef00` plus the earlier split/smoke-test commits.
 - Added explicit ownership helpers and routed public ACL setup through `create_acl_enabled_bucket`.
 - Added the initial `sse_c_acl.rs` smoke coverage early because it was isolated and did not depend on the file-move sequence.
 - Split `public_access_block_acl.rs` out of `public_access_block.rs` for BlockPublicAcls and IgnorePublicAcls behavior over bucket/object ACLs.
@@ -142,14 +132,21 @@ Do not add broad matrix duplication until these smoke tests have found no gaps.
 - Split public-write/anonymous object-lock access checks from `object_lock.rs` into `public_access_object_lock.rs`, renamed non-public ABAC tag values there to `security=allow/deny`, and added `object_lock_acl.rs` ObjectWriter smoke coverage for retention, legal hold, PutObject headers, and multipart headers.
 - Added `lifecycle_acl.rs` ObjectWriter lifecycle CRUD smoke coverage and `checksums_acl.rs` ObjectWriter single-part and multipart checksum smoke coverage.
 - Added second-priority ObjectWriter smoke coverage in `conditional_acl.rs` and `website_redirect_acl.rs`, plus a raw signed ACL header acceptance case in `headers_acl.rs`.
+- Full AWS verification uncovered follow-up test-harness and conformance fixes:
+  - raw HTTP helper now sends `Content-Length` for normal PUT/POST requests and has an explicit malformed-request opt-out;
+  - `PutObject` without `Content-Length` is now covered and rejected with `MissingContentLength`;
+  - transient hyper closed/incomplete-message errors are classified as retryable connector IO;
+  - lifecycle ACL deletion waits through AWS delete convergence;
+  - SSE-C cleanup aborts visible multipart uploads and retries bucket deletion on AWS cleanup races;
+  - atomic read tests retry the whole scenario on external-S3 transport timeouts.
 
 ## Verification Checklist
 
-- `cargo fmt`
-- `cargo test -p s3-tests -- --list`
-- `cargo test -p s3-tests`
-- `cargo clippy --all-targets --all-features -- -D warnings`
-- `./scripts/aws-tests`
+- `cargo fmt`: run during the implementation slices.
+- `cargo nextest run -p s3-tests`: passed after final fixes (`1452 passed`).
+- `cargo clippy --all-targets --all-features -- -D warnings`: passed during the smoke-test slices before final AWS-failure fixes.
+- Targeted AWS reruns for the failing groups: passed per operator report.
+- Full `./scripts/aws-tests`: recommended once more if a final end-to-end AWS green run is required for close-out; not recorded as clean after commit `0e6ef00`.
 
 For pure file moves, compare test inventory before/after so coverage is preserved:
 
