@@ -197,14 +197,44 @@ impl Coordinator {
             };
             #[cfg(test)]
             if should_probe_direct_put_commit(authorized.bucket()) {
-                let object_pg_ready = self
+                let object_pg_ready = match self
                     .storage_node
                     .try_probe_object_pg_available(
                         authorized.bucket_typed(),
                         authorized.key_typed(),
                     )
-                    .map_err(Coordinator::map_object_pg_action_error)?;
+                    .map_err(Coordinator::map_object_pg_action_error)
+                {
+                    Ok(object_pg_ready) => object_pg_ready,
+                    Err(error) => {
+                        self.storage_node.delete_direct_put_segment_payload_shards(
+                            written_segment.data_pg_id,
+                            written_segment.ec,
+                            &segment_okh,
+                            segment_vid,
+                            &written_segment.written_shards,
+                        );
+                        let _ = self.storage_node.release_object_generation_reservation(
+                            authorized.bucket_typed(),
+                            authorized.key_typed(),
+                            &commit_req.generation_reservation_id,
+                        );
+                        return Err(error);
+                    }
+                };
                 if !object_pg_ready {
+                    self.storage_node.delete_direct_put_segment_payload_shards(
+                        written_segment.data_pg_id,
+                        written_segment.ec,
+                        &segment_okh,
+                        segment_vid,
+                        &written_segment.written_shards,
+                    );
+                    let _ = self.storage_node.release_object_generation_reservation(
+                        authorized.bucket_typed(),
+                        authorized.key_typed(),
+                        &commit_req.generation_reservation_id,
+                    );
                     return Err(ServerError::InternalError {
                         reason: "test probe: object pg still locked before direct put commit"
                             .to_string(),

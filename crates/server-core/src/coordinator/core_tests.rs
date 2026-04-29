@@ -3971,8 +3971,7 @@ fn put_get_object_trailing_slash_key() {
 
 /// Compute shard file path on disk for a given object and shard index.
 fn shard_file_path(coord: &Coordinator, bucket: &str, key: &str, shard_index: u8) -> PathBuf {
-    let metadata_node = coord.storage_node.test_metadata_storage_node();
-    let (data_pg_id, okh, generation_id) = {
+    let (data_pg_id, okh, generation_id, ec) = {
         let bucket_name = trusted_bucket_name(bucket);
         let object_key = trusted_object_key(key);
         let record = coord
@@ -3984,7 +3983,15 @@ fn shard_file_path(coord: &Coordinator, bucket: &str, key: &str, shard_index: u8
             .test_get_object_segments(&bucket_name, &object_key, record.version_id())
             .unwrap();
         if let Some(segment) = segments.first() {
-            (segment.data_pg_id, segment.segment_okh, segment.segment_vid)
+            (
+                segment.data_pg_id,
+                segment.segment_okh,
+                segment.segment_vid,
+                EcShape {
+                    k: segment.ec_k,
+                    m: segment.ec_m,
+                },
+            )
         } else {
             let live = record.as_live().expect("expected live object");
             (
@@ -3996,16 +4003,14 @@ fn shard_file_path(coord: &Coordinator, bucket: &str, key: &str, shard_index: u8
                 ),
                 object_key_hash(bucket_name.as_str(), object_key.as_str()),
                 live.generation_id,
+                live.ec,
             )
         }
     };
-    let shard_key = ShardKey::new(&okh, generation_id.get(), shard_index);
-    metadata_node
-        .data_dir()
-        .join(format!("pg-{data_pg_id:04}"))
-        .join("shards")
-        .join(shard_key.hex_prefix())
-        .join(shard_key.hex())
+    coord
+        .storage_node
+        .test_payload_shard_file_path(data_pg_id, ec, &okh, generation_id, shard_index)
+        .unwrap()
 }
 
 /// Delete a specific shard file from disk.

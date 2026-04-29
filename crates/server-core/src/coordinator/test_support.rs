@@ -398,6 +398,10 @@ pub(crate) fn assert_shard_set_deleted(
                 .storage_node
                 .test_shard_exists(data_pg_id, &shard_key)
                 .unwrap()
+                && !coord
+                    .storage_node
+                    .test_payload_shard_file_exists(data_pg_id, ec, okh, generation_id, i as u8)
+                    .unwrap()
         }),
         "expected shard-set to be reclaimed for generation {generation_id:?}"
     );

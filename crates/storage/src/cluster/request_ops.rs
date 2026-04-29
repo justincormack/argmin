@@ -571,8 +571,144 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<bool, ObjectPgActionError> {
-        self.single_node
-            .reclaim_object_payload_if_unleased(bucket, key, generation_id)
+        enum ReclaimPayload {
+            Segments(ObjectSegmentsReclaimRecord),
+            Multipart(MultipartReclaimRecord),
+        }
+
+        if self
+            .single_node
+            .object_payload_lease_count(bucket, key, generation_id)
+            != 0
+        {
+            return Ok(false);
+        }
+
+        let meta_pg_id = self.single_node.pg_topology().object_pg_for(bucket, key);
+        let reclaim = {
+            let meta_pg = self.single_node.get_pg(meta_pg_id)?;
+            if self
+                .single_node
+                .object_payload_lease_count(bucket, key, generation_id)
+                != 0
+            {
+                return Ok(false);
+            }
+
+            if let Some(reclaim) =
+                PgMetadataStore::get_object_segments_reclaim(&*meta_pg, bucket, key, generation_id)?
+            {
+                Some(ReclaimPayload::Segments(reclaim))
+            } else {
+                PgMetadataStore::get_multipart_reclaim(&*meta_pg, bucket, key, generation_id)?
+                    .map(ReclaimPayload::Multipart)
+            }
+        };
+
+        let Some(reclaim) = reclaim else {
+            return Ok(false);
+        };
+
+        if self
+            .single_node
+            .object_payload_lease_count(bucket, key, generation_id)
+            != 0
+        {
+            return Ok(false);
+        }
+
+        match &reclaim {
+            ReclaimPayload::Segments(reclaim) => {
+                for segment in &reclaim.segments {
+                    self.delete_reclaim_shard_set(
+                        segment.data_pg_id,
+                        &segment.segment_okh,
+                        segment.segment_vid,
+                        segment.ec,
+                    )?;
+                }
+            }
+            ReclaimPayload::Multipart(reclaim) => {
+                for part in &reclaim.parts {
+                    match part {
+                        MultipartReclaimPartRecord::ShardSet {
+                            part_okh,
+                            part_vid,
+                            data_pg_id,
+                            ec,
+                            ..
+                        } => {
+                            self.delete_reclaim_shard_set(*data_pg_id, part_okh, *part_vid, *ec)?;
+                        }
+                        MultipartReclaimPartRecord::Segments { segments, .. } => {
+                            for segment in segments {
+                                self.delete_reclaim_shard_set(
+                                    segment.data_pg_id,
+                                    &segment.segment_okh,
+                                    segment.segment_vid,
+                                    segment.ec,
+                                )?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let meta_pg = self.single_node.get_pg(meta_pg_id)?;
+        if self
+            .single_node
+            .object_payload_lease_count(bucket, key, generation_id)
+            != 0
+        {
+            return Ok(false);
+        }
+
+        match reclaim {
+            ReclaimPayload::Segments(_) => PgMetadataStore::delete_object_segments_reclaim(
+                &*meta_pg,
+                bucket,
+                key,
+                generation_id,
+            )?,
+            ReclaimPayload::Multipart(_) => {
+                PgMetadataStore::delete_multipart_reclaim(&*meta_pg, bucket, key, generation_id)?
+            }
+        }
+        self.single_node.enqueue_bucket_delete_finalize(bucket);
+        Ok(true)
+    }
+
+    fn delete_reclaim_shard_set(
+        &self,
+        data_pg_id: u32,
+        okh: &[u8; 16],
+        generation_id: GenerationId,
+        ec: EcShape,
+    ) -> Result<(), ObjectPgActionError> {
+        let data_pg = DataPgId::new(PgId::new(data_pg_id));
+        let placement_key = super::segment_payload_placement_key(okh, generation_id);
+        let locations = self
+            .place_payload_shards(data_pg, ec, &placement_key)
+            .map_err(super::cluster_build_error_to_store)?;
+        let total = ec.k as usize + ec.m as usize;
+
+        for i in 0..total {
+            let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
+            if let Some(location) = locations.get(i).copied() {
+                self.delete_payload_shard(location, &shard_key)
+                    .map_err(|error| {
+                        super::shard_io_error_to_store(error, "delete placed reclaim shard")
+                    })?;
+            }
+        }
+
+        let data_pg = self.single_node.get_pg(data_pg_id)?;
+        for i in 0..total {
+            let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
+            data_pg.delete_shard(&shard_key)?;
+        }
+        Ok(())
     }
 
     pub fn create_put_object_stream_session<T, E>(

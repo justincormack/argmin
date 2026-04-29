@@ -1,17 +1,19 @@
 use std::sync::Arc;
 
+use ec::{EcConfig, ErasureCodec};
 use placement::NodeId;
 
 pub use local::{LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig};
 
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 use crate::node::SharedStorageNode;
+use crate::traits::ShardStore;
 use crate::types::{
     BucketName, ClusterEpoch, CommitDirectPutObjectReq, DataPgId, DirectPutCommitSnapshot,
     DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
-    ObjectEncryption, ObjectKey, PrepareStreamUploadSegmentAppendReq, SegmentStoredBytesRequest,
-    SessionId, ShardIndex, ShardKey, StreamUploadRecord, StreamUploadSegmentRecord,
-    StreamUploadTarget, WriteAck, WrittenShardAck,
+    ObjectEncryption, ObjectKey, PgId, PrepareStreamUploadSegmentAppendReq,
+    SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey, StreamUploadRecord,
+    StreamUploadSegmentRecord, StreamUploadTarget, WriteAck, WrittenShardAck,
 };
 use crate::ObjectPgActionError;
 
@@ -193,14 +195,61 @@ impl StorageCluster {
         segment_okh: &[u8; 16],
         data: &[u8],
     ) -> Result<DirectPutWrittenSegment, StoreError> {
-        self.single_node.write_direct_put_segment_shards(
-            bucket,
-            key,
-            generation_id,
-            segment_index,
+        let ec = self.default_payload_ec_shape();
+        let data_pg_id = self
+            .single_node
+            .pg_topology()
+            .object_generation_segment_data_pg(bucket, key, generation_id, segment_index)
+            .get();
+        let data_pg = DataPgId::new(PgId::new(data_pg_id));
+        let segment_vid = generation_id;
+        let placement_key = segment_payload_placement_key(segment_okh, segment_vid);
+        let locations = self
+            .place_payload_shards(data_pg, ec, &placement_key)
+            .map_err(cluster_build_error_to_store)?;
+        let written_shards = self.single_node.write_erasure_coded_segment_shards_with(
             segment_okh,
+            segment_vid,
             data,
-        )
+            ec,
+            |shard_batch| {
+                let mut written_acks = Vec::with_capacity(shard_batch.len());
+                let mut written_for_cleanup = Vec::with_capacity(shard_batch.len());
+                for (location, (shard_key, shard_payload)) in
+                    locations.iter().zip(shard_batch.iter())
+                {
+                    match self.write_payload_shard(*location, shard_key, shard_payload) {
+                        Ok(ack) => {
+                            written_acks.push((shard_key.clone(), ack));
+                            written_for_cleanup.push(WrittenShardAck {
+                                key: shard_key.clone(),
+                                ack,
+                            });
+                        }
+                        Err(error) => {
+                            self.delete_segment_payload_shards_best_effort(
+                                data_pg,
+                                ec,
+                                segment_okh,
+                                segment_vid,
+                                &written_for_cleanup,
+                            );
+                            return Err(shard_io_error_to_store(
+                                error,
+                                "write placed direct PUT shard",
+                            ));
+                        }
+                    }
+                }
+                Ok(written_acks)
+            },
+        )?;
+
+        Ok(DirectPutWrittenSegment {
+            data_pg_id,
+            ec,
+            written_shards,
+        })
     }
 
     pub fn reserve_put_object_generation(
@@ -229,8 +278,36 @@ impl StorageCluster {
         written_shards: &[WrittenShardAck],
         action: impl FnOnce(DirectPutCommitSnapshot) -> Result<(), E>,
     ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, ObjectPgActionError> {
-        self.single_node
-            .commit_direct_put_object(req, written_shards, action)
+        let result = self
+            .single_node
+            .commit_direct_put_object(req, written_shards, action);
+        if matches!(result, Err(_) | Ok(Err(_))) {
+            self.delete_direct_put_segment_payload_shards(
+                req.data_pg_id,
+                req.ec,
+                &req.segment_okh,
+                req.segment_vid,
+                written_shards,
+            );
+        }
+        result
+    }
+
+    pub fn delete_direct_put_segment_payload_shards(
+        &self,
+        data_pg_id: u32,
+        ec: EcShape,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        written_shards: &[WrittenShardAck],
+    ) {
+        self.delete_segment_payload_shards_best_effort(
+            DataPgId::new(PgId::new(data_pg_id)),
+            ec,
+            segment_okh,
+            segment_vid,
+            written_shards,
+        );
     }
 
     pub fn create_put_object_stream_session_record(
@@ -313,6 +390,360 @@ impl StorageCluster {
         req: SegmentStoredBytesRequest,
         dst: &mut Vec<u8>,
     ) -> Result<(), StoreError> {
-        self.single_node.read_segment_stored_bytes_into(req, dst)
+        match self.try_read_placed_segment_stored_bytes_into(req, dst) {
+            Ok(true) => Ok(()),
+            Ok(false) | Err(StoreError::NotFound) => {
+                self.single_node.read_segment_stored_bytes_into(req, dst)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn try_read_placed_segment_stored_bytes_into(
+        &self,
+        req: SegmentStoredBytesRequest,
+        dst: &mut Vec<u8>,
+    ) -> Result<bool, StoreError> {
+        let k = req.ec.k as usize;
+        let padded = req.stored_size.div_ceil(k) * k;
+        let shard_size = padded / k;
+
+        if shard_size == 0 {
+            dst.clear();
+            return Ok(true);
+        }
+
+        if self.try_read_placed_segment_direct_into(req, dst)? {
+            return Ok(true);
+        }
+
+        self.try_read_placed_segment_recovery_into(req, dst)
+    }
+
+    fn try_read_placed_segment_direct_into(
+        &self,
+        req: SegmentStoredBytesRequest,
+        dst: &mut Vec<u8>,
+    ) -> Result<bool, StoreError> {
+        let Some(expected_crc64) = req.segment_crc64 else {
+            return Ok(false);
+        };
+
+        let locations = self.segment_payload_locations(&req)?;
+        let k = req.ec.k as usize;
+        let padded = req.stored_size.div_ceil(k) * k;
+        let shard_size = padded / k;
+        dst.resize(padded, 0);
+        for (shard_index, location) in locations.iter().take(k).enumerate() {
+            let shard_key =
+                ShardKey::new(&req.segment_okh, req.segment_vid.get(), shard_index as u8);
+            let ack = match self.load_payload_shard_ack(req.data_pg_id, &shard_key) {
+                Ok(ack) => ack,
+                Err(StoreError::NotFound) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if ack.stored_size != shard_size as u64 {
+                return Ok(false);
+            }
+            let start = shard_index * shard_size;
+            let end = start + shard_size;
+            match self.read_payload_shard_into(*location, &shard_key, ack, &mut dst[start..end]) {
+                Ok(()) => {}
+                Err(ShardIoError::Store {
+                    source: StoreError::PgNotFound { pg_id },
+                    ..
+                }) => return Err(StoreError::PgNotFound { pg_id }),
+                Err(_) => return Ok(false),
+            }
+        }
+
+        dst.truncate(req.stored_size);
+        let actual_crc64 = checksum::crc64::checksum(dst);
+        Ok(actual_crc64 == expected_crc64)
+    }
+
+    fn try_read_placed_segment_recovery_into(
+        &self,
+        req: SegmentStoredBytesRequest,
+        dst: &mut Vec<u8>,
+    ) -> Result<bool, StoreError> {
+        let k = req.ec.k as usize;
+        let m = req.ec.m as usize;
+        let padded = req.stored_size.div_ceil(k) * k;
+        let shard_size = padded / k;
+        let locations = self.segment_payload_locations(&req)?;
+        let mut all_shards = vec![None; k + m];
+        let mut present_count = 0usize;
+
+        for shard_index in 0..k {
+            self.try_load_placed_segment_shard(
+                req.data_pg_id,
+                &req.segment_okh,
+                req.segment_vid,
+                &locations,
+                shard_index,
+                shard_size,
+                &mut all_shards,
+                &mut present_count,
+            )?;
+        }
+
+        if present_count < k {
+            for shard_index in k..(k + m) {
+                if present_count >= k {
+                    break;
+                }
+                self.try_load_placed_segment_shard(
+                    req.data_pg_id,
+                    &req.segment_okh,
+                    req.segment_vid,
+                    &locations,
+                    shard_index,
+                    shard_size,
+                    &mut all_shards,
+                    &mut present_count,
+                )?;
+            }
+        }
+
+        if present_count < k {
+            return Ok(false);
+        }
+
+        let mut recovered = None;
+        let mut recovered_ranges = vec![None; k];
+
+        if !(0..k).all(|i| all_shards[i].is_some()) {
+            let missing_needed: Vec<usize> = (0..k).filter(|&i| all_shards[i].is_none()).collect();
+            let present_indices: Vec<usize> =
+                (0..(k + m)).filter(|&i| all_shards[i].is_some()).collect();
+            let present_refs: Vec<&[u8]> = present_indices
+                .iter()
+                .map(|&i| all_shards[i].as_ref().unwrap().as_slice())
+                .collect();
+            let codec = erasure_codec_for_shape(req.ec, "build segment recovery codec")?;
+            let recovered_len = missing_needed.len() * shard_size;
+            let mut recovered_buf = vec![0; recovered_len];
+            let mut output_refs: Vec<&mut [u8]> = recovered_buf
+                .chunks_exact_mut(shard_size)
+                .take(missing_needed.len())
+                .collect();
+
+            codec
+                .reconstruct(
+                    &present_indices,
+                    &present_refs,
+                    &missing_needed,
+                    &mut output_refs,
+                )
+                .map_err(|error| StoreError::ErasureCoding {
+                    context: "reconstruct placed segment shards",
+                    reason: error.to_string(),
+                })?;
+
+            for (slot, &missing_idx) in missing_needed.iter().enumerate() {
+                let start = slot * shard_size;
+                recovered_ranges[missing_idx] = Some((start, start + shard_size));
+            }
+            recovered = Some(recovered_buf);
+        }
+
+        dst.clear();
+        dst.reserve(padded);
+        for (idx, shard) in all_shards.iter().take(k).enumerate() {
+            if let Some(shard) = shard.as_ref() {
+                dst.extend_from_slice(shard);
+            } else if let Some((start, end)) = recovered_ranges[idx] {
+                let recovered_buf = recovered.as_ref().unwrap();
+                dst.extend_from_slice(&recovered_buf[start..end]);
+            } else {
+                unreachable!("missing reconstructed shard for data index {idx}");
+            }
+        }
+        dst.truncate(req.stored_size);
+        if let Some(expected_crc64) = req.segment_crc64 {
+            let actual_crc64 = checksum::crc64::checksum(dst);
+            if actual_crc64 != expected_crc64 {
+                return Err(StoreError::IntegrityError {
+                    expected: expected_crc64,
+                    actual: actual_crc64,
+                });
+            }
+        }
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_load_placed_segment_shard(
+        &self,
+        data_pg_id: u32,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        locations: &[ShardLocation],
+        shard_index: usize,
+        shard_size: usize,
+        all_shards: &mut [Option<Vec<u8>>],
+        present_count: &mut usize,
+    ) -> Result<(), StoreError> {
+        let Some(location) = locations.get(shard_index).copied() else {
+            return Ok(());
+        };
+        let shard_key = ShardKey::new(segment_okh, segment_vid.get(), shard_index as u8);
+        let ack = match self.load_payload_shard_ack(data_pg_id, &shard_key) {
+            Ok(ack) => ack,
+            Err(StoreError::NotFound) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if ack.stored_size != shard_size as u64 {
+            return Ok(());
+        }
+        match self.read_payload_shard(location, &shard_key, ack) {
+            Ok(shard) => {
+                all_shards[shard_index] = Some(shard);
+                *present_count += 1;
+            }
+            Err(ShardIoError::Store {
+                source: StoreError::PgNotFound { pg_id },
+                ..
+            }) => return Err(StoreError::PgNotFound { pg_id }),
+            Err(_) => {}
+        }
+        Ok(())
+    }
+
+    fn load_payload_shard_ack(
+        &self,
+        data_pg_id: u32,
+        shard_key: &ShardKey,
+    ) -> Result<WriteAck, StoreError> {
+        let pg = self.single_node.get_pg(data_pg_id)?;
+        let stat = pg.stat_shard(shard_key)?;
+        Ok(WriteAck {
+            crc64: stat.crc64,
+            stored_size: stat.size,
+        })
+    }
+
+    fn segment_payload_locations(
+        &self,
+        req: &SegmentStoredBytesRequest,
+    ) -> Result<Vec<ShardLocation>, StoreError> {
+        let data_pg_id = DataPgId::new(PgId::new(req.data_pg_id));
+        let placement_key = segment_payload_placement_key(&req.segment_okh, req.segment_vid);
+        self.place_payload_shards(data_pg_id, req.ec, &placement_key)
+            .map_err(cluster_build_error_to_store)
+    }
+
+    fn delete_segment_payload_shards_best_effort(
+        &self,
+        data_pg_id: DataPgId,
+        ec: EcShape,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        written_shards: &[WrittenShardAck],
+    ) {
+        let placement_key = segment_payload_placement_key(segment_okh, segment_vid);
+        let Ok(locations) = self.place_payload_shards(data_pg_id, ec, &placement_key) else {
+            return;
+        };
+
+        for written in written_shards {
+            let shard_index = usize::from(written.key.shard_index().get());
+            let Some(location) = locations.get(shard_index).copied() else {
+                continue;
+            };
+            let _ = self.delete_payload_shard(location, &written.key);
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_payload_shard_file_path(
+        &self,
+        data_pg_id: u32,
+        ec: EcShape,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        shard_index: u8,
+    ) -> Result<std::path::PathBuf, StoreError> {
+        let data_pg = DataPgId::new(PgId::new(data_pg_id));
+        let placement_key = segment_payload_placement_key(segment_okh, segment_vid);
+        let locations = self
+            .place_payload_shards(data_pg, ec, &placement_key)
+            .map_err(cluster_build_error_to_store)?;
+        let location = locations
+            .get(usize::from(shard_index))
+            .ok_or_else(|| StoreError::Io {
+                context: "resolve placed payload shard index",
+                source: std::io::Error::other(format!(
+                    "shard index {shard_index} outside {} placed shards",
+                    locations.len()
+                )),
+            })?;
+        let shard_key = ShardKey::new(segment_okh, segment_vid.get(), shard_index);
+        let node = self
+            .local_map
+            .node(location.node_id())
+            .ok_or_else(|| StoreError::Io {
+                context: "resolve placed payload shard node",
+                source: std::io::Error::other(format!(
+                    "unknown local node {}",
+                    location.node_id().as_u32()
+                )),
+            })?;
+        Ok(node
+            .data_dir()
+            .join(format!("pg-{data_pg_id:04}"))
+            .join("shards")
+            .join(shard_key.hex_prefix())
+            .join(shard_key.hex()))
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_payload_shard_file_exists(
+        &self,
+        data_pg_id: u32,
+        ec: EcShape,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        shard_index: u8,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .test_payload_shard_file_path(data_pg_id, ec, segment_okh, segment_vid, shard_index)?
+            .exists())
+    }
+}
+
+fn segment_payload_placement_key(segment_okh: &[u8; 16], segment_vid: GenerationId) -> [u8; 24] {
+    let mut key = [0u8; 24];
+    key[..16].copy_from_slice(segment_okh);
+    key[16..].copy_from_slice(&segment_vid.get().to_be_bytes());
+    key
+}
+
+fn erasure_codec_for_shape(ec: EcShape, context: &'static str) -> Result<ErasureCodec, StoreError> {
+    let config = EcConfig::new(ec.k, ec.m).map_err(|error| StoreError::ErasureCoding {
+        context,
+        reason: error.to_string(),
+    })?;
+    ErasureCodec::new(config).map_err(|error| StoreError::ErasureCoding {
+        context,
+        reason: error.to_string(),
+    })
+}
+
+fn cluster_build_error_to_store(error: ClusterBuildError) -> StoreError {
+    StoreError::Io {
+        context: "place payload shards",
+        source: std::io::Error::other(error.to_string()),
+    }
+}
+
+fn shard_io_error_to_store(error: ShardIoError, context: &'static str) -> StoreError {
+    match error {
+        ShardIoError::Store { source, .. } => source,
+        other => StoreError::Io {
+            context,
+            source: std::io::Error::other(other.to_string()),
+        },
     }
 }

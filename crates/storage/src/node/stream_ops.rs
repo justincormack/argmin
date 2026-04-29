@@ -23,14 +23,17 @@ enum StaleObjectPayloadMetadata {
 }
 
 impl SharedStorageNode {
-    fn write_erasure_coded_segment_shards(
+    pub(crate) fn write_erasure_coded_segment_shards_with<F>(
         &self,
-        data_pg_id: u32,
         segment_okh: &[u8; 16],
         segment_vid: GenerationId,
         data: &[u8],
         ec: EcShape,
-    ) -> Result<Vec<WrittenShardAck>, StoreError> {
+        write_shards: F,
+    ) -> Result<Vec<WrittenShardAck>, StoreError>
+    where
+        F: FnOnce(&[(ShardKey, &[u8])]) -> Result<Vec<(ShardKey, WriteAck)>, StoreError>,
+    {
         let state = self.ec_write_state(ec)?;
         let k = ec.k as usize;
         let m = ec.m as usize;
@@ -76,7 +79,7 @@ impl SharedStorageNode {
                     shard_payload.as_slice(),
                 ));
             }
-            self.write_shard_files(data_pg_id, &shard_batch)?
+            write_shards(&shard_batch)?
         } else {
             let parity_len = m.checked_mul(shard_size).ok_or(StoreError::ErasureCoding {
                 context: "size parity scratch",
@@ -109,13 +112,30 @@ impl SharedStorageNode {
                     shard_payload,
                 ));
             }
-            self.write_shard_files(data_pg_id, &shard_batch)?
+            write_shards(&shard_batch)?
         };
 
         Ok(written_shards
             .into_iter()
             .map(|(key, ack)| WrittenShardAck { key, ack })
             .collect())
+    }
+
+    fn write_erasure_coded_segment_shards(
+        &self,
+        data_pg_id: u32,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        data: &[u8],
+        ec: EcShape,
+    ) -> Result<Vec<WrittenShardAck>, StoreError> {
+        self.write_erasure_coded_segment_shards_with(
+            segment_okh,
+            segment_vid,
+            data,
+            ec,
+            |shard_batch| self.write_shard_files(data_pg_id, shard_batch),
+        )
     }
 
     pub fn reserve_put_object_generation(

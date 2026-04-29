@@ -602,14 +602,17 @@ Implementation order:
   - write, read, and delete one shard on its assigned local node
   - keep the API shaped like the later remote-node boundary
   - leave metadata operations on the current metadata primary for this phase
-- [ ] 4.4 Move direct PutObject payload writes to per-shard node placement.
+- [x] 4.4 Move direct PutObject payload writes to per-shard node placement.
   - publish object metadata only after all required shard writes complete
   - clean up already-written shards on pre-commit errors
   - test shard files landing under multiple `node-XXXX` stores
-- [ ] 4.5 Move reads to fetch shards from assigned nodes.
-  - preserve the existing direct-read and recovery behavior
-  - test missing shard reconstruction and corrupt shard handling in local
-    multi-node mode
+- [ ] 4.5 Finish placed reads for segment producers.
+  - direct PutObject reads now fetch from assigned nodes using metadata-primary
+    shard ack rows as a Phase 4 bridge
+  - preserve direct-read and recovery behavior as streaming and multipart writes
+    move to placed shards
+  - keep missing shard reconstruction and corrupt shard handling covered in
+    local multi-node mode
 - [ ] 4.6 Move streaming PutObject segment writes and commit cleanup.
   - write staged segment shards to assigned nodes
   - register/publish metadata only after the required shard writes complete
@@ -667,20 +670,39 @@ Phase 4 implementation notes:
    - the implementation is still in-process and file-backed, but coordinator
      request paths can now move to a cluster-shaped shard boundary in Steps
      4.4-4.8
-5. The test harness uses a split topology while metadata routing is still a
+5. Step 4.4 moves direct buffered PutObject payloads onto placed shard IO.
+   - direct PutObject shards are encoded through the existing storage EC helper
+     and written one shard at a time through `StorageCluster` placed shard
+     dispatch
+   - object metadata and shard ack rows are still published through the
+     metadata-primary bridge; direct placed reads use those ack rows for
+     per-shard CRC and size verification until metadata PG routing is moved in
+     Phase 6
+   - failed direct writes, failed direct commits, the test-only pre-commit
+     probe, and object payload reclaim clean up placed shard files
+     best-effort
+   - object payload reclaim also deletes metadata-primary shard rows until
+     Phase 6 removes the metadata-primary bridge
+   - Step 4.8 still owns the later boundary sweep for remaining cleanup paths
+     introduced by streaming and multipart placement work
+   - request-path tests assert direct PutObject shard files land under distinct
+     `node-XXXX` stores, and EC fault-injection tests now manipulate the placed
+     shard file paths
+6. The test harness uses a split topology while metadata routing is still a
    Phase 4 bridge.
    - broad S3, HTTP, auth, and model tests use one metadata PG with the default
      `k=4,m=2` six-node local cluster, preserving the local cluster shape
      without opening unused metadata PG stores
    - those broad request-path tests still use the Phase 4 metadata-primary
-     bridge for metadata and active payload IO until Steps 4.4-4.8 move
-     coordinator paths onto placed shard IO
+     bridge for metadata; direct buffered PutObject payload IO now uses placed
+     shard files, while streaming, multipart, and payload cleanup continue to
+     move in Steps 4.6-4.8
    - tests that specifically exercise metadata PG fanout, merge, pagination, or
      bucket/object PG separation opt into two PGs
    - sparse topology tests keep explicit PG sets such as `[0, 2, 5]`
    - placement and shard IO tests use one PG unless the test checks
      PG-dependent placement
-6. Metadata operations still delegate through the metadata-primary
+7. Metadata operations still delegate through the metadata-primary
    `SharedStorageNode` in Phase 4.
    - only payload shard placement and IO are node-aware at this point
    - the other local node stores are not metadata owners or metadata replicas

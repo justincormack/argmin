@@ -2,7 +2,8 @@ use super::test_helpers;
 use super::test_support::*;
 use super::*;
 use ec::EcConfig;
-use storage::{segment_key_hash, GenerationId, PgTopology, ShardKey};
+use std::collections::BTreeSet;
+use storage::{segment_key_hash, EcShape, GenerationId, PgTopology, ShardKey};
 
 #[test]
 fn stream_put_get_object_readable() {
@@ -383,6 +384,39 @@ fn buffered_put_single_segment_skips_stream_session_rows() {
             )
             .get()
     );
+
+    let segment = &segments[0];
+    let ec = EcShape {
+        k: segment.ec_k,
+        m: segment.ec_m,
+    };
+    let mut placed_node_dirs = BTreeSet::new();
+    for shard_index in 0..ec.k + ec.m {
+        let path = coord
+            .storage_node
+            .test_payload_shard_file_path(
+                segment.data_pg_id,
+                ec,
+                &segment.segment_okh,
+                segment.segment_vid,
+                shard_index,
+            )
+            .unwrap();
+        assert!(
+            path.exists(),
+            "direct PUT shard {shard_index} should exist at {}",
+            path.display()
+        );
+        let node_dir = path
+            .ancestors()
+            .nth(4)
+            .expect("payload shard path should include a node directory")
+            .file_name()
+            .unwrap()
+            .to_owned();
+        placed_node_dirs.insert(node_dir);
+    }
+    assert_eq!(placed_node_dirs.len(), usize::from(ec.k + ec.m));
     assert!(coord
         .storage_node
         .test_list_all_stream_uploads()
@@ -454,6 +488,19 @@ fn failed_buffered_put_before_commit_leaves_no_generation_reservation_or_shards(
                 .test_shard_exists(data_pg_id, &shard_key)
                 .unwrap(),
             "failed direct PUT must not leave shard {shard_index}"
+        );
+        assert!(
+            !coord
+                .storage_node
+                .test_payload_shard_file_exists(
+                    data_pg_id,
+                    ec,
+                    &segment_okh,
+                    generation_id,
+                    shard_index,
+                )
+                .unwrap(),
+            "failed direct PUT must not leave placed shard file {shard_index}"
         );
     }
 
