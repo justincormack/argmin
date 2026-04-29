@@ -337,6 +337,23 @@ fn signed_put(bucket: &str, key: &str, body: &[u8]) -> (u16, String) {
     (status, body_str)
 }
 
+fn signed_put_without_content_length(bucket: &str, key: &str, body: &[u8]) -> (u16, String) {
+    let path = format!("/{}/{}", bucket, key);
+    let body_hash = sha256_hex(body);
+    let s = Signer::new("PUT", &path).body_hash(&body_hash).sign();
+    let url = format!("{}{}", CTX.endpoint(), path);
+    let mut resp = agent()
+        .put(&url)
+        .header("Authorization", &s.authorization)
+        .header("x-amz-date", &s.amz_date)
+        .header("x-amz-content-sha256", &s.amz_content_sha256)
+        .send_without_content_length(body)
+        .expect("transport error");
+    let status = resp.status().as_u16();
+    let body_str = resp.body_mut().read_to_string().unwrap_or_default();
+    (status, body_str)
+}
+
 fn signed_get(bucket: &str, key: &str, query: &str) -> (u16, Vec<(String, String)>, String) {
     let path = format!("/{}/{}", bucket, key);
     let url = if query.is_empty() {
@@ -1258,6 +1275,20 @@ fn test_put_empty_body() {
         let (status, _) = signed_put(&bucket, "obj", b"");
         assert_eq!(status, 200);
         cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_put_empty_body_without_content_length_rejected() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let (status, body) = signed_put_without_content_length(&bucket, "obj", b"");
+        assert_eq!(
+            status, 411,
+            "expected MissingContentLength for PutObject without Content-Length, got {status}: {body}"
+        );
+        assert_error_code(&body, "MissingContentLength");
+        cleanup(&bucket, &[]).await;
     });
 }
 

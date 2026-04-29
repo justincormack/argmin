@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::error::Error as _;
 use std::fmt;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -154,9 +155,15 @@ fn build_tls_config_with_custom_ca(tls_ca_pem: &[u8]) -> ClientConfig {
 
 fn classify_hyper_error(err: hyper_util::client::legacy::Error) -> ConnectorError {
     let is_connect = err.is_connect();
+    let is_transient_http = err
+        .source()
+        .and_then(|source| source.downcast_ref::<hyper::Error>())
+        .is_some_and(|source| source.is_closed() || source.is_incomplete_message());
     let boxed = Box::new(err);
     if is_connect {
         ConnectorError::io(boxed).never_connected()
+    } else if is_transient_http {
+        ConnectorError::io(boxed)
     } else {
         ConnectorError::other(boxed, None)
     }

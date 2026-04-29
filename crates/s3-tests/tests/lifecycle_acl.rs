@@ -21,7 +21,7 @@ async fn assert_lifecycle_deleted_eventually(bucket: &str) {
             .send()
             .await;
 
-        if err_status(&result) == 404 {
+        if result.is_err() && err_status(&result) == 404 {
             assert_s3_err_code(&result, "NoSuchLifecycleConfiguration");
             return;
         }

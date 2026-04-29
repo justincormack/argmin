@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
-use hyper::header::{HeaderName, HeaderValue};
+use hyper::header::{HeaderName, HeaderValue, CONTENT_LENGTH};
 use hyper::{Method, StatusCode, Uri};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::connect::HttpConnector as HyperHttpConnector;
@@ -50,6 +50,7 @@ pub struct RequestBuilder {
     method: Method,
     uri: String,
     headers: Vec<(String, String)>,
+    auto_content_length: bool,
 }
 
 impl Agent {
@@ -94,6 +95,7 @@ impl Agent {
             method,
             uri: uri.to_string(),
             headers: Vec::new(),
+            auto_content_length: true,
         }
     }
 
@@ -103,12 +105,22 @@ impl Agent {
         uri: String,
         headers: Vec<(String, String)>,
         body: Vec<u8>,
+        auto_content_length: bool,
     ) -> Result<Response, Error> {
         let client = self.inner.client.clone();
         let timeout = self.inner.timeout;
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         crate::RT.spawn(async move {
-            let result = execute_request(client, timeout, method, uri, headers, body).await;
+            let result = execute_request(
+                client,
+                timeout,
+                method,
+                uri,
+                headers,
+                body,
+                auto_content_length,
+            )
+            .await;
             let _ = tx.send(result);
         });
         rx.recv()
@@ -128,8 +140,21 @@ impl RequestBuilder {
     }
 
     pub fn send(self, body: impl AsRef<[u8]>) -> Result<Response, Error> {
-        self.agent
-            .execute(self.method, self.uri, self.headers, body.as_ref().to_vec())
+        self.agent.execute(
+            self.method,
+            self.uri,
+            self.headers,
+            body.as_ref().to_vec(),
+            self.auto_content_length,
+        )
+    }
+
+    pub fn send_without_content_length(self, body: impl AsRef<[u8]>) -> Result<Response, Error> {
+        Self {
+            auto_content_length: false,
+            ..self
+        }
+        .send(body)
     }
 
     pub fn send_empty(self) -> Result<Response, Error> {
@@ -185,16 +210,29 @@ async fn execute_request(
     uri: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    auto_content_length: bool,
 ) -> Result<Response, Error> {
     tokio::time::timeout(timeout, async move {
         let uri: Uri = uri
             .parse()
             .map_err(|err| Error::new(format!("invalid request URI: {err}")))?;
+        let add_content_length = auto_content_length
+            && matches!(method, Method::PUT | Method::POST)
+            && !headers.iter().any(|(name, _)| {
+                name.eq_ignore_ascii_case("content-length")
+                    || name.eq_ignore_ascii_case("transfer-encoding")
+            });
+        let content_length = body.len();
         let mut request = hyper::Request::builder()
             .method(method)
             .uri(uri)
             .body(SdkBody::from(body))
             .map_err(|err| Error::new(format!("build raw HTTP request: {err}")))?;
+        if add_content_length {
+            request
+                .headers_mut()
+                .insert(CONTENT_LENGTH, HeaderValue::from(content_length));
+        }
         for (name, value) in headers {
             let name = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|err| Error::new(format!("invalid header name: {err}")))?;

@@ -3709,6 +3709,9 @@ impl HttpFrontend {
                 reason: "Content-MD5 OR x-amz-checksum- HTTP header is required for Put Object requests with Object Lock parameters".to_string(),
             });
         }
+        if !uses_aws_chunked_transport && req.header("content-length").is_none() {
+            return Err(ServerError::MissingContentLength);
+        }
         let content_md5 = ContentMd5Claim::from_request(req)?;
         let sse_customer_request = parse_sse_customer_request(req)?;
         let managed_encryption =
@@ -5818,6 +5821,7 @@ mod tests {
                 "host".to_string(),
                 "examplebucket.s3.amazonaws.com".to_string(),
             ),
+            ("content-length".to_string(), body.len().to_string()),
             ("x-amz-content-sha256".to_string(), body_hash.clone()),
             ("x-amz-date".to_string(), amz_date.clone()),
         ];
@@ -9060,12 +9064,41 @@ mod tests {
     }
 
     #[test]
+    fn prepare_streaming_put_without_content_length_rejected() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let req = new_req(
+            http::Method::PUT,
+            "",
+            "",
+            vec![(
+                "x-amz-content-sha256".to_string(),
+                sha256_hex(b"").to_string(),
+            )],
+            Vec::new(),
+        );
+        match fe.prepare_streaming_put(&req, "mybucket", "mykey", false) {
+            Err(ServerError::MissingContentLength) => {}
+            Err(e) => panic!("expected MissingContentLength, got {e:?}"),
+            Ok(_) => panic!("expected MissingContentLength, got Ok"),
+        }
+    }
+
+    #[test]
     fn prepare_streaming_put_denies_anonymous_write_to_private_bucket() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
 
-        let req = new_req(http::Method::PUT, "", "", vec![], b"hello world".to_vec());
+        let req = new_req(
+            http::Method::PUT,
+            "",
+            "",
+            vec![("content-length".to_string(), "11".to_string())],
+            b"hello world".to_vec(),
+        );
         match fe.prepare_streaming_put(&req, "mybucket", "mykey", false) {
             Err(ServerError::AccessDenied) => {}
             Err(err) => panic!("expected AccessDenied, got {err:?}"),

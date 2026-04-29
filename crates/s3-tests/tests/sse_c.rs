@@ -105,6 +105,37 @@ macro_rules! with_sse_c_copy_headers {
 async fn cleanup(bucket: &str, key: &str) {
     let client = CTX.client();
     let _ = client.delete_object().bucket(bucket).key(key).send().await;
+
+    for _ in 0..10 {
+        let uploads = client
+            .list_multipart_uploads()
+            .bucket(bucket)
+            .send()
+            .await
+            .unwrap();
+        for upload in uploads.uploads() {
+            let _ = client
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(upload.key().unwrap_or_default())
+                .upload_id(upload.upload_id().unwrap_or_default())
+                .send()
+                .await;
+        }
+
+        match client.delete_bucket().bucket(bucket).send().await {
+            Ok(_) => return,
+            Err(err) => {
+                let raw = format!("{err:?}");
+                if raw.contains("OperationAborted") || raw.contains("BucketNotEmpty") {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    continue;
+                }
+                panic!("delete_bucket failed unexpectedly: {raw}");
+            }
+        }
+    }
+
     client.delete_bucket().bucket(bucket).send().await.unwrap();
 }
 
