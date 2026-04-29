@@ -8,12 +8,12 @@ use placement::NodeId;
 pub use local::{LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig};
 
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
-use crate::node::SharedStorageNode;
+use crate::node::{DirectPutCommitError, SharedStorageNode};
 use crate::traits::ShardStore;
 use crate::types::{
     BucketName, ClusterEpoch, CommitDirectPutObjectReq, DataPgId, DirectPutCommitSnapshot,
     DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
-    ObjectEncryption, ObjectKey, PayloadShardStorage, PgId, PrepareStreamUploadSegmentAppendReq,
+    ObjectEncryption, ObjectKey, PgId, PrepareStreamUploadSegmentAppendReq,
     SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey, StreamUploadRecord,
     StreamUploadSegmentRecord, StreamUploadTarget, WriteAck, WrittenShardAck,
 };
@@ -155,11 +155,6 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_metadata_storage_node(&self) -> Arc<SharedStorageNode> {
-        Arc::clone(&self.single_node)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_install_before_stream_abort_storage_hook(
         &self,
         hook: Arc<dyn Fn() + Send + Sync>,
@@ -167,6 +162,15 @@ impl StorageCluster {
         let slot = BEFORE_STREAM_ABORT_STORAGE_HOOK.get_or_init(|| Mutex::new(None));
         *slot.lock().unwrap() = Some(hook);
         StreamAbortTestHookGuard
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_after_direct_put_metadata_publish_hook(
+        &self,
+        hook: Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>,
+    ) -> crate::node::DirectPutMetadataPublishTestHookGuard {
+        self.single_node
+            .test_install_after_direct_put_metadata_publish_hook(hook)
     }
 
     pub fn place_payload_shards(
@@ -298,7 +302,6 @@ impl StorageCluster {
                                 ec,
                                 segment_okh,
                                 segment_vid,
-                                PayloadShardStorage::Placed,
                                 written_for_cleanup
                                     .iter()
                                     .map(|written| written.key.clone()),
@@ -341,16 +344,30 @@ impl StorageCluster {
         let result = self
             .single_node
             .commit_direct_put_object(req, written_shards, action);
-        if matches!(result, Err(_) | Ok(Err(_))) {
-            self.delete_direct_put_segment_payload_shards(
-                req.data_pg_id,
-                req.ec,
-                &req.segment_okh,
-                req.segment_vid,
-                written_shards,
-            );
+        match result {
+            Ok(Ok(outcome)) => Ok(Ok(outcome)),
+            Ok(Err(error)) => {
+                self.delete_direct_put_segment_payload_shards(
+                    req.data_pg_id,
+                    req.ec,
+                    &req.segment_okh,
+                    req.segment_vid,
+                    written_shards,
+                );
+                Ok(Err(error))
+            }
+            Err(DirectPutCommitError::PrePublish(error)) => {
+                self.delete_direct_put_segment_payload_shards(
+                    req.data_pg_id,
+                    req.ec,
+                    &req.segment_okh,
+                    req.segment_vid,
+                    written_shards,
+                );
+                Err(error)
+            }
+            Err(error @ DirectPutCommitError::PostPublish(_)) => Err(error.into_action_error()),
         }
-        result
     }
 
     pub fn delete_direct_put_segment_payload_shards(
@@ -366,7 +383,6 @@ impl StorageCluster {
             ec,
             segment_okh,
             segment_vid,
-            PayloadShardStorage::Placed,
             written_shards.iter().map(|written| written.key.clone()),
         );
     }
@@ -398,11 +414,8 @@ impl StorageCluster {
         key: &ObjectKey,
         request: &PrepareStreamUploadSegmentAppendReq,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
-        let (target, mut segment_record) = self
-            .single_node
-            .prepare_stream_segment_append(bucket, key, request)?;
-        segment_record.payload_storage = PayloadShardStorage::Placed;
-        Ok((target, segment_record))
+        self.single_node
+            .prepare_stream_segment_append(bucket, key, request)
     }
 
     pub fn write_stream_segment_payload_shards(
@@ -414,22 +427,14 @@ impl StorageCluster {
             k: segment_record.ec_k,
             m: segment_record.ec_m,
         };
-        match segment_record.payload_storage {
-            PayloadShardStorage::MetadataPrimary => self.single_node.write_stream_segment_shards(
-                segment_record.data_pg_id,
-                &segment_record.segment_okh,
-                segment_record.segment_vid,
-                data,
-            ),
-            PayloadShardStorage::Placed => self.write_placed_segment_payload_shards(
-                DataPgId::new(PgId::new(segment_record.data_pg_id)),
-                ec,
-                &segment_record.segment_okh,
-                segment_record.segment_vid,
-                data,
-                "write placed stream segment shard",
-            ),
-        }
+        self.write_placed_segment_payload_shards(
+            DataPgId::new(PgId::new(segment_record.data_pg_id)),
+            ec,
+            &segment_record.segment_okh,
+            segment_record.segment_vid,
+            data,
+            "write placed stream segment shard",
+        )
     }
 
     pub fn commit_stream_segment_append(
@@ -458,7 +463,6 @@ impl StorageCluster {
                 },
                 &segment_record.segment_okh,
                 segment_record.segment_vid,
-                segment_record.payload_storage,
                 shard_batch.iter().map(|(key, _)| (*key).clone()),
             );
         }
@@ -489,16 +493,9 @@ impl StorageCluster {
         req: SegmentStoredBytesRequest,
         dst: &mut Vec<u8>,
     ) -> Result<(), StoreError> {
-        match req.payload_storage {
-            PayloadShardStorage::MetadataPrimary => {
-                self.single_node.read_segment_stored_bytes_into(req, dst)
-            }
-            PayloadShardStorage::Placed => {
-                match self.try_read_placed_segment_stored_bytes_into(req, dst)? {
-                    true => Ok(()),
-                    false => Err(StoreError::NotFound),
-                }
-            }
+        match self.try_read_placed_segment_stored_bytes_into(req, dst)? {
+            true => Ok(()),
+            false => Err(StoreError::NotFound),
         }
     }
 
@@ -743,20 +740,17 @@ impl StorageCluster {
         ec: EcShape,
         okh: &[u8; 16],
         generation_id: GenerationId,
-        payload_storage: PayloadShardStorage,
         placed_context: &'static str,
     ) -> Result<(), ObjectPgActionError> {
         let shard_keys = Self::payload_shard_set_keys(okh, generation_id, ec);
-        if payload_storage == PayloadShardStorage::Placed {
-            self.delete_placed_payload_shard_keys(
-                DataPgId::new(PgId::new(data_pg_id)),
-                ec,
-                okh,
-                generation_id,
-                &shard_keys,
-                placed_context,
-            )?;
-        }
+        self.delete_placed_payload_shard_keys(
+            DataPgId::new(PgId::new(data_pg_id)),
+            ec,
+            okh,
+            generation_id,
+            &shard_keys,
+            placed_context,
+        )?;
         self.delete_metadata_primary_payload_shard_keys(data_pg_id, &shard_keys)
     }
 
@@ -766,17 +760,9 @@ impl StorageCluster {
         ec: EcShape,
         okh: &[u8; 16],
         generation_id: GenerationId,
-        payload_storage: PayloadShardStorage,
     ) {
         let shard_keys = Self::payload_shard_set_keys(okh, generation_id, ec);
-        self.delete_payload_shard_keys_best_effort(
-            data_pg_id,
-            ec,
-            okh,
-            generation_id,
-            payload_storage,
-            shard_keys,
-        );
+        self.delete_payload_shard_keys_best_effort(data_pg_id, ec, okh, generation_id, shard_keys);
     }
 
     fn delete_payload_shard_keys_best_effort(
@@ -785,19 +771,16 @@ impl StorageCluster {
         ec: EcShape,
         okh: &[u8; 16],
         generation_id: GenerationId,
-        payload_storage: PayloadShardStorage,
         shard_keys: impl IntoIterator<Item = ShardKey>,
     ) {
         let shard_keys: Vec<ShardKey> = shard_keys.into_iter().collect();
-        if payload_storage == PayloadShardStorage::Placed {
-            self.delete_placed_payload_shard_keys_best_effort(
-                DataPgId::new(PgId::new(data_pg_id)),
-                ec,
-                okh,
-                generation_id,
-                &shard_keys,
-            );
-        }
+        self.delete_placed_payload_shard_keys_best_effort(
+            DataPgId::new(PgId::new(data_pg_id)),
+            ec,
+            okh,
+            generation_id,
+            &shard_keys,
+        );
         self.delete_metadata_primary_payload_shard_keys_best_effort(data_pg_id, &shard_keys);
     }
 
@@ -913,7 +896,6 @@ impl StorageCluster {
                 ec,
                 &segment.segment_okh,
                 segment.segment_vid,
-                segment.payload_storage,
             );
         }
     }

@@ -571,7 +571,7 @@ Phase 3 completion notes:
 
 ## Phase 4: Node-Aware Shard Placement
 
-Status: planned.
+Status: complete.
 
 Change data writes so EC shards are distributed across nodes.
 
@@ -625,18 +625,17 @@ Implementation order:
 - [x] 4.7 Move multipart part payloads.
   - the active UploadPart path is streaming-based and now reuses the placed
     streaming segment path
-  - multipart part, object-part, segment, and reclaim metadata records carry a
-    durable payload-storage marker so any future direct multipart shard-set path
-    cannot silently assume metadata-primary storage
+  - multipart part, object-part, segment, and reclaim metadata records all refer
+    to placed payload shards; there is no metadata-primary payload fallback
   - abort, part reupload, subset completion, and omitted part cleanup are
     placement-aware in multi-node mode
 - [x] 4.8 Move delete and reclaim cleanup to placement-aware shard deletion.
   - recompute per-shard node placement from stored `data_pg_id`, EC shape, and
     shard identity
   - sweep remaining delete/reclaim paths now that multipart reclaim records also
-    preserve their payload-storage marker
+    use placed payload shard identities
   - keep crash-durable scavenger work in the later scavenger phase
-- [ ] 4.9 Do a Phase 4 boundary sweep.
+- [x] 4.9 Do a Phase 4 boundary sweep.
   - active payload reads/writes/deletes should no longer assume all EC shards live
     in one local PG store
   - keep S3-visible behavior unchanged
@@ -698,24 +697,24 @@ Phase 4 implementation notes:
    - request-path tests assert direct PutObject shard files land under distinct
      `node-XXXX` stores, and EC fault-injection tests now manipulate the placed
      shard file paths
-6. Step 4.5 makes standard segment reads explicit about payload shard storage.
-   - `stream_upload_segments`, `object_segments`, and
-     `object_segment_reclaim_segments` record whether shard files live under the
-     metadata-primary PG store or are placed through the cluster map
-   - direct buffered PutObject records are marked as placed, while existing
-     streaming standard object records remain metadata-primary until Step 4.6
-   - read routing uses that stored marker and no longer tries placed IO before
-     falling back to the metadata-primary node
+6. Step 4.5 moves standard segment reads to the cluster payload boundary.
+   - direct buffered PutObject records now refer to placed shard files; the
+     metadata-primary PG still stores the temporary shard ack rows used for
+     per-shard CRC and size verification
+   - read routing uses placed shard IO through `StorageCluster` instead of
+     trying placed IO before falling back to the metadata-primary node
    - the old local-node direct PUT shard writer was removed, and the
      local-node direct commit helper is crate-internal bridge code behind
      `StorageCluster`
-   - standard object reclaim uses the stored marker to delete placed direct PUT
-     shard files before removing metadata-primary bridge rows; multipart reclaim
-     remains metadata-primary until Step 4.7
+   - standard object reclaim deletes placed direct PUT shard files before
+     removing metadata-primary bridge rows; multipart reclaim remains
+     metadata-primary until Step 4.7
 7. Step 4.6 moves streaming PutObject staged segment files onto placed shard IO.
-   - the cluster wrapper marks `StreamUploadTarget::PutObject` segment records as
-     placed after the metadata-primary prepare step allocates their segment ID
-   - streamed UploadPart segment records remain metadata-primary until Step 4.7
+   - the cluster wrapper writes `StreamUploadTarget::PutObject` segment payload
+     files through placed shard IO after the metadata-primary prepare step
+     allocates their segment ID
+   - streamed UploadPart segment records remain on the metadata-primary payload
+     path until Step 4.7
    - stream segment writes use the same placed shard writer as direct PutObject,
      while metadata-primary shard ack rows remain the Phase 4 bridge for reads
      and recovery
@@ -738,14 +737,14 @@ Phase 4 implementation notes:
    - tests that specifically exercise metadata PG fanout, merge, pagination, or
      bucket/object PG separation opt into two PGs
 9. Step 4.7 moves streamed UploadPart payload files onto placed shard IO.
-   - `StorageCluster` now marks both standard stream PutObject segments and
-     streamed UploadPart segments as placed after the metadata-primary prepare
-     step allocates the segment payload ID
-   - multipart manifest, staged-part, object-part, and reclaim rows store
-     `PayloadShardStorage` so reads and cleanup use the durable payload location
-     instead of assuming metadata-primary shard files
+   - `StorageCluster` now writes both standard stream PutObject segments and
+     streamed UploadPart segments through placed shard IO after the
+     metadata-primary prepare step allocates the segment payload ID
+   - multipart manifest, staged-part, object-part, and reclaim rows now refer to
+     placed payload files; the metadata-primary shard rows are only the Phase 4
+     ack bridge
    - multipart reads route direct part shard sets and streamed part segments
-     through the stored marker
+     through placed shard IO
    - abort, reupload replacement cleanup, and completion cleanup for omitted
      streamed parts delete placed shard files and metadata-primary bridge rows
      best-effort
@@ -757,8 +756,8 @@ Phase 4 implementation notes:
    - placement and shard IO tests use one PG unless the test checks
      PG-dependent placement
 10. Step 4.8 centralizes delete and reclaim cleanup at the cluster boundary.
-   - `StorageCluster` has one marker-aware payload shard-set deletion helper for
-     strict reclaim and a best-effort variant for abort/commit cleanup paths
+   - `StorageCluster` has one payload shard-set deletion helper for strict
+     reclaim and a best-effort variant for abort/commit cleanup paths
    - placed cleanup recomputes each shard's local node from the stored data PG,
      EC shape, stable payload identity, and shard index before deleting the file
    - metadata-primary shard rows remain the Phase 4 ack bridge and are deleted by
@@ -777,6 +776,33 @@ Phase 4 implementation notes:
    - Phase 6 must remove this bridge by routing metadata operations through
      cluster-owned PG primaries/replica sets instead of
      `StorageCluster::single_node`
+12. Step 4.9 removes the remaining broad single-node payload escape hatches.
+   - `StorageCluster::test_metadata_storage_node` was removed; coordinator
+     tests either use cluster-level hooks for explicit metadata bridge checks or
+     the same request paths as production
+   - the coordinator test helper that hand-wrote stream shard files through the
+     metadata-primary node was removed with its legacy test
+   - server-core reclaim tests now seed placed payload records instead of
+     metadata-primary records
+   - raw local shard file IO remains crate-internal storage bridge code used by
+     placed shard dispatch, while the single-node stream shard writer and
+     single-node segment payload reader were removed
+   - `SharedStorageNode` no longer deletes payload shard keys during direct PUT,
+     stream append, stream abort, multipart completion omitted-part cleanup,
+     streamed-part replacement, or multipart abort paths; placed file deletion
+     and temporary shard ack cleanup are owned by `StorageCluster`
+   - completed multipart upload pruning now runs after cluster-owned omitted-part
+     cleanup, so post-commit prune failures cannot hide cleanup records from the
+     placement boundary
+   - direct PutObject commit errors are split into pre-publish and post-publish
+     failures so `StorageCluster` only deletes newly written placed shards when
+     object metadata was not published
+   - the transitional `PayloadShardStorage` type and `payload_storage` schema
+     columns were removed once every active payload path used placed shard IO;
+     omitted test or internal rows cannot silently recreate metadata-primary
+     payload placement
+   - metadata-primary shard rows remain only as the explicit Phase 4 ack bridge;
+     Phase 6 removes that bridge with cluster-owned metadata PG routing
 
 Exit criteria:
 

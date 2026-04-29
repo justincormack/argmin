@@ -613,7 +613,6 @@ fn delete_bucket_clears_completed_multipart_upload_records() {
         part_vid: GenerationId::MIN,
         ec_k: 4,
         ec_m: 2,
-        payload_storage: PayloadShardStorage::MetadataPrimary,
         data_pg_id: 0,
         checksum: None,
     }];
@@ -1868,7 +1867,6 @@ fn mpu_part_checksum_round_trip() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
             last_modified: 100,
             checksum: Some(checksum_bytes.clone()),
         })
@@ -1892,7 +1890,6 @@ fn mpu_part_checksum_round_trip() {
             part_vid: GenerationId::new(1).unwrap(),
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
             last_modified: 200,
             checksum: None,
         })
@@ -1923,7 +1920,6 @@ fn mpu_object_part_checksum_round_trip() {
                 part_vid: GenerationId::MIN,
                 ec_k: 4,
                 ec_m: 2,
-                payload_storage: PayloadShardStorage::MetadataPrimary,
                 data_pg_id: 0,
                 checksum: Some(checksum_bytes.clone()),
             },
@@ -1939,7 +1935,6 @@ fn mpu_object_part_checksum_round_trip() {
                 part_vid: GenerationId::new(1).unwrap(),
                 ec_k: 4,
                 ec_m: 2,
-                payload_storage: PayloadShardStorage::MetadataPrimary,
                 data_pg_id: 0,
                 checksum: None,
             },
@@ -2021,7 +2016,6 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
             data_pg_id: 0,
             checksum: Some(cksum.clone()),
         },
@@ -2037,7 +2031,6 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
             part_vid: GenerationId::new(1).unwrap(),
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
             data_pg_id: 0,
             checksum: None,
         },
@@ -2138,7 +2131,6 @@ fn completed_multipart_tombstone_survives_null_version_overwrite() {
         part_vid: GenerationId::MIN,
         ec_k: 4,
         ec_m: 2,
-        payload_storage: PayloadShardStorage::MetadataPrimary,
         data_pg_id: 0,
         checksum: None,
     }];
@@ -2239,7 +2231,6 @@ fn completed_multipart_tombstone_survives_object_version_delete() {
         part_vid: GenerationId::MIN,
         ec_k: 4,
         ec_m: 2,
-        payload_storage: PayloadShardStorage::MetadataPrimary,
         data_pg_id: 0,
         checksum: None,
     }];
@@ -2334,7 +2325,6 @@ fn completed_multipart_upload_list_reports_global_completion_orders() {
                     part_vid: GenerationId::MIN,
                     ec_k: 4,
                     ec_m: 2,
-                    payload_storage: PayloadShardStorage::MetadataPrimary,
                     data_pg_id: 0,
                     checksum: None,
                 }],
@@ -2454,7 +2444,6 @@ fn mpu_delete_upload_cascades_parts() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
             last_modified: 0,
             checksum: None,
         })
@@ -2526,7 +2515,6 @@ fn mpu_upsert_part_and_get() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
             last_modified: 100,
             checksum: None,
         })
@@ -2555,7 +2543,6 @@ fn mpu_upsert_part_and_get() {
             part_vid: GenerationId::new(1).unwrap(),
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
             last_modified: 200,
             checksum: None,
         })
@@ -2606,7 +2593,6 @@ fn mpu_list_parts_pagination() {
                 part_vid: GenerationId::MIN,
                 ec_k: 4,
                 ec_m: 2,
-                payload_storage: PayloadShardStorage::MetadataPrimary,
                 last_modified: 0,
                 checksum: None,
             })
@@ -2898,7 +2884,6 @@ fn mpu_corrupted_part_okh_returns_error() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
             last_modified: 0,
             checksum: None,
         })
@@ -2941,7 +2926,6 @@ fn mpu_corrupted_object_part_okh_returns_error() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
             data_pg_id: 0,
             checksum: None,
         }])
@@ -3090,7 +3074,6 @@ fn mpu_upsert_part_nonexistent_upload_returns_no_such_upload() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
             last_modified: 0,
             checksum: None,
         })
@@ -3133,7 +3116,6 @@ fn mpu_commit_object_parts_rollback_on_duplicate() {
         part_vid: GenerationId::MIN,
         ec_k: 4,
         ec_m: 2,
-        payload_storage: PayloadShardStorage::MetadataPrimary,
         data_pg_id: 0,
         checksum: None,
     };
@@ -3178,7 +3160,6 @@ fn mpu_commit_and_get_object_parts() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
             data_pg_id: 0,
             checksum: None,
         },
@@ -3194,7 +3175,6 @@ fn mpu_commit_and_get_object_parts() {
             part_vid: GenerationId::new(1).unwrap(),
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
             data_pg_id: 0,
             checksum: None,
         },
@@ -3245,7 +3225,6 @@ fn get_object_parts_overlapping_range_returns_only_overlapping_parts() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
             data_pg_id: 0,
             checksum: None,
         },
@@ -3261,7 +3240,6 @@ fn get_object_parts_overlapping_range_returns_only_overlapping_parts() {
             part_vid: GenerationId::new(2).unwrap(),
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
             data_pg_id: 0,
             checksum: None,
         },
@@ -3277,7 +3255,6 @@ fn get_object_parts_overlapping_range_returns_only_overlapping_parts() {
             part_vid: GenerationId::new(3).unwrap(),
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
             data_pg_id: 0,
             checksum: None,
         },
@@ -3331,7 +3308,6 @@ fn mpu_delete_object_parts() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
             data_pg_id: 0,
             checksum: None,
         }])
@@ -3400,7 +3376,6 @@ fn make_part(upload_id: &str, part_number: u32, generation: u32) -> MultipartPar
         part_vid: GenerationId::new(generation as u64 + 1).unwrap(),
         ec_k: 4,
         ec_m: 2,
-        payload_storage: PayloadShardStorage::MetadataPrimary,
         last_modified: 1000,
         checksum: None,
     }
@@ -3469,7 +3444,6 @@ fn mpu_commit_partial_batch_failure_rolls_back_all() {
         part_vid: GenerationId::MIN,
         ec_k: 4,
         ec_m: 2,
-        payload_storage: PayloadShardStorage::MetadataPrimary,
         data_pg_id: 0,
         checksum: None,
     };
@@ -3669,7 +3643,6 @@ fn mpu_commit_object_parts_connection_usable_after_multiple_failures() {
         part_vid: GenerationId::MIN,
         ec_k: 4,
         ec_m: 2,
-        payload_storage: PayloadShardStorage::MetadataPrimary,
         data_pg_id: 0,
         checksum: None,
     };
@@ -3852,7 +3825,6 @@ fn mpu_commit_object_parts_commit_failure_via_lock_contention() {
         part_vid: GenerationId::MIN,
         ec_k: 4,
         ec_m: 2,
-        payload_storage: PayloadShardStorage::MetadataPrimary,
         data_pg_id: 0,
         checksum: None,
     };
@@ -5074,7 +5046,6 @@ fn stream_segment_append_and_list() {
                 data_pg_id: i,
                 ec_k: 4,
                 ec_m: 2,
-                payload_storage: PayloadShardStorage::MetadataPrimary,
             })
             .unwrap();
     }
@@ -5133,7 +5104,6 @@ fn stream_segment_publish_with_shards_same_pg_is_atomic() {
         data_pg_id: 0,
         ec_k: 4,
         ec_m: 2,
-        payload_storage: PayloadShardStorage::MetadataPrimary,
     };
     let shard_batch = [(&shard, ack)];
 
@@ -5174,7 +5144,6 @@ fn stream_segment_cascade_delete() {
             data_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
         })
         .unwrap();
 
@@ -5215,7 +5184,6 @@ fn commit_stream_put_atomic() {
             data_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
         })
         .unwrap();
 
@@ -5230,7 +5198,6 @@ fn commit_stream_put_atomic() {
             data_pg_id: 1,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
         })
         .unwrap();
 
@@ -5266,7 +5233,6 @@ fn commit_stream_put_atomic() {
             data_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
         },
         ObjectSegmentRecord {
             bucket: bucket_name("bucket"),
@@ -5280,7 +5246,6 @@ fn commit_stream_put_atomic() {
             data_pg_id: 1,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
         },
     ];
 
@@ -5371,7 +5336,6 @@ fn commit_stream_put_overwrite_unversioned() {
                 data_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
-                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         )
         .unwrap();
@@ -5418,7 +5382,6 @@ fn commit_stream_put_overwrite_unversioned() {
                 data_pg_id: 1,
                 ec_k: 4,
                 ec_m: 2,
-                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         )
         .unwrap();
@@ -5475,7 +5438,6 @@ fn put_object_with_segments_persists_manifest() {
                     data_pg_id: 0,
                     ec_k: 4,
                     ec_m: 2,
-                    payload_storage: PayloadShardStorage::MetadataPrimary,
                 },
                 ObjectSegmentRecord {
                     bucket: bucket_name("bucket"),
@@ -5489,7 +5451,6 @@ fn put_object_with_segments_persists_manifest() {
                     data_pg_id: 0,
                     ec_k: 4,
                     ec_m: 2,
-                    payload_storage: PayloadShardStorage::MetadataPrimary,
                 },
             ],
         )
@@ -5546,7 +5507,6 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 data_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
-                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         )
         .unwrap();
@@ -5583,7 +5543,6 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 data_pg_id: 1,
                 ec_k: 4,
                 ec_m: 2,
-                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         )
         .unwrap();
@@ -5646,7 +5605,6 @@ fn delete_object_segments_cleanup() {
                 data_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
-                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         )
         .unwrap();
@@ -5809,7 +5767,6 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
         part_vid: GenerationId::MIN,
         ec_k: 4,
         ec_m: 2,
-        payload_storage: PayloadShardStorage::MetadataPrimary,
         last_modified: 1000,
         checksum: None,
     };
@@ -5827,7 +5784,6 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
         data_pg_id: 0,
         ec_k: 4,
         ec_m: 2,
-        payload_storage: PayloadShardStorage::MetadataPrimary,
     };
 
     let (prev_gen, prev_segments) = store
@@ -5898,7 +5854,6 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
         part_vid: GenerationId::new(1).unwrap(),
         ec_k: 4,
         ec_m: 2,
-        payload_storage: PayloadShardStorage::MetadataPrimary,
         last_modified: 1000,
         checksum: None,
     };
@@ -5932,7 +5887,6 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
             data_pg_id: i,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
         })
         .collect();
 
@@ -5982,7 +5936,6 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
         data_pg_id: 0,
         ec_k: 4,
         ec_m: 2,
-        payload_storage: PayloadShardStorage::MetadataPrimary,
     }];
 
     let displaced_segments = store
@@ -6160,7 +6113,6 @@ fn commit_stream_part_rejects_wrong_upload_id() {
                 part_vid: GenerationId::new(1).unwrap(),
                 ec_k: 4,
                 ec_m: 2,
-                payload_storage: PayloadShardStorage::MetadataPrimary,
                 last_modified: 1000,
                 checksum: None,
             },
@@ -6226,7 +6178,6 @@ fn commit_stream_part_zero_segments_clears_prior() {
                 part_vid: GenerationId::new(1).unwrap(),
                 ec_k: 4,
                 ec_m: 2,
-                payload_storage: PayloadShardStorage::MetadataPrimary,
                 last_modified: 1000,
                 checksum: None,
             },
@@ -6245,7 +6196,6 @@ fn commit_stream_part_zero_segments_clears_prior() {
                     data_pg_id: 0,
                     ec_k: 4,
                     ec_m: 2,
-                    payload_storage: PayloadShardStorage::MetadataPrimary,
                 },
                 MultipartPartSegmentRecord {
                     bucket: bucket_name("bucket"),
@@ -6261,7 +6211,6 @@ fn commit_stream_part_zero_segments_clears_prior() {
                     data_pg_id: 1,
                     ec_k: 4,
                     ec_m: 2,
-                    payload_storage: PayloadShardStorage::MetadataPrimary,
                 },
             ],
         )
@@ -6307,7 +6256,6 @@ fn commit_stream_part_zero_segments_clears_prior() {
                 part_vid: GenerationId::new(2).unwrap(),
                 ec_k: 4,
                 ec_m: 2,
-                payload_storage: PayloadShardStorage::MetadataPrimary,
                 last_modified: 2000,
                 checksum: None,
             },
@@ -6376,7 +6324,6 @@ fn commit_stream_put_rejects_mismatched_segment_target() {
                 data_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
-                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         )
         .unwrap_err();
@@ -6406,7 +6353,6 @@ fn object_segments_reclaim_round_trip() {
                 segment_vid: GenerationId::new(11).unwrap(),
                 data_pg_id: 1,
                 ec: EcShape { k: 4, m: 2 },
-                payload_storage: PayloadShardStorage::MetadataPrimary,
             },
             ObjectSegmentsReclaimSegmentRecord {
                 segment_index: 1,
@@ -6414,7 +6360,6 @@ fn object_segments_reclaim_round_trip() {
                 segment_vid: GenerationId::new(12).unwrap(),
                 data_pg_id: 2,
                 ec: EcShape { k: 6, m: 3 },
-                payload_storage: PayloadShardStorage::MetadataPrimary,
             },
         ],
     };
@@ -6452,7 +6397,6 @@ fn next_generation_id_skips_object_segments_reclaim_generation() {
                 segment_vid: GenerationId::new(13).unwrap(),
                 data_pg_id: 0,
                 ec: EcShape { k: 4, m: 2 },
-                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         })
         .unwrap();
@@ -6561,7 +6505,6 @@ fn multipart_reclaim_round_trip() {
                 part_vid: GenerationId::new(21).unwrap(),
                 data_pg_id: 3,
                 ec: EcShape { k: 4, m: 2 },
-                payload_storage: PayloadShardStorage::MetadataPrimary,
             },
             MultipartReclaimPartRecord::Segments {
                 part_number: 2,
@@ -6573,7 +6516,6 @@ fn multipart_reclaim_round_trip() {
                         segment_vid: GenerationId::new(22).unwrap(),
                         data_pg_id: 4,
                         ec: EcShape { k: 6, m: 3 },
-                        payload_storage: PayloadShardStorage::MetadataPrimary,
                     },
                     MultipartReclaimPartSegmentRecord {
                         part_number: 2,
@@ -6582,7 +6524,6 @@ fn multipart_reclaim_round_trip() {
                         segment_vid: GenerationId::new(23).unwrap(),
                         data_pg_id: 5,
                         ec: EcShape { k: 5, m: 2 },
-                        payload_storage: PayloadShardStorage::MetadataPrimary,
                     },
                 ],
             },
@@ -6622,7 +6563,6 @@ fn next_generation_id_skips_multipart_reclaim_generation() {
                 part_vid: GenerationId::new(24).unwrap(),
                 data_pg_id: 0,
                 ec: EcShape { k: 4, m: 2 },
-                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         })
         .unwrap();
@@ -6651,7 +6591,6 @@ fn get_bucket_payload_reclaim_root_returns_first_root() {
                 part_vid: GenerationId::new(21).unwrap(),
                 data_pg_id: 0,
                 ec: EcShape { k: 4, m: 2 },
-                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         })
         .unwrap();
@@ -6667,7 +6606,6 @@ fn get_bucket_payload_reclaim_root_returns_first_root() {
                 segment_vid: GenerationId::new(21).unwrap(),
                 data_pg_id: 0,
                 ec: EcShape { k: 4, m: 2 },
-                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         })
         .unwrap();
@@ -6708,7 +6646,6 @@ fn payload_reclaim_exists_checks_segment_and_multipart_reclaims() {
                 segment_vid: GenerationId::new(21).unwrap(),
                 data_pg_id: 0,
                 ec: EcShape { k: 4, m: 2 },
-                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         })
         .unwrap();
@@ -6739,7 +6676,6 @@ fn payload_reclaim_exists_checks_segment_and_multipart_reclaims() {
                 part_vid: GenerationId::new(22).unwrap(),
                 data_pg_id: 0,
                 ec: EcShape { k: 4, m: 2 },
-                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         })
         .unwrap();
@@ -6818,7 +6754,6 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
                 part_vid: GenerationId::new(1).unwrap(),
                 ec_k: 4,
                 ec_m: 2,
-                payload_storage: PayloadShardStorage::MetadataPrimary,
                 last_modified: 1000,
                 checksum: None,
             },
@@ -6836,7 +6771,6 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
                 data_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
-                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         )
         .unwrap_err();
@@ -6900,7 +6834,6 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
                 part_vid: GenerationId::new(1).unwrap(),
                 ec_k: 4,
                 ec_m: 2,
-                payload_storage: PayloadShardStorage::MetadataPrimary,
                 last_modified: 1000,
                 checksum: None,
             },
@@ -6918,7 +6851,6 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
                 data_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
-                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         )
         .unwrap_err();
@@ -8038,7 +7970,6 @@ fn delete_multipart_part_segments_by_upload_id_cleans_up() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
             last_modified: 0,
             checksum: None,
         })
@@ -8336,7 +8267,6 @@ fn complete_multipart_commit_no_such_upload() {
         part_vid: GenerationId::MIN,
         ec_k: 4,
         ec_m: 2,
-        payload_storage: PayloadShardStorage::MetadataPrimary,
         data_pg_id: 0,
         checksum: None,
     }];
@@ -8666,7 +8596,6 @@ fn multipart_upload_object_lock_round_trip_and_commit_copies_state() {
         part_vid: GenerationId::MIN,
         ec_k: 4,
         ec_m: 2,
-        payload_storage: PayloadShardStorage::MetadataPrimary,
         data_pg_id: 0,
         checksum: None,
     }];

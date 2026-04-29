@@ -4,7 +4,7 @@ use super::*;
 use ec::EcConfig;
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use storage::{segment_key_hash, EcShape, GenerationId, PayloadShardStorage, PgTopology, ShardKey};
+use storage::{segment_key_hash, EcShape, GenerationId, PgTopology, ShardKey};
 
 #[test]
 fn stream_put_get_object_readable() {
@@ -48,7 +48,6 @@ fn stream_put_get_object_readable() {
         )
         .unwrap();
     assert_eq!(segments.len(), 1);
-    assert_eq!(segments[0].payload_storage, PayloadShardStorage::Placed);
     let segment = &segments[0];
     let ec = EcShape {
         k: segment.ec_k,
@@ -588,7 +587,6 @@ fn buffered_put_single_segment_skips_stream_session_rows() {
         segment_key_hash("bucket", "key", live.generation_id, 0)
     );
     assert_eq!(segments[0].segment_vid, live.generation_id);
-    assert_eq!(segments[0].payload_storage, PayloadShardStorage::Placed);
     assert_eq!(
         segments[0].data_pg_id,
         topology
@@ -745,6 +743,108 @@ fn failed_buffered_put_before_commit_leaves_no_generation_reservation_or_shards(
         .clone();
     assert_eq!(live.version_id, result.version_id);
     assert_eq!(live.generation_id, GenerationId::MIN);
+}
+
+#[test]
+fn buffered_put_post_publish_error_keeps_committed_shards() {
+    let dir = test_util::tempdir();
+    let coord = setup_coordinator(dir.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let _guard = coord
+        .storage_node
+        .test_install_after_direct_put_metadata_publish_hook(Arc::new(|| {
+            Err(storage::ObjectPgActionError::InvalidRequest {
+                reason: "post-publish direct put test failure".to_string(),
+            })
+        }));
+
+    let err = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"committed-despite-error",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: &WriteCondition::default(),
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ServerError::InvalidRequest { ref reason }
+                if reason == "post-publish direct put test failure"
+        ),
+        "expected injected post-publish failure, got {err:?}"
+    );
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let live = coord
+        .storage_node
+        .test_get_object_meta(&bucket, &key)
+        .unwrap()
+        .as_live()
+        .expect("post-publish failure should leave the object visible")
+        .clone();
+    assert_eq!(live.generation_id, GenerationId::MIN);
+
+    let segments = coord
+        .storage_node
+        .test_get_object_segments(&bucket, &key, VersionId::Null)
+        .unwrap();
+    assert_eq!(segments.len(), 1);
+    let segment = &segments[0];
+    let ec = EcShape {
+        k: segment.ec_k,
+        m: segment.ec_m,
+    };
+    for shard_index in 0..ec.k + ec.m {
+        let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), shard_index);
+        assert!(
+            coord
+                .storage_node
+                .test_shard_exists(segment.data_pg_id, &shard_key)
+                .unwrap(),
+            "post-publish failure must keep shard metadata {shard_index}"
+        );
+        assert!(
+            coord
+                .storage_node
+                .test_payload_shard_file_exists(
+                    segment.data_pg_id,
+                    ec,
+                    &segment.segment_okh,
+                    segment.segment_vid,
+                    shard_index,
+                )
+                .unwrap(),
+            "post-publish failure must keep placed shard file {shard_index}"
+        );
+    }
+
+    let get = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(get.body.read_all().unwrap(), b"committed-despite-error");
 }
 
 #[test]

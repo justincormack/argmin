@@ -28,17 +28,16 @@ use crate::types::{
     CreateStreamUploadReq, EcShape, FinalizeStreamPartOutcome, GenerationId,
     ListMultipartUploadsReq, ListObjectVersionsReq, ListPartsReq, ListedBucketMultipartUploads,
     ListedBucketObjectVersions, ListedBucketObjects, ListedMultipartParts, LoadedBucketSubresource,
-    MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
-    MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, ObjectReadSnapshot,
-    ObjectReadSnapshotOutcome, PreparedStreamPartCommit, SegmentStoredBytesRequest, SessionId,
-    ShardKey, StoredObject, StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget,
-    UploadId, UploadState, WriteAck,
+    MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartSegmentRecord,
+    MultipartUploadRecord, ObjectKey, ObjectReadSnapshot, ObjectReadSnapshotOutcome,
+    PreparedStreamPartCommit, SessionId, ShardKey, StoredObject, StreamUploadPartSnapshot,
+    StreamUploadState, StreamUploadTarget, UploadId, UploadState, WriteAck,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::types::{
-    CreateBucketConfig, ListPartsResp, MultipartReclaimRecord, ObjectPartRecord,
-    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, PayloadReclaimRoot, PutLiveObjectReq,
-    StreamUploadRecord, StreamUploadSegmentRecord,
+    CreateBucketConfig, ListPartsResp, MultipartPartRecord, MultipartReclaimRecord,
+    ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord, PayloadReclaimRoot,
+    PutLiveObjectReq, StreamUploadRecord, StreamUploadSegmentRecord,
 };
 
 const TRACE_TARGET: &str = "storage";
@@ -75,6 +74,28 @@ struct StorageEcWriteState {
     scratch: Arc<EncodeScratchPool>,
 }
 
+#[derive(Debug)]
+pub(crate) enum DirectPutCommitError {
+    PrePublish(ObjectPgActionError),
+    PostPublish(ObjectPgActionError),
+}
+
+impl DirectPutCommitError {
+    pub(crate) fn pre_publish(error: impl Into<ObjectPgActionError>) -> Self {
+        Self::PrePublish(error.into())
+    }
+
+    pub(crate) fn post_publish(error: impl Into<ObjectPgActionError>) -> Self {
+        Self::PostPublish(error.into())
+    }
+
+    pub(crate) fn into_action_error(self) -> ObjectPgActionError {
+        match self {
+            Self::PrePublish(error) | Self::PostPublish(error) => error,
+        }
+    }
+}
+
 pub struct BucketLockGuard<'a> {
     guard: MutexGuard<'a, ()>,
 }
@@ -83,6 +104,9 @@ pub struct BucketLockGuard<'a> {
 pub struct BucketPgTestGuard<'a> {
     guard: MutexGuard<'a, PgStore>,
 }
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct DirectPutMetadataPublishTestHookGuard;
 
 impl Drop for BucketLockGuard<'_> {
     fn drop(&mut self) {
@@ -94,6 +118,14 @@ impl Drop for BucketLockGuard<'_> {
 impl Drop for BucketPgTestGuard<'_> {
     fn drop(&mut self) {
         let _ = &self.guard;
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for DirectPutMetadataPublishTestHookGuard {
+    fn drop(&mut self) {
+        let hook = AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOK.get_or_init(|| Mutex::new(None));
+        *hook.lock().unwrap() = None;
     }
 }
 
@@ -124,10 +156,20 @@ pub struct BucketScopedTestHooks {
     pub after_begin_bucket_delete_drain: Option<Arc<dyn Fn() + Send + Sync>>,
     pub before_multipart_completion_lock: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_multipart_completion_lock: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub before_completed_multipart_prune:
+        Option<Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
 static BUCKET_SCOPED_TEST_HOOKS: OnceLock<Mutex<BucketScopedTestHooks>> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-hooks"))]
+type DirectPutMetadataPublishHook = Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
+static AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOK: OnceLock<
+    Mutex<Option<DirectPutMetadataPublishHook>>,
+> = OnceLock::new();
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct BucketScopedTestHookGuard;
@@ -221,6 +263,44 @@ pub(super) fn maybe_run_after_multipart_completion_lock_hook(bucket: &BucketName
 
 #[cfg(not(any(test, feature = "test-hooks")))]
 pub(super) fn maybe_run_after_multipart_completion_lock_hook(_: &BucketName) {}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(super) fn maybe_run_before_completed_multipart_prune_hook(
+    bucket: &BucketName,
+) -> Result<(), ObjectPgActionError> {
+    let hooks = BUCKET_SCOPED_TEST_HOOKS
+        .get_or_init(|| Mutex::new(BucketScopedTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks.target.as_ref().is_some_and(|target| target == bucket) {
+        if let Some(hook) = hooks.before_completed_multipart_prune {
+            hook()?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(super) fn maybe_run_before_completed_multipart_prune_hook(
+    _: &BucketName,
+) -> Result<(), ObjectPgActionError> {
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(super) fn maybe_run_after_direct_put_metadata_publish_hook() -> Result<(), ObjectPgActionError>
+{
+    let hook = AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some(hook) = hook {
+        hook()?;
+    }
+    Ok(())
+}
 
 impl BucketWriteDrainGuard<'_> {
     pub fn persist(mut self) {
@@ -1034,6 +1114,16 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_after_direct_put_metadata_publish_hook(
+        &self,
+        hook: Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>,
+    ) -> DirectPutMetadataPublishTestHookGuard {
+        let slot = AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOK.get_or_init(|| Mutex::new(None));
+        *slot.lock().unwrap() = Some(hook);
+        DirectPutMetadataPublishTestHookGuard
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_shard_exists(&self, pg_id: u32, key: &ShardKey) -> Result<bool, StoreError> {
         let pg = self.get_pg(pg_id)?;
         match pg.stat_shard(key) {
@@ -1041,37 +1131,6 @@ impl SharedStorageNode {
             Err(StoreError::NotFound) => Ok(false),
             Err(other) => Err(other),
         }
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_register_written_shards(
-        &self,
-        pg_id: u32,
-        written_shards: &[(ShardKey, WriteAck)],
-    ) -> Result<(), StoreError> {
-        let pg = self.get_pg(pg_id)?;
-        let batch: Vec<(&ShardKey, WriteAck)> = written_shards
-            .iter()
-            .map(|(key, ack)| {
-                (
-                    key,
-                    WriteAck {
-                        crc64: ack.crc64,
-                        stored_size: ack.stored_size,
-                    },
-                )
-            })
-            .collect();
-        pg.register_written_shards_batch(&batch)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_delete_shards(&self, pg_id: u32, keys: &[ShardKey]) -> Result<(), StoreError> {
-        let pg = self.get_pg(pg_id)?;
-        for key in keys {
-            let _ = pg.delete_shard(key);
-        }
-        Ok(())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1132,7 +1191,7 @@ impl SharedStorageNode {
     /// This is used on the write hot path so file IO and fsync do not hold the
     /// PG metadata lock. Callers must publish the corresponding shard row under
     /// the PG mutex afterward before the shard becomes visible to reads.
-    pub fn write_shard_file(
+    pub(crate) fn write_shard_file(
         &self,
         pg_id: u32,
         key: &ShardKey,
@@ -1153,34 +1212,12 @@ impl SharedStorageNode {
         PgStore::write_shard_file_durable(&paths.tmp_dir, &paths.shards_dir, key, data)
     }
 
-    /// Write multiple shard files durably without taking the per-PG mutex.
-    ///
-    /// This batches the rename durability step across the affected shard
-    /// directories for one segment write, while preserving the existing rule
-    /// that shards do not become visible until metadata rows are published.
-    pub fn write_shard_files(
+    /// Read a shard file directly without taking the per-PG mutex.
+    pub(crate) fn read_shard_file(
         &self,
         pg_id: u32,
-        shards: &[(ShardKey, &[u8])],
-    ) -> Result<Vec<(ShardKey, WriteAck)>, StoreError> {
-        let total_bytes: usize = shards.iter().map(|(_, data)| data.len()).sum();
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "SharedStorageNode::write_shard_files",
-            "pg_id={} shards={} bytes={}",
-            pg_id,
-            shards.len(),
-            total_bytes
-        );
-        let paths = self
-            .pg_paths
-            .get(&pg_id)
-            .ok_or(StoreError::PgNotFound { pg_id })?;
-        PgStore::write_shard_files_durable(&paths.tmp_dir, &paths.shards_dir, shards)
-    }
-
-    /// Read a shard file directly without taking the per-PG mutex.
-    pub fn read_shard_file(&self, pg_id: u32, key: &ShardKey) -> Result<Vec<u8>, StoreError> {
+        key: &ShardKey,
+    ) -> Result<Vec<u8>, StoreError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "SharedStorageNode::read_shard_file",
@@ -1206,7 +1243,7 @@ impl SharedStorageNode {
 
     /// Read a shard file directly into a caller-provided buffer without taking
     /// the per-PG mutex.
-    pub fn read_shard_file_into(
+    pub(crate) fn read_shard_file_into(
         &self,
         pg_id: u32,
         key: &ShardKey,
@@ -1252,211 +1289,6 @@ impl SharedStorageNode {
                 source: e,
             }),
         }
-    }
-
-    pub fn read_segment_stored_bytes_into(
-        &self,
-        req: SegmentStoredBytesRequest,
-        dst: &mut Vec<u8>,
-    ) -> Result<(), StoreError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "SharedStorageNode::read_segment_stored_bytes_into",
-            "pg_id={} segment_vid={} stored_size={} k={} m={}",
-            req.data_pg_id,
-            req.segment_vid.get(),
-            req.stored_size,
-            req.ec.k,
-            req.ec.m
-        );
-        let k = req.ec.k as usize;
-        let padded = req.stored_size.div_ceil(k) * k;
-        let shard_size = padded / k;
-
-        if shard_size == 0 {
-            dst.clear();
-            return Ok(());
-        }
-
-        if self.try_read_segment_stored_bytes_direct_into(req, dst)? {
-            return Ok(());
-        }
-
-        self.read_segment_stored_bytes_recovery_into(req, dst)
-    }
-
-    fn try_read_segment_stored_bytes_direct_into(
-        &self,
-        req: SegmentStoredBytesRequest,
-        dst: &mut Vec<u8>,
-    ) -> Result<bool, StoreError> {
-        let Some(expected_crc64) = req.segment_crc64 else {
-            return Ok(false);
-        };
-
-        let k = req.ec.k as usize;
-        let padded = req.stored_size.div_ceil(k) * k;
-        let shard_size = padded / k;
-        dst.resize(padded, 0);
-        for shard_index in 0..k {
-            let shard_key =
-                ShardKey::new(&req.segment_okh, req.segment_vid.get(), shard_index as u8);
-            let start = shard_index * shard_size;
-            let end = start + shard_size;
-            match self.read_shard_file_into(req.data_pg_id, &shard_key, &mut dst[start..end]) {
-                Ok(()) => {}
-                Err(StoreError::PgNotFound { pg_id }) => {
-                    return Err(StoreError::PgNotFound { pg_id });
-                }
-                Err(_) => return Ok(false),
-            }
-        }
-
-        dst.truncate(req.stored_size);
-        let actual_crc64 = checksum::crc64::checksum(dst);
-        if actual_crc64 != expected_crc64 {
-            return Ok(false);
-        }
-        Ok(true)
-    }
-
-    fn read_segment_stored_bytes_recovery_into(
-        &self,
-        req: SegmentStoredBytesRequest,
-        dst: &mut Vec<u8>,
-    ) -> Result<(), StoreError> {
-        let k = req.ec.k as usize;
-        let m = req.ec.m as usize;
-        let padded = req.stored_size.div_ceil(k) * k;
-        let shard_size = padded / k;
-        let all_shards = self.load_segment_shards_for_recovery(
-            req.data_pg_id,
-            &req.segment_okh,
-            req.segment_vid,
-            req.ec.k,
-            req.ec.m,
-        )?;
-
-        let mut recovered = None;
-        let mut recovered_ranges = vec![None; k];
-
-        if !(0..k).all(|i| all_shards[i].is_some()) {
-            let missing_needed: Vec<usize> = (0..k).filter(|&i| all_shards[i].is_none()).collect();
-
-            let present_indices: Vec<usize> =
-                (0..(k + m)).filter(|&i| all_shards[i].is_some()).collect();
-            let present_refs: Vec<&[u8]> = present_indices
-                .iter()
-                .map(|&i| all_shards[i].as_ref().unwrap().as_slice())
-                .collect();
-
-            let state = self.ec_write_state(req.ec)?;
-            let recovered_len = missing_needed.len() * shard_size;
-            let mut scratch = state.scratch.checkout(recovered_len);
-            let recovered_buf = scratch.as_mut_slice(recovered_len);
-            let mut output_refs: Vec<&mut [u8]> = recovered_buf
-                .chunks_exact_mut(shard_size)
-                .take(missing_needed.len())
-                .collect();
-
-            state
-                .codec
-                .reconstruct(
-                    &present_indices,
-                    &present_refs,
-                    &missing_needed,
-                    &mut output_refs,
-                )
-                .map_err(|error| StoreError::ErasureCoding {
-                    context: "reconstruct segment shards",
-                    reason: error.to_string(),
-                })?;
-
-            for (slot, &missing_idx) in missing_needed.iter().enumerate() {
-                let start = slot * shard_size;
-                recovered_ranges[missing_idx] = Some((start, start + shard_size));
-            }
-            recovered = Some((scratch, recovered_len));
-        }
-
-        dst.clear();
-        dst.reserve(padded);
-        for (idx, shard) in all_shards.iter().take(k).enumerate() {
-            if let Some(shard) = shard.as_ref() {
-                dst.extend_from_slice(shard);
-            } else if let Some((start, end)) = recovered_ranges[idx] {
-                let (scratch, recovered_len) = recovered.as_ref().unwrap();
-                dst.extend_from_slice(&scratch.as_slice(*recovered_len)[start..end]);
-            } else {
-                unreachable!("missing reconstructed shard for data index {idx}");
-            }
-        }
-        dst.truncate(req.stored_size);
-        if let Some(expected_crc64) = req.segment_crc64 {
-            let actual_crc64 = checksum::crc64::checksum(dst);
-            if actual_crc64 != expected_crc64 {
-                return Err(StoreError::IntegrityError {
-                    expected: expected_crc64,
-                    actual: actual_crc64,
-                });
-            }
-        }
-        Ok(())
-    }
-
-    /// Load enough live shards for a segment to support recovery while keeping
-    /// PG access, shard status checks, and quarantine handling internal to
-    /// storage.
-    fn load_segment_shards_for_recovery(
-        &self,
-        data_pg_id: u32,
-        segment_okh: &[u8; 16],
-        segment_vid: GenerationId,
-        ec_k: u8,
-        ec_m: u8,
-    ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "SharedStorageNode::load_segment_shards_for_recovery",
-            "pg_id={} segment_vid={} k={} m={}",
-            data_pg_id,
-            segment_vid.get(),
-            ec_k,
-            ec_m
-        );
-        let pg = self.get_pg(data_pg_id)?;
-        let k = ec_k as usize;
-        let m = ec_m as usize;
-        let mut all_shards = vec![None; k + m];
-        let mut present_count = 0usize;
-
-        let read_shard =
-            |i: usize, all_shards: &mut [Option<Vec<u8>>], present_count: &mut usize| {
-                let shard_key = ShardKey::new(segment_okh, segment_vid.get(), i as u8);
-                if let Ok(sd) = pg.read_shard(&shard_key) {
-                    all_shards[i] = Some(sd.data);
-                    *present_count += 1;
-                }
-            };
-
-        for i in 0..k {
-            read_shard(i, &mut all_shards, &mut present_count);
-        }
-
-        if present_count < k {
-            for i in k..(k + m) {
-                if present_count >= k {
-                    break;
-                }
-                read_shard(i, &mut all_shards, &mut present_count);
-            }
-        }
-
-        if present_count < k {
-            return Err(StoreError::NotFound);
-        }
-
-        Ok(all_shards)
     }
 
     /// Acquire an in-memory lease on an object payload generation.
@@ -2149,7 +1981,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_stream_segment_append_cleans_up_cross_pg_loser_shards_on_late_duplicate() {
+    fn commit_stream_segment_append_leaves_payload_cleanup_to_cluster_on_late_duplicate() {
         let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0, 1, 2, 3]).unwrap();
         let bucket = create_bucket_for_snapshot_test(&node, "bucket");
@@ -2201,7 +2033,6 @@ mod tests {
                     data_pg_id: meta_pg_id,
                     ec_k: node.default_ec_shape.k,
                     ec_m: node.default_ec_shape.m,
-                    payload_storage: crate::PayloadShardStorage::MetadataPrimary,
                 })
                 .unwrap();
             winner_vid
@@ -2224,10 +2055,7 @@ mod tests {
         ));
 
         let data_pg = node.get_pg(loser_record.data_pg_id).unwrap();
-        assert!(matches!(
-            data_pg.read_shard(&shard_key),
-            Err(crate::error::StoreError::NotFound)
-        ));
+        assert_eq!(data_pg.read_shard(&shard_key).unwrap().data, b"hello");
         let meta_pg = node.get_pg(meta_pg_id).unwrap();
         let segments = meta_pg.list_stream_segments(&session_id).unwrap();
         assert_eq!(segments.len(), 1);
@@ -2528,109 +2356,6 @@ mod tests {
         assert!(matches!(err, StoreError::NotFound));
         pg.register_written_shard(&key, ack).unwrap();
         assert_eq!(pg.read_shard(&key).unwrap().data, b"hello");
-    }
-
-    #[test]
-    fn shared_node_write_shard_files_requires_metadata_registration() {
-        let tmp = test_util::tempdir();
-        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
-        let key_a = crate::types::ShardKey::new(&[0xEE; 16], 7, 0);
-        let key_b = crate::types::ShardKey::new(&[0xEE; 16], 7, 1);
-
-        let written = node
-            .write_shard_files(
-                0,
-                &[
-                    (key_a.clone(), b"hello".as_slice()),
-                    (key_b.clone(), b"world".as_slice()),
-                ],
-            )
-            .unwrap();
-        assert_eq!(node.read_shard_file(0, &key_a).unwrap(), b"hello");
-        assert_eq!(node.read_shard_file(0, &key_b).unwrap(), b"world");
-
-        let pg = node.get_pg(0).unwrap();
-        assert!(matches!(pg.read_shard(&key_a), Err(StoreError::NotFound)));
-        assert!(matches!(pg.read_shard(&key_b), Err(StoreError::NotFound)));
-        for (key, ack) in written {
-            pg.register_written_shard(&key, ack).unwrap();
-        }
-        assert_eq!(pg.read_shard(&key_a).unwrap().data, b"hello");
-        assert_eq!(pg.read_shard(&key_b).unwrap().data, b"world");
-    }
-
-    #[test]
-    fn shared_node_write_stream_segment_shards_reuses_encode_scratch() {
-        let tmp = test_util::tempdir();
-        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
-        let ec = EcShape { k: 4, m: 2 };
-        let segment_okh = [0xAA; 16];
-
-        assert_eq!(node.test_ec_scratch_allocation_count(ec), 0);
-
-        let written_a = node
-            .write_stream_segment_shards(0, &segment_okh, GenerationId::new(1).unwrap(), b"hello")
-            .unwrap();
-        assert_eq!(node.test_ec_scratch_allocation_count(ec), 1);
-
-        let written_b = node
-            .write_stream_segment_shards(0, &segment_okh, GenerationId::new(2).unwrap(), b"world")
-            .unwrap();
-        assert_eq!(node.test_ec_scratch_allocation_count(ec), 1);
-
-        for written in written_a.iter().chain(written_b.iter()) {
-            assert_eq!(
-                node.read_shard_file(0, &written.key).unwrap().len() as u64,
-                written.ack.stored_size
-            );
-        }
-    }
-
-    #[test]
-    fn shared_node_read_segment_stored_bytes_into_recovers_missing_data_shard() {
-        let tmp = test_util::tempdir();
-        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
-        let ec = EcShape { k: 4, m: 2 };
-        let segment_okh = [0xAB; 16];
-        let segment_vid = GenerationId::new(1).unwrap();
-        let data = b"recovery-check-segment";
-        let written = node
-            .write_stream_segment_shards(0, &segment_okh, segment_vid, data)
-            .unwrap();
-        assert_eq!(node.test_ec_scratch_allocation_count(ec), 1);
-        let written_pairs: Vec<(ShardKey, WriteAck)> = written
-            .iter()
-            .map(|written| {
-                (
-                    written.key.clone(),
-                    WriteAck {
-                        crc64: written.ack.crc64,
-                        stored_size: written.ack.stored_size,
-                    },
-                )
-            })
-            .collect();
-        node.test_register_written_shards(0, &written_pairs)
-            .unwrap();
-        node.test_delete_shards(0, &[written[0].key.clone()])
-            .unwrap();
-
-        let mut buf = Vec::new();
-        node.read_segment_stored_bytes_into(
-            SegmentStoredBytesRequest {
-                data_pg_id: 0,
-                segment_okh,
-                segment_vid,
-                stored_size: data.len(),
-                segment_crc64: Some(checksum::crc64::checksum(data)),
-                ec,
-                payload_storage: crate::PayloadShardStorage::MetadataPrimary,
-            },
-            &mut buf,
-        )
-        .unwrap();
-        assert_eq!(buf, data);
-        assert_eq!(node.test_ec_scratch_allocation_count(ec), 1);
     }
 
     #[test]

@@ -47,7 +47,6 @@ impl SharedStorageNode {
                         k: segment.ec_k,
                         m: segment.ec_m,
                     },
-                    payload_storage: segment.payload_storage,
                 })
                 .collect(),
         })
@@ -79,7 +78,6 @@ impl SharedStorageNode {
                         k: segment.ec_k,
                         m: segment.ec_m,
                     },
-                    payload_storage: segment.payload_storage,
                 });
         }
 
@@ -103,7 +101,6 @@ impl SharedStorageNode {
                             k: part.ec_k,
                             m: part.ec_m,
                         },
-                        payload_storage: part.payload_storage,
                     }
                 }
             })

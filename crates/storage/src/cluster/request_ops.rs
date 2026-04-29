@@ -625,7 +625,6 @@ impl super::StorageCluster {
                         segment.ec,
                         &segment.segment_okh,
                         segment.segment_vid,
-                        segment.payload_storage,
                         "delete placed object-segment reclaim shard",
                     )?;
                 }
@@ -638,7 +637,6 @@ impl super::StorageCluster {
                             part_vid,
                             data_pg_id,
                             ec,
-                            payload_storage,
                             ..
                         } => {
                             self.delete_payload_shard_set(
@@ -646,7 +644,6 @@ impl super::StorageCluster {
                                 *ec,
                                 part_okh,
                                 *part_vid,
-                                *payload_storage,
                                 "delete placed multipart-part reclaim shard",
                             )?;
                         }
@@ -657,7 +654,6 @@ impl super::StorageCluster {
                                     segment.ec,
                                     &segment.segment_okh,
                                     segment.segment_vid,
-                                    segment.payload_storage,
                                     "delete placed multipart-segment reclaim shard",
                                 )?;
                             }
@@ -720,7 +716,6 @@ impl super::StorageCluster {
                     k: part.ec_k,
                     m: part.ec_m,
                 },
-                part.payload_storage,
             );
         }
         self.delete_multipart_part_segments_best_effort(&cleanup.omitted_streaming_segments);
@@ -750,7 +745,6 @@ impl super::StorageCluster {
                     k: part.ec_k,
                     m: part.ec_m,
                 },
-                part.payload_storage,
             );
         }
         self.delete_multipart_part_segments_best_effort(&cleanup.displaced_segments);
@@ -779,7 +773,6 @@ impl super::StorageCluster {
                     k: part.ec_k,
                     m: part.ec_m,
                 },
-                part.payload_storage,
             );
         }
         self.delete_multipart_part_segments_best_effort(&cleanup.streaming_segments);
@@ -795,7 +788,6 @@ impl super::StorageCluster {
                     k: segment.ec_k,
                     m: segment.ec_m,
                 },
-                segment.payload_storage,
             );
         }
     }
@@ -806,15 +798,8 @@ impl super::StorageCluster {
         okh: &[u8; 16],
         generation_id: GenerationId,
         ec: EcShape,
-        payload_storage: PayloadShardStorage,
     ) {
-        self.delete_payload_shard_set_best_effort(
-            data_pg_id,
-            ec,
-            okh,
-            generation_id,
-            payload_storage,
-        );
+        self.delete_payload_shard_set_best_effort(data_pg_id, ec, okh, generation_id);
     }
 
     pub fn create_put_object_stream_session<T, E>(
@@ -969,13 +954,18 @@ impl super::StorageCluster {
         let cleanup_generation_id = req.generation_id;
         let (outcome, cleanup) = self
             .single_node
-            .complete_multipart_upload_commit_serialized(req, keep_completed_uploads)?;
+            .complete_multipart_upload_commit_serialized(req)?;
         self.delete_complete_multipart_cleanup_best_effort(
             &cleanup_bucket,
             &cleanup_key,
             cleanup_generation_id,
             &cleanup,
         );
+        self.single_node
+            .prune_completed_multipart_uploads_for_bucket_with_limit(
+                &cleanup_bucket,
+                keep_completed_uploads,
+            )?;
         Ok(outcome)
     }
 
@@ -1337,6 +1327,14 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_delete_bucket_metadata(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<(), BucketWriteDrainError> {
+        self.single_node.delete_bucket_metadata(bucket)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_get_all_multipart_part_segments_for_upload(
         &self,
         bucket: &BucketName,
@@ -1403,25 +1401,23 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_register_written_shards(
-        &self,
-        pg_id: u32,
-        written_shards: &[(ShardKey, WriteAck)],
-    ) -> Result<(), StoreError> {
-        self.single_node
-            .test_register_written_shards(pg_id, written_shards)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_delete_shards(&self, pg_id: u32, keys: &[ShardKey]) -> Result<(), StoreError> {
-        self.single_node.test_delete_shards(pg_id, keys)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_lock_bucket_pg(
         &self,
         bucket: &BucketName,
     ) -> Result<crate::node::BucketPgTestGuard<'_>, StoreError> {
         self.single_node.test_lock_bucket_pg(bucket)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_lock_bucket(&self, bucket: &BucketName) -> crate::node::BucketLockGuard<'_> {
+        self.single_node.lock_bucket(bucket)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_lock_multipart_completion_bucket(
+        &self,
+        bucket: &BucketName,
+    ) -> crate::node::BucketLockGuard<'_> {
+        self.single_node.lock_multipart_completion_bucket(bucket)
     }
 }

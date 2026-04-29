@@ -1060,7 +1060,6 @@ impl Coordinator {
                             data_pg_id: segment.data_pg_id,
                             ec_k: segment.ec_k,
                             ec_m: segment.ec_m,
-                            payload_storage: segment.payload_storage,
                         })
                         .collect();
 
@@ -1088,7 +1087,6 @@ impl Coordinator {
                             .expect("multipart part generation must be nonzero"),
                         ec_k: ec.k,
                         ec_m: ec.m,
-                        payload_storage: storage::PayloadShardStorage::Placed,
                         last_modified: now,
                         checksum: checksum.as_ref().map(ChecksumBytes::from),
                     };

@@ -1,12 +1,8 @@
-#[cfg(test)]
-use storage::GenerationId;
 use storage::{
     stream_segment_key_hash, BucketName, ManagedEncryptionAlgorithm, ObjectEncryption, ObjectKey,
     PrepareStreamUploadSegmentAppendReq, SessionId, ShardKey, StreamUploadTarget,
 };
 
-#[cfg(test)]
-use super::WrittenShard;
 #[cfg(feature = "deep-tracing")]
 use super::INTERNAL_SEGMENT_SIZE;
 #[cfg(test)]
@@ -419,26 +415,6 @@ impl Coordinator {
                 );
             }
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn write_segment_shards(
-        &self,
-        data_pg_id: u32,
-        segment_okh: &[u8; 16],
-        segment_vid: GenerationId,
-        data: &[u8],
-    ) -> Result<Vec<WrittenShard>, ServerError> {
-        Ok(self
-            .storage_node
-            .test_metadata_storage_node()
-            .write_stream_segment_shards(data_pg_id, segment_okh, segment_vid, data)?
-            .into_iter()
-            .map(|written| WrittenShard {
-                key: written.key,
-                ack: written.ack,
-            })
-            .collect())
     }
 
     pub(super) fn append_stream_segment_for(

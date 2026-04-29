@@ -1444,26 +1444,6 @@ pub struct EcShape {
     pub m: u8,
 }
 
-/// Physical location model for payload shard files.
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PayloadShardStorage {
-    /// Shard files live under the metadata-primary node's local PG store.
-    MetadataPrimary = 0,
-    /// Shard files are placed independently by shard index through the cluster map.
-    Placed = 1,
-}
-
-impl PayloadShardStorage {
-    pub fn from_u8(value: u8) -> Result<Self, String> {
-        match value {
-            0 => Ok(Self::MetadataPrimary),
-            1 => Ok(Self::Placed),
-            _ => Err(format!("invalid payload shard storage value {value}")),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentStoredBytesRequest {
     pub data_pg_id: u32,
@@ -1472,7 +1452,6 @@ pub struct SegmentStoredBytesRequest {
     pub stored_size: usize,
     pub segment_crc64: Option<u64>,
     pub ec: EcShape,
-    pub payload_storage: PayloadShardStorage,
 }
 
 /// Object-level ETag — either a single-part CRC64-NVME or a multipart composite.
@@ -1817,7 +1796,6 @@ pub struct ObjectSegmentsReclaimSegmentRecord {
     pub segment_vid: GenerationId,
     pub data_pg_id: u32,
     pub ec: EcShape,
-    pub payload_storage: PayloadShardStorage,
 }
 
 /// Durable reclaim record for a standard segmented object payload generation.
@@ -1859,7 +1837,6 @@ pub struct MultipartReclaimPartSegmentRecord {
     pub segment_vid: GenerationId,
     pub data_pg_id: u32,
     pub ec: EcShape,
-    pub payload_storage: PayloadShardStorage,
 }
 
 /// Part entry for a durable multipart reclaim record.
@@ -1871,7 +1848,6 @@ pub enum MultipartReclaimPartRecord {
         part_vid: GenerationId,
         data_pg_id: u32,
         ec: EcShape,
-        payload_storage: PayloadShardStorage,
     },
     Segments {
         part_number: u32,
@@ -2810,7 +2786,6 @@ pub struct MultipartPartRecord {
     pub part_vid: GenerationId,
     pub ec_k: u8,
     pub ec_m: u8,
-    pub payload_storage: PayloadShardStorage,
     /// Last modified timestamp (unix milliseconds).
     pub last_modified: u64,
     /// Raw checksum bytes for this part (None if no checksum).
@@ -2890,7 +2865,6 @@ pub struct ObjectPartRecord {
     pub part_vid: GenerationId,
     pub ec_k: u8,
     pub ec_m: u8,
-    pub payload_storage: PayloadShardStorage,
     /// PG where this part's shards are stored.
     pub data_pg_id: u32,
     /// Raw checksum bytes for this part (None if no checksum).
@@ -3104,7 +3078,6 @@ pub struct StreamUploadSegmentRecord {
     pub data_pg_id: u32,
     pub ec_k: u8,
     pub ec_m: u8,
-    pub payload_storage: PayloadShardStorage,
 }
 
 #[derive(Debug, Clone)]
@@ -3162,7 +3135,6 @@ pub struct ObjectSegmentRecord {
     pub data_pg_id: u32,
     pub ec_k: u8,
     pub ec_m: u8,
-    pub payload_storage: PayloadShardStorage,
 }
 
 /// Committed segment record for a multipart part.
@@ -3182,7 +3154,6 @@ pub struct MultipartPartSegmentRecord {
     pub data_pg_id: u32,
     pub ec_k: u8,
     pub ec_m: u8,
-    pub payload_storage: PayloadShardStorage,
 }
 
 #[cfg(test)]

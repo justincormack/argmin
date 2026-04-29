@@ -15,6 +15,7 @@ pub(super) struct ReclamationTestHooks {
 
 pub(super) static RECLAMATION_TEST_HOOKS: OnceLock<Mutex<ReclamationTestHooks>> = OnceLock::new();
 pub(super) static RECLAMATION_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+pub(super) static STORAGE_TEST_HOOK_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Default, Clone)]
 pub(super) struct BucketPolicyLoadTestHooks {

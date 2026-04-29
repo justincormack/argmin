@@ -142,7 +142,6 @@ CREATE TABLE IF NOT EXISTS multipart_parts (
     part_vid         INTEGER NOT NULL CHECK (part_vid > 0),
     ec_k             INTEGER NOT NULL,
     ec_m             INTEGER NOT NULL,
-    payload_storage  INTEGER NOT NULL DEFAULT 0 CHECK (payload_storage IN (0, 1)),
     last_modified    INTEGER NOT NULL,
     PRIMARY KEY (upload_id, part_number),
     FOREIGN KEY (upload_id) REFERENCES multipart_uploads(upload_id) ON DELETE CASCADE
@@ -163,7 +162,6 @@ CREATE TABLE IF NOT EXISTS object_parts (
     part_vid         INTEGER NOT NULL CHECK (part_vid > 0),
     ec_k             INTEGER NOT NULL,
     ec_m             INTEGER NOT NULL,
-    payload_storage  INTEGER NOT NULL DEFAULT 0 CHECK (payload_storage IN (0, 1)),
     data_pg_id      INTEGER NOT NULL,
     PRIMARY KEY (bucket, key, version_id, part_number)
 )";
@@ -206,7 +204,6 @@ CREATE TABLE IF NOT EXISTS stream_upload_segments (
     data_pg_id   INTEGER NOT NULL,
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
-    payload_storage INTEGER NOT NULL DEFAULT 0 CHECK (payload_storage IN (0, 1)),
     PRIMARY KEY (session_id, segment_index),
     FOREIGN KEY (session_id) REFERENCES stream_uploads(session_id) ON DELETE CASCADE
 )";
@@ -225,7 +222,6 @@ CREATE TABLE IF NOT EXISTS object_segments (
     data_pg_id   INTEGER NOT NULL,
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
-    payload_storage INTEGER NOT NULL DEFAULT 0 CHECK (payload_storage IN (0, 1)),
     PRIMARY KEY (bucket, key, version_id, segment_index)
 )";
 
@@ -251,7 +247,6 @@ CREATE TABLE IF NOT EXISTS object_segment_reclaim_segments (
     data_pg_id   INTEGER NOT NULL,
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
-    payload_storage INTEGER NOT NULL DEFAULT 0 CHECK (payload_storage IN (0, 1)),
     PRIMARY KEY (bucket, key, generation_id, segment_index),
     FOREIGN KEY (bucket, key, generation_id)
         REFERENCES object_segments_reclaims(bucket, key, generation_id)
@@ -292,7 +287,6 @@ CREATE TABLE IF NOT EXISTS multipart_reclaim_parts (
     data_pg_id   INTEGER,
     ec_k          INTEGER,
     ec_m          INTEGER,
-    payload_storage INTEGER NOT NULL DEFAULT 0 CHECK (payload_storage IN (0, 1)),
     PRIMARY KEY (bucket, key, generation_id, part_number),
     FOREIGN KEY (bucket, key, generation_id)
         REFERENCES multipart_reclaims(bucket, key, generation_id)
@@ -316,7 +310,6 @@ CREATE TABLE IF NOT EXISTS multipart_reclaim_part_segments (
     data_pg_id   INTEGER NOT NULL,
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
-    payload_storage INTEGER NOT NULL DEFAULT 0 CHECK (payload_storage IN (0, 1)),
     PRIMARY KEY (bucket, key, generation_id, part_number, segment_index),
     FOREIGN KEY (bucket, key, generation_id, part_number)
         REFERENCES multipart_reclaim_parts(bucket, key, generation_id, part_number)
@@ -339,7 +332,6 @@ CREATE TABLE IF NOT EXISTS multipart_part_segments (
     data_pg_id   INTEGER NOT NULL,
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
-    payload_storage INTEGER NOT NULL DEFAULT 0 CHECK (payload_storage IN (0, 1)),
     PRIMARY KEY (bucket, key, upload_id, part_number, segment_index)
 )";
 
@@ -490,7 +482,6 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_multipart_upload_tag_columns(conn)?;
     migrate_stream_upload_segment_vid_columns(conn)?;
     migrate_multipart_upload_object_generation_columns(conn)?;
-    migrate_payload_storage_columns(conn)?;
     create_object_lock_triggers(conn)?;
     Ok(())
 }
@@ -625,28 +616,6 @@ fn migrate_segment_crc_columns(conn: &Connection) -> Result<(), rusqlite::Error>
             {
                 // Column already exists, skip.
             }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-
-fn migrate_payload_storage_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
-    let migrations = [
-        "ALTER TABLE stream_upload_segments ADD COLUMN payload_storage INTEGER NOT NULL DEFAULT 0 CHECK (payload_storage IN (0, 1))",
-        "ALTER TABLE object_segments ADD COLUMN payload_storage INTEGER NOT NULL DEFAULT 0 CHECK (payload_storage IN (0, 1))",
-        "ALTER TABLE object_segment_reclaim_segments ADD COLUMN payload_storage INTEGER NOT NULL DEFAULT 0 CHECK (payload_storage IN (0, 1))",
-        "ALTER TABLE multipart_parts ADD COLUMN payload_storage INTEGER NOT NULL DEFAULT 0 CHECK (payload_storage IN (0, 1))",
-        "ALTER TABLE object_parts ADD COLUMN payload_storage INTEGER NOT NULL DEFAULT 0 CHECK (payload_storage IN (0, 1))",
-        "ALTER TABLE multipart_reclaim_parts ADD COLUMN payload_storage INTEGER NOT NULL DEFAULT 0 CHECK (payload_storage IN (0, 1))",
-        "ALTER TABLE multipart_reclaim_part_segments ADD COLUMN payload_storage INTEGER NOT NULL DEFAULT 0 CHECK (payload_storage IN (0, 1))",
-        "ALTER TABLE multipart_part_segments ADD COLUMN payload_storage INTEGER NOT NULL DEFAULT 0 CHECK (payload_storage IN (0, 1))",
-    ];
-    for sql in &migrations {
-        match conn.execute(sql, []) {
-            Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
-                if msg.contains("duplicate column name") => {}
             Err(e) => return Err(e),
         }
     }

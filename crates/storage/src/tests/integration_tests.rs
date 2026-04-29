@@ -292,7 +292,6 @@ fn multipart_upload_lifecycle() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
             last_modified: 0,
             checksum: None,
         })
@@ -309,7 +308,6 @@ fn multipart_upload_lifecycle() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
             last_modified: 0,
             checksum: None,
         })
@@ -357,7 +355,6 @@ fn multipart_upload_lifecycle() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
             data_pg_id: 0,
             checksum: None,
         },
@@ -373,7 +370,6 @@ fn multipart_upload_lifecycle() {
             part_vid: GenerationId::MIN,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
             data_pg_id: 0,
             checksum: None,
         },
@@ -453,7 +449,6 @@ fn streaming_put_object_lifecycle() {
             data_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
         })
         .unwrap();
     store
@@ -467,7 +462,6 @@ fn streaming_put_object_lifecycle() {
             data_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
         })
         .unwrap();
 
@@ -492,7 +486,6 @@ fn streaming_put_object_lifecycle() {
             data_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
         },
         ObjectSegmentRecord {
             bucket: bucket_name("bucket"),
@@ -506,7 +499,6 @@ fn streaming_put_object_lifecycle() {
             data_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
         },
     ];
 
@@ -624,7 +616,6 @@ fn streaming_upload_part_lifecycle() {
             data_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
-            payload_storage: PayloadShardStorage::MetadataPrimary,
         })
         .unwrap();
 
@@ -643,7 +634,6 @@ fn streaming_upload_part_lifecycle() {
         data_pg_id: 0,
         ec_k: 4,
         ec_m: 2,
-        payload_storage: PayloadShardStorage::MetadataPrimary,
     }];
 
     let displaced_segments = store
@@ -660,7 +650,6 @@ fn streaming_upload_part_lifecycle() {
                 part_vid: GenerationId::MIN,
                 ec_k: 4,
                 ec_m: 2,
-                payload_storage: PayloadShardStorage::MetadataPrimary,
                 last_modified: 0,
                 checksum: None,
             },
@@ -870,7 +859,6 @@ fn object_overwrite_with_reclaim() {
                 segment_vid: gen1,
                 data_pg_id: 0,
                 ec: EcShape { k: 4, m: 2 },
-                payload_storage: PayloadShardStorage::MetadataPrimary,
             }],
         })
         .unwrap();
@@ -1078,7 +1066,6 @@ fn multipart_abort_cleanup() {
         part_vid: GenerationId::MIN,
         ec_k: 4,
         ec_m: 2,
-        payload_storage: PayloadShardStorage::MetadataPrimary,
         last_modified: 0,
         checksum: None,
     };
@@ -1096,7 +1083,6 @@ fn multipart_abort_cleanup() {
         data_pg_id: 0,
         ec_k: 4,
         ec_m: 2,
-        payload_storage: PayloadShardStorage::MetadataPrimary,
     }];
     store
         .upsert_multipart_part_segments(&part, &segments)
@@ -1328,7 +1314,6 @@ fn persistence_complex_state_through_reopen() {
                 data_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
-                payload_storage: PayloadShardStorage::MetadataPrimary,
             })
             .unwrap();
 
@@ -1364,7 +1349,6 @@ fn persistence_complex_state_through_reopen() {
                 part_vid: GenerationId::MIN,
                 ec_k: 4,
                 ec_m: 2,
-                payload_storage: PayloadShardStorage::MetadataPrimary,
                 last_modified: 0,
                 checksum: None,
             })

@@ -8,12 +8,11 @@ use crate::sse::SSE_CUSTOMER_ALGORITHM;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Barrier, Mutex};
 use std::thread;
 use std::time::Duration;
 use storage::{install_bucket_scoped_test_hooks, BucketScopedTestHooks, StorageCluster};
 
-static STORAGE_TEST_HOOK_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1222,7 +1221,6 @@ fn put_object_does_not_wait_for_bucket_lock() {
     let bucket = "bucket-put-no-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let storage_node = storage_cluster.test_metadata_storage_node();
     let admin = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
         &storage_cluster,
     ));
@@ -1241,7 +1239,7 @@ fn put_object_does_not_wait_for_bucket_lock() {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let guard = storage_node.lock_bucket(&trusted_bucket_name(bucket));
+    let guard = storage_cluster.test_lock_bucket(&trusted_bucket_name(bucket));
     let (event_tx, event_rx) = mpsc::channel();
     let event_tx_lock = event_tx.clone();
     let _storage_hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
@@ -1296,7 +1294,6 @@ fn create_multipart_upload_does_not_wait_for_bucket_lock() {
     let bucket = "bucket-create-mpu-no-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let storage_node = storage_cluster.test_metadata_storage_node();
     let admin = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
         &storage_cluster,
     ));
@@ -1315,7 +1312,7 @@ fn create_multipart_upload_does_not_wait_for_bucket_lock() {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let guard = storage_node.lock_bucket(&trusted_bucket_name(bucket));
+    let guard = storage_cluster.test_lock_bucket(&trusted_bucket_name(bucket));
     let (event_tx, event_rx) = mpsc::channel();
     let event_tx_lock = event_tx.clone();
     let _storage_hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
@@ -1441,7 +1438,6 @@ fn delete_bucket_does_not_wait_for_bucket_lock() {
     let bucket = "bucket-delete-no-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let storage_node = storage_cluster.test_metadata_storage_node();
     let admin = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
         &storage_cluster,
     ));
@@ -1456,7 +1452,7 @@ fn delete_bucket_does_not_wait_for_bucket_lock() {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let guard = storage_node.lock_bucket(&trusted_bucket_name(bucket));
+    let guard = storage_cluster.test_lock_bucket(&trusted_bucket_name(bucket));
     let (event_tx, event_rx) = mpsc::channel();
     let event_tx_lock = event_tx.clone();
     let _storage_hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
@@ -1552,7 +1548,6 @@ fn head_object_waits_for_bucket_pg_when_non_boe_bucket_fast_path_is_warm() {
     let bucket = "bucket-head-fast-no-pg";
     let pg_ids: Vec<u32> = (0..METADATA_FANOUT_TEST_PG_COUNT).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let storage_node = storage_cluster.test_metadata_storage_node();
     let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let reader = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
@@ -1607,7 +1602,7 @@ fn head_object_waits_for_bucket_pg_when_non_boe_bucket_fast_path_is_warm() {
             panic!("non-BOE head_object should not use fast bucket path");
         })),
     });
-    let bucket_pg = storage_node
+    let bucket_pg = storage_cluster
         .test_lock_bucket_pg(&trusted_bucket_name(bucket))
         .unwrap();
     let (tx, rx) = mpsc::channel();
@@ -1646,7 +1641,6 @@ fn head_object_does_not_wait_for_bucket_pg_when_boe_fast_path_is_warm() {
     let bucket = "bucket-head-boe-fast-no-pg";
     let pg_ids: Vec<u32> = (0..METADATA_FANOUT_TEST_PG_COUNT).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let storage_node = storage_cluster.test_metadata_storage_node();
     let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let reader = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
@@ -1709,7 +1703,7 @@ fn head_object_does_not_wait_for_bucket_pg_when_boe_fast_path_is_warm() {
             let _ = event_tx.send(LockWaitEvent::Progress);
         })),
     });
-    let bucket_pg = storage_node
+    let bucket_pg = storage_cluster
         .test_lock_bucket_pg(&trusted_bucket_name(bucket))
         .unwrap();
     let (tx, rx) = mpsc::channel();
@@ -1744,7 +1738,6 @@ fn head_object_does_not_wait_for_bucket_pg_when_boe_policy_and_abac_tags_fast_pa
     let bucket = "bucket-head-policy-abac-fast";
     let pg_ids: Vec<u32> = (0..METADATA_FANOUT_TEST_PG_COUNT).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let storage_node = storage_cluster.test_metadata_storage_node();
     let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let reader = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
@@ -1854,7 +1847,7 @@ fn head_object_does_not_wait_for_bucket_pg_when_boe_policy_and_abac_tags_fast_pa
             let _ = event_tx.send(LockWaitEvent::Progress);
         })),
     });
-    let bucket_pg = storage_node
+    let bucket_pg = storage_cluster
         .test_lock_bucket_pg(&trusted_bucket_name(bucket))
         .unwrap();
     let (tx, rx) = mpsc::channel();
@@ -1907,7 +1900,6 @@ fn head_object_fast_path_denies_with_non_matching_boe_abac_bucket_tags() {
     let bucket = "bucket-head-policy-abac-fast-deny";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let storage_node = storage_cluster.test_metadata_storage_node();
     let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let reader = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
@@ -2017,7 +2009,7 @@ fn head_object_fast_path_denies_with_non_matching_boe_abac_bucket_tags() {
             let _ = event_tx.send(LockWaitEvent::Progress);
         })),
     });
-    let bucket_pg = storage_node
+    let bucket_pg = storage_cluster
         .test_lock_bucket_pg(&trusted_bucket_name(bucket))
         .unwrap();
     let (tx, rx) = mpsc::channel();
@@ -2052,7 +2044,6 @@ fn head_object_reloads_after_boe_policy_mutation_rebuilds_fast_path() {
     let bucket = "bucket-head-policy-cold-fallback";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let storage_node = storage_cluster.test_metadata_storage_node();
     let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let reader = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let reader_after_reload = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -2125,7 +2116,7 @@ fn head_object_reloads_after_boe_policy_mutation_rebuilds_fast_path() {
     let cached = reader
         .get_bucket_fast_path(&trusted_bucket_name(bucket))
         .expect("policy mutation should leave cached entry in place");
-    let raw = storage_node
+    let raw = storage_cluster
         .test_head_bucket_raw(&trusted_bucket_name(bucket))
         .expect("policy mutation should leave bucket metadata readable");
     assert!(
@@ -2354,7 +2345,6 @@ fn bucket_fast_path_watcher_survives_first_cluster_handle_drop() {
     let bucket = "bucket-fast-path-watch-first-handle-drop";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let storage_node = storage_cluster.test_metadata_storage_node();
     let admin = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let reader = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
@@ -2419,7 +2409,7 @@ fn bucket_fast_path_watcher_survives_first_cluster_handle_drop() {
     );
 
     drop(admin);
-    storage_node
+    storage_cluster
         .delete_bucket_subresource_and_load_info(
             &bucket_name,
             storage::BucketSubresourceKind::Policy,
@@ -2442,7 +2432,6 @@ fn bucket_fast_path_watcher_observes_direct_storage_policy_mutation() {
     let bucket = "bucket-fast-path-watch-direct-policy";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let storage_node = storage_cluster.test_metadata_storage_node();
     let admin = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let reader = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
@@ -2506,7 +2495,7 @@ fn bucket_fast_path_watcher_observes_direct_storage_policy_mutation() {
         Some(true)
     );
 
-    storage_node
+    storage_cluster
         .delete_bucket_subresource_and_load_info(
             &bucket_name,
             storage::BucketSubresourceKind::Policy,
@@ -2560,7 +2549,6 @@ fn bucket_fast_path_watcher_observes_direct_storage_delete_recreate() {
     let bucket = "bucket-fast-path-watch-direct-recreate";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let storage_node = storage_cluster.test_metadata_storage_node();
     let admin = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let reader = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
@@ -2602,10 +2590,12 @@ fn bucket_fast_path_watcher_observes_direct_storage_delete_recreate() {
         Some(true)
     );
 
-    storage_node.begin_bucket_delete(&bucket_name).unwrap();
-    storage_node.delete_bucket_metadata(&bucket_name).unwrap();
+    storage_cluster.begin_bucket_delete(&bucket_name).unwrap();
+    storage_cluster
+        .test_delete_bucket_metadata(&bucket_name)
+        .unwrap();
     let recreated_owner = CanonicalUserId::from_principal("777788889999");
-    storage_node
+    storage_cluster
         .create_bucket_with_config_and_load_info(&storage::CreateBucketConfig {
             name: bucket,
             owner_principal: "777788889999",
@@ -2617,7 +2607,7 @@ fn bucket_fast_path_watcher_observes_direct_storage_delete_recreate() {
             object_lock: BucketObjectLockConfig::default(),
         })
         .unwrap();
-    let recreated = storage_node.test_head_bucket_raw(&bucket_name).unwrap();
+    let recreated = storage_cluster.test_head_bucket_raw(&bucket_name).unwrap();
     assert!(
         recreated.bucket_execution_generation > cached_generation,
         "delete/recreate must advance authoritative bucket execution generation"
@@ -2670,7 +2660,6 @@ fn bucket_fast_path_watcher_recovers_after_observing_missing_bucket_before_recre
     let bucket = "bucket-fast-path-watch-delete-then-recreate";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let storage_node = storage_cluster.test_metadata_storage_node();
     let admin = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let reader = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
@@ -2709,8 +2698,10 @@ fn bucket_fast_path_watcher_recovers_after_observing_missing_bucket_before_recre
         "BOE read should warm cache"
     );
 
-    storage_node.begin_bucket_delete(&bucket_name).unwrap();
-    storage_node.delete_bucket_metadata(&bucket_name).unwrap();
+    storage_cluster.begin_bucket_delete(&bucket_name).unwrap();
+    storage_cluster
+        .test_delete_bucket_metadata(&bucket_name)
+        .unwrap();
 
     let start = std::time::Instant::now();
     while reader.get_bucket_fast_path(&bucket_name).is_some() {
@@ -2722,7 +2713,7 @@ fn bucket_fast_path_watcher_recovers_after_observing_missing_bucket_before_recre
     }
 
     let recreated_owner = CanonicalUserId::from_principal("111122223333");
-    storage_node
+    storage_cluster
         .create_bucket_with_config_and_load_info(&storage::CreateBucketConfig {
             name: bucket,
             owner_principal: "111122223333",
@@ -2734,7 +2725,7 @@ fn bucket_fast_path_watcher_recovers_after_observing_missing_bucket_before_recre
             object_lock: BucketObjectLockConfig::default(),
         })
         .unwrap();
-    storage_node
+    storage_cluster
         .put_bucket_ownership_controls_and_load_info(
             &bucket_name,
             BucketOwnershipControls {
@@ -2891,7 +2882,6 @@ fn delete_object_falls_back_to_storage_load_when_bucket_fast_path_is_acl_free() 
     let bucket = "bucket-delete-fast-no-pg";
     let pg_ids: Vec<u32> = (0..METADATA_FANOUT_TEST_PG_COUNT).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let storage_node = storage_cluster.test_metadata_storage_node();
     let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let deleter = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
@@ -2946,7 +2936,7 @@ fn delete_object_falls_back_to_storage_load_when_bucket_fast_path_is_acl_free() 
             panic!("delete_object should not use ACL-free fast bucket path");
         })),
     });
-    let bucket_pg = storage_node
+    let bucket_pg = storage_cluster
         .test_lock_bucket_pg(&trusted_bucket_name(bucket))
         .unwrap();
     let (tx, rx) = mpsc::channel();
@@ -2997,7 +2987,6 @@ fn complete_multipart_upload_does_not_wait_for_bucket_lock() {
     let bucket = "bucket-complete-no-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let storage_node = storage_cluster.test_metadata_storage_node();
     let admin = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
         &storage_cluster,
     ));
@@ -3018,7 +3007,7 @@ fn complete_multipart_upload_does_not_wait_for_bucket_lock() {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let guard = storage_node.lock_bucket(&trusted_bucket_name(bucket));
+    let guard = storage_cluster.test_lock_bucket(&trusted_bucket_name(bucket));
     let (event_tx, event_rx) = mpsc::channel();
     let event_tx_lock = event_tx.clone();
     let _storage_hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
@@ -3074,7 +3063,6 @@ fn complete_multipart_upload_waits_for_multipart_completion_lock() {
     let bucket = "bucket-complete-waits-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let storage_node = storage_cluster.test_metadata_storage_node();
     let admin = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
         &storage_cluster,
     ));
@@ -3094,7 +3082,7 @@ fn complete_multipart_upload_waits_for_multipart_completion_lock() {
     let reached_before_lock = Arc::new(Barrier::new(2));
     let reached_before_lock_hook = Arc::clone(&reached_before_lock);
     let (acquired_lock_tx, acquired_lock_rx) = mpsc::channel();
-    let guard = storage_node.lock_multipart_completion_bucket(&trusted_bucket_name(bucket));
+    let guard = storage_cluster.test_lock_multipart_completion_bucket(&trusted_bucket_name(bucket));
     let _hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
         target: Some(trusted_bucket_name(bucket)),
         before_multipart_completion_lock: Some(Arc::new(move || {

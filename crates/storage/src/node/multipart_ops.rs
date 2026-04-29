@@ -22,6 +22,7 @@ impl SharedStorageNode {
         bucket: &BucketName,
         keep: usize,
     ) -> Result<(), ObjectPgActionError> {
+        maybe_run_before_completed_multipart_prune_hook(bucket)?;
         let mut uploads: Vec<(u32, UploadId, u64)> = Vec::new();
         self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.get_pg(pg_id)?;
@@ -328,7 +329,6 @@ impl SharedStorageNode {
                         k: segment.ec_k,
                         m: segment.ec_m,
                     },
-                    payload_storage: segment.payload_storage,
                 })
                 .collect(),
         })?;
@@ -361,7 +361,6 @@ impl SharedStorageNode {
                         k: segment.ec_k,
                         m: segment.ec_m,
                     },
-                    payload_storage: segment.payload_storage,
                 });
         }
 
@@ -390,7 +389,6 @@ impl SharedStorageNode {
                                 k: part.ec_k,
                                 m: part.ec_m,
                             },
-                            payload_storage: part.payload_storage,
                         }
                     }
                 })
@@ -484,7 +482,6 @@ impl SharedStorageNode {
                     part_vid: part.part_vid,
                     ec_k: part.ec_k,
                     ec_m: part.ec_m,
-                    payload_storage: part.payload_storage,
                     data_pg_id,
                     checksum: part.checksum.clone(),
                 }
@@ -541,21 +538,12 @@ impl SharedStorageNode {
         };
         drop(pg);
 
-        self.delete_multipart_part_shards_best_effort_for_generation(
-            &req.bucket,
-            &req.key,
-            req.generation_id,
-            &cleanup.omitted_parts,
-        );
-        self.delete_streaming_segment_shards_best_effort(&cleanup.omitted_streaming_segments);
-
         Ok((outcome, cleanup))
     }
 
     pub fn complete_multipart_upload_commit_serialized(
         &self,
         req: CompleteMultipartCommitRequest,
-        keep_completed_uploads: usize,
     ) -> Result<
         (
             CompleteMultipartCommitOutcome,
@@ -563,7 +551,6 @@ impl SharedStorageNode {
         ),
         ObjectPgActionError,
     > {
-        let bucket = req.bucket.clone();
         let _completion_guard = self.lock_multipart_completion_bucket(&req.bucket);
         let completion_order = self
             .next_completed_multipart_upload_order_for_bucket(&req.bucket)
@@ -571,13 +558,7 @@ impl SharedStorageNode {
                 BucketSnapshotLoadError::Store(error) => ObjectPgActionError::Store(error),
                 BucketSnapshotLoadError::Metadata(error) => ObjectPgActionError::Metadata(error),
             })?;
-        let (outcome, cleanup) =
-            self.complete_multipart_upload_commit_with_order(req, completion_order)?;
-        self.prune_completed_multipart_uploads_for_bucket_with_limit(
-            &bucket,
-            keep_completed_uploads,
-        )?;
-        Ok((outcome, cleanup))
+        self.complete_multipart_upload_commit_with_order(req, completion_order)
     }
 
     pub fn finalize_upload_part_stream<T, E>(
@@ -636,14 +617,6 @@ impl SharedStorageNode {
                 Err(error) => (Err(error), None),
             }
         };
-
-        if let Some(cleanup) = cleanup.as_ref() {
-            self.delete_replaced_upload_part_best_effort(
-                &cleanup.upload,
-                cleanup.existing_part.as_ref(),
-                &cleanup.displaced_segments,
-            );
-        }
 
         Ok(FinalizeStreamPartStorageOutcome { result, cleanup })
     }
@@ -751,113 +724,6 @@ impl SharedStorageNode {
         }
     }
 
-    fn delete_segment_shard_set(
-        &self,
-        data_pg_id: u32,
-        segment_okh: &[u8; 16],
-        segment_vid: GenerationId,
-        ec_k: u8,
-        ec_m: u8,
-    ) -> Result<(), ObjectPgActionError> {
-        let pg = self.get_pg(data_pg_id)?;
-        let total = ec_k as usize + ec_m as usize;
-        for i in 0..total {
-            let shard_key = ShardKey::new(segment_okh, segment_vid.get(), i as u8);
-            pg.delete_shard(&shard_key)?;
-        }
-        Ok(())
-    }
-
-    fn delete_streaming_segment_shards(
-        &self,
-        segments: &[MultipartPartSegmentRecord],
-    ) -> Result<(), ObjectPgActionError> {
-        for segment in segments {
-            self.delete_segment_shard_set(
-                segment.data_pg_id,
-                &segment.segment_okh,
-                segment.segment_vid,
-                segment.ec_k,
-                segment.ec_m,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn delete_streaming_segment_shards_best_effort(&self, segments: &[MultipartPartSegmentRecord]) {
-        for segment in segments {
-            let _ = self.delete_segment_shard_set(
-                segment.data_pg_id,
-                &segment.segment_okh,
-                segment.segment_vid,
-                segment.ec_k,
-                segment.ec_m,
-            );
-        }
-    }
-
-    fn delete_multipart_part_shards_best_effort_for_generation(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        object_generation_id: GenerationId,
-        parts: &[MultipartPartRecord],
-    ) {
-        for part in parts {
-            if part.part_okh == [0u8; 16] {
-                continue;
-            }
-            let data_pg_id =
-                self.multipart_part_data_pg_id(bucket, key, object_generation_id, part.part_number);
-            let Ok(data_pg) = self.get_pg(data_pg_id) else {
-                continue;
-            };
-            let total = part.ec_k as usize + part.ec_m as usize;
-            for i in 0..total {
-                let shard_key = ShardKey::new(&part.part_okh, part.part_vid.get(), i as u8);
-                let _ = data_pg.delete_shard(&shard_key);
-            }
-        }
-    }
-
-    fn delete_multipart_part_shards_best_effort(
-        &self,
-        upload: &MultipartUploadRecord,
-        parts: &[MultipartPartRecord],
-    ) {
-        self.delete_multipart_part_shards_best_effort_for_generation(
-            &upload.bucket,
-            &upload.key,
-            upload.object_generation_id,
-            parts,
-        );
-    }
-
-    fn delete_replaced_upload_part_best_effort(
-        &self,
-        upload: &MultipartUploadRecord,
-        existing_part: Option<&MultipartPartRecord>,
-        displaced_segments: &[MultipartPartSegmentRecord],
-    ) {
-        if let Some(existing_part) = existing_part.filter(|part| part.part_okh != [0u8; 16]) {
-            let data_pg_id = self.multipart_part_data_pg_id(
-                &upload.bucket,
-                &upload.key,
-                upload.object_generation_id,
-                existing_part.part_number,
-            );
-            let _ = self.delete_segment_shard_set(
-                data_pg_id,
-                &existing_part.part_okh,
-                existing_part.part_vid,
-                existing_part.ec_k,
-                existing_part.ec_m,
-            );
-        }
-
-        let _ = self.delete_streaming_segment_shards(displaced_segments);
-    }
-
     pub fn abort_multipart_upload(
         &self,
         bucket: &BucketName,
@@ -891,11 +757,6 @@ impl SharedStorageNode {
             let streaming_segments = pg.get_all_multipart_part_segments_for_upload(upload_id)?;
             (upload, parts, streaming_segments)
         };
-
-        self.delete_multipart_part_shards_best_effort(&upload, &parts);
-        if !streaming_segments.is_empty() {
-            self.delete_streaming_segment_shards(&streaming_segments)?;
-        }
 
         let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
         if !streaming_segments.is_empty() {

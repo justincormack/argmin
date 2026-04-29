@@ -9,8 +9,8 @@ use std::path::Path;
 use std::sync::{Arc, Barrier, MutexGuard};
 use storage::{
     EcShape, MultipartPartSegmentRecord, MultipartUploadRecord, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, PayloadReclaimRoot, PayloadShardStorage, PgTopology,
-    StreamUploadRecord, StreamUploadSegmentRecord,
+    ObjectSegmentsReclaimSegmentRecord, PayloadReclaimRoot, PgTopology, StreamUploadRecord,
+    StreamUploadSegmentRecord,
 };
 
 const NO_READ: &ReadCondition = &ReadCondition {
@@ -389,24 +389,22 @@ fn assert_segment_shards_exist(
                     .unwrap(),
                 "{invariant}: shard {i} should exist {phase}"
             );
-            if segment.payload_storage == PayloadShardStorage::Placed {
-                assert!(
-                    coord
-                        .storage_node
-                        .test_payload_shard_file_exists(
-                            segment.data_pg_id,
-                            EcShape {
-                                k: segment.ec_k,
-                                m: segment.ec_m,
-                            },
-                            &segment.segment_okh,
-                            segment.segment_vid,
-                            i as u8,
-                        )
-                        .unwrap(),
-                    "{invariant}: placed shard file {i} should exist {phase}"
-                );
-            }
+            assert!(
+                coord
+                    .storage_node
+                    .test_payload_shard_file_exists(
+                        segment.data_pg_id,
+                        EcShape {
+                            k: segment.ec_k,
+                            m: segment.ec_m,
+                        },
+                        &segment.segment_okh,
+                        segment.segment_vid,
+                        i as u8,
+                    )
+                    .unwrap(),
+                "{invariant}: placed shard file {i} should exist {phase}"
+            );
         }
     }
 }
@@ -428,24 +426,22 @@ fn assert_segment_shards_deleted(
                     .unwrap(),
                 "{invariant}: shard {i} should be deleted {phase}"
             );
-            if segment.payload_storage == PayloadShardStorage::Placed {
-                assert!(
-                    !coord
-                        .storage_node
-                        .test_payload_shard_file_exists(
-                            segment.data_pg_id,
-                            EcShape {
-                                k: segment.ec_k,
-                                m: segment.ec_m,
-                            },
-                            &segment.segment_okh,
-                            segment.segment_vid,
-                            i as u8,
-                        )
-                        .unwrap(),
-                    "{invariant}: placed shard file {i} should be deleted {phase}"
-                );
-            }
+            assert!(
+                !coord
+                    .storage_node
+                    .test_payload_shard_file_exists(
+                        segment.data_pg_id,
+                        EcShape {
+                            k: segment.ec_k,
+                            m: segment.ec_m,
+                        },
+                        &segment.segment_okh,
+                        segment.segment_vid,
+                        i as u8,
+                    )
+                    .unwrap(),
+                "{invariant}: placed shard file {i} should be deleted {phase}"
+            );
         }
     }
 }
@@ -829,24 +825,22 @@ fn aborting_streamed_multipart_upload_cleans_committed_segments_and_shards() {
                     .unwrap(),
                 "{invariant}: shard {i} should exist before abort"
             );
-            if segment.payload_storage == PayloadShardStorage::Placed {
-                assert!(
-                    coord
-                        .storage_node
-                        .test_payload_shard_file_exists(
-                            segment.data_pg_id,
-                            EcShape {
-                                k: segment.ec_k,
-                                m: segment.ec_m,
-                            },
-                            &segment.segment_okh,
-                            segment.segment_vid,
-                            i as u8,
-                        )
-                        .unwrap(),
-                    "{invariant}: placed shard file {i} should exist before abort"
-                );
-            }
+            assert!(
+                coord
+                    .storage_node
+                    .test_payload_shard_file_exists(
+                        segment.data_pg_id,
+                        EcShape {
+                            k: segment.ec_k,
+                            m: segment.ec_m,
+                        },
+                        &segment.segment_okh,
+                        segment.segment_vid,
+                        i as u8,
+                    )
+                    .unwrap(),
+                "{invariant}: placed shard file {i} should exist before abort"
+            );
         }
     }
 
@@ -879,24 +873,22 @@ fn aborting_streamed_multipart_upload_cleans_committed_segments_and_shards() {
                     .unwrap(),
                 "{invariant}: shard {i} should be deleted after abort"
             );
-            if segment.payload_storage == PayloadShardStorage::Placed {
-                assert!(
-                    !coord
-                        .storage_node
-                        .test_payload_shard_file_exists(
-                            segment.data_pg_id,
-                            EcShape {
-                                k: segment.ec_k,
-                                m: segment.ec_m,
-                            },
-                            &segment.segment_okh,
-                            segment.segment_vid,
-                            i as u8,
-                        )
-                        .unwrap(),
-                    "{invariant}: placed shard file {i} should be deleted after abort"
-                );
-            }
+            assert!(
+                !coord
+                    .storage_node
+                    .test_payload_shard_file_exists(
+                        segment.data_pg_id,
+                        EcShape {
+                            k: segment.ec_k,
+                            m: segment.ec_m,
+                        },
+                        &segment.segment_okh,
+                        segment.segment_vid,
+                        i as u8,
+                    )
+                    .unwrap(),
+                "{invariant}: placed shard file {i} should be deleted after abort"
+            );
         }
     }
 }
@@ -1460,7 +1452,6 @@ fn final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists() {
                         segment_vid: generation_id,
                         data_pg_id,
                         ec: EcShape { k: 4, m: 2 },
-                        payload_storage: storage::PayloadShardStorage::MetadataPrimary,
                     }],
                 },
             )

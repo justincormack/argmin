@@ -121,23 +121,6 @@ impl SharedStorageNode {
             .collect())
     }
 
-    fn write_erasure_coded_segment_shards(
-        &self,
-        data_pg_id: u32,
-        segment_okh: &[u8; 16],
-        segment_vid: GenerationId,
-        data: &[u8],
-        ec: EcShape,
-    ) -> Result<Vec<WrittenShardAck>, StoreError> {
-        self.write_erasure_coded_segment_shards_with(
-            segment_okh,
-            segment_vid,
-            data,
-            ec,
-            |shard_batch| self.write_shard_files(data_pg_id, shard_batch),
-        )
-    }
-
     pub fn reserve_put_object_generation(
         &self,
         bucket: &BucketName,
@@ -158,45 +141,27 @@ impl SharedStorageNode {
         Ok(object_pg.delete_object_generation_reservation(bucket, key, reservation_id)?)
     }
 
-    pub fn write_stream_segment_shards(
-        &self,
-        data_pg_id: u32,
-        segment_okh: &[u8; 16],
-        segment_vid: GenerationId,
-        data: &[u8],
-    ) -> Result<Vec<WrittenShardAck>, StoreError> {
-        let ec = self.default_ec_shape();
-        self.write_erasure_coded_segment_shards(data_pg_id, segment_okh, segment_vid, data, ec)
-    }
-
     pub(crate) fn commit_direct_put_object<E>(
         &self,
         req: &CommitDirectPutObjectReq,
         written_shards: &[WrittenShardAck],
         action: impl FnOnce(DirectPutCommitSnapshot) -> Result<(), E>,
-    ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, ObjectPgActionError> {
+    ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, DirectPutCommitError> {
         let meta_pg_id = self.pg_topology.object_pg_for(&req.bucket, &req.key);
         let (meta_pg, data_pg) = match self.lock_two_pgs(meta_pg_id, req.data_pg_id) {
             Ok(guards) => guards,
             Err(error) => {
-                let shard_keys: Vec<ShardKey> = written_shards
-                    .iter()
-                    .map(|written| written.key.clone())
-                    .collect();
-                self.delete_shards_best_effort(req.data_pg_id, &shard_keys);
                 let _ = self.release_object_generation_reservation(
                     &req.bucket,
                     &req.key,
                     &req.generation_reservation_id,
                 );
-                return Err(ObjectPgActionError::Store(error));
+                return Err(DirectPutCommitError::pre_publish(
+                    ObjectPgActionError::Store(error),
+                ));
             }
         };
         let data_pg = data_pg.as_deref().unwrap_or(&meta_pg);
-        let shard_keys: Vec<ShardKey> = written_shards
-            .iter()
-            .map(|written| written.key.clone())
-            .collect();
 
         let release_reservation = |meta_pg: &PgStore| {
             meta_pg.delete_object_generation_reservation(
@@ -213,20 +178,20 @@ impl SharedStorageNode {
         ) {
             Ok(generation_id) => generation_id,
             Err(error) => {
-                Self::cleanup_shards_locked(data_pg, &shard_keys);
-                return Err(error.into());
+                return Err(DirectPutCommitError::pre_publish(error));
             }
         };
         if reserved_generation != req.generation_id {
-            Self::cleanup_shards_locked(data_pg, &shard_keys);
             let _ = release_reservation(&meta_pg);
-            return Err(ObjectPgActionError::InvalidRequest {
-                reason: format!(
+            return Err(DirectPutCommitError::pre_publish(
+                ObjectPgActionError::InvalidRequest {
+                    reason: format!(
                     "object generation reservation mismatch: reserved {} but commit requested {}",
                     reserved_generation.get(),
                     req.generation_id.get()
                 ),
-            });
+                },
+            ));
         }
 
         let existing_etag = match PgMetadataStore::get_object_meta(&*meta_pg, &req.bucket, &req.key)
@@ -234,14 +199,12 @@ impl SharedStorageNode {
             Ok(stored) => stored.as_live().map(|record| record.etag.format()),
             Err(crate::error::MetadataError::ObjectNotFound) => None,
             Err(other) => {
-                Self::cleanup_shards_locked(data_pg, &shard_keys);
                 let _ = release_reservation(&meta_pg);
-                return Err(other.into());
+                return Err(DirectPutCommitError::pre_publish(other));
             }
         };
 
         if let Err(error) = action(DirectPutCommitSnapshot { existing_etag }) {
-            Self::cleanup_shards_locked(data_pg, shard_keys.as_slice());
             let _ = release_reservation(&meta_pg);
             return Ok(Err(error));
         }
@@ -250,9 +213,8 @@ impl SharedStorageNode {
             match PgMetadataStore::next_version_id(&*meta_pg, &req.bucket, &req.key) {
                 Ok(version_id) => version_id,
                 Err(error) => {
-                    Self::cleanup_shards_locked(data_pg, shard_keys.as_slice());
                     let _ = release_reservation(&meta_pg);
-                    return Err(error.into());
+                    return Err(DirectPutCommitError::pre_publish(error));
                 }
             }
         } else {
@@ -267,9 +229,8 @@ impl SharedStorageNode {
             ) {
                 Ok(stale_payload) => stale_payload,
                 Err(error) => {
-                    Self::cleanup_shards_locked(data_pg, shard_keys.as_slice());
                     let _ = release_reservation(&meta_pg);
-                    return Err(error.into());
+                    return Err(DirectPutCommitError::pre_publish(error));
                 }
             }
         } else {
@@ -281,9 +242,8 @@ impl SharedStorageNode {
             .map(|written| (&written.key, written.ack))
             .collect();
         if let Err(err) = data_pg.register_written_shards_batch(&shard_batch) {
-            Self::cleanup_shards_locked(data_pg, shard_keys.as_slice());
             let _ = release_reservation(&meta_pg);
-            return Err(err.into());
+            return Err(DirectPutCommitError::pre_publish(err));
         }
 
         let segment_record = ObjectSegmentRecord {
@@ -298,7 +258,6 @@ impl SharedStorageNode {
             data_pg_id: req.data_pg_id,
             ec_k: req.ec.k,
             ec_m: req.ec.m,
-            payload_storage: crate::PayloadShardStorage::Placed,
         };
         let live_req = PutLiveObjectReq {
             bucket: req.bucket.clone(),
@@ -320,26 +279,31 @@ impl SharedStorageNode {
         };
 
         if let Err(err) = meta_pg.put_object_with_segments(&live_req, &[segment_record]) {
-            Self::cleanup_shards_locked(data_pg, shard_keys.as_slice());
             let _ = release_reservation(&meta_pg);
-            return Err(err.into());
+            return Err(DirectPutCommitError::pre_publish(err));
         }
-        release_reservation(&meta_pg)?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        maybe_run_after_direct_put_metadata_publish_hook()
+            .map_err(DirectPutCommitError::post_publish)?;
+        release_reservation(&meta_pg).map_err(DirectPutCommitError::post_publish)?;
         Self::finalize_stream_put_stale_payload_metadata(
             &meta_pg,
             &req.bucket,
             &req.key,
             version_id,
             stale_payload.as_ref(),
-        )?;
+        )
+        .map_err(DirectPutCommitError::post_publish)?;
 
-        let stored = PgMetadataStore::get_object_meta(&*meta_pg, &req.bucket, &req.key)?;
+        let stored = PgMetadataStore::get_object_meta(&*meta_pg, &req.bucket, &req.key)
+            .map_err(DirectPutCommitError::post_publish)?;
         let live_record = stored
             .as_live()
             .ok_or_else(|| crate::error::MetadataError::Db {
                 context: "stored object missing live record after direct put",
                 source: rusqlite::Error::QueryReturnedNoRows,
-            })?;
+            })
+            .map_err(DirectPutCommitError::post_publish)?;
 
         Ok(Ok(FinalizeDirectPutObjectOutcome {
             version_id,
@@ -390,12 +354,6 @@ impl SharedStorageNode {
             });
         }
         Ok(())
-    }
-
-    fn cleanup_shards_locked(data_pg: &PgStore, shard_keys: &[ShardKey]) {
-        for shard_key in shard_keys {
-            let _ = data_pg.delete_shard(shard_key);
-        }
     }
 
     pub fn load_stream_upload_session(
@@ -481,7 +439,6 @@ impl SharedStorageNode {
             data_pg_id,
             ec_k: self.default_ec_shape.k,
             ec_m: self.default_ec_shape.m,
-            payload_storage: crate::PayloadShardStorage::MetadataPrimary,
         };
         Ok((session.target, segment_record))
     }
@@ -497,48 +454,28 @@ impl SharedStorageNode {
     ) -> Result<(), ObjectPgActionError> {
         let meta_pg_id = self.pg_topology.object_pg_for(bucket, key);
         let (meta_pg, data_pg) = self.lock_two_pgs(meta_pg_id, segment_record.data_pg_id)?;
-        let shard_keys: Vec<ShardKey> = shard_batch
-            .iter()
-            .map(|(shard_key, _)| (*shard_key).clone())
-            .collect();
-
-        let cleanup = |data_pg: &PgStore| Self::cleanup_shards_locked(data_pg, &shard_keys);
-        let cleanup_target = data_pg.as_deref().unwrap_or(&*meta_pg);
-
         let session = match meta_pg.get_stream_upload(session_id) {
             Ok(session) => session,
             Err(err) => {
-                cleanup(cleanup_target);
                 return Err(err.into());
             }
         };
-        if let Err(err) = Self::validate_stream_upload_session_binding(&session, bucket, key) {
-            cleanup(cleanup_target);
-            return Err(err);
-        }
-        if let Err(err) =
-            Self::reject_duplicate_stream_segment_index(&meta_pg, session_id, segment_index)
-        {
-            cleanup(cleanup_target);
-            return Err(err);
-        }
+        Self::validate_stream_upload_session_binding(&session, bucket, key)?;
+        Self::reject_duplicate_stream_segment_index(&meta_pg, session_id, segment_index)?;
 
         match data_pg {
             None => {
                 if let Err(err) = meta_pg
                     .register_written_shards_and_append_stream_segment(shard_batch, segment_record)
                 {
-                    cleanup(&meta_pg);
                     return Err(err.into());
                 }
             }
             Some(data_pg) => {
                 if let Err(err) = data_pg.register_written_shards_batch(shard_batch) {
-                    cleanup(&data_pg);
                     return Err(err.into());
                 }
                 if let Err(err) = meta_pg.append_stream_segment(segment_record) {
-                    cleanup(&data_pg);
                     return Err(err.into());
                 }
             }
@@ -622,25 +559,7 @@ impl SharedStorageNode {
         pg.delete_stream_upload(session_id)?;
         drop(pg);
 
-        for segment in &staging_segments {
-            if let Ok(data_pg) = self.get_pg(segment.data_pg_id) {
-                let total = segment.ec_k as usize + segment.ec_m as usize;
-                for i in 0..total {
-                    let shard_key =
-                        ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
-                    let _ = data_pg.delete_shard(&shard_key);
-                }
-            }
-        }
-
         Ok(staging_segments)
-    }
-
-    fn delete_shards_best_effort(&self, data_pg_id: u32, shard_keys: &[ShardKey]) {
-        let Ok(data_pg) = self.get_pg(data_pg_id) else {
-            return;
-        };
-        Self::cleanup_shards_locked(&data_pg, shard_keys);
     }
 
     pub fn list_all_stream_uploads_best_effort(&self) -> Vec<StreamUploadRecord> {
@@ -718,7 +637,6 @@ impl SharedStorageNode {
                         data_pg_id: segment.data_pg_id,
                         ec_k: segment.ec_k,
                         ec_m: segment.ec_m,
-                        payload_storage: segment.payload_storage,
                     })
                     .collect();
 
@@ -923,7 +841,6 @@ impl SharedStorageNode {
                         k: segment.ec_k,
                         m: segment.ec_m,
                     },
-                    payload_storage: segment.payload_storage,
                 })
                 .collect(),
         })
@@ -955,7 +872,6 @@ impl SharedStorageNode {
                         k: segment.ec_k,
                         m: segment.ec_m,
                     },
-                    payload_storage: segment.payload_storage,
                 });
         }
 
@@ -979,7 +895,6 @@ impl SharedStorageNode {
                             k: part.ec_k,
                             m: part.ec_m,
                         },
-                        payload_storage: part.payload_storage,
                     }
                 }
             })

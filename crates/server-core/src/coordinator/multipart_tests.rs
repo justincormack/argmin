@@ -4,8 +4,10 @@ use super::test_topology::*;
 use super::*;
 use crate::conditional::{DeleteCondition, ReadCondition, SpecificEtag, WriteCondition};
 use crate::sse::SSE_C_CUSTOMER_KEY_LEN;
+use std::sync::Arc;
 use storage::{
-    EcShape, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, PayloadShardStorage,
+    install_bucket_scoped_test_hooks, BucketScopedTestHooks, EcShape, ObjectSegmentsReclaimRecord,
+    ObjectSegmentsReclaimSegmentRecord,
 };
 
 fn create_bucket_with_explicit_writer_grant(
@@ -1310,7 +1312,6 @@ fn delete_bucket_drains_unqueued_payload_reclaim() {
                     segment_vid: generation_id,
                     data_pg_id,
                     ec: EcShape { k: 4, m: 2 },
-                    payload_storage: storage::PayloadShardStorage::MetadataPrimary,
                 }],
             },
         )
@@ -3148,7 +3149,6 @@ fn abort_multipart_upload_reclaims_uploaded_and_streamed_part_shards() {
         .unwrap();
     assert!(!streamed_segments.is_empty());
     for segment in &streamed_segments {
-        assert_eq!(segment.payload_storage, PayloadShardStorage::Placed);
         assert_payload_shard_files_state(
             &coord,
             segment.data_pg_id,
@@ -7106,7 +7106,6 @@ fn stream_put_abort_cleans_up_shards() {
     assert_eq!(segments.len(), 1);
     let segment = segments[0].clone();
     let data_pg_id = segment.data_pg_id;
-    assert_eq!(segment.payload_storage, PayloadShardStorage::Placed);
     let ec = EcShape {
         k: segment.ec_k,
         m: segment.ec_m,
@@ -7775,99 +7774,6 @@ fn authorize_upload_part_copy_rejects_non_owner_requester() {
 }
 
 #[test]
-fn stream_segment_cleanup_only_deletes_matching_segment_vid() {
-    let dir = test_util::tempdir();
-    let coord = setup_coordinator(dir.path());
-    coord
-        .create_bucket_for_owner("default-owner", "bucket", false)
-        .unwrap();
-
-    let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
-    let bucket = trusted_bucket_name("bucket");
-    let key = trusted_object_key("key");
-    let generation_id = coord
-        .storage_node
-        .test_object_generation_reservation_for(&bucket, &key, &session_id)
-        .unwrap();
-    let segment_okh = storage::stream_segment_key_hash(&session_id, 0);
-    let winner_vid = GenerationId::new(1).unwrap();
-    let loser_vid = GenerationId::new(2).unwrap();
-    let winner_pg_id = object_data_pg_id(&coord, "bucket", "key", generation_id);
-    let loser_pg_id = winner_pg_id;
-    let winner_shards = coord
-        .write_segment_shards(winner_pg_id, &segment_okh, winner_vid, b"winner-data")
-        .unwrap();
-    let loser_shards = coord
-        .write_segment_shards(loser_pg_id, &segment_okh, loser_vid, b"loser-data")
-        .unwrap();
-    let winner_batch: Vec<(ShardKey, storage::WriteAck)> = winner_shards
-        .iter()
-        .map(|written| {
-            (
-                written.key.clone(),
-                storage::WriteAck {
-                    crc64: written.ack.crc64,
-                    stored_size: written.ack.stored_size,
-                },
-            )
-        })
-        .collect();
-    let loser_batch: Vec<(ShardKey, storage::WriteAck)> = loser_shards
-        .iter()
-        .map(|written| {
-            (
-                written.key.clone(),
-                storage::WriteAck {
-                    crc64: written.ack.crc64,
-                    stored_size: written.ack.stored_size,
-                },
-            )
-        })
-        .collect();
-    coord
-        .storage_node
-        .test_register_written_shards(winner_pg_id, &winner_batch)
-        .unwrap();
-    coord
-        .storage_node
-        .test_register_written_shards(loser_pg_id, &loser_batch)
-        .unwrap();
-
-    coord
-        .storage_node
-        .test_delete_shards(
-            loser_pg_id,
-            &loser_shards
-                .iter()
-                .map(|written| written.key.clone())
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
-
-    for written in &winner_shards {
-        assert!(
-            coord
-                .storage_node
-                .test_shard_exists(winner_pg_id, &written.key)
-                .unwrap(),
-            "winner shard {:?} should remain after loser cleanup",
-            written.key
-        );
-    }
-
-    for written in &loser_shards {
-        assert!(
-            !coord
-                .storage_node
-                .test_shard_exists(loser_pg_id, &written.key)
-                .unwrap(),
-            "loser shard {:?} should be deleted by cleanup",
-            written.key
-        );
-    }
-}
-
-#[test]
 fn stream_put_duplicate_segment_index_rejected() {
     let dir = test_util::tempdir();
     let coord = setup_coordinator(dir.path());
@@ -7946,7 +7852,6 @@ fn stream_append_accepts_upload_part_session() {
         )
         .unwrap();
     assert_eq!(segments.len(), 1);
-    assert_eq!(segments[0].payload_storage, PayloadShardStorage::Placed);
     assert_payload_shard_files_state(
         &coord,
         segments[0].data_pg_id,
@@ -8108,10 +8013,6 @@ fn complete_multipart_upload_omits_streamed_part_cleanup() {
         .cloned()
         .collect();
     assert_eq!(part2_segments.len(), 1);
-    assert_eq!(
-        part2_segments[0].payload_storage,
-        PayloadShardStorage::Placed
-    );
     let part2_shards: Vec<_> = part2_segments
         .iter()
         .flat_map(|segment| {
@@ -8219,6 +8120,200 @@ fn complete_multipart_upload_omits_streamed_part_cleanup() {
 }
 
 #[test]
+fn complete_multipart_upload_prune_failure_still_cleans_omitted_streamed_part() {
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap();
+    let dir = test_util::tempdir();
+    let coord = setup_coordinator(dir.path());
+    let bucket_name = "bucket-prune-failure-omitted-cleanup";
+    let key_name = "key";
+    coord
+        .create_bucket_for_owner("default-owner", bucket_name, false)
+        .unwrap();
+
+    let mpu = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(
+                bucket_name,
+                key_name,
+                test_requester(),
+                None,
+            ),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let session1 = begin_stream_part_test(&coord, bucket_name, key_name, &mpu.upload_id, 1)
+        .unwrap()
+        .session_id;
+    let session2 = begin_stream_part_test(&coord, bucket_name, key_name, &mpu.upload_id, 2)
+        .unwrap()
+        .session_id;
+    let data1 = b"selected streamed part";
+    let data2 = b"omitted streamed part";
+    coord
+        .append_plaintext_stream_segment_for_test(bucket_name, key_name, &session1, 0, data1)
+        .unwrap();
+    coord
+        .append_plaintext_stream_segment_for_test(bucket_name, key_name, &session2, 0, data2)
+        .unwrap();
+
+    let part1 = coord
+        .finalize_stream_part(FinalizeStreamPartRequest {
+            upload: multipart_object_request(
+                bucket_name,
+                key_name,
+                &mpu.upload_id,
+                test_requester(),
+            ),
+            session_id: &session1,
+            part_number: 1,
+            crc64: checksum::crc64::checksum(data1),
+            total_size: data1.len() as u64,
+            claimed_checksum: None,
+            computed_checksum: None,
+        })
+        .unwrap();
+    coord
+        .finalize_stream_part(FinalizeStreamPartRequest {
+            upload: multipart_object_request(
+                bucket_name,
+                key_name,
+                &mpu.upload_id,
+                test_requester(),
+            ),
+            session_id: &session2,
+            part_number: 2,
+            crc64: checksum::crc64::checksum(data2),
+            total_size: data2.len() as u64,
+            claimed_checksum: None,
+            computed_checksum: None,
+        })
+        .unwrap();
+
+    let bucket = trusted_bucket_name(bucket_name);
+    let key = trusted_object_key(key_name);
+    let before_segments = coord
+        .storage_node
+        .test_get_all_multipart_part_segments_for_upload(&bucket, &key, &mpu.upload_id)
+        .unwrap();
+    let part2_segments: Vec<_> = before_segments
+        .iter()
+        .filter(|segment| segment.part_number == 2)
+        .cloned()
+        .collect();
+    assert_eq!(part2_segments.len(), 1);
+    let part2_shards: Vec<_> = part2_segments
+        .iter()
+        .flat_map(|segment| {
+            (0..(segment.ec_k + segment.ec_m)).map(|shard_index| {
+                (
+                    segment.data_pg_id,
+                    ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), shard_index),
+                )
+            })
+        })
+        .collect();
+
+    let _prune_hook = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
+        target: Some(bucket.clone()),
+        before_completed_multipart_prune: Some(Arc::new(|| {
+            Err(storage::ObjectPgActionError::InvalidRequest {
+                reason: "injected completed multipart prune failure".to_string(),
+            })
+        })),
+        ..BucketScopedTestHooks::default()
+    });
+
+    let err = coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                bucket_name,
+                key_name,
+                &mpu.upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &[CompletePart {
+                part_number: 1,
+                etag: part1.etag.clone(),
+                checksum: None,
+            }],
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ServerError::InvalidRequest { ref reason }
+                if reason == "injected completed multipart prune failure"
+        ),
+        "expected injected prune failure, got {err:?}"
+    );
+
+    let after_segments = coord
+        .storage_node
+        .test_get_all_multipart_part_segments_for_upload(&bucket, &key, &mpu.upload_id)
+        .unwrap();
+    assert!(
+        after_segments
+            .iter()
+            .all(|segment| segment.part_number != 2),
+        "omitted part segment rows must be deleted even when prune fails"
+    );
+    for (pg_id, shard_key) in &part2_shards {
+        assert!(
+            !coord
+                .storage_node
+                .test_shard_exists(*pg_id, shard_key)
+                .unwrap(),
+            "omitted part shard metadata should be deleted even when prune fails"
+        );
+    }
+    for segment in &part2_segments {
+        assert_payload_shard_files_state(
+            &coord,
+            segment.data_pg_id,
+            EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            },
+            &segment.segment_okh,
+            segment.segment_vid,
+            false,
+            "omitted streamed part after prune failure",
+        );
+    }
+
+    let object = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket_name,
+                key_name,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(object.body.read_all().unwrap(), data1);
+}
+
+#[test]
 fn streamed_upload_part_same_part_last_finisher_wins() {
     let dir = test_util::tempdir();
     let coord = setup_coordinator(dir.path());
@@ -8278,10 +8373,6 @@ fn streamed_upload_part_same_part_last_finisher_wins() {
         .filter(|segment| segment.part_number == 1)
         .collect();
     assert_eq!(first_segments.len(), 1);
-    assert_eq!(
-        first_segments[0].payload_storage,
-        PayloadShardStorage::Placed
-    );
     for segment in &first_segments {
         assert_payload_shard_files_state(
             &coord,
@@ -8330,10 +8421,6 @@ fn streamed_upload_part_same_part_last_finisher_wins() {
         .filter(|segment| segment.part_number == 1)
         .collect();
     assert_eq!(final_segments.len(), 1);
-    assert_eq!(
-        final_segments[0].payload_storage,
-        PayloadShardStorage::Placed
-    );
     for segment in &final_segments {
         assert_payload_shard_files_state(
             &coord,
