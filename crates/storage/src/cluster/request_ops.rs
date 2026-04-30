@@ -1,10 +1,61 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::MutexGuard;
+#[cfg(test)]
+use std::sync::{Arc, Mutex, OnceLock};
 
+#[cfg(test)]
+use placement::NodeId;
+
+use crate::metadata_command::{
+    CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
+};
 use crate::*;
 
 const INTERNAL_LIST_PAGE_SIZE: u32 = 1_000;
+
+#[cfg(test)]
+type MetadataCommandApplyTestHook =
+    Arc<dyn Fn(NodeId, &MetadataCommandEnvelope) -> Result<(), StoreError> + Send + Sync>;
+
+#[cfg(test)]
+static BEFORE_METADATA_COMMAND_APPLY_HOOK: OnceLock<Mutex<Option<MetadataCommandApplyTestHook>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct MetadataCommandApplyTestHookGuard;
+
+#[cfg(test)]
+impl Drop for MetadataCommandApplyTestHookGuard {
+    fn drop(&mut self) {
+        let hook = BEFORE_METADATA_COMMAND_APPLY_HOOK.get_or_init(|| Mutex::new(None));
+        *hook.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+fn maybe_run_before_metadata_command_apply_hook(
+    node_id: NodeId,
+    command: &MetadataCommandEnvelope,
+) -> Result<(), StoreError> {
+    let hook = BEFORE_METADATA_COMMAND_APPLY_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(node_id, command)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn maybe_run_before_metadata_command_apply_hook(
+    _node_id: placement::NodeId,
+    _command: &MetadataCommandEnvelope,
+) -> Result<(), StoreError> {
+    Ok(())
+}
 
 #[derive(Clone)]
 enum ListObjectsPageStart {
@@ -69,6 +120,16 @@ fn merge_bucket_snapshot_pair_request(
 // operations route through the local metadata PG primary; composite scans fan
 // out across routed PG primaries and merge locally.
 impl super::StorageCluster {
+    #[cfg(test)]
+    pub(crate) fn test_install_before_metadata_command_apply_hook(
+        &self,
+        hook: MetadataCommandApplyTestHook,
+    ) -> MetadataCommandApplyTestHookGuard {
+        let slot = BEFORE_METADATA_COMMAND_APPLY_HOOK.get_or_init(|| Mutex::new(None));
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
+        MetadataCommandApplyTestHookGuard
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_pg_ids(&self) -> &[u32] {
         self.metadata_primary_topology_node().pg_ids()
@@ -110,8 +171,121 @@ impl super::StorageCluster {
                 reason: reason.to_string(),
             }
         })?;
-        self.bucket_metadata_primary_node(&bucket)?
-            .create_bucket_with_config_and_load_info(config)
+        let pg_id = self.bucket_metadata_pg_id(&bucket);
+        let primary_node = self.bucket_metadata_primary_node(&bucket)?;
+        let _bucket_guard = primary_node.lock_bucket(&bucket);
+        {
+            let bucket_pg = primary_node.get_pg(pg_id)?;
+            match PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket) {
+                Ok(info) => {
+                    self.local_map
+                        .runtime_state()
+                        .remove_pending_create_bucket_command(PgId::new(pg_id), &bucket);
+                    return Ok(BucketCreateAttemptOutcome::Exists(info));
+                }
+                Err(MetadataError::BucketNotFound { .. }) => {}
+                Err(other) => return Err(other.into()),
+            }
+        }
+
+        let pg_id = PgId::new(pg_id);
+        let runtime_state = self.local_map.runtime_state();
+        let command = if let Some(command) =
+            runtime_state.pending_create_bucket_command(pg_id, &bucket)
+        {
+            match command.payload() {
+                MetadataCommandPayload::CreateBucket(create) if create.matches_config(config) => {
+                    command
+                }
+                MetadataCommandPayload::CreateBucket(_) => {
+                    return Err(MetadataError::BucketAlreadyExists.into());
+                }
+            }
+        } else {
+            let command_id = MetadataCommandId::new(
+                self.operation_epoch(),
+                pg_id,
+                runtime_state.next_metadata_command_log_index(pg_id),
+            );
+            let bucket_pg = primary_node.get_pg(pg_id.get())?;
+            let bucket_execution_generation = bucket_pg.reserve_bucket_execution_generation()?;
+            drop(bucket_pg);
+            let command = CreateBucketCommand::from_config(
+                config,
+                crate::clock::current_time_millis(),
+                bucket_execution_generation,
+            )
+            .map_err(|reason| MetadataError::InvalidBucketName {
+                reason: reason.to_string(),
+            })?;
+            let command = MetadataCommandEnvelope::new(
+                command_id,
+                MetadataCommandPayload::CreateBucket(command),
+            );
+            runtime_state.insert_pending_create_bucket_command(pg_id, &bucket, command.clone());
+            command
+        };
+        self.apply_metadata_command_to_acting_set(&command)?;
+
+        let bucket_pg = primary_node.get_pg(pg_id.get())?;
+        let info = PgMetadataStore::head_bucket(&*bucket_pg, &bucket)?;
+        self.local_map
+            .runtime_state()
+            .remove_pending_create_bucket_command(pg_id, &bucket);
+        Ok(BucketCreateAttemptOutcome::Created(info))
+    }
+
+    fn apply_metadata_command_to_acting_set(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let pg_id = command.id().pg_id();
+        let mut nodes = self
+            .local_map
+            .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id)?;
+        let primary_node_id = self
+            .local_map
+            .pg_route(pg_id)
+            .expect("validated metadata PG command route must exist")
+            .primary_node_id();
+        nodes.sort_by_key(|node| node.node_id() == primary_node_id);
+        for node in nodes {
+            maybe_run_before_metadata_command_apply_hook(node.node_id(), command)?;
+            let pg = node.storage_node().get_pg(pg_id.get())?;
+            pg.apply_metadata_command(command)?;
+        }
+        Ok(())
+    }
+
+    fn delete_bucket_from_acting_set(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
+        let mut nodes = self
+            .local_map
+            .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?;
+        let primary_node_id = self
+            .local_map
+            .pg_route(pg_id)
+            .expect("validated metadata PG delete route must exist")
+            .primary_node_id();
+        nodes.sort_by_key(|node| node.node_id() == primary_node_id);
+
+        for node in nodes {
+            let pg = node.storage_node().get_pg(pg_id.get())?;
+            match PgMetadataStore::delete_bucket(&*pg, bucket) {
+                Ok(()) => {}
+                Err(crate::error::MetadataError::BucketNotFound { .. })
+                    if node.node_id() == primary_node_id =>
+                {
+                    return Ok(BucketDeleteFinalizeOutcome::NotFound);
+                }
+                Err(crate::error::MetadataError::BucketNotFound { .. }) => {}
+                Err(other) => return Err(other.into()),
+            }
+        }
+        Ok(BucketDeleteFinalizeOutcome::Finalized)
     }
 
     pub fn load_bucket_snapshot(
@@ -285,14 +459,7 @@ impl super::StorageCluster {
 
         self.delete_completed_multipart_uploads_for_bucket(bucket)?;
 
-        let bucket_pg = self.metadata_pg(bucket_pg_id)?;
-        match PgMetadataStore::delete_bucket(&*bucket_pg, bucket) {
-            Ok(()) => Ok(BucketDeleteFinalizeOutcome::Finalized),
-            Err(crate::error::MetadataError::BucketNotFound { .. }) => {
-                Ok(BucketDeleteFinalizeOutcome::NotFound)
-            }
-            Err(other) => Err(other.into()),
-        }
+        self.delete_bucket_from_acting_set(PgId::new(bucket_pg_id), bucket)
     }
 
     fn bucket_has_visible_data(
@@ -2011,8 +2178,19 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<(), BucketWriteDrainError> {
-        self.metadata_primary_bridge_node()?
-            .delete_bucket_metadata(bucket)
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        match self.delete_bucket_from_acting_set(pg_id, bucket)? {
+            BucketDeleteFinalizeOutcome::Finalized => Ok(()),
+            BucketDeleteFinalizeOutcome::NotFound => {
+                Err(crate::error::MetadataError::BucketNotFound {
+                    name: bucket.clone(),
+                }
+                .into())
+            }
+            BucketDeleteFinalizeOutcome::NotDeleting | BucketDeleteFinalizeOutcome::Pending => {
+                unreachable!("test bucket metadata delete bypasses finalization checks")
+            }
+        }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

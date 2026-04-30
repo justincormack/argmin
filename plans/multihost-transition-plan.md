@@ -1157,6 +1157,34 @@ Work items:
      preferably bucket create or a bucket config update
    - compare primary and replica SQLite state in deterministic tests for that
      first command
+   - first slice:
+     - add `MetadataCommandId`, per-PG log-index shape, canonical command
+       encoding, and CRC64 command checksum verification
+     - migrate `create_bucket_with_config_and_load_info` onto the command path
+       for local clusters
+     - keep command log indexes separate from bucket execution generations:
+       create commands reserve a bucket execution generation from the routed
+       primary so delete/recreate still invalidates fast-path cache state after
+       earlier non-command bucket mutations
+     - keep an in-process pending create-bucket command keyed by bucket PG and
+       bucket name until the command fully applies, so retries after partial
+       replica apply reuse the same command identity, timestamp, and execution
+       generation instead of poisoning already-updated replicas
+     - apply the create-bucket command to every active acting node for the
+       bucket PG and apply the routed primary last, so strict-replica failures
+       happen before primary publication where possible
+     - keep bucket-row finalization consistent with replicated create by
+       deleting finalized bucket rows from every active acting node, also
+       primary last; Phase 6.3 will move the rest of bucket lifecycle mutation
+       onto explicit command apply
+     - include deterministic command-encoding coverage and a routed local
+       cluster tests that compare created bucket metadata across primary and
+       replica SQLite stores, prove delete-then-recreate removes stale replica
+       bucket rows, and prove retry after partial replica apply converges on
+       one identical command result
+     - this is still an in-process substrate: command indexes are local runtime
+       state, command logs are not durable, and later Phase 6 work must add
+       durable ordering, origin/epoch checks, hash chaining, and recovery
 3. Phase 6.3: bucket and object command migration.
    - migrate bucket mutations to command apply
    - migrate ordinary object mutations, including generation

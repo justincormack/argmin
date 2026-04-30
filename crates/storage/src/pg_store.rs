@@ -18,6 +18,9 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 use crate::error::{MetadataError, StoreError};
+use crate::metadata_command::{
+    CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandPayload,
+};
 use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::*;
@@ -38,6 +41,28 @@ FROM buckets";
 /// in-progress staging rows are invisible to reads of completed objects.
 const PART_SEGMENT_STAGING_VERSION_ID: VersionId = MULTIPART_PART_SEGMENT_STAGING_VERSION_ID;
 type StreamSessionRow = (u8, u8, BucketName, ObjectKey, Option<UploadId>, Option<i64>);
+
+#[derive(Debug, Clone, Copy)]
+enum BucketExecutionGeneration {
+    Allocate,
+    Explicit(u64),
+}
+
+fn bucket_matches_create_command(info: &BucketInfo, command: &CreateBucketCommand) -> bool {
+    info.name == command.name
+        && info.owner_principal == command.owner_principal
+        && info.owner_canonical_id == command.owner_canonical_id
+        && info.created_at == command.created_at_millis
+        && info.state == BucketState::Active
+        && info.versioning == command.versioning
+        && info.object_lock == command.object_lock
+        && info.acl_grants == command.acl_grants
+        && info.public_read == command.public_read
+        && info.public_write == command.public_write
+        && !info.write_reservations_blocked
+        && info.active_write_reservations == 0
+        && info.bucket_execution_generation == command.bucket_execution_generation
+}
 type PublicAccessBlockSqlValues = (i64, i64, i64, i64, i64);
 type BucketObjectLockSqlValues = (i64, Option<u8>, Option<i64>, Option<i64>);
 type ObjectLockSqlValues = (Option<u8>, Option<i64>, u8);
@@ -1861,9 +1886,54 @@ impl PgStore {
             })
     }
 
+    pub(crate) fn reserve_bucket_execution_generation(&self) -> Result<u64, MetadataError> {
+        self.with_immediate_txn(
+            "reserve bucket execution generation (begin txn)",
+            "reserve bucket execution generation (commit txn)",
+            |store| {
+                store.next_bucket_execution_generation_in_txn("reserve bucket execution generation")
+            },
+        )
+    }
+
+    fn advance_bucket_execution_generation_in_txn(
+        &self,
+        generation: u64,
+        context: &'static str,
+    ) -> Result<(), MetadataError> {
+        let generation = i64::try_from(generation).map_err(|_| MetadataError::Db {
+            context: "encode bucket execution generation",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+                "bucket execution generation exceeds i64",
+            )),
+        })?;
+        self.conn
+            .execute(
+                "UPDATE pg_counters \
+                 SET next_bucket_execution_generation = max(next_bucket_execution_generation, ?1) \
+                 WHERE singleton = 0",
+                params![generation],
+            )
+            .map_err(|source| MetadataError::Db { context, source })?;
+        Ok(())
+    }
+
     pub fn create_bucket_with_config(
         &self,
         config: &CreateBucketConfig<'_>,
+    ) -> Result<(), MetadataError> {
+        self.create_bucket_with_config_inner(
+            config,
+            PgStore::now_millis(),
+            BucketExecutionGeneration::Allocate,
+        )
+    }
+
+    fn create_bucket_with_config_inner(
+        &self,
+        config: &CreateBucketConfig<'_>,
+        created_at_millis: u64,
+        generation: BucketExecutionGeneration,
     ) -> Result<(), MetadataError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -1875,7 +1945,13 @@ impl PgStore {
             config.versioning,
             config.object_lock.enabled
         );
-        let now = PgStore::now_millis() as i64;
+        let created_at_millis =
+            i64::try_from(created_at_millis).map_err(|_| MetadataError::Db {
+                context: "create bucket (encode created_at)",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+                    "bucket created_at exceeds i64",
+                )),
+            })?;
         let (
             object_lock_enabled,
             object_lock_default_mode,
@@ -1891,8 +1967,19 @@ impl PgStore {
             "create bucket (begin txn)",
             "create bucket (commit txn)",
             |store| {
-                let generation = store
-                    .next_bucket_execution_generation_in_txn("create bucket (allocate execution generation)")?;
+                let generation = match generation {
+                    BucketExecutionGeneration::Allocate => store
+                        .next_bucket_execution_generation_in_txn(
+                            "create bucket (allocate execution generation)",
+                        )?,
+                    BucketExecutionGeneration::Explicit(generation) => {
+                        store.advance_bucket_execution_generation_in_txn(
+                            generation,
+                            "create bucket (advance execution generation)",
+                        )?;
+                        generation
+                    }
+                };
                 match store.conn.execute(
                     "INSERT INTO buckets \
                      (name, owner_principal, owner_canonical_id, created_at, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years, bucket_execution_generation) \
@@ -1901,7 +1988,7 @@ impl PgStore {
                         config.name,
                         config.owner_principal,
                         config.owner_canonical_id.as_str(),
-                        now,
+                        created_at_millis,
                         BucketState::Active as u8,
                         config.versioning as u8 as i64,
                         config.acl_grants.serialized(),
@@ -1928,6 +2015,52 @@ impl PgStore {
                 }
             },
         )
+    }
+
+    pub(crate) fn apply_metadata_command(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), MetadataError> {
+        if command.id().pg_id().get() != self.pg_id {
+            return Err(MetadataError::Db {
+                context: "apply metadata command PG mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        if !command.verify_checksum() {
+            return Err(MetadataError::Db {
+                context: "apply metadata command checksum",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        match command.payload() {
+            MetadataCommandPayload::CreateBucket(create) => {
+                self.apply_create_bucket_command(create)
+            }
+        }
+    }
+
+    fn apply_create_bucket_command(
+        &self,
+        command: &CreateBucketCommand,
+    ) -> Result<(), MetadataError> {
+        let config = command.config();
+        match self.create_bucket_with_config_inner(
+            &config,
+            command.created_at_millis,
+            BucketExecutionGeneration::Explicit(command.bucket_execution_generation),
+        ) {
+            Ok(()) => Ok(()),
+            Err(MetadataError::BucketAlreadyExists) => {
+                let existing = self.head_bucket_raw(&command.name)?;
+                if bucket_matches_create_command(&existing, command) {
+                    Ok(())
+                } else {
+                    Err(MetadataError::BucketAlreadyExists)
+                }
+            }
+            Err(other) => Err(other),
+        }
     }
 
     pub fn load_bucket_execution_generations(

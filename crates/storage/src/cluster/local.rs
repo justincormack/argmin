@@ -7,6 +7,7 @@ use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
 
 use super::ShardLocation;
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
+use crate::metadata_command::{MetadataCommandEnvelope, MetadataCommandLogIndex};
 use crate::{
     BucketName, ClusterEpoch, DataPgId, EcShape, GenerationId, ObjectKey, PgId, PgState,
     ReclaimWorkItem, ShardIndex, ShardKey, SharedStorageNode, WriteAck,
@@ -210,6 +211,8 @@ impl LocalPgRoute {
 pub(crate) struct LocalClusterRuntimeState {
     object_payload_leases: Mutex<HashMap<LocalReclaimRoot, usize>>,
     reclaim_queue: (Mutex<LocalReclaimQueueState>, Condvar),
+    metadata_command_indexes: Mutex<HashMap<PgId, u64>>,
+    pending_create_bucket_commands: Mutex<HashMap<(PgId, BucketName), MetadataCommandEnvelope>>,
 }
 
 type LocalReclaimRoot = (BucketName, ObjectKey, GenerationId);
@@ -235,7 +238,52 @@ impl LocalClusterRuntimeState {
                 }),
                 Condvar::new(),
             ),
+            metadata_command_indexes: Mutex::new(HashMap::new()),
+            pending_create_bucket_commands: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn next_metadata_command_log_index(&self, pg_id: PgId) -> MetadataCommandLogIndex {
+        let mut indexes = self
+            .metadata_command_indexes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let index = indexes.entry(pg_id).or_insert(0);
+        *index = index
+            .checked_add(1)
+            .expect("metadata command log index overflow");
+        MetadataCommandLogIndex::new(*index).expect("metadata command log index starts at one")
+    }
+
+    pub(crate) fn pending_create_bucket_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Option<MetadataCommandEnvelope> {
+        self.pending_create_bucket_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(pg_id, bucket.clone()))
+            .cloned()
+    }
+
+    pub(crate) fn insert_pending_create_bucket_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: MetadataCommandEnvelope,
+    ) {
+        self.pending_create_bucket_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((pg_id, bucket.clone()), command);
+    }
+
+    pub(crate) fn remove_pending_create_bucket_command(&self, pg_id: PgId, bucket: &BucketName) {
+        self.pending_create_bucket_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(pg_id, bucket.clone()));
     }
 
     pub(crate) fn acquire_object_payload_lease(
@@ -582,6 +630,61 @@ impl LocalClusterMap {
             pg_id: pg_id.get(),
             cluster_epoch: self.epoch,
         })
+    }
+
+    pub(crate) fn metadata_pg_acting_nodes(
+        &self,
+        operation_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<Vec<&LocalNodeStore>, StoreError> {
+        if operation_epoch != self.epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch,
+                current_epoch: self.epoch,
+            });
+        }
+
+        let route = self
+            .pg_routes
+            .get(&pg_id)
+            .ok_or(StoreError::ClusterPgNotFound {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.epoch,
+            })?;
+        if route.cluster_epoch() != self.epoch {
+            return Err(StoreError::StaleMetadataRoute {
+                pg_id: pg_id.get(),
+                route_epoch: route.cluster_epoch(),
+                current_epoch: self.epoch,
+            });
+        }
+        if !route.is_active() {
+            return Err(StoreError::PgNotActive {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.epoch,
+                state: route.state(),
+            });
+        }
+        if !route.contains_node(route.primary_node_id()) {
+            return Err(StoreError::NodeNotInActingSet {
+                node_id: route.primary_node_id().as_u32(),
+                pg_id: pg_id.get(),
+                cluster_epoch: self.epoch,
+            });
+        }
+
+        route
+            .acting_set()
+            .iter()
+            .map(|node_id| {
+                self.nodes.get(node_id).ok_or(StoreError::NodeNotFound {
+                    node_id: node_id.as_u32(),
+                    pg_id: pg_id.get(),
+                    cluster_epoch: self.epoch,
+                })
+            })
+            .collect()
     }
 
     pub fn place_payload_shards(
@@ -935,9 +1038,11 @@ fn prepare_local_node_data_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata_command::MetadataCommandPayload;
     use proptest::prelude::*;
     use proptest::test_runner::{TestCaseError, TestCaseResult};
     use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     struct CommittedDirectSegment {
@@ -1095,6 +1200,27 @@ mod tests {
                 object_lock: crate::BucketObjectLockConfig::default(),
             })
             .unwrap();
+    }
+
+    fn seed_bucket_record(
+        map: &LocalClusterMap,
+        node_id: NodeId,
+        pg_id: u32,
+        bucket: &crate::BucketName,
+        owner: &crate::CanonicalUserId,
+    ) {
+        let node = map.node(node_id).unwrap().storage_node();
+        let pg = node.get_pg(pg_id).unwrap();
+        crate::PgMetadataStore::create_bucket(
+            &*pg,
+            bucket,
+            "owner",
+            owner,
+            &crate::AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
     }
 
     fn upload_id_from_label(label: &str) -> crate::UploadId {
@@ -2353,24 +2479,12 @@ mod tests {
         set_route_primary(&mut map, 1, NodeId::new(1));
         set_route_primary(&mut map, 2, NodeId::new(2));
 
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        seed_bucket_record(&map, NodeId::new(1), 1, &bucket_a, &owner);
+        seed_bucket_record(&map, NodeId::new(2), 2, &bucket_b, &owner);
+
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
-        let owner = crate::CanonicalUserId::from_principal("owner");
-        let acl_grants = crate::AclGrants::default();
-        for bucket in [&bucket_b, &bucket_a] {
-            cluster
-                .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
-                    name: bucket.as_str(),
-                    owner_principal: "owner",
-                    owner_canonical_id: &owner,
-                    acl_grants: &acl_grants,
-                    public_read: false,
-                    public_write: false,
-                    versioning: crate::BucketVersioningState::Disabled,
-                    object_lock: crate::BucketObjectLockConfig::default(),
-                })
-                .unwrap();
-        }
 
         let bridge_node = map.node(NodeId::new(0)).unwrap().storage_node();
         assert!(bridge_node.test_head_bucket_raw(&bucket_a).is_err());
@@ -2384,6 +2498,278 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![&bucket_a, &bucket_b]
         );
+    }
+
+    #[test]
+    fn create_bucket_command_applies_to_all_acting_pg_nodes() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "replicated-create-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let acl_grants = crate::AclGrants::default();
+        let created = cluster
+            .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+                name: bucket.as_str(),
+                owner_principal: "owner",
+                owner_canonical_id: &owner,
+                acl_grants: &acl_grants,
+                public_read: true,
+                public_write: false,
+                versioning: crate::BucketVersioningState::Enabled,
+                object_lock: crate::BucketObjectLockConfig::default(),
+            })
+            .unwrap();
+        let created = match created {
+            crate::BucketCreateAttemptOutcome::Created(info) => info,
+            crate::BucketCreateAttemptOutcome::Exists(_) => {
+                panic!("fresh bucket unexpectedly existed")
+            }
+        };
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.name, created.name);
+            assert_eq!(info.owner_principal, created.owner_principal);
+            assert_eq!(info.owner_canonical_id, created.owner_canonical_id);
+            assert_eq!(info.created_at, created.created_at);
+            assert_eq!(info.versioning, created.versioning);
+            assert_eq!(info.acl_grants, created.acl_grants);
+            assert_eq!(info.public_read, created.public_read);
+            assert_eq!(info.public_write, created.public_write);
+            assert_eq!(
+                info.bucket_execution_generation,
+                created.bucket_execution_generation
+            );
+        }
+
+        let exists = cluster
+            .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+                name: bucket.as_str(),
+                owner_principal: "owner",
+                owner_canonical_id: &owner,
+                acl_grants: &acl_grants,
+                public_read: true,
+                public_write: false,
+                versioning: crate::BucketVersioningState::Enabled,
+                object_lock: crate::BucketObjectLockConfig::default(),
+            })
+            .unwrap();
+        assert!(matches!(
+            exists,
+            crate::BucketCreateAttemptOutcome::Exists(info) if info.name == bucket
+        ));
+    }
+
+    #[test]
+    fn create_bucket_command_retry_reuses_pending_partial_replica_command() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "partial-create-retry-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let acl_grants = crate::AclGrants::default();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let _hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                let MetadataCommandPayload::CreateBucket(create) = command.payload();
+                if create.name == hook_bucket
+                    && node_id == NodeId::new(2)
+                    && fail_once_hook.swap(false, Ordering::SeqCst)
+                {
+                    return Err(StoreError::Io {
+                        context: "injected metadata command apply failure",
+                        source: std::io::Error::other("injected metadata command apply failure"),
+                    });
+                }
+                Ok(())
+            },
+        ));
+        let create_config = || crate::CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: "owner",
+            owner_canonical_id: &owner,
+            acl_grants: &acl_grants,
+            public_read: true,
+            public_write: false,
+            versioning: crate::BucketVersioningState::Enabled,
+            object_lock: crate::BucketObjectLockConfig::default(),
+        };
+
+        let err = cluster
+            .create_bucket_with_config_and_load_info(&create_config())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Store(StoreError::Io {
+                    context: "injected metadata command apply failure",
+                    ..
+                })
+            ),
+            "expected injected replica failure, got {err:?}"
+        );
+        assert!(!fail_once.load(Ordering::SeqCst));
+
+        let partial_info = {
+            let applied_replica = map.node(NodeId::new(0)).unwrap().storage_node();
+            let pg = applied_replica.get_pg(1).unwrap();
+            crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap()
+        };
+        for node_id in [NodeId::new(1), NodeId::new(2)] {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            assert!(
+                crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).is_err(),
+                "node {node_id:?} should not have the partially applied bucket"
+            );
+        }
+
+        let retried = cluster
+            .create_bucket_with_config_and_load_info(&create_config())
+            .unwrap();
+        assert!(matches!(
+            retried,
+            crate::BucketCreateAttemptOutcome::Created(info)
+                if info.name == bucket
+                    && info.created_at == partial_info.created_at
+                    && info.bucket_execution_generation
+                        == partial_info.bucket_execution_generation
+        ));
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.name, partial_info.name);
+            assert_eq!(info.owner_principal, partial_info.owner_principal);
+            assert_eq!(info.owner_canonical_id, partial_info.owner_canonical_id);
+            assert_eq!(info.created_at, partial_info.created_at);
+            assert_eq!(info.state, partial_info.state);
+            assert_eq!(info.versioning, partial_info.versioning);
+            assert_eq!(info.object_lock, partial_info.object_lock);
+            assert_eq!(info.acl_grants, partial_info.acl_grants);
+            assert_eq!(info.public_read, partial_info.public_read);
+            assert_eq!(info.public_write, partial_info.public_write);
+            assert_eq!(
+                info.bucket_execution_generation,
+                partial_info.bucket_execution_generation
+            );
+        }
+    }
+
+    #[test]
+    fn finalized_bucket_delete_removes_replicated_create_rows() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "delete-recreate-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let created_generation = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .test_head_bucket_raw(&bucket)
+            .unwrap()
+            .bucket_execution_generation;
+        cluster
+            .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+            .unwrap();
+        let pre_delete_generation = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .test_head_bucket_raw(&bucket)
+            .unwrap()
+            .bucket_execution_generation;
+        assert!(pre_delete_generation > created_generation);
+
+        cluster.begin_bucket_delete(&bucket).unwrap();
+        assert_eq!(
+            cluster.try_finalize_bucket_delete(&bucket).unwrap(),
+            crate::BucketDeleteFinalizeOutcome::Finalized
+        );
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            assert!(crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).is_err());
+        }
+
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let acl_grants = crate::AclGrants::default();
+        let recreated = cluster
+            .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+                name: bucket.as_str(),
+                owner_principal: "owner",
+                owner_canonical_id: &owner,
+                acl_grants: &acl_grants,
+                public_read: false,
+                public_write: false,
+                versioning: crate::BucketVersioningState::Disabled,
+                object_lock: crate::BucketObjectLockConfig::default(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recreated,
+            crate::BucketCreateAttemptOutcome::Created(info)
+                if info.name == bucket
+                    && info.bucket_execution_generation > pre_delete_generation
+        ));
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+                    .unwrap()
+                    .name,
+                bucket
+            );
+        }
     }
 
     #[test]
@@ -2431,12 +2817,6 @@ mod tests {
                 },
             )
             .unwrap();
-
-        let bridge_node = map.node(NodeId::new(0)).unwrap().storage_node();
-        assert!(bridge_node.test_head_bucket_raw(&source_bucket).is_err());
-        assert!(bridge_node
-            .test_head_bucket_raw(&destination_bucket)
-            .is_err());
 
         let pair = cluster
             .load_bucket_snapshot_pair(
@@ -2544,9 +2924,6 @@ mod tests {
             .test_list_multipart_uploads_for_bucket(&upload_bucket)
             .unwrap()
             .is_empty());
-        assert!(bridge_node.test_head_bucket_raw(&lifecycle_bucket).is_err());
-        assert!(bridge_node.test_head_bucket_raw(&aborting_bucket).is_err());
-
         let all_uploads = cluster
             .list_all_multipart_uploads_for_bucket(&upload_bucket)
             .unwrap();
@@ -2697,7 +3074,6 @@ mod tests {
         );
 
         let bridge_node = map.node(NodeId::new(0)).unwrap().storage_node();
-        assert!(bridge_node.test_head_bucket_raw(&bucket).is_err());
         assert!(bridge_node
             .test_get_object_meta(&bucket, &live_key)
             .is_err());
