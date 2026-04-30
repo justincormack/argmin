@@ -9,6 +9,7 @@ use placement::NodeId;
 
 use crate::metadata_command::{
     CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
+    PutBucketVersioningCommand,
 };
 use crate::*;
 
@@ -116,6 +117,14 @@ fn merge_bucket_snapshot_pair_request(
     }
 }
 
+fn conflicting_pending_metadata_command(context: &'static str) -> BucketSnapshotLoadError {
+    StoreError::Io {
+        context,
+        source: std::io::Error::other("conflicting pending metadata command"),
+    }
+    .into()
+}
+
 // Metadata routing moves incrementally in Phase 6. Single-PG bucket/object
 // operations route through the local metadata PG primary; composite scans fan
 // out across routed PG primaries and merge locally.
@@ -199,6 +208,11 @@ impl super::StorageCluster {
                 }
                 MetadataCommandPayload::CreateBucket(_) => {
                     return Err(MetadataError::BucketAlreadyExists.into());
+                }
+                MetadataCommandPayload::PutBucketVersioning(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending put bucket versioning command for create bucket",
+                    ));
                 }
             }
         } else {
@@ -285,6 +299,9 @@ impl super::StorageCluster {
                 Err(other) => return Err(other.into()),
             }
         }
+        self.local_map
+            .runtime_state()
+            .remove_pending_metadata_commands_for_bucket(pg_id, bucket);
         Ok(BucketDeleteFinalizeOutcome::Finalized)
     }
 
@@ -551,8 +568,76 @@ impl super::StorageCluster {
         bucket: &BucketName,
         state: BucketVersioningState,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.bucket_metadata_primary_node(bucket)?
-            .put_bucket_versioning_and_load_info(bucket, state)
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        let primary_node = self.bucket_metadata_primary_node(bucket)?;
+        let _bucket_guard = primary_node.lock_bucket(bucket);
+        {
+            let bucket_pg = primary_node.get_pg(pg_id.get())?;
+            let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
+            if state == BucketVersioningState::Disabled
+                && info.versioning != BucketVersioningState::Disabled
+            {
+                return Err(MetadataError::InvalidVersioningTransition {
+                    from: info.versioning,
+                    to: state,
+                }
+                .into());
+            }
+        }
+
+        let runtime_state = self.local_map.runtime_state();
+        let command = if let Some(command) =
+            runtime_state.pending_put_bucket_versioning_command(pg_id, bucket)
+        {
+            match command.payload() {
+                MetadataCommandPayload::PutBucketVersioning(versioning)
+                    if versioning.matches_request(bucket, state) =>
+                {
+                    command
+                }
+                MetadataCommandPayload::PutBucketVersioning(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "conflicting pending put bucket versioning command",
+                    ));
+                }
+                MetadataCommandPayload::CreateBucket(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending create bucket command for versioning",
+                    ));
+                }
+            }
+        } else {
+            let command_id = MetadataCommandId::new(
+                self.operation_epoch(),
+                pg_id,
+                runtime_state.next_metadata_command_log_index(pg_id),
+            );
+            let bucket_pg = primary_node.get_pg(pg_id.get())?;
+            let bucket_execution_generation = bucket_pg.reserve_bucket_execution_generation()?;
+            drop(bucket_pg);
+            let command = MetadataCommandEnvelope::new(
+                command_id,
+                MetadataCommandPayload::PutBucketVersioning(PutBucketVersioningCommand::new(
+                    bucket.clone(),
+                    state,
+                    bucket_execution_generation,
+                )),
+            );
+            runtime_state.insert_pending_put_bucket_versioning_command(
+                pg_id,
+                bucket,
+                command.clone(),
+            );
+            command
+        };
+        self.apply_metadata_command_to_acting_set(&command)?;
+
+        let bucket_pg = primary_node.get_pg(pg_id.get())?;
+        let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
+        self.local_map
+            .runtime_state()
+            .remove_pending_put_bucket_versioning_command(pg_id, bucket);
+        Ok(info)
     }
 
     pub fn put_bucket_object_lock_and_load_info(

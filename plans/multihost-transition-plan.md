@@ -1191,6 +1191,17 @@ Work items:
      reservation/release, direct PUT publish, delete, tag, ACL, retention, and
      legal-hold changes
    - keep reads primary-owned and epoch-fenced
+   - first slice:
+     - migrate `put_bucket_versioning_and_load_info` onto the metadata command
+       path as the first non-create bucket mutation
+     - reserve bucket execution generations on the routed bucket PG primary,
+       then carry the explicit generation through command apply so every
+       active acting node converges on the same cache-invalidation generation
+     - keep an in-process pending versioning command until full apply
+       succeeds, matching the create-bucket retry behavior for partial replica
+       apply
+     - include deterministic command encoding coverage, primary/replica
+       convergence tests, and a partial-replica retry regression
 4. Phase 6.4: stream, multipart, and reclaim command migration.
    - migrate stream session creation, segment append/finalize/abort metadata,
      multipart create/part/finalize/abort metadata, omitted-part cleanup

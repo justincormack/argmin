@@ -10,6 +10,7 @@ use crate::types::{BucketName, ClusterEpoch, CreateBucketConfig, PgId};
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
 const METADATA_COMMAND_ENCODING_VERSION: u16 = 1;
 const METADATA_COMMAND_CREATE_BUCKET: u16 = 1;
+const METADATA_COMMAND_PUT_BUCKET_VERSIONING: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct MetadataCommandLogIndex(NonZeroU64);
@@ -124,13 +125,44 @@ impl CreateBucketCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MetadataCommandPayload {
     CreateBucket(CreateBucketCommand),
+    PutBucketVersioning(PutBucketVersioningCommand),
 }
 
 impl MetadataCommandPayload {
     fn kind_id(&self) -> u16 {
         match self {
             Self::CreateBucket(_) => METADATA_COMMAND_CREATE_BUCKET,
+            Self::PutBucketVersioning(_) => METADATA_COMMAND_PUT_BUCKET_VERSIONING,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PutBucketVersioningCommand {
+    pub(crate) name: BucketName,
+    pub(crate) state: BucketVersioningState,
+    pub(crate) bucket_execution_generation: u64,
+}
+
+impl PutBucketVersioningCommand {
+    pub(crate) fn new(
+        name: BucketName,
+        state: BucketVersioningState,
+        bucket_execution_generation: u64,
+    ) -> Self {
+        Self {
+            name,
+            state,
+            bucket_execution_generation,
+        }
+    }
+
+    pub(crate) fn matches_request(
+        &self,
+        bucket: &BucketName,
+        state: BucketVersioningState,
+    ) -> bool {
+        self.name == *bucket && self.state == state
     }
 }
 
@@ -187,6 +219,9 @@ fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPaylo
     put_u16(&mut out, payload.kind_id());
     match payload {
         MetadataCommandPayload::CreateBucket(command) => encode_create_bucket(&mut out, command),
+        MetadataCommandPayload::PutBucketVersioning(command) => {
+            encode_put_bucket_versioning(&mut out, command);
+        }
     }
     out
 }
@@ -201,6 +236,12 @@ fn encode_create_bucket(out: &mut Vec<u8>, command: &CreateBucketCommand) {
     put_u8(out, command.versioning as u8);
     encode_object_lock(out, command.object_lock);
     put_u64(out, command.created_at_millis);
+    put_u64(out, command.bucket_execution_generation);
+}
+
+fn encode_put_bucket_versioning(out: &mut Vec<u8>, command: &PutBucketVersioningCommand) {
+    put_str(out, command.name.as_str());
+    put_u8(out, command.state as u8);
     put_u64(out, command.bucket_execution_generation);
 }
 
@@ -297,5 +338,30 @@ mod tests {
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
         assert!(envelope.verify_checksum());
         assert_eq!(envelope.checksum_crc64(), 0xa1bf3d54b1685454);
+    }
+
+    #[test]
+    fn metadata_command_versioning_encoding_is_stable() {
+        let command = PutBucketVersioningCommand::new(
+            BucketName::try_from("bucket").unwrap(),
+            BucketVersioningState::Enabled,
+            11,
+        );
+        let id = MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(3),
+            MetadataCommandLogIndex::new(10).unwrap(),
+        );
+        let envelope = MetadataCommandEnvelope::new(
+            id,
+            MetadataCommandPayload::PutBucketVersioning(command.clone()),
+        );
+        let duplicate =
+            MetadataCommandEnvelope::new(id, MetadataCommandPayload::PutBucketVersioning(command));
+
+        assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
+        assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
+        assert_eq!(envelope.checksum_crc64(), 0xa7a53964fbc32e58);
+        assert!(envelope.verify_checksum());
     }
 }

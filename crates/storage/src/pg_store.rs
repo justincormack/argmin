@@ -20,6 +20,7 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use crate::error::{MetadataError, StoreError};
 use crate::metadata_command::{
     CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandPayload,
+    PutBucketVersioningCommand,
 };
 use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
@@ -2037,6 +2038,9 @@ impl PgStore {
             MetadataCommandPayload::CreateBucket(create) => {
                 self.apply_create_bucket_command(create)
             }
+            MetadataCommandPayload::PutBucketVersioning(versioning) => {
+                self.apply_put_bucket_versioning_command(versioning)
+            }
         }
     }
 
@@ -2061,6 +2065,120 @@ impl PgStore {
             }
             Err(other) => Err(other),
         }
+    }
+
+    fn apply_put_bucket_versioning_command(
+        &self,
+        command: &PutBucketVersioningCommand,
+    ) -> Result<(), MetadataError> {
+        self.put_bucket_versioning_inner(
+            &command.name,
+            command.state,
+            BucketExecutionGeneration::Explicit(command.bucket_execution_generation),
+        )
+    }
+
+    fn put_bucket_versioning_inner(
+        &self,
+        name: &BucketName,
+        state: BucketVersioningState,
+        generation: BucketExecutionGeneration,
+    ) -> Result<(), MetadataError> {
+        let (current, current_generation): (BucketVersioningState, u64) = self
+            .conn
+            .query_row(
+                "SELECT versioning, bucket_execution_generation FROM buckets WHERE name = ?1",
+                params![name.as_str()],
+                |row| {
+                    let raw_versioning = row.get::<_, u8>(0)?;
+                    let raw_generation = row.get::<_, i64>(1)?;
+                    Ok((raw_versioning, raw_generation))
+                },
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get bucket versioning",
+                source: e,
+            })?
+            .ok_or_else(|| bucket_not_found(name.as_str()))
+            .and_then(|(raw_versioning, raw_generation)| {
+                let versioning =
+                    BucketVersioningState::from_u8(raw_versioning).ok_or_else(|| {
+                        MetadataError::Db {
+                            context: "invalid versioning state in database",
+                            source: rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Integer,
+                                Box::from(format!("invalid versioning: {raw_versioning}")),
+                            ),
+                        }
+                    })?;
+                let generation = raw_generation.try_into().map_err(|_| MetadataError::Db {
+                    context: "decode bucket execution generation",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Integer,
+                        Box::from("negative bucket_execution_generation"),
+                    ),
+                })?;
+                Ok((versioning, generation))
+            })?;
+        if matches!(
+            generation,
+            BucketExecutionGeneration::Explicit(explicit)
+                if current == state && current_generation == explicit
+        ) {
+            return Ok(());
+        }
+        if matches!(
+            generation,
+            BucketExecutionGeneration::Explicit(explicit) if current_generation > explicit
+        ) {
+            return Err(MetadataError::Db {
+                context: "apply stale bucket versioning command",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        if state == BucketVersioningState::Disabled && current != BucketVersioningState::Disabled {
+            return Err(MetadataError::InvalidVersioningTransition {
+                from: current,
+                to: state,
+            });
+        }
+
+        self.with_immediate_txn(
+            "put bucket versioning (begin txn)",
+            "put bucket versioning (commit txn)",
+            |store| {
+                let generation = match generation {
+                    BucketExecutionGeneration::Allocate => store
+                        .next_bucket_execution_generation_in_txn(
+                            "put bucket versioning (allocate execution generation)",
+                        )?,
+                    BucketExecutionGeneration::Explicit(generation) => {
+                        store.advance_bucket_execution_generation_in_txn(
+                            generation,
+                            "put bucket versioning (advance execution generation)",
+                        )?;
+                        generation
+                    }
+                };
+                store
+                    .conn
+                    .execute(
+                        "UPDATE buckets \
+                         SET versioning = ?1, \
+                             bucket_execution_generation = ?2 \
+                         WHERE name = ?3",
+                        params![state as u8 as i64, generation as i64, name.as_str()],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "put bucket versioning",
+                        source,
+                    })?;
+                Ok(())
+            },
+        )
     }
 
     pub fn load_bucket_execution_generations(
@@ -2711,59 +2829,7 @@ impl PgMetadataStore for PgStore {
         name: &BucketName,
         state: BucketVersioningState,
     ) -> Result<(), MetadataError> {
-        let current: BucketVersioningState = self
-            .conn
-            .query_row(
-                "SELECT versioning FROM buckets WHERE name = ?1",
-                params![name.as_str()],
-                |row| row.get::<_, u8>(0),
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "get bucket versioning",
-                source: e,
-            })?
-            .ok_or_else(|| bucket_not_found(name.as_str()))
-            .and_then(|raw| {
-                BucketVersioningState::from_u8(raw).ok_or_else(|| MetadataError::Db {
-                    context: "invalid versioning state in database",
-                    source: rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Integer,
-                        Box::from(format!("invalid versioning: {raw}")),
-                    ),
-                })
-            })?;
-        if state == BucketVersioningState::Disabled && current != BucketVersioningState::Disabled {
-            return Err(MetadataError::InvalidVersioningTransition {
-                from: current,
-                to: state,
-            });
-        }
-
-        self.with_immediate_txn(
-            "put bucket versioning (begin txn)",
-            "put bucket versioning (commit txn)",
-            |store| {
-                let generation = store.next_bucket_execution_generation_in_txn(
-                    "put bucket versioning (allocate execution generation)",
-                )?;
-                store
-                    .conn
-                    .execute(
-                        "UPDATE buckets \
-                         SET versioning = ?1, \
-                             bucket_execution_generation = ?2 \
-                         WHERE name = ?3",
-                        params![state as u8 as i64, generation as i64, name.as_str()],
-                    )
-                    .map_err(|source| MetadataError::Db {
-                        context: "put bucket versioning",
-                        source,
-                    })?;
-                Ok(())
-            },
-        )
+        self.put_bucket_versioning_inner(name, state, BucketExecutionGeneration::Allocate)
     }
 
     fn put_bucket_object_lock(
@@ -7741,6 +7807,7 @@ fn fsync_dir(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex};
     use crate::traits::PgMetadataStore;
 
     fn test_owner() -> OwnerIdentity {
@@ -7784,6 +7851,69 @@ mod tests {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 42).unwrap();
         assert_eq!(store.pg_id(), 42);
+    }
+
+    #[test]
+    fn put_bucket_versioning_command_does_not_lower_execution_generation() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("bucket");
+        let owner = test_owner();
+        let acl_grants = AclGrants::default();
+        store
+            .create_bucket_with_config(&CreateBucketConfig {
+                name: bucket.as_str(),
+                owner_principal: &owner.principal,
+                owner_canonical_id: &owner.canonical_id,
+                acl_grants: &acl_grants,
+                public_read: false,
+                public_write: false,
+                versioning: BucketVersioningState::Disabled,
+                object_lock: BucketObjectLockConfig::default(),
+            })
+            .unwrap();
+
+        let newer = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            MetadataCommandPayload::PutBucketVersioning(PutBucketVersioningCommand::new(
+                bucket.clone(),
+                BucketVersioningState::Enabled,
+                12,
+            )),
+        );
+        store.apply_metadata_command(&newer).unwrap();
+
+        let stale = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::PutBucketVersioning(PutBucketVersioningCommand::new(
+                bucket.clone(),
+                BucketVersioningState::Enabled,
+                11,
+            )),
+        );
+        let err = store.apply_metadata_command(&stale).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MetadataError::Db {
+                    context: "apply stale bucket versioning command",
+                    ..
+                }
+            ),
+            "expected stale command rejection, got {err:?}"
+        );
+
+        let info = store.head_bucket_raw(&bucket).unwrap();
+        assert_eq!(info.versioning, BucketVersioningState::Enabled);
+        assert_eq!(info.bucket_execution_generation, 12);
     }
 
     // ── list_objects with prefix + start_after ────────────────────────

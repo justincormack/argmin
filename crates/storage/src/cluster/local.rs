@@ -212,10 +212,17 @@ pub(crate) struct LocalClusterRuntimeState {
     object_payload_leases: Mutex<HashMap<LocalReclaimRoot, usize>>,
     reclaim_queue: (Mutex<LocalReclaimQueueState>, Condvar),
     metadata_command_indexes: Mutex<HashMap<PgId, u64>>,
-    pending_create_bucket_commands: Mutex<HashMap<(PgId, BucketName), MetadataCommandEnvelope>>,
+    pending_metadata_commands:
+        Mutex<HashMap<(PgId, BucketName, PendingMetadataCommandKind), MetadataCommandEnvelope>>,
 }
 
 type LocalReclaimRoot = (BucketName, ObjectKey, GenerationId);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PendingMetadataCommandKind {
+    CreateBucket,
+    PutBucketVersioning,
+}
 
 #[derive(Debug)]
 struct LocalReclaimQueueState {
@@ -239,7 +246,7 @@ impl LocalClusterRuntimeState {
                 Condvar::new(),
             ),
             metadata_command_indexes: Mutex::new(HashMap::new()),
-            pending_create_bucket_commands: Mutex::new(HashMap::new()),
+            pending_metadata_commands: Mutex::new(HashMap::new()),
         }
     }
 
@@ -255,16 +262,63 @@ impl LocalClusterRuntimeState {
         MetadataCommandLogIndex::new(*index).expect("metadata command log index starts at one")
     }
 
+    fn pending_metadata_command(
+        &self,
+        kind: PendingMetadataCommandKind,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Option<MetadataCommandEnvelope> {
+        self.pending_metadata_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(pg_id, bucket.clone(), kind))
+            .cloned()
+    }
+
+    fn insert_pending_metadata_command(
+        &self,
+        kind: PendingMetadataCommandKind,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: MetadataCommandEnvelope,
+    ) {
+        self.pending_metadata_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((pg_id, bucket.clone(), kind), command);
+    }
+
+    fn remove_pending_metadata_command(
+        &self,
+        kind: PendingMetadataCommandKind,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) {
+        self.pending_metadata_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(pg_id, bucket.clone(), kind));
+    }
+
+    pub(crate) fn remove_pending_metadata_commands_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) {
+        self.pending_metadata_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(pending_pg_id, pending_bucket, _), _| {
+                *pending_pg_id != pg_id || pending_bucket != bucket
+            });
+    }
+
     pub(crate) fn pending_create_bucket_command(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Option<MetadataCommandEnvelope> {
-        self.pending_create_bucket_commands
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&(pg_id, bucket.clone()))
-            .cloned()
+        self.pending_metadata_command(PendingMetadataCommandKind::CreateBucket, pg_id, bucket)
     }
 
     pub(crate) fn insert_pending_create_bucket_command(
@@ -273,17 +327,58 @@ impl LocalClusterRuntimeState {
         bucket: &BucketName,
         command: MetadataCommandEnvelope,
     ) {
-        self.pending_create_bucket_commands
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert((pg_id, bucket.clone()), command);
+        self.insert_pending_metadata_command(
+            PendingMetadataCommandKind::CreateBucket,
+            pg_id,
+            bucket,
+            command,
+        );
     }
 
     pub(crate) fn remove_pending_create_bucket_command(&self, pg_id: PgId, bucket: &BucketName) {
-        self.pending_create_bucket_commands
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&(pg_id, bucket.clone()));
+        self.remove_pending_metadata_command(
+            PendingMetadataCommandKind::CreateBucket,
+            pg_id,
+            bucket,
+        );
+    }
+
+    pub(crate) fn pending_put_bucket_versioning_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Option<MetadataCommandEnvelope> {
+        self.pending_metadata_command(
+            PendingMetadataCommandKind::PutBucketVersioning,
+            pg_id,
+            bucket,
+        )
+    }
+
+    pub(crate) fn insert_pending_put_bucket_versioning_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: MetadataCommandEnvelope,
+    ) {
+        self.insert_pending_metadata_command(
+            PendingMetadataCommandKind::PutBucketVersioning,
+            pg_id,
+            bucket,
+            command,
+        );
+    }
+
+    pub(crate) fn remove_pending_put_bucket_versioning_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) {
+        self.remove_pending_metadata_command(
+            PendingMetadataCommandKind::PutBucketVersioning,
+            pg_id,
+            bucket,
+        );
     }
 
     pub(crate) fn acquire_object_payload_lease(
@@ -1043,7 +1138,16 @@ mod tests {
     use proptest::test_runner::{TestCaseError, TestCaseResult};
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    static METADATA_COMMAND_APPLY_HOOK_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn lock_metadata_command_apply_hook_test() -> std::sync::MutexGuard<'static, ()> {
+        METADATA_COMMAND_APPLY_HOOK_TEST_SERIAL
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     struct CommittedDirectSegment {
         generation_id: crate::GenerationId,
@@ -2597,20 +2701,26 @@ mod tests {
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
         let owner = crate::CanonicalUserId::from_principal("owner");
         let acl_grants = crate::AclGrants::default();
+        let _serial = lock_metadata_command_apply_hook_test();
         let fail_once = Arc::new(AtomicBool::new(true));
         let hook_bucket = bucket.clone();
         let fail_once_hook = Arc::clone(&fail_once);
         let _hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
             move |node_id, command| {
-                let MetadataCommandPayload::CreateBucket(create) = command.payload();
-                if create.name == hook_bucket
-                    && node_id == NodeId::new(2)
-                    && fail_once_hook.swap(false, Ordering::SeqCst)
-                {
-                    return Err(StoreError::Io {
-                        context: "injected metadata command apply failure",
-                        source: std::io::Error::other("injected metadata command apply failure"),
-                    });
+                match command.payload() {
+                    MetadataCommandPayload::CreateBucket(create)
+                        if create.name == hook_bucket
+                            && node_id == NodeId::new(2)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected metadata command apply failure",
+                            source: std::io::Error::other(
+                                "injected metadata command apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
                 }
                 Ok(())
             },
@@ -2684,6 +2794,274 @@ mod tests {
             assert_eq!(
                 info.bucket_execution_generation,
                 partial_info.bucket_execution_generation
+            );
+        }
+    }
+
+    #[test]
+    fn put_bucket_versioning_command_applies_to_all_acting_pg_nodes() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "replicated-versioning-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let original = {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            primary.test_head_bucket_raw(&bucket).unwrap()
+        };
+
+        let updated = cluster
+            .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+            .unwrap();
+        assert_eq!(updated.versioning, crate::BucketVersioningState::Enabled);
+        assert!(updated.bucket_execution_generation > original.bucket_execution_generation);
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.versioning, updated.versioning);
+            assert_eq!(
+                info.bucket_execution_generation,
+                updated.bucket_execution_generation
+            );
+        }
+    }
+
+    #[test]
+    fn put_bucket_versioning_command_retry_reuses_pending_partial_replica_command() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "partial-versioning-retry-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let _hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::PutBucketVersioning(versioning)
+                        if versioning.name == hook_bucket
+                            && node_id == NodeId::new(2)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected metadata command apply failure",
+                            source: std::io::Error::other(
+                                "injected metadata command apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Store(StoreError::Io {
+                    context: "injected metadata command apply failure",
+                    ..
+                })
+            ),
+            "expected injected replica failure, got {err:?}"
+        );
+        assert!(!fail_once.load(Ordering::SeqCst));
+
+        let partial_info = {
+            let applied_replica = map.node(NodeId::new(0)).unwrap().storage_node();
+            let pg = applied_replica.get_pg(1).unwrap();
+            crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap()
+        };
+        assert_eq!(
+            partial_info.versioning,
+            crate::BucketVersioningState::Enabled
+        );
+        for node_id in [NodeId::new(1), NodeId::new(2)] {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+                    .unwrap()
+                    .versioning,
+                crate::BucketVersioningState::Disabled,
+                "node {node_id:?} should not have the partially applied versioning update"
+            );
+        }
+
+        let retried = cluster
+            .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+            .unwrap();
+        assert_eq!(retried.versioning, crate::BucketVersioningState::Enabled);
+        assert_eq!(
+            retried.bucket_execution_generation,
+            partial_info.bucket_execution_generation
+        );
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.versioning, crate::BucketVersioningState::Enabled);
+            assert_eq!(
+                info.bucket_execution_generation,
+                partial_info.bucket_execution_generation
+            );
+        }
+    }
+
+    #[test]
+    fn finalized_bucket_delete_clears_pending_versioning_command_for_recreate() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "partial-versioning-delete-recreate-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::PutBucketVersioning(versioning)
+                        if versioning.name == hook_bucket
+                            && node_id == NodeId::new(2)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected metadata command apply failure",
+                            source: std::io::Error::other(
+                                "injected metadata command apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Store(StoreError::Io {
+                    context: "injected metadata command apply failure",
+                    ..
+                })
+            ),
+            "expected injected replica failure, got {err:?}"
+        );
+        drop(hook_guard);
+        assert!(
+            map.runtime_state()
+                .pending_put_bucket_versioning_command(PgId::new(1), &bucket)
+                .is_some(),
+            "failed versioning command should remain pending before delete"
+        );
+        let old_partial_generation = {
+            let applied_replica = map.node(NodeId::new(0)).unwrap().storage_node();
+            let pg = applied_replica.get_pg(1).unwrap();
+            crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+                .unwrap()
+                .bucket_execution_generation
+        };
+
+        cluster.begin_bucket_delete(&bucket).unwrap();
+        assert_eq!(
+            cluster.try_finalize_bucket_delete(&bucket).unwrap(),
+            crate::BucketDeleteFinalizeOutcome::Finalized
+        );
+        assert!(
+            map.runtime_state()
+                .pending_put_bucket_versioning_command(PgId::new(1), &bucket)
+                .is_none(),
+            "finalized delete must clear stale pending commands for the old bucket incarnation"
+        );
+
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let acl_grants = crate::AclGrants::default();
+        let recreated = cluster
+            .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+                name: bucket.as_str(),
+                owner_principal: "owner",
+                owner_canonical_id: &owner,
+                acl_grants: &acl_grants,
+                public_read: false,
+                public_write: false,
+                versioning: crate::BucketVersioningState::Disabled,
+                object_lock: crate::BucketObjectLockConfig::default(),
+            })
+            .unwrap();
+        let recreated_generation = match recreated {
+            crate::BucketCreateAttemptOutcome::Created(info) => info.bucket_execution_generation,
+            other => panic!("expected recreated bucket, got {other:?}"),
+        };
+        assert!(recreated_generation > old_partial_generation);
+
+        let updated = cluster
+            .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+            .unwrap();
+        assert_eq!(updated.versioning, crate::BucketVersioningState::Enabled);
+        assert!(updated.bucket_execution_generation > recreated_generation);
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.versioning, crate::BucketVersioningState::Enabled);
+            assert_eq!(
+                info.bucket_execution_generation,
+                updated.bucket_execution_generation
             );
         }
     }
