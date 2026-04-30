@@ -1185,11 +1185,8 @@ Work items:
      - this is still an in-process substrate: command indexes are local runtime
        state, command logs are not durable, and later Phase 6 work must add
        durable ordering, origin/epoch checks, hash chaining, and recovery
-3. Phase 6.3: bucket and object command migration.
+3. Phase 6.3: bucket command migration. Complete.
    - migrate bucket mutations to command apply
-   - migrate ordinary object mutations, including generation
-     reservation/release, direct PUT publish, delete, tag, ACL, retention, and
-     legal-hold changes
    - keep reads primary-owned and epoch-fenced
    - first slice:
      - migrate `put_bucket_versioning_and_load_info` onto the metadata command
@@ -1249,11 +1246,22 @@ Work items:
      - include deterministic command encoding coverage, primary/replica
        convergence tests, a partial-replica retry regression, and stale or
        same-generation divergent command rejection coverage
-4. Phase 6.4: stream, multipart, and reclaim command migration.
+4. Phase 6.4: object, stream, multipart, and reclaim command migration.
+   - migrate ordinary object mutations, including generation
+     reservation/release, direct PUT publish, delete, tag, ACL, retention, and
+     legal-hold changes
    - migrate stream session creation, segment append/finalize/abort metadata,
      multipart create/part/finalize/abort metadata, omitted-part cleanup
      metadata, and reclaim rows
    - keep multi-step workflows serialized by the PG primary command path
+   - likely slices:
+     - object generation reservation/release and direct PUT publish
+     - object delete and lifecycle expiry metadata
+     - object tag, ACL, retention, and legal-hold updates
+     - stream session creation plus segment append/finalize/abort metadata
+     - multipart create, part upload, completion, abort, and omitted-part
+       cleanup metadata
+     - reclaim rows and reclaim worker metadata transitions
 5. Phase 6.5: synchronous replica apply.
    - apply every metadata command to all required replicas before acknowledging
      success
