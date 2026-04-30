@@ -10,7 +10,7 @@ This guide collects the main testing workflows for the repository:
 - parser fuzzing
 
 For the current compatibility target and explicitly documented AWS gaps, see
-[guides/aws-compatibility.md](/home/justin/src/github.com/justincormack/argmin/guides/aws-compatibility.md).
+[aws-compatibility.md](aws-compatibility.md).
 
 ## Quick reference
 

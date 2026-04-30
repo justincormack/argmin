@@ -1036,6 +1036,9 @@ Phase 5 implementation notes:
      allowed orphan state, plus reclaim placed-delete failure that returns an
      error, preserves retryable reclaim metadata and payload, and succeeds on a
      later retry
+   - error taxonomy regressions now pin stale shard locations, acting-set
+     violations, shard-index mismatches, and coordinator GET behavior so typed
+     route/control-plane errors do not become `ObjectNotFound`
 
 ## Phase 6: PG Metadata Replication
 

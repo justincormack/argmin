@@ -2393,6 +2393,174 @@ mod tests {
     }
 
     #[test]
+    fn placed_segment_recovery_propagates_node_not_in_acting_set() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+        let cluster =
+            crate::StorageCluster::open_local_nodes(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
+        let segment = write_committed_direct_segment(&cluster, b"phase-five-acting-set-route");
+        let shard_size = segment
+            .payload
+            .len()
+            .div_ceil(usize::from(segment.written.ec.k));
+        let mut locations = segment.locations.clone();
+        locations[0] = ShardLocation::new(
+            ClusterEpoch::INITIAL,
+            DataPgId::new(PgId::new(segment.written.data_pg_id)),
+            ShardIndex::new(0),
+            NodeId::new(99),
+        );
+        let mut all_shards = vec![None; usize::from(segment.written.ec.k + segment.written.ec.m)];
+        let mut present_count = 0;
+
+        let err = cluster
+            .try_load_placed_segment_shard(
+                segment.written.data_pg_id,
+                &segment.segment_okh,
+                segment.generation_id,
+                &locations,
+                0,
+                shard_size,
+                &mut all_shards,
+                &mut present_count,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StoreError::NodeNotInActingSet {
+                node_id: 99,
+                pg_id,
+                cluster_epoch: ClusterEpoch::INITIAL,
+            } if pg_id == segment.written.data_pg_id
+        ));
+        assert_eq!(present_count, 0);
+        assert!(all_shards.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn placed_segment_recovery_propagates_stale_shard_location() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+        let cluster =
+            crate::StorageCluster::open_local_nodes(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
+        let segment = write_committed_direct_segment(&cluster, b"phase-five-stale-location");
+        let shard_size = segment
+            .payload
+            .len()
+            .div_ceil(usize::from(segment.written.ec.k));
+        let mut locations = segment.locations.clone();
+        locations[0] = ShardLocation::new(
+            ClusterEpoch::new(2).unwrap(),
+            DataPgId::new(PgId::new(segment.written.data_pg_id)),
+            ShardIndex::new(0),
+            locations[0].node_id(),
+        );
+        let mut all_shards = vec![None; usize::from(segment.written.ec.k + segment.written.ec.m)];
+        let mut present_count = 0;
+
+        let err = cluster
+            .try_load_placed_segment_shard(
+                segment.written.data_pg_id,
+                &segment.segment_okh,
+                segment.generation_id,
+                &locations,
+                0,
+                shard_size,
+                &mut all_shards,
+                &mut present_count,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StoreError::StaleShardLocation {
+                node_id,
+                pg_id,
+                location_epoch,
+                current_epoch: ClusterEpoch::INITIAL,
+            } if node_id == locations[0].node_id().as_u32()
+                && pg_id == segment.written.data_pg_id
+                && location_epoch == ClusterEpoch::new(2).unwrap()
+        ));
+        assert_eq!(present_count, 0);
+        assert!(all_shards.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn placed_segment_recovery_propagates_shard_index_mismatch() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+        let cluster =
+            crate::StorageCluster::open_local_nodes(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
+        let segment = write_committed_direct_segment(&cluster, b"phase-five-shard-index-route");
+        let shard_size = segment
+            .payload
+            .len()
+            .div_ceil(usize::from(segment.written.ec.k));
+        let mut locations = segment.locations.clone();
+        locations[0] = ShardLocation::new(
+            ClusterEpoch::INITIAL,
+            DataPgId::new(PgId::new(segment.written.data_pg_id)),
+            ShardIndex::new(1),
+            locations[0].node_id(),
+        );
+        let mut all_shards = vec![None; usize::from(segment.written.ec.k + segment.written.ec.m)];
+        let mut present_count = 0;
+
+        let err = cluster
+            .try_load_placed_segment_shard(
+                segment.written.data_pg_id,
+                &segment.segment_okh,
+                segment.generation_id,
+                &locations,
+                0,
+                shard_size,
+                &mut all_shards,
+                &mut present_count,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StoreError::ShardIndexMismatch {
+                node_id,
+                pg_id,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                location_shard_index: 1,
+                key_shard_index: 0,
+            } if node_id == locations[0].node_id().as_u32()
+                && pg_id == segment.written.data_pg_id
+        ));
+        assert_eq!(present_count, 0);
+        assert!(all_shards.iter().all(Option::is_none));
+    }
+
+    #[test]
     fn placed_segment_recovery_wraps_node_store_error_with_shard_route() {
         let tmp = test_util::tempdir();
         let node_ids = [

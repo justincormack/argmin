@@ -114,6 +114,70 @@ fn stream_put_get_object_readable() {
 }
 
 #[test]
+fn get_object_payload_route_error_does_not_become_object_not_found() {
+    let dir = test_util::tempdir();
+    let coord = setup_coordinator(dir.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let put = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"route error must not look missing",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: &WriteCondition::default(),
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let mut segments = coord
+        .storage_node
+        .test_get_object_segments(&bucket, &key, put.version_id)
+        .unwrap();
+    assert_eq!(segments.len(), 1);
+    segments[0].data_pg_id = 99;
+    coord
+        .storage_node
+        .test_replace_live_object_segments(&bucket, &key, put.version_id, &segments)
+        .unwrap();
+
+    let result = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    let err = result.body.read_all().unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            ServerError::Store(StoreError::ClusterPgNotFound {
+                pg_id: 99,
+                cluster_epoch: storage::ClusterEpoch::INITIAL,
+            })
+        ),
+        "expected typed route error, got {err:?}"
+    );
+}
+
+#[test]
 fn failed_stream_put_append_commit_cleans_placed_shards() {
     let _serial = STREAM_APPEND_TEST_SERIAL
         .get_or_init(|| std::sync::Mutex::new(()))
