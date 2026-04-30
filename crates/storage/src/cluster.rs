@@ -91,6 +91,79 @@ impl ShardLocation {
     }
 }
 
+pub struct ObjectPayloadLease {
+    node: Arc<SharedStorageNode>,
+    bucket: BucketName,
+    key: ObjectKey,
+    generation_id: GenerationId,
+    released: bool,
+}
+
+impl ObjectPayloadLease {
+    fn new(
+        node: Arc<SharedStorageNode>,
+        bucket: BucketName,
+        key: ObjectKey,
+        generation_id: GenerationId,
+    ) -> Self {
+        Self {
+            node,
+            bucket,
+            key,
+            generation_id,
+            released: false,
+        }
+    }
+
+    pub fn release(mut self) -> ReleasedObjectPayloadLease {
+        let remaining =
+            self.node
+                .release_object_payload_lease(&self.bucket, &self.key, self.generation_id);
+        self.released = true;
+        ReleasedObjectPayloadLease {
+            node: Arc::clone(&self.node),
+            bucket: self.bucket.clone(),
+            key: self.key.clone(),
+            generation_id: self.generation_id,
+            remaining,
+        }
+    }
+}
+
+impl Drop for ObjectPayloadLease {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ =
+                self.node
+                    .release_object_payload_lease(&self.bucket, &self.key, self.generation_id);
+        }
+    }
+}
+
+pub struct ReleasedObjectPayloadLease {
+    node: Arc<SharedStorageNode>,
+    bucket: BucketName,
+    key: ObjectKey,
+    generation_id: GenerationId,
+    remaining: usize,
+}
+
+impl ReleasedObjectPayloadLease {
+    pub fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    pub fn payload_reclaim_exists(&self) -> Result<bool, ObjectPgActionError> {
+        self.node
+            .payload_reclaim_exists(&self.bucket, &self.key, self.generation_id)
+    }
+
+    pub fn enqueue_object_payload_reclaim(&self) {
+        self.node
+            .enqueue_object_payload_reclaim(&self.bucket, &self.key, self.generation_id);
+    }
+}
+
 /// Cluster-shaped storage handle.
 ///
 /// The initial local multihost implementation keeps metadata operations on the
@@ -149,6 +222,22 @@ impl StorageCluster {
 
     pub fn operation_epoch(&self) -> ClusterEpoch {
         self.operation_epoch
+    }
+
+    fn require_current_operation_epoch(&self) -> Result<(), StoreError> {
+        let current_epoch = self.cluster_epoch();
+        if self.operation_epoch() != current_epoch {
+            return Err(StoreError::StaleEpoch {
+                operation_epoch: self.operation_epoch(),
+                current_epoch,
+            });
+        }
+        Ok(())
+    }
+
+    fn current_single_node(&self) -> Result<&SharedStorageNode, StoreError> {
+        self.require_current_operation_epoch()?;
+        Ok(self.single_node.as_ref())
     }
 
     pub fn metadata_node_id(&self) -> NodeId {
@@ -362,7 +451,7 @@ impl StorageCluster {
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<GenerationId, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .reserve_put_object_generation(bucket, key, reservation_id)
     }
 
@@ -372,7 +461,7 @@ impl StorageCluster {
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .release_object_generation_reservation(bucket, key, reservation_id)
     }
 
@@ -382,6 +471,7 @@ impl StorageCluster {
         written_shards: &[WrittenShardAck],
         action: impl FnOnce(DirectPutCommitSnapshot) -> Result<(), E>,
     ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, ObjectPgActionError> {
+        self.require_current_operation_epoch()?;
         let result = self
             .single_node
             .commit_direct_put_object(req, written_shards, action);
@@ -435,7 +525,7 @@ impl StorageCluster {
         session_id: &SessionId,
         encryption: ObjectEncryption,
     ) -> Result<(), ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .create_put_object_stream_session_record(bucket, key, session_id, encryption)
     }
 
@@ -445,7 +535,7 @@ impl StorageCluster {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<StreamUploadRecord, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .load_stream_upload_session(bucket, key, session_id)
     }
 
@@ -455,7 +545,7 @@ impl StorageCluster {
         key: &ObjectKey,
         request: &PrepareStreamUploadSegmentAppendReq,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .prepare_stream_segment_append(bucket, key, request)
     }
 
@@ -487,6 +577,7 @@ impl StorageCluster {
         segment_record: &StreamUploadSegmentRecord,
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), ObjectPgActionError> {
+        self.require_current_operation_epoch()?;
         let result = self.single_node.commit_stream_segment_append(
             bucket,
             key,
@@ -516,6 +607,7 @@ impl StorageCluster {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
+        self.require_current_operation_epoch()?;
         #[cfg(any(test, feature = "test-hooks"))]
         maybe_run_before_stream_abort_storage_hook();
         let staged_segments = self
@@ -526,6 +618,9 @@ impl StorageCluster {
     }
 
     pub fn list_stream_upload_sessions_best_effort(&self) -> Vec<StreamUploadRecord> {
+        if self.require_current_operation_epoch().is_err() {
+            return Vec::new();
+        }
         self.single_node.list_all_stream_uploads_best_effort()
     }
 
@@ -534,6 +629,7 @@ impl StorageCluster {
         req: SegmentStoredBytesRequest,
         dst: &mut Vec<u8>,
     ) -> Result<(), StoreError> {
+        self.require_current_operation_epoch()?;
         match self.try_read_placed_segment_stored_bytes_into(req, dst)? {
             true => Ok(()),
             false => Err(StoreError::NotFound),
@@ -1016,6 +1112,13 @@ fn erasure_codec_for_shape(ec: EcShape, context: &'static str) -> Result<Erasure
 fn cluster_build_error_to_store(error: ClusterBuildError) -> StoreError {
     match error {
         ClusterBuildError::PgNotFound { pg_id, .. } => StoreError::PgNotFound { pg_id },
+        ClusterBuildError::StaleEpoch {
+            operation_epoch,
+            current_epoch,
+        } => StoreError::StaleEpoch {
+            operation_epoch,
+            current_epoch,
+        },
         other => StoreError::Io {
             context: "place payload shards",
             source: std::io::Error::other(other.to_string()),

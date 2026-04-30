@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
-use storage::{EcShape, StorageCluster};
+use storage::EcShape;
 
 use super::lock_mutex_unpoisoned;
 use super::read_core::{PayloadLease, ReadChunk, SegmentPayloadRecord};
@@ -219,30 +219,17 @@ impl SegmentPayloadRecord {
 
 impl Drop for PayloadLease {
     fn drop(&mut self) {
-        if self.storage_node().release_object_payload_lease(
-            &self.bucket,
-            &self.key,
-            self.generation_id,
-        ) == 0
-        {
-            match self.runtime.object_payload_reclaim_exists_for(
-                &self.bucket,
-                &self.key,
-                self.generation_id,
-            ) {
-                Ok(true) | Err(_) => self.runtime.enqueue_object_payload_reclaim_for(
-                    &self.bucket,
-                    &self.key,
-                    self.generation_id,
-                ),
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        let released = lease.release();
+        if released.remaining() == 0 {
+            match released.payload_reclaim_exists() {
+                Ok(true) | Err(_) => {
+                    released.enqueue_object_payload_reclaim();
+                }
                 Ok(false) => {}
             }
         }
-    }
-}
-
-impl PayloadLease {
-    fn storage_node(&self) -> &StorageCluster {
-        &self.runtime.storage_node
     }
 }

@@ -37,8 +37,8 @@ pub mod traits;
 pub mod types;
 
 pub use cluster::{
-    LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute, ShardLocation,
-    StorageCluster,
+    LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute, ObjectPayloadLease,
+    ReleasedObjectPayloadLease, ShardLocation, StorageCluster,
 };
 pub use error::{
     BucketSnapshotLoadError, BucketWriteDrainError, ClusterBuildError, MetadataError,

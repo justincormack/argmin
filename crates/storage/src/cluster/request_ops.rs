@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use crate::*;
 
-// Phase 1 forwards through the local single-node implementation while making
-// the coordinator's storage dependency explicit at the cluster boundary.
+// Metadata still forwards through the local metadata-primary node until Phase 6,
+// but cluster handles fence those bridge calls by their operation epoch.
 impl super::StorageCluster {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_pg_ids(&self) -> &[u32] {
@@ -16,7 +17,8 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<bool, BucketSnapshotLoadError> {
-        self.single_node.try_probe_bucket_pg_available(bucket)
+        self.current_single_node()?
+            .try_probe_bucket_pg_available(bucket)
     }
 
     #[cfg(feature = "test-hooks")]
@@ -25,14 +27,15 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<bool, ObjectPgActionError> {
-        self.single_node.try_probe_object_pg_available(bucket, key)
+        self.current_single_node()?
+            .try_probe_object_pg_available(bucket, key)
     }
 
     pub fn create_bucket_with_config_and_load_info(
         &self,
         config: &CreateBucketConfig<'_>,
     ) -> Result<BucketCreateAttemptOutcome, BucketSnapshotLoadError> {
-        self.single_node
+        self.current_single_node()?
             .create_bucket_with_config_and_load_info(config)
     }
 
@@ -41,13 +44,18 @@ impl super::StorageCluster {
         bucket: &BucketName,
         request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
-        self.single_node.load_bucket_snapshot(bucket, request)
+        self.current_single_node()?
+            .load_bucket_snapshot(bucket, request)
     }
 
     pub fn load_available_bucket_execution_generation_batches(
         &self,
         buckets: &[BucketName],
     ) -> Vec<(Vec<BucketName>, HashMap<BucketName, u64>)> {
+        if self.require_current_operation_epoch().is_err() {
+            return Vec::new();
+        }
+
         let mut buckets_by_pg = HashMap::<u32, Vec<BucketName>>::new();
         for bucket in buckets {
             buckets_by_pg
@@ -75,7 +83,7 @@ impl super::StorageCluster {
         request: BucketSnapshotRequest,
         action: impl FnOnce(BucketSnapshot) -> Result<T, E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
-        self.single_node
+        self.current_single_node()?
             .with_bucket_write_snapshot(bucket, request, action)
     }
 
@@ -84,26 +92,27 @@ impl super::StorageCluster {
         source: (&BucketName, BucketSnapshotRequest),
         destination: (&BucketName, BucketSnapshotRequest),
     ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
-        self.single_node
+        self.current_single_node()?
             .load_bucket_snapshot_pair(source, destination)
     }
 
     pub fn begin_bucket_delete(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
-        self.single_node.begin_bucket_delete(bucket)
+        self.current_single_node()?.begin_bucket_delete(bucket)
     }
 
     pub fn try_finalize_bucket_delete(
         &self,
         bucket: &BucketName,
     ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
-        self.single_node.try_finalize_bucket_delete(bucket)
+        self.current_single_node()?
+            .try_finalize_bucket_delete(bucket)
     }
 
     pub fn head_bucket_info(
         &self,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.single_node.head_bucket_info(bucket)
+        self.current_single_node()?.head_bucket_info(bucket)
     }
 
     pub fn get_bucket_subresource(
@@ -111,7 +120,8 @@ impl super::StorageCluster {
         bucket: &BucketName,
         kind: BucketSubresourceKind,
     ) -> Result<Option<String>, BucketSnapshotLoadError> {
-        self.single_node.get_bucket_subresource(bucket, kind)
+        self.current_single_node()?
+            .get_bucket_subresource(bucket, kind)
     }
 
     pub fn put_bucket_versioning_and_load_info(
@@ -119,7 +129,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         state: BucketVersioningState,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.single_node
+        self.current_single_node()?
             .put_bucket_versioning_and_load_info(bucket, state)
     }
 
@@ -128,7 +138,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         config: BucketObjectLockConfig,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.single_node
+        self.current_single_node()?
             .put_bucket_object_lock_and_load_info(bucket, config)
     }
 
@@ -137,7 +147,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         config: BucketEncryptionConfig,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.single_node
+        self.current_single_node()?
             .put_bucket_encryption_and_load_info(bucket, config)
     }
 
@@ -146,7 +156,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         config: PublicAccessBlockConfig,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.single_node
+        self.current_single_node()?
             .put_bucket_public_access_block_and_load_info(bucket, config)
     }
 
@@ -154,7 +164,7 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.single_node
+        self.current_single_node()?
             .delete_bucket_public_access_block_and_load_info(bucket)
     }
 
@@ -163,7 +173,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         config: BucketOwnershipControls,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.single_node
+        self.current_single_node()?
             .put_bucket_ownership_controls_and_load_info(bucket, config)
     }
 
@@ -171,7 +181,7 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.single_node
+        self.current_single_node()?
             .delete_bucket_ownership_controls_and_load_info(bucket)
     }
 
@@ -180,7 +190,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         enabled: bool,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.single_node
+        self.current_single_node()?
             .put_bucket_abac_enabled_and_load_info(bucket, enabled)
     }
 
@@ -191,8 +201,12 @@ impl super::StorageCluster {
         public_read: bool,
         public_write: bool,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.single_node
-            .put_bucket_acl_and_load_info(bucket, acl_grants, public_read, public_write)
+        self.current_single_node()?.put_bucket_acl_and_load_info(
+            bucket,
+            acl_grants,
+            public_read,
+            public_write,
+        )
     }
 
     pub fn put_bucket_subresource_and_load_info(
@@ -200,7 +214,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         req: PutBucketSubresource<'_>,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.single_node
+        self.current_single_node()?
             .put_bucket_subresource_and_load_info(bucket, req)
     }
 
@@ -209,7 +223,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         kind: BucketSubresourceKind,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.single_node
+        self.current_single_node()?
             .delete_bucket_subresource_and_load_info(bucket, kind)
     }
 
@@ -217,7 +231,8 @@ impl super::StorageCluster {
         &self,
         owner_canonical_id: &str,
     ) -> Result<Vec<BucketInfo>, ObjectPgActionError> {
-        self.single_node.list_buckets_for_owner(owner_canonical_id)
+        self.current_single_node()?
+            .list_buckets_for_owner(owner_canonical_id)
     }
 
     pub fn prune_completed_multipart_uploads_for_bucket_with_limit(
@@ -225,35 +240,37 @@ impl super::StorageCluster {
         bucket: &BucketName,
         keep: usize,
     ) -> Result<(), ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .prune_completed_multipart_uploads_for_bucket_with_limit(bucket, keep)
     }
 
     pub fn list_lifecycle_sweep_buckets(
         &self,
     ) -> Result<LifecycleSweepBuckets, ObjectPgActionError> {
-        self.single_node.list_lifecycle_sweep_buckets()
+        self.current_single_node()?.list_lifecycle_sweep_buckets()
     }
 
     pub fn list_all_objects_for_bucket(
         &self,
         bucket: &BucketName,
     ) -> Result<Vec<StoredObject>, ObjectPgActionError> {
-        self.single_node.list_all_objects_for_bucket(bucket)
+        self.current_single_node()?
+            .list_all_objects_for_bucket(bucket)
     }
 
     pub fn list_all_object_versions_for_bucket(
         &self,
         bucket: &BucketName,
     ) -> Result<Vec<StoredObject>, ObjectPgActionError> {
-        self.single_node.list_all_object_versions_for_bucket(bucket)
+        self.current_single_node()?
+            .list_all_object_versions_for_bucket(bucket)
     }
 
     pub fn list_all_multipart_uploads_for_bucket(
         &self,
         bucket: &BucketName,
     ) -> Result<Vec<MultipartUploadRecord>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .list_all_multipart_uploads_for_bucket(bucket)
     }
 
@@ -266,7 +283,7 @@ impl super::StorageCluster {
         record_cap: usize,
         max_keys: u32,
     ) -> Result<ListedBucketObjects, ObjectPgActionError> {
-        self.single_node.list_objects_for_bucket(
+        self.current_single_node()?.list_objects_for_bucket(
             bucket,
             prefix,
             delimiter,
@@ -284,7 +301,7 @@ impl super::StorageCluster {
         version_id_marker: Option<VersionId>,
         max_keys: u32,
     ) -> Result<ListedBucketObjectVersions, ObjectPgActionError> {
-        self.single_node.list_object_versions_for_bucket(
+        self.current_single_node()?.list_object_versions_for_bucket(
             bucket,
             prefix,
             key_marker,
@@ -300,7 +317,7 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<T, E>,
     ) -> Result<Result<T, E>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .load_object_if(bucket, key, version_id, action)
     }
 
@@ -309,7 +326,8 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<Option<StoredObject>, ObjectPgActionError> {
-        self.single_node.load_existing_live_object(bucket, key)
+        self.current_single_node()?
+            .load_existing_live_object(bucket, key)
     }
 
     pub fn load_object_read_snapshot_if<T, E>(
@@ -320,7 +338,7 @@ impl super::StorageCluster {
         snapshot_mode: ObjectReadSnapshotMode,
         action: impl FnOnce(&StoredObject) -> Result<T, E>,
     ) -> Result<Result<ObjectReadSnapshotOutcome<T>, E>, ObjectPgActionError> {
-        self.single_node.load_object_read_snapshot_if(
+        self.current_single_node()?.load_object_read_snapshot_if(
             bucket,
             key,
             version_id,
@@ -335,7 +353,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<bool, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .payload_reclaim_exists(bucket, key, generation_id)
     }
 
@@ -346,7 +364,7 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
     ) -> Result<Result<Option<String>, E>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .get_object_tags_if(bucket, key, version_id, action)
     }
 
@@ -358,7 +376,7 @@ impl super::StorageCluster {
         tags: &str,
         action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
     ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .put_object_tags_if(bucket, key, version_id, tags, action)
     }
 
@@ -369,7 +387,7 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
     ) -> Result<Result<(), E>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .delete_object_tags_if(bucket, key, version_id, action)
     }
 
@@ -381,7 +399,7 @@ impl super::StorageCluster {
         retention: ObjectRetention,
         action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
     ) -> Result<Result<(), E>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .put_object_retention_if(bucket, key, version_id, retention, action)
     }
 
@@ -393,7 +411,7 @@ impl super::StorageCluster {
         legal_hold: StoredLegalHoldStatus,
         action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
     ) -> Result<Result<(), E>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .put_object_legal_hold_if(bucket, key, version_id, legal_hold, action)
     }
 
@@ -404,7 +422,7 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<(VersionId, AclGrants, bool), E>,
     ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .put_object_acl_if(bucket, key, version_id, action)
     }
 
@@ -415,7 +433,7 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<Option<LegalHoldStatus>, E>,
     ) -> Result<Result<Option<LegalHoldStatus>, E>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .get_object_legal_hold_if(bucket, key, version_id, action)
     }
 
@@ -426,7 +444,7 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<Option<ObjectRetention>, E>,
     ) -> Result<Result<Option<ObjectRetention>, E>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .get_object_retention_if(bucket, key, version_id, action)
     }
 
@@ -437,7 +455,7 @@ impl super::StorageCluster {
         version_id: VersionId,
         action: impl FnOnce(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<DeleteSpecificObjectVersionOutcome<T>, E>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .delete_specific_object_version_if(bucket, key, version_id, action)
     }
 
@@ -447,7 +465,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         action: impl FnOnce(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<DeleteCurrentObjectOutcome<T>, E>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .delete_current_object_if(bucket, key, action)
     }
 
@@ -458,7 +476,7 @@ impl super::StorageCluster {
         owner: OwnerIdentity,
         action: impl FnOnce(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<InsertCurrentDeleteMarkerOutcome<T>, E>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .insert_current_delete_marker_if(bucket, key, owner, action)
     }
 
@@ -469,7 +487,7 @@ impl super::StorageCluster {
         expected_version_id: VersionId,
         should_expire: impl FnOnce(Option<&str>, &LiveObjectRecord) -> Result<bool, E>,
     ) -> Result<Result<Option<ExpireCurrentObjectOutcome>, E>, ObjectPgActionError> {
-        self.single_node.expire_current_object_if_due(
+        self.current_single_node()?.expire_current_object_if_due(
             bucket,
             key,
             expected_version_id,
@@ -483,7 +501,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         select_versions: impl FnOnce(Option<&str>, &[StoredObject]) -> Result<HashSet<VersionId>, E>,
     ) -> Result<Result<Vec<GenerationId>, E>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .delete_noncurrent_live_versions_if_due(bucket, key, select_versions)
     }
 
@@ -494,12 +512,8 @@ impl super::StorageCluster {
         expected_version_id: VersionId,
         should_delete: impl FnOnce(Option<&str>, &[StoredObject]) -> Result<bool, E>,
     ) -> Result<Result<bool, E>, ObjectPgActionError> {
-        self.single_node.delete_expired_delete_marker_if_due(
-            bucket,
-            key,
-            expected_version_id,
-            should_delete,
-        )
+        self.current_single_node()?
+            .delete_expired_delete_marker_if_due(bucket, key, expected_version_id, should_delete)
     }
 
     pub fn acquire_object_payload_lease(
@@ -507,19 +521,16 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-    ) {
+    ) -> Result<ObjectPayloadLease, StoreError> {
+        self.require_current_operation_epoch()?;
         self.single_node
             .acquire_object_payload_lease(bucket, key, generation_id);
-    }
-
-    pub fn release_object_payload_lease(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> usize {
-        self.single_node
-            .release_object_payload_lease(bucket, key, generation_id)
+        Ok(ObjectPayloadLease::new(
+            Arc::clone(&self.single_node),
+            bucket.clone(),
+            key.clone(),
+            generation_id,
+        ))
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -529,12 +540,18 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> usize {
+        if self.require_current_operation_epoch().is_err() {
+            return 0;
+        }
         self.single_node
             .object_payload_lease_count(bucket, key, generation_id)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize {
+        if self.require_current_operation_epoch().is_err() {
+            return 0;
+        }
         self.single_node.bucket_object_payload_lease_count(bucket)
     }
 
@@ -544,24 +561,39 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) {
+        if self.require_current_operation_epoch().is_err() {
+            return;
+        }
         self.single_node
             .enqueue_object_payload_reclaim(bucket, key, generation_id);
     }
 
     pub fn enqueue_bucket_delete_finalize(&self, bucket: &BucketName) {
+        if self.require_current_operation_epoch().is_err() {
+            return;
+        }
         self.single_node.enqueue_bucket_delete_finalize(bucket);
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn try_take_reclaim_work(&self) -> Option<ReclaimWorkItem> {
+        if self.require_current_operation_epoch().is_err() {
+            return None;
+        }
         self.single_node.try_take_reclaim_work()
     }
 
     pub fn wait_for_reclaim_work(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
+        if self.require_current_operation_epoch().is_err() {
+            return None;
+        }
         self.single_node.wait_for_reclaim_work(stop)
     }
 
     pub fn wake_reclaim_workers(&self) {
+        if self.require_current_operation_epoch().is_err() {
+            return;
+        }
         self.single_node.wake_reclaim_workers();
     }
 
@@ -571,6 +603,8 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<bool, ObjectPgActionError> {
+        self.require_current_operation_epoch()?;
+
         enum ReclaimPayload {
             Segments(ObjectSegmentsReclaimRecord),
             Multipart(MultipartReclaimRecord),
@@ -812,7 +846,7 @@ impl super::StorageCluster {
             Option<StoredObject>,
         ) -> Result<(T, CreateStreamUploadReq), E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
-        self.single_node
+        self.current_single_node()?
             .create_put_object_stream_session(bucket, key, request, action)
     }
 
@@ -824,7 +858,7 @@ impl super::StorageCluster {
         total_size: u64,
         action: impl FnOnce(StreamPutFinalizeSnapshot) -> Result<PreparedStreamPutCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPutOutcome<T>, E>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .finalize_put_object_stream(bucket, key, session_id, total_size, action)
     }
 
@@ -838,7 +872,7 @@ impl super::StorageCluster {
             Option<StoredObject>,
         ) -> Result<(T, CreateMultipartUploadReq), E>,
     ) -> Result<Result<CreateMultipartUploadOutcome<T>, E>, BucketSnapshotLoadError> {
-        self.single_node
+        self.current_single_node()?
             .create_multipart_upload(bucket, key, request, action)
     }
 
@@ -848,7 +882,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, BucketSnapshotLoadError> {
-        self.single_node
+        self.current_single_node()?
             .load_multipart_upload(bucket, key, upload_id)
     }
 
@@ -861,14 +895,15 @@ impl super::StorageCluster {
         session_id: &SessionId,
         action: impl FnOnce(&MultipartUploadRecord) -> Result<T, E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
-        self.single_node.begin_upload_part_stream_session(
-            bucket,
-            key,
-            upload_id,
-            part_number,
-            session_id,
-            action,
-        )
+        self.current_single_node()?
+            .begin_upload_part_stream_session(
+                bucket,
+                key,
+                upload_id,
+                part_number,
+                session_id,
+                action,
+            )
     }
 
     pub fn create_upload_part_stream_session(
@@ -879,13 +914,8 @@ impl super::StorageCluster {
         part_number: u32,
         session_id: &SessionId,
     ) -> Result<SessionId, ObjectPgActionError> {
-        self.single_node.create_upload_part_stream_session(
-            bucket,
-            key,
-            upload_id,
-            part_number,
-            session_id,
-        )
+        self.current_single_node()?
+            .create_upload_part_stream_session(bucket, key, upload_id, part_number, session_id)
     }
 
     pub fn load_in_progress_multipart_upload(
@@ -894,7 +924,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .load_in_progress_multipart_upload(bucket, key, upload_id)
     }
 
@@ -905,7 +935,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<Option<MultipartUploadRecord>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .try_load_in_progress_multipart_upload(bucket, key, upload_id)
     }
 
@@ -915,7 +945,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .load_in_progress_multipart_upload_for_listing(bucket, key, upload_id)
     }
 
@@ -926,12 +956,8 @@ impl super::StorageCluster {
         upload_id: &UploadId,
         requested_part_numbers: &[u32],
     ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError> {
-        self.single_node.load_multipart_completion_snapshot(
-            bucket,
-            key,
-            upload_id,
-            requested_part_numbers,
-        )
+        self.current_single_node()?
+            .load_multipart_completion_snapshot(bucket, key, upload_id, requested_part_numbers)
     }
 
     pub fn load_multipart_completion_preflight(
@@ -940,7 +966,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartCompletionPreflight, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .load_multipart_completion_preflight(bucket, key, upload_id)
     }
 
@@ -949,23 +975,21 @@ impl super::StorageCluster {
         req: CompleteMultipartCommitRequest,
         keep_completed_uploads: usize,
     ) -> Result<CompleteMultipartCommitOutcome, ObjectPgActionError> {
+        let single_node = self.current_single_node()?;
         let cleanup_bucket = req.bucket.clone();
         let cleanup_key = req.key.clone();
         let cleanup_generation_id = req.generation_id;
-        let (outcome, cleanup) = self
-            .single_node
-            .complete_multipart_upload_commit_serialized(req)?;
+        let (outcome, cleanup) = single_node.complete_multipart_upload_commit_serialized(req)?;
         self.delete_complete_multipart_cleanup_best_effort(
             &cleanup_bucket,
             &cleanup_key,
             cleanup_generation_id,
             &cleanup,
         );
-        self.single_node
-            .prune_completed_multipart_uploads_for_bucket_with_limit(
-                &cleanup_bucket,
-                keep_completed_uploads,
-            )?;
+        single_node.prune_completed_multipart_uploads_for_bucket_with_limit(
+            &cleanup_bucket,
+            keep_completed_uploads,
+        )?;
         Ok(outcome)
     }
 
@@ -978,7 +1002,7 @@ impl super::StorageCluster {
         part_number: u32,
         action: impl FnOnce(StreamUploadPartSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, ObjectPgActionError> {
-        let outcome = self.single_node.finalize_upload_part_stream(
+        let outcome = self.current_single_node()?.finalize_upload_part_stream(
             bucket,
             key,
             upload_id,
@@ -1001,14 +1025,15 @@ impl super::StorageCluster {
         record_cap: usize,
         max_uploads: u32,
     ) -> Result<ListedBucketMultipartUploads, ObjectPgActionError> {
-        self.single_node.list_multipart_uploads_for_bucket(
-            bucket,
-            prefix,
-            key_marker,
-            upload_id_marker,
-            record_cap,
-            max_uploads,
-        )
+        self.current_single_node()?
+            .list_multipart_uploads_for_bucket(
+                bucket,
+                prefix,
+                key_marker,
+                upload_id_marker,
+                record_cap,
+                max_uploads,
+            )
     }
 
     pub fn list_multipart_parts_for_upload<E, F>(
@@ -1023,7 +1048,7 @@ impl super::StorageCluster {
     where
         F: FnOnce(&MultipartUploadRecord) -> Result<(), E>,
     {
-        self.single_node.list_multipart_parts_for_upload(
+        self.current_single_node()?.list_multipart_parts_for_upload(
             bucket,
             key,
             upload_id,
@@ -1039,7 +1064,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<AbortMultipartUploadLookup, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .lookup_abort_multipart_upload(bucket, key, upload_id)
     }
 
@@ -1049,6 +1074,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<bool, ObjectPgActionError> {
+        self.require_current_operation_epoch()?;
         let cleanup = self
             .single_node
             .abort_multipart_upload(bucket, key, upload_id)?;
@@ -1065,7 +1091,7 @@ impl super::StorageCluster {
         upload_id: &UploadId,
         should_abort: impl FnOnce(Option<&str>, &MultipartUploadRecord) -> Result<bool, E>,
     ) -> Result<Result<bool, E>, ObjectPgActionError> {
-        match self.single_node.abort_multipart_upload_if_due(
+        match self.current_single_node()?.abort_multipart_upload_if_due(
             bucket,
             key,
             upload_id,
@@ -1095,7 +1121,7 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.single_node.test_head_bucket_raw(bucket)
+        self.current_single_node()?.test_head_bucket_raw(bucket)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1121,7 +1147,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<GenerationId, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .test_object_generation_reservation_for(bucket, key, reservation_id)
     }
 
@@ -1147,7 +1173,8 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<StoredObject, ObjectPgActionError> {
-        self.single_node.test_get_object_meta(bucket, key)
+        self.current_single_node()?
+            .test_get_object_meta(bucket, key)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1157,7 +1184,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .test_get_multipart_upload(bucket, key, upload_id)
     }
 
@@ -1169,7 +1196,7 @@ impl super::StorageCluster {
         upload_id: &UploadId,
         part_number: u16,
     ) -> Result<MultipartPartRecord, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .test_get_multipart_part(bucket, key, upload_id, part_number)
     }
 
@@ -1180,7 +1207,8 @@ impl super::StorageCluster {
         key: &ObjectKey,
         req: &ListPartsReq,
     ) -> Result<ListPartsResp, ObjectPgActionError> {
-        self.single_node.test_list_multipart_parts(bucket, key, req)
+        self.current_single_node()?
+            .test_list_multipart_parts(bucket, key, req)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1188,7 +1216,7 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<Vec<MultipartUploadRecord>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .test_list_multipart_uploads_for_bucket(bucket)
     }
 
@@ -1199,7 +1227,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<Vec<ObjectSegmentRecord>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .test_get_object_segments(bucket, key, version_id)
     }
 
@@ -1211,7 +1239,7 @@ impl super::StorageCluster {
         version_id: VersionId,
         segments: &[ObjectSegmentRecord],
     ) -> Result<(), ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .test_replace_live_object_segments(bucket, key, version_id, segments)
     }
 
@@ -1222,7 +1250,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<Vec<ObjectPartRecord>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .test_get_object_parts(bucket, key, version_id)
     }
 
@@ -1234,7 +1262,7 @@ impl super::StorageCluster {
         version_id: VersionId,
         parts: &[ObjectPartRecord],
     ) -> Result<(), ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .test_replace_object_parts(bucket, key, version_id, parts)
     }
 
@@ -1245,7 +1273,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<StoredObject, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .test_get_object_version(bucket, key, version_id)
     }
 
@@ -1256,7 +1284,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<Option<ObjectSegmentsReclaimRecord>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .test_get_object_segments_reclaim(bucket, key, generation_id)
     }
 
@@ -1267,7 +1295,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         reclaim: &ObjectSegmentsReclaimRecord,
     ) -> Result<(), ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .test_put_object_segments_reclaim(bucket, key, reclaim)
     }
 
@@ -1278,7 +1306,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         reclaim: &MultipartReclaimRecord,
     ) -> Result<(), ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .test_put_multipart_reclaim(bucket, key, reclaim)
     }
 
@@ -1289,7 +1317,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<bool, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .test_payload_reclaim_exists(bucket, key, generation_id)
     }
 
@@ -1298,7 +1326,7 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<Vec<PayloadReclaimRoot>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .test_list_bucket_payload_reclaim_roots(bucket)
     }
 
@@ -1310,7 +1338,7 @@ impl super::StorageCluster {
         version_id: VersionId,
         became_noncurrent_at: u64,
     ) -> Result<(), ObjectPgActionError> {
-        self.single_node.test_force_became_noncurrent_at(
+        self.current_single_node()?.test_force_became_noncurrent_at(
             bucket,
             key,
             version_id,
@@ -1323,7 +1351,8 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<(), BucketWriteDrainError> {
-        self.single_node.test_create_deleting_bucket(bucket)
+        self.current_single_node()?
+            .test_create_deleting_bucket(bucket)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1331,7 +1360,7 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<(), BucketWriteDrainError> {
-        self.single_node.delete_bucket_metadata(bucket)
+        self.current_single_node()?.delete_bucket_metadata(bucket)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1341,7 +1370,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<Vec<MultipartPartSegmentRecord>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .test_get_all_multipart_part_segments_for_upload(bucket, key, upload_id)
     }
 
@@ -1353,7 +1382,7 @@ impl super::StorageCluster {
         upload_id: &UploadId,
         state: UploadState,
     ) -> Result<(), ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .test_set_upload_state(bucket, key, upload_id, state)
     }
 
@@ -1364,7 +1393,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .test_list_stream_segments(bucket, key, session_id)
     }
 
@@ -1376,7 +1405,7 @@ impl super::StorageCluster {
         session_id: &SessionId,
         created_at: u64,
     ) -> Result<(), ObjectPgActionError> {
-        self.single_node
+        self.current_single_node()?
             .test_force_stream_upload_created_at(bucket, key, session_id, created_at)
     }
 
@@ -1384,7 +1413,7 @@ impl super::StorageCluster {
     pub fn test_list_all_stream_uploads(
         &self,
     ) -> Result<Vec<StreamUploadRecord>, ObjectPgActionError> {
-        self.single_node.test_list_all_stream_uploads()
+        self.current_single_node()?.test_list_all_stream_uploads()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1392,12 +1421,12 @@ impl super::StorageCluster {
         &self,
         req: &CreateStreamUploadReq,
     ) -> Result<(), ObjectPgActionError> {
-        self.single_node.test_create_stream_upload(req)
+        self.current_single_node()?.test_create_stream_upload(req)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_shard_exists(&self, pg_id: u32, key: &ShardKey) -> Result<bool, StoreError> {
-        self.single_node.test_shard_exists(pg_id, key)
+        self.current_single_node()?.test_shard_exists(pg_id, key)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1405,7 +1434,7 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<crate::node::BucketPgTestGuard<'_>, StoreError> {
-        self.single_node.test_lock_bucket_pg(bucket)
+        self.current_single_node()?.test_lock_bucket_pg(bucket)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

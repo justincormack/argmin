@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use storage::{
     BucketName, GenerationId, MultipartPartSegmentRecord, ObjectEncryption, ObjectKey,
-    ObjectPartRecord, ObjectSegmentRecord, StorageCluster,
+    ObjectPartRecord, ObjectPayloadLease, ObjectSegmentRecord, StorageCluster,
 };
 
 use super::object_state::SnapshottedMultipartPart;
@@ -110,10 +110,7 @@ pub(super) enum ReadHandleInner {
 }
 
 pub(super) struct PayloadLease {
-    pub(super) runtime: ReadRuntime,
-    pub(super) bucket: BucketName,
-    pub(super) key: ObjectKey,
-    pub(super) generation_id: GenerationId,
+    pub(super) lease: Option<ObjectPayloadLease>,
 }
 
 /// Core-owned streaming object body.
@@ -226,7 +223,7 @@ impl ReadHandle {
         segments: Vec<SegmentPayloadRecord>,
         expected_size: usize,
         expected_crc64: Option<u64>,
-    ) -> Self {
+    ) -> Result<Self, ServerError> {
         let ReadObjectContext {
             runtime,
             bucket,
@@ -236,10 +233,11 @@ impl ReadHandle {
         } = ctx;
         let bucket_owned = bucket.as_str().to_string();
         let key_owned = key.as_str().to_string();
-        Self {
+        let lease = runtime.acquire_object_payload_lease_for(bucket, key, generation_id)?;
+        Ok(Self {
             bucket: bucket_owned.clone(),
             key: key_owned.clone(),
-            lease: Some(runtime.acquire_object_payload_lease_for(bucket, key, generation_id)),
+            lease: Some(lease),
             trace: observability::current_context(),
             expected_size,
             bytes_emitted: 0,
@@ -260,7 +258,7 @@ impl ReadHandle {
                 loaded_segment: None,
                 sse_customer_request,
             }),
-        }
+        })
     }
 
     pub(super) fn from_segments_range(
@@ -268,7 +266,7 @@ impl ReadHandle {
         segments: Vec<SegmentPayloadRecord>,
         start: usize,
         end: usize,
-    ) -> Self {
+    ) -> Result<Self, ServerError> {
         let ReadObjectContext {
             runtime,
             bucket,
@@ -279,10 +277,11 @@ impl ReadHandle {
         let expected_size = end - start + 1;
         let bucket_owned = bucket.as_str().to_string();
         let key_owned = key.as_str().to_string();
-        Self {
+        let lease = runtime.acquire_object_payload_lease_for(bucket, key, generation_id)?;
+        Ok(Self {
             bucket: bucket_owned.clone(),
             key: key_owned.clone(),
-            lease: Some(runtime.acquire_object_payload_lease_for(bucket, key, generation_id)),
+            lease: Some(lease),
             trace: observability::current_context(),
             expected_size,
             bytes_emitted: 0,
@@ -297,7 +296,7 @@ impl ReadHandle {
                 loaded_segment: None,
                 sse_customer_request,
             }),
-        }
+        })
     }
 
     pub(super) fn from_multipart(
@@ -308,11 +307,12 @@ impl ReadHandle {
         parts: Vec<SnapshottedMultipartPart>,
         expected_size: usize,
         sse_customer_request: Option<SseCustomerRequest>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ServerError> {
+        let lease = runtime.acquire_object_payload_lease_for(bucket, key, generation_id)?;
+        Ok(Self {
             bucket: bucket.as_str().to_string(),
             key: key.as_str().to_string(),
-            lease: Some(runtime.acquire_object_payload_lease_for(bucket, key, generation_id)),
+            lease: Some(lease),
             trace: observability::current_context(),
             expected_size,
             bytes_emitted: 0,
@@ -327,7 +327,7 @@ impl ReadHandle {
                 current_part: None,
                 sse_customer_request,
             })),
-        }
+        })
     }
 
     pub(super) fn from_multipart_range(
@@ -338,13 +338,14 @@ impl ReadHandle {
         parts: Vec<SnapshottedMultipartPart>,
         range: (usize, usize),
         sse_customer_request: Option<SseCustomerRequest>,
-    ) -> Self {
+    ) -> Result<Self, ServerError> {
         let (start, end) = range;
         let expected_size = end - start + 1;
-        Self {
+        let lease = runtime.acquire_object_payload_lease_for(bucket, key, generation_id)?;
+        Ok(Self {
             bucket: bucket.as_str().to_string(),
             key: key.as_str().to_string(),
-            lease: Some(runtime.acquire_object_payload_lease_for(bucket, key, generation_id)),
+            lease: Some(lease),
             trace: observability::current_context(),
             expected_size,
             bytes_emitted: 0,
@@ -359,7 +360,7 @@ impl ReadHandle {
                 current_part: None,
                 sse_customer_request,
             })),
-        }
+        })
     }
 
     pub fn from_buffered_bytes(data: Vec<u8>) -> Self {

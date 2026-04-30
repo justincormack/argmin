@@ -1162,16 +1162,14 @@ mod tests {
             )
             .unwrap_err();
 
-        match err {
-            StoreError::Io { context, source } => {
-                assert_eq!(context, "place payload shards");
-                assert!(
-                    source.to_string().contains("cluster epoch 2"),
-                    "expected operation epoch in propagated error, got {source}"
-                );
-            }
-            other => panic!("expected stale operation epoch as IO error, got {other:?}"),
-        }
+        assert!(matches!(
+            err,
+            StoreError::StaleEpoch {
+                operation_epoch,
+                current_epoch,
+            } if operation_epoch == ClusterEpoch::new(2).unwrap()
+                && current_epoch == ClusterEpoch::INITIAL
+        ));
         for shard_index in 0..(ec_shape.k + ec_shape.m) {
             assert!(
                 !current_cluster
@@ -1243,6 +1241,176 @@ mod tests {
         assert!(matches!(
             node.storage_node().read_shard_file(data_pg_id.get(), &key),
             Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn stale_storage_cluster_handle_rejects_bucket_metadata_before_mutation() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+        let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
+        let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let stale_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
+            Arc::clone(&map),
+            ClusterEpoch::new(2).unwrap(),
+        )
+        .unwrap();
+        let bucket = crate::BucketName::try_from("stale-bucket".to_string()).unwrap();
+        let owner_canonical_id = crate::CanonicalUserId::from_principal("owner");
+        let acl_grants = crate::AclGrants::default();
+        let create = crate::CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: "owner",
+            owner_canonical_id: &owner_canonical_id,
+            acl_grants: &acl_grants,
+            public_read: false,
+            public_write: false,
+            versioning: crate::BucketVersioningState::Disabled,
+            object_lock: crate::BucketObjectLockConfig::default(),
+        };
+
+        let err = stale_cluster
+            .create_bucket_with_config_and_load_info(&create)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::BucketSnapshotLoadError::Store(StoreError::StaleEpoch {
+                operation_epoch,
+                current_epoch,
+            }) if operation_epoch == ClusterEpoch::new(2).unwrap()
+                && current_epoch == ClusterEpoch::INITIAL
+        ));
+        let err = current_cluster.head_bucket_info(&bucket).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::BucketNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn stale_storage_cluster_handle_rejects_object_metadata_before_mutation() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+        let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
+        let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let stale_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
+            Arc::clone(&map),
+            ClusterEpoch::new(2).unwrap(),
+        )
+        .unwrap();
+        let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+        let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+        let reservation_id = crate::SessionId::try_from("02".repeat(16)).unwrap();
+
+        let err = stale_cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::ObjectPgActionError::Store(StoreError::StaleEpoch {
+                operation_epoch,
+                current_epoch,
+            }) if operation_epoch == ClusterEpoch::new(2).unwrap()
+                && current_epoch == ClusterEpoch::INITIAL
+        ));
+        let err = current_cluster
+            .test_object_generation_reservation_for(&bucket, &key, &reservation_id)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::ObjectPgActionError::Metadata(
+                crate::MetadataError::ObjectGenerationReservationNotFound { .. }
+            )
+        ));
+    }
+
+    #[test]
+    fn object_payload_lease_token_releases_after_cluster_epoch_transition() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+        let mut map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
+        let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+        let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+        let generation_id = crate::GenerationId::MIN;
+
+        let lease = current_cluster
+            .acquire_object_payload_lease(&bucket, &key, generation_id)
+            .unwrap();
+        assert_eq!(
+            current_cluster.object_payload_lease_count(&bucket, &key, generation_id),
+            1
+        );
+        drop(current_cluster);
+
+        Arc::get_mut(&mut map).unwrap().epoch = ClusterEpoch::new(2).unwrap();
+        let current_epoch_cluster =
+            crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let stale_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
+            Arc::clone(&map),
+            ClusterEpoch::INITIAL,
+        )
+        .unwrap();
+
+        let err = match stale_cluster.acquire_object_payload_lease(&bucket, &key, generation_id) {
+            Ok(_) => panic!("stale cluster handle acquired a payload lease"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            StoreError::StaleEpoch {
+                operation_epoch,
+                current_epoch,
+            } if operation_epoch == ClusterEpoch::INITIAL
+                && current_epoch == ClusterEpoch::new(2).unwrap()
+        ));
+        stale_cluster.enqueue_object_payload_reclaim(&bucket, &key, generation_id);
+        assert!(current_epoch_cluster.try_take_reclaim_work().is_none());
+
+        let released = lease.release();
+        assert_eq!(released.remaining(), 0);
+        assert_eq!(
+            current_epoch_cluster.object_payload_lease_count(&bucket, &key, generation_id),
+            0
+        );
+
+        released.enqueue_object_payload_reclaim();
+        assert!(matches!(
+            current_epoch_cluster.try_take_reclaim_work(),
+            Some(crate::ReclaimWorkItem::ObjectPayload((
+                queued_bucket,
+                queued_key,
+                queued_generation_id
+            ))) if queued_bucket == bucket
+                && queued_key == key
+                && queued_generation_id == generation_id
         ));
     }
 

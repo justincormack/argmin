@@ -15,6 +15,14 @@ pub enum StoreError {
     #[error("PG {pg_id} not found on this node")]
     PgNotFound { pg_id: u32 },
 
+    #[error(
+        "operation has cluster epoch {operation_epoch}, current cluster epoch is {current_epoch}"
+    )]
+    StaleEpoch {
+        operation_epoch: ClusterEpoch,
+        current_epoch: ClusterEpoch,
+    },
+
     #[error("invalid shard key length: {len} (expected {expected})")]
     InvalidKeyLength { len: usize, expected: usize },
 

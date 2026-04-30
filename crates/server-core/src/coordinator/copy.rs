@@ -54,7 +54,7 @@ impl Coordinator {
                         obj_parts,
                         src_record.size as usize,
                         source_sse_customer.cloned(),
-                    );
+                    )?;
                     #[cfg(test)]
                     maybe_run_multipart_snapshot_hook(bucket.as_str(), key.as_str());
                     Ok(body)
@@ -64,7 +64,7 @@ impl Coordinator {
                 if src_record.size == 0 {
                     Ok(ReadHandle::from_buffered_bytes(Vec::new()))
                 } else {
-                    Ok(ReadHandle::from_segments(
+                    ReadHandle::from_segments(
                         ReadObjectContext {
                             runtime: self.read_runtime(),
                             bucket,
@@ -78,7 +78,7 @@ impl Coordinator {
                         ),
                         src_record.size as usize,
                         Some(src_record.etag.crc64()),
-                    ))
+                    )
                 }
             }
         }
@@ -118,7 +118,7 @@ impl Coordinator {
                         obj_parts,
                         (read_start, read_end),
                         source_sse_customer.cloned(),
-                    );
+                    )?;
                     #[cfg(test)]
                     maybe_run_multipart_snapshot_hook(bucket.as_str(), key.as_str());
                     Ok(body)
@@ -128,7 +128,7 @@ impl Coordinator {
                 if src_record.size == 0 {
                     Ok(ReadHandle::from_buffered_bytes(Vec::new()))
                 } else {
-                    Ok(ReadHandle::from_segments_range(
+                    ReadHandle::from_segments_range(
                         ReadObjectContext {
                             runtime: self.read_runtime(),
                             bucket,
@@ -142,7 +142,7 @@ impl Coordinator {
                         ),
                         read_start,
                         read_end,
-                    ))
+                    )
                 }
             }
         }

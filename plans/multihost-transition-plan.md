@@ -869,10 +869,32 @@ Phase 5 implementation notes:
    - stale operation epochs fail before placement or node-store IO, distinct
      from stale shard locations that were produced by an older route table
    - current production paths still bind the handle to the static epoch at
-     construction; later Phase 5 work should thread the request epoch through
-     the broader metadata bridge before Phase 6 replaces that bridge
+     construction; Step 5.3 extends the same stale-handle check to the
+     metadata-primary bridge before Phase 6 replaces that bridge
    - tests cover stale-epoch rejection for both placement and shard mutation
      without creating or modifying shard files
+3. Step 5.3 fences metadata-primary bridge calls by the `StorageCluster`
+   operation epoch.
+   - `StoreError::StaleEpoch` is now the common storage-layer stale handle
+     error for metadata and payload operations surfaced through
+     `BucketSnapshotLoadError`, `BucketWriteDrainError`, and
+     `ObjectPgActionError`
+   - result-returning bucket, object, multipart, stream, reclaim, and lifecycle
+     metadata bridge methods check the cluster handle epoch before forwarding to
+     the metadata-primary `SharedStorageNode`
+   - best-effort queue/worker bridge helpers no-op on stale handles rather than
+     mutating process-local metadata queues
+   - direct PUT and stream append commit helpers reject stale handles before the
+     metadata publish path; they do not try to perform current-epoch payload
+     cleanup for an operation that may have been written under an older route
+     table
+   - payload lease acquisition is fenced as new work, but a successful acquire
+     returns an active lease token that releases against the metadata-primary
+     node where it was recorded even if the acquiring cluster handle later
+     becomes stale
+   - tests cover stale bucket metadata creation and object generation
+     reservation attempts failing before metadata mutation, plus lease release
+     after an epoch transition
 
 ## Phase 6: PG Metadata Replication
 

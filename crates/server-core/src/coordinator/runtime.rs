@@ -153,23 +153,6 @@ impl ReadRuntime {
         }
     }
 
-    pub(super) fn object_payload_reclaim_exists_for(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<bool, ServerError> {
-        self.storage_node
-            .payload_reclaim_exists(bucket, key, generation_id)
-            .map_err(|error| match error {
-                storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
-                storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
-                storage::ObjectPgActionError::InvalidRequest { reason } => {
-                    ServerError::InvalidRequest { reason }
-                }
-            })
-    }
-
     pub(super) fn enqueue_object_payload_reclaim_for(
         &self,
         bucket: &BucketName,
@@ -649,15 +632,11 @@ impl ReadRuntime {
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-    ) -> PayloadLease {
-        self.storage_node
-            .acquire_object_payload_lease(bucket, key, generation_id);
-        PayloadLease {
-            runtime: self.clone(),
-            bucket: bucket.clone(),
-            key: key.clone(),
-            generation_id,
-        }
+    ) -> Result<PayloadLease, ServerError> {
+        let lease = self
+            .storage_node
+            .acquire_object_payload_lease(bucket, key, generation_id)?;
+        Ok(PayloadLease { lease: Some(lease) })
     }
 
     #[cfg(test)]
@@ -672,6 +651,7 @@ impl ReadRuntime {
             &trusted_object_key(key),
             generation_id,
         )
+        .expect("current storage cluster should acquire payload lease")
     }
 
     pub(super) fn try_reclaim_object_payload_for(

@@ -78,7 +78,7 @@ impl Coordinator {
                 obj_parts,
                 record.size as usize,
                 req.sse_customer.cloned(),
-            );
+            )?;
             let lifecycle_expiration = if emit_lifecycle_expiration {
                 self.current_object_lifecycle_expiration(
                     &bucket_summary,
@@ -135,7 +135,7 @@ impl Coordinator {
                     ),
                     user_size,
                     Some(etag_crc),
-                );
+                )?;
                 body
             };
             let lifecycle_expiration = if emit_lifecycle_expiration {
@@ -277,7 +277,7 @@ impl Coordinator {
                 vec![part_body],
                 part.record.size as usize,
                 req.sse_customer.cloned(),
-            );
+            )?;
             let lifecycle_expiration = if emit_lifecycle_expiration {
                 self.current_object_lifecycle_expiration(
                     &bucket_summary,
@@ -336,7 +336,7 @@ impl Coordinator {
                     ),
                     user_size,
                     Some(etag_crc),
-                );
+                )?;
                 body
             };
             let lifecycle_expiration = if emit_lifecycle_expiration {
@@ -894,7 +894,7 @@ impl Coordinator {
                 obj_parts,
                 (user_start as usize, user_end as usize),
                 req.sse_customer.cloned(),
-            );
+            )?;
             #[cfg(test)]
             maybe_run_multipart_snapshot_hook(bucket, key);
             (metadata, system_metadata, body)
@@ -917,7 +917,7 @@ impl Coordinator {
                 segment_payloads_from_object_segments(object_segments, record.encryption.clone()),
                 user_start as usize,
                 user_end as usize,
-            );
+            )?;
 
             (metadata, system_metadata, body)
         };
