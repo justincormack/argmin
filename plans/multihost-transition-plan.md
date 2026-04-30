@@ -1135,6 +1135,21 @@ Work items:
        current-handle test hooks; active production metadata paths either route
        through PG primaries, use read-only topology/config helpers, or use the
        local runtime coordination state
+   - closeout:
+     - Phase 6.1 is complete: active production metadata reads and mutations no
+       longer use the metadata-primary bridge or direct single-node shortcuts
+     - the remaining `metadata_primary_bridge_node` callers are
+       `#[cfg(any(test, feature = "test-hooks"))]` test helpers only
+     - `metadata_primary_topology_node` remains as a read-only topology/config
+       helper for PG mapping and default EC shape until cluster topology becomes
+       first-class state
+     - payload lease bookkeeping and reclaim/finalize queues are now
+       local-cluster runtime coordination state; this is intentionally
+       single-process and must become durable/replicated in a later
+       coordination/scavenger phase
+     - closeout verification used `cargo clippy --all-targets --all-features
+       -- -D warnings`, `./scripts/check-storage-cluster-boundaries`, and full
+       `cargo nextest run`
 2. Phase 6.2: command substrate vertical slice.
    - define the command envelope, command identity, canonical encoding, command
      checksum, and log-index shape
