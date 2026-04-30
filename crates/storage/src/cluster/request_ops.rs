@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use placement::NodeId;
 
 use crate::metadata_command::{
-    BucketPropertyMutation, CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId,
-    MetadataCommandPayload, PutBucketAclCommand, PutBucketPropertyCommand,
-    PutBucketVersioningCommand,
+    BucketPropertyMutation, BucketSubresourceMutation, CreateBucketCommand,
+    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload, PutBucketAclCommand,
+    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
 };
 use crate::*;
 
@@ -126,38 +126,9 @@ fn conflicting_pending_metadata_command(context: &'static str) -> BucketSnapshot
     .into()
 }
 
-fn invalid_bucket_object_lock_command(context: &'static str) -> BucketSnapshotLoadError {
-    MetadataError::Db {
-        context,
-        source: rusqlite::Error::InvalidQuery,
-    }
-    .into()
-}
-
-fn validate_bucket_property_command_preconditions(
-    info: &BucketInfo,
-    mutation: &BucketPropertyMutation,
-) -> Result<(), BucketSnapshotLoadError> {
-    let BucketPropertyMutation::ObjectLock(config) = mutation else {
-        return Ok(());
-    };
-
-    if !config.enabled && config.default_retention.is_some() {
-        return Err(invalid_bucket_object_lock_command(
-            "put bucket object lock command default retention requires object lock enabled",
-        ));
-    }
-    if config.enabled && info.versioning != BucketVersioningState::Enabled {
-        return Err(invalid_bucket_object_lock_command(
-            "put bucket object lock command requires enabled versioning",
-        ));
-    }
-    if info.object_lock.enabled && !config.enabled {
-        return Err(invalid_bucket_object_lock_command(
-            "put bucket object lock command cannot disable object lock",
-        ));
-    }
-    Ok(())
+struct MetadataCommandApplyFailure {
+    applied_nodes: usize,
+    source: BucketSnapshotLoadError,
 }
 
 // Metadata routing moves incrementally in Phase 6. Single-PG bucket/object
@@ -234,12 +205,12 @@ impl super::StorageCluster {
 
         let pg_id = PgId::new(pg_id);
         let runtime_state = self.local_map.runtime_state();
-        let command = if let Some(command) =
+        let (command, clear_pending_on_zero_apply) = if let Some(command) =
             runtime_state.pending_metadata_command_for_bucket(pg_id, &bucket)
         {
             match command.payload() {
                 MetadataCommandPayload::CreateBucket(create) if create.matches_config(config) => {
-                    command
+                    (command, false)
                 }
                 MetadataCommandPayload::CreateBucket(_) => {
                     return Err(MetadataError::BucketAlreadyExists.into());
@@ -257,6 +228,11 @@ impl super::StorageCluster {
                 MetadataCommandPayload::PutBucketProperty(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending put bucket property command for create bucket",
+                    ));
+                }
+                MetadataCommandPayload::PutBucketSubresource(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending put bucket subresource command for create bucket",
                     ));
                 }
             }
@@ -282,9 +258,14 @@ impl super::StorageCluster {
                 MetadataCommandPayload::CreateBucket(command),
             );
             runtime_state.set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone());
-            command
+            (command, true)
         };
-        self.apply_metadata_command_to_acting_set(&command)?;
+        self.apply_pending_metadata_command_to_acting_set(
+            pg_id,
+            &bucket,
+            &command,
+            clear_pending_on_zero_apply,
+        )?;
 
         let bucket_pg = primary_node.get_pg(pg_id.get())?;
         let info = PgMetadataStore::head_bucket(&*bucket_pg, &bucket)?;
@@ -297,23 +278,61 @@ impl super::StorageCluster {
     fn apply_metadata_command_to_acting_set(
         &self,
         command: &MetadataCommandEnvelope,
-    ) -> Result<(), BucketSnapshotLoadError> {
+    ) -> Result<(), MetadataCommandApplyFailure> {
         let pg_id = command.id().pg_id();
         let mut nodes = self
             .local_map
-            .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id)?;
+            .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id)
+            .map_err(|source| MetadataCommandApplyFailure {
+                applied_nodes: 0,
+                source: source.into(),
+            })?;
         let primary_node_id = self
             .local_map
             .pg_route(pg_id)
             .expect("validated metadata PG command route must exist")
             .primary_node_id();
         nodes.sort_by_key(|node| node.node_id() == primary_node_id);
-        for node in nodes {
-            maybe_run_before_metadata_command_apply_hook(node.node_id(), command)?;
-            let pg = node.storage_node().get_pg(pg_id.get())?;
-            pg.apply_metadata_command(command)?;
+        for (applied_nodes, node) in nodes.into_iter().enumerate() {
+            maybe_run_before_metadata_command_apply_hook(node.node_id(), command).map_err(
+                |source| MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                },
+            )?;
+            let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
+                MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                }
+            })?;
+            pg.apply_metadata_command(command)
+                .map_err(|source| MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                })?;
         }
         Ok(())
+    }
+
+    fn apply_pending_metadata_command_to_acting_set(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        clear_pending_on_zero_apply: bool,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        match self.apply_metadata_command_to_acting_set(command) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if clear_pending_on_zero_apply && error.applied_nodes == 0 {
+                    self.local_map
+                        .runtime_state()
+                        .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                }
+                Err(error.source)
+            }
+        }
     }
 
     fn delete_bucket_from_acting_set(
@@ -631,14 +650,14 @@ impl super::StorageCluster {
         }
 
         let runtime_state = self.local_map.runtime_state();
-        let command = if let Some(command) =
+        let (command, clear_pending_on_zero_apply) = if let Some(command) =
             runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
         {
             match command.payload() {
                 MetadataCommandPayload::PutBucketVersioning(versioning)
                     if versioning.matches_request(bucket, state) =>
                 {
-                    command
+                    (command, false)
                 }
                 MetadataCommandPayload::PutBucketVersioning(_) => {
                     return Err(conflicting_pending_metadata_command(
@@ -660,6 +679,11 @@ impl super::StorageCluster {
                         "unexpected pending put bucket property command for versioning",
                     ));
                 }
+                MetadataCommandPayload::PutBucketSubresource(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending put bucket subresource command for versioning",
+                    ));
+                }
             }
         } else {
             let command_id = MetadataCommandId::new(
@@ -679,9 +703,14 @@ impl super::StorageCluster {
                 )),
             );
             runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
-            command
+            (command, true)
         };
-        self.apply_metadata_command_to_acting_set(&command)?;
+        self.apply_pending_metadata_command_to_acting_set(
+            pg_id,
+            bucket,
+            &command,
+            clear_pending_on_zero_apply,
+        )?;
 
         let bucket_pg = primary_node.get_pg(pg_id.get())?;
         let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
@@ -782,14 +811,14 @@ impl super::StorageCluster {
         }
 
         let runtime_state = self.local_map.runtime_state();
-        let command = if let Some(command) =
+        let (command, clear_pending_on_zero_apply) = if let Some(command) =
             runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
         {
             match command.payload() {
                 MetadataCommandPayload::PutBucketAcl(acl)
                     if acl.matches_request(bucket, acl_grants, public_read, public_write) =>
                 {
-                    command
+                    (command, false)
                 }
                 MetadataCommandPayload::PutBucketAcl(_) => {
                     return Err(conflicting_pending_metadata_command(
@@ -809,6 +838,11 @@ impl super::StorageCluster {
                 MetadataCommandPayload::PutBucketProperty(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending put bucket property command for bucket acl",
+                    ));
+                }
+                MetadataCommandPayload::PutBucketSubresource(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending put bucket subresource command for bucket acl",
                     ));
                 }
             }
@@ -832,9 +866,14 @@ impl super::StorageCluster {
                 )),
             );
             runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
-            command
+            (command, true)
         };
-        self.apply_metadata_command_to_acting_set(&command)?;
+        self.apply_pending_metadata_command_to_acting_set(
+            pg_id,
+            bucket,
+            &command,
+            clear_pending_on_zero_apply,
+        )?;
 
         let bucket_pg = primary_node.get_pg(pg_id.get())?;
         let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
@@ -852,21 +891,20 @@ impl super::StorageCluster {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let primary_node = self.bucket_metadata_primary_node(bucket)?;
         let _bucket_guard = primary_node.lock_bucket(bucket);
-        let info = {
+        {
             let bucket_pg = primary_node.get_pg(pg_id.get())?;
-            PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?
-        };
-        validate_bucket_property_command_preconditions(&info, &mutation)?;
+            PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
+        }
 
         let runtime_state = self.local_map.runtime_state();
-        let command = if let Some(command) =
+        let (command, clear_pending_on_zero_apply) = if let Some(command) =
             runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
         {
             match command.payload() {
                 MetadataCommandPayload::PutBucketProperty(property)
                     if property.matches_request(bucket, &mutation) =>
                 {
-                    command
+                    (command, false)
                 }
                 MetadataCommandPayload::PutBucketProperty(_) => {
                     return Err(conflicting_pending_metadata_command(
@@ -888,6 +926,11 @@ impl super::StorageCluster {
                         "unexpected pending put bucket acl command for bucket property",
                     ));
                 }
+                MetadataCommandPayload::PutBucketSubresource(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending put bucket subresource command for bucket property",
+                    ));
+                }
             }
         } else {
             let command_id = MetadataCommandId::new(
@@ -907,9 +950,14 @@ impl super::StorageCluster {
                 )),
             );
             runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
-            command
+            (command, true)
         };
-        self.apply_metadata_command_to_acting_set(&command)?;
+        self.apply_pending_metadata_command_to_acting_set(
+            pg_id,
+            bucket,
+            &command,
+            clear_pending_on_zero_apply,
+        )?;
 
         let bucket_pg = primary_node.get_pg(pg_id.get())?;
         let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
@@ -924,8 +972,14 @@ impl super::StorageCluster {
         bucket: &BucketName,
         req: PutBucketSubresource<'_>,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.bucket_metadata_primary_node(bucket)?
-            .put_bucket_subresource_and_load_info(bucket, req)
+        self.put_bucket_subresource_command_and_load_info(
+            bucket,
+            BucketSubresourceMutation::Put {
+                kind: req.kind,
+                body: req.body.to_owned(),
+                aux: req.aux,
+            },
+        )
     }
 
     pub fn delete_bucket_subresource_and_load_info(
@@ -933,8 +987,93 @@ impl super::StorageCluster {
         bucket: &BucketName,
         kind: BucketSubresourceKind,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.bucket_metadata_primary_node(bucket)?
-            .delete_bucket_subresource_and_load_info(bucket, kind)
+        self.put_bucket_subresource_command_and_load_info(
+            bucket,
+            BucketSubresourceMutation::Delete { kind },
+        )
+    }
+
+    fn put_bucket_subresource_command_and_load_info(
+        &self,
+        bucket: &BucketName,
+        mutation: BucketSubresourceMutation,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        let primary_node = self.bucket_metadata_primary_node(bucket)?;
+        let _bucket_guard = primary_node.lock_bucket(bucket);
+        {
+            let bucket_pg = primary_node.get_pg(pg_id.get())?;
+            PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
+        }
+        let runtime_state = self.local_map.runtime_state();
+        let (command, clear_pending_on_zero_apply) = if let Some(command) =
+            runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+        {
+            match command.payload() {
+                MetadataCommandPayload::PutBucketSubresource(subresource)
+                    if subresource.matches_request(bucket, &mutation) =>
+                {
+                    (command, false)
+                }
+                MetadataCommandPayload::PutBucketSubresource(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "conflicting pending put bucket subresource command",
+                    ));
+                }
+                MetadataCommandPayload::CreateBucket(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending create bucket command for bucket subresource",
+                    ));
+                }
+                MetadataCommandPayload::PutBucketVersioning(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending put bucket versioning command for bucket subresource",
+                    ));
+                }
+                MetadataCommandPayload::PutBucketAcl(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending put bucket acl command for bucket subresource",
+                    ));
+                }
+                MetadataCommandPayload::PutBucketProperty(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending put bucket property command for bucket subresource",
+                    ));
+                }
+            }
+        } else {
+            let command_id = MetadataCommandId::new(
+                self.operation_epoch(),
+                pg_id,
+                runtime_state.next_metadata_command_log_index(pg_id),
+            );
+            let bucket_pg = primary_node.get_pg(pg_id.get())?;
+            let bucket_execution_generation = bucket_pg.reserve_bucket_execution_generation()?;
+            drop(bucket_pg);
+            let command = MetadataCommandEnvelope::new(
+                command_id,
+                MetadataCommandPayload::PutBucketSubresource(PutBucketSubresourceCommand::new(
+                    bucket.clone(),
+                    mutation,
+                    bucket_execution_generation,
+                )),
+            );
+            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            (command, true)
+        };
+        self.apply_pending_metadata_command_to_acting_set(
+            pg_id,
+            bucket,
+            &command,
+            clear_pending_on_zero_apply,
+        )?;
+
+        let bucket_pg = primary_node.get_pg(pg_id.get())?;
+        let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
+        self.local_map
+            .runtime_state()
+            .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+        Ok(info)
     }
 
     pub fn list_buckets_for_owner(

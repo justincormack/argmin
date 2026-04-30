@@ -1060,7 +1060,9 @@ fn prepare_local_node_data_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata_command::{BucketPropertyMutation, MetadataCommandPayload};
+    use crate::metadata_command::{
+        BucketPropertyMutation, BucketSubresourceMutation, MetadataCommandPayload,
+    };
     use proptest::prelude::*;
     use proptest::test_runner::{TestCaseError, TestCaseResult};
     use std::collections::BTreeSet;
@@ -3451,10 +3453,10 @@ mod tests {
             .unwrap_err();
         match err {
             crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::Db {
-                context: "put bucket object lock command requires enabled versioning",
-                source: rusqlite::Error::InvalidQuery,
-            }) => {}
-            other => panic!("expected object-lock prevalidation error, got {other:?}"),
+                context: "put bucket object lock",
+                source: rusqlite::Error::SqliteFailure(_, Some(message)),
+            }) if message == "bucket object lock requires enabled versioning" => {}
+            other => panic!("expected object-lock storage validation error, got {other:?}"),
         }
         assert!(
             map.runtime_state()
@@ -3487,6 +3489,468 @@ mod tests {
             let pg = node.get_pg(1).unwrap();
             let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
             assert_eq!(info.public_access_block, Some(public_access_block));
+            assert_eq!(
+                info.bucket_execution_generation,
+                updated.bucket_execution_generation
+            );
+        }
+    }
+
+    #[test]
+    fn bucket_subresource_commands_apply_to_all_acting_pg_nodes() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "replicated-subresource-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let mut previous_generation = {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            primary.test_head_bucket_raw(&bucket).unwrap()
+        }
+        .bucket_execution_generation;
+
+        let policy_body = r#"{"Statement":[]}"#;
+        let updated = cluster
+            .put_bucket_subresource_and_load_info(
+                &bucket,
+                crate::PutBucketSubresource {
+                    kind: crate::BucketSubresourceKind::Policy,
+                    body: policy_body,
+                    aux: crate::BucketSubresourceAux::policy(true),
+                },
+            )
+            .unwrap();
+        assert!(updated.bucket_execution_generation > previous_generation);
+        previous_generation = updated.bucket_execution_generation;
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            let stored = crate::PgMetadataStore::get_bucket_subresource(
+                &*pg,
+                &bucket,
+                crate::BucketSubresourceKind::Policy,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(stored.body, policy_body);
+            assert_eq!(stored.generation, Some(1));
+            assert_eq!(stored.aux, crate::BucketSubresourceAux::policy(true));
+            assert!(info.bucket_policy_present);
+            assert!(info.bucket_policy_public);
+            assert_eq!(info.bucket_policy_generation, 1);
+            assert_eq!(info.bucket_execution_generation, previous_generation);
+        }
+
+        let tags_body = "<Tagging><TagSet/></Tagging>";
+        let updated = cluster
+            .put_bucket_subresource_and_load_info(
+                &bucket,
+                crate::PutBucketSubresource {
+                    kind: crate::BucketSubresourceKind::Tagging,
+                    body: tags_body,
+                    aux: crate::BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+        assert!(updated.bucket_execution_generation > previous_generation);
+        previous_generation = updated.bucket_execution_generation;
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            let stored = crate::PgMetadataStore::get_bucket_subresource(
+                &*pg,
+                &bucket,
+                crate::BucketSubresourceKind::Tagging,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(stored.body, tags_body);
+            assert_eq!(stored.generation, Some(1));
+            assert_eq!(stored.aux, crate::BucketSubresourceAux::None);
+            assert_eq!(info.bucket_execution_generation, previous_generation);
+        }
+
+        let updated = cluster
+            .delete_bucket_subresource_and_load_info(&bucket, crate::BucketSubresourceKind::Tagging)
+            .unwrap();
+        assert!(updated.bucket_execution_generation > previous_generation);
+        previous_generation = updated.bucket_execution_generation;
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert!(crate::PgMetadataStore::get_bucket_subresource(
+                &*pg,
+                &bucket,
+                crate::BucketSubresourceKind::Tagging,
+            )
+            .unwrap()
+            .is_none());
+            assert_eq!(info.bucket_execution_generation, previous_generation);
+        }
+
+        let lifecycle_body = "<LifecycleConfiguration/>";
+        let updated = cluster
+            .put_bucket_subresource_and_load_info(
+                &bucket,
+                crate::PutBucketSubresource {
+                    kind: crate::BucketSubresourceKind::Lifecycle,
+                    body: lifecycle_body,
+                    aux: crate::BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+        assert!(updated.bucket_execution_generation > previous_generation);
+        previous_generation = updated.bucket_execution_generation;
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            let stored = crate::PgMetadataStore::get_bucket_subresource(
+                &*pg,
+                &bucket,
+                crate::BucketSubresourceKind::Lifecycle,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(stored.body, lifecycle_body);
+            assert_eq!(stored.generation, Some(1));
+            assert!(info.bucket_lifecycle_present);
+            assert_eq!(info.bucket_lifecycle_generation, 1);
+            assert_eq!(info.bucket_execution_generation, previous_generation);
+        }
+
+        let cors_body = "<CORSConfiguration/>";
+        let updated = cluster
+            .put_bucket_subresource_and_load_info(
+                &bucket,
+                crate::PutBucketSubresource {
+                    kind: crate::BucketSubresourceKind::Cors,
+                    body: cors_body,
+                    aux: crate::BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+        assert!(updated.bucket_execution_generation > previous_generation);
+        previous_generation = updated.bucket_execution_generation;
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            let stored = crate::PgMetadataStore::get_bucket_subresource(
+                &*pg,
+                &bucket,
+                crate::BucketSubresourceKind::Cors,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(stored.body, cors_body);
+            assert_eq!(stored.generation, Some(1));
+            assert_eq!(info.bucket_execution_generation, previous_generation);
+        }
+
+        let updated = cluster
+            .delete_bucket_subresource_and_load_info(&bucket, crate::BucketSubresourceKind::Cors)
+            .unwrap();
+        assert!(updated.bucket_execution_generation > previous_generation);
+        previous_generation = updated.bucket_execution_generation;
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert!(crate::PgMetadataStore::get_bucket_subresource(
+                &*pg,
+                &bucket,
+                crate::BucketSubresourceKind::Cors,
+            )
+            .unwrap()
+            .is_none());
+            assert_eq!(info.bucket_execution_generation, previous_generation);
+        }
+
+        let updated = cluster
+            .delete_bucket_subresource_and_load_info(&bucket, crate::BucketSubresourceKind::Policy)
+            .unwrap();
+        assert!(updated.bucket_execution_generation > previous_generation);
+        previous_generation = updated.bucket_execution_generation;
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert!(crate::PgMetadataStore::get_bucket_subresource(
+                &*pg,
+                &bucket,
+                crate::BucketSubresourceKind::Policy,
+            )
+            .unwrap()
+            .is_none());
+            assert!(!info.bucket_policy_present);
+            assert!(!info.bucket_policy_public);
+            assert_eq!(info.bucket_policy_generation, 2);
+            assert_eq!(info.bucket_execution_generation, previous_generation);
+        }
+
+        let updated = cluster
+            .delete_bucket_subresource_and_load_info(
+                &bucket,
+                crate::BucketSubresourceKind::Lifecycle,
+            )
+            .unwrap();
+        assert!(updated.bucket_execution_generation > previous_generation);
+        previous_generation = updated.bucket_execution_generation;
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert!(crate::PgMetadataStore::get_bucket_subresource(
+                &*pg,
+                &bucket,
+                crate::BucketSubresourceKind::Lifecycle,
+            )
+            .unwrap()
+            .is_none());
+            assert!(!info.bucket_lifecycle_present);
+            assert_eq!(info.bucket_lifecycle_generation, 2);
+            assert_eq!(info.bucket_execution_generation, previous_generation);
+        }
+    }
+
+    #[test]
+    fn bucket_subresource_command_retry_reuses_pending_partial_replica_command() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "partial-subresource-retry-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let policy_body = r#"{"Statement":[]}"#;
+        let expected_mutation = BucketSubresourceMutation::Put {
+            kind: crate::BucketSubresourceKind::Policy,
+            body: policy_body.to_owned(),
+            aux: crate::BucketSubresourceAux::policy(false),
+        };
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let _hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::PutBucketSubresource(subresource)
+                        if subresource.name == hook_bucket
+                            && subresource.mutation == expected_mutation
+                            && node_id == NodeId::new(2)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected metadata command apply failure",
+                            source: std::io::Error::other(
+                                "injected metadata command apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .put_bucket_subresource_and_load_info(
+                &bucket,
+                crate::PutBucketSubresource {
+                    kind: crate::BucketSubresourceKind::Policy,
+                    body: policy_body,
+                    aux: crate::BucketSubresourceAux::policy(false),
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Store(StoreError::Io {
+                    context: "injected metadata command apply failure",
+                    ..
+                })
+            ),
+            "expected injected replica failure, got {err:?}"
+        );
+        assert!(!fail_once.load(Ordering::SeqCst));
+
+        let partial_info = {
+            let applied_replica = map.node(NodeId::new(0)).unwrap().storage_node();
+            let pg = applied_replica.get_pg(1).unwrap();
+            crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap()
+        };
+        assert!(partial_info.bucket_policy_present);
+        assert!(!partial_info.bucket_policy_public);
+        assert_eq!(partial_info.bucket_policy_generation, 1);
+        for node_id in [NodeId::new(1), NodeId::new(2)] {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert!(
+                !info.bucket_policy_present,
+                "node {node_id:?} should not have the partially applied policy"
+            );
+        }
+
+        let retried = cluster
+            .put_bucket_subresource_and_load_info(
+                &bucket,
+                crate::PutBucketSubresource {
+                    kind: crate::BucketSubresourceKind::Policy,
+                    body: policy_body,
+                    aux: crate::BucketSubresourceAux::policy(false),
+                },
+            )
+            .unwrap();
+        assert!(retried.bucket_policy_present);
+        assert!(!retried.bucket_policy_public);
+        assert_eq!(
+            retried.bucket_execution_generation,
+            partial_info.bucket_execution_generation
+        );
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            let stored = crate::PgMetadataStore::get_bucket_subresource(
+                &*pg,
+                &bucket,
+                crate::BucketSubresourceKind::Policy,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(stored.body, policy_body);
+            assert_eq!(stored.generation, Some(1));
+            assert_eq!(stored.aux, crate::BucketSubresourceAux::policy(false));
+            assert!(info.bucket_policy_present);
+            assert!(!info.bucket_policy_public);
+            assert_eq!(info.bucket_policy_generation, 1);
+            assert_eq!(
+                info.bucket_execution_generation,
+                partial_info.bucket_execution_generation
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_bucket_subresource_command_does_not_poison_bucket_command_stream() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "invalid-subresource-no-poison-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let initial_generation = {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            primary.test_head_bucket_raw(&bucket).unwrap()
+        }
+        .bucket_execution_generation;
+
+        let err = cluster
+            .put_bucket_subresource_and_load_info(
+                &bucket,
+                crate::PutBucketSubresource {
+                    kind: crate::BucketSubresourceKind::Tagging,
+                    body: "<Tagging/>",
+                    aux: crate::BucketSubresourceAux::policy(true),
+                },
+            )
+            .unwrap_err();
+        match err {
+            crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::Db {
+                context: "put bucket subresource",
+                source: rusqlite::Error::InvalidParameterName(message),
+            }) if message.contains("Tagging does not support aux") => {}
+            other => panic!("expected subresource storage validation error, got {other:?}"),
+        }
+        assert!(
+            map.runtime_state()
+                .pending_metadata_command_for_bucket(PgId::new(1), &bucket)
+                .is_none(),
+            "deterministic validation failures must not leave pending commands"
+        );
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.bucket_execution_generation, initial_generation);
+            assert!(crate::PgMetadataStore::get_bucket_subresource(
+                &*pg,
+                &bucket,
+                crate::BucketSubresourceKind::Tagging,
+            )
+            .unwrap()
+            .is_none());
+        }
+
+        let tags_body = "<Tagging><TagSet/></Tagging>";
+        let updated = cluster
+            .put_bucket_subresource_and_load_info(
+                &bucket,
+                crate::PutBucketSubresource {
+                    kind: crate::BucketSubresourceKind::Tagging,
+                    body: tags_body,
+                    aux: crate::BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+        assert!(updated.bucket_execution_generation > initial_generation);
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            let stored = crate::PgMetadataStore::get_bucket_subresource(
+                &*pg,
+                &bucket,
+                crate::BucketSubresourceKind::Tagging,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(stored.body, tags_body);
             assert_eq!(
                 info.bucket_execution_generation,
                 updated.bucket_execution_generation

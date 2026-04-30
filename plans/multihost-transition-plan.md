@@ -1235,6 +1235,20 @@ Work items:
      - include deterministic command encoding coverage, primary/replica
        convergence tests for every row-backed property, and a partial-replica
        retry regression
+   - fourth slice:
+     - migrate opaque bucket subresource mutations onto a
+       `PutBucketSubresource` metadata command:
+       `put_bucket_subresource_and_load_info` and
+       `delete_bucket_subresource_and_load_info`
+     - cover policy, tagging, lifecycle, and CORS bodies, including policy
+       public-summary metadata and policy/lifecycle generation mirrors
+     - preserve per-bucket command-stream serialization, explicit bucket
+       execution generation, and primary-last acting-set apply
+     - make retry idempotence prevent duplicate subresource-generation
+       increments on replicas that already applied a partial command
+     - include deterministic command encoding coverage, primary/replica
+       convergence tests, a partial-replica retry regression, and stale or
+       same-generation divergent command rejection coverage
 4. Phase 6.4: stream, multipart, and reclaim command migration.
    - migrate stream session creation, segment append/finalize/abort metadata,
      multipart create/part/finalize/abort metadata, omitted-part cleanup

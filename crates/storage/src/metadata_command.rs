@@ -7,7 +7,8 @@ use s3_types::{
 
 use crate::types::{
     BucketEncryptionConfig, BucketName, BucketObjectOwnership, BucketOwnershipControls,
-    ClusterEpoch, CreateBucketConfig, ManagedEncryptionAlgorithm, PgId, PublicAccessBlockConfig,
+    BucketSubresourceAux, BucketSubresourceKind, ClusterEpoch, CreateBucketConfig,
+    ManagedEncryptionAlgorithm, PgId, PublicAccessBlockConfig,
 };
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
@@ -16,6 +17,7 @@ const METADATA_COMMAND_CREATE_BUCKET: u16 = 1;
 const METADATA_COMMAND_PUT_BUCKET_VERSIONING: u16 = 2;
 const METADATA_COMMAND_PUT_BUCKET_ACL: u16 = 3;
 const METADATA_COMMAND_PUT_BUCKET_PROPERTY: u16 = 4;
+const METADATA_COMMAND_PUT_BUCKET_SUBRESOURCE: u16 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct MetadataCommandLogIndex(NonZeroU64);
@@ -133,6 +135,7 @@ pub(crate) enum MetadataCommandPayload {
     PutBucketVersioning(PutBucketVersioningCommand),
     PutBucketAcl(PutBucketAclCommand),
     PutBucketProperty(PutBucketPropertyCommand),
+    PutBucketSubresource(PutBucketSubresourceCommand),
 }
 
 impl MetadataCommandPayload {
@@ -142,6 +145,7 @@ impl MetadataCommandPayload {
             Self::PutBucketVersioning(_) => METADATA_COMMAND_PUT_BUCKET_VERSIONING,
             Self::PutBucketAcl(_) => METADATA_COMMAND_PUT_BUCKET_ACL,
             Self::PutBucketProperty(_) => METADATA_COMMAND_PUT_BUCKET_PROPERTY,
+            Self::PutBucketSubresource(_) => METADATA_COMMAND_PUT_BUCKET_SUBRESOURCE,
         }
     }
 }
@@ -254,6 +258,47 @@ pub(crate) enum BucketPropertyMutation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PutBucketSubresourceCommand {
+    pub(crate) name: BucketName,
+    pub(crate) mutation: BucketSubresourceMutation,
+    pub(crate) bucket_execution_generation: u64,
+}
+
+impl PutBucketSubresourceCommand {
+    pub(crate) fn new(
+        name: BucketName,
+        mutation: BucketSubresourceMutation,
+        bucket_execution_generation: u64,
+    ) -> Self {
+        Self {
+            name,
+            mutation,
+            bucket_execution_generation,
+        }
+    }
+
+    pub(crate) fn matches_request(
+        &self,
+        bucket: &BucketName,
+        mutation: &BucketSubresourceMutation,
+    ) -> bool {
+        self.name == *bucket && self.mutation == *mutation
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BucketSubresourceMutation {
+    Put {
+        kind: BucketSubresourceKind,
+        body: String,
+        aux: BucketSubresourceAux,
+    },
+    Delete {
+        kind: BucketSubresourceKind,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MetadataCommandEnvelope {
     id: MetadataCommandId,
     payload: MetadataCommandPayload,
@@ -315,6 +360,9 @@ fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPaylo
         MetadataCommandPayload::PutBucketProperty(command) => {
             encode_put_bucket_property(&mut out, command);
         }
+        MetadataCommandPayload::PutBucketSubresource(command) => {
+            encode_put_bucket_subresource(&mut out, command);
+        }
     }
     out
 }
@@ -350,6 +398,41 @@ fn encode_put_bucket_property(out: &mut Vec<u8>, command: &PutBucketPropertyComm
     put_str(out, command.name.as_str());
     encode_bucket_property_mutation(out, &command.mutation);
     put_u64(out, command.bucket_execution_generation);
+}
+
+fn encode_put_bucket_subresource(out: &mut Vec<u8>, command: &PutBucketSubresourceCommand) {
+    put_str(out, command.name.as_str());
+    encode_bucket_subresource_mutation(out, &command.mutation);
+    put_u64(out, command.bucket_execution_generation);
+}
+
+fn encode_bucket_subresource_mutation(out: &mut Vec<u8>, mutation: &BucketSubresourceMutation) {
+    match mutation {
+        BucketSubresourceMutation::Put { kind, body, aux } => {
+            put_u8(out, 1);
+            encode_bucket_subresource_kind(out, *kind);
+            put_str(out, body);
+            encode_bucket_subresource_aux(out, *aux);
+        }
+        BucketSubresourceMutation::Delete { kind } => {
+            put_u8(out, 2);
+            encode_bucket_subresource_kind(out, *kind);
+        }
+    }
+}
+
+fn encode_bucket_subresource_kind(out: &mut Vec<u8>, kind: BucketSubresourceKind) {
+    put_u8(out, kind as u8);
+}
+
+fn encode_bucket_subresource_aux(out: &mut Vec<u8>, aux: BucketSubresourceAux) {
+    match aux {
+        BucketSubresourceAux::None => put_u8(out, 0),
+        BucketSubresourceAux::Policy { is_public } => {
+            put_u8(out, 1);
+            put_bool(out, is_public);
+        }
+    }
 }
 
 fn encode_bucket_property_mutation(out: &mut Vec<u8>, mutation: &BucketPropertyMutation) {
@@ -642,6 +725,87 @@ mod tests {
                 0xbc2d9efb84c3ed11,
                 0xd8eb45a268b77749,
                 0xcc7e17ba9b256211,
+            ]
+        );
+    }
+
+    #[test]
+    fn metadata_command_bucket_subresource_encoding_is_stable() {
+        let bucket = BucketName::try_from("bucket").unwrap();
+        let id = MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(3),
+            MetadataCommandLogIndex::new(19).unwrap(),
+        );
+        let mutations = [
+            BucketSubresourceMutation::Put {
+                kind: BucketSubresourceKind::Policy,
+                body: r#"{"Statement":[]}"#.to_owned(),
+                aux: BucketSubresourceAux::policy(true),
+            },
+            BucketSubresourceMutation::Delete {
+                kind: BucketSubresourceKind::Policy,
+            },
+            BucketSubresourceMutation::Put {
+                kind: BucketSubresourceKind::Tagging,
+                body: "<Tagging/>".to_owned(),
+                aux: BucketSubresourceAux::None,
+            },
+            BucketSubresourceMutation::Delete {
+                kind: BucketSubresourceKind::Tagging,
+            },
+            BucketSubresourceMutation::Put {
+                kind: BucketSubresourceKind::Lifecycle,
+                body: "<LifecycleConfiguration/>".to_owned(),
+                aux: BucketSubresourceAux::None,
+            },
+            BucketSubresourceMutation::Delete {
+                kind: BucketSubresourceKind::Lifecycle,
+            },
+            BucketSubresourceMutation::Put {
+                kind: BucketSubresourceKind::Cors,
+                body: "<CORSConfiguration/>".to_owned(),
+                aux: BucketSubresourceAux::None,
+            },
+            BucketSubresourceMutation::Delete {
+                kind: BucketSubresourceKind::Cors,
+            },
+        ];
+
+        let mut checksums = Vec::new();
+        for (offset, mutation) in mutations.into_iter().enumerate() {
+            let command =
+                PutBucketSubresourceCommand::new(bucket.clone(), mutation, 30 + offset as u64);
+            let id = MetadataCommandId::new(
+                id.cluster_epoch(),
+                id.pg_id(),
+                MetadataCommandLogIndex::new(id.log_index().get() + offset as u64).unwrap(),
+            );
+            let envelope = MetadataCommandEnvelope::new(
+                id,
+                MetadataCommandPayload::PutBucketSubresource(command.clone()),
+            );
+            let duplicate = MetadataCommandEnvelope::new(
+                id,
+                MetadataCommandPayload::PutBucketSubresource(command),
+            );
+
+            assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
+            assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
+            assert!(envelope.verify_checksum());
+            checksums.push(envelope.checksum_crc64());
+        }
+        assert_eq!(
+            checksums,
+            [
+                0x2c71312aba70ec12,
+                0x7a3aad2f1477e115,
+                0xa9d13d13566d4ae2,
+                0x26a1d1cfadbac4da,
+                0x48043526c6d0ce88,
+                0xb566708169760d44,
+                0xfcc8ed210f34db99,
+                0x4b00ed0e84caf2ba,
             ]
         );
     }
