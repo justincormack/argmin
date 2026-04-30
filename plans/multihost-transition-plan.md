@@ -1019,6 +1019,12 @@ Phase 5 implementation notes:
      conversions
    - `guides/testing.md` includes the boundary script in broad local
      verification so the check is part of the documented full-suite gate
+   - `prop_local_cluster_trace_preserves_epoch_route_and_cleanup_invariants`
+     now runs randomized local-cluster traces covering map epoch changes, PG
+     active/peering/degraded/backfilling transitions, current and stale placed
+     shard IO, stale metadata bridge calls, zero-size stale payload reads,
+     best-effort reclaim queue suppression, lease release after epoch changes,
+     and EC recovery after physical shard loss
 
 ## Phase 6: PG Metadata Replication
 

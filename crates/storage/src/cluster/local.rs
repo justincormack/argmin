@@ -711,6 +711,8 @@ fn prepare_local_node_data_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::{TestCaseError, TestCaseResult};
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
@@ -787,6 +789,539 @@ mod tests {
             payload: payload.to_vec(),
             written,
             locations,
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    enum LocalClusterTraceOp {
+        AdvanceEpoch,
+        SetPgState(PgState),
+        WriteCurrent(u8),
+        WriteStale(u8),
+        ReadCurrent,
+        ReadStale,
+        DeleteCurrent,
+        DeleteStale,
+        MetadataBridgeStale(u8),
+        ZeroSizeStalePayloadRead,
+        QueueCurrent(u8),
+        QueueStale(u8),
+        LeaseReleaseAcrossEpoch(u8),
+        RecoverAfterPhysicalShardLoss(u8),
+    }
+
+    #[derive(Debug, Clone)]
+    struct TraceWrittenShard {
+        placement_key: Vec<u8>,
+        location: ShardLocation,
+        key: ShardKey,
+        ack: WriteAck,
+        data: Vec<u8>,
+    }
+
+    fn local_cluster_trace_strategy() -> impl Strategy<Value = Vec<LocalClusterTraceOp>> {
+        prop::collection::vec(
+            prop_oneof![
+                2 => Just(LocalClusterTraceOp::AdvanceEpoch),
+                3 => pg_state_strategy().prop_map(LocalClusterTraceOp::SetPgState),
+                5 => any::<u8>().prop_map(LocalClusterTraceOp::WriteCurrent),
+                3 => any::<u8>().prop_map(LocalClusterTraceOp::WriteStale),
+                4 => Just(LocalClusterTraceOp::ReadCurrent),
+                3 => Just(LocalClusterTraceOp::ReadStale),
+                3 => Just(LocalClusterTraceOp::DeleteCurrent),
+                2 => Just(LocalClusterTraceOp::DeleteStale),
+                3 => any::<u8>().prop_map(LocalClusterTraceOp::MetadataBridgeStale),
+                3 => Just(LocalClusterTraceOp::ZeroSizeStalePayloadRead),
+                2 => any::<u8>().prop_map(LocalClusterTraceOp::QueueCurrent),
+                2 => any::<u8>().prop_map(LocalClusterTraceOp::QueueStale),
+                2 => any::<u8>().prop_map(LocalClusterTraceOp::LeaseReleaseAcrossEpoch),
+                1 => any::<u8>().prop_map(LocalClusterTraceOp::RecoverAfterPhysicalShardLoss),
+            ],
+            1..=40,
+        )
+    }
+
+    fn pg_state_strategy() -> impl Strategy<Value = PgState> {
+        prop_oneof![
+            Just(PgState::Active),
+            Just(PgState::Peering),
+            Just(PgState::Degraded),
+            Just(PgState::Backfilling),
+        ]
+    }
+
+    fn trace_node_ids() -> [NodeId; 6] {
+        [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ]
+    }
+
+    fn current_cluster(map: &Arc<LocalClusterMap>) -> Arc<crate::StorageCluster> {
+        crate::StorageCluster::from_local_map(Arc::clone(map)).unwrap()
+    }
+
+    fn stale_cluster(
+        map: &Arc<LocalClusterMap>,
+        current_epoch: ClusterEpoch,
+    ) -> Arc<crate::StorageCluster> {
+        crate::StorageCluster::test_from_local_map_with_epoch(
+            Arc::clone(map),
+            stale_epoch_for(current_epoch),
+        )
+        .unwrap()
+    }
+
+    fn stale_epoch_for(current_epoch: ClusterEpoch) -> ClusterEpoch {
+        if current_epoch == ClusterEpoch::INITIAL {
+            ClusterEpoch::new(2).unwrap()
+        } else {
+            ClusterEpoch::INITIAL
+        }
+    }
+
+    fn set_trace_epoch(map: &mut Arc<LocalClusterMap>, epoch: ClusterEpoch) {
+        let map = Arc::get_mut(map).expect("trace must not retain StorageCluster handles");
+        map.epoch = epoch;
+        for route in map.pg_routes.values_mut() {
+            route.cluster_epoch = epoch;
+        }
+    }
+
+    fn set_trace_pg_state(map: &mut Arc<LocalClusterMap>, state: PgState) {
+        let map = Arc::get_mut(map).expect("trace must not retain StorageCluster handles");
+        map.pg_routes.get_mut(&PgId::new(0)).unwrap().state = state;
+    }
+
+    fn trace_bucket(seed: u8) -> crate::BucketName {
+        crate::BucketName::try_from(format!("trace-bucket-{seed}")).unwrap()
+    }
+
+    fn trace_key(seed: u8) -> crate::ObjectKey {
+        crate::ObjectKey::try_from(format!("trace-key-{seed}")).unwrap()
+    }
+
+    fn trace_session(seed: u8) -> crate::SessionId {
+        crate::SessionId::try_from(format!("{:032x}", u128::from(seed) + 1)).unwrap()
+    }
+
+    fn trace_generation(seed: u8) -> crate::GenerationId {
+        crate::GenerationId::new(u64::from(seed) + 1).unwrap()
+    }
+
+    fn trace_shard_key(step: usize, seed: u8) -> ShardKey {
+        ShardKey::new(&[seed.wrapping_add(1); 16], 10_000 + step as u64, 0)
+    }
+
+    fn trace_placement_key(step: usize, seed: u8) -> Vec<u8> {
+        format!("trace-placement-{step}-{seed}").into_bytes()
+    }
+
+    fn current_trace_location(
+        cluster: &crate::StorageCluster,
+        written: &TraceWrittenShard,
+        ec_shape: EcShape,
+    ) -> ShardLocation {
+        cluster
+            .place_payload_shards(
+                DataPgId::new(PgId::new(0)),
+                ec_shape,
+                &written.placement_key,
+            )
+            .unwrap()[usize::from(written.key.shard_index().get())]
+    }
+
+    fn written_trace_location_for_epoch(
+        written: &TraceWrittenShard,
+        current_epoch: ClusterEpoch,
+    ) -> ShardLocation {
+        ShardLocation::new(
+            current_epoch,
+            written.location.data_pg_id(),
+            written.location.shard_index(),
+            written.location.node_id(),
+        )
+    }
+
+    fn arbitrary_current_location(current_epoch: ClusterEpoch) -> ShardLocation {
+        ShardLocation::new(
+            current_epoch,
+            DataPgId::new(PgId::new(0)),
+            ShardIndex::new(0),
+            NodeId::new(0),
+        )
+    }
+
+    fn shard_file_present_on_any_trace_node(map: &LocalClusterMap, key: &ShardKey) -> bool {
+        trace_node_ids().into_iter().any(|node_id| {
+            map.node(node_id)
+                .unwrap()
+                .storage_node()
+                .read_shard_file(0, key)
+                .is_ok()
+        })
+    }
+
+    fn drain_trace_reclaim_work(cluster: &crate::StorageCluster) {
+        while cluster.try_take_reclaim_work().is_some() {}
+    }
+
+    fn assert_stale_metadata_bridge_error(
+        err: crate::ObjectPgActionError,
+        current_epoch: ClusterEpoch,
+    ) -> TestCaseResult {
+        let expected = matches!(
+            err,
+            crate::ObjectPgActionError::Store(StoreError::StaleMetadataPrimaryBridge {
+                metadata_node_id: 0,
+                operation_epoch,
+                current_epoch: err_current_epoch,
+            }) if operation_epoch == stale_epoch_for(current_epoch)
+                && err_current_epoch == current_epoch
+        );
+        prop_assert!(expected, "unexpected metadata bridge error: {err:?}");
+        Ok(())
+    }
+
+    fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
+        let tmp = test_util::tempdir();
+        let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+        let node_ids = trace_node_ids();
+        let mut map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
+        let mut current_epoch = ClusterEpoch::INITIAL;
+        let mut pg_state = PgState::Active;
+        let mut written = None::<TraceWrittenShard>;
+
+        for (step, op) in ops.iter().enumerate() {
+            match op {
+                LocalClusterTraceOp::AdvanceEpoch => {
+                    current_epoch = ClusterEpoch::new(current_epoch.get() + 1).unwrap();
+                    set_trace_epoch(&mut map, current_epoch);
+                }
+                LocalClusterTraceOp::SetPgState(state) => {
+                    pg_state = *state;
+                    set_trace_pg_state(&mut map, pg_state);
+                }
+                LocalClusterTraceOp::WriteCurrent(seed) => {
+                    let cluster = current_cluster(&map);
+                    let placement_key = trace_placement_key(step, *seed);
+                    let key = trace_shard_key(step, *seed);
+                    let data = format!("trace-payload-{step}-{seed}").into_bytes();
+                    match cluster.place_payload_shards(
+                        DataPgId::new(PgId::new(0)),
+                        ec_shape,
+                        &placement_key,
+                    ) {
+                        Ok(locations) => {
+                            prop_assert_eq!(pg_state, PgState::Active);
+                            let location = locations[usize::from(key.shard_index().get())];
+                            let ack = cluster.write_payload_shard(location, &key, &data).unwrap();
+                            let read = cluster.read_payload_shard(location, &key, ack).unwrap();
+                            prop_assert_eq!(read.as_slice(), data.as_slice());
+                            written = Some(TraceWrittenShard {
+                                placement_key,
+                                location,
+                                key,
+                                ack,
+                                data,
+                            });
+                        }
+                        Err(ClusterBuildError::PgNotActive { state, .. }) => {
+                            prop_assert_eq!(state, pg_state);
+                            prop_assert!(!shard_file_present_on_any_trace_node(&map, &key));
+                        }
+                        Err(err) => return Err(TestCaseError::fail(format!("{err:?}"))),
+                    }
+                }
+                LocalClusterTraceOp::WriteStale(seed) => {
+                    let cluster = stale_cluster(&map, current_epoch);
+                    let key = trace_shard_key(step, *seed);
+                    let err = cluster
+                        .write_payload_shard(
+                            arbitrary_current_location(current_epoch),
+                            &key,
+                            b"stale write",
+                        )
+                        .unwrap_err();
+                    let expected = matches!(
+                        err,
+                        ShardIoError::StaleOperationEpoch {
+                            operation_epoch,
+                            current_epoch: err_current_epoch,
+                            ..
+                        } if operation_epoch == stale_epoch_for(current_epoch)
+                            && err_current_epoch == current_epoch
+                    );
+                    prop_assert!(expected, "unexpected stale write error: {err:?}");
+                    prop_assert!(!shard_file_present_on_any_trace_node(&map, &key));
+                }
+                LocalClusterTraceOp::ReadCurrent => {
+                    let Some(written) = written.as_ref() else {
+                        continue;
+                    };
+                    let cluster = current_cluster(&map);
+                    if pg_state == PgState::Active {
+                        let location = current_trace_location(&cluster, written, ec_shape);
+                        let read = cluster
+                            .read_payload_shard(location, &written.key, written.ack)
+                            .unwrap();
+                        prop_assert_eq!(read.as_slice(), written.data.as_slice());
+                    } else {
+                        let location = written_trace_location_for_epoch(written, current_epoch);
+                        let err = cluster
+                            .read_payload_shard(location, &written.key, written.ack)
+                            .unwrap_err();
+                        let expected = matches!(
+                            err,
+                            ShardIoError::PgNotActive { state, .. } if state == pg_state
+                        );
+                        prop_assert!(expected, "unexpected inactive read error: {err:?}");
+                        prop_assert!(shard_file_present_on_any_trace_node(&map, &written.key));
+                    }
+                }
+                LocalClusterTraceOp::ReadStale => {
+                    let key = written
+                        .as_ref()
+                        .map(|written| written.key.clone())
+                        .unwrap_or_else(|| trace_shard_key(step, 0));
+                    let ack = written
+                        .as_ref()
+                        .map(|written| written.ack)
+                        .unwrap_or(WriteAck {
+                            crc64: 0,
+                            stored_size: 1,
+                        });
+                    let cluster = stale_cluster(&map, current_epoch);
+                    let err = cluster
+                        .read_payload_shard(arbitrary_current_location(current_epoch), &key, ack)
+                        .unwrap_err();
+                    let expected = matches!(
+                        err,
+                        ShardIoError::StaleOperationEpoch {
+                            operation_epoch,
+                            current_epoch: err_current_epoch,
+                            ..
+                        } if operation_epoch == stale_epoch_for(current_epoch)
+                            && err_current_epoch == current_epoch
+                    );
+                    prop_assert!(expected, "unexpected stale read error: {err:?}");
+                }
+                LocalClusterTraceOp::DeleteCurrent => {
+                    let Some(previous) = written.clone() else {
+                        continue;
+                    };
+                    let cluster = current_cluster(&map);
+                    if pg_state == PgState::Active {
+                        let location = current_trace_location(&cluster, &previous, ec_shape);
+                        cluster
+                            .delete_payload_shard(location, &previous.key)
+                            .unwrap();
+                        prop_assert!(!shard_file_present_on_any_trace_node(&map, &previous.key));
+                        written = None;
+                    } else {
+                        let location = written_trace_location_for_epoch(&previous, current_epoch);
+                        let err = cluster
+                            .delete_payload_shard(location, &previous.key)
+                            .unwrap_err();
+                        let expected = matches!(
+                            err,
+                            ShardIoError::PgNotActive { state, .. } if state == pg_state
+                        );
+                        prop_assert!(expected, "unexpected inactive delete error: {err:?}");
+                        prop_assert!(shard_file_present_on_any_trace_node(&map, &previous.key));
+                    }
+                }
+                LocalClusterTraceOp::DeleteStale => {
+                    let Some(previous) = written.as_ref() else {
+                        continue;
+                    };
+                    let cluster = stale_cluster(&map, current_epoch);
+                    let err = cluster
+                        .delete_payload_shard(
+                            arbitrary_current_location(current_epoch),
+                            &previous.key,
+                        )
+                        .unwrap_err();
+                    let expected = matches!(
+                        err,
+                        ShardIoError::StaleOperationEpoch {
+                            operation_epoch,
+                            current_epoch: err_current_epoch,
+                            ..
+                        } if operation_epoch == stale_epoch_for(current_epoch)
+                            && err_current_epoch == current_epoch
+                    );
+                    prop_assert!(expected, "unexpected stale delete error: {err:?}");
+                    prop_assert!(shard_file_present_on_any_trace_node(&map, &previous.key));
+                }
+                LocalClusterTraceOp::MetadataBridgeStale(seed) => {
+                    let cluster = stale_cluster(&map, current_epoch);
+                    let bucket = trace_bucket(*seed);
+                    let key = trace_key(*seed);
+                    let reservation_id = trace_session(*seed);
+                    let err = cluster
+                        .reserve_put_object_generation(&bucket, &key, &reservation_id)
+                        .unwrap_err();
+                    assert_stale_metadata_bridge_error(err, current_epoch)?;
+                    let cluster = current_cluster(&map);
+                    let err = cluster
+                        .test_object_generation_reservation_for(&bucket, &key, &reservation_id)
+                        .unwrap_err();
+                    let expected = matches!(
+                        err,
+                        crate::ObjectPgActionError::Metadata(
+                            crate::MetadataError::ObjectGenerationReservationNotFound { .. }
+                        )
+                    );
+                    prop_assert!(expected, "unexpected reservation lookup error: {err:?}");
+                }
+                LocalClusterTraceOp::ZeroSizeStalePayloadRead => {
+                    let cluster = stale_cluster(&map, current_epoch);
+                    let mut dst = vec![0xAA];
+                    let err = cluster
+                        .read_segment_payload_stored_bytes_into(
+                            crate::SegmentStoredBytesRequest {
+                                data_pg_id: 0,
+                                segment_okh: [step as u8; 16],
+                                segment_vid: crate::GenerationId::MIN,
+                                stored_size: 0,
+                                segment_crc64: Some(0),
+                                ec: ec_shape,
+                            },
+                            &mut dst,
+                        )
+                        .unwrap_err();
+                    let expected = matches!(
+                        err,
+                        StoreError::StalePayloadOperation {
+                            pg_id: 0,
+                            operation_epoch,
+                            current_epoch: err_current_epoch,
+                        } if operation_epoch == stale_epoch_for(current_epoch)
+                            && err_current_epoch == current_epoch
+                    );
+                    prop_assert!(expected, "unexpected stale zero-size read error: {err:?}");
+                    prop_assert_eq!(dst, vec![0xAA]);
+                }
+                LocalClusterTraceOp::QueueCurrent(seed) => {
+                    let cluster = current_cluster(&map);
+                    drain_trace_reclaim_work(&cluster);
+                    let bucket = trace_bucket(*seed);
+                    let key = trace_key(*seed);
+                    let generation_id = trace_generation(*seed);
+                    cluster.enqueue_object_payload_reclaim(&bucket, &key, generation_id);
+                    let work = cluster.try_take_reclaim_work();
+                    let expected = matches!(
+                        work,
+                        Some(crate::ReclaimWorkItem::ObjectPayload((
+                            queued_bucket,
+                            queued_key,
+                            queued_generation_id
+                        ))) if queued_bucket == bucket
+                            && queued_key == key
+                            && queued_generation_id == generation_id
+                    );
+                    prop_assert!(expected, "unexpected reclaim work item");
+                    drain_trace_reclaim_work(&cluster);
+                }
+                LocalClusterTraceOp::QueueStale(seed) => {
+                    let cluster = current_cluster(&map);
+                    drain_trace_reclaim_work(&cluster);
+                    drop(cluster);
+                    let cluster = stale_cluster(&map, current_epoch);
+                    cluster.enqueue_object_payload_reclaim(
+                        &trace_bucket(*seed),
+                        &trace_key(*seed),
+                        trace_generation(*seed),
+                    );
+                    drop(cluster);
+                    let cluster = current_cluster(&map);
+                    prop_assert!(cluster.try_take_reclaim_work().is_none());
+                }
+                LocalClusterTraceOp::LeaseReleaseAcrossEpoch(seed) => {
+                    let bucket = trace_bucket(*seed);
+                    let key = trace_key(*seed);
+                    let generation_id = trace_generation(*seed);
+                    let cluster = current_cluster(&map);
+                    let lease = cluster
+                        .acquire_object_payload_lease(&bucket, &key, generation_id)
+                        .unwrap();
+                    prop_assert_eq!(
+                        cluster.object_payload_lease_count(&bucket, &key, generation_id),
+                        1
+                    );
+                    drop(cluster);
+
+                    current_epoch = ClusterEpoch::new(current_epoch.get() + 1).unwrap();
+                    set_trace_epoch(&mut map, current_epoch);
+                    let cluster = current_cluster(&map);
+                    prop_assert_eq!(
+                        cluster.object_payload_lease_count(&bucket, &key, generation_id),
+                        1
+                    );
+                    let released = lease.release();
+                    prop_assert_eq!(released.remaining(), 0);
+                    prop_assert_eq!(
+                        cluster.object_payload_lease_count(&bucket, &key, generation_id),
+                        0
+                    );
+                }
+                LocalClusterTraceOp::RecoverAfterPhysicalShardLoss(seed) => {
+                    if pg_state != PgState::Active {
+                        continue;
+                    }
+                    let cluster = current_cluster(&map);
+                    let payload = format!("recoverable-physical-shard-loss-{step}-{seed}");
+                    let segment = write_committed_direct_segment(&cluster, payload.as_bytes());
+                    let shard_path = cluster
+                        .test_payload_shard_file_path(
+                            segment.written.data_pg_id,
+                            segment.written.ec,
+                            &segment.segment_okh,
+                            segment.generation_id,
+                            0,
+                        )
+                        .unwrap();
+                    std::fs::remove_file(shard_path).unwrap();
+
+                    let mut recovered = Vec::new();
+                    cluster
+                        .read_segment_payload_stored_bytes_into(
+                            crate::SegmentStoredBytesRequest {
+                                data_pg_id: segment.written.data_pg_id,
+                                segment_okh: segment.segment_okh,
+                                segment_vid: segment.generation_id,
+                                stored_size: segment.payload.len(),
+                                segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+                                ec: segment.written.ec,
+                            },
+                            &mut recovered,
+                        )
+                        .unwrap();
+                    prop_assert_eq!(recovered, segment.payload);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 32,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn prop_local_cluster_trace_preserves_epoch_route_and_cleanup_invariants(
+            ops in local_cluster_trace_strategy()
+        ) {
+            run_local_cluster_trace(&ops)?;
         }
     }
 
