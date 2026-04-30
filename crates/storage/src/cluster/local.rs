@@ -6,7 +6,6 @@ use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
 
 use super::ShardLocation;
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
-use crate::traits::ShardStore;
 use crate::{
     ClusterEpoch, DataPgId, EcShape, PgId, PgState, ShardIndex, ShardKey, SharedStorageNode,
     WriteAck,
@@ -118,12 +117,9 @@ impl LocalShardNodeClient<'_> {
     }
 
     fn delete_shard(&self, key: &ShardKey) -> Result<(), ShardIoError> {
-        let pg = self
-            .node
+        self.node
             .storage_node()
-            .get_pg(self.data_pg_id.get())
-            .map_err(|source| self.store_error(source))?;
-        pg.delete_shard(key)
+            .delete_shard_file(self.data_pg_id.get(), key)
             .map_err(|source| self.store_error(source))
     }
 

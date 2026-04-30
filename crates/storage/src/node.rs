@@ -1291,6 +1291,30 @@ impl SharedStorageNode {
         }
     }
 
+    /// Delete a shard file directly without mutating the PG shard metadata row.
+    pub(crate) fn delete_shard_file(&self, pg_id: u32, key: &ShardKey) -> Result<(), StoreError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "SharedStorageNode::delete_shard_file",
+            "pg_id={} shard={}",
+            pg_id,
+            key
+        );
+        let paths = self
+            .pg_paths
+            .get(&pg_id)
+            .ok_or(StoreError::PgNotFound { pg_id })?;
+        let shard_path = PgStore::shard_path_for_shards_dir(&paths.shards_dir, key);
+        match fs::remove_file(&shard_path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(StoreError::Io {
+                context: "unlink shard file",
+                source: e,
+            }),
+        }
+    }
+
     /// Acquire an in-memory lease on an object payload generation.
     pub fn acquire_object_payload_lease(
         &self,

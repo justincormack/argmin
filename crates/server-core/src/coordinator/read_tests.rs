@@ -3,8 +3,8 @@ use super::test_support::*;
 use super::*;
 use ec::EcConfig;
 use std::collections::BTreeSet;
-use std::sync::Arc;
-use storage::{segment_key_hash, EcShape, GenerationId, PgTopology, ShardKey};
+use std::sync::{Arc, Mutex};
+use storage::{segment_key_hash, EcShape, GenerationId, PgTopology, ShardKey, StoreError};
 
 #[test]
 fn stream_put_get_object_readable() {
@@ -133,7 +133,7 @@ fn failed_stream_put_append_commit_cleans_placed_shards() {
         .test_object_generation_reservation_for(&bucket, &key, &session_id)
         .unwrap();
     let segment_okh = segment_key_hash("bucket", "key", generation_id, 0);
-    let segment_vid = GenerationId::MIN;
+    let segment_vid = GenerationId::new(1).unwrap();
     let ec = coord.storage_node.default_payload_ec_shape();
     let data_pg_id = PgTopology::new(coord.storage_node.test_pg_ids())
         .unwrap()
@@ -181,6 +181,237 @@ fn failed_stream_put_append_commit_cleans_placed_shards() {
                 )
                 .unwrap(),
             "failed stream append must remove placed shard file {shard_index}"
+        );
+    }
+}
+
+#[test]
+fn failed_stream_put_append_cleanup_failure_traces_allowed_orphan() {
+    let _storage_serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _stream_serial = STREAM_APPEND_TEST_SERIAL
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap();
+    let dir = test_util::tempdir();
+    let coord = setup_coordinator(dir.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let generation_id = coord
+        .storage_node
+        .test_object_generation_reservation_for(&bucket, &key, &session_id)
+        .unwrap();
+    let segment_okh = segment_key_hash("bucket", "key", generation_id, 0);
+    let segment_vid = GenerationId::new(1).unwrap();
+    let ec = coord.storage_node.default_payload_ec_shape();
+    let data_pg_id = PgTopology::new(coord.storage_node.test_pg_ids())
+        .unwrap()
+        .object_generation_segment_data_pg(&bucket, &key, generation_id, 0)
+        .get();
+
+    let observed_cleanup_errors = Arc::new(Mutex::new(Vec::new()));
+    let observed_cleanup_errors_for_hook = Arc::clone(&observed_cleanup_errors);
+    let _cleanup_error_guard = coord
+        .storage_node
+        .test_install_best_effort_payload_cleanup_error_hook(Arc::new(move |operation, error| {
+            let context = match error {
+                StoreError::Io { context, .. } => *context,
+                other => panic!("expected injected IO cleanup error, got {other:?}"),
+            };
+            observed_cleanup_errors_for_hook
+                .lock()
+                .unwrap()
+                .push((operation, context));
+        }));
+    let _placed_cleanup_guard = coord
+        .storage_node
+        .test_install_before_placed_payload_shard_delete_hook(Arc::new(|_shard_key| {
+            Err(StoreError::Io {
+                context: "injected placed cleanup delete failure",
+                source: std::io::Error::other("injected placed cleanup delete failure"),
+            })
+        }));
+    let hook_storage = Arc::clone(&coord.storage_node);
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let hook_session_id = session_id.clone();
+    let _stream_guard = install_stream_append_test_hooks(StreamAppendTestHooks {
+        target: Some((session_id.as_str().to_owned(), 0)),
+        after_prepare: Some(Arc::new(move || {
+            hook_storage
+                .abort_stream_upload_session(&hook_bucket, &hook_key, &hook_session_id)
+                .unwrap();
+        })),
+    });
+
+    let _trace = observability::AttachedTrace::new(observability::TraceContext::new_request());
+    let err = coord
+        .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"orphan-me")
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::Metadata(_)),
+        "expected missing stream session after hook abort, got {err:?}"
+    );
+
+    let observed_cleanup_errors = observed_cleanup_errors.lock().unwrap();
+    assert_eq!(
+        observed_cleanup_errors.len(),
+        usize::from(ec.k + ec.m),
+        "each placed shard cleanup failure should emit typed cleanup context"
+    );
+    assert!(observed_cleanup_errors.iter().all(|(operation, context)| {
+        *operation == "delete placed payload shard"
+            && *context == "injected placed cleanup delete failure"
+    }));
+    drop(observed_cleanup_errors);
+
+    let mut remaining_placed_files = 0usize;
+    for shard_index in 0..ec.k + ec.m {
+        let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), shard_index);
+        assert!(
+            !coord
+                .storage_node
+                .test_shard_exists(data_pg_id, &shard_key)
+                .unwrap(),
+            "best-effort failure should still remove ack metadata {shard_index}"
+        );
+        if coord
+            .storage_node
+            .test_payload_shard_file_exists(data_pg_id, ec, &segment_okh, segment_vid, shard_index)
+            .unwrap()
+        {
+            remaining_placed_files += 1;
+        }
+    }
+    assert_eq!(
+        remaining_placed_files,
+        usize::from(ec.k + ec.m),
+        "injected best-effort failure should leave every placed shard as orphan state"
+    );
+}
+
+#[test]
+fn stream_put_abort_ack_cleanup_failure_traces_after_placed_cleanup() {
+    let _storage_serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap();
+    let dir = test_util::tempdir();
+    let coord = setup_coordinator(dir.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let generation_id = coord
+        .storage_node
+        .test_object_generation_reservation_for(&bucket, &key, &session_id)
+        .unwrap();
+    let segment_okh = segment_key_hash("bucket", "key", generation_id, 0);
+    let segment_vid = GenerationId::new(1).unwrap();
+    let ec = coord.storage_node.default_payload_ec_shape();
+    let data_pg_id = PgTopology::new(coord.storage_node.test_pg_ids())
+        .unwrap()
+        .object_generation_segment_data_pg(&bucket, &key, generation_id, 0)
+        .get();
+
+    coord
+        .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"cleanup-me")
+        .unwrap();
+    for shard_index in 0..ec.k + ec.m {
+        let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), shard_index);
+        assert!(
+            coord
+                .storage_node
+                .test_shard_exists(data_pg_id, &shard_key)
+                .unwrap(),
+            "staged stream append should publish ack row {shard_index}"
+        );
+        assert!(
+            coord
+                .storage_node
+                .test_payload_shard_file_exists(
+                    data_pg_id,
+                    ec,
+                    &segment_okh,
+                    segment_vid,
+                    shard_index,
+                )
+                .unwrap(),
+            "staged stream append should publish placed file {shard_index}"
+        );
+    }
+
+    let observed_cleanup_errors = Arc::new(Mutex::new(Vec::new()));
+    let observed_cleanup_errors_for_hook = Arc::clone(&observed_cleanup_errors);
+    let _cleanup_error_guard = coord
+        .storage_node
+        .test_install_best_effort_payload_cleanup_error_hook(Arc::new(move |operation, error| {
+            let context = match error {
+                StoreError::Io { context, .. } => *context,
+                other => panic!("expected injected IO cleanup error, got {other:?}"),
+            };
+            observed_cleanup_errors_for_hook
+                .lock()
+                .unwrap()
+                .push((operation, context));
+        }));
+    let _ack_cleanup_guard = coord
+        .storage_node
+        .test_install_before_metadata_primary_payload_ack_delete_hook(Arc::new(|_shard_key| {
+            Err(StoreError::Io {
+                context: "injected ack cleanup delete failure",
+                source: std::io::Error::other("injected ack cleanup delete failure"),
+            })
+        }));
+
+    let _trace = observability::AttachedTrace::new(observability::TraceContext::new_request());
+    coord
+        .abort_stream_put("bucket", "key", &session_id)
+        .unwrap();
+
+    let observed_cleanup_errors = observed_cleanup_errors.lock().unwrap();
+    assert_eq!(
+        observed_cleanup_errors.len(),
+        usize::from(ec.k + ec.m),
+        "each ack cleanup failure should emit typed cleanup context"
+    );
+    assert!(observed_cleanup_errors.iter().all(|(operation, context)| {
+        *operation == "delete metadata-primary payload ack"
+            && *context == "injected ack cleanup delete failure"
+    }));
+    drop(observed_cleanup_errors);
+
+    for shard_index in 0..ec.k + ec.m {
+        let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), shard_index);
+        assert!(
+            coord
+                .storage_node
+                .test_shard_exists(data_pg_id, &shard_key)
+                .unwrap(),
+            "ack cleanup failure should leave metadata-primary ack row {shard_index}"
+        );
+        assert!(
+            !coord
+                .storage_node
+                .test_payload_shard_file_exists(
+                    data_pg_id,
+                    ec,
+                    &segment_okh,
+                    segment_vid,
+                    shard_index,
+                )
+                .unwrap(),
+            "ack cleanup failure should not prevent placed cleanup for shard {shard_index}"
         );
     }
 }

@@ -250,6 +250,19 @@ impl PgStore {
         Ok(())
     }
 
+    pub(crate) fn delete_shard_record(&self, key: &ShardKey) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "DELETE FROM shards WHERE shard_key = ?1",
+                params![key.as_bytes().as_slice()],
+            )
+            .map_err(|e| StoreError::Db {
+                context: "delete shard record",
+                source: e,
+            })?;
+        Ok(())
+    }
+
     pub fn register_written_shards_batch(
         &self,
         shards: &[(&ShardKey, WriteAck)],

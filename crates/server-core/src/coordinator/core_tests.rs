@@ -3617,6 +3617,128 @@ fn delete_object_eventually_reclaims_simple_shards() {
 }
 
 #[test]
+fn reclaim_object_payload_delete_failure_keeps_retryable_reclaim_record() {
+    let _storage_serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap();
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"simple-data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let (generation_id, ec, data_pg_id, okh, segment_vid) = {
+        match coord
+            .storage_node
+            .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+            .unwrap()
+        {
+            StoredObject::Live(record) => {
+                let segments = coord
+                    .storage_node
+                    .test_get_object_segments(
+                        &trusted_bucket_name("bucket"),
+                        &trusted_object_key("key"),
+                        record.version_id,
+                    )
+                    .unwrap();
+                let segment = segments
+                    .first()
+                    .expect("direct put should store one segment");
+                (
+                    record.generation_id,
+                    record.ec,
+                    segment.data_pg_id,
+                    segment.segment_okh,
+                    segment.segment_vid,
+                )
+            }
+            other @ StoredObject::DeleteMarker(_) => {
+                panic!("expected live object, got {other:?}")
+            }
+        }
+    };
+
+    coord
+        .delete_object(&delete_object_request(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            false,
+            NO_DELETE,
+        ))
+        .unwrap();
+
+    let failing_key = ShardKey::new(&okh, segment_vid.get(), 0);
+    let placed_cleanup_guard = coord
+        .storage_node
+        .test_install_before_placed_payload_shard_delete_hook(Arc::new(move |shard_key| {
+            if shard_key == &failing_key {
+                return Err(storage::StoreError::Io {
+                    context: "injected reclaim placed delete failure",
+                    source: std::io::Error::other("injected reclaim placed delete failure"),
+                });
+            }
+            Ok(())
+        }));
+
+    let err = coord
+        .read_runtime()
+        .try_reclaim_object_payload("bucket", "key", generation_id)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ServerError::Store(storage::StoreError::Io {
+                context: "injected reclaim placed delete failure",
+                ..
+            })
+        ),
+        "expected injected reclaim delete failure, got {err:?}"
+    );
+    for shard_index in 0..ec.k + ec.m {
+        let shard_key = ShardKey::new(&okh, segment_vid.get(), shard_index);
+        assert!(
+            coord
+                .storage_node
+                .test_shard_exists(data_pg_id, &shard_key)
+                .unwrap(),
+            "failed reclaim should keep ack metadata {shard_index} retryable"
+        );
+        assert!(
+            coord
+                .storage_node
+                .test_payload_shard_file_exists(data_pg_id, ec, &okh, segment_vid, shard_index)
+                .unwrap(),
+            "failed reclaim should keep placed shard {shard_index} retryable"
+        );
+    }
+
+    drop(placed_cleanup_guard);
+    reclaim_object_payload(&coord, "bucket", "key", generation_id);
+    assert_shard_set_deleted(&coord, data_pg_id, &okh, segment_vid, ec);
+}
+
+#[test]
 fn delete_nonexistent_object_is_ok() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());

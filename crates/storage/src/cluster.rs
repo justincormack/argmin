@@ -28,16 +28,71 @@ const TRACE_TARGET: &str = "storage";
 type StreamAbortHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
+pub type PayloadShardCleanupTestHook =
+    Arc<dyn Fn(&ShardKey) -> Result<(), StoreError> + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub type PayloadCleanupErrorTestHook = Arc<dyn Fn(&'static str, &StoreError) + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
 static BEFORE_STREAM_ABORT_STORAGE_HOOK: OnceLock<Mutex<Option<StreamAbortHook>>> = OnceLock::new();
 
 #[cfg(any(test, feature = "test-hooks"))]
+static BEFORE_PLACED_PAYLOAD_SHARD_DELETE_HOOK: OnceLock<
+    Mutex<Option<PayloadShardCleanupTestHook>>,
+> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-hooks"))]
+static BEFORE_METADATA_PRIMARY_PAYLOAD_ACK_DELETE_HOOK: OnceLock<
+    Mutex<Option<PayloadShardCleanupTestHook>>,
+> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-hooks"))]
+static BEST_EFFORT_PAYLOAD_CLEANUP_ERROR_HOOK: OnceLock<
+    Mutex<Option<PayloadCleanupErrorTestHook>>,
+> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-hooks"))]
 pub struct StreamAbortTestHookGuard;
+
+#[cfg(any(test, feature = "test-hooks"))]
+enum PayloadCleanupTestHookKind {
+    PlacedShardDelete,
+    MetadataPrimaryAckDelete,
+    BestEffortError,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct PayloadCleanupTestHookGuard {
+    kind: PayloadCleanupTestHookKind,
+}
 
 #[cfg(any(test, feature = "test-hooks"))]
 impl Drop for StreamAbortTestHookGuard {
     fn drop(&mut self) {
         let hook = BEFORE_STREAM_ABORT_STORAGE_HOOK.get_or_init(|| Mutex::new(None));
         *hook.lock().unwrap() = None;
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for PayloadCleanupTestHookGuard {
+    fn drop(&mut self) {
+        match self.kind {
+            PayloadCleanupTestHookKind::PlacedShardDelete => {
+                let hook = BEFORE_PLACED_PAYLOAD_SHARD_DELETE_HOOK.get_or_init(|| Mutex::new(None));
+                *hook.lock().unwrap() = None;
+            }
+            PayloadCleanupTestHookKind::MetadataPrimaryAckDelete => {
+                let hook = BEFORE_METADATA_PRIMARY_PAYLOAD_ACK_DELETE_HOOK
+                    .get_or_init(|| Mutex::new(None));
+                *hook.lock().unwrap() = None;
+            }
+            PayloadCleanupTestHookKind::BestEffortError => {
+                let hook = BEST_EFFORT_PAYLOAD_CLEANUP_ERROR_HOOK.get_or_init(|| Mutex::new(None));
+                *hook.lock().unwrap() = None;
+            }
+        }
     }
 }
 
@@ -52,6 +107,65 @@ fn maybe_run_before_stream_abort_storage_hook() {
         hook();
     }
 }
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn maybe_run_before_placed_payload_shard_delete_hook(
+    shard_key: &ShardKey,
+) -> Result<(), StoreError> {
+    let hook = BEFORE_PLACED_PAYLOAD_SHARD_DELETE_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some(hook) = hook {
+        hook(shard_key)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+fn maybe_run_before_placed_payload_shard_delete_hook(
+    _shard_key: &ShardKey,
+) -> Result<(), StoreError> {
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn maybe_run_before_metadata_primary_payload_ack_delete_hook(
+    shard_key: &ShardKey,
+) -> Result<(), StoreError> {
+    let hook = BEFORE_METADATA_PRIMARY_PAYLOAD_ACK_DELETE_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some(hook) = hook {
+        hook(shard_key)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+fn maybe_run_before_metadata_primary_payload_ack_delete_hook(
+    _shard_key: &ShardKey,
+) -> Result<(), StoreError> {
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn maybe_observe_best_effort_payload_cleanup_error(operation: &'static str, error: &StoreError) {
+    let hook = BEST_EFFORT_PAYLOAD_CLEANUP_ERROR_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some(hook) = hook {
+        hook(operation, error);
+    }
+}
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+fn maybe_observe_best_effort_payload_cleanup_error(_operation: &'static str, _error: &StoreError) {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardLocation {
@@ -315,6 +429,42 @@ impl StorageCluster {
         let slot = BEFORE_STREAM_ABORT_STORAGE_HOOK.get_or_init(|| Mutex::new(None));
         *slot.lock().unwrap() = Some(hook);
         StreamAbortTestHookGuard
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_before_placed_payload_shard_delete_hook(
+        &self,
+        hook: PayloadShardCleanupTestHook,
+    ) -> PayloadCleanupTestHookGuard {
+        let slot = BEFORE_PLACED_PAYLOAD_SHARD_DELETE_HOOK.get_or_init(|| Mutex::new(None));
+        *slot.lock().unwrap() = Some(hook);
+        PayloadCleanupTestHookGuard {
+            kind: PayloadCleanupTestHookKind::PlacedShardDelete,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_before_metadata_primary_payload_ack_delete_hook(
+        &self,
+        hook: PayloadShardCleanupTestHook,
+    ) -> PayloadCleanupTestHookGuard {
+        let slot = BEFORE_METADATA_PRIMARY_PAYLOAD_ACK_DELETE_HOOK.get_or_init(|| Mutex::new(None));
+        *slot.lock().unwrap() = Some(hook);
+        PayloadCleanupTestHookGuard {
+            kind: PayloadCleanupTestHookKind::MetadataPrimaryAckDelete,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_best_effort_payload_cleanup_error_hook(
+        &self,
+        hook: PayloadCleanupErrorTestHook,
+    ) -> PayloadCleanupTestHookGuard {
+        let slot = BEST_EFFORT_PAYLOAD_CLEANUP_ERROR_HOOK.get_or_init(|| Mutex::new(None));
+        *slot.lock().unwrap() = Some(hook);
+        PayloadCleanupTestHookGuard {
+            kind: PayloadCleanupTestHookKind::BestEffortError,
+        }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -962,6 +1112,8 @@ impl StorageCluster {
         for shard_key in shard_keys {
             let location = Self::placed_payload_shard_location(&locations, shard_key)
                 .map_err(ObjectPgActionError::Store)?;
+            maybe_run_before_placed_payload_shard_delete_hook(shard_key)
+                .map_err(ObjectPgActionError::Store)?;
             self.delete_payload_shard(location, shard_key)
                 .map_err(|error| ObjectPgActionError::Store(shard_io_error_to_store(error)))?;
         }
@@ -989,6 +1141,14 @@ impl StorageCluster {
         for shard_key in shard_keys {
             match Self::placed_payload_shard_location(&locations, shard_key) {
                 Ok(location) => {
+                    if let Err(error) = maybe_run_before_placed_payload_shard_delete_hook(shard_key)
+                    {
+                        emit_best_effort_payload_cleanup_error(
+                            "delete placed payload shard",
+                            &error,
+                        );
+                        continue;
+                    }
                     if let Err(error) = self.delete_payload_shard(location, shard_key) {
                         let error = shard_io_error_to_store(error);
                         emit_best_effort_payload_cleanup_error(
@@ -1013,7 +1173,9 @@ impl StorageCluster {
         // separately by the caller before these metadata-primary ack rows.
         let data_pg = self.metadata_primary_bridge_node()?.get_pg(data_pg_id)?;
         for shard_key in shard_keys {
-            data_pg.delete_shard(shard_key)?;
+            maybe_run_before_metadata_primary_payload_ack_delete_hook(shard_key)
+                .map_err(ObjectPgActionError::Store)?;
+            data_pg.delete_shard_record(shard_key)?;
         }
         Ok(())
     }
@@ -1044,7 +1206,15 @@ impl StorageCluster {
             }
         };
         for shard_key in shard_keys {
-            if let Err(error) = data_pg.delete_shard(shard_key) {
+            if let Err(error) = maybe_run_before_metadata_primary_payload_ack_delete_hook(shard_key)
+            {
+                emit_best_effort_payload_cleanup_error(
+                    "delete metadata-primary payload ack",
+                    &error,
+                );
+                continue;
+            }
+            if let Err(error) = data_pg.delete_shard_record(shard_key) {
                 emit_best_effort_payload_cleanup_error(
                     "delete metadata-primary payload ack",
                     &error,
@@ -1331,6 +1501,7 @@ fn emit_best_effort_payload_cleanup_error(operation: &'static str, error: &Store
     let Some(trace) = observability::current_context() else {
         return;
     };
+    maybe_observe_best_effort_payload_cleanup_error(operation, error);
     let _ = observability::event_in_context(
         &trace,
         TRACE_TARGET,

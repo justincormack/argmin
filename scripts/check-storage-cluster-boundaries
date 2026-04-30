@@ -43,7 +43,7 @@ fail_with_matches \
     "$unexpected_single_node"
 
 direct_shard_matches=$(
-    rg -n --color=never '\.(write_shard|read_shard|delete_shard|write_shard_file|read_shard_file|read_shard_file_into)\(' \
+    rg -n --color=never '\.(write_shard|read_shard|delete_shard|write_shard_file|read_shard_file|read_shard_file_into|delete_shard_file)\(' \
         crates/storage/src \
         crates/server-core/src \
         -g '*.rs' \

@@ -1025,6 +1025,17 @@ Phase 5 implementation notes:
      shard IO, stale metadata bridge calls, zero-size stale payload reads,
      best-effort reclaim queue suppression, lease release after epoch changes,
      and EC recovery after physical shard loss
+   - payload cleanup fault-injection hooks now cover placed shard delete,
+     metadata-primary ack delete, and typed best-effort cleanup error
+     observation under request trace context
+   - placed payload shard deletion now unlinks only placed files; the
+     metadata-primary ack bridge owns only shard-row deletion so colocated
+     placed shards cannot lose ack rows before ack cleanup runs
+   - server-core regressions now cover stream append cleanup failures that
+     trace typed placed-delete and ack-delete errors while leaving only the
+     allowed orphan state, plus reclaim placed-delete failure that returns an
+     error, preserves retryable reclaim metadata and payload, and succeeds on a
+     later retry
 
 ## Phase 6: PG Metadata Replication
 
