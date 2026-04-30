@@ -785,11 +785,20 @@ mod tests {
         key: &crate::ObjectKey,
         payload: &[u8],
     ) -> CommittedDirectSegment {
+        write_committed_direct_segment_for_with_okh(cluster, bucket, key, [41; 16], payload)
+    }
+
+    fn write_committed_direct_segment_for_with_okh(
+        cluster: &crate::StorageCluster,
+        bucket: &crate::BucketName,
+        key: &crate::ObjectKey,
+        segment_okh: [u8; 16],
+        payload: &[u8],
+    ) -> CommittedDirectSegment {
         let reservation_id = crate::SessionId::try_from("01".repeat(16)).unwrap();
         let generation_id = cluster
             .reserve_put_object_generation(bucket, key, &reservation_id)
             .unwrap();
-        let segment_okh = [41; 16];
         let written = cluster
             .write_direct_put_segment_payload_shards(
                 bucket,
@@ -862,6 +871,96 @@ mod tests {
             }
         }
         panic!("test topology did not produce distinct object/data PGs");
+    }
+
+    fn key_for_object_pg(
+        topology: &crate::PgTopology,
+        bucket: &crate::BucketName,
+        target_pg_id: u32,
+        prefix: &str,
+    ) -> crate::ObjectKey {
+        for index in 0..10_000 {
+            let key = crate::ObjectKey::try_from(format!("{prefix}{index}")).unwrap();
+            if topology.object_pg_for(bucket, &key) == target_pg_id {
+                return key;
+            }
+        }
+        panic!("test topology did not produce a key for PG {target_pg_id}");
+    }
+
+    fn bucket_for_pg(
+        topology: &crate::PgTopology,
+        target_pg_id: u32,
+        prefix: &str,
+    ) -> crate::BucketName {
+        for index in 0..10_000 {
+            let bucket = crate::BucketName::try_from(format!("{prefix}{index}")).unwrap();
+            if topology.bucket_pg_for(&bucket) == target_pg_id {
+                return bucket;
+            }
+        }
+        panic!("test topology did not produce a bucket for PG {target_pg_id}");
+    }
+
+    fn create_test_bucket(cluster: &crate::StorageCluster, bucket: &crate::BucketName) {
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let acl_grants = crate::AclGrants::default();
+        cluster
+            .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+                name: bucket.as_str(),
+                owner_principal: "owner",
+                owner_canonical_id: &owner,
+                acl_grants: &acl_grants,
+                public_read: false,
+                public_write: false,
+                versioning: crate::BucketVersioningState::Disabled,
+                object_lock: crate::BucketObjectLockConfig::default(),
+            })
+            .unwrap();
+    }
+
+    fn upload_id_from_label(label: &str) -> crate::UploadId {
+        let mut upload_id = String::from(label);
+        upload_id.extend(std::iter::repeat_n(
+            '.',
+            crate::UPLOAD_ID_LEN - upload_id.len(),
+        ));
+        crate::UploadId::try_from(upload_id).unwrap()
+    }
+
+    fn seed_multipart_upload_record(
+        map: &LocalClusterMap,
+        node_id: NodeId,
+        pg_id: u32,
+        bucket: &crate::BucketName,
+        key: &crate::ObjectKey,
+        upload_id: &crate::UploadId,
+        state: crate::UploadState,
+    ) {
+        let node = map.node(node_id).unwrap().storage_node();
+        let pg = node.get_pg(pg_id).unwrap();
+        crate::PgMetadataStore::create_multipart_upload(
+            &*pg,
+            &crate::CreateMultipartUploadReq {
+                upload_id: upload_id.clone(),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                tags: None,
+                metadata_blob: crate::SerializedMetadataBlob::default(),
+                system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                initiator: None,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                object_lock: crate::ObjectLockState::default(),
+                checksum: None,
+                encryption: crate::ObjectEncryption::None,
+            },
+        )
+        .unwrap();
+        if state != crate::UploadState::InProgress {
+            crate::PgMetadataStore::set_upload_state(&*pg, upload_id, state).unwrap();
+        }
     }
 
     fn set_route_primary(map: &mut LocalClusterMap, pg_id: u32, primary_node_id: NodeId) {
@@ -1868,6 +1967,270 @@ mod tests {
                 "retried reclaim should delete placed shard {shard_index}"
             );
         }
+    }
+
+    #[test]
+    fn composite_object_listings_fan_out_to_routed_pg_primaries() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let key_a = key_for_object_pg(topology, &bucket, 1, "dir/a/file-");
+        let key_b = key_for_object_pg(topology, &bucket, 2, "dir/b/file-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        write_committed_direct_segment_for_with_okh(
+            &cluster,
+            &bucket,
+            &key_b,
+            [52; 16],
+            b"payload-b",
+        );
+        write_committed_direct_segment_for_with_okh(
+            &cluster,
+            &bucket,
+            &key_a,
+            [53; 16],
+            b"payload-a",
+        );
+
+        let bridge_node = map.node(NodeId::new(0)).unwrap().storage_node();
+        assert!(bridge_node.test_get_object_meta(&bucket, &key_a).is_err());
+        assert!(bridge_node.test_get_object_meta(&bucket, &key_b).is_err());
+
+        let all_objects = cluster.list_all_objects_for_bucket(&bucket).unwrap();
+        assert_eq!(
+            all_objects
+                .iter()
+                .map(|object| object.key())
+                .collect::<Vec<_>>(),
+            vec![&key_a, &key_b]
+        );
+
+        let listed = cluster
+            .list_objects_for_bucket(&bucket, None, None, None, 100, 100)
+            .unwrap();
+        assert_eq!(
+            listed
+                .objects
+                .iter()
+                .map(|object| object.key())
+                .collect::<Vec<_>>(),
+            vec![&key_a, &key_b]
+        );
+
+        let prefix = crate::ObjectKey::try_from("dir/".to_string()).unwrap();
+        let delimited = cluster
+            .list_objects_for_bucket(&bucket, Some(&prefix), Some("/"), None, 100, 100)
+            .unwrap();
+        assert!(delimited.objects.is_empty());
+        assert_eq!(
+            delimited
+                .common_prefixes
+                .iter()
+                .map(crate::ObjectKey::as_str)
+                .collect::<Vec<_>>(),
+            vec!["dir/a/", "dir/b/"]
+        );
+
+        let all_versions = cluster
+            .list_all_object_versions_for_bucket(&bucket)
+            .unwrap();
+        assert_eq!(
+            all_versions
+                .iter()
+                .map(|object| object.key())
+                .collect::<Vec<_>>(),
+            vec![&key_a, &key_b]
+        );
+
+        let listed_versions = cluster
+            .list_object_versions_for_bucket(&bucket, None, None, None, 100)
+            .unwrap();
+        assert_eq!(
+            listed_versions
+                .versions
+                .iter()
+                .map(|object| object.key())
+                .collect::<Vec<_>>(),
+            vec![&key_a, &key_b]
+        );
+    }
+
+    #[test]
+    fn composite_bucket_listing_fan_out_to_routed_pg_primaries() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let (bucket_a, bucket_b) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            (
+                bucket_for_pg(topology, 1, "routed-bucket-a-"),
+                bucket_for_pg(topology, 2, "routed-bucket-b-"),
+            )
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let acl_grants = crate::AclGrants::default();
+        for bucket in [&bucket_b, &bucket_a] {
+            cluster
+                .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+                    name: bucket.as_str(),
+                    owner_principal: "owner",
+                    owner_canonical_id: &owner,
+                    acl_grants: &acl_grants,
+                    public_read: false,
+                    public_write: false,
+                    versioning: crate::BucketVersioningState::Disabled,
+                    object_lock: crate::BucketObjectLockConfig::default(),
+                })
+                .unwrap();
+        }
+
+        let bridge_node = map.node(NodeId::new(0)).unwrap().storage_node();
+        assert!(bridge_node.test_head_bucket_raw(&bucket_a).is_err());
+        assert!(bridge_node.test_head_bucket_raw(&bucket_b).is_err());
+
+        let buckets = cluster.list_buckets_for_owner(owner.as_str()).unwrap();
+        assert_eq!(
+            buckets
+                .iter()
+                .map(|bucket| &bucket.name)
+                .collect::<Vec<_>>(),
+            vec![&bucket_a, &bucket_b]
+        );
+    }
+
+    #[test]
+    fn composite_multipart_and_lifecycle_scans_fan_out_to_routed_pg_primaries() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let upload_bucket =
+            crate::BucketName::try_from("multipart-fanout-bucket".to_string()).unwrap();
+        let lifecycle_bucket = bucket_for_pg(topology, 1, "lifecycle-bucket-");
+        let aborting_bucket = bucket_for_pg(topology, 2, "aborting-bucket-");
+        let key_a = key_for_object_pg(topology, &upload_bucket, 1, "uploads/a-");
+        let key_b = key_for_object_pg(topology, &upload_bucket, 2, "uploads/b-");
+        let aborting_key = key_for_object_pg(topology, &aborting_bucket, 2, "abort-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &lifecycle_bucket);
+        create_test_bucket(&cluster, &aborting_bucket);
+        cluster
+            .put_bucket_subresource_and_load_info(
+                &lifecycle_bucket,
+                crate::PutBucketSubresource {
+                    kind: crate::BucketSubresourceKind::Lifecycle,
+                    body: "<LifecycleConfiguration/>",
+                    aux: crate::BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+
+        let upload_a = upload_id_from_label("routedUploadA");
+        let upload_b = upload_id_from_label("routedUploadB");
+        let aborting_upload = upload_id_from_label("abortingUpload");
+        seed_multipart_upload_record(
+            &map,
+            NodeId::new(1),
+            1,
+            &upload_bucket,
+            &key_a,
+            &upload_a,
+            crate::UploadState::InProgress,
+        );
+        seed_multipart_upload_record(
+            &map,
+            NodeId::new(2),
+            2,
+            &upload_bucket,
+            &key_b,
+            &upload_b,
+            crate::UploadState::InProgress,
+        );
+        seed_multipart_upload_record(
+            &map,
+            NodeId::new(2),
+            2,
+            &aborting_bucket,
+            &aborting_key,
+            &aborting_upload,
+            crate::UploadState::Aborting,
+        );
+
+        let bridge_node = map.node(NodeId::new(0)).unwrap().storage_node();
+        assert!(bridge_node
+            .test_list_multipart_uploads_for_bucket(&upload_bucket)
+            .unwrap()
+            .is_empty());
+        assert!(bridge_node.test_head_bucket_raw(&lifecycle_bucket).is_err());
+        assert!(bridge_node.test_head_bucket_raw(&aborting_bucket).is_err());
+
+        let all_uploads = cluster
+            .list_all_multipart_uploads_for_bucket(&upload_bucket)
+            .unwrap();
+        assert_eq!(
+            all_uploads
+                .iter()
+                .map(|upload| (&upload.key, &upload.upload_id))
+                .collect::<Vec<_>>(),
+            vec![(&key_a, &upload_a), (&key_b, &upload_b)]
+        );
+
+        let mut listed_uploads = cluster
+            .list_multipart_uploads_for_bucket(&upload_bucket, None, None, None, 100, 100)
+            .unwrap()
+            .uploads;
+        listed_uploads.sort_by(|left, right| left.key.cmp(&right.key));
+        assert_eq!(
+            listed_uploads
+                .iter()
+                .map(|upload| (&upload.key, &upload.upload_id))
+                .collect::<Vec<_>>(),
+            vec![(&key_a, &upload_a), (&key_b, &upload_b)]
+        );
+
+        let sweep = cluster.list_lifecycle_sweep_buckets().unwrap();
+        assert_eq!(
+            sweep
+                .lifecycle_buckets
+                .iter()
+                .map(|bucket| &bucket.name)
+                .collect::<Vec<_>>(),
+            vec![&lifecycle_bucket]
+        );
+        assert_eq!(sweep.aborting_buckets, vec![aborting_bucket]);
     }
 
     #[test]

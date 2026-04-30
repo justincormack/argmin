@@ -633,42 +633,6 @@ impl SharedStorageNode {
         )?)
     }
 
-    pub fn list_multipart_uploads_for_bucket(
-        &self,
-        bucket: &BucketName,
-        prefix: Option<&ObjectKey>,
-        key_marker: Option<&ObjectKey>,
-        upload_id_marker: Option<&UploadId>,
-        record_cap: usize,
-        max_uploads: u32,
-    ) -> Result<ListedBucketMultipartUploads, ObjectPgActionError> {
-        let mut uploads = Vec::new();
-        let mut hit_record_cap = false;
-        self.pg_topology.for_each_pg(|pg_id| {
-            if hit_record_cap {
-                return Ok::<(), ObjectPgActionError>(());
-            }
-            let pg = self.get_pg(pg_id)?;
-            let resp = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                bucket: bucket.clone(),
-                prefix: prefix.cloned(),
-                key_marker: key_marker.cloned(),
-                upload_id_marker: upload_id_marker.cloned(),
-                max_uploads: max_uploads.saturating_add(1),
-            })?;
-            uploads.extend(resp.uploads);
-            if uploads.len() >= record_cap {
-                uploads.truncate(record_cap);
-                hit_record_cap = true;
-            }
-            Ok::<(), ObjectPgActionError>(())
-        })?;
-        Ok(ListedBucketMultipartUploads {
-            uploads,
-            hit_record_cap,
-        })
-    }
-
     pub fn list_multipart_parts_for_upload<E, F>(
         &self,
         bucket: &BucketName,

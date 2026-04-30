@@ -1084,6 +1084,16 @@ Work items:
      - use `StoreError::StaleMetadataOperation` for routed metadata stale-handle
        failures; keep `StoreError::StaleMetadataPrimaryBridge` only for the
        temporary bridge surfaces that remain during 6.1
+   - second slice:
+     - move read-only composite bucket/object/multipart listing scans from the
+       metadata-primary bridge to explicit fanout over routed metadata PG
+       primaries, preserving the existing in-process merge and pagination rules
+     - include owner bucket listing, lifecycle sweep bucket discovery, full
+       lifecycle object/version/upload scans, ListObjects/ListObjectVersions,
+       and ListMultipartUploads
+     - keep bucket snapshot-pair locking, bucket delete/finalization, completed
+       multipart prune, lease bookkeeping, and worker queues on the bridge until
+       they are split into explicit per-PG or coordination paths
 2. Phase 6.2: command substrate vertical slice.
    - define the command envelope, command identity, canonical encoding, command
      checksum, and log-index shape

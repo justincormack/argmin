@@ -26,12 +26,12 @@ use crate::types::{
     AbortMultipartUploadLookup, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
     BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind,
     CreateStreamUploadReq, EcShape, FinalizeStreamPartOutcome, GenerationId,
-    ListMultipartUploadsReq, ListObjectVersionsReq, ListPartsReq, ListedBucketMultipartUploads,
-    ListedBucketObjectVersions, ListedBucketObjects, ListedMultipartParts, LoadedBucketSubresource,
-    MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartSegmentRecord,
-    MultipartUploadRecord, ObjectKey, ObjectReadSnapshot, ObjectReadSnapshotOutcome,
-    PreparedStreamPartCommit, SessionId, ShardKey, StoredObject, StreamUploadPartSnapshot,
-    StreamUploadState, StreamUploadTarget, UploadId, UploadState, WriteAck,
+    ListMultipartUploadsReq, ListObjectVersionsReq, ListPartsReq, ListedMultipartParts,
+    LoadedBucketSubresource, MultipartCompletionPreflight, MultipartCompletionSnapshot,
+    MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, ObjectReadSnapshot,
+    ObjectReadSnapshotOutcome, PreparedStreamPartCommit, SessionId, ShardKey, StoredObject,
+    StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
+    WriteAck,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::types::{
@@ -45,7 +45,6 @@ const RAPIDHASH_SECRETS: RapidSecrets = RapidSecrets::seed(0);
 const LOCK_WAIT_EVENT_THRESHOLD_US: u128 = 1_000;
 const RECLAIM_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 mod bucket_ops;
-mod listing_ops;
 mod multipart_ops;
 mod object_delete_ops;
 mod object_metadata_ops;
