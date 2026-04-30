@@ -875,10 +875,9 @@ Phase 5 implementation notes:
      without creating or modifying shard files
 3. Step 5.3 fences metadata-primary bridge calls by the `StorageCluster`
    operation epoch.
-   - `StoreError::StaleEpoch` is now the common storage-layer stale handle
-     error for metadata and payload operations surfaced through
-     `BucketSnapshotLoadError`, `BucketWriteDrainError`, and
-     `ObjectPgActionError`
+   - stale metadata-primary bridge errors are surfaced through
+     `StoreError::StaleMetadataPrimaryBridge` so they remain distinct from
+     payload placement, shard IO, and underlying metadata/SQLite failures
    - result-returning bucket, object, multipart, stream, reclaim, and lifecycle
      metadata bridge methods check the cluster handle epoch before forwarding to
      the metadata-primary `SharedStorageNode`
@@ -915,10 +914,16 @@ Phase 5 implementation notes:
      into object-not-found or best-effort silence except for explicitly
      best-effort worker queues
    - typed storage errors now preserve metadata-primary stale bridge failures
-     separately from payload placement stale epochs, and preserve inactive PG,
-     missing PG, stale shard operation, stale shard location, missing node,
-     acting-set, shard-index mismatch, and node-local shard store errors when
-     shard IO is converted to higher-level storage results
+     separately from `StalePayloadPlacement` and `StalePayloadOperation`,
+     include data PG context for stale payload operations, and preserve
+     inactive PG, missing PG, stale shard operation, stale shard location,
+     missing node, acting-set, shard-index mismatch, and node-local shard store
+     errors when shard IO is converted to higher-level storage results
+   - coordinator segment reads, including zero-size segments, route through the
+     storage payload API so stale-handle fencing is not bypassed above the
+     storage layer
+   - best-effort payload cleanup still suppresses cleanup failures, but emits a
+     trace event with the typed storage error when request tracing is active
 6. Step 5.6 closes Phase 5 with a representative stale-handle regression
    matrix and final plan update.
    - cover at least one bucket path, object path, stream path, multipart path,

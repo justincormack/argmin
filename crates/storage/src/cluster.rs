@@ -22,6 +22,8 @@ use crate::ObjectPgActionError;
 mod local;
 mod request_ops;
 
+const TRACE_TARGET: &str = "storage";
+
 #[cfg(any(test, feature = "test-hooks"))]
 type StreamAbortHook = Arc<dyn Fn() + Send + Sync>;
 
@@ -224,10 +226,11 @@ impl StorageCluster {
         self.operation_epoch
     }
 
-    fn require_current_operation_epoch(&self) -> Result<(), StoreError> {
+    fn require_current_payload_operation_epoch(&self, pg_id: u32) -> Result<(), StoreError> {
         let current_epoch = self.cluster_epoch();
         if self.operation_epoch() != current_epoch {
-            return Err(StoreError::StaleEpoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id,
                 operation_epoch: self.operation_epoch(),
                 current_epoch,
             });
@@ -654,7 +657,7 @@ impl StorageCluster {
         req: SegmentStoredBytesRequest,
         dst: &mut Vec<u8>,
     ) -> Result<(), StoreError> {
-        self.require_current_operation_epoch()?;
+        self.require_current_payload_operation_epoch(req.data_pg_id)?;
         match self.try_read_placed_segment_stored_bytes_into(req, dst)? {
             true => Ok(()),
             false => Err(StoreError::NotFound),
@@ -974,15 +977,30 @@ impl StorageCluster {
         shard_keys: &[ShardKey],
     ) {
         let placement_key = segment_payload_placement_key(okh, generation_id);
-        let Ok(locations) = self.place_payload_shards(data_pg_id, ec, &placement_key) else {
-            return;
+        let locations = match self.place_payload_shards(data_pg_id, ec, &placement_key) {
+            Ok(locations) => locations,
+            Err(error) => {
+                let error = cluster_build_error_to_store(error);
+                emit_best_effort_payload_cleanup_error("place payload shards", &error);
+                return;
+            }
         };
 
         for shard_key in shard_keys {
-            let Ok(location) = Self::placed_payload_shard_location(&locations, shard_key) else {
-                continue;
-            };
-            let _ = self.delete_payload_shard(location, shard_key);
+            match Self::placed_payload_shard_location(&locations, shard_key) {
+                Ok(location) => {
+                    if let Err(error) = self.delete_payload_shard(location, shard_key) {
+                        let error = shard_io_error_to_store(error);
+                        emit_best_effort_payload_cleanup_error(
+                            "delete placed payload shard",
+                            &error,
+                        );
+                    }
+                }
+                Err(error) => {
+                    emit_best_effort_payload_cleanup_error("resolve placed payload shard", &error);
+                }
+            }
         }
     }
 
@@ -1005,14 +1023,33 @@ impl StorageCluster {
         data_pg_id: u32,
         shard_keys: &[ShardKey],
     ) {
-        let Ok(bridge_node) = self.metadata_primary_bridge_node() else {
-            return;
+        let bridge_node = match self.metadata_primary_bridge_node() {
+            Ok(bridge_node) => bridge_node,
+            Err(error) => {
+                emit_best_effort_payload_cleanup_error(
+                    "resolve metadata-primary payload ack bridge",
+                    &error,
+                );
+                return;
+            }
         };
-        let Ok(data_pg) = bridge_node.get_pg(data_pg_id) else {
-            return;
+        let data_pg = match bridge_node.get_pg(data_pg_id) {
+            Ok(data_pg) => data_pg,
+            Err(error) => {
+                emit_best_effort_payload_cleanup_error(
+                    "resolve metadata-primary payload ack PG",
+                    &error,
+                );
+                return;
+            }
         };
         for shard_key in shard_keys {
-            let _ = data_pg.delete_shard(shard_key);
+            if let Err(error) = data_pg.delete_shard(shard_key) {
+                emit_best_effort_payload_cleanup_error(
+                    "delete metadata-primary payload ack",
+                    &error,
+                );
+            }
         }
     }
 
@@ -1154,10 +1191,12 @@ fn cluster_build_error_to_store(error: ClusterBuildError) -> StoreError {
             cluster_epoch,
             state,
         },
-        ClusterBuildError::StaleEpoch {
+        ClusterBuildError::StalePayloadPlacement {
+            pg_id,
             operation_epoch,
             current_epoch,
-        } => StoreError::StaleEpoch {
+        } => StoreError::StalePayloadOperation {
+            pg_id,
             operation_epoch,
             current_epoch,
         },
@@ -1286,4 +1325,16 @@ fn is_recoverable_physical_shard_io_error(context: &'static str, kind: std::io::
             std::io::ErrorKind::InvalidData
         ) | ("read shard file", std::io::ErrorKind::UnexpectedEof)
     )
+}
+
+fn emit_best_effort_payload_cleanup_error(operation: &'static str, error: &StoreError) {
+    let Some(trace) = observability::current_context() else {
+        return;
+    };
+    let _ = observability::event_in_context(
+        &trace,
+        TRACE_TARGET,
+        "payload_cleanup_best_effort_error",
+        Some(format_args!("operation={operation:?} error={error}")),
+    );
 }

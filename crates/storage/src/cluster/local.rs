@@ -367,7 +367,7 @@ impl LocalClusterMap {
         ec_shape: EcShape,
         stable_placement_key: &[u8],
     ) -> Result<Vec<ShardLocation>, ClusterBuildError> {
-        self.require_current_epoch_for_placement(operation_epoch)?;
+        self.require_current_epoch_for_placement(operation_epoch, data_pg_id.pg_id())?;
         self.require_active_pg_for_placement(data_pg_id.pg_id())?;
         let ec_config = ec_config_for_shape(ec_shape)?;
         let total_shards = ec_config.total_shards();
@@ -515,9 +515,11 @@ impl LocalClusterMap {
     fn require_current_epoch_for_placement(
         &self,
         operation_epoch: ClusterEpoch,
+        pg_id: PgId,
     ) -> Result<(), ClusterBuildError> {
         if operation_epoch != self.epoch {
-            return Err(ClusterBuildError::StaleEpoch {
+            return Err(ClusterBuildError::StalePayloadPlacement {
+                pg_id: pg_id.get(),
                 operation_epoch,
                 current_epoch: self.epoch,
             });
@@ -1037,7 +1039,8 @@ mod tests {
 
         assert!(matches!(
             err,
-            ClusterBuildError::StaleEpoch {
+            ClusterBuildError::StalePayloadPlacement {
+                pg_id: 0,
                 operation_epoch,
                 current_epoch,
             } if operation_epoch == ClusterEpoch::new(2).unwrap()
@@ -1164,7 +1167,8 @@ mod tests {
 
         assert!(matches!(
             err,
-            StoreError::StaleEpoch {
+            StoreError::StalePayloadOperation {
+                pg_id: 0,
                 operation_epoch,
                 current_epoch,
             } if operation_epoch == ClusterEpoch::new(2).unwrap()
@@ -1184,6 +1188,53 @@ mod tests {
                 "stale operation epoch wrote shard {shard_index}"
             );
         }
+    }
+
+    #[test]
+    fn stale_storage_cluster_payload_read_reports_data_pg() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+        let mut map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
+        Arc::get_mut(&mut map).unwrap().epoch = ClusterEpoch::new(2).unwrap();
+        let stale_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
+            Arc::clone(&map),
+            ClusterEpoch::INITIAL,
+        )
+        .unwrap();
+        let mut dst = Vec::new();
+
+        let err = stale_cluster
+            .read_segment_payload_stored_bytes_into(
+                crate::SegmentStoredBytesRequest {
+                    data_pg_id: 0,
+                    segment_okh: [53; 16],
+                    segment_vid: crate::GenerationId::MIN,
+                    stored_size: 0,
+                    segment_crc64: Some(0),
+                    ec: ec_shape,
+                },
+                &mut dst,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StoreError::StalePayloadOperation {
+                pg_id: 0,
+                operation_epoch: ClusterEpoch::INITIAL,
+                current_epoch,
+            } if current_epoch == ClusterEpoch::new(2).unwrap()
+        ));
+        assert!(dst.is_empty());
     }
 
     #[test]
@@ -1217,7 +1268,8 @@ mod tests {
 
         assert!(matches!(
             err,
-            ClusterBuildError::StaleEpoch {
+            ClusterBuildError::StalePayloadPlacement {
+                pg_id: 0,
                 operation_epoch,
                 current_epoch,
             } if operation_epoch == ClusterEpoch::new(2).unwrap()

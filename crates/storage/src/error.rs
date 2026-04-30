@@ -55,9 +55,10 @@ pub enum StoreError {
     },
 
     #[error(
-        "operation has cluster epoch {operation_epoch}, current cluster epoch is {current_epoch}"
+        "payload operation for PG {pg_id} has cluster epoch {operation_epoch}, current cluster epoch is {current_epoch}"
     )]
-    StaleEpoch {
+    StalePayloadOperation {
+        pg_id: u32,
         operation_epoch: ClusterEpoch,
         current_epoch: ClusterEpoch,
     },
@@ -263,9 +264,10 @@ pub enum ClusterBuildError {
     },
 
     #[error(
-        "operation has cluster epoch {operation_epoch}, current cluster epoch is {current_epoch}"
+        "payload placement for PG {pg_id} has cluster epoch {operation_epoch}, current cluster epoch is {current_epoch}"
     )]
-    StaleEpoch {
+    StalePayloadPlacement {
+        pg_id: u32,
         operation_epoch: ClusterEpoch,
         current_epoch: ClusterEpoch,
     },

@@ -706,13 +706,6 @@ impl ReadRuntime {
     ) -> Result<Arc<SharedPayloadBuffer>, ServerError> {
         let k = segment.ec_k as usize;
         let padded = segment.stored_size().div_ceil(k) * k;
-        let shard_size = padded / k;
-
-        if shard_size == 0 {
-            let plaintext =
-                self.decrypt_segment_if_needed(segment, part_number, sse_customer_request, &[])?;
-            return Ok(Arc::new(SharedPayloadBuffer::from_unpooled(plaintext)));
-        }
 
         let mut buf = self.payload_buffer_pool.checkout(padded);
         self.storage_node.read_segment_payload_stored_bytes_into(
@@ -970,5 +963,69 @@ impl MultipartReader {
                 sse_customer_request: self.sse_customer_request.clone(),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use storage::{
+        ClusterEpoch, EcShape, GenerationId, LocalClusterMap, NodeId, ObjectEncryption, PgTopology,
+        StorageCluster, StoreError,
+    };
+
+    use super::super::payload::PayloadBufferPool;
+    use super::*;
+
+    #[test]
+    fn stale_read_runtime_rejects_zero_size_segment_payload() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let ec_shape = EcShape { k: 4, m: 2 };
+        let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
+        let stale_cluster = StorageCluster::test_from_local_map_with_epoch(
+            Arc::clone(&map),
+            ClusterEpoch::new(2).unwrap(),
+        )
+        .unwrap();
+        let runtime = ReadRuntime {
+            storage_node: stale_cluster,
+            pg_topology: PgTopology::new(&[0]).unwrap(),
+            payload_buffer_pool: PayloadBufferPool::new(ec_shape),
+            sse_c_validator: None,
+            managed_key_provider: None,
+        };
+        let segment = SegmentPayloadRecord {
+            segment_index: 0,
+            size: 0,
+            segment_crc64: Some(0),
+            segment_okh: [61; 16],
+            segment_vid: GenerationId::MIN,
+            data_pg_id: 0,
+            ec_k: ec_shape.k,
+            ec_m: ec_shape.m,
+            encryption: ObjectEncryption::None,
+        };
+
+        let err = runtime
+            .read_segment_payload(&segment, None, None)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ServerError::Store(StoreError::StalePayloadOperation {
+                pg_id: 0,
+                operation_epoch,
+                current_epoch: ClusterEpoch::INITIAL,
+            }) if operation_epoch == ClusterEpoch::new(2).unwrap()
+        ));
     }
 }
