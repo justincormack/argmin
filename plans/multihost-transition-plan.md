@@ -924,14 +924,90 @@ Phase 5 implementation notes:
      storage layer
    - best-effort payload cleanup still suppresses cleanup failures, but emits a
      trace event with the typed storage error when request tracing is active
-6. Step 5.6 closes Phase 5 with a representative stale-handle regression
-   matrix and final plan update.
-   - cover at least one bucket path, object path, stream path, multipart path,
-     reclaim/queue path, and payload path
-   - verify stale handles fail before metadata/shard mutation, while active
-     token release paths still release already-acquired state
-   - mark Phase 5 complete once the audit, error-context pass, and regression
-     matrix are in place
+6. Step 5.6 is a bounded stabilization gate before Phase 6.
+   Phase 4 and Phase 5 exposed enough review issues around routing, stale
+   handles, payload cleanup, and partial publish failures that the current
+   bridge needs an explicit confidence pass before metadata replication
+   multiplies the same state space.
+
+   5.6 work items:
+
+   1. Operation classification matrix.
+      - classify every public `StorageCluster` method as one of:
+        epoch-fenced metadata bridge, payload placement/read/write/delete,
+        best-effort cleanup or worker queue, read-only topology/config, active
+        token release, or test hook
+      - document the expected stale-handle behavior for each class
+      - add representative stale-handle tests for each class, including
+        metadata bridge calls, payload writes, payload reads, zero-size reads,
+        best-effort cleanup, reclaim queues, and active lease-token release
+
+   2. Stateful local-cluster model.
+      - add a small proptest trace model around local cluster handles and PG
+        routes, not full S3 semantics
+      - model: create a handle at epoch N, advance the map epoch, change PG
+        state between active/peering/degraded/backfilling, place/write/read/delete
+        payload shards, call metadata bridge methods, acquire/release payload
+        leases, and run best-effort cleanup
+      - invariants: stale handles never start new metadata or payload work,
+        stale payload reads fail before returning data including zero-size
+        payloads, active lease tokens release after epoch change, route and
+        control-plane errors never become `NotFound`, and physical shard loss is
+        recoverable only in the EC read paths that explicitly allow it
+
+   3. Failure-injection coverage around cleanup and publish boundaries.
+      - inject failures around placed shard delete, metadata-primary ack delete,
+        multipart omitted-part cleanup, stream abort cleanup, and reclaim cleanup
+      - cover pre-publish and post-publish failures for direct PUT, stream
+        append, and multipart completion where hooks already exist or can be
+        added narrowly
+      - assert committed data remains readable when publish succeeded and
+        successful cleanup removes payload files plus metadata-primary ack rows
+      - for injected best-effort cleanup failures, assert the failure emits
+        typed trace context when tracing is active and leaves only the explicitly
+        allowed orphan state for later scavenger/reclaim work
+
+   4. Mechanical boundary checks.
+      - add rg-based scripts under `scripts/` with no new dependencies for the
+        review patterns we keep checking manually
+      - checks should reject broad `self.single_node` use outside the approved
+        helper area, route/control-plane errors converted through generic
+        `StoreError::Io { source: std::io::Error::other(...) }`, direct
+        production shard read/write/delete bypassing `StorageCluster` placed IO,
+        and reintroduction of metadata-primary payload write paths
+      - keep the scripts specific and auditable; they are guardrails, not a
+        substitute for tests
+
+   5. Error taxonomy tests.
+      - assert exact variants for stale metadata bridge, stale payload
+        placement, stale payload operation, stale shard operation, stale shard
+        location, inactive PG, missing PG route, node not in acting set,
+        shard-index mismatch, and node-local store failure wrapped with route
+        context
+      - include at least one coordinator-level test proving route/control-plane
+        storage errors do not become `ObjectNotFound`
+
+   6. Plan-level and guide-level invariants.
+      - add either a short guide or a dedicated plan section that states the
+        rules reviewers should enforce: the metadata-primary bridge is
+        temporary and epoch-fenced, payload IO is always placed IO,
+        metadata-primary shard rows are ack bridge only, best-effort cleanup may
+        suppress but must trace, token release is not new work, and
+        crash-durable orphan cleanup belongs to a later scavenger/reclaim phase
+
+   5.6 exit criteria:
+
+   - operation classification matrix exists and all public `StorageCluster`
+     methods are accounted for
+   - stateful local-cluster model covers stale handles, route state changes,
+     lease release, best-effort cleanup, and recoverable physical shard loss
+   - failure-injection tests cover the known publish/cleanup boundaries from
+     Phases 4 and 5
+   - mechanical boundary checks are wired into the normal verification path:
+     either CI or the documented pre-commit/full-suite gate
+   - error taxonomy regressions pin the typed stale/route/control-plane errors
+   - Phase 5 is marked complete only after these checks pass with the full test
+     suite
 
 ## Phase 6: PG Metadata Replication
 
