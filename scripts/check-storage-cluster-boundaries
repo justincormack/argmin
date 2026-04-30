@@ -1,0 +1,99 @@
+#!/bin/env bash
+
+set -euo pipefail
+
+if ! command -v rg >/dev/null 2>&1; then
+    echo "error: rg is required for scripts/check-storage-cluster-boundaries" >&2
+    exit 1
+fi
+
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+cd "$repo_root"
+
+failed=0
+
+fail_with_matches() {
+    local label=$1
+    local matches=$2
+
+    if [[ -n "$matches" ]]; then
+        echo
+        echo "== $label =="
+        printf '%s\n' "$matches"
+        failed=1
+    fi
+}
+
+echo "Storage cluster boundary checks"
+
+single_node_matches=$(
+    rg -n --color=never 'self\.single_node' \
+        crates/storage/src/cluster.rs \
+        crates/storage/src/cluster/request_ops.rs \
+        crates/server-core/src \
+        || true
+)
+unexpected_single_node=$(
+    printf '%s\n' "$single_node_matches" \
+        | rg -v 'Ok\(self\.single_node\.as_ref\(\)\)|Ok\(Arc::clone\(&self\.single_node\)\)|self\.single_node\.as_ref\(\)' \
+        || true
+)
+fail_with_matches \
+    "Unexpected direct self.single_node access outside approved StorageCluster helpers" \
+    "$unexpected_single_node"
+
+direct_shard_matches=$(
+    rg -n --color=never '\.(write_shard|read_shard|delete_shard|write_shard_file|read_shard_file|read_shard_file_into)\(' \
+        crates/storage/src \
+        crates/server-core/src \
+        -g '*.rs' \
+        -g '!crates/storage/src/tests/**' \
+        -g '!crates/storage/src/cluster.rs' \
+        -g '!crates/storage/src/cluster/local.rs' \
+        -g '!crates/storage/src/pg_store.rs' \
+        -g '!crates/storage/src/traits.rs' \
+        || true
+)
+unexpected_direct_shard=$(
+    printf '%s\n' "$direct_shard_matches" \
+        | awk -F: '($1 == "crates/storage/src/node.rs" && $2 >= 1570) { next } { print }'
+)
+fail_with_matches \
+    "Production shard IO bypasses StorageCluster placed IO" \
+    "$unexpected_direct_shard"
+
+legacy_payload_matches=$(
+    rg -n --color=never \
+        'write_direct_put_segment_shards|PayloadShardStorage::MetadataPrimary|payload_storage:[[:space:]]*PayloadShardStorage::MetadataPrimary|write_erasure_coded_segment_shards\(' \
+        crates/storage/src \
+        crates/server-core/src \
+        -g '*.rs' \
+        || true
+)
+fail_with_matches \
+    "Legacy metadata-primary payload write path reintroduced" \
+    "$legacy_payload_matches"
+
+generic_route_io_matches=$(
+    rg -n --color=never \
+        'std::io::Error::other\((error|other)\.to_string\(\)\)|StoreError::Io[[:space:]]*\{[[:space:]]*context:[^}]*route|StoreError::Io[[:space:]]*\{[[:space:]]*context:[^}]*PG' \
+        crates/storage/src/cluster.rs \
+        crates/storage/src/cluster/local.rs \
+        || true
+)
+allowed_generic_route_io=$(
+    printf '%s\n' "$generic_route_io_matches" \
+        | rg -v 'crates/storage/src/cluster.rs:.*source: std::io::Error::other\(other\.to_string\(\)\)' \
+        || true
+)
+fail_with_matches \
+    "Route/control-plane error converted through generic StoreError::Io" \
+    "$allowed_generic_route_io"
+
+if [[ "$failed" -ne 0 ]]; then
+    echo
+    echo "storage cluster boundary checks failed" >&2
+    exit 1
+fi
+
+echo "storage cluster boundary checks passed"

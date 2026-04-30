@@ -1009,6 +1009,17 @@ Phase 5 implementation notes:
    - Phase 5 is marked complete only after these checks pass with the full test
      suite
 
+   5.6 implementation notes:
+
+   - `guides/storage-cluster-invariants.md` now defines the operation classes,
+     bridge-era invariants, and the public `StorageCluster` method matrix
+   - `scripts/check-storage-cluster-boundaries` now guards the recurring review
+     patterns around `self.single_node`, direct shard IO bypasses, legacy
+     metadata-primary payload writes, and generic route/control-plane IO
+     conversions
+   - `guides/testing.md` includes the boundary script in broad local
+     verification so the check is part of the documented full-suite gate
+
 ## Phase 6: PG Metadata Replication
 
 Turn per-PG metadata mutation into primary-owned replicated commands.

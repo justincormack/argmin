@@ -22,7 +22,8 @@ cargo test -p auth -- --nocapture
 cargo test -p server-http -- --nocapture
 
 # Broad local verification.
-cargo test --workspace --no-fail-fast
+cargo nextest run
+./scripts/check-storage-cluster-boundaries
 cargo clippy --all-targets --all-features -- -D warnings
 
 # Integration coverage.
@@ -64,6 +65,22 @@ under test is AWS or another remote S3 endpoint. In those cases, bounded
 eventual checks are correct because AWS control-plane convergence is part of
 the real behavior being modeled. That is acceptable in `crates/s3-tests` and
 similar external suites, but not in ordinary unit/property tests.
+
+## Storage Cluster Boundary Checks
+
+Run `./scripts/check-storage-cluster-boundaries` as part of broad local
+verification while the multihost transition is in progress. The script fails on
+review patterns that should break loudly before Phase 6:
+
+- broad `self.single_node` use outside the approved `StorageCluster` bridge
+  helpers
+- production shard read/write/delete calls that bypass placed `StorageCluster`
+  IO
+- legacy metadata-primary payload write paths
+- route/control-plane errors converted through generic `StoreError::Io`
+
+The operation classes and bridge-era invariants are documented in
+[storage-cluster-invariants.md](storage-cluster-invariants.md).
 
 ## External Test Scripts
 

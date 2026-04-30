@@ -1397,6 +1397,51 @@ mod tests {
     }
 
     #[test]
+    fn stale_storage_cluster_handle_rejects_multipart_metadata_before_lookup() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+        let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
+        let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let stale_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
+            Arc::clone(&map),
+            ClusterEpoch::new(2).unwrap(),
+        )
+        .unwrap();
+        let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+        let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+        let upload_id = crate::UploadId::try_from(".".repeat(128)).unwrap();
+
+        let err = stale_cluster
+            .load_multipart_upload(&bucket, &key, &upload_id)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::BucketSnapshotLoadError::Store(StoreError::StaleMetadataPrimaryBridge {
+                metadata_node_id: 0,
+                operation_epoch,
+                current_epoch,
+            }) if operation_epoch == ClusterEpoch::new(2).unwrap()
+                && current_epoch == ClusterEpoch::INITIAL
+        ));
+        let err = current_cluster
+            .load_multipart_upload(&bucket, &key, &upload_id)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::NoSuchUpload { .. })
+        ));
+    }
+
+    #[test]
     fn object_payload_lease_token_releases_after_cluster_epoch_transition() {
         let tmp = test_util::tempdir();
         let node_ids = [
