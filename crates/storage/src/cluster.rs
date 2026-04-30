@@ -5,11 +5,12 @@ use std::sync::{Mutex, OnceLock};
 use ec::{EcConfig, ErasureCodec};
 use placement::NodeId;
 
+use local::LocalClusterRuntimeState;
 pub use local::{LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute};
 
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 use crate::node::{DirectPutCommitError, SharedStorageNode};
-use crate::traits::ShardStore;
+use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
     BucketName, ClusterEpoch, CommitDirectPutObjectReq, DataPgId, DirectPutCommitSnapshot,
     DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
@@ -209,7 +210,7 @@ impl ShardLocation {
 
 pub struct ObjectPayloadLease {
     cluster: Weak<StorageCluster>,
-    lease_node: Arc<SharedStorageNode>,
+    runtime_state: Arc<LocalClusterRuntimeState>,
     bucket: BucketName,
     key: ObjectKey,
     generation_id: GenerationId,
@@ -219,14 +220,14 @@ pub struct ObjectPayloadLease {
 impl ObjectPayloadLease {
     fn new(
         cluster: Weak<StorageCluster>,
-        lease_node: Arc<SharedStorageNode>,
+        runtime_state: Arc<LocalClusterRuntimeState>,
         bucket: BucketName,
         key: ObjectKey,
         generation_id: GenerationId,
     ) -> Self {
         Self {
             cluster,
-            lease_node,
+            runtime_state,
             bucket,
             key,
             generation_id,
@@ -235,7 +236,7 @@ impl ObjectPayloadLease {
     }
 
     pub fn release(mut self) -> ReleasedObjectPayloadLease {
-        let remaining = self.lease_node.release_object_payload_lease(
+        let remaining = self.runtime_state.release_object_payload_lease(
             &self.bucket,
             &self.key,
             self.generation_id,
@@ -243,7 +244,7 @@ impl ObjectPayloadLease {
         self.released = true;
         ReleasedObjectPayloadLease {
             cluster: self.cluster.clone(),
-            lease_node: Arc::clone(&self.lease_node),
+            runtime_state: Arc::clone(&self.runtime_state),
             bucket: self.bucket.clone(),
             key: self.key.clone(),
             generation_id: self.generation_id,
@@ -255,7 +256,7 @@ impl ObjectPayloadLease {
 impl Drop for ObjectPayloadLease {
     fn drop(&mut self) {
         if !self.released {
-            let _ = self.lease_node.release_object_payload_lease(
+            let _ = self.runtime_state.release_object_payload_lease(
                 &self.bucket,
                 &self.key,
                 self.generation_id,
@@ -266,7 +267,7 @@ impl Drop for ObjectPayloadLease {
 
 pub struct ReleasedObjectPayloadLease {
     cluster: Weak<StorageCluster>,
-    lease_node: Arc<SharedStorageNode>,
+    runtime_state: Arc<LocalClusterRuntimeState>,
     bucket: BucketName,
     key: ObjectKey,
     generation_id: GenerationId,
@@ -290,8 +291,11 @@ impl ReleasedObjectPayloadLease {
     }
 
     pub fn enqueue_object_payload_reclaim(&self) {
-        self.lease_node
-            .enqueue_object_payload_reclaim(&self.bucket, &self.key, self.generation_id);
+        self.runtime_state.enqueue_object_payload_reclaim(
+            &self.bucket,
+            &self.key,
+            self.generation_id,
+        );
     }
 }
 
@@ -363,6 +367,7 @@ impl StorageCluster {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     fn require_current_metadata_primary_bridge_epoch(&self) -> Result<(), StoreError> {
         let current_epoch = self.cluster_epoch();
         if self.operation_epoch() != current_epoch {
@@ -375,17 +380,12 @@ impl StorageCluster {
         Ok(())
     }
 
-    // Transitional metadata-primary bridge. Production metadata paths must pass
-    // through this helper until Phase 6 replaces the bridge with routed PG
-    // commands.
+    // Transitional metadata-primary test hook bridge. Production metadata paths
+    // must use routed PG primaries.
+    #[cfg(any(test, feature = "test-hooks"))]
     fn metadata_primary_bridge_node(&self) -> Result<&SharedStorageNode, StoreError> {
         self.require_current_metadata_primary_bridge_epoch()?;
         Ok(self.single_node.as_ref())
-    }
-
-    fn metadata_primary_bridge_node_arc(&self) -> Result<Arc<SharedStorageNode>, StoreError> {
-        self.require_current_metadata_primary_bridge_epoch()?;
-        Ok(Arc::clone(&self.single_node))
     }
 
     // Read-only topology/config helpers still use the metadata-primary node
@@ -906,10 +906,20 @@ impl StorageCluster {
     }
 
     pub fn list_stream_upload_sessions_best_effort(&self) -> Vec<StreamUploadRecord> {
-        let Ok(bridge_node) = self.metadata_primary_bridge_node() else {
-            return Vec::new();
-        };
-        bridge_node.list_all_stream_uploads_best_effort()
+        let mut sessions = Vec::new();
+        for &pg_id in self.metadata_primary_topology_node().pg_ids() {
+            let Ok(node) = self.metadata_pg_primary_node(pg_id) else {
+                continue;
+            };
+            let Ok(pg) = node.get_pg(pg_id) else {
+                continue;
+            };
+            let Ok(mut local) = pg.list_all_stream_uploads() else {
+                continue;
+            };
+            sessions.append(&mut local);
+        }
+        sessions
     }
 
     pub fn read_segment_payload_stored_bytes_into(

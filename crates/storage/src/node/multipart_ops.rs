@@ -17,32 +17,6 @@ impl SharedStorageNode {
         Ok(bucket_pg.next_completed_multipart_upload_order_for_bucket(bucket)?)
     }
 
-    pub fn prune_completed_multipart_uploads_for_bucket_with_limit(
-        &self,
-        bucket: &BucketName,
-        keep: usize,
-    ) -> Result<(), ObjectPgActionError> {
-        maybe_run_before_completed_multipart_prune_hook(bucket)?;
-        let mut uploads: Vec<(u32, UploadId, u64)> = Vec::new();
-        self.pg_topology.for_each_pg(|pg_id| {
-            let pg = self.get_pg(pg_id)?;
-            let local = pg.list_completed_multipart_uploads_for_bucket(bucket.as_str())?;
-            uploads.extend(
-                local
-                    .into_iter()
-                    .map(|(upload_id, completion_order)| (pg_id, upload_id, completion_order)),
-            );
-            Ok::<(), ObjectPgActionError>(())
-        })?;
-
-        uploads.sort_by_key(|entry| std::cmp::Reverse(entry.2));
-        for (pg_id, upload_id, _) in uploads.into_iter().skip(keep) {
-            let pg = self.get_pg(pg_id)?;
-            pg.delete_completed_multipart_upload(&upload_id)?;
-        }
-        Ok(())
-    }
-
     fn multipart_part_data_pg_id(
         &self,
         bucket: &BucketName,

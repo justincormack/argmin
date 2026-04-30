@@ -42,6 +42,29 @@ impl VersionCursor {
     }
 }
 
+fn merge_bucket_snapshot_pair_request(
+    source: BucketSnapshotRequest,
+    destination: BucketSnapshotRequest,
+) -> BucketSnapshotRequest {
+    BucketSnapshotRequest {
+        policy: source.policy || destination.policy,
+        tags: match (source.tags, destination.tags) {
+            (BucketSnapshotTagsRequest::Always, _) | (_, BucketSnapshotTagsRequest::Always) => {
+                BucketSnapshotTagsRequest::Always
+            }
+            (BucketSnapshotTagsRequest::IfBucketAbacEnabled, _)
+            | (_, BucketSnapshotTagsRequest::IfBucketAbacEnabled) => {
+                BucketSnapshotTagsRequest::IfBucketAbacEnabled
+            }
+            (BucketSnapshotTagsRequest::NotRequested, BucketSnapshotTagsRequest::NotRequested) => {
+                BucketSnapshotTagsRequest::NotRequested
+            }
+        },
+        lifecycle: source.lifecycle || destination.lifecycle,
+        cors: source.cors || destination.cors,
+    }
+}
+
 // Metadata routing moves incrementally in Phase 6. Single-PG bucket/object
 // operations route through the local metadata PG primary; composite scans fan
 // out across routed PG primaries and merge locally.
@@ -141,21 +164,202 @@ impl super::StorageCluster {
         source: (&BucketName, BucketSnapshotRequest),
         destination: (&BucketName, BucketSnapshotRequest),
     ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
-            .load_bucket_snapshot_pair(source, destination)
+        if source.0 == destination.0 {
+            let merged_request = merge_bucket_snapshot_pair_request(source.1, destination.1);
+            let bucket = self.load_bucket_snapshot(source.0, merged_request)?;
+            return Ok(BucketSnapshotPair::Same {
+                bucket: Box::new(bucket),
+            });
+        }
+
+        let source_pg_id = self.bucket_metadata_pg_id(source.0);
+        let destination_pg_id = self.bucket_metadata_pg_id(destination.0);
+        if source_pg_id == destination_pg_id {
+            let bucket_pg = self.metadata_pg(source_pg_id)?;
+            return Ok(BucketSnapshotPair::Distinct {
+                source: Box::new(crate::SharedStorageNode::load_bucket_snapshot_from_pg(
+                    &bucket_pg, source.0, source.1,
+                )?),
+                destination: Box::new(crate::SharedStorageNode::load_bucket_snapshot_from_pg(
+                    &bucket_pg,
+                    destination.0,
+                    destination.1,
+                )?),
+            });
+        }
+
+        let (source_snapshot, destination_snapshot) = if source_pg_id < destination_pg_id {
+            let source_pg = self.metadata_pg(source_pg_id)?;
+            let destination_pg = self.metadata_pg(destination_pg_id)?;
+            (
+                crate::SharedStorageNode::load_bucket_snapshot_from_pg(
+                    &source_pg, source.0, source.1,
+                )?,
+                crate::SharedStorageNode::load_bucket_snapshot_from_pg(
+                    &destination_pg,
+                    destination.0,
+                    destination.1,
+                )?,
+            )
+        } else {
+            let destination_pg = self.metadata_pg(destination_pg_id)?;
+            let source_pg = self.metadata_pg(source_pg_id)?;
+            (
+                crate::SharedStorageNode::load_bucket_snapshot_from_pg(
+                    &source_pg, source.0, source.1,
+                )?,
+                crate::SharedStorageNode::load_bucket_snapshot_from_pg(
+                    &destination_pg,
+                    destination.0,
+                    destination.1,
+                )?,
+            )
+        };
+
+        Ok(BucketSnapshotPair::Distinct {
+            source: Box::new(source_snapshot),
+            destination: Box::new(destination_snapshot),
+        })
     }
 
     pub fn begin_bucket_delete(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
-        self.metadata_primary_bridge_node()?
-            .begin_bucket_delete(bucket)
+        let node = self.bucket_metadata_primary_node(bucket)?;
+        let drain = node.begin_bucket_write_drain(bucket)?;
+        crate::node::maybe_run_after_begin_bucket_delete_drain_hook(bucket);
+
+        if self.bucket_has_visible_data(bucket, true)? {
+            return Err(crate::error::MetadataError::BucketNotEmpty.into());
+        }
+
+        node.mark_bucket_deleting(bucket)?;
+        drain.persist();
+        Ok(())
     }
 
     pub fn try_finalize_bucket_delete(
         &self,
         bucket: &BucketName,
     ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
-        self.metadata_primary_bridge_node()?
-            .try_finalize_bucket_delete(bucket)
+        let bucket_node = self.bucket_metadata_primary_node(bucket)?;
+        let _bucket_guard = bucket_node.lock_bucket(bucket);
+        let bucket_pg_id = self.bucket_metadata_pg_id(bucket);
+        {
+            let bucket_pg = self.metadata_pg(bucket_pg_id)?;
+            let info = match PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket) {
+                Ok(info) => info,
+                Err(crate::error::MetadataError::BucketNotFound { .. }) => {
+                    return Ok(BucketDeleteFinalizeOutcome::NotFound);
+                }
+                Err(other) => return Err(other.into()),
+            };
+            if info.state != BucketState::Deleting {
+                return Ok(BucketDeleteFinalizeOutcome::NotDeleting);
+            }
+        }
+
+        if self.bucket_has_visible_data(bucket, false)? {
+            return Ok(BucketDeleteFinalizeOutcome::Pending);
+        }
+
+        let reclaim_roots = self.bucket_payload_reclaim_roots(bucket)?;
+        for root in &reclaim_roots {
+            if self.local_map.runtime_state().object_payload_lease_count(
+                &root.bucket,
+                &root.key,
+                root.generation_id,
+            ) == 0
+            {
+                self.enqueue_object_payload_reclaim(&root.bucket, &root.key, root.generation_id);
+            }
+        }
+
+        if !reclaim_roots.is_empty()
+            || self
+                .local_map
+                .runtime_state()
+                .bucket_object_payload_lease_count(bucket)
+                != 0
+        {
+            return Ok(BucketDeleteFinalizeOutcome::Pending);
+        }
+
+        self.delete_completed_multipart_uploads_for_bucket(bucket)?;
+
+        let bucket_pg = self.metadata_pg(bucket_pg_id)?;
+        match PgMetadataStore::delete_bucket(&*bucket_pg, bucket) {
+            Ok(()) => Ok(BucketDeleteFinalizeOutcome::Finalized),
+            Err(crate::error::MetadataError::BucketNotFound { .. }) => {
+                Ok(BucketDeleteFinalizeOutcome::NotFound)
+            }
+            Err(other) => Err(other.into()),
+        }
+    }
+
+    fn bucket_has_visible_data(
+        &self,
+        bucket: &BucketName,
+        include_stream_uploads: bool,
+    ) -> Result<bool, BucketWriteDrainError> {
+        for pg_id in self.metadata_pg_ids() {
+            let pg = self.metadata_pg(pg_id)?;
+            let versions = pg.list_object_versions(&ListObjectVersionsReq {
+                bucket: bucket.clone(),
+                prefix: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: 1,
+            })?;
+            if !versions.versions.is_empty() {
+                return Ok(true);
+            }
+
+            let uploads = pg.list_multipart_uploads(&ListMultipartUploadsReq {
+                bucket: bucket.clone(),
+                prefix: None,
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: 1,
+            })?;
+            if !uploads.uploads.is_empty() {
+                return Ok(true);
+            }
+
+            if include_stream_uploads {
+                let sessions = pg.list_all_stream_uploads()?;
+                if sessions
+                    .iter()
+                    .any(|session| session.bucket == bucket.as_str())
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn bucket_payload_reclaim_roots(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Vec<PayloadReclaimRoot>, BucketWriteDrainError> {
+        let mut roots = Vec::new();
+        for pg_id in self.metadata_pg_ids() {
+            let pg = self.metadata_pg(pg_id)?;
+            if let Some(root) = PgMetadataStore::get_bucket_payload_reclaim_root(&*pg, bucket)? {
+                roots.push(root);
+            }
+        }
+        Ok(roots)
+    }
+
+    fn delete_completed_multipart_uploads_for_bucket(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<(), BucketWriteDrainError> {
+        for pg_id in self.metadata_pg_ids() {
+            let pg = self.metadata_pg(pg_id)?;
+            PgMetadataStore::delete_completed_multipart_uploads_for_bucket(&*pg, bucket)?;
+        }
+        Ok(())
     }
 
     pub fn head_bucket_info(
@@ -293,8 +497,25 @@ impl super::StorageCluster {
         bucket: &BucketName,
         keep: usize,
     ) -> Result<(), ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
-            .prune_completed_multipart_uploads_for_bucket_with_limit(bucket, keep)
+        crate::node::maybe_run_before_completed_multipart_prune_hook(bucket)?;
+
+        let mut uploads: Vec<(u32, UploadId, u64)> = Vec::new();
+        for pg_id in self.metadata_pg_ids() {
+            let pg = self.metadata_pg(pg_id)?;
+            let local = pg.list_completed_multipart_uploads_for_bucket(bucket.as_str())?;
+            uploads.extend(
+                local
+                    .into_iter()
+                    .map(|(upload_id, completion_order)| (pg_id, upload_id, completion_order)),
+            );
+        }
+
+        uploads.sort_by_key(|entry| std::cmp::Reverse(entry.2));
+        for (pg_id, upload_id, _) in uploads.into_iter().skip(keep) {
+            let pg = self.metadata_pg(pg_id)?;
+            pg.delete_completed_multipart_upload(&upload_id)?;
+        }
+        Ok(())
     }
 
     pub fn list_lifecycle_sweep_buckets(
@@ -945,11 +1166,12 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<ObjectPayloadLease, StoreError> {
-        let node = self.metadata_primary_bridge_node_arc()?;
-        node.acquire_object_payload_lease(bucket, key, generation_id);
+        self.object_metadata_primary_node(bucket, key)?;
+        let runtime_state = self.local_map.runtime_state();
+        runtime_state.acquire_object_payload_lease(bucket, key, generation_id);
         Ok(ObjectPayloadLease::new(
             std::sync::Arc::downgrade(self),
-            node,
+            runtime_state,
             bucket.clone(),
             key.clone(),
             generation_id,
@@ -963,18 +1185,22 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> usize {
-        let Ok(node) = self.metadata_primary_bridge_node() else {
+        if self.operation_epoch() != self.cluster_epoch() {
             return 0;
-        };
-        node.object_payload_lease_count(bucket, key, generation_id)
+        }
+        self.local_map
+            .runtime_state()
+            .object_payload_lease_count(bucket, key, generation_id)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize {
-        let Ok(node) = self.metadata_primary_bridge_node() else {
+        if self.operation_epoch() != self.cluster_epoch() {
             return 0;
-        };
-        node.bucket_object_payload_lease_count(bucket)
+        }
+        self.local_map
+            .runtime_state()
+            .bucket_object_payload_lease_count(bucket)
     }
 
     pub fn enqueue_object_payload_reclaim(
@@ -983,37 +1209,43 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) {
-        let Ok(bridge_node) = self.metadata_primary_bridge_node() else {
+        if self.operation_epoch() != self.cluster_epoch() {
             return;
-        };
-        bridge_node.enqueue_object_payload_reclaim(bucket, key, generation_id);
+        }
+        self.local_map
+            .runtime_state()
+            .enqueue_object_payload_reclaim(bucket, key, generation_id);
     }
 
     pub fn enqueue_bucket_delete_finalize(&self, bucket: &BucketName) {
-        let Ok(bridge_node) = self.metadata_primary_bridge_node() else {
+        if self.operation_epoch() != self.cluster_epoch() {
             return;
-        };
-        bridge_node.enqueue_bucket_delete_finalize(bucket);
+        }
+        self.local_map
+            .runtime_state()
+            .enqueue_bucket_delete_finalize(bucket);
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn try_take_reclaim_work(&self) -> Option<ReclaimWorkItem> {
-        self.metadata_primary_bridge_node()
-            .ok()?
-            .try_take_reclaim_work()
+        if self.operation_epoch() != self.cluster_epoch() {
+            return None;
+        }
+        self.local_map.runtime_state().try_take_reclaim_work()
     }
 
     pub fn wait_for_reclaim_work(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
-        self.metadata_primary_bridge_node()
-            .ok()?
-            .wait_for_reclaim_work(stop)
+        if self.operation_epoch() != self.cluster_epoch() {
+            return None;
+        }
+        self.local_map.runtime_state().wait_for_reclaim_work(stop)
     }
 
     pub fn wake_reclaim_workers(&self) {
-        let Ok(bridge_node) = self.metadata_primary_bridge_node() else {
+        if self.operation_epoch() != self.cluster_epoch() {
             return;
-        };
-        bridge_node.wake_reclaim_workers();
+        }
+        self.local_map.runtime_state().wake_reclaim_workers();
     }
 
     pub fn reclaim_object_payload_if_unleased(
@@ -1022,7 +1254,6 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<bool, ObjectPgActionError> {
-        let lease_node = self.metadata_primary_bridge_node()?;
         let node = self.object_metadata_primary_node(bucket, key)?;
 
         enum ReclaimPayload {
@@ -1030,14 +1261,24 @@ impl super::StorageCluster {
             Multipart(MultipartReclaimRecord),
         }
 
-        if lease_node.object_payload_lease_count(bucket, key, generation_id) != 0 {
+        if self
+            .local_map
+            .runtime_state()
+            .object_payload_lease_count(bucket, key, generation_id)
+            != 0
+        {
             return Ok(false);
         }
 
         let meta_pg_id = self.object_metadata_pg_id(bucket, key);
         let reclaim = {
             let meta_pg = node.get_pg(meta_pg_id)?;
-            if lease_node.object_payload_lease_count(bucket, key, generation_id) != 0 {
+            if self
+                .local_map
+                .runtime_state()
+                .object_payload_lease_count(bucket, key, generation_id)
+                != 0
+            {
                 return Ok(false);
             }
 
@@ -1055,7 +1296,12 @@ impl super::StorageCluster {
             return Ok(false);
         };
 
-        if lease_node.object_payload_lease_count(bucket, key, generation_id) != 0 {
+        if self
+            .local_map
+            .runtime_state()
+            .object_payload_lease_count(bucket, key, generation_id)
+            != 0
+        {
             return Ok(false);
         }
 
@@ -1098,7 +1344,12 @@ impl super::StorageCluster {
         }
 
         let meta_pg = node.get_pg(meta_pg_id)?;
-        if lease_node.object_payload_lease_count(bucket, key, generation_id) != 0 {
+        if self
+            .local_map
+            .runtime_state()
+            .object_payload_lease_count(bucket, key, generation_id)
+            != 0
+        {
             return Ok(false);
         }
 

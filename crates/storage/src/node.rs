@@ -240,12 +240,12 @@ pub(super) fn maybe_run_after_bucket_write_reservation_retry_hook(bucket: &Bucke
 pub(super) fn maybe_run_after_bucket_write_reservation_retry_hook(_: &BucketName) {}
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub(super) fn maybe_run_after_begin_bucket_delete_drain_hook(bucket: &BucketName) {
+pub(crate) fn maybe_run_after_begin_bucket_delete_drain_hook(bucket: &BucketName) {
     maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.after_begin_bucket_delete_drain)
 }
 
 #[cfg(not(any(test, feature = "test-hooks")))]
-pub(super) fn maybe_run_after_begin_bucket_delete_drain_hook(_: &BucketName) {}
+pub(crate) fn maybe_run_after_begin_bucket_delete_drain_hook(_: &BucketName) {}
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub(super) fn maybe_run_before_multipart_completion_lock_hook(bucket: &BucketName) {
@@ -264,7 +264,7 @@ pub(super) fn maybe_run_after_multipart_completion_lock_hook(bucket: &BucketName
 pub(super) fn maybe_run_after_multipart_completion_lock_hook(_: &BucketName) {}
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub(super) fn maybe_run_before_completed_multipart_prune_hook(
+pub(crate) fn maybe_run_before_completed_multipart_prune_hook(
     bucket: &BucketName,
 ) -> Result<(), ObjectPgActionError> {
     let hooks = BUCKET_SCOPED_TEST_HOOKS
@@ -281,7 +281,7 @@ pub(super) fn maybe_run_before_completed_multipart_prune_hook(
 }
 
 #[cfg(not(any(test, feature = "test-hooks")))]
-pub(super) fn maybe_run_before_completed_multipart_prune_hook(
+pub(crate) fn maybe_run_before_completed_multipart_prune_hook(
     _: &BucketName,
 ) -> Result<(), ObjectPgActionError> {
     Ok(())

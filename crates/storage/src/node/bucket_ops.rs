@@ -539,7 +539,7 @@ impl SharedStorageNode {
         }
     }
 
-    pub(super) fn load_bucket_snapshot_from_pg(
+    pub(crate) fn load_bucket_snapshot_from_pg(
         bucket_pg: &PgStore,
         bucket: &BucketName,
         request: BucketSnapshotRequest,

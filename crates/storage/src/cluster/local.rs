@@ -1,17 +1,19 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
 
 use super::ShardLocation;
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 use crate::{
-    ClusterEpoch, DataPgId, EcShape, PgId, PgState, ShardIndex, ShardKey, SharedStorageNode,
-    WriteAck,
+    BucketName, ClusterEpoch, DataPgId, EcShape, GenerationId, ObjectKey, PgId, PgState,
+    ReclaimWorkItem, ShardIndex, ShardKey, SharedStorageNode, WriteAck,
 };
 
 const PAYLOAD_SHARD_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin/payload-shard-placement/v1";
+const LOCAL_RECLAIM_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalNodeStoreConfig {
@@ -205,12 +207,183 @@ impl LocalPgRoute {
 }
 
 #[derive(Debug)]
+pub(crate) struct LocalClusterRuntimeState {
+    object_payload_leases: Mutex<HashMap<LocalReclaimRoot, usize>>,
+    reclaim_queue: (Mutex<LocalReclaimQueueState>, Condvar),
+}
+
+type LocalReclaimRoot = (BucketName, ObjectKey, GenerationId);
+
+#[derive(Debug)]
+struct LocalReclaimQueueState {
+    object_queue: VecDeque<LocalReclaimRoot>,
+    queued_objects: HashSet<LocalReclaimRoot>,
+    bucket_delete_queue: VecDeque<BucketName>,
+    queued_bucket_deletes: HashSet<BucketName>,
+}
+
+impl LocalClusterRuntimeState {
+    fn new() -> Self {
+        Self {
+            object_payload_leases: Mutex::new(HashMap::new()),
+            reclaim_queue: (
+                Mutex::new(LocalReclaimQueueState {
+                    object_queue: VecDeque::new(),
+                    queued_objects: HashSet::new(),
+                    bucket_delete_queue: VecDeque::new(),
+                    queued_bucket_deletes: HashSet::new(),
+                }),
+                Condvar::new(),
+            ),
+        }
+    }
+
+    pub(crate) fn acquire_object_payload_lease(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) {
+        let mut leases = self
+            .object_payload_leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *leases
+            .entry((bucket.clone(), key.clone(), generation_id))
+            .or_insert(0) += 1;
+    }
+
+    pub(crate) fn release_object_payload_lease(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> usize {
+        let mut leases = self
+            .object_payload_leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = (bucket.clone(), key.clone(), generation_id);
+        let entry = leases
+            .get_mut(&root)
+            .expect("object payload lease release without acquire");
+        *entry -= 1;
+        let remaining = *entry;
+        if remaining == 0 {
+            leases.remove(&root);
+        }
+        remaining
+    }
+
+    pub(crate) fn object_payload_lease_count(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> usize {
+        let leases = self
+            .object_payload_leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        leases
+            .get(&(bucket.clone(), key.clone(), generation_id))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize {
+        let leases = self
+            .object_payload_leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        leases
+            .iter()
+            .filter(|((lease_bucket, _, _), _)| lease_bucket == bucket)
+            .map(|(_, count)| *count)
+            .sum()
+    }
+
+    pub(crate) fn enqueue_object_payload_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) {
+        let root = (bucket.clone(), key.clone(), generation_id);
+        let (state_lock, cv) = &self.reclaim_queue;
+        let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if state.queued_objects.insert(root.clone()) {
+            state.object_queue.push_back(root);
+            cv.notify_one();
+        }
+    }
+
+    pub(crate) fn enqueue_bucket_delete_finalize(&self, bucket: &BucketName) {
+        let (state_lock, cv) = &self.reclaim_queue;
+        let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let bucket = bucket.clone();
+        if state.queued_bucket_deletes.insert(bucket.clone()) {
+            state.bucket_delete_queue.push_back(bucket);
+            cv.notify_one();
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn try_take_reclaim_work(&self) -> Option<ReclaimWorkItem> {
+        let mut state = self
+            .reclaim_queue
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(root) = state.object_queue.pop_front() {
+            state.queued_objects.remove(&root);
+            return Some(ReclaimWorkItem::ObjectPayload(root));
+        }
+        let bucket = state.bucket_delete_queue.pop_front()?;
+        state.queued_bucket_deletes.remove(&bucket);
+        Some(ReclaimWorkItem::BucketDelete(bucket))
+    }
+
+    pub(crate) fn wait_for_reclaim_work(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
+        let (state_lock, cv) = &self.reclaim_queue;
+        let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
+        while state.object_queue.is_empty()
+            && state.bucket_delete_queue.is_empty()
+            && !stop.load(Ordering::SeqCst)
+        {
+            let (next_state, _) = cv
+                .wait_timeout(
+                    state,
+                    std::time::Duration::from_millis(LOCAL_RECLAIM_WORKER_WAIT_POLL_MILLIS),
+                )
+                .unwrap_or_else(|e| e.into_inner());
+            state = next_state;
+        }
+        if stop.load(Ordering::SeqCst) {
+            return None;
+        }
+        if let Some(root) = state.object_queue.pop_front() {
+            state.queued_objects.remove(&root);
+            return Some(ReclaimWorkItem::ObjectPayload(root));
+        }
+        let bucket = state.bucket_delete_queue.pop_front()?;
+        state.queued_bucket_deletes.remove(&bucket);
+        Some(ReclaimWorkItem::BucketDelete(bucket))
+    }
+
+    pub(crate) fn wake_reclaim_workers(&self) {
+        self.reclaim_queue.1.notify_all();
+    }
+}
+
+#[derive(Debug)]
 pub struct LocalClusterMap {
     epoch: ClusterEpoch,
     metadata_primary_node_id: NodeId,
     nodes: BTreeMap<NodeId, LocalNodeStore>,
     pg_routes: BTreeMap<PgId, LocalPgRoute>,
     placement_map: placement::ClusterMap,
+    runtime_state: Arc<LocalClusterRuntimeState>,
     process_local_registry_key: usize,
 }
 
@@ -313,6 +486,7 @@ impl LocalClusterMap {
             metadata_primary_node_id,
             pg_routes,
             placement_map,
+            runtime_state: Arc::new(LocalClusterRuntimeState::new()),
             process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
             nodes,
         })
@@ -354,6 +528,10 @@ impl LocalClusterMap {
 
     pub fn process_local_registry_key(&self) -> usize {
         self.process_local_registry_key
+    }
+
+    pub(crate) fn runtime_state(&self) -> Arc<LocalClusterRuntimeState> {
+        Arc::clone(&self.runtime_state)
     }
 
     pub(crate) fn metadata_pg_primary_node(
@@ -963,6 +1141,69 @@ mod tests {
         }
     }
 
+    fn seed_completed_multipart_upload_record(
+        map: &LocalClusterMap,
+        node_id: NodeId,
+        pg_id: u32,
+        bucket: &crate::BucketName,
+        key: &crate::ObjectKey,
+        upload_id: &crate::UploadId,
+        completion_order: u64,
+    ) {
+        seed_multipart_upload_record(
+            map,
+            node_id,
+            pg_id,
+            bucket,
+            key,
+            upload_id,
+            crate::UploadState::InProgress,
+        );
+        let node = map.node(node_id).unwrap().storage_node();
+        let pg = node.get_pg(pg_id).unwrap();
+        let upload = crate::PgMetadataStore::get_multipart_upload(&*pg, upload_id).unwrap();
+        let version_id = crate::VersionId::Null;
+        let part = crate::ObjectPartRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id,
+            part_number: 1,
+            size: 1,
+            etag: vec![completion_order as u8; 8],
+            etag_kind: crate::EtagKind::Crc64,
+            part_okh: [completion_order as u8; 16],
+            part_vid: upload.object_generation_id,
+            ec_k: 2,
+            ec_m: 1,
+            data_pg_id: pg_id,
+            checksum: None,
+        };
+        crate::PgMetadataStore::complete_multipart_commit(
+            &*pg,
+            upload_id,
+            completion_order,
+            &crate::CommitMultipartReq {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                generation_id: upload.object_generation_id,
+                size: part.size,
+                etag_crc64: [completion_order as u8; 8],
+                ec: EcShape { k: 2, m: 1 },
+                tags: None,
+                metadata_blob: None,
+                system_metadata_blob: None,
+                object_lock: crate::ObjectLockState::default(),
+                encryption: crate::ObjectEncryption::None,
+            },
+            &[part],
+        )
+        .unwrap();
+    }
+
     fn set_route_primary(map: &mut LocalClusterMap, pg_id: u32, primary_node_id: NodeId) {
         let route = map.pg_routes.get_mut(&PgId::new(pg_id)).unwrap();
         route.acting_set = Arc::from([NodeId::new(0), NodeId::new(1), NodeId::new(2)]);
@@ -1425,6 +1666,30 @@ mod tests {
                     let key = trace_key(*seed);
                     let generation_id = trace_generation(*seed);
                     let cluster = current_cluster(&map);
+                    if pg_state != PgState::Active {
+                        let err = match cluster.acquire_object_payload_lease(
+                            &bucket,
+                            &key,
+                            generation_id,
+                        ) {
+                            Ok(_) => {
+                                return Err(TestCaseError::fail(
+                                    "inactive PG acquired a payload lease",
+                                ));
+                            }
+                            Err(err) => err,
+                        };
+                        let expected = matches!(
+                            err,
+                            StoreError::PgNotActive {
+                                pg_id: 0,
+                                cluster_epoch,
+                                state,
+                            } if cluster_epoch == current_epoch && state == pg_state
+                        );
+                        prop_assert!(expected, "unexpected inactive lease acquire error: {err:?}");
+                        continue;
+                    }
                     let lease = cluster
                         .acquire_object_payload_lease(&bucket, &key, generation_id)
                         .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
@@ -2122,6 +2387,91 @@ mod tests {
     }
 
     #[test]
+    fn bucket_snapshot_pair_routes_to_bucket_pg_primaries() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let (source_bucket, destination_bucket) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            (
+                bucket_for_pg(topology, 1, "snapshot-source-"),
+                bucket_for_pg(topology, 2, "snapshot-destination-"),
+            )
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &source_bucket);
+        create_test_bucket(&cluster, &destination_bucket);
+        cluster
+            .put_bucket_subresource_and_load_info(
+                &source_bucket,
+                crate::PutBucketSubresource {
+                    kind: crate::BucketSubresourceKind::Tagging,
+                    body: "<Tagging><TagSet><Tag><Key>src</Key><Value>1</Value></Tag></TagSet></Tagging>",
+                    aux: crate::BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+        cluster
+            .put_bucket_subresource_and_load_info(
+                &destination_bucket,
+                crate::PutBucketSubresource {
+                    kind: crate::BucketSubresourceKind::Cors,
+                    body: "<CORSConfiguration/>",
+                    aux: crate::BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+
+        let bridge_node = map.node(NodeId::new(0)).unwrap().storage_node();
+        assert!(bridge_node.test_head_bucket_raw(&source_bucket).is_err());
+        assert!(bridge_node
+            .test_head_bucket_raw(&destination_bucket)
+            .is_err());
+
+        let pair = cluster
+            .load_bucket_snapshot_pair(
+                (
+                    &source_bucket,
+                    crate::BucketSnapshotRequest {
+                        tags: crate::BucketSnapshotTagsRequest::Always,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    &destination_bucket,
+                    crate::BucketSnapshotRequest {
+                        cors: true,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(pair.source().bucket.name, source_bucket);
+        assert_eq!(pair.destination().bucket.name, destination_bucket);
+        assert_eq!(
+            pair.source().tags,
+            crate::LoadedBucketSubresource::Loaded(
+                "<Tagging><TagSet><Tag><Key>src</Key><Value>1</Value></Tag></TagSet></Tagging>"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            pair.destination().cors,
+            crate::LoadedBucketSubresource::Loaded("<CORSConfiguration/>".to_string())
+        );
+    }
+
+    #[test]
     fn composite_multipart_and_lifecycle_scans_fan_out_to_routed_pg_primaries() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -2231,6 +2581,183 @@ mod tests {
             vec![&lifecycle_bucket]
         );
         assert_eq!(sweep.aborting_buckets, vec![aborting_bucket]);
+    }
+
+    #[test]
+    fn completed_multipart_prune_fans_out_to_routed_pg_primaries() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = crate::BucketName::try_from("completed-prune-bucket".to_string()).unwrap();
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let older_key = key_for_object_pg(topology, &bucket, 1, "older-");
+        let newer_key = key_for_object_pg(topology, &bucket, 2, "newer-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let older_upload = upload_id_from_label("olderCompleted");
+        let newer_upload = upload_id_from_label("newerCompleted");
+        seed_completed_multipart_upload_record(
+            &map,
+            NodeId::new(1),
+            1,
+            &bucket,
+            &older_key,
+            &older_upload,
+            1,
+        );
+        seed_completed_multipart_upload_record(
+            &map,
+            NodeId::new(2),
+            2,
+            &bucket,
+            &newer_key,
+            &newer_upload,
+            2,
+        );
+
+        let bridge_node = map.node(NodeId::new(0)).unwrap().storage_node();
+        assert!(bridge_node
+            .get_pg(1)
+            .unwrap()
+            .list_completed_multipart_uploads_for_bucket(bucket.as_str())
+            .unwrap()
+            .is_empty());
+        assert!(bridge_node
+            .get_pg(2)
+            .unwrap()
+            .list_completed_multipart_uploads_for_bucket(bucket.as_str())
+            .unwrap()
+            .is_empty());
+
+        cluster
+            .prune_completed_multipart_uploads_for_bucket_with_limit(&bucket, 1)
+            .unwrap();
+
+        let node_one_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::get_completed_multipart_upload(&*node_one_pg, &older_upload)
+                .unwrap()
+                .is_none(),
+            "older routed completed-upload tombstone should be pruned"
+        );
+        let node_two_pg = map
+            .node(NodeId::new(2))
+            .unwrap()
+            .storage_node()
+            .get_pg(2)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::get_completed_multipart_upload(&*node_two_pg, &newer_upload)
+                .unwrap()
+                .is_some(),
+            "newer routed completed-upload tombstone should be retained"
+        );
+    }
+
+    #[test]
+    fn bucket_delete_and_finalize_fan_out_to_routed_pg_primaries() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let (bucket, live_key, tombstone_key) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "delete-bucket-");
+            let live_key = key_for_object_pg(topology, &bucket, 2, "live-");
+            let tombstone_key = key_for_object_pg(topology, &bucket, 2, "tombstone-");
+            (bucket, live_key, tombstone_key)
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        write_committed_direct_segment_for_with_okh(
+            &cluster, &bucket, &live_key, [61; 16], b"live",
+        );
+
+        let bridge_node = map.node(NodeId::new(0)).unwrap().storage_node();
+        assert!(bridge_node.test_head_bucket_raw(&bucket).is_err());
+        assert!(bridge_node
+            .test_get_object_meta(&bucket, &live_key)
+            .is_err());
+
+        let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketWriteDrainError::Metadata(crate::MetadataError::BucketNotEmpty)
+            ),
+            "routed non-empty bucket should reject delete, got {err:?}"
+        );
+
+        let node_two = map.node(NodeId::new(2)).unwrap().storage_node();
+        let node_two_pg = node_two.get_pg(2).unwrap();
+        crate::PgMetadataStore::delete_object_meta(&*node_two_pg, &bucket, &live_key).unwrap();
+        drop(node_two_pg);
+
+        let completed_upload = upload_id_from_label("deleteCompleted");
+        seed_completed_multipart_upload_record(
+            &map,
+            NodeId::new(2),
+            2,
+            &bucket,
+            &tombstone_key,
+            &completed_upload,
+            1,
+        );
+        let node_two_pg = node_two.get_pg(2).unwrap();
+        crate::PgMetadataStore::delete_object_meta(&*node_two_pg, &bucket, &tombstone_key).unwrap();
+        assert!(crate::PgMetadataStore::get_completed_multipart_upload(
+            &*node_two_pg,
+            &completed_upload
+        )
+        .unwrap()
+        .is_some());
+        drop(node_two_pg);
+
+        cluster.begin_bucket_delete(&bucket).unwrap();
+        assert_eq!(
+            cluster.try_finalize_bucket_delete(&bucket).unwrap(),
+            crate::BucketDeleteFinalizeOutcome::Finalized
+        );
+
+        assert!(map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .test_head_bucket_raw(&bucket)
+            .is_err());
+        let node_two_pg = node_two.get_pg(2).unwrap();
+        assert!(
+            crate::PgMetadataStore::get_completed_multipart_upload(
+                &*node_two_pg,
+                &completed_upload
+            )
+            .unwrap()
+            .is_none(),
+            "finalization should prune routed completed-upload tombstones"
+        );
     }
 
     #[test]
@@ -2893,8 +3420,8 @@ mod tests {
         };
         assert!(matches!(
             err,
-            StoreError::StaleMetadataPrimaryBridge {
-                metadata_node_id: 0,
+            StoreError::StaleMetadataOperation {
+                pg_id: 0,
                 operation_epoch,
                 current_epoch,
             } if operation_epoch == ClusterEpoch::INITIAL

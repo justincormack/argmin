@@ -14,7 +14,7 @@ Every public `StorageCluster` operation must fit one of these classes:
 | Construction | Creates a handle for the current local map epoch, except explicit test hooks that can create stale handles. |
 | Read-only topology/config | May read local map or static topology/config without an epoch fence. It must not read object metadata, payload bytes, or worker queues. |
 | Epoch-fenced routed metadata PG | Must route through the PG primary selected by the cluster map. Stale handles fail with `StoreError::StaleMetadataOperation`; inactive or missing routes fail with typed route errors before metadata is read or mutated. |
-| Epoch-fenced metadata bridge | Must call the metadata-primary bridge and fail with `StoreError::StaleMetadataPrimaryBridge` before metadata mutation or metadata reads when the handle epoch is stale. |
+| Epoch-fenced metadata bridge test hook | Test-only bridge helpers must fail with `StoreError::StaleMetadataPrimaryBridge` when the handle epoch is stale. Production metadata paths must not use this class. |
 | Payload placement/read/write/delete | Must use `StorageCluster` placed payload APIs. Stale placement becomes `StalePayloadOperation`; stale shard IO becomes `StaleShardOperation` or `StaleShardLocation`. |
 | Best-effort cleanup/worker queue | May suppress stale-handle and cleanup failures only where the API is explicitly best effort. Suppressed payload cleanup failures must emit typed trace context when tracing is active. |
 | Active token release | Releasing already-acquired state is not new work. Release must go to the node where the token was acquired even if the creating cluster handle is stale by release time. |
@@ -24,10 +24,10 @@ Every public `StorageCluster` operation must fit one of these classes:
 
 - Single-PG metadata reads and writes must route through the cluster map PG
   primary. They must not fall back to the process-wide metadata-primary node.
-- The remaining metadata-primary bridge is temporary and epoch-fenced. During
-  the rest of Phase 6.1 it is allowed only for composite/global scans,
-  multi-PG bucket cleanup/finalization, lease bookkeeping, worker queues, and
-  current-handle test hooks until those surfaces are split by PG.
+- The remaining metadata-primary bridge is temporary, epoch-fenced, and allowed
+  only for current-handle test hooks. Production metadata paths must route by
+  PG primary or use explicit local-cluster runtime state for in-memory
+  coordination.
 - Payload bytes are always accessed through placed IO. Production request paths
   must not call node or PG shard read/write/delete APIs directly.
 - Payload shard ack rows are metadata rows in the data PG and must route
@@ -39,7 +39,7 @@ Every public `StorageCluster` operation must fit one of these classes:
 - Physical shard absence, CRC corruption, and length corruption are recoverable
   only inside the EC read paths that explicitly opt into reconstruction.
 - Token release is not new work. Acquiring a token requires a current handle;
-  releasing an acquired token must still decrement the acquired node state
+  releasing an acquired token must still decrement local-cluster runtime state
   after an epoch transition.
 - Crash-durable orphan discovery is a later scavenger/reclaim responsibility.
   Injected best-effort cleanup failures may leave only explicitly documented
@@ -59,30 +59,32 @@ script in the same change.
 | `delete_direct_put_segment_payload_shards` | Best-effort cleanup/worker queue |
 | `reserve_put_object_generation`, `release_object_generation_reservation`, `commit_direct_put_object_from_payload_shards` | Epoch-fenced routed metadata PG |
 | `create_put_object_stream_session_record`, `load_stream_upload_session`, `prepare_stream_segment_append`, `commit_stream_segment_append`, `abort_stream_upload_session`, `create_put_object_stream_session`, `finalize_put_object_stream` | Epoch-fenced routed metadata PG |
-| `list_stream_upload_sessions_best_effort` | Best-effort cleanup/worker queue |
-| `try_probe_bucket_pg_available`, `create_bucket_with_config_and_load_info`, `load_bucket_snapshot`, `with_bucket_write_snapshot`, `head_bucket_info`, `get_bucket_subresource`, `put_bucket_versioning_and_load_info`, `put_bucket_object_lock_and_load_info`, `put_bucket_encryption_and_load_info`, `put_bucket_public_access_block_and_load_info`, `delete_bucket_public_access_block_and_load_info`, `put_bucket_ownership_controls_and_load_info`, `delete_bucket_ownership_controls_and_load_info`, `put_bucket_abac_enabled_and_load_info`, `put_bucket_acl_and_load_info`, `put_bucket_subresource_and_load_info`, `delete_bucket_subresource_and_load_info` | Epoch-fenced routed metadata PG |
+| `list_stream_upload_sessions_best_effort` | Best-effort routed metadata PG fanout |
+| `try_probe_bucket_pg_available`, `create_bucket_with_config_and_load_info`, `load_bucket_snapshot`, `load_bucket_snapshot_pair`, `with_bucket_write_snapshot`, `head_bucket_info`, `get_bucket_subresource`, `put_bucket_versioning_and_load_info`, `put_bucket_object_lock_and_load_info`, `put_bucket_encryption_and_load_info`, `put_bucket_public_access_block_and_load_info`, `delete_bucket_public_access_block_and_load_info`, `put_bucket_ownership_controls_and_load_info`, `delete_bucket_ownership_controls_and_load_info`, `put_bucket_abac_enabled_and_load_info`, `put_bucket_acl_and_load_info`, `put_bucket_subresource_and_load_info`, `delete_bucket_subresource_and_load_info` | Epoch-fenced routed metadata PG |
 | `list_buckets_for_owner`, `list_lifecycle_sweep_buckets` | Epoch-fenced routed metadata PG fanout |
-| `load_bucket_snapshot_pair`, `begin_bucket_delete`, `try_finalize_bucket_delete`, `prune_completed_multipart_uploads_for_bucket_with_limit` | Epoch-fenced metadata bridge |
+| `begin_bucket_delete` | Epoch-fenced routed metadata PG fanout |
+| `try_finalize_bucket_delete` | Epoch-fenced routed metadata PG fanout plus local runtime lease bookkeeping and worker queue |
 | `load_available_bucket_execution_generation_batches` | Best-effort routed metadata PG |
 | `try_probe_object_pg_available`, `load_object_if`, `load_existing_live_object`, `load_object_read_snapshot_if`, `payload_reclaim_exists`, `get_object_tags_if`, `put_object_tags_if`, `delete_object_tags_if`, `put_object_retention_if`, `put_object_legal_hold_if`, `put_object_acl_if`, `get_object_legal_hold_if`, `get_object_retention_if`, `delete_specific_object_version_if`, `delete_current_object_if`, `insert_current_delete_marker_if`, `expire_current_object_if_due`, `delete_noncurrent_live_versions_if_due`, `delete_expired_delete_marker_if_due` | Epoch-fenced routed metadata PG |
 | `list_all_objects_for_bucket`, `list_all_object_versions_for_bucket`, `list_all_multipart_uploads_for_bucket`, `list_objects_for_bucket`, `list_object_versions_for_bucket` | Epoch-fenced routed metadata PG fanout |
-| `acquire_object_payload_lease` | Epoch-fenced metadata bridge |
-| `enqueue_object_payload_reclaim`, `enqueue_bucket_delete_finalize`, `wait_for_reclaim_work`, `wake_reclaim_workers` | Best-effort cleanup/worker queue |
-| `reclaim_object_payload_if_unleased` | Epoch-fenced routed metadata PG plus bridge lease bookkeeping and payload cleanup |
+| `acquire_object_payload_lease` | Epoch-fenced routed metadata PG plus local runtime lease bookkeeping |
+| `enqueue_object_payload_reclaim`, `enqueue_bucket_delete_finalize`, `wait_for_reclaim_work`, `wake_reclaim_workers` | Best-effort local runtime worker queue |
+| `reclaim_object_payload_if_unleased` | Epoch-fenced routed metadata PG plus local runtime lease bookkeeping and payload cleanup |
 | `create_multipart_upload`, `load_multipart_upload`, `begin_upload_part_stream_session`, `create_upload_part_stream_session`, `load_in_progress_multipart_upload`, `try_load_in_progress_multipart_upload`, `load_in_progress_multipart_upload_for_listing`, `load_multipart_completion_snapshot`, `load_multipart_completion_preflight`, `complete_multipart_upload_commit_serialized`, `finalize_upload_part_stream`, `list_multipart_parts_for_upload`, `lookup_abort_multipart_upload`, `abort_multipart_upload`, `abort_multipart_upload_if_due` | Epoch-fenced routed metadata PG |
-| `list_multipart_uploads_for_bucket` | Epoch-fenced routed metadata PG fanout |
+| `list_multipart_uploads_for_bucket`, `prune_completed_multipart_uploads_for_bucket_with_limit` | Epoch-fenced routed metadata PG fanout |
 | `test_from_local_map_with_epoch`, `test_install_before_stream_abort_storage_hook`, `test_install_after_direct_put_metadata_publish_hook`, `test_install_before_placed_payload_shard_delete_hook`, `test_install_before_metadata_primary_payload_ack_delete_hook`, `test_install_best_effort_payload_cleanup_error_hook`, `test_pg_ids`, `object_payload_lease_count`, `bucket_object_payload_lease_count`, `try_take_reclaim_work`, `test_ec_scratch_allocation_count`, `test_bucket_pg_id_for`, `test_head_bucket_raw`, `test_object_pg_id_for`, `test_data_pg_id_for`, `test_object_generation_reservation_for`, `test_multipart_part_data_pg_id_for`, `test_get_object_meta`, `test_get_multipart_upload`, `test_get_multipart_part`, `test_list_multipart_parts`, `test_list_multipart_uploads_for_bucket`, `test_get_object_segments`, `test_replace_live_object_segments`, `test_get_object_parts`, `test_replace_object_parts`, `test_get_object_version`, `test_get_object_segments_reclaim`, `test_put_object_segments_reclaim`, `test_put_multipart_reclaim`, `test_payload_reclaim_exists`, `test_list_bucket_payload_reclaim_roots`, `test_force_became_noncurrent_at`, `test_create_deleting_bucket`, `test_delete_bucket_metadata`, `test_get_all_multipart_part_segments_for_upload`, `test_set_upload_state`, `test_list_stream_segments`, `test_force_stream_upload_created_at`, `test_list_all_stream_uploads`, `test_create_stream_upload`, `test_shard_exists`, `test_lock_bucket_pg`, `test_lock_bucket`, `test_lock_multipart_completion_bucket`, `test_payload_shard_file_path`, `test_payload_shard_file_exists` | Test hook |
 
 ## Associated Token Types
 
 `ObjectPayloadLease::release` is the active token release path. It must release
-against the `SharedStorageNode` captured at acquisition time and must not depend
-on the current cluster epoch.
+against the local-cluster runtime state captured at acquisition time and must
+not depend on the current cluster epoch.
 
 `ReleasedObjectPayloadLease::remaining`, `ReleasedObjectPayloadLease::payload_reclaim_exists`,
 and `ReleasedObjectPayloadLease::enqueue_object_payload_reclaim` are release
 follow-up helpers for the already-acquired token. `payload_reclaim_exists`
 routes through the object PG primary for the handle epoch captured at acquire
 time; stale or unavailable routing is treated by callers as a conservative
-reason to enqueue. `enqueue_object_payload_reclaim` uses the captured bridge
-node because the worker queue remains on the bridge during Phase 6.1.
+reason to enqueue. `enqueue_object_payload_reclaim` uses the captured
+local-cluster runtime state because enqueueing after the final release is part
+of the already-acquired token workflow, not new metadata work.

@@ -1094,6 +1094,47 @@ Work items:
      - keep bucket snapshot-pair locking, bucket delete/finalization, completed
        multipart prune, lease bookkeeping, and worker queues on the bridge until
        they are split into explicit per-PG or coordination paths
+   - third slice:
+     - move completed multipart tombstone pruning from the metadata-primary
+       bridge to explicit fanout over routed metadata PG primaries
+     - preserve the existing global newest-`keep` ordering across PGs before
+       deleting older tombstones from their owning PG primary
+     - keep bucket snapshot-pair locking, bucket delete/finalization, lease
+       bookkeeping, and worker queues on the bridge until they are split into
+       explicit per-PG or coordination paths
+   - fourth slice:
+     - move bucket snapshot-pair loading from the metadata-primary bridge to
+       routed bucket PG primaries
+     - preserve same-bucket request merging and deterministic PG lock ordering
+       for distinct buckets that share a local primary node
+     - keep bucket delete/finalization, lease bookkeeping, and worker queues on
+       the bridge until they are split into explicit per-PG or coordination
+       paths
+   - fifth slice:
+     - move bucket delete begin/finalize metadata checks from the
+       metadata-primary bridge to routed metadata PG primaries
+     - preserve bucket write-drain behavior on the bucket PG primary and fan out
+       bucket emptiness, reclaim-root, and completed-upload cleanup checks
+       across routed PG primaries
+     - keep finalization's lease-count checks and reclaim/finalize worker queues
+       on the bridge until queue ownership is split into explicit coordination
+       paths
+   - sixth slice:
+     - move payload lease bookkeeping and reclaim/finalize worker queues from
+       the metadata-primary bridge into local-cluster runtime state shared by
+       all handles for the same local map
+     - fence lease acquisition as routed object-PG metadata work, but keep
+       release of an already-acquired lease token independent of the current
+       cluster epoch
+     - make release-time reclaim enqueue use the captured local runtime state so
+       a final lease release after an epoch transition remains visible to the
+       current worker handle
+     - move best-effort stream upload session sweeping from the bridge to routed
+       metadata PG fanout
+     - after this slice, the metadata-primary bridge remains only for
+       current-handle test hooks; active production metadata paths either route
+       through PG primaries, use read-only topology/config helpers, or use the
+       local runtime coordination state
 2. Phase 6.2: command substrate vertical slice.
    - define the command envelope, command identity, canonical encoding, command
      checksum, and log-index shape
