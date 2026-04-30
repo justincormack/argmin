@@ -8,8 +8,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use placement::NodeId;
 
 use crate::metadata_command::{
-    CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
-    PutBucketAclCommand, PutBucketVersioningCommand,
+    BucketPropertyMutation, CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId,
+    MetadataCommandPayload, PutBucketAclCommand, PutBucketPropertyCommand,
+    PutBucketVersioningCommand,
 };
 use crate::*;
 
@@ -125,6 +126,40 @@ fn conflicting_pending_metadata_command(context: &'static str) -> BucketSnapshot
     .into()
 }
 
+fn invalid_bucket_object_lock_command(context: &'static str) -> BucketSnapshotLoadError {
+    MetadataError::Db {
+        context,
+        source: rusqlite::Error::InvalidQuery,
+    }
+    .into()
+}
+
+fn validate_bucket_property_command_preconditions(
+    info: &BucketInfo,
+    mutation: &BucketPropertyMutation,
+) -> Result<(), BucketSnapshotLoadError> {
+    let BucketPropertyMutation::ObjectLock(config) = mutation else {
+        return Ok(());
+    };
+
+    if !config.enabled && config.default_retention.is_some() {
+        return Err(invalid_bucket_object_lock_command(
+            "put bucket object lock command default retention requires object lock enabled",
+        ));
+    }
+    if config.enabled && info.versioning != BucketVersioningState::Enabled {
+        return Err(invalid_bucket_object_lock_command(
+            "put bucket object lock command requires enabled versioning",
+        ));
+    }
+    if info.object_lock.enabled && !config.enabled {
+        return Err(invalid_bucket_object_lock_command(
+            "put bucket object lock command cannot disable object lock",
+        ));
+    }
+    Ok(())
+}
+
 // Metadata routing moves incrementally in Phase 6. Single-PG bucket/object
 // operations route through the local metadata PG primary; composite scans fan
 // out across routed PG primaries and merge locally.
@@ -217,6 +252,11 @@ impl super::StorageCluster {
                 MetadataCommandPayload::PutBucketAcl(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending put bucket acl command for create bucket",
+                    ));
+                }
+                MetadataCommandPayload::PutBucketProperty(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending put bucket property command for create bucket",
                     ));
                 }
             }
@@ -615,6 +655,11 @@ impl super::StorageCluster {
                         "unexpected pending put bucket acl command for versioning",
                     ));
                 }
+                MetadataCommandPayload::PutBucketProperty(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending put bucket property command for versioning",
+                    ));
+                }
             }
         } else {
             let command_id = MetadataCommandId::new(
@@ -651,8 +696,10 @@ impl super::StorageCluster {
         bucket: &BucketName,
         config: BucketObjectLockConfig,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.bucket_metadata_primary_node(bucket)?
-            .put_bucket_object_lock_and_load_info(bucket, config)
+        self.put_bucket_property_command_and_load_info(
+            bucket,
+            BucketPropertyMutation::ObjectLock(config),
+        )
     }
 
     pub fn put_bucket_encryption_and_load_info(
@@ -660,8 +707,10 @@ impl super::StorageCluster {
         bucket: &BucketName,
         config: BucketEncryptionConfig,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.bucket_metadata_primary_node(bucket)?
-            .put_bucket_encryption_and_load_info(bucket, config)
+        self.put_bucket_property_command_and_load_info(
+            bucket,
+            BucketPropertyMutation::Encryption(config),
+        )
     }
 
     pub fn put_bucket_public_access_block_and_load_info(
@@ -669,16 +718,20 @@ impl super::StorageCluster {
         bucket: &BucketName,
         config: PublicAccessBlockConfig,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.bucket_metadata_primary_node(bucket)?
-            .put_bucket_public_access_block_and_load_info(bucket, config)
+        self.put_bucket_property_command_and_load_info(
+            bucket,
+            BucketPropertyMutation::PublicAccessBlock(Some(config)),
+        )
     }
 
     pub fn delete_bucket_public_access_block_and_load_info(
         &self,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.bucket_metadata_primary_node(bucket)?
-            .delete_bucket_public_access_block_and_load_info(bucket)
+        self.put_bucket_property_command_and_load_info(
+            bucket,
+            BucketPropertyMutation::PublicAccessBlock(None),
+        )
     }
 
     pub fn put_bucket_ownership_controls_and_load_info(
@@ -686,16 +739,20 @@ impl super::StorageCluster {
         bucket: &BucketName,
         config: BucketOwnershipControls,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.bucket_metadata_primary_node(bucket)?
-            .put_bucket_ownership_controls_and_load_info(bucket, config)
+        self.put_bucket_property_command_and_load_info(
+            bucket,
+            BucketPropertyMutation::OwnershipControls(Some(config)),
+        )
     }
 
     pub fn delete_bucket_ownership_controls_and_load_info(
         &self,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.bucket_metadata_primary_node(bucket)?
-            .delete_bucket_ownership_controls_and_load_info(bucket)
+        self.put_bucket_property_command_and_load_info(
+            bucket,
+            BucketPropertyMutation::OwnershipControls(None),
+        )
     }
 
     pub fn put_bucket_abac_enabled_and_load_info(
@@ -703,8 +760,10 @@ impl super::StorageCluster {
         bucket: &BucketName,
         enabled: bool,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.bucket_metadata_primary_node(bucket)?
-            .put_bucket_abac_enabled_and_load_info(bucket, enabled)
+        self.put_bucket_property_command_and_load_info(
+            bucket,
+            BucketPropertyMutation::AbacEnabled(enabled),
+        )
     }
 
     pub fn put_bucket_acl_and_load_info(
@@ -747,6 +806,11 @@ impl super::StorageCluster {
                         "unexpected pending put bucket versioning command for bucket acl",
                     ));
                 }
+                MetadataCommandPayload::PutBucketProperty(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending put bucket property command for bucket acl",
+                    ));
+                }
             }
         } else {
             let command_id = MetadataCommandId::new(
@@ -764,6 +828,81 @@ impl super::StorageCluster {
                     acl_grants.clone(),
                     public_read,
                     public_write,
+                    bucket_execution_generation,
+                )),
+            );
+            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            command
+        };
+        self.apply_metadata_command_to_acting_set(&command)?;
+
+        let bucket_pg = primary_node.get_pg(pg_id.get())?;
+        let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
+        self.local_map
+            .runtime_state()
+            .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+        Ok(info)
+    }
+
+    fn put_bucket_property_command_and_load_info(
+        &self,
+        bucket: &BucketName,
+        mutation: BucketPropertyMutation,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        let primary_node = self.bucket_metadata_primary_node(bucket)?;
+        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let info = {
+            let bucket_pg = primary_node.get_pg(pg_id.get())?;
+            PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?
+        };
+        validate_bucket_property_command_preconditions(&info, &mutation)?;
+
+        let runtime_state = self.local_map.runtime_state();
+        let command = if let Some(command) =
+            runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+        {
+            match command.payload() {
+                MetadataCommandPayload::PutBucketProperty(property)
+                    if property.matches_request(bucket, &mutation) =>
+                {
+                    command
+                }
+                MetadataCommandPayload::PutBucketProperty(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "conflicting pending put bucket property command",
+                    ));
+                }
+                MetadataCommandPayload::CreateBucket(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending create bucket command for bucket property",
+                    ));
+                }
+                MetadataCommandPayload::PutBucketVersioning(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending put bucket versioning command for bucket property",
+                    ));
+                }
+                MetadataCommandPayload::PutBucketAcl(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending put bucket acl command for bucket property",
+                    ));
+                }
+            }
+        } else {
+            let command_id = MetadataCommandId::new(
+                self.operation_epoch(),
+                pg_id,
+                runtime_state.next_metadata_command_log_index(pg_id),
+            );
+            let bucket_pg = primary_node.get_pg(pg_id.get())?;
+            let bucket_execution_generation = bucket_pg.reserve_bucket_execution_generation()?;
+            drop(bucket_pg);
+            let command = MetadataCommandEnvelope::new(
+                command_id,
+                MetadataCommandPayload::PutBucketProperty(PutBucketPropertyCommand::new(
+                    bucket.clone(),
+                    mutation,
                     bucket_execution_generation,
                 )),
             );

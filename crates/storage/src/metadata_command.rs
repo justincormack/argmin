@@ -5,13 +5,17 @@ use s3_types::{
     ObjectLockDefaultRetention, ObjectLockMode, RetentionPeriod,
 };
 
-use crate::types::{BucketName, ClusterEpoch, CreateBucketConfig, PgId};
+use crate::types::{
+    BucketEncryptionConfig, BucketName, BucketObjectOwnership, BucketOwnershipControls,
+    ClusterEpoch, CreateBucketConfig, ManagedEncryptionAlgorithm, PgId, PublicAccessBlockConfig,
+};
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
 const METADATA_COMMAND_ENCODING_VERSION: u16 = 1;
 const METADATA_COMMAND_CREATE_BUCKET: u16 = 1;
 const METADATA_COMMAND_PUT_BUCKET_VERSIONING: u16 = 2;
 const METADATA_COMMAND_PUT_BUCKET_ACL: u16 = 3;
+const METADATA_COMMAND_PUT_BUCKET_PROPERTY: u16 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct MetadataCommandLogIndex(NonZeroU64);
@@ -128,6 +132,7 @@ pub(crate) enum MetadataCommandPayload {
     CreateBucket(CreateBucketCommand),
     PutBucketVersioning(PutBucketVersioningCommand),
     PutBucketAcl(PutBucketAclCommand),
+    PutBucketProperty(PutBucketPropertyCommand),
 }
 
 impl MetadataCommandPayload {
@@ -136,6 +141,7 @@ impl MetadataCommandPayload {
             Self::CreateBucket(_) => METADATA_COMMAND_CREATE_BUCKET,
             Self::PutBucketVersioning(_) => METADATA_COMMAND_PUT_BUCKET_VERSIONING,
             Self::PutBucketAcl(_) => METADATA_COMMAND_PUT_BUCKET_ACL,
+            Self::PutBucketProperty(_) => METADATA_COMMAND_PUT_BUCKET_PROPERTY,
         }
     }
 }
@@ -210,6 +216,44 @@ impl PutBucketAclCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PutBucketPropertyCommand {
+    pub(crate) name: BucketName,
+    pub(crate) mutation: BucketPropertyMutation,
+    pub(crate) bucket_execution_generation: u64,
+}
+
+impl PutBucketPropertyCommand {
+    pub(crate) fn new(
+        name: BucketName,
+        mutation: BucketPropertyMutation,
+        bucket_execution_generation: u64,
+    ) -> Self {
+        Self {
+            name,
+            mutation,
+            bucket_execution_generation,
+        }
+    }
+
+    pub(crate) fn matches_request(
+        &self,
+        bucket: &BucketName,
+        mutation: &BucketPropertyMutation,
+    ) -> bool {
+        self.name == *bucket && self.mutation == *mutation
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BucketPropertyMutation {
+    ObjectLock(BucketObjectLockConfig),
+    Encryption(BucketEncryptionConfig),
+    PublicAccessBlock(Option<PublicAccessBlockConfig>),
+    OwnershipControls(Option<BucketOwnershipControls>),
+    AbacEnabled(bool),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MetadataCommandEnvelope {
     id: MetadataCommandId,
     payload: MetadataCommandPayload,
@@ -268,6 +312,9 @@ fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPaylo
         MetadataCommandPayload::PutBucketAcl(command) => {
             encode_put_bucket_acl(&mut out, command);
         }
+        MetadataCommandPayload::PutBucketProperty(command) => {
+            encode_put_bucket_property(&mut out, command);
+        }
     }
     out
 }
@@ -297,6 +344,78 @@ fn encode_put_bucket_acl(out: &mut Vec<u8>, command: &PutBucketAclCommand) {
     put_bool(out, command.public_read);
     put_bool(out, command.public_write);
     put_u64(out, command.bucket_execution_generation);
+}
+
+fn encode_put_bucket_property(out: &mut Vec<u8>, command: &PutBucketPropertyCommand) {
+    put_str(out, command.name.as_str());
+    encode_bucket_property_mutation(out, &command.mutation);
+    put_u64(out, command.bucket_execution_generation);
+}
+
+fn encode_bucket_property_mutation(out: &mut Vec<u8>, mutation: &BucketPropertyMutation) {
+    match mutation {
+        BucketPropertyMutation::ObjectLock(config) => {
+            put_u8(out, 1);
+            encode_object_lock(out, *config);
+        }
+        BucketPropertyMutation::Encryption(config) => {
+            put_u8(out, 2);
+            encode_bucket_encryption(out, *config);
+        }
+        BucketPropertyMutation::PublicAccessBlock(config) => {
+            put_u8(out, 3);
+            encode_public_access_block(out, *config);
+        }
+        BucketPropertyMutation::OwnershipControls(config) => {
+            put_u8(out, 4);
+            encode_ownership_controls(out, *config);
+        }
+        BucketPropertyMutation::AbacEnabled(enabled) => {
+            put_u8(out, 5);
+            put_bool(out, *enabled);
+        }
+    }
+}
+
+fn encode_bucket_encryption(out: &mut Vec<u8>, config: BucketEncryptionConfig) {
+    match config.default_encryption {
+        None => put_u8(out, 0),
+        Some(ManagedEncryptionAlgorithm::Aes256) => {
+            put_u8(out, 1);
+            put_u8(out, ManagedEncryptionAlgorithm::Aes256 as u8);
+        }
+    }
+    put_bool(out, config.sse_c_blocked);
+}
+
+fn encode_public_access_block(out: &mut Vec<u8>, config: Option<PublicAccessBlockConfig>) {
+    match config {
+        None => put_u8(out, 0),
+        Some(config) => {
+            put_u8(out, 1);
+            put_bool(out, config.block_public_acls);
+            put_bool(out, config.ignore_public_acls);
+            put_bool(out, config.block_public_policy);
+            put_bool(out, config.restrict_public_buckets);
+        }
+    }
+}
+
+fn encode_ownership_controls(out: &mut Vec<u8>, config: Option<BucketOwnershipControls>) {
+    match config {
+        None => put_u8(out, 0),
+        Some(config) => {
+            put_u8(out, 1);
+            put_u8(
+                out,
+                match config.object_ownership {
+                    BucketObjectOwnership::BucketOwnerEnforced => 0,
+                    BucketObjectOwnership::BucketOwnerPreferred => 1,
+                    BucketObjectOwnership::ObjectWriter => 2,
+                },
+            );
+        }
+    }
 }
 
 fn encode_object_lock(out: &mut Vec<u8>, object_lock: BucketObjectLockConfig) {
@@ -442,5 +561,88 @@ mod tests {
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
         assert_eq!(envelope.checksum_crc64(), 0x3947184ebe5f3b3b);
         assert!(envelope.verify_checksum());
+    }
+
+    #[test]
+    fn metadata_command_bucket_property_encoding_is_stable() {
+        let bucket = BucketName::try_from("bucket").unwrap();
+        let id = MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(3),
+            MetadataCommandLogIndex::new(12).unwrap(),
+        );
+        let mutations = [
+            (
+                BucketPropertyMutation::ObjectLock(BucketObjectLockConfig {
+                    enabled: true,
+                    default_retention: Some(ObjectLockDefaultRetention {
+                        mode: ObjectLockMode::Governance,
+                        period: RetentionPeriod::days(7).unwrap(),
+                    }),
+                }),
+                0,
+            ),
+            (
+                BucketPropertyMutation::Encryption(BucketEncryptionConfig {
+                    default_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
+                    sse_c_blocked: false,
+                }),
+                0,
+            ),
+            (
+                BucketPropertyMutation::PublicAccessBlock(Some(PublicAccessBlockConfig {
+                    block_public_acls: true,
+                    ignore_public_acls: false,
+                    block_public_policy: true,
+                    restrict_public_buckets: false,
+                })),
+                0,
+            ),
+            (BucketPropertyMutation::PublicAccessBlock(None), 0),
+            (
+                BucketPropertyMutation::OwnershipControls(Some(BucketOwnershipControls {
+                    object_ownership: BucketObjectOwnership::BucketOwnerPreferred,
+                })),
+                0,
+            ),
+            (BucketPropertyMutation::OwnershipControls(None), 0),
+            (BucketPropertyMutation::AbacEnabled(true), 0),
+        ];
+
+        let mut checksums = Vec::new();
+        for (offset, (mutation, _expected_checksum)) in mutations.into_iter().enumerate() {
+            let command =
+                PutBucketPropertyCommand::new(bucket.clone(), mutation.clone(), 20 + offset as u64);
+            let id = MetadataCommandId::new(
+                id.cluster_epoch(),
+                id.pg_id(),
+                MetadataCommandLogIndex::new(id.log_index().get() + offset as u64).unwrap(),
+            );
+            let envelope = MetadataCommandEnvelope::new(
+                id,
+                MetadataCommandPayload::PutBucketProperty(command.clone()),
+            );
+            let duplicate = MetadataCommandEnvelope::new(
+                id,
+                MetadataCommandPayload::PutBucketProperty(command),
+            );
+
+            assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
+            assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
+            assert!(envelope.verify_checksum());
+            checksums.push(envelope.checksum_crc64());
+        }
+        assert_eq!(
+            checksums,
+            [
+                0x239f63ca5e298fa1,
+                0xb5c042bf2bf79c2d,
+                0x01ff273102f24631,
+                0x703c1fc321a3a801,
+                0xbc2d9efb84c3ed11,
+                0xd8eb45a268b77749,
+                0xcc7e17ba9b256211,
+            ]
+        );
     }
 }

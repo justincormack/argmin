@@ -1060,7 +1060,7 @@ fn prepare_local_node_data_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata_command::MetadataCommandPayload;
+    use crate::metadata_command::{BucketPropertyMutation, MetadataCommandPayload};
     use proptest::prelude::*;
     use proptest::test_runner::{TestCaseError, TestCaseResult};
     use std::collections::BTreeSet;
@@ -3157,6 +3157,339 @@ mod tests {
             assert_eq!(
                 info.bucket_execution_generation,
                 partial_info.bucket_execution_generation
+            );
+        }
+    }
+
+    #[test]
+    fn bucket_property_commands_apply_to_all_acting_pg_nodes() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "replicated-property-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let mut previous_generation = {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            primary.test_head_bucket_raw(&bucket).unwrap()
+        }
+        .bucket_execution_generation;
+        let updated = cluster
+            .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+            .unwrap();
+        assert!(updated.bucket_execution_generation > previous_generation);
+        previous_generation = updated.bucket_execution_generation;
+
+        let object_lock = crate::BucketObjectLockConfig {
+            enabled: true,
+            default_retention: Some(crate::ObjectLockDefaultRetention {
+                mode: crate::ObjectLockMode::Governance,
+                period: crate::RetentionPeriod::days(3).unwrap(),
+            }),
+        };
+        let updated = cluster
+            .put_bucket_object_lock_and_load_info(&bucket, object_lock)
+            .unwrap();
+        assert!(updated.bucket_execution_generation > previous_generation);
+        previous_generation = updated.bucket_execution_generation;
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.object_lock, object_lock);
+            assert_eq!(info.bucket_execution_generation, previous_generation);
+        }
+
+        let encryption = crate::BucketEncryptionConfig {
+            default_encryption: Some(crate::ManagedEncryptionAlgorithm::Aes256),
+            sse_c_blocked: false,
+        };
+        let updated = cluster
+            .put_bucket_encryption_and_load_info(&bucket, encryption)
+            .unwrap();
+        assert!(updated.bucket_execution_generation > previous_generation);
+        previous_generation = updated.bucket_execution_generation;
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.encryption, encryption.effective());
+            assert_eq!(
+                crate::PgMetadataStore::get_bucket_encryption(&*pg, &bucket).unwrap(),
+                encryption
+            );
+            assert_eq!(info.bucket_execution_generation, previous_generation);
+        }
+
+        let public_access_block = crate::PublicAccessBlockConfig {
+            block_public_acls: true,
+            ignore_public_acls: false,
+            block_public_policy: true,
+            restrict_public_buckets: false,
+        };
+        let updated = cluster
+            .put_bucket_public_access_block_and_load_info(&bucket, public_access_block)
+            .unwrap();
+        assert!(updated.bucket_execution_generation > previous_generation);
+        previous_generation = updated.bucket_execution_generation;
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.public_access_block, Some(public_access_block));
+            assert_eq!(info.bucket_execution_generation, previous_generation);
+        }
+
+        let updated = cluster
+            .delete_bucket_public_access_block_and_load_info(&bucket)
+            .unwrap();
+        assert!(updated.bucket_execution_generation > previous_generation);
+        previous_generation = updated.bucket_execution_generation;
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.public_access_block, None);
+            assert_eq!(info.bucket_execution_generation, previous_generation);
+        }
+
+        let ownership_controls = crate::BucketOwnershipControls {
+            object_ownership: crate::BucketObjectOwnership::BucketOwnerPreferred,
+        };
+        let updated = cluster
+            .put_bucket_ownership_controls_and_load_info(&bucket, ownership_controls)
+            .unwrap();
+        assert!(updated.bucket_execution_generation > previous_generation);
+        previous_generation = updated.bucket_execution_generation;
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.ownership_controls, Some(ownership_controls));
+            assert_eq!(info.bucket_execution_generation, previous_generation);
+        }
+
+        let updated = cluster
+            .delete_bucket_ownership_controls_and_load_info(&bucket)
+            .unwrap();
+        assert!(updated.bucket_execution_generation > previous_generation);
+        previous_generation = updated.bucket_execution_generation;
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.ownership_controls, None);
+            assert_eq!(info.bucket_execution_generation, previous_generation);
+        }
+
+        let updated = cluster
+            .put_bucket_abac_enabled_and_load_info(&bucket, true)
+            .unwrap();
+        assert!(updated.bucket_execution_generation > previous_generation);
+        previous_generation = updated.bucket_execution_generation;
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert!(info.bucket_abac_enabled);
+            assert_eq!(info.bucket_execution_generation, previous_generation);
+        }
+    }
+
+    #[test]
+    fn bucket_property_command_retry_reuses_pending_partial_replica_command() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "partial-property-retry-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let public_access_block = crate::PublicAccessBlockConfig {
+            block_public_acls: true,
+            ignore_public_acls: true,
+            block_public_policy: false,
+            restrict_public_buckets: true,
+        };
+        let expected_mutation =
+            BucketPropertyMutation::PublicAccessBlock(Some(public_access_block));
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let _hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::PutBucketProperty(property)
+                        if property.name == hook_bucket
+                            && property.mutation == expected_mutation
+                            && node_id == NodeId::new(2)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected metadata command apply failure",
+                            source: std::io::Error::other(
+                                "injected metadata command apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .put_bucket_public_access_block_and_load_info(&bucket, public_access_block)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Store(StoreError::Io {
+                    context: "injected metadata command apply failure",
+                    ..
+                })
+            ),
+            "expected injected replica failure, got {err:?}"
+        );
+        assert!(!fail_once.load(Ordering::SeqCst));
+
+        let partial_info = {
+            let applied_replica = map.node(NodeId::new(0)).unwrap().storage_node();
+            let pg = applied_replica.get_pg(1).unwrap();
+            crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap()
+        };
+        assert_eq!(partial_info.public_access_block, Some(public_access_block));
+        for node_id in [NodeId::new(1), NodeId::new(2)] {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+                    .unwrap()
+                    .public_access_block,
+                None,
+                "node {node_id:?} should not have the partially applied property update"
+            );
+        }
+
+        let retried = cluster
+            .put_bucket_public_access_block_and_load_info(&bucket, public_access_block)
+            .unwrap();
+        assert_eq!(retried.public_access_block, Some(public_access_block));
+        assert_eq!(
+            retried.bucket_execution_generation,
+            partial_info.bucket_execution_generation
+        );
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.public_access_block, Some(public_access_block));
+            assert_eq!(
+                info.bucket_execution_generation,
+                partial_info.bucket_execution_generation
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_bucket_property_command_does_not_poison_bucket_command_stream() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "invalid-property-no-poison-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let initial_generation = {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            primary.test_head_bucket_raw(&bucket).unwrap()
+        }
+        .bucket_execution_generation;
+
+        let invalid_object_lock = crate::BucketObjectLockConfig {
+            enabled: true,
+            default_retention: None,
+        };
+        let err = cluster
+            .put_bucket_object_lock_and_load_info(&bucket, invalid_object_lock)
+            .unwrap_err();
+        match err {
+            crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::Db {
+                context: "put bucket object lock command requires enabled versioning",
+                source: rusqlite::Error::InvalidQuery,
+            }) => {}
+            other => panic!("expected object-lock prevalidation error, got {other:?}"),
+        }
+        assert!(
+            map.runtime_state()
+                .pending_metadata_command_for_bucket(PgId::new(1), &bucket)
+                .is_none(),
+            "deterministic validation failures must not leave pending commands"
+        );
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.object_lock, crate::BucketObjectLockConfig::default());
+            assert_eq!(info.bucket_execution_generation, initial_generation);
+        }
+
+        let public_access_block = crate::PublicAccessBlockConfig {
+            block_public_acls: true,
+            ignore_public_acls: false,
+            block_public_policy: true,
+            restrict_public_buckets: false,
+        };
+        let updated = cluster
+            .put_bucket_public_access_block_and_load_info(&bucket, public_access_block)
+            .unwrap();
+        assert_eq!(updated.public_access_block, Some(public_access_block));
+        assert!(updated.bucket_execution_generation > initial_generation);
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.public_access_block, Some(public_access_block));
+            assert_eq!(
+                info.bucket_execution_generation,
+                updated.bucket_execution_generation
             );
         }
     }

@@ -1216,6 +1216,25 @@ Work items:
      - include deterministic command encoding coverage, primary/replica
        convergence tests, partial-replica retry regression, and a cross-command
        ordering regression
+   - third slice:
+     - migrate row-backed bucket property mutations onto a
+       `PutBucketProperty` metadata command:
+       `put_bucket_object_lock_and_load_info`,
+       `put_bucket_encryption_and_load_info`,
+       `put_bucket_public_access_block_and_load_info`,
+       `delete_bucket_public_access_block_and_load_info`,
+       `put_bucket_ownership_controls_and_load_info`,
+       `delete_bucket_ownership_controls_and_load_info`, and
+       `put_bucket_abac_enabled_and_load_info`
+     - use the same explicit bucket execution generation, per-bucket pending
+       command stream, and primary-last acting-set apply model as versioning
+       and ACL commands
+     - keep exact stored-state idempotence for bucket encryption commands, not
+       only effective encryption equivalence, so same-generation divergent
+       commands fail closed
+     - include deterministic command encoding coverage, primary/replica
+       convergence tests for every row-backed property, and a partial-replica
+       retry regression
 4. Phase 6.4: stream, multipart, and reclaim command migration.
    - migrate stream session creation, segment append/finalize/abort metadata,
      multipart create/part/finalize/abort metadata, omitted-part cleanup
