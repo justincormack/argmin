@@ -235,9 +235,29 @@ impl StorageCluster {
         Ok(())
     }
 
-    fn current_single_node(&self) -> Result<&SharedStorageNode, StoreError> {
+    // Transitional metadata-primary bridge. Production metadata paths must pass
+    // through this helper until Phase 6 replaces the bridge with routed PG
+    // commands.
+    fn metadata_primary_bridge_node(&self) -> Result<&SharedStorageNode, StoreError> {
         self.require_current_operation_epoch()?;
         Ok(self.single_node.as_ref())
+    }
+
+    fn metadata_primary_bridge_node_arc(&self) -> Result<Arc<SharedStorageNode>, StoreError> {
+        self.require_current_operation_epoch()?;
+        Ok(Arc::clone(&self.single_node))
+    }
+
+    // Read-only topology/config helpers still use the metadata-primary node
+    // while PgTopology lives on SharedStorageNode.
+    fn metadata_primary_topology_node(&self) -> &SharedStorageNode {
+        self.single_node.as_ref()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn metadata_primary_test_hook_node(&self) -> &SharedStorageNode {
+        self.metadata_primary_bridge_node()
+            .expect("test hook requires a current storage cluster handle")
     }
 
     pub fn metadata_node_id(&self) -> NodeId {
@@ -269,7 +289,7 @@ impl StorageCluster {
     }
 
     pub fn default_payload_ec_shape(&self) -> EcShape {
-        self.single_node.default_ec_shape()
+        self.metadata_primary_topology_node().default_ec_shape()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -287,7 +307,7 @@ impl StorageCluster {
         &self,
         hook: Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>,
     ) -> crate::node::DirectPutMetadataPublishTestHookGuard {
-        self.single_node
+        self.metadata_primary_test_hook_node()
             .test_install_after_direct_put_metadata_publish_hook(hook)
     }
 
@@ -372,7 +392,7 @@ impl StorageCluster {
     ) -> Result<DirectPutWrittenSegment, StoreError> {
         let ec = self.default_payload_ec_shape();
         let data_pg_id = self
-            .single_node
+            .metadata_primary_topology_node()
             .pg_topology()
             .object_generation_segment_data_pg(bucket, key, generation_id, segment_index)
             .get();
@@ -407,42 +427,43 @@ impl StorageCluster {
         let locations = self
             .place_payload_shards(data_pg, ec, &placement_key)
             .map_err(cluster_build_error_to_store)?;
-        self.single_node.write_erasure_coded_segment_shards_with(
-            segment_okh,
-            segment_vid,
-            data,
-            ec,
-            |shard_batch| {
-                let mut written_acks = Vec::with_capacity(shard_batch.len());
-                let mut written_for_cleanup = Vec::with_capacity(shard_batch.len());
-                for (location, (shard_key, shard_payload)) in
-                    locations.iter().zip(shard_batch.iter())
-                {
-                    match self.write_payload_shard(*location, shard_key, shard_payload) {
-                        Ok(ack) => {
-                            written_acks.push((shard_key.clone(), ack));
-                            written_for_cleanup.push(WrittenShardAck {
-                                key: shard_key.clone(),
-                                ack,
-                            });
-                        }
-                        Err(error) => {
-                            self.delete_payload_shard_keys_best_effort(
-                                data_pg.get(),
-                                ec,
-                                segment_okh,
-                                segment_vid,
-                                written_for_cleanup
-                                    .iter()
-                                    .map(|written| written.key.clone()),
-                            );
-                            return Err(shard_io_error_to_store(error, write_context));
+        self.metadata_primary_bridge_node()?
+            .write_erasure_coded_segment_shards_with(
+                segment_okh,
+                segment_vid,
+                data,
+                ec,
+                |shard_batch| {
+                    let mut written_acks = Vec::with_capacity(shard_batch.len());
+                    let mut written_for_cleanup = Vec::with_capacity(shard_batch.len());
+                    for (location, (shard_key, shard_payload)) in
+                        locations.iter().zip(shard_batch.iter())
+                    {
+                        match self.write_payload_shard(*location, shard_key, shard_payload) {
+                            Ok(ack) => {
+                                written_acks.push((shard_key.clone(), ack));
+                                written_for_cleanup.push(WrittenShardAck {
+                                    key: shard_key.clone(),
+                                    ack,
+                                });
+                            }
+                            Err(error) => {
+                                self.delete_payload_shard_keys_best_effort(
+                                    data_pg.get(),
+                                    ec,
+                                    segment_okh,
+                                    segment_vid,
+                                    written_for_cleanup
+                                        .iter()
+                                        .map(|written| written.key.clone()),
+                                );
+                                return Err(shard_io_error_to_store(error, write_context));
+                            }
                         }
                     }
-                }
-                Ok(written_acks)
-            },
-        )
+                    Ok(written_acks)
+                },
+            )
     }
 
     pub fn reserve_put_object_generation(
@@ -451,7 +472,7 @@ impl StorageCluster {
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<GenerationId, ObjectPgActionError> {
-        self.current_single_node()?
+        self.metadata_primary_bridge_node()?
             .reserve_put_object_generation(bucket, key, reservation_id)
     }
 
@@ -461,7 +482,7 @@ impl StorageCluster {
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
-        self.current_single_node()?
+        self.metadata_primary_bridge_node()?
             .release_object_generation_reservation(bucket, key, reservation_id)
     }
 
@@ -471,9 +492,8 @@ impl StorageCluster {
         written_shards: &[WrittenShardAck],
         action: impl FnOnce(DirectPutCommitSnapshot) -> Result<(), E>,
     ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, ObjectPgActionError> {
-        self.require_current_operation_epoch()?;
         let result = self
-            .single_node
+            .metadata_primary_bridge_node()?
             .commit_direct_put_object(req, written_shards, action);
         match result {
             Ok(Ok(outcome)) => Ok(Ok(outcome)),
@@ -525,7 +545,7 @@ impl StorageCluster {
         session_id: &SessionId,
         encryption: ObjectEncryption,
     ) -> Result<(), ObjectPgActionError> {
-        self.current_single_node()?
+        self.metadata_primary_bridge_node()?
             .create_put_object_stream_session_record(bucket, key, session_id, encryption)
     }
 
@@ -535,7 +555,7 @@ impl StorageCluster {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<StreamUploadRecord, ObjectPgActionError> {
-        self.current_single_node()?
+        self.metadata_primary_bridge_node()?
             .load_stream_upload_session(bucket, key, session_id)
     }
 
@@ -545,7 +565,7 @@ impl StorageCluster {
         key: &ObjectKey,
         request: &PrepareStreamUploadSegmentAppendReq,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
-        self.current_single_node()?
+        self.metadata_primary_bridge_node()?
             .prepare_stream_segment_append(bucket, key, request)
     }
 
@@ -577,15 +597,16 @@ impl StorageCluster {
         segment_record: &StreamUploadSegmentRecord,
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), ObjectPgActionError> {
-        self.require_current_operation_epoch()?;
-        let result = self.single_node.commit_stream_segment_append(
-            bucket,
-            key,
-            session_id,
-            segment_index,
-            segment_record,
-            shard_batch,
-        );
+        let result = self
+            .metadata_primary_bridge_node()?
+            .commit_stream_segment_append(
+                bucket,
+                key,
+                session_id,
+                segment_index,
+                segment_record,
+                shard_batch,
+            );
         if result.is_err() {
             self.delete_payload_shard_keys_best_effort(
                 segment_record.data_pg_id,
@@ -611,17 +632,17 @@ impl StorageCluster {
         #[cfg(any(test, feature = "test-hooks"))]
         maybe_run_before_stream_abort_storage_hook();
         let staged_segments = self
-            .single_node
+            .metadata_primary_bridge_node()?
             .abort_stream_upload_session(bucket, key, session_id)?;
         self.delete_staged_stream_segment_payload_shards_best_effort(&staged_segments);
         Ok(())
     }
 
     pub fn list_stream_upload_sessions_best_effort(&self) -> Vec<StreamUploadRecord> {
-        if self.require_current_operation_epoch().is_err() {
+        let Ok(bridge_node) = self.metadata_primary_bridge_node() else {
             return Vec::new();
-        }
-        self.single_node.list_all_stream_uploads_best_effort()
+        };
+        bridge_node.list_all_stream_uploads_best_effort()
     }
 
     pub fn read_segment_payload_stored_bytes_into(
@@ -850,7 +871,9 @@ impl StorageCluster {
         data_pg_id: u32,
         shard_key: &ShardKey,
     ) -> Result<WriteAck, StoreError> {
-        let pg = self.single_node.get_pg(data_pg_id)?;
+        // Phase 4 ack bridge: placed payload bytes are routed by LocalClusterMap,
+        // but per-shard CRC/size acks still live in metadata-primary PG stores.
+        let pg = self.metadata_primary_bridge_node()?.get_pg(data_pg_id)?;
         let stat = pg.stat_shard(shard_key)?;
         Ok(WriteAck {
             crc64: stat.crc64,
@@ -969,7 +992,9 @@ impl StorageCluster {
         data_pg_id: u32,
         shard_keys: &[ShardKey],
     ) -> Result<(), ObjectPgActionError> {
-        let data_pg = self.single_node.get_pg(data_pg_id)?;
+        // Phase 4 ack bridge cleanup. The placed shard files are deleted
+        // separately by the caller before these metadata-primary ack rows.
+        let data_pg = self.metadata_primary_bridge_node()?.get_pg(data_pg_id)?;
         for shard_key in shard_keys {
             data_pg.delete_shard(shard_key)?;
         }
@@ -981,7 +1006,10 @@ impl StorageCluster {
         data_pg_id: u32,
         shard_keys: &[ShardKey],
     ) {
-        let Ok(data_pg) = self.single_node.get_pg(data_pg_id) else {
+        let Ok(bridge_node) = self.metadata_primary_bridge_node() else {
+            return;
+        };
+        let Ok(data_pg) = bridge_node.get_pg(data_pg_id) else {
             return;
         };
         for shard_key in shard_keys {

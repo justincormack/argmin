@@ -895,6 +895,33 @@ Phase 5 implementation notes:
    - tests cover stale bucket metadata creation and object generation
      reservation attempts failing before metadata mutation, plus lease release
      after an epoch transition
+4. Step 5.4 audits and closes remaining broad `SharedStorageNode` escape
+   hatches at the cluster boundary.
+   - production `StorageCluster` paths may only touch the metadata-primary node
+     through an epoch-checked bridge helper, an explicitly best-effort stale
+     no-op helper, or a read-only topology/config helper
+   - remaining direct metadata-primary shard-row access is documented as the
+     Phase 4 ack bridge and is reachable only after the operation epoch has
+     been checked
+   - test-only helpers are either epoch checked, read-only topology helpers, or
+     explicitly named as lock/contention hooks that do not model production
+     routing
+5. Step 5.5 tightens stale/control-plane error context.
+   - storage errors for stale handles and inactive/misrouted PGs should carry
+     enough node, PG, and epoch context to diagnose a failed route
+   - metadata-primary bridge errors should make clear whether they are
+     operation-epoch failures or underlying metadata/SQLite failures
+   - logs should not collapse stale epoch, inactive PG, or misroute conditions
+     into object-not-found or best-effort silence except for explicitly
+     best-effort worker queues
+6. Step 5.6 closes Phase 5 with a representative stale-handle regression
+   matrix and final plan update.
+   - cover at least one bucket path, object path, stream path, multipart path,
+     reclaim/queue path, and payload path
+   - verify stale handles fail before metadata/shard mutation, while active
+     token release paths still release already-acquired state
+   - mark Phase 5 complete once the audit, error-context pass, and regression
+     matrix are in place
 
 ## Phase 6: PG Metadata Replication
 
