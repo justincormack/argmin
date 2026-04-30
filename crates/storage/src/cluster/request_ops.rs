@@ -9,7 +9,7 @@ use placement::NodeId;
 
 use crate::metadata_command::{
     CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
-    PutBucketVersioningCommand,
+    PutBucketAclCommand, PutBucketVersioningCommand,
 };
 use crate::*;
 
@@ -189,7 +189,7 @@ impl super::StorageCluster {
                 Ok(info) => {
                     self.local_map
                         .runtime_state()
-                        .remove_pending_create_bucket_command(PgId::new(pg_id), &bucket);
+                        .remove_pending_metadata_command_for_bucket(PgId::new(pg_id), &bucket);
                     return Ok(BucketCreateAttemptOutcome::Exists(info));
                 }
                 Err(MetadataError::BucketNotFound { .. }) => {}
@@ -200,7 +200,7 @@ impl super::StorageCluster {
         let pg_id = PgId::new(pg_id);
         let runtime_state = self.local_map.runtime_state();
         let command = if let Some(command) =
-            runtime_state.pending_create_bucket_command(pg_id, &bucket)
+            runtime_state.pending_metadata_command_for_bucket(pg_id, &bucket)
         {
             match command.payload() {
                 MetadataCommandPayload::CreateBucket(create) if create.matches_config(config) => {
@@ -212,6 +212,11 @@ impl super::StorageCluster {
                 MetadataCommandPayload::PutBucketVersioning(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending put bucket versioning command for create bucket",
+                    ));
+                }
+                MetadataCommandPayload::PutBucketAcl(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending put bucket acl command for create bucket",
                     ));
                 }
             }
@@ -236,7 +241,7 @@ impl super::StorageCluster {
                 command_id,
                 MetadataCommandPayload::CreateBucket(command),
             );
-            runtime_state.insert_pending_create_bucket_command(pg_id, &bucket, command.clone());
+            runtime_state.set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone());
             command
         };
         self.apply_metadata_command_to_acting_set(&command)?;
@@ -245,7 +250,7 @@ impl super::StorageCluster {
         let info = PgMetadataStore::head_bucket(&*bucket_pg, &bucket)?;
         self.local_map
             .runtime_state()
-            .remove_pending_create_bucket_command(pg_id, &bucket);
+            .remove_pending_metadata_command_for_bucket(pg_id, &bucket);
         Ok(BucketCreateAttemptOutcome::Created(info))
     }
 
@@ -301,7 +306,7 @@ impl super::StorageCluster {
         }
         self.local_map
             .runtime_state()
-            .remove_pending_metadata_commands_for_bucket(pg_id, bucket);
+            .clear_pending_metadata_command_for_bucket(pg_id, bucket);
         Ok(BucketDeleteFinalizeOutcome::Finalized)
     }
 
@@ -587,7 +592,7 @@ impl super::StorageCluster {
 
         let runtime_state = self.local_map.runtime_state();
         let command = if let Some(command) =
-            runtime_state.pending_put_bucket_versioning_command(pg_id, bucket)
+            runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
         {
             match command.payload() {
                 MetadataCommandPayload::PutBucketVersioning(versioning)
@@ -603,6 +608,11 @@ impl super::StorageCluster {
                 MetadataCommandPayload::CreateBucket(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending create bucket command for versioning",
+                    ));
+                }
+                MetadataCommandPayload::PutBucketAcl(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending put bucket acl command for versioning",
                     ));
                 }
             }
@@ -623,11 +633,7 @@ impl super::StorageCluster {
                     bucket_execution_generation,
                 )),
             );
-            runtime_state.insert_pending_put_bucket_versioning_command(
-                pg_id,
-                bucket,
-                command.clone(),
-            );
+            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
             command
         };
         self.apply_metadata_command_to_acting_set(&command)?;
@@ -636,7 +642,7 @@ impl super::StorageCluster {
         let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
         self.local_map
             .runtime_state()
-            .remove_pending_put_bucket_versioning_command(pg_id, bucket);
+            .remove_pending_metadata_command_for_bucket(pg_id, bucket);
         Ok(info)
     }
 
@@ -708,8 +714,70 @@ impl super::StorageCluster {
         public_read: bool,
         public_write: bool,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.bucket_metadata_primary_node(bucket)?
-            .put_bucket_acl_and_load_info(bucket, acl_grants, public_read, public_write)
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        let primary_node = self.bucket_metadata_primary_node(bucket)?;
+        let _bucket_guard = primary_node.lock_bucket(bucket);
+        {
+            let bucket_pg = primary_node.get_pg(pg_id.get())?;
+            PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
+        }
+
+        let runtime_state = self.local_map.runtime_state();
+        let command = if let Some(command) =
+            runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+        {
+            match command.payload() {
+                MetadataCommandPayload::PutBucketAcl(acl)
+                    if acl.matches_request(bucket, acl_grants, public_read, public_write) =>
+                {
+                    command
+                }
+                MetadataCommandPayload::PutBucketAcl(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "conflicting pending put bucket acl command",
+                    ));
+                }
+                MetadataCommandPayload::CreateBucket(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending create bucket command for bucket acl",
+                    ));
+                }
+                MetadataCommandPayload::PutBucketVersioning(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending put bucket versioning command for bucket acl",
+                    ));
+                }
+            }
+        } else {
+            let command_id = MetadataCommandId::new(
+                self.operation_epoch(),
+                pg_id,
+                runtime_state.next_metadata_command_log_index(pg_id),
+            );
+            let bucket_pg = primary_node.get_pg(pg_id.get())?;
+            let bucket_execution_generation = bucket_pg.reserve_bucket_execution_generation()?;
+            drop(bucket_pg);
+            let command = MetadataCommandEnvelope::new(
+                command_id,
+                MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::new(
+                    bucket.clone(),
+                    acl_grants.clone(),
+                    public_read,
+                    public_write,
+                    bucket_execution_generation,
+                )),
+            );
+            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            command
+        };
+        self.apply_metadata_command_to_acting_set(&command)?;
+
+        let bucket_pg = primary_node.get_pg(pg_id.get())?;
+        let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
+        self.local_map
+            .runtime_state()
+            .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+        Ok(info)
     }
 
     pub fn put_bucket_subresource_and_load_info(

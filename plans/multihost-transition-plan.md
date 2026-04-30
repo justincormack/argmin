@@ -1197,11 +1197,25 @@ Work items:
      - reserve bucket execution generations on the routed bucket PG primary,
        then carry the explicit generation through command apply so every
        active acting node converges on the same cache-invalidation generation
-     - keep an in-process pending versioning command until full apply
-       succeeds, matching the create-bucket retry behavior for partial replica
-       apply
+     - keep one in-process pending bucket metadata command per bucket command
+       stream until full apply succeeds, matching the create-bucket retry
+       behavior for partial replica apply
      - include deterministic command encoding coverage, primary/replica
        convergence tests, and a partial-replica retry regression
+   - second slice:
+     - migrate `put_bucket_acl_and_load_info` onto the metadata command path
+       using the same explicit bucket execution generation and pending-command
+       retry model as versioning
+     - serialize pending bucket mutations across command kinds: a partially
+       applied versioning command blocks a later ACL command until the
+       versioning retry converges, rather than allowing a newer generation to
+       make the earlier command stale on already-updated replicas
+     - reject stale or same-generation divergent ACL commands during command
+       apply rather than letting an older command lower or overwrite the bucket
+       incarnation state
+     - include deterministic command encoding coverage, primary/replica
+       convergence tests, partial-replica retry regression, and a cross-command
+       ordering regression
 4. Phase 6.4: stream, multipart, and reclaim command migration.
    - migrate stream session creation, segment append/finalize/abort metadata,
      multipart create/part/finalize/abort metadata, omitted-part cleanup

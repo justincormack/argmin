@@ -33,6 +33,10 @@ Every public `StorageCluster` operation must fit one of these classes:
 - Payload shard ack rows are metadata rows in the data PG and must route
   through that PG's primary. They hold shard checksums/sizes while payload
   files are placed through the cluster map.
+- Local metadata commands are serialized per bucket command stream. A pending
+  command for `(bucket PG, bucket)` must block later bucket mutations of any
+  command kind until the pending command converges or the bucket incarnation is
+  finalized away.
 - Best-effort cleanup may suppress cleanup errors, but typed route/control-plane
   errors must not collapse into `NotFound` or generic IO before the suppression
   point.
@@ -60,8 +64,8 @@ script in the same change.
 | `reserve_put_object_generation`, `release_object_generation_reservation`, `commit_direct_put_object_from_payload_shards` | Epoch-fenced routed metadata PG |
 | `create_put_object_stream_session_record`, `load_stream_upload_session`, `prepare_stream_segment_append`, `commit_stream_segment_append`, `abort_stream_upload_session`, `create_put_object_stream_session`, `finalize_put_object_stream` | Epoch-fenced routed metadata PG |
 | `list_stream_upload_sessions_best_effort` | Best-effort routed metadata PG fanout |
-| `create_bucket_with_config_and_load_info`, `put_bucket_versioning_and_load_info` | Epoch-fenced routed metadata PG command apply |
-| `try_probe_bucket_pg_available`, `load_bucket_snapshot`, `load_bucket_snapshot_pair`, `with_bucket_write_snapshot`, `head_bucket_info`, `get_bucket_subresource`, `put_bucket_object_lock_and_load_info`, `put_bucket_encryption_and_load_info`, `put_bucket_public_access_block_and_load_info`, `delete_bucket_public_access_block_and_load_info`, `put_bucket_ownership_controls_and_load_info`, `delete_bucket_ownership_controls_and_load_info`, `put_bucket_abac_enabled_and_load_info`, `put_bucket_acl_and_load_info`, `put_bucket_subresource_and_load_info`, `delete_bucket_subresource_and_load_info` | Epoch-fenced routed metadata PG |
+| `create_bucket_with_config_and_load_info`, `put_bucket_versioning_and_load_info`, `put_bucket_acl_and_load_info` | Epoch-fenced routed metadata PG command apply |
+| `try_probe_bucket_pg_available`, `load_bucket_snapshot`, `load_bucket_snapshot_pair`, `with_bucket_write_snapshot`, `head_bucket_info`, `get_bucket_subresource`, `put_bucket_object_lock_and_load_info`, `put_bucket_encryption_and_load_info`, `put_bucket_public_access_block_and_load_info`, `delete_bucket_public_access_block_and_load_info`, `put_bucket_ownership_controls_and_load_info`, `delete_bucket_ownership_controls_and_load_info`, `put_bucket_abac_enabled_and_load_info`, `put_bucket_subresource_and_load_info`, `delete_bucket_subresource_and_load_info` | Epoch-fenced routed metadata PG |
 | `list_buckets_for_owner`, `list_lifecycle_sweep_buckets` | Epoch-fenced routed metadata PG fanout |
 | `begin_bucket_delete` | Epoch-fenced routed metadata PG fanout |
 | `try_finalize_bucket_delete` | Epoch-fenced routed metadata PG fanout plus local runtime lease bookkeeping and worker queue |

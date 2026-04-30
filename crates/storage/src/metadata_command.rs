@@ -11,6 +11,7 @@ const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
 const METADATA_COMMAND_ENCODING_VERSION: u16 = 1;
 const METADATA_COMMAND_CREATE_BUCKET: u16 = 1;
 const METADATA_COMMAND_PUT_BUCKET_VERSIONING: u16 = 2;
+const METADATA_COMMAND_PUT_BUCKET_ACL: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct MetadataCommandLogIndex(NonZeroU64);
@@ -126,6 +127,7 @@ impl CreateBucketCommand {
 pub(crate) enum MetadataCommandPayload {
     CreateBucket(CreateBucketCommand),
     PutBucketVersioning(PutBucketVersioningCommand),
+    PutBucketAcl(PutBucketAclCommand),
 }
 
 impl MetadataCommandPayload {
@@ -133,6 +135,7 @@ impl MetadataCommandPayload {
         match self {
             Self::CreateBucket(_) => METADATA_COMMAND_CREATE_BUCKET,
             Self::PutBucketVersioning(_) => METADATA_COMMAND_PUT_BUCKET_VERSIONING,
+            Self::PutBucketAcl(_) => METADATA_COMMAND_PUT_BUCKET_ACL,
         }
     }
 }
@@ -163,6 +166,46 @@ impl PutBucketVersioningCommand {
         state: BucketVersioningState,
     ) -> bool {
         self.name == *bucket && self.state == state
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PutBucketAclCommand {
+    pub(crate) name: BucketName,
+    pub(crate) acl_grants: AclGrants,
+    pub(crate) public_read: bool,
+    pub(crate) public_write: bool,
+    pub(crate) bucket_execution_generation: u64,
+}
+
+impl PutBucketAclCommand {
+    pub(crate) fn new(
+        name: BucketName,
+        acl_grants: AclGrants,
+        public_read: bool,
+        public_write: bool,
+        bucket_execution_generation: u64,
+    ) -> Self {
+        Self {
+            name,
+            acl_grants,
+            public_read,
+            public_write,
+            bucket_execution_generation,
+        }
+    }
+
+    pub(crate) fn matches_request(
+        &self,
+        bucket: &BucketName,
+        acl_grants: &AclGrants,
+        public_read: bool,
+        public_write: bool,
+    ) -> bool {
+        self.name == *bucket
+            && self.acl_grants == *acl_grants
+            && self.public_read == public_read
+            && self.public_write == public_write
     }
 }
 
@@ -222,6 +265,9 @@ fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPaylo
         MetadataCommandPayload::PutBucketVersioning(command) => {
             encode_put_bucket_versioning(&mut out, command);
         }
+        MetadataCommandPayload::PutBucketAcl(command) => {
+            encode_put_bucket_acl(&mut out, command);
+        }
     }
     out
 }
@@ -242,6 +288,14 @@ fn encode_create_bucket(out: &mut Vec<u8>, command: &CreateBucketCommand) {
 fn encode_put_bucket_versioning(out: &mut Vec<u8>, command: &PutBucketVersioningCommand) {
     put_str(out, command.name.as_str());
     put_u8(out, command.state as u8);
+    put_u64(out, command.bucket_execution_generation);
+}
+
+fn encode_put_bucket_acl(out: &mut Vec<u8>, command: &PutBucketAclCommand) {
+    put_str(out, command.name.as_str());
+    put_str(out, &command.acl_grants.serialized());
+    put_bool(out, command.public_read);
+    put_bool(out, command.public_write);
     put_u64(out, command.bucket_execution_generation);
 }
 
@@ -362,6 +416,31 @@ mod tests {
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
         assert_eq!(envelope.checksum_crc64(), 0xa7a53964fbc32e58);
+        assert!(envelope.verify_checksum());
+    }
+
+    #[test]
+    fn metadata_command_bucket_acl_encoding_is_stable() {
+        let command = PutBucketAclCommand::new(
+            BucketName::try_from("bucket").unwrap(),
+            AclGrants::default(),
+            true,
+            false,
+            12,
+        );
+        let id = MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(3),
+            MetadataCommandLogIndex::new(11).unwrap(),
+        );
+        let envelope =
+            MetadataCommandEnvelope::new(id, MetadataCommandPayload::PutBucketAcl(command.clone()));
+        let duplicate =
+            MetadataCommandEnvelope::new(id, MetadataCommandPayload::PutBucketAcl(command));
+
+        assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
+        assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
+        assert_eq!(envelope.checksum_crc64(), 0x3947184ebe5f3b3b);
         assert!(envelope.verify_checksum());
     }
 }

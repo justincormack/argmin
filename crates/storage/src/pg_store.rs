@@ -19,7 +19,7 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 use crate::error::{MetadataError, StoreError};
 use crate::metadata_command::{
-    CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandPayload,
+    CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandPayload, PutBucketAclCommand,
     PutBucketVersioningCommand,
 };
 use crate::schema::init_pg_schema;
@@ -2041,6 +2041,7 @@ impl PgStore {
             MetadataCommandPayload::PutBucketVersioning(versioning) => {
                 self.apply_put_bucket_versioning_command(versioning)
             }
+            MetadataCommandPayload::PutBucketAcl(acl) => self.apply_put_bucket_acl_command(acl),
         }
     }
 
@@ -2074,6 +2075,19 @@ impl PgStore {
         self.put_bucket_versioning_inner(
             &command.name,
             command.state,
+            BucketExecutionGeneration::Explicit(command.bucket_execution_generation),
+        )
+    }
+
+    fn apply_put_bucket_acl_command(
+        &self,
+        command: &PutBucketAclCommand,
+    ) -> Result<(), MetadataError> {
+        self.put_bucket_acl_inner(
+            &command.name,
+            &command.acl_grants,
+            command.public_read,
+            command.public_write,
             BucketExecutionGeneration::Explicit(command.bucket_execution_generation),
         )
     }
@@ -2123,21 +2137,22 @@ impl PgStore {
                 })?;
                 Ok((versioning, generation))
             })?;
-        if matches!(
-            generation,
-            BucketExecutionGeneration::Explicit(explicit)
-                if current == state && current_generation == explicit
-        ) {
-            return Ok(());
-        }
-        if matches!(
-            generation,
-            BucketExecutionGeneration::Explicit(explicit) if current_generation > explicit
-        ) {
-            return Err(MetadataError::Db {
-                context: "apply stale bucket versioning command",
-                source: rusqlite::Error::InvalidQuery,
-            });
+        if let BucketExecutionGeneration::Explicit(explicit) = generation {
+            if current_generation == explicit {
+                if current == state {
+                    return Ok(());
+                }
+                return Err(MetadataError::Db {
+                    context: "apply conflicting bucket versioning command",
+                    source: rusqlite::Error::InvalidQuery,
+                });
+            }
+            if current_generation > explicit {
+                return Err(MetadataError::Db {
+                    context: "apply stale bucket versioning command",
+                    source: rusqlite::Error::InvalidQuery,
+                });
+            }
         }
         if state == BucketVersioningState::Disabled && current != BucketVersioningState::Disabled {
             return Err(MetadataError::InvalidVersioningTransition {
@@ -2176,6 +2191,125 @@ impl PgStore {
                         context: "put bucket versioning",
                         source,
                     })?;
+                Ok(())
+            },
+        )
+    }
+
+    fn put_bucket_acl_inner(
+        &self,
+        name: &BucketName,
+        acl_grants: &AclGrants,
+        public_read: bool,
+        public_write: bool,
+        generation: BucketExecutionGeneration,
+    ) -> Result<(), MetadataError> {
+        let (current_acl_grants, current_public_read, current_public_write, current_generation): (
+            AclGrants,
+            bool,
+            bool,
+            u64,
+        ) = self
+            .conn
+            .query_row(
+                "SELECT acl_grants, public_read, public_write, bucket_execution_generation \
+                 FROM buckets \
+                 WHERE name = ?1",
+                params![name.as_str()],
+                |row| {
+                    let raw_acl_grants = row.get::<_, String>(0)?;
+                    let public_read = row.get::<_, i64>(1)? != 0;
+                    let public_write = row.get::<_, i64>(2)? != 0;
+                    let raw_generation = row.get::<_, i64>(3)?;
+                    Ok((raw_acl_grants, public_read, public_write, raw_generation))
+                },
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get bucket acl",
+                source: e,
+            })?
+            .ok_or_else(|| bucket_not_found(name.as_str()))
+            .and_then(
+                |(raw_acl_grants, public_read, public_write, raw_generation)| {
+                    let acl_grants = Self::parse_acl_grants(raw_acl_grants, 0, "bucket acl")
+                        .map_err(|source| MetadataError::Db {
+                            context: "decode bucket acl",
+                            source,
+                        })?;
+                    let generation = raw_generation.try_into().map_err(|_| MetadataError::Db {
+                        context: "decode bucket execution generation",
+                        source: rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Integer,
+                            Box::from("negative bucket_execution_generation"),
+                        ),
+                    })?;
+                    Ok((acl_grants, public_read, public_write, generation))
+                },
+            )?;
+        if let BucketExecutionGeneration::Explicit(explicit) = generation {
+            if current_generation == explicit {
+                if current_acl_grants == *acl_grants
+                    && current_public_read == public_read
+                    && current_public_write == public_write
+                {
+                    return Ok(());
+                }
+                return Err(MetadataError::Db {
+                    context: "apply conflicting bucket acl command",
+                    source: rusqlite::Error::InvalidQuery,
+                });
+            }
+            if current_generation > explicit {
+                return Err(MetadataError::Db {
+                    context: "apply stale bucket acl command",
+                    source: rusqlite::Error::InvalidQuery,
+                });
+            }
+        }
+
+        self.with_immediate_txn(
+            "put bucket acl (begin txn)",
+            "put bucket acl (commit txn)",
+            |store| {
+                let generation = match generation {
+                    BucketExecutionGeneration::Allocate => store
+                        .next_bucket_execution_generation_in_txn(
+                            "put bucket acl (allocate execution generation)",
+                        )?,
+                    BucketExecutionGeneration::Explicit(generation) => {
+                        store.advance_bucket_execution_generation_in_txn(
+                            generation,
+                            "put bucket acl (advance execution generation)",
+                        )?;
+                        generation
+                    }
+                };
+                let updated = store
+                    .conn
+                    .execute(
+                        "UPDATE buckets \
+                         SET acl_grants = ?1, \
+                             public_read = ?2, \
+                             public_write = ?3, \
+                             bucket_execution_generation = ?4 \
+                         WHERE name = ?5",
+                        params![
+                            acl_grants.serialized(),
+                            i32::from(public_read),
+                            i32::from(public_write),
+                            generation as i64,
+                            name.as_str()
+                        ],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "put bucket acl",
+                        source,
+                    })?;
+                if updated == 0 {
+                    return Err(bucket_not_found(name.as_str()));
+                }
                 Ok(())
             },
         )
@@ -2887,39 +3021,12 @@ impl PgMetadataStore for PgStore {
         public_read: bool,
         public_write: bool,
     ) -> Result<(), MetadataError> {
-        self.with_immediate_txn(
-            "put bucket acl (begin txn)",
-            "put bucket acl (commit txn)",
-            |store| {
-                let generation = store.next_bucket_execution_generation_in_txn(
-                    "put bucket acl (allocate execution generation)",
-                )?;
-                let updated = store
-                    .conn
-                    .execute(
-                        "UPDATE buckets \
-                         SET acl_grants = ?1, \
-                             public_read = ?2, \
-                             public_write = ?3, \
-                             bucket_execution_generation = ?4 \
-                         WHERE name = ?5",
-                        params![
-                            acl_grants.serialized(),
-                            i32::from(public_read),
-                            i32::from(public_write),
-                            generation as i64,
-                            name.as_str()
-                        ],
-                    )
-                    .map_err(|source| MetadataError::Db {
-                        context: "put bucket acl",
-                        source,
-                    })?;
-                if updated == 0 {
-                    return Err(bucket_not_found(name.as_str()));
-                }
-                Ok(())
-            },
+        self.put_bucket_acl_inner(
+            name,
+            acl_grants,
+            public_read,
+            public_write,
+            BucketExecutionGeneration::Allocate,
         )
     }
 
@@ -7911,8 +8018,127 @@ mod tests {
             "expected stale command rejection, got {err:?}"
         );
 
+        let conflicting = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(3).unwrap(),
+            ),
+            MetadataCommandPayload::PutBucketVersioning(PutBucketVersioningCommand::new(
+                bucket.clone(),
+                BucketVersioningState::Suspended,
+                12,
+            )),
+        );
+        let err = store.apply_metadata_command(&conflicting).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MetadataError::Db {
+                    context: "apply conflicting bucket versioning command",
+                    ..
+                }
+            ),
+            "expected conflicting command rejection, got {err:?}"
+        );
+
         let info = store.head_bucket_raw(&bucket).unwrap();
         assert_eq!(info.versioning, BucketVersioningState::Enabled);
+        assert_eq!(info.bucket_execution_generation, 12);
+    }
+
+    #[test]
+    fn put_bucket_acl_command_does_not_lower_execution_generation() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("bucket");
+        let owner = test_owner();
+        let acl_grants = AclGrants::default();
+        store
+            .create_bucket_with_config(&CreateBucketConfig {
+                name: bucket.as_str(),
+                owner_principal: &owner.principal,
+                owner_canonical_id: &owner.canonical_id,
+                acl_grants: &acl_grants,
+                public_read: false,
+                public_write: false,
+                versioning: BucketVersioningState::Disabled,
+                object_lock: BucketObjectLockConfig::default(),
+            })
+            .unwrap();
+
+        let newer = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::new(
+                bucket.clone(),
+                acl_grants.clone(),
+                true,
+                false,
+                12,
+            )),
+        );
+        store.apply_metadata_command(&newer).unwrap();
+
+        let stale = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::new(
+                bucket.clone(),
+                acl_grants.clone(),
+                true,
+                false,
+                11,
+            )),
+        );
+        let err = store.apply_metadata_command(&stale).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MetadataError::Db {
+                    context: "apply stale bucket acl command",
+                    ..
+                }
+            ),
+            "expected stale command rejection, got {err:?}"
+        );
+
+        let conflicting = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(3).unwrap(),
+            ),
+            MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::new(
+                bucket.clone(),
+                acl_grants.clone(),
+                false,
+                true,
+                12,
+            )),
+        );
+        let err = store.apply_metadata_command(&conflicting).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MetadataError::Db {
+                    context: "apply conflicting bucket acl command",
+                    ..
+                }
+            ),
+            "expected conflicting command rejection, got {err:?}"
+        );
+
+        let info = store.head_bucket_raw(&bucket).unwrap();
+        assert_eq!(info.acl_grants, acl_grants);
+        assert!(info.public_read);
+        assert!(!info.public_write);
         assert_eq!(info.bucket_execution_generation, 12);
     }
 
