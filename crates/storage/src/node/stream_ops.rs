@@ -144,12 +144,11 @@ impl SharedStorageNode {
     pub(crate) fn commit_direct_put_object<E>(
         &self,
         req: &CommitDirectPutObjectReq,
-        written_shards: &[WrittenShardAck],
         action: impl FnOnce(DirectPutCommitSnapshot) -> Result<(), E>,
     ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, DirectPutCommitError> {
         let meta_pg_id = self.pg_topology.object_pg_for(&req.bucket, &req.key);
-        let (meta_pg, data_pg) = match self.lock_two_pgs(meta_pg_id, req.data_pg_id) {
-            Ok(guards) => guards,
+        let meta_pg = match self.get_pg(meta_pg_id) {
+            Ok(meta_pg) => meta_pg,
             Err(error) => {
                 let _ = self.release_object_generation_reservation(
                     &req.bucket,
@@ -161,7 +160,6 @@ impl SharedStorageNode {
                 ));
             }
         };
-        let data_pg = data_pg.as_deref().unwrap_or(&meta_pg);
 
         let release_reservation = |meta_pg: &PgStore| {
             meta_pg.delete_object_generation_reservation(
@@ -236,15 +234,6 @@ impl SharedStorageNode {
         } else {
             None
         };
-
-        let shard_batch: Vec<(&ShardKey, WriteAck)> = written_shards
-            .iter()
-            .map(|written| (&written.key, written.ack))
-            .collect();
-        if let Err(err) = data_pg.register_written_shards_batch(&shard_batch) {
-            let _ = release_reservation(&meta_pg);
-            return Err(DirectPutCommitError::pre_publish(err));
-        }
 
         let segment_record = ObjectSegmentRecord {
             bucket: req.bucket.clone(),
@@ -450,10 +439,10 @@ impl SharedStorageNode {
         session_id: &SessionId,
         segment_index: u32,
         segment_record: &StreamUploadSegmentRecord,
-        shard_batch: &[(&ShardKey, WriteAck)],
+        _shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), ObjectPgActionError> {
         let meta_pg_id = self.pg_topology.object_pg_for(bucket, key);
-        let (meta_pg, data_pg) = self.lock_two_pgs(meta_pg_id, segment_record.data_pg_id)?;
+        let meta_pg = self.get_pg(meta_pg_id)?;
         let session = match meta_pg.get_stream_upload(session_id) {
             Ok(session) => session,
             Err(err) => {
@@ -463,22 +452,8 @@ impl SharedStorageNode {
         Self::validate_stream_upload_session_binding(&session, bucket, key)?;
         Self::reject_duplicate_stream_segment_index(&meta_pg, session_id, segment_index)?;
 
-        match data_pg {
-            None => {
-                if let Err(err) = meta_pg
-                    .register_written_shards_and_append_stream_segment(shard_batch, segment_record)
-                {
-                    return Err(err.into());
-                }
-            }
-            Some(data_pg) => {
-                if let Err(err) = data_pg.register_written_shards_batch(shard_batch) {
-                    return Err(err.into());
-                }
-                if let Err(err) = meta_pg.append_stream_segment(segment_record) {
-                    return Err(err.into());
-                }
-            }
+        if let Err(err) = meta_pg.append_stream_segment(segment_record) {
+            return Err(err.into());
         }
 
         Ok(())

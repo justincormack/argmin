@@ -356,6 +356,56 @@ impl LocalClusterMap {
         self.process_local_registry_key
     }
 
+    pub(crate) fn metadata_pg_primary_node(
+        &self,
+        operation_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<&LocalNodeStore, StoreError> {
+        if operation_epoch != self.epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch,
+                current_epoch: self.epoch,
+            });
+        }
+
+        let route = self
+            .pg_routes
+            .get(&pg_id)
+            .ok_or(StoreError::ClusterPgNotFound {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.epoch,
+            })?;
+        if route.cluster_epoch() != self.epoch {
+            return Err(StoreError::StaleMetadataRoute {
+                pg_id: pg_id.get(),
+                route_epoch: route.cluster_epoch(),
+                current_epoch: self.epoch,
+            });
+        }
+        if !route.is_active() {
+            return Err(StoreError::PgNotActive {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.epoch,
+                state: route.state(),
+            });
+        }
+        let node_id = route.primary_node_id();
+        if !route.contains_node(node_id) {
+            return Err(StoreError::NodeNotInActingSet {
+                node_id: node_id.as_u32(),
+                pg_id: pg_id.get(),
+                cluster_epoch: self.epoch,
+            });
+        }
+
+        self.nodes.get(&node_id).ok_or(StoreError::NodeNotFound {
+            node_id: node_id.as_u32(),
+            pg_id: pg_id.get(),
+            cluster_epoch: self.epoch,
+        })
+    }
+
     pub fn place_payload_shards(
         &self,
         operation_epoch: ClusterEpoch,
@@ -726,15 +776,24 @@ mod tests {
     ) -> CommittedDirectSegment {
         let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
         let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+        write_committed_direct_segment_for(cluster, &bucket, &key, payload)
+    }
+
+    fn write_committed_direct_segment_for(
+        cluster: &crate::StorageCluster,
+        bucket: &crate::BucketName,
+        key: &crate::ObjectKey,
+        payload: &[u8],
+    ) -> CommittedDirectSegment {
         let reservation_id = crate::SessionId::try_from("01".repeat(16)).unwrap();
         let generation_id = cluster
-            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .reserve_put_object_generation(bucket, key, &reservation_id)
             .unwrap();
         let segment_okh = [41; 16];
         let written = cluster
             .write_direct_put_segment_payload_shards(
-                &bucket,
-                &key,
+                bucket,
+                key,
                 generation_id,
                 0,
                 &segment_okh,
@@ -742,8 +801,8 @@ mod tests {
             )
             .unwrap();
         let commit_req = crate::CommitDirectPutObjectReq {
-            bucket,
-            key,
+            bucket: bucket.clone(),
+            key: key.clone(),
             generation_reservation_id: reservation_id,
             versioning: crate::BucketVersioningState::Disabled,
             owner: crate::OwnerIdentity::from_principal("owner"),
@@ -788,6 +847,29 @@ mod tests {
         }
     }
 
+    fn bucket_key_with_distinct_object_and_data_pg(
+        topology: &crate::PgTopology,
+    ) -> (crate::BucketName, crate::ObjectKey, u32, u32) {
+        let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+        for index in 0..1000 {
+            let key = crate::ObjectKey::try_from(format!("key-{index}")).unwrap();
+            let object_pg = topology.object_pg_for(&bucket, &key);
+            let data_pg = topology
+                .object_generation_segment_data_pg(&bucket, &key, crate::GenerationId::MIN, 0)
+                .get();
+            if object_pg != data_pg {
+                return (bucket, key, object_pg, data_pg);
+            }
+        }
+        panic!("test topology did not produce distinct object/data PGs");
+    }
+
+    fn set_route_primary(map: &mut LocalClusterMap, pg_id: u32, primary_node_id: NodeId) {
+        let route = map.pg_routes.get_mut(&PgId::new(pg_id)).unwrap();
+        route.acting_set = Arc::from([NodeId::new(0), NodeId::new(1), NodeId::new(2)]);
+        route.primary_node_id = primary_node_id;
+    }
+
     #[derive(Debug, Clone)]
     enum LocalClusterTraceOp {
         AdvanceEpoch,
@@ -798,7 +880,7 @@ mod tests {
         ReadStale,
         DeleteCurrent,
         DeleteStale,
-        MetadataBridgeStale(u8),
+        MetadataOperationStale(u8),
         ZeroSizeStalePayloadRead,
         QueueCurrent(u8),
         QueueStale(u8),
@@ -826,7 +908,7 @@ mod tests {
                 3 => Just(LocalClusterTraceOp::ReadStale),
                 3 => Just(LocalClusterTraceOp::DeleteCurrent),
                 2 => Just(LocalClusterTraceOp::DeleteStale),
-                3 => any::<u8>().prop_map(LocalClusterTraceOp::MetadataBridgeStale),
+                3 => any::<u8>().prop_map(LocalClusterTraceOp::MetadataOperationStale),
                 3 => Just(LocalClusterTraceOp::ZeroSizeStalePayloadRead),
                 2 => any::<u8>().prop_map(LocalClusterTraceOp::QueueCurrent),
                 2 => any::<u8>().prop_map(LocalClusterTraceOp::QueueStale),
@@ -966,20 +1048,20 @@ mod tests {
         while cluster.try_take_reclaim_work().is_some() {}
     }
 
-    fn assert_stale_metadata_bridge_error(
+    fn assert_stale_metadata_operation_error(
         err: crate::ObjectPgActionError,
         current_epoch: ClusterEpoch,
     ) -> TestCaseResult {
         let expected = matches!(
             err,
-            crate::ObjectPgActionError::Store(StoreError::StaleMetadataPrimaryBridge {
-                metadata_node_id: 0,
+            crate::ObjectPgActionError::Store(StoreError::StaleMetadataOperation {
+                pg_id: 0,
                 operation_epoch,
                 current_epoch: err_current_epoch,
             }) if operation_epoch == stale_epoch_for(current_epoch)
                 && err_current_epoch == current_epoch
         );
-        prop_assert!(expected, "unexpected metadata bridge error: {err:?}");
+        prop_assert!(expected, "unexpected metadata operation error: {err:?}");
         Ok(())
     }
 
@@ -1155,7 +1237,7 @@ mod tests {
                     prop_assert!(expected, "unexpected stale delete error: {err:?}");
                     prop_assert!(shard_file_present_on_any_trace_node(&map, &previous.key));
                 }
-                LocalClusterTraceOp::MetadataBridgeStale(seed) => {
+                LocalClusterTraceOp::MetadataOperationStale(seed) => {
                     let cluster = stale_cluster(&map, current_epoch);
                     let bucket = trace_bucket(*seed);
                     let key = trace_key(*seed);
@@ -1163,7 +1245,7 @@ mod tests {
                     let err = cluster
                         .reserve_put_object_generation(&bucket, &key, &reservation_id)
                         .unwrap_err();
-                    assert_stale_metadata_bridge_error(err, current_epoch)?;
+                    assert_stale_metadata_operation_error(err, current_epoch)?;
                     let cluster = current_cluster(&map);
                     let err = cluster
                         .test_object_generation_reservation_for(&bucket, &key, &reservation_id)
@@ -1246,7 +1328,7 @@ mod tests {
                     let cluster = current_cluster(&map);
                     let lease = cluster
                         .acquire_object_payload_lease(&bucket, &key, generation_id)
-                        .unwrap();
+                        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
                     prop_assert_eq!(
                         cluster.object_payload_lease_count(&bucket, &key, generation_id),
                         1
@@ -1353,6 +1435,439 @@ mod tests {
             map.node(NodeId::new(0)).unwrap().data_dir(),
             map.node(NodeId::new(1)).unwrap().data_dir()
         );
+    }
+
+    #[test]
+    fn metadata_pg_primary_node_routes_by_pg_primary_and_fails_closed() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+
+        {
+            let route = map.pg_routes.get_mut(&PgId::new(1)).unwrap();
+            route.primary_node_id = NodeId::new(2);
+        }
+        assert_eq!(
+            map.metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(1))
+                .unwrap()
+                .node_id(),
+            NodeId::new(2)
+        );
+
+        {
+            let route = map.pg_routes.get_mut(&PgId::new(1)).unwrap();
+            route.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        }
+        let err = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(1))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::StaleMetadataRoute {
+                pg_id: 1,
+                route_epoch,
+                current_epoch,
+            } if route_epoch == ClusterEpoch::new(2).unwrap()
+                && current_epoch == ClusterEpoch::INITIAL
+        ));
+        {
+            let route = map.pg_routes.get_mut(&PgId::new(1)).unwrap();
+            route.cluster_epoch = ClusterEpoch::INITIAL;
+        }
+
+        let err = map
+            .metadata_pg_primary_node(ClusterEpoch::new(2).unwrap(), PgId::new(1))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::StaleMetadataOperation {
+                pg_id: 1,
+                operation_epoch,
+                current_epoch,
+            } if operation_epoch == ClusterEpoch::new(2).unwrap()
+                && current_epoch == ClusterEpoch::INITIAL
+        ));
+
+        {
+            let route = map.pg_routes.get_mut(&PgId::new(1)).unwrap();
+            route.state = PgState::Peering;
+        }
+        let err = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(1))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::PgNotActive {
+                pg_id: 1,
+                cluster_epoch,
+                state: PgState::Peering,
+            } if cluster_epoch == ClusterEpoch::INITIAL
+        ));
+
+        {
+            let route = map.pg_routes.get_mut(&PgId::new(1)).unwrap();
+            route.state = PgState::Active;
+            route.acting_set = Arc::from([NodeId::new(0), NodeId::new(1)]);
+            route.primary_node_id = NodeId::new(2);
+        }
+        let err = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(1))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::NodeNotInActingSet {
+                node_id: 2,
+                pg_id: 1,
+                cluster_epoch,
+            } if cluster_epoch == ClusterEpoch::INITIAL
+        ));
+
+        {
+            let route = map.pg_routes.get_mut(&PgId::new(1)).unwrap();
+            route.acting_set = Arc::from([NodeId::new(99)]);
+            route.primary_node_id = NodeId::new(99);
+        }
+        let err = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(1))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::NodeNotFound {
+                node_id: 99,
+                pg_id: 1,
+                cluster_epoch,
+            } if cluster_epoch == ClusterEpoch::INITIAL
+        ));
+
+        let err = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(9))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::ClusterPgNotFound {
+                pg_id: 9,
+                cluster_epoch,
+            } if cluster_epoch == ClusterEpoch::INITIAL
+        ));
+    }
+
+    #[test]
+    fn direct_put_registers_payload_acks_on_routed_data_pg_primary() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let reservation_id = crate::SessionId::try_from("02".repeat(16)).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        assert_eq!(generation_id, crate::GenerationId::MIN);
+
+        let payload = b"direct put payload with routed data acks";
+        let segment_okh = [62; 16];
+        let written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                payload,
+            )
+            .unwrap();
+        assert_eq!(written.data_pg_id, data_pg);
+
+        let commit_req = crate::CommitDirectPutObjectReq {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_reservation_id: reservation_id,
+            versioning: crate::BucketVersioningState::Disabled,
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            generation_id,
+            size: payload.len() as u64,
+            etag_crc64: checksum::crc64::checksum(payload),
+            ec: written.ec,
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            object_lock: crate::ObjectLockState::default(),
+            encryption: crate::ObjectEncryption::None,
+            segment_index: 0,
+            segment_crc64: Some(checksum::crc64::checksum(payload)),
+            segment_okh,
+            segment_vid: generation_id,
+            data_pg_id: written.data_pg_id,
+        };
+        cluster
+            .commit_direct_put_object_from_payload_shards(
+                &commit_req,
+                &written.written_shards,
+                |_| Ok::<(), ()>(()),
+            )
+            .unwrap()
+            .unwrap();
+
+        let first_shard_key = &written.written_shards[0].key;
+        assert!(map
+            .nodes
+            .get(&NodeId::new(2))
+            .unwrap()
+            .storage_node()
+            .test_shard_exists(data_pg, first_shard_key)
+            .unwrap());
+        assert!(!map
+            .nodes
+            .get(&NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .test_shard_exists(data_pg, first_shard_key)
+            .unwrap());
+
+        let mut readback = Vec::new();
+        cluster
+            .read_segment_payload_stored_bytes_into(
+                crate::SegmentStoredBytesRequest {
+                    data_pg_id: data_pg,
+                    segment_okh,
+                    segment_vid: generation_id,
+                    stored_size: payload.len(),
+                    segment_crc64: Some(checksum::crc64::checksum(payload)),
+                    ec: written.ec,
+                },
+                &mut readback,
+            )
+            .unwrap();
+        assert_eq!(readback, payload);
+    }
+
+    #[test]
+    fn stream_append_registers_payload_acks_on_routed_data_pg_primary() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let session_id = crate::SessionId::try_from("03".repeat(16)).unwrap();
+        cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                &session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap();
+
+        let payload = b"stream append payload with routed data acks";
+        let segment_okh = crate::stream_segment_key_hash(&session_id, 0);
+        let (_, segment_record) = cluster
+            .prepare_stream_segment_append(
+                &bucket,
+                &key,
+                &crate::PrepareStreamUploadSegmentAppendReq {
+                    session_id: session_id.clone(),
+                    segment_index: 0,
+                    size: payload.len() as u64,
+                    segment_crc64: Some(checksum::crc64::checksum(payload)),
+                    segment_okh,
+                },
+            )
+            .unwrap();
+        assert_eq!(segment_record.data_pg_id, data_pg);
+
+        let written = cluster
+            .write_stream_segment_payload_shards(&segment_record, payload)
+            .unwrap();
+        let shard_batch: Vec<(&ShardKey, crate::WriteAck)> = written
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect();
+        cluster
+            .commit_stream_segment_append(
+                &bucket,
+                &key,
+                &session_id,
+                0,
+                &segment_record,
+                &shard_batch,
+            )
+            .unwrap();
+
+        let first_shard_key = &written[0].key;
+        assert!(map
+            .nodes
+            .get(&NodeId::new(2))
+            .unwrap()
+            .storage_node()
+            .test_shard_exists(data_pg, first_shard_key)
+            .unwrap());
+        assert!(!map
+            .nodes
+            .get(&NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .test_shard_exists(data_pg, first_shard_key)
+            .unwrap());
+
+        let mut readback = Vec::new();
+        cluster
+            .read_segment_payload_stored_bytes_into(
+                crate::SegmentStoredBytesRequest {
+                    data_pg_id: data_pg,
+                    segment_okh: segment_record.segment_okh,
+                    segment_vid: segment_record.segment_vid,
+                    stored_size: payload.len(),
+                    segment_crc64: Some(checksum::crc64::checksum(payload)),
+                    ec: EcShape {
+                        k: segment_record.ec_k,
+                        m: segment_record.ec_m,
+                    },
+                },
+                &mut readback,
+            )
+            .unwrap();
+        assert_eq!(readback, payload);
+    }
+
+    #[test]
+    fn lease_release_requeues_routed_reclaim_after_worker_defers_for_active_lease() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+        let committed =
+            write_committed_direct_segment_for(&cluster, &bucket, &key, b"leased payload");
+        assert_eq!(committed.written.data_pg_id, data_pg);
+
+        let lease = cluster
+            .acquire_object_payload_lease(&bucket, &key, committed.generation_id)
+            .unwrap();
+        let delete_outcome = cluster
+            .delete_current_object_if(&bucket, &key, |stored| {
+                assert!(matches!(stored, Some(crate::StoredObject::Live(_))));
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            delete_outcome.deleted,
+            crate::DeletedCurrentObject::Live {
+                generation_id,
+                ..
+            } if generation_id == committed.generation_id
+        ));
+        assert!(
+            cluster
+                .payload_reclaim_exists(&bucket, &key, committed.generation_id)
+                .unwrap(),
+            "delete should create reclaim metadata on the routed object PG primary"
+        );
+
+        cluster.enqueue_object_payload_reclaim(&bucket, &key, committed.generation_id);
+        assert!(matches!(
+            cluster.try_take_reclaim_work(),
+            Some(crate::ReclaimWorkItem::ObjectPayload((
+                queued_bucket,
+                queued_key,
+                queued_generation_id
+            ))) if queued_bucket == bucket
+                && queued_key == key
+                && queued_generation_id == committed.generation_id
+        ));
+        assert!(
+            !cluster
+                .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
+                .unwrap(),
+            "active lease should make the worker defer reclaim"
+        );
+        assert!(cluster.try_take_reclaim_work().is_none());
+
+        let released = lease.release();
+        assert_eq!(released.remaining(), 0);
+        assert!(
+            released.payload_reclaim_exists().unwrap(),
+            "released lease must find reclaim metadata through the routed object PG primary"
+        );
+        released.enqueue_object_payload_reclaim();
+        assert!(matches!(
+            cluster.try_take_reclaim_work(),
+            Some(crate::ReclaimWorkItem::ObjectPayload((
+                queued_bucket,
+                queued_key,
+                queued_generation_id
+            ))) if queued_bucket == bucket
+                && queued_key == key
+                && queued_generation_id == committed.generation_id
+        ));
+
+        assert!(
+            cluster
+                .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
+                .unwrap(),
+            "lease release requeue should make the deferred reclaim retryable"
+        );
+        assert!(!cluster
+            .payload_reclaim_exists(&bucket, &key, committed.generation_id)
+            .unwrap());
+        for shard_index in 0..committed.written.ec.k + committed.written.ec.m {
+            assert!(
+                !cluster
+                    .test_payload_shard_file_exists(
+                        committed.written.data_pg_id,
+                        committed.written.ec,
+                        &committed.segment_okh,
+                        committed.generation_id,
+                        shard_index,
+                    )
+                    .unwrap(),
+                "retried reclaim should delete placed shard {shard_index}"
+            );
+        }
     }
 
     #[test]
@@ -1866,8 +2381,8 @@ mod tests {
 
         assert!(matches!(
             err,
-            crate::BucketSnapshotLoadError::Store(StoreError::StaleMetadataPrimaryBridge {
-                metadata_node_id: 0,
+            crate::BucketSnapshotLoadError::Store(StoreError::StaleMetadataOperation {
+                pg_id: 0,
                 operation_epoch,
                 current_epoch,
             }) if operation_epoch == ClusterEpoch::new(2).unwrap()
@@ -1909,8 +2424,8 @@ mod tests {
 
         assert!(matches!(
             err,
-            crate::ObjectPgActionError::Store(StoreError::StaleMetadataPrimaryBridge {
-                metadata_node_id: 0,
+            crate::ObjectPgActionError::Store(StoreError::StaleMetadataOperation {
+                pg_id: 0,
                 operation_epoch,
                 current_epoch,
             }) if operation_epoch == ClusterEpoch::new(2).unwrap()
@@ -1956,8 +2471,8 @@ mod tests {
 
         assert!(matches!(
             err,
-            crate::BucketSnapshotLoadError::Store(StoreError::StaleMetadataPrimaryBridge {
-                metadata_node_id: 0,
+            crate::BucketSnapshotLoadError::Store(StoreError::StaleMetadataOperation {
+                pg_id: 0,
                 operation_epoch,
                 current_epoch,
             }) if operation_epoch == ClusterEpoch::new(2).unwrap()
@@ -2298,13 +2813,12 @@ mod tests {
 
         assert!(matches!(
             err,
-            StoreError::ShardPgNotActive {
-                node_id,
+            StoreError::PgNotActive {
                 pg_id,
-                cluster_epoch: ClusterEpoch::INITIAL,
+                cluster_epoch,
                 state: PgState::Peering,
-            } if node_id == segment.locations[0].node_id().as_u32()
-                && pg_id == data_pg_id.get()
+            } if pg_id == data_pg_id.get()
+                && cluster_epoch == ClusterEpoch::INITIAL
         ));
         assert_eq!(present_count, 0);
         assert!(all_shards.iter().all(Option::is_none));

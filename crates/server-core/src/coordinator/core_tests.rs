@@ -3677,17 +3677,6 @@ fn reclaim_object_payload_delete_failure_keeps_retryable_reclaim_record() {
         }
     };
 
-    coord
-        .delete_object(&delete_object_request(
-            "bucket",
-            "key",
-            None,
-            test_requester(),
-            false,
-            NO_DELETE,
-        ))
-        .unwrap();
-
     let failing_key = ShardKey::new(&okh, segment_vid.get(), 0);
     let placed_cleanup_guard = coord
         .storage_node
@@ -3700,6 +3689,17 @@ fn reclaim_object_payload_delete_failure_keeps_retryable_reclaim_record() {
             }
             Ok(())
         }));
+
+    coord
+        .delete_object(&delete_object_request(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            false,
+            NO_DELETE,
+        ))
+        .unwrap();
 
     let err = coord
         .read_runtime()

@@ -73,6 +73,24 @@ pub enum StoreError {
     },
 
     #[error(
+        "metadata operation for PG {pg_id} has cluster epoch {operation_epoch}, current cluster epoch is {current_epoch}"
+    )]
+    StaleMetadataOperation {
+        pg_id: u32,
+        operation_epoch: ClusterEpoch,
+        current_epoch: ClusterEpoch,
+    },
+
+    #[error(
+        "metadata route for PG {pg_id} has cluster epoch {route_epoch}, current cluster epoch is {current_epoch}"
+    )]
+    StaleMetadataRoute {
+        pg_id: u32,
+        route_epoch: ClusterEpoch,
+        current_epoch: ClusterEpoch,
+    },
+
+    #[error(
         "shard operation for local node {node_id} PG {pg_id} has epoch {operation_epoch}, current cluster epoch is {current_epoch}"
     )]
     StaleShardOperation {

@@ -3,8 +3,9 @@ use std::sync::atomic::AtomicBool;
 
 use crate::*;
 
-// Metadata still forwards through the local metadata-primary node until Phase 6,
-// but cluster handles fence those bridge calls by their operation epoch.
+// Metadata routing moves incrementally in Phase 6. Single-PG bucket/object
+// operations route through the local metadata PG primary; composite scans still
+// use the temporary metadata-primary bridge until they are split by PG.
 impl super::StorageCluster {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_pg_ids(&self) -> &[u32] {
@@ -16,7 +17,7 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<bool, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
+        self.bucket_metadata_primary_node(bucket)?
             .try_probe_bucket_pg_available(bucket)
     }
 
@@ -26,7 +27,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<bool, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .try_probe_object_pg_available(bucket, key)
     }
 
@@ -34,7 +35,12 @@ impl super::StorageCluster {
         &self,
         config: &CreateBucketConfig<'_>,
     ) -> Result<BucketCreateAttemptOutcome, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
+        let bucket = BucketName::try_from(config.name).map_err(|reason| {
+            MetadataError::InvalidBucketName {
+                reason: reason.to_string(),
+            }
+        })?;
+        self.bucket_metadata_primary_node(&bucket)?
             .create_bucket_with_config_and_load_info(config)
     }
 
@@ -43,7 +49,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
+        self.bucket_metadata_primary_node(bucket)?
             .load_bucket_snapshot(bucket, request)
     }
 
@@ -51,22 +57,20 @@ impl super::StorageCluster {
         &self,
         buckets: &[BucketName],
     ) -> Vec<(Vec<BucketName>, HashMap<BucketName, u64>)> {
-        let Ok(bridge_node) = self.metadata_primary_bridge_node() else {
-            return Vec::new();
-        };
-
         let mut buckets_by_pg = HashMap::<u32, Vec<BucketName>>::new();
         for bucket in buckets {
             buckets_by_pg
-                .entry(bridge_node.bucket_pg_id_for(bucket))
+                .entry(self.bucket_metadata_pg_id(bucket))
                 .or_default()
                 .push(bucket.clone());
         }
 
         let mut batches = Vec::new();
         for (pg_id, buckets) in buckets_by_pg {
-            let Ok(generations) =
-                bridge_node.load_bucket_execution_generations_for_pg(pg_id, &buckets)
+            let Ok(node) = self.metadata_pg_primary_node(pg_id) else {
+                continue;
+            };
+            let Ok(generations) = node.load_bucket_execution_generations_for_pg(pg_id, &buckets)
             else {
                 continue;
             };
@@ -81,7 +85,7 @@ impl super::StorageCluster {
         request: BucketSnapshotRequest,
         action: impl FnOnce(BucketSnapshot) -> Result<T, E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
+        self.bucket_metadata_primary_node(bucket)?
             .with_bucket_write_snapshot(bucket, request, action)
     }
 
@@ -111,7 +115,7 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
+        self.bucket_metadata_primary_node(bucket)?
             .head_bucket_info(bucket)
     }
 
@@ -120,7 +124,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         kind: BucketSubresourceKind,
     ) -> Result<Option<String>, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
+        self.bucket_metadata_primary_node(bucket)?
             .get_bucket_subresource(bucket, kind)
     }
 
@@ -129,7 +133,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         state: BucketVersioningState,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
+        self.bucket_metadata_primary_node(bucket)?
             .put_bucket_versioning_and_load_info(bucket, state)
     }
 
@@ -138,7 +142,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         config: BucketObjectLockConfig,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
+        self.bucket_metadata_primary_node(bucket)?
             .put_bucket_object_lock_and_load_info(bucket, config)
     }
 
@@ -147,7 +151,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         config: BucketEncryptionConfig,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
+        self.bucket_metadata_primary_node(bucket)?
             .put_bucket_encryption_and_load_info(bucket, config)
     }
 
@@ -156,7 +160,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         config: PublicAccessBlockConfig,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
+        self.bucket_metadata_primary_node(bucket)?
             .put_bucket_public_access_block_and_load_info(bucket, config)
     }
 
@@ -164,7 +168,7 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
+        self.bucket_metadata_primary_node(bucket)?
             .delete_bucket_public_access_block_and_load_info(bucket)
     }
 
@@ -173,7 +177,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         config: BucketOwnershipControls,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
+        self.bucket_metadata_primary_node(bucket)?
             .put_bucket_ownership_controls_and_load_info(bucket, config)
     }
 
@@ -181,7 +185,7 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
+        self.bucket_metadata_primary_node(bucket)?
             .delete_bucket_ownership_controls_and_load_info(bucket)
     }
 
@@ -190,7 +194,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         enabled: bool,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
+        self.bucket_metadata_primary_node(bucket)?
             .put_bucket_abac_enabled_and_load_info(bucket, enabled)
     }
 
@@ -201,7 +205,7 @@ impl super::StorageCluster {
         public_read: bool,
         public_write: bool,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
+        self.bucket_metadata_primary_node(bucket)?
             .put_bucket_acl_and_load_info(bucket, acl_grants, public_read, public_write)
     }
 
@@ -210,7 +214,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         req: PutBucketSubresource<'_>,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
+        self.bucket_metadata_primary_node(bucket)?
             .put_bucket_subresource_and_load_info(bucket, req)
     }
 
@@ -219,7 +223,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         kind: BucketSubresourceKind,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
+        self.bucket_metadata_primary_node(bucket)?
             .delete_bucket_subresource_and_load_info(bucket, kind)
     }
 
@@ -316,7 +320,7 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<T, E>,
     ) -> Result<Result<T, E>, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .load_object_if(bucket, key, version_id, action)
     }
 
@@ -325,7 +329,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<Option<StoredObject>, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .load_existing_live_object(bucket, key)
     }
 
@@ -337,7 +341,7 @@ impl super::StorageCluster {
         snapshot_mode: ObjectReadSnapshotMode,
         action: impl FnOnce(&StoredObject) -> Result<T, E>,
     ) -> Result<Result<ObjectReadSnapshotOutcome<T>, E>, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .load_object_read_snapshot_if(bucket, key, version_id, snapshot_mode, action)
     }
 
@@ -347,7 +351,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<bool, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .payload_reclaim_exists(bucket, key, generation_id)
     }
 
@@ -358,7 +362,7 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
     ) -> Result<Result<Option<String>, E>, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .get_object_tags_if(bucket, key, version_id, action)
     }
 
@@ -370,7 +374,7 @@ impl super::StorageCluster {
         tags: &str,
         action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
     ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .put_object_tags_if(bucket, key, version_id, tags, action)
     }
 
@@ -381,7 +385,7 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
     ) -> Result<Result<(), E>, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .delete_object_tags_if(bucket, key, version_id, action)
     }
 
@@ -393,7 +397,7 @@ impl super::StorageCluster {
         retention: ObjectRetention,
         action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
     ) -> Result<Result<(), E>, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .put_object_retention_if(bucket, key, version_id, retention, action)
     }
 
@@ -405,7 +409,7 @@ impl super::StorageCluster {
         legal_hold: StoredLegalHoldStatus,
         action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
     ) -> Result<Result<(), E>, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .put_object_legal_hold_if(bucket, key, version_id, legal_hold, action)
     }
 
@@ -416,7 +420,7 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<(VersionId, AclGrants, bool), E>,
     ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .put_object_acl_if(bucket, key, version_id, action)
     }
 
@@ -427,7 +431,7 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<Option<LegalHoldStatus>, E>,
     ) -> Result<Result<Option<LegalHoldStatus>, E>, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .get_object_legal_hold_if(bucket, key, version_id, action)
     }
 
@@ -438,7 +442,7 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<Option<ObjectRetention>, E>,
     ) -> Result<Result<Option<ObjectRetention>, E>, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .get_object_retention_if(bucket, key, version_id, action)
     }
 
@@ -449,7 +453,7 @@ impl super::StorageCluster {
         version_id: VersionId,
         action: impl FnOnce(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<DeleteSpecificObjectVersionOutcome<T>, E>, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .delete_specific_object_version_if(bucket, key, version_id, action)
     }
 
@@ -459,7 +463,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         action: impl FnOnce(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<DeleteCurrentObjectOutcome<T>, E>, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .delete_current_object_if(bucket, key, action)
     }
 
@@ -470,7 +474,7 @@ impl super::StorageCluster {
         owner: OwnerIdentity,
         action: impl FnOnce(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<InsertCurrentDeleteMarkerOutcome<T>, E>, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .insert_current_delete_marker_if(bucket, key, owner, action)
     }
 
@@ -481,7 +485,7 @@ impl super::StorageCluster {
         expected_version_id: VersionId,
         should_expire: impl FnOnce(Option<&str>, &LiveObjectRecord) -> Result<bool, E>,
     ) -> Result<Result<Option<ExpireCurrentObjectOutcome>, E>, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .expire_current_object_if_due(bucket, key, expected_version_id, should_expire)
     }
 
@@ -491,7 +495,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         select_versions: impl FnOnce(Option<&str>, &[StoredObject]) -> Result<HashSet<VersionId>, E>,
     ) -> Result<Result<Vec<GenerationId>, E>, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .delete_noncurrent_live_versions_if_due(bucket, key, select_versions)
     }
 
@@ -502,20 +506,21 @@ impl super::StorageCluster {
         expected_version_id: VersionId,
         should_delete: impl FnOnce(Option<&str>, &[StoredObject]) -> Result<bool, E>,
     ) -> Result<Result<bool, E>, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .delete_expired_delete_marker_if_due(bucket, key, expected_version_id, should_delete)
     }
 
     pub fn acquire_object_payload_lease(
-        &self,
+        self: &std::sync::Arc<Self>,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<ObjectPayloadLease, StoreError> {
-        let bridge_node = self.metadata_primary_bridge_node_arc()?;
-        bridge_node.acquire_object_payload_lease(bucket, key, generation_id);
+        let node = self.metadata_primary_bridge_node_arc()?;
+        node.acquire_object_payload_lease(bucket, key, generation_id);
         Ok(ObjectPayloadLease::new(
-            bridge_node,
+            std::sync::Arc::downgrade(self),
+            node,
             bucket.clone(),
             key.clone(),
             generation_id,
@@ -529,18 +534,18 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> usize {
-        let Ok(bridge_node) = self.metadata_primary_bridge_node() else {
+        let Ok(node) = self.metadata_primary_bridge_node() else {
             return 0;
         };
-        bridge_node.object_payload_lease_count(bucket, key, generation_id)
+        node.object_payload_lease_count(bucket, key, generation_id)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize {
-        let Ok(bridge_node) = self.metadata_primary_bridge_node() else {
+        let Ok(node) = self.metadata_primary_bridge_node() else {
             return 0;
         };
-        bridge_node.bucket_object_payload_lease_count(bucket)
+        node.bucket_object_payload_lease_count(bucket)
     }
 
     pub fn enqueue_object_payload_reclaim(
@@ -588,21 +593,22 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<bool, ObjectPgActionError> {
-        let bridge_node = self.metadata_primary_bridge_node()?;
+        let lease_node = self.metadata_primary_bridge_node()?;
+        let node = self.object_metadata_primary_node(bucket, key)?;
 
         enum ReclaimPayload {
             Segments(ObjectSegmentsReclaimRecord),
             Multipart(MultipartReclaimRecord),
         }
 
-        if bridge_node.object_payload_lease_count(bucket, key, generation_id) != 0 {
+        if lease_node.object_payload_lease_count(bucket, key, generation_id) != 0 {
             return Ok(false);
         }
 
-        let meta_pg_id = bridge_node.pg_topology().object_pg_for(bucket, key);
+        let meta_pg_id = self.object_metadata_pg_id(bucket, key);
         let reclaim = {
-            let meta_pg = bridge_node.get_pg(meta_pg_id)?;
-            if bridge_node.object_payload_lease_count(bucket, key, generation_id) != 0 {
+            let meta_pg = node.get_pg(meta_pg_id)?;
+            if lease_node.object_payload_lease_count(bucket, key, generation_id) != 0 {
                 return Ok(false);
             }
 
@@ -620,7 +626,7 @@ impl super::StorageCluster {
             return Ok(false);
         };
 
-        if bridge_node.object_payload_lease_count(bucket, key, generation_id) != 0 {
+        if lease_node.object_payload_lease_count(bucket, key, generation_id) != 0 {
             return Ok(false);
         }
 
@@ -662,8 +668,8 @@ impl super::StorageCluster {
             }
         }
 
-        let meta_pg = bridge_node.get_pg(meta_pg_id)?;
-        if bridge_node.object_payload_lease_count(bucket, key, generation_id) != 0 {
+        let meta_pg = node.get_pg(meta_pg_id)?;
+        if lease_node.object_payload_lease_count(bucket, key, generation_id) != 0 {
             return Ok(false);
         }
 
@@ -807,7 +813,7 @@ impl super::StorageCluster {
             Option<StoredObject>,
         ) -> Result<(T, CreateStreamUploadReq), E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .create_put_object_stream_session(bucket, key, request, action)
     }
 
@@ -819,7 +825,7 @@ impl super::StorageCluster {
         total_size: u64,
         action: impl FnOnce(StreamPutFinalizeSnapshot) -> Result<PreparedStreamPutCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPutOutcome<T>, E>, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .finalize_put_object_stream(bucket, key, session_id, total_size, action)
     }
 
@@ -833,7 +839,7 @@ impl super::StorageCluster {
             Option<StoredObject>,
         ) -> Result<(T, CreateMultipartUploadReq), E>,
     ) -> Result<Result<CreateMultipartUploadOutcome<T>, E>, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .create_multipart_upload(bucket, key, request, action)
     }
 
@@ -843,7 +849,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .load_multipart_upload(bucket, key, upload_id)
     }
 
@@ -856,7 +862,7 @@ impl super::StorageCluster {
         session_id: &SessionId,
         action: impl FnOnce(&MultipartUploadRecord) -> Result<T, E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .begin_upload_part_stream_session(
                 bucket,
                 key,
@@ -875,7 +881,7 @@ impl super::StorageCluster {
         part_number: u32,
         session_id: &SessionId,
     ) -> Result<SessionId, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .create_upload_part_stream_session(bucket, key, upload_id, part_number, session_id)
     }
 
@@ -885,7 +891,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .load_in_progress_multipart_upload(bucket, key, upload_id)
     }
 
@@ -896,7 +902,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<Option<MultipartUploadRecord>, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .try_load_in_progress_multipart_upload(bucket, key, upload_id)
     }
 
@@ -906,7 +912,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .load_in_progress_multipart_upload_for_listing(bucket, key, upload_id)
     }
 
@@ -917,7 +923,7 @@ impl super::StorageCluster {
         upload_id: &UploadId,
         requested_part_numbers: &[u32],
     ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .load_multipart_completion_snapshot(bucket, key, upload_id, requested_part_numbers)
     }
 
@@ -927,7 +933,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartCompletionPreflight, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .load_multipart_completion_preflight(bucket, key, upload_id)
     }
 
@@ -936,18 +942,18 @@ impl super::StorageCluster {
         req: CompleteMultipartCommitRequest,
         keep_completed_uploads: usize,
     ) -> Result<CompleteMultipartCommitOutcome, ObjectPgActionError> {
-        let single_node = self.metadata_primary_bridge_node()?;
         let cleanup_bucket = req.bucket.clone();
         let cleanup_key = req.key.clone();
         let cleanup_generation_id = req.generation_id;
-        let (outcome, cleanup) = single_node.complete_multipart_upload_commit_serialized(req)?;
+        let node = self.object_metadata_primary_node(&cleanup_bucket, &cleanup_key)?;
+        let (outcome, cleanup) = node.complete_multipart_upload_commit_serialized(req)?;
         self.delete_complete_multipart_cleanup_best_effort(
             &cleanup_bucket,
             &cleanup_key,
             cleanup_generation_id,
             &cleanup,
         );
-        single_node.prune_completed_multipart_uploads_for_bucket_with_limit(
+        self.prune_completed_multipart_uploads_for_bucket_with_limit(
             &cleanup_bucket,
             keep_completed_uploads,
         )?;
@@ -964,7 +970,7 @@ impl super::StorageCluster {
         action: impl FnOnce(StreamUploadPartSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, ObjectPgActionError> {
         let outcome = self
-            .metadata_primary_bridge_node()?
+            .object_metadata_primary_node(bucket, key)?
             .finalize_upload_part_stream(bucket, key, upload_id, session_id, part_number, action)?;
         if let Some(cleanup) = outcome.cleanup.as_ref() {
             self.delete_finalize_upload_part_cleanup_best_effort(cleanup);
@@ -1004,7 +1010,7 @@ impl super::StorageCluster {
     where
         F: FnOnce(&MultipartUploadRecord) -> Result<(), E>,
     {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .list_multipart_parts_for_upload(
                 bucket,
                 key,
@@ -1021,7 +1027,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<AbortMultipartUploadLookup, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .lookup_abort_multipart_upload(bucket, key, upload_id)
     }
 
@@ -1032,7 +1038,7 @@ impl super::StorageCluster {
         upload_id: &UploadId,
     ) -> Result<bool, ObjectPgActionError> {
         let cleanup = self
-            .metadata_primary_bridge_node()?
+            .object_metadata_primary_node(bucket, key)?
             .abort_multipart_upload(bucket, key, upload_id)?;
         if let Some(cleanup) = cleanup.as_ref() {
             self.delete_abort_multipart_cleanup_best_effort(cleanup);
@@ -1048,7 +1054,7 @@ impl super::StorageCluster {
         should_abort: impl FnOnce(Option<&str>, &MultipartUploadRecord) -> Result<bool, E>,
     ) -> Result<Result<bool, E>, ObjectPgActionError> {
         match self
-            .metadata_primary_bridge_node()?
+            .object_metadata_primary_node(bucket, key)?
             .abort_multipart_upload_if_due(bucket, key, upload_id, should_abort)?
         {
             Ok(Some(cleanup)) => {

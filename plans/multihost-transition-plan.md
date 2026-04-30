@@ -1065,6 +1065,25 @@ Work items:
      out of scope for Phase 6
    - exit when no active metadata path mutates or reads PG state through the old
      metadata-primary bridge or single-node shortcut
+   - first slice:
+     - add a local-map `metadata_pg_primary_node` lookup that validates handle
+       epoch, route presence, PG active state, primary membership in the acting
+       set, and primary node presence before returning a storage node
+     - move obvious single-PG bucket/object metadata calls, direct PUT metadata,
+       stream metadata, multipart object metadata, reclaim metadata, and payload
+       shard ack rows through routed metadata PG primaries; payload shard acks
+       route through the data PG primary, while object/stream publication routes
+       through the object PG primary
+     - keep composite/global scans, multi-PG bucket cleanup/finalization, and
+       lease bookkeeping/worker queues on the temporary bridge until they are
+       split into explicit per-PG fanout in the next 6.1 slice
+     - keep payload lease release and worker enqueue on the bridge, but route
+       the release-time reclaim-existence check through the object PG primary so
+       a deferred reclaim row published off-bridge is requeued after the last
+       read lease drops
+     - use `StoreError::StaleMetadataOperation` for routed metadata stale-handle
+       failures; keep `StoreError::StaleMetadataPrimaryBridge` only for the
+       temporary bridge surfaces that remain during 6.1
 2. Phase 6.2: command substrate vertical slice.
    - define the command envelope, command identity, canonical encoding, command
      checksum, and log-index shape

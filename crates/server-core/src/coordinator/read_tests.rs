@@ -450,8 +450,7 @@ fn stream_put_abort_ack_cleanup_failure_traces_after_placed_cleanup() {
         "each ack cleanup failure should emit typed cleanup context"
     );
     assert!(observed_cleanup_errors.iter().all(|(operation, context)| {
-        *operation == "delete metadata-primary payload ack"
-            && *context == "injected ack cleanup delete failure"
+        *operation == "delete payload ack" && *context == "injected ack cleanup delete failure"
     }));
     drop(observed_cleanup_errors);
 
@@ -462,7 +461,7 @@ fn stream_put_abort_ack_cleanup_failure_traces_after_placed_cleanup() {
                 .storage_node
                 .test_shard_exists(data_pg_id, &shard_key)
                 .unwrap(),
-            "ack cleanup failure should leave metadata-primary ack row {shard_index}"
+            "ack cleanup failure should leave payload ack row {shard_index}"
         );
         assert!(
             !coord
