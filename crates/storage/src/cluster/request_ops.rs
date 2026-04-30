@@ -632,7 +632,6 @@ impl super::StorageCluster {
                         segment.ec,
                         &segment.segment_okh,
                         segment.segment_vid,
-                        "delete placed object-segment reclaim shard",
                     )?;
                 }
             }
@@ -646,13 +645,7 @@ impl super::StorageCluster {
                             ec,
                             ..
                         } => {
-                            self.delete_payload_shard_set(
-                                *data_pg_id,
-                                *ec,
-                                part_okh,
-                                *part_vid,
-                                "delete placed multipart-part reclaim shard",
-                            )?;
+                            self.delete_payload_shard_set(*data_pg_id, *ec, part_okh, *part_vid)?;
                         }
                         MultipartReclaimPartRecord::Segments { segments, .. } => {
                             for segment in segments {
@@ -661,7 +654,6 @@ impl super::StorageCluster {
                                     segment.ec,
                                     &segment.segment_okh,
                                     segment.segment_vid,
-                                    "delete placed multipart-segment reclaim shard",
                                 )?;
                             }
                         }

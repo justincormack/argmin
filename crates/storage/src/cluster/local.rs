@@ -1283,7 +1283,8 @@ mod tests {
 
         assert!(matches!(
             err,
-            crate::BucketSnapshotLoadError::Store(StoreError::StaleEpoch {
+            crate::BucketSnapshotLoadError::Store(StoreError::StaleMetadataPrimaryBridge {
+                metadata_node_id: 0,
                 operation_epoch,
                 current_epoch,
             }) if operation_epoch == ClusterEpoch::new(2).unwrap()
@@ -1325,7 +1326,8 @@ mod tests {
 
         assert!(matches!(
             err,
-            crate::ObjectPgActionError::Store(StoreError::StaleEpoch {
+            crate::ObjectPgActionError::Store(StoreError::StaleMetadataPrimaryBridge {
+                metadata_node_id: 0,
                 operation_epoch,
                 current_epoch,
             }) if operation_epoch == ClusterEpoch::new(2).unwrap()
@@ -1385,7 +1387,8 @@ mod tests {
         };
         assert!(matches!(
             err,
-            StoreError::StaleEpoch {
+            StoreError::StaleMetadataPrimaryBridge {
+                metadata_node_id: 0,
                 operation_epoch,
                 current_epoch,
             } if operation_epoch == ClusterEpoch::INITIAL
@@ -1665,15 +1668,168 @@ mod tests {
             )
             .unwrap_err();
 
+        assert!(matches!(
+            err,
+            StoreError::ShardPgNotActive {
+                node_id,
+                pg_id,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: PgState::Peering,
+            } if node_id == segment.locations[0].node_id().as_u32()
+                && pg_id == data_pg_id.get()
+        ));
+        assert_eq!(present_count, 0);
+        assert!(all_shards.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn placed_payload_delete_propagates_missing_pg_route() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+        let cluster =
+            crate::StorageCluster::open_local_nodes(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
+
+        let err = cluster
+            .delete_payload_shard_set(99, ec_shape, &[17; 16], crate::GenerationId::MIN)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::ObjectPgActionError::Store(StoreError::ClusterPgNotFound {
+                pg_id: 99,
+                cluster_epoch: ClusterEpoch::INITIAL,
+            })
+        ));
+    }
+
+    #[test]
+    fn placed_segment_recovery_propagates_missing_shard_pg_route() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+        let cluster =
+            crate::StorageCluster::open_local_nodes(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
+        let segment = write_committed_direct_segment(&cluster, b"phase-five-missing-pg-route");
+        let shard_size = segment
+            .payload
+            .len()
+            .div_ceil(usize::from(segment.written.ec.k));
+        let mut locations = segment.locations.clone();
+        locations[0] = ShardLocation::new(
+            ClusterEpoch::INITIAL,
+            DataPgId::new(PgId::new(99)),
+            ShardIndex::new(0),
+            locations[0].node_id(),
+        );
+        let mut all_shards = vec![None; usize::from(segment.written.ec.k + segment.written.ec.m)];
+        let mut present_count = 0;
+
+        let err = cluster
+            .try_load_placed_segment_shard(
+                segment.written.data_pg_id,
+                &segment.segment_okh,
+                segment.generation_id,
+                &locations,
+                0,
+                shard_size,
+                &mut all_shards,
+                &mut present_count,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StoreError::ShardPgNotFound {
+                node_id,
+                pg_id: 99,
+                cluster_epoch: ClusterEpoch::INITIAL,
+            } if node_id == locations[0].node_id().as_u32()
+        ));
+        assert_eq!(present_count, 0);
+        assert!(all_shards.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn placed_segment_recovery_wraps_node_store_error_with_shard_route() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+        let mut map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let segment = write_committed_direct_segment(&cluster, b"phase-five-shard-store-route");
+        drop(cluster);
+
+        Arc::get_mut(&mut map).unwrap().pg_routes.insert(
+            PgId::new(99),
+            LocalPgRoute::active(
+                ClusterEpoch::INITIAL,
+                PgId::new(99),
+                NodeId::new(0),
+                Arc::<[NodeId]>::from(node_ids.to_vec()),
+            ),
+        );
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let shard_size = segment
+            .payload
+            .len()
+            .div_ceil(usize::from(segment.written.ec.k));
+        let mut locations = segment.locations.clone();
+        locations[0] = ShardLocation::new(
+            ClusterEpoch::INITIAL,
+            DataPgId::new(PgId::new(99)),
+            ShardIndex::new(0),
+            locations[0].node_id(),
+        );
+        let mut all_shards = vec![None; usize::from(segment.written.ec.k + segment.written.ec.m)];
+        let mut present_count = 0;
+
+        let err = cluster
+            .try_load_placed_segment_shard(
+                segment.written.data_pg_id,
+                &segment.segment_okh,
+                segment.generation_id,
+                &locations,
+                0,
+                shard_size,
+                &mut all_shards,
+                &mut present_count,
+            )
+            .unwrap_err();
+
         match err {
-            StoreError::Io { context, source } => {
-                assert_eq!(context, "recover placed segment shard");
-                assert!(
-                    source.to_string().contains("peering"),
-                    "expected PG state in propagated error, got {source}"
-                );
+            StoreError::ShardStore {
+                node_id,
+                pg_id: 99,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                source,
+            } => {
+                assert_eq!(node_id, locations[0].node_id().as_u32());
+                assert!(matches!(*source, StoreError::PgNotFound { pg_id: 99 }));
             }
-            other => panic!("expected non-active PG route to propagate, got {other:?}"),
+            other => panic!("expected shard store error with route context, got {other:?}"),
         }
         assert_eq!(present_count, 0);
         assert!(all_shards.iter().all(Option::is_none));

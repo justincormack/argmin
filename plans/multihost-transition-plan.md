@@ -914,6 +914,11 @@ Phase 5 implementation notes:
    - logs should not collapse stale epoch, inactive PG, or misroute conditions
      into object-not-found or best-effort silence except for explicitly
      best-effort worker queues
+   - typed storage errors now preserve metadata-primary stale bridge failures
+     separately from payload placement stale epochs, and preserve inactive PG,
+     missing PG, stale shard operation, stale shard location, missing node,
+     acting-set, shard-index mismatch, and node-local shard store errors when
+     shard IO is converted to higher-level storage results
 6. Step 5.6 closes Phase 5 with a representative stale-handle regression
    matrix and final plan update.
    - cover at least one bucket path, object path, stream path, multipart path,

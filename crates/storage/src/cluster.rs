@@ -235,16 +235,28 @@ impl StorageCluster {
         Ok(())
     }
 
+    fn require_current_metadata_primary_bridge_epoch(&self) -> Result<(), StoreError> {
+        let current_epoch = self.cluster_epoch();
+        if self.operation_epoch() != current_epoch {
+            return Err(StoreError::StaleMetadataPrimaryBridge {
+                metadata_node_id: self.metadata_node_id().as_u32(),
+                operation_epoch: self.operation_epoch(),
+                current_epoch,
+            });
+        }
+        Ok(())
+    }
+
     // Transitional metadata-primary bridge. Production metadata paths must pass
     // through this helper until Phase 6 replaces the bridge with routed PG
     // commands.
     fn metadata_primary_bridge_node(&self) -> Result<&SharedStorageNode, StoreError> {
-        self.require_current_operation_epoch()?;
+        self.require_current_metadata_primary_bridge_epoch()?;
         Ok(self.single_node.as_ref())
     }
 
     fn metadata_primary_bridge_node_arc(&self) -> Result<Arc<SharedStorageNode>, StoreError> {
-        self.require_current_operation_epoch()?;
+        self.require_current_metadata_primary_bridge_epoch()?;
         Ok(Arc::clone(&self.single_node))
     }
 
@@ -398,14 +410,8 @@ impl StorageCluster {
             .get();
         let data_pg = DataPgId::new(PgId::new(data_pg_id));
         let segment_vid = generation_id;
-        let written_shards = self.write_placed_segment_payload_shards(
-            data_pg,
-            ec,
-            segment_okh,
-            segment_vid,
-            data,
-            "write placed direct PUT shard",
-        )?;
+        let written_shards =
+            self.write_placed_segment_payload_shards(data_pg, ec, segment_okh, segment_vid, data)?;
 
         Ok(DirectPutWrittenSegment {
             data_pg_id,
@@ -421,7 +427,6 @@ impl StorageCluster {
         segment_okh: &[u8; 16],
         segment_vid: GenerationId,
         data: &[u8],
-        write_context: &'static str,
     ) -> Result<Vec<WrittenShardAck>, StoreError> {
         let placement_key = segment_payload_placement_key(segment_okh, segment_vid);
         let locations = self
@@ -457,7 +462,7 @@ impl StorageCluster {
                                         .iter()
                                         .map(|written| written.key.clone()),
                                 );
-                                return Err(shard_io_error_to_store(error, write_context));
+                                return Err(shard_io_error_to_store(error));
                             }
                         }
                     }
@@ -584,7 +589,6 @@ impl StorageCluster {
             &segment_record.segment_okh,
             segment_record.segment_vid,
             data,
-            "write placed stream segment shard",
         )
     }
 
@@ -628,7 +632,7 @@ impl StorageCluster {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
-        self.require_current_operation_epoch()?;
+        self.require_current_metadata_primary_bridge_epoch()?;
         #[cfg(any(test, feature = "test-hooks"))]
         maybe_run_before_stream_abort_storage_hook();
         let staged_segments = self
@@ -708,7 +712,7 @@ impl StorageCluster {
             match self.read_payload_shard_into(*location, &shard_key, ack, &mut dst[start..end]) {
                 Ok(()) => {}
                 Err(error) => {
-                    placed_segment_recoverable_shard_error(error, "read placed segment shard")?;
+                    placed_segment_recoverable_shard_error(error)?;
                     return Ok(false);
                 }
             }
@@ -860,7 +864,7 @@ impl StorageCluster {
                 *present_count += 1;
             }
             Err(error) => {
-                placed_segment_recoverable_shard_error(error, "recover placed segment shard")?;
+                placed_segment_recoverable_shard_error(error)?;
             }
         }
         Ok(())
@@ -897,7 +901,6 @@ impl StorageCluster {
         ec: EcShape,
         okh: &[u8; 16],
         generation_id: GenerationId,
-        placed_context: &'static str,
     ) -> Result<(), ObjectPgActionError> {
         let shard_keys = Self::payload_shard_set_keys(okh, generation_id, ec);
         self.delete_placed_payload_shard_keys(
@@ -906,7 +909,6 @@ impl StorageCluster {
             okh,
             generation_id,
             &shard_keys,
-            placed_context,
         )?;
         self.delete_metadata_primary_payload_shard_keys(data_pg_id, &shard_keys)
     }
@@ -948,7 +950,6 @@ impl StorageCluster {
         okh: &[u8; 16],
         generation_id: GenerationId,
         shard_keys: &[ShardKey],
-        placed_context: &'static str,
     ) -> Result<(), ObjectPgActionError> {
         let placement_key = segment_payload_placement_key(okh, generation_id);
         let locations = self
@@ -959,9 +960,7 @@ impl StorageCluster {
             let location = Self::placed_payload_shard_location(&locations, shard_key)
                 .map_err(ObjectPgActionError::Store)?;
             self.delete_payload_shard(location, shard_key)
-                .map_err(|error| {
-                    ObjectPgActionError::Store(shard_io_error_to_store(error, placed_context))
-                })?;
+                .map_err(|error| ObjectPgActionError::Store(shard_io_error_to_store(error)))?;
         }
         Ok(())
     }
@@ -1139,7 +1138,22 @@ fn erasure_codec_for_shape(ec: EcShape, context: &'static str) -> Result<Erasure
 
 fn cluster_build_error_to_store(error: ClusterBuildError) -> StoreError {
     match error {
-        ClusterBuildError::PgNotFound { pg_id, .. } => StoreError::PgNotFound { pg_id },
+        ClusterBuildError::PgNotFound {
+            pg_id,
+            cluster_epoch,
+        } => StoreError::ClusterPgNotFound {
+            pg_id,
+            cluster_epoch,
+        },
+        ClusterBuildError::PgNotActive {
+            pg_id,
+            cluster_epoch,
+            state,
+        } => StoreError::PgNotActive {
+            pg_id,
+            cluster_epoch,
+            state,
+        },
         ClusterBuildError::StaleEpoch {
             operation_epoch,
             current_epoch,
@@ -1154,21 +1168,96 @@ fn cluster_build_error_to_store(error: ClusterBuildError) -> StoreError {
     }
 }
 
-fn shard_io_error_to_store(error: ShardIoError, context: &'static str) -> StoreError {
+fn shard_io_error_to_store(error: ShardIoError) -> StoreError {
     match error {
-        ShardIoError::Store { source, .. } => source,
-        ShardIoError::PgNotFound { pg_id, .. } => StoreError::PgNotFound { pg_id },
-        other => StoreError::Io {
-            context,
-            source: std::io::Error::other(other.to_string()),
+        ShardIoError::Store {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            source,
+        } => StoreError::ShardStore {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            source: Box::new(source),
+        },
+        ShardIoError::StaleOperationEpoch {
+            node_id,
+            pg_id,
+            operation_epoch,
+            current_epoch,
+        } => StoreError::StaleShardOperation {
+            node_id,
+            pg_id,
+            operation_epoch,
+            current_epoch,
+        },
+        ShardIoError::StaleLocation {
+            node_id,
+            pg_id,
+            location_epoch,
+            current_epoch,
+        } => StoreError::StaleShardLocation {
+            node_id,
+            pg_id,
+            location_epoch,
+            current_epoch,
+        },
+        ShardIoError::NodeNotFound {
+            node_id,
+            pg_id,
+            cluster_epoch,
+        } => StoreError::NodeNotFound {
+            node_id,
+            pg_id,
+            cluster_epoch,
+        },
+        ShardIoError::PgNotFound {
+            node_id,
+            pg_id,
+            cluster_epoch,
+        } => StoreError::ShardPgNotFound {
+            node_id,
+            pg_id,
+            cluster_epoch,
+        },
+        ShardIoError::PgNotActive {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            state,
+        } => StoreError::ShardPgNotActive {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            state,
+        },
+        ShardIoError::NodeNotInActingSet {
+            node_id,
+            pg_id,
+            cluster_epoch,
+        } => StoreError::NodeNotInActingSet {
+            node_id,
+            pg_id,
+            cluster_epoch,
+        },
+        ShardIoError::ShardIndexMismatch {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            location_shard_index,
+            key_shard_index,
+        } => StoreError::ShardIndexMismatch {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            location_shard_index,
+            key_shard_index,
         },
     }
 }
 
-fn placed_segment_recoverable_shard_error(
-    error: ShardIoError,
-    context: &'static str,
-) -> Result<(), StoreError> {
+fn placed_segment_recoverable_shard_error(error: ShardIoError) -> Result<(), StoreError> {
     match error {
         ShardIoError::Store {
             source: StoreError::NotFound,
@@ -1182,7 +1271,7 @@ fn placed_segment_recoverable_shard_error(
             source: StoreError::Io { context, source },
             ..
         } if is_recoverable_physical_shard_io_error(context, source.kind()) => Ok(()),
-        other => Err(shard_io_error_to_store(other, context)),
+        other => Err(shard_io_error_to_store(other)),
     }
 }
 

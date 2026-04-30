@@ -15,12 +15,109 @@ pub enum StoreError {
     #[error("PG {pg_id} not found on this node")]
     PgNotFound { pg_id: u32 },
 
+    #[error("PG {pg_id} is not present in cluster epoch {cluster_epoch}")]
+    ClusterPgNotFound {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+
+    #[error("PG {pg_id} for local node {node_id} is not present in cluster epoch {cluster_epoch}")]
+    ShardPgNotFound {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+
+    #[error("PG {pg_id} is {state} in cluster epoch {cluster_epoch}")]
+    PgNotActive {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        state: PgState,
+    },
+
+    #[error("PG {pg_id} for local node {node_id} is {state} in cluster epoch {cluster_epoch}")]
+    ShardPgNotActive {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        state: PgState,
+    },
+
+    #[error(
+        "shard store failed on local node {node_id} PG {pg_id} epoch {cluster_epoch}: {source}"
+    )]
+    ShardStore {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        #[source]
+        source: Box<StoreError>,
+    },
+
     #[error(
         "operation has cluster epoch {operation_epoch}, current cluster epoch is {current_epoch}"
     )]
     StaleEpoch {
         operation_epoch: ClusterEpoch,
         current_epoch: ClusterEpoch,
+    },
+
+    #[error(
+        "metadata-primary bridge for local node {metadata_node_id} has operation epoch {operation_epoch}, current cluster epoch is {current_epoch}"
+    )]
+    StaleMetadataPrimaryBridge {
+        metadata_node_id: u32,
+        operation_epoch: ClusterEpoch,
+        current_epoch: ClusterEpoch,
+    },
+
+    #[error(
+        "shard operation for local node {node_id} PG {pg_id} has epoch {operation_epoch}, current cluster epoch is {current_epoch}"
+    )]
+    StaleShardOperation {
+        node_id: u32,
+        pg_id: u32,
+        operation_epoch: ClusterEpoch,
+        current_epoch: ClusterEpoch,
+    },
+
+    #[error(
+        "shard location for local node {node_id} PG {pg_id} has epoch {location_epoch}, current cluster epoch is {current_epoch}"
+    )]
+    StaleShardLocation {
+        node_id: u32,
+        pg_id: u32,
+        location_epoch: ClusterEpoch,
+        current_epoch: ClusterEpoch,
+    },
+
+    #[error(
+        "shard location references unknown local node {node_id} for PG {pg_id} in epoch {cluster_epoch}"
+    )]
+    NodeNotFound {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+
+    #[error(
+        "local node {node_id} is not in the acting set for PG {pg_id} in cluster epoch {cluster_epoch}"
+    )]
+    NodeNotInActingSet {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+
+    #[error(
+        "shard location for local node {node_id} PG {pg_id} epoch {cluster_epoch} has index {location_shard_index}, shard key has index {key_shard_index}"
+    )]
+    ShardIndexMismatch {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        location_shard_index: u8,
+        key_shard_index: u8,
     },
 
     #[error("invalid shard key length: {len} (expected {expected})")]
