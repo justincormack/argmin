@@ -1057,19 +1057,53 @@ before peering and recovery are real.
 
 Work items:
 
-1. replace the Phase 4 metadata-primary bridge with cluster-owned metadata PG
-   routing
-2. define PG metadata commands for bucket, object, multipart, stream, and reclaim
-   mutations
-3. apply commands through the PG primary
-4. replicate commands to PG replicas before acknowledging success
-5. encode commands canonically so all replicas hash the same logical operation
-6. add command checksums and a chained log or equivalent replay state
-7. record each replica's applied log index and state digest
-8. make replicas reject non-primary or stale-epoch commands
-9. make reads use primary-owned metadata until replica-read semantics are
-   specified
-10. add peering placeholders but keep failure handling disabled initially
+1. Phase 6.1: metadata PG routing boundary.
+   - replace the Phase 4 metadata-primary bridge with cluster-owned metadata PG
+     routing
+   - keep a single primary for each PG and keep strict fail-closed behavior
+   - route metadata reads through the PG primary; replica-read semantics stay
+     out of scope for Phase 6
+   - exit when no active metadata path mutates or reads PG state through the old
+     metadata-primary bridge or single-node shortcut
+2. Phase 6.2: command substrate vertical slice.
+   - define the command envelope, command identity, canonical encoding, command
+     checksum, and log-index shape
+   - implement one small metadata mutation end to end through command apply,
+     preferably bucket create or a bucket config update
+   - compare primary and replica SQLite state in deterministic tests for that
+     first command
+3. Phase 6.3: bucket and object command migration.
+   - migrate bucket mutations to command apply
+   - migrate ordinary object mutations, including generation
+     reservation/release, direct PUT publish, delete, tag, ACL, retention, and
+     legal-hold changes
+   - keep reads primary-owned and epoch-fenced
+4. Phase 6.4: stream, multipart, and reclaim command migration.
+   - migrate stream session creation, segment append/finalize/abort metadata,
+     multipart create/part/finalize/abort metadata, omitted-part cleanup
+     metadata, and reclaim rows
+   - keep multi-step workflows serialized by the PG primary command path
+5. Phase 6.5: synchronous replica apply.
+   - apply every metadata command to all required replicas before acknowledging
+     success
+   - make replicas reject non-primary-origin, stale-epoch, wrong-PG, or
+     out-of-order commands
+   - writes fail closed when any required metadata replica is unavailable
+   - metadata replicas converge in no-failure tests
+6. Phase 6.6: log chain and state digest.
+   - add a durable command-log hash chain or equivalent replay state:
+     epoch, PG ID, monotonically increasing log index, previous log hash, and
+     command checksum
+   - record each replica's applied log index, applied log hash, and state digest
+     or equivalent comparison value
+   - command-log checksum mismatch prevents replica acknowledgement
+   - applied-state digest mismatch prevents the PG from being considered clean
+7. Phase 6.7: peering placeholders and closeout.
+   - add explicit peering/backfill/inconsistent placeholders needed by later
+     repair work, but keep failure handling disabled initially
+   - keep strict writes as the only acknowledged write mode
+   - close out with boundary checks proving active metadata paths route through
+     cluster-owned PG routing
 
 Exit criteria:
 
@@ -1091,28 +1125,19 @@ useful local signals, but replicated correctness needs PG-level integrity.
 
 Work items:
 
-1. define canonical encodings for metadata commands and, where useful, metadata
-   rows or table ranges
-2. define the PG command-log hash chain:
-   - epoch
-   - PG ID
-   - monotonically increasing log index
-   - previous log hash
-   - command checksum
-3. define a durable replica state table for:
-   - current epoch
-   - applied log index
-   - applied log hash
-   - optional state digest or Merkle root
-4. decide how periodic metadata scrub compares replicas:
+1. use the Phase 6 command-log hash chain and replica state table as the
+   baseline integrity source for every replicated metadata PG
+2. define canonical encodings for metadata rows or table ranges where scrub or
+   targeted repair needs row-level comparison beyond the command log
+3. decide how periodic metadata scrub compares replicas:
    - full PG digest for small PGs
    - table or key-range digests for larger PGs
    - targeted row comparison after a digest mismatch
-5. define the resolution rules:
+4. define the resolution rules:
    - replay from a valid command log when possible
    - rebuild a bad replica from a clean peer or snapshot when needed
    - enter inconsistent or peering state when no safe authoritative source exists
-6. decide whether record-level checksums are needed for high-value rows, or
+5. decide whether record-level checksums are needed for high-value rows, or
    whether command-log plus state-digest verification is sufficient initially
 
 Exit criteria:
