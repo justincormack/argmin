@@ -816,6 +816,8 @@ Exit criteria:
 
 ## Phase 5: Cluster Epoch And PG State
 
+Status: complete.
+
 Add epoch-fenced APIs before adding real failure behavior.
 
 Work items:
@@ -1039,6 +1041,11 @@ Phase 5 implementation notes:
    - error taxonomy regressions now pin stale shard locations, acting-set
      violations, shard-index mismatches, and coordinator GET behavior so typed
      route/control-plane errors do not become `ObjectNotFound`
+   - closeout audit confirmed that every public `StorageCluster` method in
+     `cluster.rs` and `cluster/request_ops.rs` is listed in
+     `guides/storage-cluster-invariants.md`
+   - Phase 5.6 and Phase 5 are complete after the documented broad verification
+     gate passed with the boundary script, clippy, and full nextest suite
 
 ## Phase 6: PG Metadata Replication
 
