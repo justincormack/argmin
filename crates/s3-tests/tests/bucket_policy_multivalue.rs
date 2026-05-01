@@ -890,6 +890,306 @@ fn test_bucket_policy_request_object_tag_keys_for_any_value_string_not_equals_ig
 }
 
 #[test]
+fn test_bucket_policy_request_object_tag_keys_for_all_values_string_like() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_policy(client).await;
+        let key = "request-object-tag-keys-for-all-like";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:PutObjectTagging",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "ForAllValues:StringLike": {
+                                "s3:RequestObjectTagKeys": ["sec*", "team"]
+                            },
+                            "Null": {
+                                "s3:RequestObjectTagKeys": "false"
+                            }
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObjectTagging allowed when every request tag key matches a wildcard",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .tagging(tagging(vec![
+                        tag("security", "allow"),
+                        tag("team", "storage"),
+                    ]))
+                    .send()
+            },
+        )
+        .await;
+        eventually_access_denied(
+            "PutObjectTagging denied when any request tag key misses every wildcard",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .tagging(tagging(vec![
+                        tag("security", "allow"),
+                        tag("project", "argmin"),
+                    ]))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_request_object_tag_keys_for_any_value_string_like() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_policy(client).await;
+        let key = "request-object-tag-keys-for-any-like";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:PutObjectTagging",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "ForAnyValue:StringLike": {
+                                "s3:RequestObjectTagKeys": ["sec*"]
+                            }
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObjectTagging allowed when at least one request tag key matches a wildcard",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .tagging(tagging(vec![
+                        tag("security", "allow"),
+                        tag("project", "argmin"),
+                    ]))
+                    .send()
+            },
+        )
+        .await;
+        eventually_access_denied(
+            "PutObjectTagging denied when no request tag key matches a wildcard",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .tagging(tagging(vec![tag("project", "argmin")]))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_request_object_tag_keys_for_all_values_string_not_like() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_policy(client).await;
+        let key = "request-object-tag-keys-for-all-not-like";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:PutObjectTagging",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "ForAllValues:StringNotLike": {
+                                "s3:RequestObjectTagKeys": ["sec*"]
+                            },
+                            "Null": {
+                                "s3:RequestObjectTagKeys": "false"
+                            }
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObjectTagging allowed when every request tag key misses the wildcard",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .tagging(tagging(vec![
+                        tag("project", "argmin"),
+                        tag("team", "storage"),
+                    ]))
+                    .send()
+            },
+        )
+        .await;
+        eventually_access_denied(
+            "PutObjectTagging denied when any request tag key matches the wildcard",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .tagging(tagging(vec![
+                        tag("project", "argmin"),
+                        tag("security", "allow"),
+                    ]))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_request_object_tag_keys_for_any_value_string_not_like() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_policy(client).await;
+        let key = "request-object-tag-keys-for-any-not-like";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:PutObjectTagging",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "ForAnyValue:StringNotLike": {
+                                "s3:RequestObjectTagKeys": ["sec*"]
+                            }
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObjectTagging allowed when at least one request tag key misses the wildcard",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .tagging(tagging(vec![
+                        tag("security", "allow"),
+                        tag("project", "argmin"),
+                    ]))
+                    .send()
+            },
+        )
+        .await;
+        eventually_access_denied(
+            "PutObjectTagging denied when every request tag key matches the wildcard",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .tagging(tagging(vec![tag("security", "allow")]))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_tag_resource_tag_keys_for_all_values() {
     s3_tests::run(async {
         let client = CTX.client();

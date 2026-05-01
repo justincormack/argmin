@@ -10556,6 +10556,105 @@ fn test_bucket_policy_condition_operator_if_exists() {
 }
 
 #[test]
+fn test_bucket_policy_string_not_like_if_exists_copy_source_condition() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let src_bucket = create_bucket_allowing_public_policy(client).await;
+        let dst_bucket = create_bucket_allowing_public_policy(client).await;
+
+        for key in ["public/foo", "blocked/foo"] {
+            client
+                .put_object()
+                .bucket(&src_bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"copy-source"))
+                .send()
+                .await
+                .unwrap();
+        }
+        client
+            .put_bucket_policy()
+            .bucket(&src_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:GetObject",
+                        "Resource": bucket_wildcard_resource(&src_bucket)
+                    }]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&dst_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:PutObject",
+                        "Resource": bucket_wildcard_resource(&dst_bucket),
+                        "Condition": {
+                            "StringNotLikeIfExists": {
+                                "s3:x-amz-copy-source": format!("{src_bucket}/blocked/*")
+                            }
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok("PutObject with absent StringNotLikeIfExists key", || {
+            alt_client
+                .put_object()
+                .bucket(&dst_bucket)
+                .key("direct")
+                .body(ByteStream::from_static(b"direct"))
+                .send()
+        })
+        .await;
+        eventually_ok(
+            "CopyObject with StringNotLikeIfExists nonmatching copy-source",
+            || {
+                alt_client
+                    .copy_object()
+                    .bucket(&dst_bucket)
+                    .key("copied-public")
+                    .copy_source(format!("{src_bucket}/public/foo"))
+                    .send()
+            },
+        )
+        .await;
+        eventually_access_denied(
+            "CopyObject denied when StringNotLikeIfExists copy-source pattern matches",
+            || {
+                alt_client
+                    .copy_object()
+                    .bucket(&dst_bucket)
+                    .key("copied-blocked")
+                    .copy_source(format!("{src_bucket}/blocked/foo"))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&dst_bucket, &["direct", "copied-public", "copied-blocked"]).await;
+        cleanup(&src_bucket, &["public/foo", "blocked/foo"]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_put_object_if_none_match_condition() {
     s3_tests::run(async {
         let client = CTX.client();

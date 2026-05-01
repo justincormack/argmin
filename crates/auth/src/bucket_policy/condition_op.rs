@@ -62,10 +62,6 @@ pub(super) struct ConditionOpDef {
 
 /// The compile-time operator table.
 ///
-/// `StringNotLikeIfExists` is intentionally marked
-/// `evaluable_on_evaluable_object_actions: false` so the supportedness
-/// predicate preserves the asymmetry currently encoded in
-/// `evaluable_string_condition_operator_supported`.
 pub(super) const CONDITION_OPS: &[ConditionOpDef] = &[
     ConditionOpDef {
         name: "Bool",
@@ -168,6 +164,18 @@ pub(super) const CONDITION_OPS: &[ConditionOpDef] = &[
         evaluable_on_evaluable_object_actions: true,
     },
     ConditionOpDef {
+        name: "ForAllValues:StringLike",
+        kind: ConditionOpKind::StringLike,
+        evaluate: eval_for_all_values_string_like,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "ForAnyValue:StringLike",
+        kind: ConditionOpKind::StringLike,
+        evaluate: eval_for_any_value_string_like,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
         name: "StringLikeIfExists",
         kind: ConditionOpKind::StringLike,
         evaluate: eval_string_like_if_exists,
@@ -180,14 +188,24 @@ pub(super) const CONDITION_OPS: &[ConditionOpDef] = &[
         evaluable_on_evaluable_object_actions: true,
     },
     ConditionOpDef {
+        name: "ForAllValues:StringNotLike",
+        kind: ConditionOpKind::StringNotLike,
+        evaluate: eval_for_all_values_string_not_like,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "ForAnyValue:StringNotLike",
+        kind: ConditionOpKind::StringNotLike,
+        evaluate: eval_for_any_value_string_not_like,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
         name: "StringNotLikeIfExists",
         kind: ConditionOpKind::StringNotLike,
         // StringNotLike already treats Absent as Matches, so the IfExists
         // variant shares the same evaluator.
         evaluate: eval_string_not_like,
-        // Intentionally not in the currently enforced object-action subset,
-        // preserving the existing supportedness asymmetry.
-        evaluable_on_evaluable_object_actions: false,
+        evaluable_on_evaluable_object_actions: true,
     },
     ConditionOpDef {
         name: "Null",
@@ -512,6 +530,66 @@ fn eval_string_like(operands: &[String], actual: ActualValue<'_>) -> ConditionMa
     }
 }
 
+fn eval_for_all_values_string_like(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands
+                .iter()
+                .any(|expected| wildcard_matches(expected, actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(actuals) => {
+            if actuals.iter().all(|actual| {
+                operands
+                    .iter()
+                    .any(|expected| wildcard_matches(expected, actual))
+            }) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::Absent => ConditionMatchResult::Matches,
+    }
+}
+
+fn eval_for_any_value_string_like(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands
+                .iter()
+                .any(|expected| wildcard_matches(expected, actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(actuals) => {
+            if actuals.iter().any(|actual| {
+                operands
+                    .iter()
+                    .any(|expected| wildcard_matches(expected, actual))
+            }) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::Absent => ConditionMatchResult::NoMatch,
+    }
+}
+
 fn eval_string_like_if_exists(
     operands: &[String],
     actual: ActualValue<'_>,
@@ -538,6 +616,66 @@ fn eval_string_not_like(operands: &[String], actual: ActualValue<'_>) -> Conditi
         }
         ActualValue::PresentValues(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
+    }
+}
+
+fn eval_for_all_values_string_not_like(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands
+                .iter()
+                .all(|expected| !wildcard_matches(expected, actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(actuals) => {
+            if actuals.iter().all(|actual| {
+                operands
+                    .iter()
+                    .all(|expected| !wildcard_matches(expected, actual))
+            }) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::Absent => ConditionMatchResult::Matches,
+    }
+}
+
+fn eval_for_any_value_string_not_like(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands
+                .iter()
+                .all(|expected| !wildcard_matches(expected, actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(actuals) => {
+            if actuals.iter().any(|actual| {
+                operands
+                    .iter()
+                    .all(|expected| !wildcard_matches(expected, actual))
+            }) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
 
@@ -617,14 +755,11 @@ mod tests {
     }
 
     #[test]
-    fn string_not_like_if_exists_is_not_evaluable_on_object_actions() {
-        // The existing supportedness predicate intentionally omits this
-        // operator. The table row exists so evaluation stays total for the
-        // current dispatch, but the supportedness check rejects it.
-        assert!(!is_evaluable_on_evaluable_object_actions(
+    fn string_not_like_if_exists_is_evaluable_on_object_actions() {
+        assert!(is_evaluable_on_evaluable_object_actions("StringNotLike"));
+        assert!(is_evaluable_on_evaluable_object_actions(
             "StringNotLikeIfExists"
         ));
-        assert!(is_evaluable_on_evaluable_object_actions("StringNotLike"));
     }
 
     #[test]
@@ -937,6 +1072,52 @@ mod tests {
     }
 
     #[test]
+    fn for_all_values_string_like_requires_every_actual_value_to_match() {
+        let op = lookup("ForAllValues:StringLike").unwrap();
+        assert_eq!(op.kind, ConditionOpKind::StringLike);
+        let expected = operands(&["sec*", "team"]);
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["security"])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["security", "team"])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["security", "project"])),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&[])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, ActualValue::Absent),
+            ConditionMatchResult::Matches
+        );
+    }
+
+    #[test]
+    fn for_any_value_string_like_requires_at_least_one_actual_value_to_match() {
+        let op = lookup("ForAnyValue:StringLike").unwrap();
+        assert_eq!(op.kind, ConditionOpKind::StringLike);
+        let expected = operands(&["sec*"]);
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["security", "project"])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["project"])),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, ActualValue::Absent),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
     fn string_not_like_absent_matches() {
         let op = lookup("StringNotLike").unwrap();
         let expected = operands(&["foo-*"]);
@@ -951,6 +1132,52 @@ mod tests {
         assert_eq!(
             (op.evaluate)(&expected, present("bar")),
             ConditionMatchResult::Matches
+        );
+    }
+
+    #[test]
+    fn for_all_values_string_not_like_requires_every_actual_value_to_differ() {
+        let op = lookup("ForAllValues:StringNotLike").unwrap();
+        assert_eq!(op.kind, ConditionOpKind::StringNotLike);
+        let expected = operands(&["sec*", "team"]);
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["project"])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["project", "owner"])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["project", "team"])),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&[])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, ActualValue::Absent),
+            ConditionMatchResult::Matches
+        );
+    }
+
+    #[test]
+    fn for_any_value_string_not_like_requires_one_actual_value_to_differ() {
+        let op = lookup("ForAnyValue:StringNotLike").unwrap();
+        assert_eq!(op.kind, ConditionOpKind::StringNotLike);
+        let expected = operands(&["sec*"]);
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["security", "project"])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["security"])),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, ActualValue::Absent),
+            ConditionMatchResult::NoMatch
         );
     }
 
