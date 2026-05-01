@@ -20,10 +20,11 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use crate::error::{MetadataError, StoreError};
 use crate::metadata_command::{
     BucketPropertyMutation, BucketSubresourceMutation, CommitDirectPutObjectCommand,
-    CreateBucketCommand, DirectPutStalePayloadCommand, MetadataCommandEnvelope,
-    MetadataCommandPayload, PutBucketAclCommand, PutBucketPropertyCommand,
-    PutBucketSubresourceCommand, PutBucketVersioningCommand, ReleaseObjectGenerationCommand,
-    ReserveObjectGenerationCommand,
+    CommitMultipartObjectCommand, CreateBucketCommand, DeleteObjectVersionCommand,
+    DeleteObjectVersionTarget, InsertDeleteMarkerCommand, MetadataCommandEnvelope,
+    MetadataCommandPayload, ObjectPayloadReclaimCommand, PutBucketAclCommand,
+    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
+    ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
 };
 use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
@@ -2118,6 +2119,15 @@ impl PgStore {
             MetadataCommandPayload::CommitDirectPutObject(command) => {
                 self.apply_commit_direct_put_object_command(command)
             }
+            MetadataCommandPayload::CommitMultipartObject(command) => {
+                self.apply_commit_multipart_object_command(command)
+            }
+            MetadataCommandPayload::DeleteObjectVersion(command) => {
+                self.apply_delete_object_version_command(command)
+            }
+            MetadataCommandPayload::InsertDeleteMarker(command) => {
+                self.apply_insert_delete_marker_command(command)
+            }
         }
     }
 
@@ -2261,6 +2271,20 @@ impl PgStore {
                     stale_payload,
                 )?;
             }
+            self.conn
+                .execute(
+                    "DELETE FROM stream_uploads \
+                     WHERE session_id = ?1 AND bucket = ?2 AND key = ?3",
+                    params![
+                        command.generation_reservation_id.as_str(),
+                        &command.object.bucket,
+                        &command.object.key
+                    ],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "commit standard object command (delete stream staging)",
+                    source: e,
+                })?;
             Ok(())
         })();
 
@@ -2322,23 +2346,517 @@ impl PgStore {
         Ok(segments == command.segments)
     }
 
+    fn apply_commit_multipart_object_command(
+        &self,
+        command: &CommitMultipartObjectCommand,
+    ) -> Result<(), MetadataError> {
+        if self.multipart_object_command_already_applied(command)? {
+            return Ok(());
+        }
+
+        self.with_immediate_txn(
+            "commit multipart object command (begin txn)",
+            "commit multipart object command (commit txn)",
+            |store| {
+                if let Some(stale_payload) = &command.stale_payload {
+                    store.apply_multipart_overwrite_stale_payload_in_open_txn(
+                        &command.object.bucket,
+                        &command.object.key,
+                        command.object.version_id,
+                        stale_payload,
+                    )?;
+                }
+                store.put_multipart_object_explicit_in_open_txn(
+                    &command.object,
+                    &command.parts,
+                    command.write_sequence,
+                    command.last_modified_millis,
+                )?;
+                store.delete_multipart_part_segments(
+                    &command.object.bucket,
+                    &command.object.key,
+                    command.object.version_id,
+                )?;
+                store.delete_multipart_part_staging_segments_for_upload_in_open_txn(
+                    &command.upload_id,
+                )?;
+                store.insert_multipart_part_segments_in_open_txn(
+                    &command.object,
+                    &command.selected_streaming_segments,
+                )?;
+                store.insert_completed_multipart_upload_in_open_txn(command)?;
+                store.release_multipart_completion_reservation_in_open_txn(command)?;
+                store.delete_multipart_upload_if_present_in_open_txn(&command.upload_id)?;
+                Ok(())
+            },
+        )
+    }
+
+    fn multipart_object_command_already_applied(
+        &self,
+        command: &CommitMultipartObjectCommand,
+    ) -> Result<bool, MetadataError> {
+        let stored = match self.get_object_version(
+            &command.object.bucket,
+            &command.object.key,
+            command.object.version_id,
+        ) {
+            Ok(StoredObject::Live(record)) => record,
+            Ok(StoredObject::DeleteMarker(_)) | Err(MetadataError::ObjectNotFound) => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        if stored.generation_id != command.object.generation_id
+            || stored.size != command.object.size
+            || stored.etag != command.object.etag
+            || stored.last_modified != command.last_modified_millis
+            || stored.ec != command.object.ec
+            || stored.layout != command.object.layout
+            || stored.tags != command.object.tags
+            || stored.metadata_blob != command.object.metadata_blob
+            || stored.system_metadata_blob != command.object.system_metadata_blob
+            || stored.object_lock != command.object.object_lock
+            || stored.encryption != command.object.encryption
+            || stored.owner != command.object.owner
+            || stored.acl_grants != command.object.acl_grants
+            || stored.public_read != command.object.public_read
+        {
+            return Ok(false);
+        }
+        let parts = self.get_object_parts(
+            &command.object.bucket,
+            &command.object.key,
+            command.object.version_id,
+        )?;
+        if parts != command.parts {
+            return Ok(false);
+        }
+        let mut streaming_segments = Vec::new();
+        for part in &parts {
+            if part.part_okh == [0u8; 16] {
+                streaming_segments.extend(self.get_multipart_part_segments(
+                    &command.object.bucket,
+                    &command.object.key,
+                    command.object.version_id,
+                    part.part_number,
+                )?);
+            }
+        }
+        Ok(streaming_segments == command.selected_streaming_segments)
+    }
+
+    fn insert_multipart_part_segments_in_open_txn(
+        &self,
+        object: &PutLiveObjectReq,
+        segments: &[MultipartPartSegmentRecord],
+    ) -> Result<(), MetadataError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "INSERT INTO multipart_part_segments \
+                 (bucket, key, upload_id, version_id, part_number, segment_index, size, \
+                  segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "commit multipart object command (prepare insert part segments)",
+                source: e,
+            })?;
+
+        for segment in segments {
+            if segment.bucket != object.bucket
+                || segment.key != object.key
+                || segment.version_id != object.version_id.to_u64()
+            {
+                return Err(MetadataError::Db {
+                    context: "commit multipart object command (segment object mismatch)",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Null,
+                        Box::from("multipart part segment row does not match object identity"),
+                    ),
+                });
+            }
+            stmt.execute(params![
+                &segment.bucket,
+                &segment.key,
+                segment.upload_id.as_str(),
+                segment.version_id as i64,
+                segment.part_number,
+                segment.segment_index,
+                segment.size as i64,
+                segment.segment_crc64.map(|v| v as i64),
+                segment.segment_okh.as_slice(),
+                segment.segment_vid.get() as i64,
+                segment.data_pg_id,
+                segment.ec_k,
+                segment.ec_m,
+            ])
+            .map_err(|e| MetadataError::Db {
+                context: "commit multipart object command (insert part segment)",
+                source: e,
+            })?;
+        }
+
+        Ok(())
+    }
+
+    fn delete_multipart_part_staging_segments_for_upload_in_open_txn(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM multipart_part_segments \
+                 WHERE upload_id = ?1 AND version_id = ?2",
+                params![
+                    upload_id.as_str(),
+                    PART_SEGMENT_STAGING_VERSION_ID.to_u64() as i64
+                ],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "commit multipart object command (delete staging segments)",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn insert_completed_multipart_upload_in_open_txn(
+        &self,
+        command: &CommitMultipartObjectCommand,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO completed_multipart_uploads \
+                 (upload_id, bucket, key, completion_order, completed_at, owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    command.upload_id.as_str(),
+                    &command.object.bucket,
+                    &command.object.key,
+                    command.completion_order as i64,
+                    command.completed_at_millis as i64,
+                    &command.object.owner.principal,
+                    command.object.owner.canonical_id.as_str(),
+                    command
+                        .initiator
+                        .as_ref()
+                        .map(|owner| owner.principal.as_str()),
+                    command
+                        .initiator
+                        .as_ref()
+                        .map(|owner| owner.canonical_id.as_str()),
+                ],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "commit multipart object command (insert completed upload)",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    pub(crate) fn advance_completed_multipart_upload_sequence_for_bucket(
+        &self,
+        bucket: &BucketName,
+        completion_order: u64,
+    ) -> Result<(), MetadataError> {
+        let completion_order = i64::try_from(completion_order).map_err(|_| MetadataError::Db {
+            context: "commit multipart object command (completion order overflow)",
+            source: rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Integer,
+                Box::from("completion_order exceeds SQLite integer range"),
+            ),
+        })?;
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets \
+                 SET completed_multipart_upload_sequence = \
+                     CASE \
+                         WHEN completed_multipart_upload_sequence < ?2 THEN ?2 \
+                         ELSE completed_multipart_upload_sequence \
+                     END \
+                 WHERE name = ?1",
+                params![bucket, completion_order],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "commit multipart object command (advance completed upload sequence)",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(bucket_not_found(bucket.as_str()));
+        }
+        Ok(())
+    }
+
+    fn release_multipart_completion_reservation_in_open_txn(
+        &self,
+        command: &CommitMultipartObjectCommand,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM object_generation_reservations \
+                 WHERE reservation_id = ?1 AND bucket = ?2 AND key = ?3 AND generation_id = ?4",
+                params![
+                    command.upload_id.as_str(),
+                    &command.object.bucket,
+                    &command.object.key,
+                    command.object.generation_id.get() as i64,
+                ],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "commit multipart object command (release generation reservation)",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn delete_multipart_upload_if_present_in_open_txn(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM multipart_uploads WHERE upload_id = ?1",
+                params![upload_id.as_str()],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "commit multipart object command (delete upload)",
+                source: e,
+            })?;
+        Ok(())
+    }
+
     fn apply_direct_put_stale_payload_in_open_txn(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
-        stale_payload: &DirectPutStalePayloadCommand,
+        stale_payload: &ObjectPayloadReclaimCommand,
     ) -> Result<(), MetadataError> {
         match stale_payload {
-            DirectPutStalePayloadCommand::Segments(reclaim) => {
+            ObjectPayloadReclaimCommand::Segments(reclaim) => {
                 self.put_object_segments_reclaim_in_open_txn(reclaim)
             }
-            DirectPutStalePayloadCommand::Multipart(reclaim) => {
+            ObjectPayloadReclaimCommand::Multipart(reclaim) => {
                 self.put_multipart_reclaim_in_open_txn(reclaim)?;
                 self.delete_multipart_part_segments(bucket, key, version_id)?;
                 self.delete_object_parts(bucket, key, version_id)
             }
         }
+    }
+
+    fn apply_multipart_overwrite_stale_payload_in_open_txn(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        stale_payload: &ObjectPayloadReclaimCommand,
+    ) -> Result<(), MetadataError> {
+        match stale_payload {
+            ObjectPayloadReclaimCommand::Segments(reclaim) => {
+                self.put_object_segments_reclaim_in_open_txn(reclaim)?;
+                self.delete_object_segments(bucket, key, version_id)
+            }
+            ObjectPayloadReclaimCommand::Multipart(reclaim) => {
+                self.put_multipart_reclaim_in_open_txn(reclaim)?;
+                self.delete_multipart_part_segments(bucket, key, version_id)?;
+                self.delete_object_parts(bucket, key, version_id)
+            }
+        }
+    }
+
+    fn apply_delete_object_version_command(
+        &self,
+        command: &DeleteObjectVersionCommand,
+    ) -> Result<(), MetadataError> {
+        self.with_immediate_txn(
+            "delete object version command (begin txn)",
+            "delete object version command (commit txn)",
+            |store| {
+                let stored = match store.get_object_version(
+                    &command.bucket,
+                    &command.key,
+                    command.version_id,
+                ) {
+                    Ok(stored) => stored,
+                    Err(MetadataError::ObjectNotFound) => return Ok(()),
+                    Err(error) => return Err(error),
+                };
+
+                match (&command.target, stored) {
+                    (DeleteObjectVersionTarget::DeleteMarker, StoredObject::DeleteMarker(_)) => {}
+                    (
+                        DeleteObjectVersionTarget::Live {
+                            generation_id,
+                            layout,
+                            payload,
+                        },
+                        StoredObject::Live(record),
+                    ) => {
+                        if record.generation_id != *generation_id || record.layout != *layout {
+                            return Err(MetadataError::Db {
+                                context: "delete object version command target mismatch",
+                                source: rusqlite::Error::InvalidQuery,
+                            });
+                        }
+                        match payload {
+                            ObjectPayloadReclaimCommand::Segments(reclaim) => {
+                                store.put_object_segments_reclaim_in_open_txn(reclaim)?;
+                                store.delete_object_segments(
+                                    &command.bucket,
+                                    &command.key,
+                                    command.version_id,
+                                )?;
+                            }
+                            ObjectPayloadReclaimCommand::Multipart(reclaim) => {
+                                store.put_multipart_reclaim_in_open_txn(reclaim)?;
+                                store.delete_multipart_part_segments(
+                                    &command.bucket,
+                                    &command.key,
+                                    command.version_id,
+                                )?;
+                                store.delete_object_parts(
+                                    &command.bucket,
+                                    &command.key,
+                                    command.version_id,
+                                )?;
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(MetadataError::Db {
+                            context: "delete object version command kind mismatch",
+                            source: rusqlite::Error::InvalidQuery,
+                        });
+                    }
+                }
+
+                store.delete_object_version_in_open_txn(
+                    &command.bucket,
+                    &command.key,
+                    command.version_id,
+                )
+            },
+        )
+    }
+
+    fn apply_insert_delete_marker_command(
+        &self,
+        command: &InsertDeleteMarkerCommand,
+    ) -> Result<(), MetadataError> {
+        self.with_immediate_txn(
+            "insert delete marker command (begin txn)",
+            "insert delete marker command (commit txn)",
+            |store| {
+                match store.get_object_version(&command.bucket, &command.key, command.version_id) {
+                    Ok(StoredObject::DeleteMarker(marker))
+                        if marker.owner == command.owner
+                            && marker.last_modified == command.last_modified_millis =>
+                    {
+                        return Ok(());
+                    }
+                    Ok(StoredObject::Live(_)) if command.version_id.is_null() => {}
+                    Ok(_) => {
+                        return Err(MetadataError::Db {
+                            context: "insert delete marker command existing object mismatch",
+                            source: rusqlite::Error::InvalidQuery,
+                        });
+                    }
+                    Err(MetadataError::ObjectNotFound) => {}
+                    Err(error) => return Err(error),
+                }
+
+                store.put_delete_marker_explicit_in_open_txn(command)
+            },
+        )
+    }
+
+    fn put_delete_marker_explicit_in_open_txn(
+        &self,
+        command: &InsertDeleteMarkerCommand,
+    ) -> Result<(), MetadataError> {
+        self.mark_current_live_noncurrent(
+            command.bucket.as_str(),
+            command.key.as_str(),
+            command.version_id,
+            command.last_modified_millis,
+        )
+        .map_err(|e| MetadataError::Db {
+            context: "put object meta (mark noncurrent delete marker)",
+            source: e,
+        })?;
+        self.advance_object_version_counter_in_open_txn(
+            &command.bucket,
+            &command.key,
+            command.version_id,
+        )?;
+        let sql = if command.version_id.is_null() {
+            "INSERT OR REPLACE INTO objects \
+             (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
+              storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read) \
+             VALUES (?1, ?2, ?3, ?4, NULL, 0, zeroblob(0), 0, ?5, 0, 0, 0, 1, 0, NULL, NULL, NULL, 0, NULL, ?6, ?7, ?8, 0)"
+        } else {
+            "INSERT INTO objects \
+             (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
+              storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read) \
+             VALUES (?1, ?2, ?3, ?4, NULL, 0, zeroblob(0), 0, ?5, 0, 0, 0, 1, 0, NULL, NULL, NULL, 0, NULL, ?6, ?7, ?8, 0)"
+        };
+        self.conn
+            .execute(
+                sql,
+                params![
+                    command.bucket,
+                    command.key,
+                    command.version_id.to_u64() as i64,
+                    command.write_sequence as i64,
+                    command.last_modified_millis as i64,
+                    command.owner.principal,
+                    command.owner.canonical_id.as_str(),
+                    "",
+                ],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put object meta (delete marker)",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn delete_object_version_in_open_txn(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<(), MetadataError> {
+        let deleted_was_current = self
+            .current_object_head(bucket.as_str(), key.as_str())
+            .map_err(|e| MetadataError::Db {
+                context: "delete object version (lookup current)",
+                source: e,
+            })?
+            .is_some_and(|(current_version_id, _)| current_version_id == version_id);
+
+        self.conn
+            .execute(
+                "DELETE FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![bucket, key, version_id.to_u64() as i64],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete object version",
+                source: e,
+            })?;
+
+        if deleted_was_current {
+            self.clear_current_live_noncurrent(bucket.as_str(), key.as_str())
+                .map_err(|e| MetadataError::Db {
+                    context: "delete object version (restore current)",
+                    source: e,
+                })?;
+        }
+        Ok(())
     }
 
     fn put_bucket_versioning_inner(
@@ -2894,7 +3412,7 @@ impl PgStore {
         Ok(())
     }
 
-    fn object_write_sequence(
+    pub(crate) fn object_write_sequence(
         &self,
         bucket: &str,
         key: &str,
@@ -3004,22 +3522,30 @@ impl PgStore {
         &self,
         bucket: &BucketName,
     ) -> Result<u64, MetadataError> {
-        let bucket = bucket.as_str();
+        let bucket_name = bucket.as_str();
         let updated = self
             .conn
             .execute(
                 "UPDATE buckets \
                  SET completed_multipart_upload_sequence = completed_multipart_upload_sequence + 1 \
                  WHERE name = ?1",
-                params![bucket],
+                params![bucket_name],
             )
             .map_err(|e| MetadataError::Db {
                 context: "increment completed multipart upload sequence",
                 source: e,
             })?;
         if updated == 0 {
-            return Err(bucket_not_found(bucket));
+            return Err(bucket_not_found(bucket_name));
         }
+        self.completed_multipart_upload_sequence_for_bucket(bucket)
+    }
+
+    pub(crate) fn completed_multipart_upload_sequence_for_bucket(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<u64, MetadataError> {
+        let bucket = bucket.as_str();
         self.conn
             .query_row(
                 "SELECT completed_multipart_upload_sequence FROM buckets WHERE name = ?1",
@@ -3451,6 +3977,182 @@ impl PgStore {
                 context: "put explicit segment object (insert segment)",
                 source: e,
             })?;
+        }
+
+        Ok(())
+    }
+
+    fn put_multipart_object_explicit_in_open_txn(
+        &self,
+        obj: &PutLiveObjectReq,
+        parts: &[ObjectPartRecord],
+        write_sequence: u64,
+        last_modified: u64,
+    ) -> Result<(), MetadataError> {
+        obj.validate().map_err(|msg| MetadataError::Db {
+            context: "put explicit multipart object (etag/layout mismatch)",
+            source: rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Null,
+                Box::from(msg),
+            ),
+        })?;
+        if !matches!(obj.layout, ObjectLayout::MultipartManifest { .. }) {
+            return Err(MetadataError::Db {
+                context: "put explicit multipart object (non-multipart layout)",
+                source: rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Null,
+                    Box::from("put multipart object requires MultipartManifest layout"),
+                ),
+            });
+        }
+        if parts.is_empty() {
+            return Err(MetadataError::Db {
+                context: "put explicit multipart object (empty parts)",
+                source: rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Null,
+                    Box::from("multipart commit requires at least one part"),
+                ),
+            });
+        }
+
+        let data_layout = obj.layout.data_layout() as u8;
+        let etag_kind = obj.etag.etag_kind() as u8;
+        let status = ObjectState::Live as u8;
+        let parts_count = obj.layout.parts_count().map(|n| n as i64);
+        let tags = obj.tags.as_ref().map(SerializedTagSet::as_str);
+        let metadata_blob = obj
+            .metadata_blob
+            .as_ref()
+            .map(SerializedMetadataBlob::as_slice);
+        let system_metadata_blob = obj
+            .system_metadata_blob
+            .as_ref()
+            .map(SerializedSystemMetadataBlob::as_slice);
+        let (object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) =
+            Self::object_lock_sql_values(obj.object_lock).map_err(|e| MetadataError::Db {
+                context: "put explicit multipart object (encode object lock)",
+                source: e,
+            })?;
+        let encryption_type = obj.encryption.encryption_type() as u8;
+        let encryption_state = obj.encryption.encode_state();
+        self.mark_current_live_noncurrent(
+            obj.bucket.as_str(),
+            obj.key.as_str(),
+            obj.version_id,
+            last_modified,
+        )
+        .map_err(|e| MetadataError::Db {
+            context: "put explicit multipart object (mark noncurrent)",
+            source: e,
+        })?;
+        self.advance_object_version_counter_in_open_txn(&obj.bucket, &obj.key, obj.version_id)?;
+
+        let obj_sql = if obj.version_id.is_null() {
+            "INSERT OR REPLACE INTO objects \
+             (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
+              storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)"
+        } else {
+            "INSERT INTO objects \
+             (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
+              storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)"
+        };
+        self.conn
+            .execute(
+                obj_sql,
+                params![
+                    &obj.bucket,
+                    &obj.key,
+                    obj.version_id.to_u64() as i64,
+                    write_sequence as i64,
+                    obj.generation_id.get() as i64,
+                    obj.size as i64,
+                    obj.etag.as_bytes(),
+                    etag_kind,
+                    last_modified as i64,
+                    obj.ec.k,
+                    obj.ec.m,
+                    status,
+                    data_layout,
+                    parts_count,
+                    tags,
+                    metadata_blob,
+                    system_metadata_blob,
+                    encryption_type,
+                    encryption_state,
+                    &obj.owner.principal,
+                    obj.owner.canonical_id.as_str(),
+                    obj.acl_grants.serialized(),
+                    i32::from(obj.public_read),
+                    object_lock_retention_mode,
+                    object_lock_retain_until,
+                    object_lock_legal_hold,
+                ],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put explicit multipart object (write object)",
+                source: e,
+            })?;
+
+        self.conn
+            .execute(
+                "DELETE FROM object_parts \
+                 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![&obj.bucket, &obj.key, obj.version_id.to_u64() as i64],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put explicit multipart object (delete prior parts)",
+                source: e,
+            })?;
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "INSERT INTO object_parts \
+                 (bucket, key, version_id, part_number, object_offset_start, size, etag, etag_kind, \
+                  part_okh, part_vid, ec_k, ec_m, data_pg_id, checksum) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put explicit multipart object (prepare insert parts)",
+                source: e,
+            })?;
+        let mut ordered_parts: Vec<&ObjectPartRecord> = parts.iter().collect();
+        ordered_parts.sort_by_key(|part| part.part_number);
+        let mut object_offset_start = 0u64;
+        for part in ordered_parts {
+            if part.bucket != obj.bucket || part.key != obj.key || part.version_id != obj.version_id
+            {
+                return Err(MetadataError::Db {
+                    context: "put explicit multipart object (part identity mismatch)",
+                    source: rusqlite::Error::InvalidQuery,
+                });
+            }
+            stmt.execute(params![
+                &part.bucket,
+                &part.key,
+                part.version_id.to_u64() as i64,
+                part.part_number,
+                object_offset_start as i64,
+                part.size as i64,
+                &part.etag,
+                part.etag_kind as u8,
+                part.part_okh.as_slice(),
+                part.part_vid.get() as i64,
+                part.ec_k,
+                part.ec_m,
+                part.data_pg_id,
+                part.checksum.as_ref().map(|checksum| checksum.as_slice()),
+            ])
+            .map_err(|e| MetadataError::Db {
+                context: "put explicit multipart object (insert part)",
+                source: e,
+            })?;
+            object_offset_start += part.size;
         }
 
         Ok(())
@@ -4160,51 +4862,14 @@ impl PgMetadataStore for PgStore {
             PutObjectReq::DeleteMarker(req) => {
                 let write_sequence =
                     self.next_object_write_sequence(req.bucket.as_str(), req.key.as_str())?;
-                self.mark_current_live_noncurrent(
-                    req.bucket.as_str(),
-                    req.key.as_str(),
-                    req.version_id,
-                    now,
-                )
-                .map_err(|e| MetadataError::Db {
-                    context: "put object meta (mark noncurrent delete marker)",
-                    source: e,
-                })?;
-                self.advance_object_version_counter_in_open_txn(
-                    &req.bucket,
-                    &req.key,
-                    req.version_id,
-                )?;
-                let sql = if req.version_id.is_null() {
-                    "INSERT OR REPLACE INTO objects \
-                     (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
-                      storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read) \
-                     VALUES (?1, ?2, ?3, ?4, NULL, 0, zeroblob(0), 0, ?5, 0, 0, 0, 1, 0, NULL, NULL, NULL, 0, NULL, ?6, ?7, ?8, 0)"
-                } else {
-                    "INSERT INTO objects \
-                     (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
-                      storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read) \
-                     VALUES (?1, ?2, ?3, ?4, NULL, 0, zeroblob(0), 0, ?5, 0, 0, 0, 1, 0, NULL, NULL, NULL, 0, NULL, ?6, ?7, ?8, 0)"
-                };
-                self.conn
-                    .execute(
-                        sql,
-                        params![
-                            req.bucket,
-                            req.key,
-                            req.version_id.to_u64() as i64,
-                            write_sequence as i64,
-                            now as i64,
-                            req.owner.principal,
-                            req.owner.canonical_id.as_str(),
-                            "",
-                        ],
-                    )
-                    .map_err(|e| MetadataError::Db {
-                        context: "put object meta (delete marker)",
-                        source: e,
-                    })?;
-                Ok(())
+                self.put_delete_marker_explicit_in_open_txn(&InsertDeleteMarkerCommand {
+                    bucket: req.bucket.clone(),
+                    key: req.key.clone(),
+                    version_id: req.version_id,
+                    owner: req.owner.clone(),
+                    write_sequence,
+                    last_modified_millis: now,
+                })
             }
         })();
 
@@ -4491,34 +5156,8 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
 
-        let result: Result<(), MetadataError> = (|| {
-            let deleted_was_current = self
-                .current_object_head(bucket.as_str(), key.as_str())
-                .map_err(|e| MetadataError::Db {
-                    context: "delete object version (lookup current)",
-                    source: e,
-                })?
-                .is_some_and(|(current_version_id, _)| current_version_id == version_id);
-
-            self.conn
-                .execute(
-                    "DELETE FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                    params![bucket, key, version_id.to_u64() as i64],
-                )
-                .map_err(|e| MetadataError::Db {
-                    context: "delete object version",
-                    source: e,
-                })?;
-
-            if deleted_was_current {
-                self.clear_current_live_noncurrent(bucket.as_str(), key.as_str())
-                    .map_err(|e| MetadataError::Db {
-                        context: "delete object version (restore current)",
-                        source: e,
-                    })?;
-            }
-            Ok(())
-        })();
+        let result: Result<(), MetadataError> =
+            self.delete_object_version_in_open_txn(bucket, key, version_id);
 
         match result {
             Ok(()) => {

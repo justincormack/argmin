@@ -14,8 +14,10 @@ use super::{
     MetadataCommandApplyTestContext, MetadataCommandApplyTestKind,
 };
 use crate::metadata_command::{
-    BucketPropertyMutation, BucketSubresourceMutation, CreateBucketCommand,
-    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload, PutBucketAclCommand,
+    BucketPropertyMutation, BucketSubresourceMutation, CommitDirectPutObjectCommand,
+    CommitMultipartObjectCommand, CreateBucketCommand, DeleteObjectVersionCommand,
+    DeleteObjectVersionTarget, InsertDeleteMarkerCommand, MetadataCommandEnvelope,
+    MetadataCommandId, MetadataCommandPayload, ObjectPayloadReclaimCommand, PutBucketAclCommand,
     PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
 };
 use crate::*;
@@ -128,6 +130,21 @@ fn metadata_command_apply_test_context(
             MetadataCommandApplyTestKind::CommitDirectPutObject,
             Some(command.object.bucket.clone()),
             Some(command.object.key.clone()),
+        ),
+        MetadataCommandPayload::CommitMultipartObject(command) => (
+            MetadataCommandApplyTestKind::CommitMultipartObject,
+            Some(command.object.bucket.clone()),
+            Some(command.object.key.clone()),
+        ),
+        MetadataCommandPayload::DeleteObjectVersion(command) => (
+            MetadataCommandApplyTestKind::DeleteObjectVersion,
+            Some(command.bucket.clone()),
+            Some(command.key.clone()),
+        ),
+        MetadataCommandPayload::InsertDeleteMarker(command) => (
+            MetadataCommandApplyTestKind::InsertDeleteMarker,
+            Some(command.bucket.clone()),
+            Some(command.key.clone()),
         ),
     };
     MetadataCommandApplyTestContext {
@@ -326,7 +343,10 @@ impl super::StorageCluster {
                 }
                 MetadataCommandPayload::ReserveObjectGeneration(_)
                 | MetadataCommandPayload::ReleaseObjectGeneration(_)
-                | MetadataCommandPayload::CommitDirectPutObject(_) => {
+                | MetadataCommandPayload::CommitDirectPutObject(_)
+                | MetadataCommandPayload::CommitMultipartObject(_)
+                | MetadataCommandPayload::DeleteObjectVersion(_)
+                | MetadataCommandPayload::InsertDeleteMarker(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending object command for create bucket",
                     ));
@@ -396,6 +416,27 @@ impl super::StorageCluster {
                     source: source.into(),
                 },
             )?;
+            if let MetadataCommandPayload::CommitMultipartObject(commit) = command.payload() {
+                let bucket_pg_id = node
+                    .storage_node()
+                    .pg_topology()
+                    .bucket_pg_for(&commit.object.bucket);
+                let bucket_pg = node.storage_node().get_pg(bucket_pg_id).map_err(|source| {
+                    MetadataCommandApplyFailure {
+                        applied_nodes,
+                        source: source.into(),
+                    }
+                })?;
+                bucket_pg
+                    .advance_completed_multipart_upload_sequence_for_bucket(
+                        &commit.object.bucket,
+                        commit.completion_order,
+                    )
+                    .map_err(|source| MetadataCommandApplyFailure {
+                        applied_nodes,
+                        source: source.into(),
+                    })?;
+            }
             let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
                 MetadataCommandApplyFailure {
                     applied_nodes,
@@ -782,7 +823,10 @@ impl super::StorageCluster {
                 }
                 MetadataCommandPayload::ReserveObjectGeneration(_)
                 | MetadataCommandPayload::ReleaseObjectGeneration(_)
-                | MetadataCommandPayload::CommitDirectPutObject(_) => {
+                | MetadataCommandPayload::CommitDirectPutObject(_)
+                | MetadataCommandPayload::CommitMultipartObject(_)
+                | MetadataCommandPayload::DeleteObjectVersion(_)
+                | MetadataCommandPayload::InsertDeleteMarker(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending object command for versioning",
                     ));
@@ -950,7 +994,10 @@ impl super::StorageCluster {
                 }
                 MetadataCommandPayload::ReserveObjectGeneration(_)
                 | MetadataCommandPayload::ReleaseObjectGeneration(_)
-                | MetadataCommandPayload::CommitDirectPutObject(_) => {
+                | MetadataCommandPayload::CommitDirectPutObject(_)
+                | MetadataCommandPayload::CommitMultipartObject(_)
+                | MetadataCommandPayload::DeleteObjectVersion(_)
+                | MetadataCommandPayload::InsertDeleteMarker(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending object command for bucket acl",
                     ));
@@ -1043,7 +1090,10 @@ impl super::StorageCluster {
                 }
                 MetadataCommandPayload::ReserveObjectGeneration(_)
                 | MetadataCommandPayload::ReleaseObjectGeneration(_)
-                | MetadataCommandPayload::CommitDirectPutObject(_) => {
+                | MetadataCommandPayload::CommitDirectPutObject(_)
+                | MetadataCommandPayload::CommitMultipartObject(_)
+                | MetadataCommandPayload::DeleteObjectVersion(_)
+                | MetadataCommandPayload::InsertDeleteMarker(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending object command for bucket property",
                     ));
@@ -1159,7 +1209,10 @@ impl super::StorageCluster {
                 }
                 MetadataCommandPayload::ReserveObjectGeneration(_)
                 | MetadataCommandPayload::ReleaseObjectGeneration(_)
-                | MetadataCommandPayload::CommitDirectPutObject(_) => {
+                | MetadataCommandPayload::CommitDirectPutObject(_)
+                | MetadataCommandPayload::CommitMultipartObject(_)
+                | MetadataCommandPayload::DeleteObjectVersion(_)
+                | MetadataCommandPayload::InsertDeleteMarker(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending object command for bucket subresource",
                     ));
@@ -1818,6 +1871,130 @@ impl super::StorageCluster {
             .get_object_retention_if(bucket, key, version_id, action)
     }
 
+    fn apply_new_object_metadata_command_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), ObjectPgActionError> {
+        match self.apply_metadata_command_to_acting_set(command) {
+            Ok(()) => {
+                self.local_map
+                    .runtime_state()
+                    .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                self.after_object_metadata_command_applied(command);
+                Ok(())
+            }
+            Err(error) => {
+                if error.applied_nodes == 0 {
+                    self.local_map
+                        .runtime_state()
+                        .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                }
+                Err(super::bucket_snapshot_error_to_object_pg_action_error(
+                    error.source,
+                ))
+            }
+        }
+    }
+
+    fn delete_command_target_from_stored(
+        &self,
+        object_pg: &crate::PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        stored: Option<&StoredObject>,
+    ) -> Result<Option<DeleteObjectVersionTarget>, ObjectPgActionError> {
+        match stored {
+            None => Ok(None),
+            Some(StoredObject::DeleteMarker(_)) => {
+                Ok(Some(DeleteObjectVersionTarget::DeleteMarker))
+            }
+            Some(StoredObject::Live(record)) => Ok(Some(
+                self.live_delete_command_target(object_pg, bucket, key, record)?,
+            )),
+        }
+    }
+
+    fn live_delete_command_target(
+        &self,
+        object_pg: &crate::PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        record: &LiveObjectRecord,
+    ) -> Result<DeleteObjectVersionTarget, ObjectPgActionError> {
+        let payload = Self::snapshot_live_object_payload_reclaim_command(
+            object_pg,
+            bucket,
+            key,
+            record,
+            crate::clock::current_time_millis(),
+        )?;
+        Ok(DeleteObjectVersionTarget::Live {
+            generation_id: record.generation_id,
+            layout: record.layout,
+            payload,
+        })
+    }
+
+    fn new_delete_object_version_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        target: DeleteObjectVersionTarget,
+    ) -> MetadataCommandEnvelope {
+        let command_id = MetadataCommandId::new(
+            self.operation_epoch(),
+            pg_id,
+            self.local_map
+                .runtime_state()
+                .next_metadata_command_log_index(pg_id),
+        );
+        MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id,
+                target,
+            })),
+        )
+    }
+
+    fn deleted_specific_from_command_target(
+        target: &DeleteObjectVersionTarget,
+    ) -> DeletedSpecificObjectVersion {
+        match target {
+            DeleteObjectVersionTarget::DeleteMarker => DeletedSpecificObjectVersion::DeleteMarker,
+            DeleteObjectVersionTarget::Live {
+                generation_id,
+                layout,
+                ..
+            } => DeletedSpecificObjectVersion::Live {
+                generation_id: *generation_id,
+                layout: *layout,
+            },
+        }
+    }
+
+    fn deleted_current_from_command_target(
+        target: &DeleteObjectVersionTarget,
+    ) -> DeletedCurrentObject {
+        match target {
+            DeleteObjectVersionTarget::DeleteMarker => DeletedCurrentObject::DeleteMarker,
+            DeleteObjectVersionTarget::Live {
+                generation_id,
+                layout,
+                ..
+            } => DeletedCurrentObject::Live {
+                generation_id: *generation_id,
+                layout: *layout,
+            },
+        }
+    }
+
     pub fn delete_specific_object_version_if<T, E>(
         &self,
         bucket: &BucketName,
@@ -1825,8 +2002,80 @@ impl super::StorageCluster {
         version_id: VersionId,
         action: impl FnOnce(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<DeleteSpecificObjectVersionOutcome<T>, E>, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .delete_specific_object_version_if(bucket, key, version_id, action)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let runtime_state = self.local_map.runtime_state();
+        let mut action = Some(action);
+
+        loop {
+            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                if let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() {
+                    if delete.matches_request(bucket, key, version_id) {
+                        let object_pg = primary_node.get_pg(pg_id.get())?;
+                        let stored = match PgMetadataStore::get_object_version(
+                            &*object_pg,
+                            bucket,
+                            key,
+                            version_id,
+                        ) {
+                            Ok(stored) => Some(stored),
+                            Err(MetadataError::ObjectNotFound) => None,
+                            Err(error) => return Err(error.into()),
+                        };
+                        let value = match action.take().expect("delete action used once")(
+                            stored.as_ref(),
+                        ) {
+                            Ok(value) => value,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        drop(object_pg);
+                        self.apply_pending_object_metadata_command_for_bucket(
+                            pg_id, bucket, &command,
+                        )?;
+                        return Ok(Ok(DeleteSpecificObjectVersionOutcome {
+                            value,
+                            deleted: Self::deleted_specific_from_command_target(&delete.target),
+                        }));
+                    }
+                }
+                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                continue;
+            }
+
+            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let stored =
+                match PgMetadataStore::get_object_version(&*object_pg, bucket, key, version_id) {
+                    Ok(stored) => Some(stored),
+                    Err(MetadataError::ObjectNotFound) => None,
+                    Err(error) => return Err(error.into()),
+                };
+            let value = match action.take().expect("delete action used once")(stored.as_ref()) {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            };
+            let Some(target) =
+                self.delete_command_target_from_stored(&object_pg, bucket, key, stored.as_ref())?
+            else {
+                return Ok(Ok(DeleteSpecificObjectVersionOutcome {
+                    value,
+                    deleted: DeletedSpecificObjectVersion::Missing,
+                }));
+            };
+            let command =
+                self.new_delete_object_version_command(pg_id, bucket, key, version_id, target);
+            drop(object_pg);
+            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() else {
+                unreachable!("new delete object command changed payload kind");
+            };
+            return Ok(Ok(DeleteSpecificObjectVersionOutcome {
+                value,
+                deleted: Self::deleted_specific_from_command_target(&delete.target),
+            }));
+        }
     }
 
     pub fn delete_current_object_if<T, E>(
@@ -1835,8 +2084,90 @@ impl super::StorageCluster {
         key: &ObjectKey,
         action: impl FnOnce(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<DeleteCurrentObjectOutcome<T>, E>, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .delete_current_object_if(bucket, key, action)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let runtime_state = self.local_map.runtime_state();
+        let mut action = Some(action);
+
+        loop {
+            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                if let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() {
+                    if delete.bucket == *bucket && delete.key == *key {
+                        let object_pg = primary_node.get_pg(pg_id.get())?;
+                        let stored =
+                            match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
+                                Ok(stored) => Some(stored),
+                                Err(MetadataError::ObjectNotFound) => None,
+                                Err(error) => return Err(error.into()),
+                            };
+                        if stored
+                            .as_ref()
+                            .is_some_and(|stored| stored.version_id() == delete.version_id)
+                        {
+                            let value = match action.take().expect("delete action used once")(
+                                stored.as_ref(),
+                            ) {
+                                Ok(value) => value,
+                                Err(error) => return Ok(Err(error)),
+                            };
+                            drop(object_pg);
+                            self.apply_pending_object_metadata_command_for_bucket(
+                                pg_id, bucket, &command,
+                            )?;
+                            return Ok(Ok(DeleteCurrentObjectOutcome {
+                                value,
+                                deleted: Self::deleted_current_from_command_target(&delete.target),
+                            }));
+                        }
+                    }
+                }
+                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                continue;
+            }
+
+            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let stored = match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
+                Ok(stored) => Some(stored),
+                Err(MetadataError::ObjectNotFound) => None,
+                Err(error) => return Err(error.into()),
+            };
+            let value = match action.take().expect("delete action used once")(stored.as_ref()) {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            };
+            let Some(stored) = stored.as_ref() else {
+                return Ok(Ok(DeleteCurrentObjectOutcome {
+                    value,
+                    deleted: DeletedCurrentObject::Missing,
+                }));
+            };
+            let StoredObject::Live(record) = stored else {
+                return Ok(Ok(DeleteCurrentObjectOutcome {
+                    value,
+                    deleted: DeletedCurrentObject::DeleteMarker,
+                }));
+            };
+            let target = self.live_delete_command_target(&object_pg, bucket, key, record)?;
+            let command = self.new_delete_object_version_command(
+                pg_id,
+                bucket,
+                key,
+                record.version_id,
+                target,
+            );
+            drop(object_pg);
+            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() else {
+                unreachable!("new delete object command changed payload kind");
+            };
+            return Ok(Ok(DeleteCurrentObjectOutcome {
+                value,
+                deleted: Self::deleted_current_from_command_target(&delete.target),
+            }));
+        }
     }
 
     pub fn insert_current_delete_marker_if<T, E>(
@@ -1846,8 +2177,81 @@ impl super::StorageCluster {
         owner: OwnerIdentity,
         action: impl FnOnce(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<InsertCurrentDeleteMarkerOutcome<T>, E>, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .insert_current_delete_marker_if(bucket, key, owner, action)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let runtime_state = self.local_map.runtime_state();
+        let mut action = Some(action);
+
+        loop {
+            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                if let MetadataCommandPayload::InsertDeleteMarker(marker) = command.payload() {
+                    if marker.matches_request(bucket, key) {
+                        let object_pg = primary_node.get_pg(pg_id.get())?;
+                        let stored =
+                            match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
+                                Ok(stored) => Some(stored),
+                                Err(MetadataError::ObjectNotFound) => None,
+                                Err(error) => return Err(error.into()),
+                            };
+                        let value = match action.take().expect("delete marker action used once")(
+                            stored.as_ref(),
+                        ) {
+                            Ok(value) => value,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        drop(object_pg);
+                        self.apply_pending_object_metadata_command_for_bucket(
+                            pg_id, bucket, &command,
+                        )?;
+                        return Ok(Ok(InsertCurrentDeleteMarkerOutcome {
+                            value,
+                            version_id: marker.version_id,
+                        }));
+                    }
+                }
+                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                continue;
+            }
+
+            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let stored = match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
+                Ok(stored) => Some(stored),
+                Err(MetadataError::ObjectNotFound) => None,
+                Err(error) => return Err(error.into()),
+            };
+            let value =
+                match action.take().expect("delete marker action used once")(stored.as_ref()) {
+                    Ok(value) => value,
+                    Err(error) => return Ok(Err(error)),
+                };
+            let marker_vid = PgMetadataStore::next_version_id(&*object_pg, bucket, key)?;
+            let command_id = MetadataCommandId::new(
+                self.operation_epoch(),
+                pg_id,
+                runtime_state.next_metadata_command_log_index(pg_id),
+            );
+            let command = MetadataCommandEnvelope::new(
+                command_id,
+                MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: marker_vid,
+                    owner,
+                    write_sequence: object_pg
+                        .next_object_write_sequence(bucket.as_str(), key.as_str())?,
+                    last_modified_millis: crate::clock::current_time_millis(),
+                }),
+            );
+            drop(object_pg);
+            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            return Ok(Ok(InsertCurrentDeleteMarkerOutcome {
+                value,
+                version_id: marker_vid,
+            }));
+        }
     }
 
     pub fn expire_current_object_if_due<E>(
@@ -2215,8 +2619,33 @@ impl super::StorageCluster {
             Option<StoredObject>,
         ) -> Result<(T, CreateStreamUploadReq), E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .create_put_object_stream_session(bucket, key, request, action)
+        let pg_id = self.object_metadata_pg_id(bucket, key);
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        primary_node.with_bucket_write_reservation_snapshot(bucket, request, |snapshot| {
+            let object_pg = primary_node.get_pg(pg_id)?;
+            let existing_object = match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
+                Ok(StoredObject::Live(record)) => Some(StoredObject::Live(record)),
+                Ok(StoredObject::DeleteMarker(_)) | Err(MetadataError::ObjectNotFound) => None,
+                Err(error) => return Err(error.into()),
+            };
+            drop(object_pg);
+
+            let (value, create) = match action(snapshot, existing_object) {
+                Ok(prepared) => prepared,
+                Err(error) => return Ok(Err(error)),
+            };
+            self.reserve_put_object_generation(bucket, key, &create.session_id)
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+
+            let object_pg = primary_node.get_pg(pg_id)?;
+            if let Err(error) = object_pg.create_stream_upload(&create) {
+                drop(object_pg);
+                let _ = self.release_object_generation_reservation(bucket, key, &create.session_id);
+                return Err(error.into());
+            }
+
+            Ok(Ok(value))
+        })
     }
 
     pub fn finalize_put_object_stream<T, E>(
@@ -2227,8 +2656,190 @@ impl super::StorageCluster {
         total_size: u64,
         action: impl FnOnce(StreamPutFinalizeSnapshot) -> Result<PreparedStreamPutCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPutOutcome<T>, E>, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .finalize_put_object_stream(bucket, key, session_id, total_size, action)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let runtime_state = self.local_map.runtime_state();
+
+        while let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket) {
+            let is_matching_stream_commit = matches!(
+                command.payload(),
+                MetadataCommandPayload::CommitDirectPutObject(commit)
+                    if commit.matches_request(
+                        bucket,
+                        key,
+                        session_id,
+                        commit.object.generation_id,
+                    )
+            );
+            if is_matching_stream_commit {
+                break;
+            }
+            self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+        }
+
+        let pending_command = runtime_state
+            .pending_metadata_command_for_bucket(pg_id, bucket)
+            .filter(|command| {
+                matches!(
+                    command.payload(),
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                        if commit.matches_request(
+                            bucket,
+                            key,
+                            session_id,
+                            commit.object.generation_id,
+                        )
+                )
+            });
+
+        let object_pg = primary_node.get_pg(pg_id.get())?;
+        let session = object_pg.get_stream_upload(session_id)?;
+        if session.state != StreamUploadState::InProgress {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "stream session is not in progress".to_string(),
+            });
+        }
+        if session.bucket != bucket.as_str() || session.key != key.as_str() {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "session bucket/key mismatch".to_string(),
+            });
+        }
+        if !matches!(session.target, StreamUploadTarget::PutObject) {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "session is not a PutObject session".to_string(),
+            });
+        }
+        let existing_etag = match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
+            Ok(stored) => stored.as_live().map(|record| record.etag.format()),
+            Err(MetadataError::ObjectNotFound) => None,
+            Err(other) => return Err(other.into()),
+        };
+        let staging_segments = object_pg.list_stream_segments(session_id)?;
+        let prepared = match action(StreamPutFinalizeSnapshot {
+            session,
+            existing_etag,
+        }) {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok(Err(error)),
+        };
+        let segments_total: u64 = staging_segments.iter().map(|segment| segment.size).sum();
+        if segments_total != total_size {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: format!(
+                    "total_size mismatch: caller passed {total_size} but staged segments sum to {segments_total}"
+                ),
+            });
+        }
+
+        let (command, new_pending_command) = if let Some(command) = pending_command {
+            (command, false)
+        } else {
+            let version_id = if prepared.versioning == BucketVersioningState::Enabled {
+                PgMetadataStore::next_version_id(&*object_pg, bucket, key)?
+            } else {
+                VersionId::Null
+            };
+            let generation_id =
+                object_pg.get_object_generation_reservation(bucket, key, session_id)?;
+            let last_modified_millis = crate::clock::current_time_millis();
+            let write_sequence =
+                object_pg.next_object_write_sequence(bucket.as_str(), key.as_str())?;
+            let stale_payload = if version_id.is_null() {
+                self.snapshot_direct_put_stale_payload_command(
+                    &object_pg,
+                    bucket,
+                    key,
+                    last_modified_millis,
+                )?
+            } else {
+                None
+            };
+            let committed_segments: Vec<ObjectSegmentRecord> = staging_segments
+                .iter()
+                .map(|segment| ObjectSegmentRecord {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id,
+                    segment_index: segment.segment_index,
+                    size: segment.size,
+                    segment_crc64: segment.segment_crc64,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    data_pg_id: segment.data_pg_id,
+                    ec_k: segment.ec_k,
+                    ec_m: segment.ec_m,
+                })
+                .collect();
+            let object = PutLiveObjectReq {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id,
+                owner: prepared.owner.clone(),
+                acl_grants: prepared.acl_grants.clone(),
+                public_read: prepared.public_read,
+                generation_id,
+                size: prepared.size,
+                etag: ObjectEtag::single_part(prepared.etag_crc64),
+                ec: staging_segments
+                    .first()
+                    .map_or(self.default_payload_ec_shape(), |segment| EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    }),
+                layout: ObjectLayout::Standard,
+                tags: prepared.tags.clone(),
+                metadata_blob: Some(prepared.metadata_blob.clone()),
+                system_metadata_blob: Some(prepared.system_metadata_blob.clone()),
+                object_lock: prepared.object_lock,
+                encryption: prepared.encryption.clone(),
+            };
+            let command = MetadataCommandEnvelope::new(
+                MetadataCommandId::new(
+                    self.operation_epoch(),
+                    pg_id,
+                    runtime_state.next_metadata_command_log_index(pg_id),
+                ),
+                MetadataCommandPayload::CommitDirectPutObject(Box::new(
+                    CommitDirectPutObjectCommand {
+                        object,
+                        segments: committed_segments,
+                        generation_reservation_id: session_id.clone(),
+                        write_sequence,
+                        last_modified_millis,
+                        stale_payload,
+                    },
+                )),
+            );
+            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            (command, true)
+        };
+        drop(object_pg);
+
+        if new_pending_command {
+            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+        } else {
+            self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+        }
+
+        let object_pg = primary_node.get_pg(pg_id.get())?;
+        let stored = PgMetadataStore::get_object_meta(&*object_pg, bucket, key)?;
+        let live_record = stored.as_live().ok_or_else(|| MetadataError::Db {
+            context: "stored object missing live record after stream put",
+            source: rusqlite::Error::QueryReturnedNoRows,
+        })?;
+        let MetadataCommandPayload::CommitDirectPutObject(commit) = command.payload() else {
+            unreachable!("stream put commit pending command kind changed");
+        };
+        Ok(Ok(FinalizeStreamPutOutcome {
+            value: prepared.value,
+            version_id: commit.object.version_id,
+            encryption: commit.object.encryption.clone(),
+            live_tags: live_record.tags.clone(),
+            live_size: live_record.size,
+            live_last_modified: live_record.last_modified,
+            stale_generation_id: super::object_payload_reclaim_generation(&commit.stale_payload),
+        }))
     }
 
     pub fn create_multipart_upload<T, E>(
@@ -2339,27 +2950,384 @@ impl super::StorageCluster {
             .load_multipart_completion_preflight(bucket, key, upload_id)
     }
 
+    fn complete_multipart_outcome_from_command(
+        command: &CommitMultipartObjectCommand,
+    ) -> CompleteMultipartCommitOutcome {
+        CompleteMultipartCommitOutcome {
+            version_id: command.object.version_id,
+            stale_payload: command
+                .stale_payload
+                .as_ref()
+                .map(Self::completed_multipart_stale_payload_from_reclaim_command),
+            live_tags: command.object.tags.clone(),
+            live_size: command.object.size,
+            live_last_modified: command.last_modified_millis,
+        }
+    }
+
+    fn completed_multipart_stale_payload_from_reclaim_command(
+        command: &ObjectPayloadReclaimCommand,
+    ) -> CompletedMultipartStalePayload {
+        match command {
+            ObjectPayloadReclaimCommand::Segments(reclaim) => {
+                CompletedMultipartStalePayload::Segments {
+                    generation_id: reclaim.generation_id,
+                    segments: Vec::new(),
+                }
+            }
+            ObjectPayloadReclaimCommand::Multipart(reclaim) => {
+                CompletedMultipartStalePayload::Multipart {
+                    generation_id: reclaim.generation_id,
+                    parts: Vec::new(),
+                    streaming_segments: Vec::new(),
+                }
+            }
+        }
+    }
+
+    fn snapshot_completed_multipart_stale_payload(
+        object_pg: &crate::PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Option<CompletedMultipartStalePayload>, ObjectPgActionError> {
+        let stored =
+            match PgMetadataStore::get_object_version(object_pg, bucket, key, VersionId::Null) {
+                Ok(stored) => stored,
+                Err(MetadataError::ObjectNotFound) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+        let StoredObject::Live(record) = stored else {
+            return Ok(None);
+        };
+
+        match record.layout {
+            ObjectLayout::Standard => {
+                let segments =
+                    PgMetadataStore::get_object_segments(object_pg, bucket, key, VersionId::Null)?;
+                Ok(Some(CompletedMultipartStalePayload::Segments {
+                    generation_id: record.generation_id,
+                    segments,
+                }))
+            }
+            ObjectLayout::MultipartManifest { .. } => {
+                let parts =
+                    PgMetadataStore::get_object_parts(object_pg, bucket, key, VersionId::Null)?;
+                let mut streaming_segments = Vec::new();
+                for part in &parts {
+                    if part.part_okh == [0u8; 16] {
+                        streaming_segments.extend(PgMetadataStore::get_multipart_part_segments(
+                            object_pg,
+                            bucket,
+                            key,
+                            VersionId::Null,
+                            part.part_number,
+                        )?);
+                    }
+                }
+                Ok(Some(CompletedMultipartStalePayload::Multipart {
+                    generation_id: record.generation_id,
+                    parts,
+                    streaming_segments,
+                }))
+            }
+        }
+    }
+
+    fn completed_multipart_stale_payload_to_reclaim_command(
+        bucket: &BucketName,
+        key: &ObjectKey,
+        created_at: u64,
+        payload: &CompletedMultipartStalePayload,
+    ) -> ObjectPayloadReclaimCommand {
+        match payload {
+            CompletedMultipartStalePayload::Segments {
+                generation_id,
+                segments,
+            } => ObjectPayloadReclaimCommand::Segments(ObjectSegmentsReclaimRecord {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                generation_id: *generation_id,
+                created_at,
+                segments: segments
+                    .iter()
+                    .map(|segment| ObjectSegmentsReclaimSegmentRecord {
+                        segment_index: segment.segment_index,
+                        segment_okh: segment.segment_okh,
+                        segment_vid: segment.segment_vid,
+                        data_pg_id: segment.data_pg_id,
+                        ec: EcShape {
+                            k: segment.ec_k,
+                            m: segment.ec_m,
+                        },
+                    })
+                    .collect(),
+            }),
+            CompletedMultipartStalePayload::Multipart {
+                generation_id,
+                parts,
+                streaming_segments,
+            } => ObjectPayloadReclaimCommand::Multipart(Self::multipart_reclaim_from_parts(
+                bucket,
+                key,
+                *generation_id,
+                created_at,
+                parts,
+                streaming_segments,
+            )),
+        }
+    }
+
+    fn complete_multipart_command_cleanup(
+        command: &CommitMultipartObjectCommand,
+    ) -> CompleteMultipartCommitCleanup {
+        CompleteMultipartCommitCleanup {
+            omitted_parts: command.omitted_parts.clone(),
+            omitted_streaming_segments: command.omitted_streaming_segments.clone(),
+        }
+    }
+
+    fn apply_multipart_completion_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), ObjectPgActionError> {
+        match self.apply_metadata_command_to_acting_set(command) {
+            Ok(()) => {
+                self.local_map
+                    .runtime_state()
+                    .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                self.after_object_metadata_command_applied(command);
+                Ok(())
+            }
+            Err(error) => Err(super::bucket_snapshot_error_to_object_pg_action_error(
+                error.source,
+            )),
+        }
+    }
+
     pub fn complete_multipart_upload_commit_serialized(
         &self,
         req: CompleteMultipartCommitRequest,
         keep_completed_uploads: usize,
     ) -> Result<CompleteMultipartCommitOutcome, ObjectPgActionError> {
-        let cleanup_bucket = req.bucket.clone();
-        let cleanup_key = req.key.clone();
-        let cleanup_generation_id = req.generation_id;
-        let node = self.object_metadata_primary_node(&cleanup_bucket, &cleanup_key)?;
-        let (outcome, cleanup) = node.complete_multipart_upload_commit_serialized(req)?;
-        self.delete_complete_multipart_cleanup_best_effort(
-            &cleanup_bucket,
-            &cleanup_key,
-            cleanup_generation_id,
-            &cleanup,
+        let bucket = req.bucket.clone();
+        let key = req.key.clone();
+        let upload_id = req.upload_id.clone();
+        let generation_id = req.generation_id;
+        let pg_id = PgId::new(self.object_metadata_pg_id(&bucket, &key));
+        let bucket_primary_node = self.bucket_metadata_primary_node(&bucket)?;
+        let _completion_guard = bucket_primary_node.lock_multipart_completion_bucket(&bucket);
+        let primary_node = self.object_metadata_primary_node(&bucket, &key)?;
+        let runtime_state = self.local_map.runtime_state();
+
+        while let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, &bucket)
+        {
+            if let MetadataCommandPayload::CommitMultipartObject(commit) = command.payload() {
+                if commit.matches_request(
+                    &bucket,
+                    &key,
+                    &upload_id,
+                    generation_id,
+                    &req.part_records,
+                ) {
+                    let outcome = Self::complete_multipart_outcome_from_command(commit);
+                    let cleanup = Self::complete_multipart_command_cleanup(commit);
+                    self.apply_multipart_completion_command(pg_id, &bucket, &command)?;
+                    self.delete_complete_multipart_cleanup_best_effort(
+                        &bucket,
+                        &key,
+                        generation_id,
+                        &cleanup,
+                    );
+                    self.prune_completed_multipart_uploads_for_bucket_with_limit(
+                        &bucket,
+                        keep_completed_uploads,
+                    )?;
+                    return Ok(outcome);
+                }
+            }
+            self.apply_pending_object_metadata_command_for_bucket(pg_id, &bucket, &command)?;
+        }
+
+        let object_pg = primary_node.get_pg(pg_id.get())?;
+        let upload = PgMetadataStore::get_multipart_upload(&*object_pg, &upload_id)?;
+        if upload.bucket != bucket || upload.key != key || upload.state != UploadState::InProgress {
+            return Err(MetadataError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            }
+            .into());
+        }
+        if upload.object_generation_id != generation_id {
+            return Err(MetadataError::Db {
+                context: "complete multipart command generation mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            }
+            .into());
+        }
+        if req.part_records.is_empty() {
+            return Err(MetadataError::Db {
+                context: "complete multipart command empty parts",
+                source: rusqlite::Error::InvalidQuery,
+            }
+            .into());
+        }
+
+        let version_id = if req.versioning == BucketVersioningState::Enabled {
+            PgMetadataStore::next_version_id(&*object_pg, &bucket, &key)?
+        } else {
+            VersionId::Null
+        };
+        let stale_payload = if version_id.is_null() {
+            Self::snapshot_completed_multipart_stale_payload(&object_pg, &bucket, &key)?
+        } else {
+            None
+        };
+        let parts_count =
+            std::num::NonZeroU32::new(u32::try_from(req.part_records.len()).map_err(|_| {
+                MetadataError::Db {
+                    context: "complete multipart command too many parts",
+                    source: rusqlite::Error::InvalidQuery,
+                }
+            })?)
+            .ok_or_else(|| MetadataError::Db {
+                context: "complete multipart command empty parts",
+                source: rusqlite::Error::InvalidQuery,
+            })?;
+        let object_parts: Vec<ObjectPartRecord> = req
+            .part_records
+            .iter()
+            .map(|part| {
+                let data_pg_id = self
+                    .metadata_primary_topology_node()
+                    .pg_topology()
+                    .object_generation_multipart_part_data_pg(
+                        &bucket,
+                        &key,
+                        generation_id,
+                        part.part_number,
+                    )
+                    .get();
+                ObjectPartRecord {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id,
+                    part_number: part.part_number,
+                    size: part.size,
+                    etag: part.etag.clone(),
+                    etag_kind: part.etag_kind,
+                    part_okh: part.part_okh,
+                    part_vid: part.part_vid,
+                    ec_k: part.ec_k,
+                    ec_m: part.ec_m,
+                    data_pg_id,
+                    checksum: part.checksum.clone(),
+                }
+            })
+            .collect();
+        let selected_part_numbers: std::collections::BTreeSet<u32> = req
+            .part_records
+            .iter()
+            .map(|part| part.part_number)
+            .collect();
+        let all_parts = PgMetadataStore::list_multipart_parts(
+            &*object_pg,
+            &ListPartsReq {
+                upload_id: upload_id.clone(),
+                part_number_marker: None,
+                max_parts: u32::MAX,
+            },
+        )?
+        .parts;
+        let omitted_parts = all_parts
+            .into_iter()
+            .filter(|part| !selected_part_numbers.contains(&part.part_number))
+            .collect::<Vec<_>>();
+        let all_streaming_segments =
+            PgMetadataStore::get_all_multipart_part_segments_for_upload(&*object_pg, &upload_id)?;
+        let mut selected_streaming_segments = Vec::new();
+        let mut omitted_streaming_segments = Vec::new();
+        for mut segment in all_streaming_segments {
+            if selected_part_numbers.contains(&segment.part_number) {
+                segment.version_id = version_id.to_u64();
+                selected_streaming_segments.push(segment);
+            } else {
+                omitted_streaming_segments.push(segment);
+            }
+        }
+
+        let last_modified_millis = crate::clock::current_time_millis();
+        let completed_at_millis = last_modified_millis;
+        let write_sequence = object_pg.next_object_write_sequence(bucket.as_str(), key.as_str())?;
+        let stale_payload_command = stale_payload.as_ref().map(|payload| {
+            Self::completed_multipart_stale_payload_to_reclaim_command(
+                &bucket,
+                &key,
+                last_modified_millis,
+                payload,
+            )
+        });
+        drop(object_pg);
+        let completion_order = bucket_primary_node
+            .next_completed_multipart_upload_order_for_bucket(&bucket)
+            .map_err(|error| match error {
+                BucketSnapshotLoadError::Store(error) => ObjectPgActionError::Store(error),
+                BucketSnapshotLoadError::Metadata(error) => ObjectPgActionError::Metadata(error),
+            })?;
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                self.operation_epoch(),
+                pg_id,
+                runtime_state.next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::CommitMultipartObject(Box::new(CommitMultipartObjectCommand {
+                upload_id: upload_id.clone(),
+                object: PutLiveObjectReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id,
+                    owner: req.owner,
+                    acl_grants: req.acl_grants,
+                    public_read: req.public_read,
+                    generation_id,
+                    size: req.size,
+                    etag: ObjectEtag::MultipartComposite {
+                        crc64: req.etag_crc64,
+                        parts: parts_count,
+                    },
+                    ec: EcShape { k: 0, m: 0 },
+                    layout: ObjectLayout::MultipartManifest { parts_count },
+                    tags: req.tags,
+                    metadata_blob: req.metadata_blob,
+                    system_metadata_blob: req.system_metadata_blob,
+                    object_lock: req.object_lock,
+                    encryption: req.encryption,
+                },
+                parts: object_parts,
+                selected_streaming_segments,
+                omitted_parts,
+                omitted_streaming_segments,
+                write_sequence,
+                completion_order,
+                completed_at_millis,
+                initiator: upload.initiator.clone(),
+                last_modified_millis,
+                stale_payload: stale_payload_command,
+            })),
         );
+        runtime_state.set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone());
+        self.apply_multipart_completion_command(pg_id, &bucket, &command)?;
+
+        let MetadataCommandPayload::CommitMultipartObject(commit) = command.payload() else {
+            unreachable!("new complete multipart command changed payload kind");
+        };
+        let cleanup = Self::complete_multipart_command_cleanup(commit);
+        self.delete_complete_multipart_cleanup_best_effort(&bucket, &key, generation_id, &cleanup);
         self.prune_completed_multipart_uploads_for_bucket_with_limit(
-            &cleanup_bucket,
+            &bucket,
             keep_completed_uploads,
         )?;
-        Ok(outcome)
+        Ok(Self::complete_multipart_outcome_from_command(commit))
     }
 
     pub fn finalize_upload_part_stream<T, E>(

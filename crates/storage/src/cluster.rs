@@ -10,18 +10,18 @@ pub use local::{LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRo
 
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 use crate::metadata_command::{
-    CommitDirectPutObjectCommand, DirectPutStalePayloadCommand, MetadataCommandEnvelope,
-    MetadataCommandId, MetadataCommandPayload, ReleaseObjectGenerationCommand,
-    ReserveObjectGenerationCommand,
+    CommitDirectPutObjectCommand, DeleteObjectVersionTarget, MetadataCommandEnvelope,
+    MetadataCommandId, MetadataCommandPayload, ObjectPayloadReclaimCommand,
+    ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
 };
 use crate::node::SharedStorageNode;
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
-    BucketName, ClusterEpoch, CommitDirectPutObjectReq, DataPgId, DirectPutCommitSnapshot,
-    DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
-    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
-    ObjectEncryption, ObjectKey, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord,
-    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, PgId,
+    BucketName, ClusterEpoch, CommitDirectPutObjectReq, CreateStreamUploadReq, DataPgId,
+    DirectPutCommitSnapshot, DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome,
+    GenerationId, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
+    MultipartReclaimRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectPartRecord,
+    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, PgId,
     PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SegmentStoredBytesRequest, SessionId,
     ShardIndex, ShardKey, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadTarget,
     VersionId, WriteAck, WrittenShardAck,
@@ -42,6 +42,9 @@ pub enum MetadataCommandApplyTestKind {
     ReserveObjectGeneration,
     ReleaseObjectGeneration,
     CommitDirectPutObject,
+    CommitMultipartObject,
+    DeleteObjectVersion,
+    InsertDeleteMarker,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -71,13 +74,22 @@ fn conflicting_pending_object_metadata_command(context: &'static str) -> ObjectP
     })
 }
 
-fn direct_put_stale_payload_generation(
-    stale_payload: &Option<DirectPutStalePayloadCommand>,
+fn object_payload_reclaim_generation(
+    stale_payload: &Option<ObjectPayloadReclaimCommand>,
 ) -> Option<GenerationId> {
     match stale_payload {
         None => None,
-        Some(DirectPutStalePayloadCommand::Segments(reclaim)) => Some(reclaim.generation_id),
-        Some(DirectPutStalePayloadCommand::Multipart(reclaim)) => Some(reclaim.generation_id),
+        Some(ObjectPayloadReclaimCommand::Segments(reclaim)) => Some(reclaim.generation_id),
+        Some(ObjectPayloadReclaimCommand::Multipart(reclaim)) => Some(reclaim.generation_id),
+    }
+}
+
+fn delete_object_version_reclaim_generation(
+    target: &DeleteObjectVersionTarget,
+) -> Option<GenerationId> {
+    match target {
+        DeleteObjectVersionTarget::DeleteMarker => None,
+        DeleteObjectVersionTarget::Live { generation_id, .. } => Some(*generation_id),
     }
 }
 
@@ -87,6 +99,21 @@ fn bucket_snapshot_error_to_object_pg_action_error(
     match error {
         BucketSnapshotLoadError::Store(error) => ObjectPgActionError::Store(error),
         BucketSnapshotLoadError::Metadata(error) => ObjectPgActionError::Metadata(error),
+    }
+}
+
+fn object_pg_action_error_to_bucket_snapshot_error(
+    error: ObjectPgActionError,
+) -> BucketSnapshotLoadError {
+    match error {
+        ObjectPgActionError::Store(error) => BucketSnapshotLoadError::Store(error),
+        ObjectPgActionError::Metadata(error) => BucketSnapshotLoadError::Metadata(error),
+        ObjectPgActionError::InvalidRequest { reason } => {
+            BucketSnapshotLoadError::Store(StoreError::Io {
+                context: "object PG action failed during bucket snapshot operation",
+                source: std::io::Error::other(reason),
+            })
+        }
     }
 }
 
@@ -833,22 +860,51 @@ impl StorageCluster {
                 self.local_map
                     .runtime_state()
                     .remove_pending_metadata_command_for_bucket(pg_id, bucket);
-                if let MetadataCommandPayload::CommitDirectPutObject(commit) = command.payload() {
-                    if let Some(stale_generation_id) =
-                        direct_put_stale_payload_generation(&commit.stale_payload)
-                    {
-                        self.enqueue_object_payload_reclaim(
-                            &commit.object.bucket,
-                            &commit.object.key,
-                            stale_generation_id,
-                        );
-                    }
-                }
+                self.after_object_metadata_command_applied(command);
                 Ok(())
             }
             Err(error) => Err(bucket_snapshot_error_to_object_pg_action_error(
                 error.source,
             )),
+        }
+    }
+
+    fn after_object_metadata_command_applied(&self, command: &MetadataCommandEnvelope) {
+        match command.payload() {
+            MetadataCommandPayload::CommitDirectPutObject(commit) => {
+                if let Some(stale_generation_id) =
+                    object_payload_reclaim_generation(&commit.stale_payload)
+                {
+                    self.enqueue_object_payload_reclaim(
+                        &commit.object.bucket,
+                        &commit.object.key,
+                        stale_generation_id,
+                    );
+                }
+            }
+            MetadataCommandPayload::CommitMultipartObject(commit) => {
+                if let Some(stale_generation_id) =
+                    object_payload_reclaim_generation(&commit.stale_payload)
+                {
+                    self.enqueue_object_payload_reclaim(
+                        &commit.object.bucket,
+                        &commit.object.key,
+                        stale_generation_id,
+                    );
+                }
+            }
+            MetadataCommandPayload::DeleteObjectVersion(delete) => {
+                if let Some(reclaim_generation_id) =
+                    delete_object_version_reclaim_generation(&delete.target)
+                {
+                    self.enqueue_object_payload_reclaim(
+                        &delete.bucket,
+                        &delete.key,
+                        reclaim_generation_id,
+                    );
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1115,10 +1171,8 @@ impl StorageCluster {
                     live_last_modified: live_record.last_modified,
                     stale_generation_id: commit.stale_payload.as_ref().map(
                         |payload| match payload {
-                            DirectPutStalePayloadCommand::Segments(reclaim) => {
-                                reclaim.generation_id
-                            }
-                            DirectPutStalePayloadCommand::Multipart(reclaim) => {
+                            ObjectPayloadReclaimCommand::Segments(reclaim) => reclaim.generation_id,
+                            ObjectPayloadReclaimCommand::Multipart(reclaim) => {
                                 reclaim.generation_id
                             }
                         },
@@ -1238,7 +1292,7 @@ impl StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         created_at: u64,
-    ) -> Result<Option<DirectPutStalePayloadCommand>, MetadataError> {
+    ) -> Result<Option<ObjectPayloadReclaimCommand>, MetadataError> {
         let stored = match PgMetadataStore::get_object_version(pg, bucket, key, VersionId::Null) {
             Ok(stored) => stored,
             Err(MetadataError::ObjectNotFound) => return Ok(None),
@@ -1249,11 +1303,23 @@ impl StorageCluster {
             crate::StoredObject::DeleteMarker(_) => return Ok(None),
         };
 
+        Ok(Some(Self::snapshot_live_object_payload_reclaim_command(
+            pg, bucket, key, &record, created_at,
+        )?))
+    }
+
+    fn snapshot_live_object_payload_reclaim_command(
+        pg: &crate::PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        record: &crate::LiveObjectRecord,
+        created_at: u64,
+    ) -> Result<ObjectPayloadReclaimCommand, MetadataError> {
         match record.layout {
             ObjectLayout::Standard => {
                 let segments =
-                    PgMetadataStore::get_object_segments(pg, bucket, key, VersionId::Null)?;
-                Ok(Some(DirectPutStalePayloadCommand::Segments(
+                    PgMetadataStore::get_object_segments(pg, bucket, key, record.version_id)?;
+                Ok(ObjectPayloadReclaimCommand::Segments(
                     ObjectSegmentsReclaimRecord {
                         bucket: bucket.clone(),
                         key: key.clone(),
@@ -1273,10 +1339,10 @@ impl StorageCluster {
                             })
                             .collect(),
                     },
-                )))
+                ))
             }
             ObjectLayout::MultipartManifest { .. } => {
-                let parts = PgMetadataStore::get_object_parts(pg, bucket, key, VersionId::Null)?;
+                let parts = PgMetadataStore::get_object_parts(pg, bucket, key, record.version_id)?;
                 let mut streaming_segments = Vec::new();
                 for part in &parts {
                     if part.part_okh == [0u8; 16] {
@@ -1284,12 +1350,12 @@ impl StorageCluster {
                             pg,
                             bucket,
                             key,
-                            VersionId::Null,
+                            record.version_id,
                             part.part_number,
                         )?);
                     }
                 }
-                Ok(Some(DirectPutStalePayloadCommand::Multipart(
+                Ok(ObjectPayloadReclaimCommand::Multipart(
                     Self::multipart_reclaim_from_parts(
                         bucket,
                         key,
@@ -1298,7 +1364,7 @@ impl StorageCluster {
                         &parts,
                         &streaming_segments,
                     ),
-                )))
+                ))
             }
         }
     }
@@ -1388,8 +1454,21 @@ impl StorageCluster {
         session_id: &SessionId,
         encryption: ObjectEncryption,
     ) -> Result<(), ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .create_put_object_stream_session_record(bucket, key, session_id, encryption)
+        self.reserve_put_object_generation(bucket, key, session_id)?;
+        let object_node = self.object_metadata_primary_node(bucket, key)?;
+        let object_pg = object_node.get_pg(self.object_metadata_pg_id(bucket, key))?;
+        if let Err(error) = object_pg.create_stream_upload(&CreateStreamUploadReq {
+            session_id: session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: StreamUploadTarget::PutObject,
+            encryption,
+        }) {
+            drop(object_pg);
+            let _ = self.release_object_generation_reservation(bucket, key, session_id);
+            return Err(error.into());
+        }
+        Ok(())
     }
 
     pub fn load_stream_upload_session(

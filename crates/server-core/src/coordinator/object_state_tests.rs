@@ -1136,6 +1136,20 @@ fn copy_object_same_key_replace_metadata() {
         obj.system_metadata.content_type().map(|v| v.as_str()),
         Some("application/json")
     );
+
+    coord
+        .delete_object(&DeleteObjectRequest {
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            bypass_governance: false,
+            cond: NO_DELETE,
+        })
+        .unwrap();
 }
 
 #[test]

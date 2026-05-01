@@ -421,7 +421,7 @@ impl SharedStorageNode {
         }
     }
 
-    pub(super) fn with_bucket_write_reservation_snapshot<T, E>(
+    pub(crate) fn with_bucket_write_reservation_snapshot<T, E>(
         &self,
         bucket: &BucketName,
         request: BucketSnapshotRequest,

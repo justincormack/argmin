@@ -2793,7 +2793,7 @@ pub enum AbortMultipartUploadLookup {
 }
 
 /// In-progress multipart part record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultipartPartRecord {
     pub upload_id: UploadId,
     pub part_number: u32,
@@ -2857,7 +2857,7 @@ pub struct CompleteMultipartCommitRequest {
     pub part_records: Vec<MultipartPartRecord>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CompleteMultipartCommitCleanup {
     pub omitted_parts: Vec<MultipartPartRecord>,
     pub omitted_streaming_segments: Vec<MultipartPartSegmentRecord>,
@@ -2873,7 +2873,7 @@ pub struct CompleteMultipartCommitOutcome {
 }
 
 /// Committed part record in the object manifest.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectPartRecord {
     pub bucket: BucketName,
     pub key: ObjectKey,
@@ -3159,7 +3159,7 @@ pub struct ObjectSegmentRecord {
 }
 
 /// Committed segment record for a multipart part.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultipartPartSegmentRecord {
     pub bucket: BucketName,
     pub key: ObjectKey,

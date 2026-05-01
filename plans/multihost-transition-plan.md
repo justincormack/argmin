@@ -1254,7 +1254,7 @@ Work items:
      multipart create/part/finalize/abort metadata, omitted-part cleanup
      metadata, and reclaim rows
    - keep multi-step workflows serialized by the PG primary command path
-   - first slice complete:
+   - completed so far:
      - add `ReserveObjectGeneration`, `ReleaseObjectGeneration`, and
        `CommitDirectPutObject` metadata command payloads with deterministic
        canonical encoding and CRC64 coverage
@@ -1281,12 +1281,48 @@ Work items:
      - include primary/replica convergence tests for reservation/release and
        direct PUT publish, plus a partial-primary-apply retry regression proving
        the same pending command is reused and replicas converge
+     - add `DeleteObjectVersion` and `InsertDeleteMarker` command payloads
+       carrying exact version IDs, owner/timestamp/write-sequence data, and
+       object-payload reclaim metadata for live-version deletes
+     - route ordinary current-object delete, version-specific delete, and
+       current delete-marker insertion through the object metadata PG acting
+       set with pending-command retry for partial replica apply
+     - include acting-set convergence tests for live object delete and delete
+       marker insertion, plus a partial-primary-apply retry regression for
+       object delete
+     - route stream PutObject generation reservation through the object
+       metadata PG acting set and publish stream/copy finalization through the
+       same replicated standard-object command used by direct PUT, while
+       keeping stream segment staging metadata on the routed-primary bridge for
+       the remaining stream slice
+     - add `CommitMultipartObject` command payloads as the actual completed
+       multipart object publication path, carrying the exact live object,
+       manifest parts, selected streamed part segment rows, completed-upload
+       idempotence row data, omitted-part cleanup refs, deterministic object
+       write sequence, last modified timestamp, and stale payload reclaim rows
+       needed to converge replicas after completion
+     - advance each applying node's bucket-PG completed multipart upload
+       sequence to at least the command's completion order before publishing
+       the object-PG command, so primary changes cannot reuse a lower
+       completed-upload pruning order
+     - serialize completed-upload order allocation on the bucket-PG primary
+       before constructing the object-PG completion command, so concurrent
+       completions for the same bucket on different object PG primaries cannot
+       allocate duplicate pruning orders
+     - retain pending multipart completion commands even when a hook or node
+       failure occurs before the first acting node applies the command, because
+       the command is now the convergence record for the completion attempt
+     - include convergence regressions for streamed UploadPart completion across
+       acting nodes, deterministic write sequence on a replica with divergent
+       local object history, concurrent completion order allocation across
+       different object PG primaries, replica bucket sequence advancement, and
+       zero-apply command failure followed by retry
    - remaining slices:
-     - object delete and lifecycle expiry metadata
+     - lifecycle expiry metadata
      - object tag, ACL, retention, and legal-hold updates
-     - stream session creation plus segment append/finalize/abort metadata
-     - multipart create, part upload, completion, abort, and omitted-part
-       cleanup metadata
+     - stream segment append/abort metadata and cleanup hardening
+     - multipart create, part upload, upload-part stream staging, abort, and
+       remaining multipart staging metadata
      - reclaim rows and reclaim worker metadata transitions
 5. Phase 6.5: synchronous replica apply.
    - apply every metadata command to all required replicas before acknowledging

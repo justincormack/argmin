@@ -8,10 +8,10 @@ use s3_types::{
 use crate::types::{
     BucketEncryptionConfig, BucketName, BucketObjectOwnership, BucketOwnershipControls,
     BucketSubresourceAux, BucketSubresourceKind, ClusterEpoch, CreateBucketConfig, GenerationId,
-    ManagedEncryptionAlgorithm, MultipartReclaimPartRecord, MultipartReclaimRecord,
-    ObjectEncryption, ObjectEtag, ObjectKey, ObjectLayout, ObjectSegmentRecord,
-    ObjectSegmentsReclaimRecord, PgId, PublicAccessBlockConfig, PutLiveObjectReq, SessionId,
-    VersionId,
+    ManagedEncryptionAlgorithm, MultipartPartRecord, MultipartPartSegmentRecord,
+    MultipartReclaimPartRecord, MultipartReclaimRecord, ObjectEncryption, ObjectEtag, ObjectKey,
+    ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
+    OwnerIdentity, PgId, PublicAccessBlockConfig, PutLiveObjectReq, SessionId, UploadId, VersionId,
 };
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
@@ -24,6 +24,9 @@ const METADATA_COMMAND_PUT_BUCKET_SUBRESOURCE: u16 = 5;
 const METADATA_COMMAND_RESERVE_OBJECT_GENERATION: u16 = 6;
 const METADATA_COMMAND_RELEASE_OBJECT_GENERATION: u16 = 7;
 const METADATA_COMMAND_COMMIT_DIRECT_PUT_OBJECT: u16 = 8;
+const METADATA_COMMAND_DELETE_OBJECT_VERSION: u16 = 9;
+const METADATA_COMMAND_INSERT_DELETE_MARKER: u16 = 10;
+const METADATA_COMMAND_COMMIT_MULTIPART_OBJECT: u16 = 11;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct MetadataCommandLogIndex(NonZeroU64);
@@ -145,6 +148,9 @@ pub(crate) enum MetadataCommandPayload {
     ReserveObjectGeneration(ReserveObjectGenerationCommand),
     ReleaseObjectGeneration(ReleaseObjectGenerationCommand),
     CommitDirectPutObject(Box<CommitDirectPutObjectCommand>),
+    CommitMultipartObject(Box<CommitMultipartObjectCommand>),
+    DeleteObjectVersion(Box<DeleteObjectVersionCommand>),
+    InsertDeleteMarker(InsertDeleteMarkerCommand),
 }
 
 impl MetadataCommandPayload {
@@ -158,6 +164,9 @@ impl MetadataCommandPayload {
             Self::ReserveObjectGeneration(_) => METADATA_COMMAND_RESERVE_OBJECT_GENERATION,
             Self::ReleaseObjectGeneration(_) => METADATA_COMMAND_RELEASE_OBJECT_GENERATION,
             Self::CommitDirectPutObject(_) => METADATA_COMMAND_COMMIT_DIRECT_PUT_OBJECT,
+            Self::CommitMultipartObject(_) => METADATA_COMMAND_COMMIT_MULTIPART_OBJECT,
+            Self::DeleteObjectVersion(_) => METADATA_COMMAND_DELETE_OBJECT_VERSION,
+            Self::InsertDeleteMarker(_) => METADATA_COMMAND_INSERT_DELETE_MARKER,
         }
     }
 }
@@ -379,7 +388,7 @@ pub(crate) struct CommitDirectPutObjectCommand {
     pub(crate) generation_reservation_id: SessionId,
     pub(crate) write_sequence: u64,
     pub(crate) last_modified_millis: u64,
-    pub(crate) stale_payload: Option<DirectPutStalePayloadCommand>,
+    pub(crate) stale_payload: Option<ObjectPayloadReclaimCommand>,
 }
 
 impl CommitDirectPutObjectCommand {
@@ -398,9 +407,102 @@ impl CommitDirectPutObjectCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum DirectPutStalePayloadCommand {
+pub(crate) struct CommitMultipartObjectCommand {
+    pub(crate) upload_id: UploadId,
+    pub(crate) object: PutLiveObjectReq,
+    pub(crate) parts: Vec<ObjectPartRecord>,
+    pub(crate) selected_streaming_segments: Vec<MultipartPartSegmentRecord>,
+    pub(crate) omitted_parts: Vec<MultipartPartRecord>,
+    pub(crate) omitted_streaming_segments: Vec<MultipartPartSegmentRecord>,
+    pub(crate) write_sequence: u64,
+    pub(crate) completion_order: u64,
+    pub(crate) completed_at_millis: u64,
+    pub(crate) initiator: Option<OwnerIdentity>,
+    pub(crate) last_modified_millis: u64,
+    pub(crate) stale_payload: Option<ObjectPayloadReclaimCommand>,
+}
+
+impl CommitMultipartObjectCommand {
+    pub(crate) fn matches_request(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        generation_id: GenerationId,
+        parts: &[MultipartPartRecord],
+    ) -> bool {
+        self.object.bucket == *bucket
+            && self.object.key == *key
+            && self.upload_id == *upload_id
+            && self.object.generation_id == generation_id
+            && self
+                .parts
+                .iter()
+                .zip(parts.iter())
+                .all(|(stored, requested)| {
+                    stored.part_number == requested.part_number
+                        && stored.size == requested.size
+                        && stored.etag == requested.etag
+                        && stored.etag_kind == requested.etag_kind
+                        && stored.part_okh == requested.part_okh
+                        && stored.part_vid == requested.part_vid
+                        && stored.ec_k == requested.ec_k
+                        && stored.ec_m == requested.ec_m
+                        && stored.checksum == requested.checksum
+                })
+            && self.parts.len() == parts.len()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ObjectPayloadReclaimCommand {
     Segments(ObjectSegmentsReclaimRecord),
     Multipart(MultipartReclaimRecord),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeleteObjectVersionTarget {
+    DeleteMarker,
+    Live {
+        generation_id: GenerationId,
+        layout: ObjectLayout,
+        payload: ObjectPayloadReclaimCommand,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeleteObjectVersionCommand {
+    pub(crate) bucket: BucketName,
+    pub(crate) key: ObjectKey,
+    pub(crate) version_id: VersionId,
+    pub(crate) target: DeleteObjectVersionTarget,
+}
+
+impl DeleteObjectVersionCommand {
+    pub(crate) fn matches_request(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> bool {
+        self.bucket == *bucket && self.key == *key && self.version_id == version_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InsertDeleteMarkerCommand {
+    pub(crate) bucket: BucketName,
+    pub(crate) key: ObjectKey,
+    pub(crate) version_id: VersionId,
+    pub(crate) owner: OwnerIdentity,
+    pub(crate) write_sequence: u64,
+    pub(crate) last_modified_millis: u64,
+}
+
+impl InsertDeleteMarkerCommand {
+    pub(crate) fn matches_request(&self, bucket: &BucketName, key: &ObjectKey) -> bool {
+        self.bucket == *bucket && self.key == *key
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -477,6 +579,15 @@ fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPaylo
         MetadataCommandPayload::CommitDirectPutObject(command) => {
             encode_commit_direct_put_object(&mut out, command);
         }
+        MetadataCommandPayload::CommitMultipartObject(command) => {
+            encode_commit_multipart_object(&mut out, command);
+        }
+        MetadataCommandPayload::DeleteObjectVersion(command) => {
+            encode_delete_object_version(&mut out, command);
+        }
+        MetadataCommandPayload::InsertDeleteMarker(command) => {
+            encode_insert_delete_marker(&mut out, command);
+        }
     }
     out
 }
@@ -545,15 +656,97 @@ fn encode_commit_direct_put_object(out: &mut Vec<u8>, command: &CommitDirectPutO
     put_u64(out, command.last_modified_millis);
     match &command.stale_payload {
         None => put_u8(out, 0),
-        Some(DirectPutStalePayloadCommand::Segments(reclaim)) => {
+        Some(ObjectPayloadReclaimCommand::Segments(reclaim)) => {
             put_u8(out, 1);
             encode_object_segments_reclaim(out, reclaim);
         }
-        Some(DirectPutStalePayloadCommand::Multipart(reclaim)) => {
+        Some(ObjectPayloadReclaimCommand::Multipart(reclaim)) => {
             put_u8(out, 2);
             encode_multipart_reclaim(out, reclaim);
         }
     }
+}
+
+fn encode_commit_multipart_object(out: &mut Vec<u8>, command: &CommitMultipartObjectCommand) {
+    put_str(out, command.upload_id.as_str());
+    encode_put_live_object(out, &command.object);
+    put_u32(out, command.parts.len() as u32);
+    for part in &command.parts {
+        encode_object_part(out, part);
+    }
+    put_u32(out, command.selected_streaming_segments.len() as u32);
+    for segment in &command.selected_streaming_segments {
+        encode_multipart_part_segment(out, segment);
+    }
+    put_u32(out, command.omitted_parts.len() as u32);
+    for part in &command.omitted_parts {
+        encode_multipart_part(out, part);
+    }
+    put_u32(out, command.omitted_streaming_segments.len() as u32);
+    for segment in &command.omitted_streaming_segments {
+        encode_multipart_part_segment(out, segment);
+    }
+    put_u64(out, command.write_sequence);
+    put_u64(out, command.completion_order);
+    put_u64(out, command.completed_at_millis);
+    match &command.initiator {
+        None => put_u8(out, 0),
+        Some(initiator) => {
+            put_u8(out, 1);
+            put_str(out, &initiator.principal);
+            put_str(out, initiator.canonical_id.as_str());
+        }
+    }
+    put_u64(out, command.last_modified_millis);
+    match &command.stale_payload {
+        None => put_u8(out, 0),
+        Some(ObjectPayloadReclaimCommand::Segments(reclaim)) => {
+            put_u8(out, 1);
+            encode_object_segments_reclaim(out, reclaim);
+        }
+        Some(ObjectPayloadReclaimCommand::Multipart(reclaim)) => {
+            put_u8(out, 2);
+            encode_multipart_reclaim(out, reclaim);
+        }
+    }
+}
+
+fn encode_delete_object_version(out: &mut Vec<u8>, command: &DeleteObjectVersionCommand) {
+    put_str(out, command.bucket.as_str());
+    put_str(out, command.key.as_str());
+    encode_version_id(out, command.version_id);
+    match &command.target {
+        DeleteObjectVersionTarget::DeleteMarker => put_u8(out, 1),
+        DeleteObjectVersionTarget::Live {
+            generation_id,
+            layout,
+            payload,
+        } => {
+            put_u8(out, 2);
+            put_u64(out, generation_id.get());
+            encode_object_layout(out, *layout);
+            match payload {
+                ObjectPayloadReclaimCommand::Segments(reclaim) => {
+                    put_u8(out, 1);
+                    encode_object_segments_reclaim(out, reclaim);
+                }
+                ObjectPayloadReclaimCommand::Multipart(reclaim) => {
+                    put_u8(out, 2);
+                    encode_multipart_reclaim(out, reclaim);
+                }
+            }
+        }
+    }
+}
+
+fn encode_insert_delete_marker(out: &mut Vec<u8>, command: &InsertDeleteMarkerCommand) {
+    put_str(out, command.bucket.as_str());
+    put_str(out, command.key.as_str());
+    encode_version_id(out, command.version_id);
+    put_str(out, &command.owner.principal);
+    put_str(out, command.owner.canonical_id.as_str());
+    put_u64(out, command.write_sequence);
+    put_u64(out, command.last_modified_millis);
 }
 
 fn encode_put_live_object(out: &mut Vec<u8>, object: &PutLiveObjectReq) {
@@ -590,6 +783,59 @@ fn encode_object_segment(out: &mut Vec<u8>, segment: &ObjectSegmentRecord) {
     put_str(out, segment.bucket.as_str());
     put_str(out, segment.key.as_str());
     encode_version_id(out, segment.version_id);
+    put_u32(out, segment.segment_index);
+    put_u64(out, segment.size);
+    encode_optional_u64(out, segment.segment_crc64);
+    put_bytes(out, &segment.segment_okh);
+    put_u64(out, segment.segment_vid.get());
+    put_u32(out, segment.data_pg_id);
+    put_u8(out, segment.ec_k);
+    put_u8(out, segment.ec_m);
+}
+
+fn encode_object_part(out: &mut Vec<u8>, part: &ObjectPartRecord) {
+    put_str(out, part.bucket.as_str());
+    put_str(out, part.key.as_str());
+    encode_version_id(out, part.version_id);
+    put_u32(out, part.part_number);
+    put_u64(out, part.size);
+    put_bytes(out, &part.etag);
+    put_u8(out, part.etag_kind as u8);
+    put_bytes(out, &part.part_okh);
+    put_u64(out, part.part_vid.get());
+    put_u8(out, part.ec_k);
+    put_u8(out, part.ec_m);
+    put_u32(out, part.data_pg_id);
+    encode_optional_bytes(
+        out,
+        part.checksum.as_ref().map(|checksum| checksum.as_slice()),
+    );
+}
+
+fn encode_multipart_part(out: &mut Vec<u8>, part: &MultipartPartRecord) {
+    put_str(out, part.upload_id.as_str());
+    put_u32(out, part.part_number);
+    put_u32(out, part.generation);
+    put_u64(out, part.size);
+    put_bytes(out, &part.etag);
+    put_u8(out, part.etag_kind as u8);
+    put_bytes(out, &part.part_okh);
+    put_u64(out, part.part_vid.get());
+    put_u8(out, part.ec_k);
+    put_u8(out, part.ec_m);
+    put_u64(out, part.last_modified);
+    encode_optional_bytes(
+        out,
+        part.checksum.as_ref().map(|checksum| checksum.as_slice()),
+    );
+}
+
+fn encode_multipart_part_segment(out: &mut Vec<u8>, segment: &MultipartPartSegmentRecord) {
+    put_str(out, segment.bucket.as_str());
+    put_str(out, segment.key.as_str());
+    put_str(out, segment.upload_id.as_str());
+    put_u64(out, segment.version_id);
+    put_u32(out, segment.part_number);
     put_u32(out, segment.segment_index);
     put_u64(out, segment.size);
     encode_optional_u64(out, segment.segment_crc64);
@@ -1191,7 +1437,66 @@ mod tests {
             object_lock: ObjectLockState::default(),
             encryption: ObjectEncryption::None,
         };
-        let segment_reclaim = DirectPutStalePayloadCommand::Segments(ObjectSegmentsReclaimRecord {
+        let multipart_object = PutLiveObjectReq {
+            layout: ObjectLayout::MultipartManifest {
+                parts_count: std::num::NonZeroU32::new(1).unwrap(),
+            },
+            etag: ObjectEtag::multipart([3; 8], 1),
+            ..object.clone()
+        };
+        let part = ObjectPartRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::Null,
+            part_number: 2,
+            size: 13,
+            etag: vec![4; 8],
+            etag_kind: crate::types::EtagKind::Crc64,
+            part_okh: [0; 16],
+            part_vid: generation_id,
+            ec_k: 2,
+            ec_m: 1,
+            data_pg_id: 2,
+            checksum: None,
+        };
+        let upload_id = UploadId::try_from(format!("{}{}", "upload", ".".repeat(122))).unwrap();
+        let uploaded_part = MultipartPartRecord {
+            upload_id: upload_id.clone(),
+            part_number: 2,
+            generation: 1,
+            size: 13,
+            etag: vec![4; 8],
+            etag_kind: crate::types::EtagKind::Crc64,
+            part_okh: [0; 16],
+            part_vid: generation_id,
+            ec_k: 2,
+            ec_m: 1,
+            last_modified: 444,
+            checksum: None,
+        };
+        let selected_streaming_segment = MultipartPartSegmentRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id: upload_id.clone(),
+            version_id: VersionId::Null.to_u64(),
+            part_number: 2,
+            segment_index: 0,
+            size: 13,
+            segment_crc64: Some(10),
+            segment_okh: [10; 16],
+            segment_vid: generation_id,
+            data_pg_id: 2,
+            ec_k: 2,
+            ec_m: 1,
+        };
+        let omitted_streaming_segment = MultipartPartSegmentRecord {
+            version_id: u64::MAX,
+            part_number: 3,
+            segment_index: 1,
+            segment_okh: [11; 16],
+            ..selected_streaming_segment.clone()
+        };
+        let segment_reclaim = ObjectPayloadReclaimCommand::Segments(ObjectSegmentsReclaimRecord {
             bucket: bucket.clone(),
             key: key.clone(),
             generation_id,
@@ -1204,7 +1509,7 @@ mod tests {
                 ec: EcShape { k: 2, m: 1 },
             }],
         });
-        let multipart_reclaim = DirectPutStalePayloadCommand::Multipart(MultipartReclaimRecord {
+        let multipart_reclaim = ObjectPayloadReclaimCommand::Multipart(MultipartReclaimRecord {
             bucket: bucket.clone(),
             key: key.clone(),
             generation_id,
@@ -1240,16 +1545,54 @@ mod tests {
                 generation_reservation_id: reservation_id.clone(),
                 write_sequence: 44,
                 last_modified_millis: 555,
-                stale_payload: Some(segment_reclaim),
+                stale_payload: Some(segment_reclaim.clone()),
             })),
             MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
-                object,
-                segments: vec![segment],
-                generation_reservation_id: reservation_id,
+                object: object.clone(),
+                segments: vec![segment.clone()],
+                generation_reservation_id: reservation_id.clone(),
                 write_sequence: 45,
                 last_modified_millis: 556,
+                stale_payload: Some(multipart_reclaim.clone()),
+            })),
+            MetadataCommandPayload::CommitMultipartObject(Box::new(CommitMultipartObjectCommand {
+                upload_id,
+                object: multipart_object,
+                parts: vec![part],
+                selected_streaming_segments: vec![selected_streaming_segment],
+                omitted_parts: vec![uploaded_part],
+                omitted_streaming_segments: vec![omitted_streaming_segment],
+                write_sequence: 43,
+                completion_order: 12,
+                completed_at_millis: 556,
+                initiator: Some(OwnerIdentity::from_principal("initiator")),
+                last_modified_millis: 557,
                 stale_payload: Some(multipart_reclaim),
             })),
+            MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::from_u64(7),
+                target: DeleteObjectVersionTarget::DeleteMarker,
+            })),
+            MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::Null,
+                target: DeleteObjectVersionTarget::Live {
+                    generation_id,
+                    layout: ObjectLayout::Standard,
+                    payload: segment_reclaim,
+                },
+            })),
+            MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                bucket,
+                key,
+                version_id: VersionId::from_u64(8),
+                owner: OwnerIdentity::from_principal("owner"),
+                write_sequence: 46,
+                last_modified_millis: 558,
+            }),
         ];
 
         let mut checksums = Vec::new();
@@ -1274,6 +1617,10 @@ mod tests {
                 0x56db6be41cc9a89c,
                 0xee750f881921402d,
                 0xfe04371c6a46ec80,
+                0x8e971303e9b59031,
+                0x66ff987ed0727bc1,
+                0x37077018dfee09b9,
+                0xb9932d8c0d5bd142,
             ]
         );
     }
