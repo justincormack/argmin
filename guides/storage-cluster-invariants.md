@@ -33,10 +33,11 @@ Every public `StorageCluster` operation must fit one of these classes:
 - Payload shard ack rows are metadata rows in the data PG and must route
   through that PG's primary. They hold shard checksums/sizes while payload
   files are placed through the cluster map.
-- Local metadata commands are serialized per bucket command stream. A pending
-  command for `(bucket PG, bucket)` must block later bucket mutations of any
-  command kind until the pending command converges or the bucket incarnation is
-  finalized away.
+- Local metadata commands are serialized per `(PG, bucket)` command stream.
+  Bucket metadata commands use the bucket PG; object metadata commands use the
+  object PG for the target object. A pending command for a stream must block
+  later metadata mutations on that same stream until the pending command
+  converges or the bucket incarnation is finalized away.
 - Best-effort cleanup may suppress cleanup errors, but typed route/control-plane
   errors must not collapse into `NotFound` or generic IO before the suppression
   point.
@@ -71,8 +72,8 @@ script in the same change.
 | `begin_bucket_delete` | Epoch-fenced routed metadata PG fanout |
 | `try_finalize_bucket_delete` | Epoch-fenced routed metadata PG fanout plus local runtime lease bookkeeping and worker queue |
 | `load_available_bucket_execution_generation_batches` | Best-effort routed metadata PG |
-| `try_probe_object_pg_available`, `load_object_if`, `load_existing_live_object`, `load_object_read_snapshot_if`, `payload_reclaim_exists`, `get_object_tags_if`, `put_object_tags_if`, `delete_object_tags_if`, `put_object_retention_if`, `put_object_legal_hold_if`, `put_object_acl_if`, `get_object_legal_hold_if`, `get_object_retention_if`, `expire_current_object_if_due`, `delete_noncurrent_live_versions_if_due`, `delete_expired_delete_marker_if_due` | Epoch-fenced routed metadata PG |
-| `delete_specific_object_version_if`, `delete_current_object_if`, `insert_current_delete_marker_if` | Epoch-fenced routed metadata PG command apply |
+| `try_probe_object_pg_available`, `load_object_if`, `load_existing_live_object`, `load_object_read_snapshot_if`, `payload_reclaim_exists`, `get_object_tags_if`, `get_object_legal_hold_if`, `get_object_retention_if`, `expire_current_object_if_due`, `delete_noncurrent_live_versions_if_due`, `delete_expired_delete_marker_if_due` | Epoch-fenced routed metadata PG |
+| `put_object_tags_if`, `delete_object_tags_if`, `put_object_retention_if`, `put_object_legal_hold_if`, `put_object_acl_if`, `delete_specific_object_version_if`, `delete_current_object_if`, `insert_current_delete_marker_if` | Epoch-fenced routed metadata PG command apply |
 | `list_all_objects_for_bucket`, `list_all_object_versions_for_bucket`, `list_all_multipart_uploads_for_bucket`, `list_objects_for_bucket`, `list_object_versions_for_bucket` | Epoch-fenced routed metadata PG fanout |
 | `acquire_object_payload_lease` | Epoch-fenced routed metadata PG plus local runtime lease bookkeeping |
 | `enqueue_object_payload_reclaim`, `enqueue_bucket_delete_finalize`, `wait_for_reclaim_work`, `wake_reclaim_workers` | Best-effort local runtime worker queue |

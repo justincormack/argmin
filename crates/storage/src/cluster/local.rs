@@ -3587,6 +3587,247 @@ mod tests {
     }
 
     #[test]
+    fn object_metadata_update_commands_apply_to_all_acting_object_pg_nodes() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        write_committed_direct_segment_for(&cluster, &bucket, &key, b"object metadata");
+        let tags =
+            "<Tagging><TagSet><Tag><Key>tier</Key><Value>hot</Value></Tag></TagSet></Tagging>";
+        let retention = crate::ObjectRetention {
+            mode: crate::ObjectLockMode::Governance,
+            retain_until_unix_seconds: 123_456,
+        };
+        let acl_grants = crate::AclGrants::default();
+
+        let tagged_version = cluster
+            .put_object_tags_if(&bucket, &key, None, tags, |stored| {
+                Ok::<_, ()>(stored.version_id())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(tagged_version, crate::VersionId::Null);
+        cluster
+            .put_object_retention_if(&bucket, &key, None, retention, |stored| {
+                Ok::<_, ()>(stored.version_id())
+            })
+            .unwrap()
+            .unwrap();
+        cluster
+            .put_object_legal_hold_if(
+                &bucket,
+                &key,
+                None,
+                crate::StoredLegalHoldStatus::On,
+                |stored| Ok::<_, ()>(stored.version_id()),
+            )
+            .unwrap()
+            .unwrap();
+        let acl_version = cluster
+            .put_object_acl_if(&bucket, &key, None, |stored| {
+                Ok::<_, ()>((stored.version_id(), acl_grants.clone(), true))
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(acl_version, crate::VersionId::Null);
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            let stored = crate::PgMetadataStore::get_object_version(
+                &*pg,
+                &bucket,
+                &key,
+                crate::VersionId::Null,
+            )
+            .unwrap();
+            let live = stored.as_live().unwrap();
+            assert_eq!(live.tags.as_ref().map(|tags| tags.as_str()), Some(tags));
+            assert_eq!(live.object_lock.retention, Some(retention));
+            assert_eq!(
+                live.object_lock.legal_hold,
+                crate::StoredLegalHoldStatus::On
+            );
+            assert_eq!(live.acl_grants, acl_grants);
+            assert!(live.public_read);
+        }
+
+        cluster
+            .delete_object_tags_if(&bucket, &key, None, |stored| {
+                Ok::<_, ()>(stored.version_id())
+            })
+            .unwrap()
+            .unwrap();
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::get_object_tags(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    crate::VersionId::Null,
+                )
+                .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn object_metadata_update_retry_converges_pending_partial_replica_command() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        write_committed_direct_segment_for(&cluster, &bucket, &key, b"partial object metadata");
+        let tags =
+            "<Tagging><TagSet><Tag><Key>retry</Key><Value>yes</Value></Tag></TagSet></Tagging>";
+        fn require_tags_absent(
+            stored: &crate::StoredObject,
+        ) -> Result<crate::VersionId, &'static str> {
+            if stored.as_live().unwrap().tags.is_some() {
+                Err("tags already visible before pending command convergence")
+            } else {
+                Ok(stored.version_id())
+            }
+        }
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::PutObjectMetadata(update)
+                        if update.bucket == hook_bucket
+                            && update.key == hook_key
+                            && node_id == NodeId::new(1)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected object metadata command apply failure",
+                            source: std::io::Error::other(
+                                "injected object metadata command apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .put_object_tags_if(&bucket, &key, None, tags, require_tags_absent)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected object metadata command apply failure",
+                    ..
+                })
+            ),
+            "expected injected primary failure, got {err:?}"
+        );
+        drop(hook_guard);
+        assert!(
+            map.runtime_state()
+                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+                .is_some(),
+            "partial object metadata command must remain pending"
+        );
+        for node_id in [NodeId::new(0), NodeId::new(2)] {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::get_object_tags(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    crate::VersionId::Null,
+                )
+                .unwrap()
+                .as_deref(),
+                Some(tags)
+            );
+        }
+        {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = primary.get_pg(object_pg).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::get_object_tags(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    crate::VersionId::Null,
+                )
+                .unwrap(),
+                None
+            );
+        }
+
+        cluster
+            .put_object_tags_if(&bucket, &key, None, tags, require_tags_absent)
+            .unwrap()
+            .unwrap();
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::get_object_tags(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    crate::VersionId::Null,
+                )
+                .unwrap()
+                .as_deref(),
+                Some(tags)
+            );
+        }
+    }
+
+    #[test]
     fn insert_delete_marker_metadata_command_applies_to_all_acting_object_pg_nodes() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

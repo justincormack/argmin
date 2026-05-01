@@ -45,6 +45,7 @@ pub enum MetadataCommandApplyTestKind {
     CommitMultipartObject,
     DeleteObjectVersion,
     InsertDeleteMarker,
+    PutObjectMetadata,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]

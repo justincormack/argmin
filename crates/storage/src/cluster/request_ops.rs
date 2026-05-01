@@ -19,6 +19,7 @@ use crate::metadata_command::{
     DeleteObjectVersionTarget, InsertDeleteMarkerCommand, MetadataCommandEnvelope,
     MetadataCommandId, MetadataCommandPayload, ObjectPayloadReclaimCommand, PutBucketAclCommand,
     PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
+    PutObjectMetadataCommand, PutObjectMetadataMutation,
 };
 use crate::*;
 
@@ -143,6 +144,11 @@ fn metadata_command_apply_test_context(
         ),
         MetadataCommandPayload::InsertDeleteMarker(command) => (
             MetadataCommandApplyTestKind::InsertDeleteMarker,
+            Some(command.bucket.clone()),
+            Some(command.key.clone()),
+        ),
+        MetadataCommandPayload::PutObjectMetadata(command) => (
+            MetadataCommandApplyTestKind::PutObjectMetadata,
             Some(command.bucket.clone()),
             Some(command.key.clone()),
         ),
@@ -343,7 +349,8 @@ impl super::StorageCluster {
                 | MetadataCommandPayload::CommitDirectPutObject(_)
                 | MetadataCommandPayload::CommitMultipartObject(_)
                 | MetadataCommandPayload::DeleteObjectVersion(_)
-                | MetadataCommandPayload::InsertDeleteMarker(_) => {
+                | MetadataCommandPayload::InsertDeleteMarker(_)
+                | MetadataCommandPayload::PutObjectMetadata(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending object command for create bucket",
                     ));
@@ -823,7 +830,8 @@ impl super::StorageCluster {
                 | MetadataCommandPayload::CommitDirectPutObject(_)
                 | MetadataCommandPayload::CommitMultipartObject(_)
                 | MetadataCommandPayload::DeleteObjectVersion(_)
-                | MetadataCommandPayload::InsertDeleteMarker(_) => {
+                | MetadataCommandPayload::InsertDeleteMarker(_)
+                | MetadataCommandPayload::PutObjectMetadata(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending object command for versioning",
                     ));
@@ -994,7 +1002,8 @@ impl super::StorageCluster {
                 | MetadataCommandPayload::CommitDirectPutObject(_)
                 | MetadataCommandPayload::CommitMultipartObject(_)
                 | MetadataCommandPayload::DeleteObjectVersion(_)
-                | MetadataCommandPayload::InsertDeleteMarker(_) => {
+                | MetadataCommandPayload::InsertDeleteMarker(_)
+                | MetadataCommandPayload::PutObjectMetadata(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending object command for bucket acl",
                     ));
@@ -1090,7 +1099,8 @@ impl super::StorageCluster {
                 | MetadataCommandPayload::CommitDirectPutObject(_)
                 | MetadataCommandPayload::CommitMultipartObject(_)
                 | MetadataCommandPayload::DeleteObjectVersion(_)
-                | MetadataCommandPayload::InsertDeleteMarker(_) => {
+                | MetadataCommandPayload::InsertDeleteMarker(_)
+                | MetadataCommandPayload::PutObjectMetadata(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending object command for bucket property",
                     ));
@@ -1209,7 +1219,8 @@ impl super::StorageCluster {
                 | MetadataCommandPayload::CommitDirectPutObject(_)
                 | MetadataCommandPayload::CommitMultipartObject(_)
                 | MetadataCommandPayload::DeleteObjectVersion(_)
-                | MetadataCommandPayload::InsertDeleteMarker(_) => {
+                | MetadataCommandPayload::InsertDeleteMarker(_)
+                | MetadataCommandPayload::PutObjectMetadata(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending object command for bucket subresource",
                     ));
@@ -1788,6 +1799,124 @@ impl super::StorageCluster {
             .get_object_tags_if(bucket, key, version_id, action)
     }
 
+    fn new_put_object_metadata_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        mutation: PutObjectMetadataMutation,
+    ) -> MetadataCommandEnvelope {
+        let command_id = MetadataCommandId::new(
+            self.operation_epoch(),
+            pg_id,
+            self.local_map
+                .runtime_state()
+                .next_metadata_command_log_index(pg_id),
+        );
+        MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id,
+                mutation,
+            })),
+        )
+    }
+
+    fn put_object_metadata_if<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        requested_version_id: Option<VersionId>,
+        action: impl FnOnce(&StoredObject) -> Result<(T, VersionId, PutObjectMetadataMutation), E>,
+    ) -> Result<Result<T, E>, ObjectPgActionError> {
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let runtime_state = self.local_map.runtime_state();
+        let mut action = Some(action);
+
+        loop {
+            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                if let MetadataCommandPayload::PutObjectMetadata(update) = command.payload() {
+                    if update.bucket == *bucket && update.key == *key {
+                        let object_pg = primary_node.get_pg(pg_id.get())?;
+                        let stored = match requested_version_id {
+                            Some(version_id) => {
+                                if version_id != update.version_id {
+                                    drop(object_pg);
+                                    self.apply_pending_object_metadata_command_for_bucket(
+                                        pg_id, bucket, &command,
+                                    )?;
+                                    continue;
+                                }
+                                PgMetadataStore::get_object_version(
+                                    &*object_pg,
+                                    bucket,
+                                    key,
+                                    version_id,
+                                )?
+                            }
+                            None => {
+                                let stored =
+                                    PgMetadataStore::get_object_meta(&*object_pg, bucket, key)?;
+                                if stored.version_id() != update.version_id {
+                                    drop(object_pg);
+                                    self.apply_pending_object_metadata_command_for_bucket(
+                                        pg_id, bucket, &command,
+                                    )?;
+                                    continue;
+                                }
+                                stored
+                            }
+                        };
+                        let (value, version_id, mutation) =
+                            match action.take().expect("object metadata action used once")(&stored)
+                            {
+                                Ok(command) => command,
+                                Err(error) => return Ok(Err(error)),
+                            };
+                        if !update.matches_request(bucket, key, version_id, &mutation) {
+                            return Err(super::conflicting_pending_object_metadata_command(
+                                "conflicting pending command for object metadata update",
+                            ));
+                        }
+                        drop(object_pg);
+                        self.apply_pending_object_metadata_command_for_bucket(
+                            pg_id, bucket, &command,
+                        )?;
+                        return Ok(Ok(value));
+                    }
+                }
+
+                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                continue;
+            }
+
+            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let stored = match requested_version_id {
+                Some(version_id) => {
+                    PgMetadataStore::get_object_version(&*object_pg, bucket, key, version_id)?
+                }
+                None => PgMetadataStore::get_object_meta(&*object_pg, bucket, key)?,
+            };
+            let (value, version_id, mutation) =
+                match action.take().expect("object metadata action used once")(&stored) {
+                    Ok(command) => command,
+                    Err(error) => return Ok(Err(error)),
+                };
+            let command =
+                self.new_put_object_metadata_command(pg_id, bucket, key, version_id, mutation);
+            drop(object_pg);
+            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            return Ok(Ok(value));
+        }
+    }
+
     pub fn put_object_tags_if<E>(
         &self,
         bucket: &BucketName,
@@ -1796,8 +1925,14 @@ impl super::StorageCluster {
         tags: &str,
         action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
     ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .put_object_tags_if(bucket, key, version_id, tags, action)
+        self.put_object_metadata_if(bucket, key, version_id, |stored| {
+            let version_id = action(stored)?;
+            Ok((
+                version_id,
+                version_id,
+                PutObjectMetadataMutation::PutTags(tags.to_string()),
+            ))
+        })
     }
 
     pub fn delete_object_tags_if<E>(
@@ -1807,8 +1942,10 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
     ) -> Result<Result<(), E>, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .delete_object_tags_if(bucket, key, version_id, action)
+        self.put_object_metadata_if(bucket, key, version_id, |stored| {
+            let version_id = action(stored)?;
+            Ok(((), version_id, PutObjectMetadataMutation::DeleteTags))
+        })
     }
 
     pub fn put_object_retention_if<E>(
@@ -1819,8 +1956,14 @@ impl super::StorageCluster {
         retention: ObjectRetention,
         action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
     ) -> Result<Result<(), E>, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .put_object_retention_if(bucket, key, version_id, retention, action)
+        self.put_object_metadata_if(bucket, key, version_id, |stored| {
+            let version_id = action(stored)?;
+            Ok((
+                (),
+                version_id,
+                PutObjectMetadataMutation::PutRetention(retention),
+            ))
+        })
     }
 
     pub fn put_object_legal_hold_if<E>(
@@ -1831,8 +1974,14 @@ impl super::StorageCluster {
         legal_hold: StoredLegalHoldStatus,
         action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
     ) -> Result<Result<(), E>, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .put_object_legal_hold_if(bucket, key, version_id, legal_hold, action)
+        self.put_object_metadata_if(bucket, key, version_id, |stored| {
+            let version_id = action(stored)?;
+            Ok((
+                (),
+                version_id,
+                PutObjectMetadataMutation::PutLegalHold(legal_hold),
+            ))
+        })
     }
 
     pub fn put_object_acl_if<E>(
@@ -1842,8 +1991,17 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<(VersionId, AclGrants, bool), E>,
     ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .put_object_acl_if(bucket, key, version_id, action)
+        self.put_object_metadata_if(bucket, key, version_id, |stored| {
+            let (version_id, acl_grants, public_read) = action(stored)?;
+            Ok((
+                version_id,
+                version_id,
+                PutObjectMetadataMutation::PutAcl {
+                    acl_grants,
+                    public_read,
+                },
+            ))
+        })
     }
 
     pub fn get_object_legal_hold_if<E>(

@@ -24,7 +24,8 @@ use crate::metadata_command::{
     DeleteObjectVersionTarget, InsertDeleteMarkerCommand, MetadataCommandEnvelope,
     MetadataCommandPayload, ObjectPayloadReclaimCommand, PutBucketAclCommand,
     PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
-    ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
+    PutObjectMetadataCommand, PutObjectMetadataMutation, ReleaseObjectGenerationCommand,
+    ReserveObjectGenerationCommand,
 };
 use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
@@ -2128,6 +2129,9 @@ impl PgStore {
             MetadataCommandPayload::InsertDeleteMarker(command) => {
                 self.apply_insert_delete_marker_command(command)
             }
+            MetadataCommandPayload::PutObjectMetadata(command) => {
+                self.apply_put_object_metadata_command(command)
+            }
         }
     }
 
@@ -2772,6 +2776,42 @@ impl PgStore {
                 store.put_delete_marker_explicit_in_open_txn(command)
             },
         )
+    }
+
+    fn apply_put_object_metadata_command(
+        &self,
+        command: &PutObjectMetadataCommand,
+    ) -> Result<(), MetadataError> {
+        match &command.mutation {
+            PutObjectMetadataMutation::PutTags(tags) => {
+                self.put_object_tags(&command.bucket, &command.key, command.version_id, tags)
+            }
+            PutObjectMetadataMutation::DeleteTags => {
+                self.delete_object_tags(&command.bucket, &command.key, command.version_id)
+            }
+            PutObjectMetadataMutation::PutRetention(retention) => self.put_object_retention(
+                &command.bucket,
+                &command.key,
+                command.version_id,
+                *retention,
+            ),
+            PutObjectMetadataMutation::PutLegalHold(legal_hold) => self.put_object_legal_hold(
+                &command.bucket,
+                &command.key,
+                command.version_id,
+                *legal_hold,
+            ),
+            PutObjectMetadataMutation::PutAcl {
+                acl_grants,
+                public_read,
+            } => self.put_object_acl(
+                &command.bucket,
+                &command.key,
+                command.version_id,
+                acl_grants,
+                *public_read,
+            ),
+        }
     }
 
     fn put_delete_marker_explicit_in_open_txn(

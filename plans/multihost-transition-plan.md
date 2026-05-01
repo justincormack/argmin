@@ -1317,9 +1317,17 @@ Work items:
        local object history, concurrent completion order allocation across
        different object PG primaries, replica bucket sequence advancement, and
        zero-apply command failure followed by retry
+     - add a `PutObjectMetadata` command payload for ordinary per-version
+       object metadata updates: object tags, tag deletion, object ACL,
+       retention, and legal-hold changes
+     - route those object metadata mutations through the object metadata PG
+       acting set with the same pending-command drain/retry behavior used by
+       direct PUT and delete commands
+     - include deterministic canonical encoding coverage, acting-set
+       convergence coverage for every mutation kind, and a partial-primary
+       apply retry regression for object tag updates
    - remaining slices:
      - lifecycle expiry metadata
-     - object tag, ACL, retention, and legal-hold updates
      - stream segment append/abort metadata and cleanup hardening
      - multipart create, part upload, upload-part stream staging, abort, and
        remaining multipart staging metadata

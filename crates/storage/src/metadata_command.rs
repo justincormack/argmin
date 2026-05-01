@@ -2,7 +2,8 @@ use std::num::NonZeroU64;
 
 use s3_types::{
     AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId,
-    ObjectLockDefaultRetention, ObjectLockMode, ObjectLockState, RetentionPeriod,
+    ObjectLockDefaultRetention, ObjectLockMode, ObjectLockState, ObjectRetention, RetentionPeriod,
+    StoredLegalHoldStatus,
 };
 
 use crate::types::{
@@ -27,6 +28,7 @@ const METADATA_COMMAND_COMMIT_DIRECT_PUT_OBJECT: u16 = 8;
 const METADATA_COMMAND_DELETE_OBJECT_VERSION: u16 = 9;
 const METADATA_COMMAND_INSERT_DELETE_MARKER: u16 = 10;
 const METADATA_COMMAND_COMMIT_MULTIPART_OBJECT: u16 = 11;
+const METADATA_COMMAND_PUT_OBJECT_METADATA: u16 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct MetadataCommandLogIndex(NonZeroU64);
@@ -151,6 +153,7 @@ pub(crate) enum MetadataCommandPayload {
     CommitMultipartObject(Box<CommitMultipartObjectCommand>),
     DeleteObjectVersion(Box<DeleteObjectVersionCommand>),
     InsertDeleteMarker(InsertDeleteMarkerCommand),
+    PutObjectMetadata(Box<PutObjectMetadataCommand>),
 }
 
 impl MetadataCommandPayload {
@@ -167,6 +170,7 @@ impl MetadataCommandPayload {
             Self::CommitMultipartObject(_) => METADATA_COMMAND_COMMIT_MULTIPART_OBJECT,
             Self::DeleteObjectVersion(_) => METADATA_COMMAND_DELETE_OBJECT_VERSION,
             Self::InsertDeleteMarker(_) => METADATA_COMMAND_INSERT_DELETE_MARKER,
+            Self::PutObjectMetadata(_) => METADATA_COMMAND_PUT_OBJECT_METADATA,
         }
     }
 }
@@ -506,6 +510,41 @@ impl InsertDeleteMarkerCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PutObjectMetadataMutation {
+    PutTags(String),
+    DeleteTags,
+    PutRetention(ObjectRetention),
+    PutLegalHold(StoredLegalHoldStatus),
+    PutAcl {
+        acl_grants: AclGrants,
+        public_read: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PutObjectMetadataCommand {
+    pub(crate) bucket: BucketName,
+    pub(crate) key: ObjectKey,
+    pub(crate) version_id: VersionId,
+    pub(crate) mutation: PutObjectMetadataMutation,
+}
+
+impl PutObjectMetadataCommand {
+    pub(crate) fn matches_request(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        mutation: &PutObjectMetadataMutation,
+    ) -> bool {
+        self.bucket == *bucket
+            && self.key == *key
+            && self.version_id == version_id
+            && self.mutation == *mutation
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MetadataCommandEnvelope {
     id: MetadataCommandId,
     payload: MetadataCommandPayload,
@@ -587,6 +626,9 @@ fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPaylo
         }
         MetadataCommandPayload::InsertDeleteMarker(command) => {
             encode_insert_delete_marker(&mut out, command);
+        }
+        MetadataCommandPayload::PutObjectMetadata(command) => {
+            encode_put_object_metadata(&mut out, command);
         }
     }
     out
@@ -747,6 +789,38 @@ fn encode_insert_delete_marker(out: &mut Vec<u8>, command: &InsertDeleteMarkerCo
     put_str(out, command.owner.canonical_id.as_str());
     put_u64(out, command.write_sequence);
     put_u64(out, command.last_modified_millis);
+}
+
+fn encode_put_object_metadata(out: &mut Vec<u8>, command: &PutObjectMetadataCommand) {
+    put_str(out, command.bucket.as_str());
+    put_str(out, command.key.as_str());
+    encode_version_id(out, command.version_id);
+    match &command.mutation {
+        PutObjectMetadataMutation::PutTags(tags) => {
+            put_u8(out, 1);
+            put_str(out, tags);
+        }
+        PutObjectMetadataMutation::DeleteTags => {
+            put_u8(out, 2);
+        }
+        PutObjectMetadataMutation::PutRetention(retention) => {
+            put_u8(out, 3);
+            put_u8(out, retention.mode as u8);
+            put_u64(out, retention.retain_until_unix_seconds);
+        }
+        PutObjectMetadataMutation::PutLegalHold(legal_hold) => {
+            put_u8(out, 4);
+            put_u8(out, *legal_hold as u8);
+        }
+        PutObjectMetadataMutation::PutAcl {
+            acl_grants,
+            public_read,
+        } => {
+            put_u8(out, 5);
+            put_str(out, &acl_grants.serialized());
+            put_bool(out, *public_read);
+        }
+    }
 }
 
 fn encode_put_live_object(out: &mut Vec<u8>, object: &PutLiveObjectReq) {
@@ -1586,13 +1660,49 @@ mod tests {
                 },
             })),
             MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
-                bucket,
-                key,
+                bucket: bucket.clone(),
+                key: key.clone(),
                 version_id: VersionId::from_u64(8),
                 owner: OwnerIdentity::from_principal("owner"),
                 write_sequence: 46,
                 last_modified_millis: 558,
             }),
+            MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::from_u64(8),
+                mutation: PutObjectMetadataMutation::PutTags("<Tagging/>".to_string()),
+            })),
+            MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::from_u64(8),
+                mutation: PutObjectMetadataMutation::DeleteTags,
+            })),
+            MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::from_u64(8),
+                mutation: PutObjectMetadataMutation::PutRetention(ObjectRetention {
+                    mode: ObjectLockMode::Governance,
+                    retain_until_unix_seconds: 999,
+                }),
+            })),
+            MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::from_u64(8),
+                mutation: PutObjectMetadataMutation::PutLegalHold(StoredLegalHoldStatus::On),
+            })),
+            MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
+                bucket,
+                key,
+                version_id: VersionId::from_u64(8),
+                mutation: PutObjectMetadataMutation::PutAcl {
+                    acl_grants: AclGrants::default(),
+                    public_read: true,
+                },
+            })),
         ];
 
         let mut checksums = Vec::new();
@@ -1621,6 +1731,11 @@ mod tests {
                 0x66ff987ed0727bc1,
                 0x37077018dfee09b9,
                 0xb9932d8c0d5bd142,
+                0x2409fec0814418c6,
+                0x27ce426128d5a91d,
+                0x6a301d6f0442d1c2,
+                0x1a341162c27b185a,
+                0xb518fde2aa266bff,
             ]
         );
     }
