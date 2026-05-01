@@ -501,6 +501,7 @@ pub(crate) struct InsertDeleteMarkerCommand {
     pub(crate) owner: OwnerIdentity,
     pub(crate) write_sequence: u64,
     pub(crate) last_modified_millis: u64,
+    pub(crate) stale_payload: Option<ObjectPayloadReclaimCommand>,
 }
 
 impl InsertDeleteMarkerCommand {
@@ -789,6 +790,17 @@ fn encode_insert_delete_marker(out: &mut Vec<u8>, command: &InsertDeleteMarkerCo
     put_str(out, command.owner.canonical_id.as_str());
     put_u64(out, command.write_sequence);
     put_u64(out, command.last_modified_millis);
+    match &command.stale_payload {
+        None => put_u8(out, 0),
+        Some(ObjectPayloadReclaimCommand::Segments(reclaim)) => {
+            put_u8(out, 1);
+            encode_object_segments_reclaim(out, reclaim);
+        }
+        Some(ObjectPayloadReclaimCommand::Multipart(reclaim)) => {
+            put_u8(out, 2);
+            encode_multipart_reclaim(out, reclaim);
+        }
+    }
 }
 
 fn encode_put_object_metadata(out: &mut Vec<u8>, command: &PutObjectMetadataCommand) {
@@ -1641,7 +1653,7 @@ mod tests {
                 completed_at_millis: 556,
                 initiator: Some(OwnerIdentity::from_principal("initiator")),
                 last_modified_millis: 557,
-                stale_payload: Some(multipart_reclaim),
+                stale_payload: Some(multipart_reclaim.clone()),
             })),
             MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
                 bucket: bucket.clone(),
@@ -1656,7 +1668,7 @@ mod tests {
                 target: DeleteObjectVersionTarget::Live {
                     generation_id,
                     layout: ObjectLayout::Standard,
-                    payload: segment_reclaim,
+                    payload: segment_reclaim.clone(),
                 },
             })),
             MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
@@ -1666,6 +1678,25 @@ mod tests {
                 owner: OwnerIdentity::from_principal("owner"),
                 write_sequence: 46,
                 last_modified_millis: 558,
+                stale_payload: None,
+            }),
+            MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::from_u64(9),
+                owner: OwnerIdentity::from_principal("owner"),
+                write_sequence: 47,
+                last_modified_millis: 559,
+                stale_payload: Some(segment_reclaim),
+            }),
+            MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::from_u64(10),
+                owner: OwnerIdentity::from_principal("owner"),
+                write_sequence: 48,
+                last_modified_millis: 560,
+                stale_payload: Some(multipart_reclaim),
             }),
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
                 bucket: bucket.clone(),
@@ -1730,12 +1761,14 @@ mod tests {
                 0x8e971303e9b59031,
                 0x66ff987ed0727bc1,
                 0x37077018dfee09b9,
-                0xb9932d8c0d5bd142,
-                0x2409fec0814418c6,
-                0x27ce426128d5a91d,
-                0x6a301d6f0442d1c2,
-                0x1a341162c27b185a,
-                0xb518fde2aa266bff,
+                0xfce4f84779e4e364,
+                0xa1b20e6eb91852f7,
+                0x4a877a8134817636,
+                0x1f4a02b6464a538c,
+                0x01cd87bdfd723201,
+                0x12751ef35639efd3,
+                0x22fd0e282e38997a,
+                0xfb00f982e5637056,
             ]
         );
     }

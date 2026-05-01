@@ -1080,6 +1080,7 @@ mod tests {
     }
 
     struct CommittedDirectSegment {
+        version_id: crate::VersionId,
         generation_id: crate::GenerationId,
         segment_okh: [u8; 16],
         payload: Vec<u8>,
@@ -1112,7 +1113,33 @@ mod tests {
         segment_okh: [u8; 16],
         payload: &[u8],
     ) -> CommittedDirectSegment {
-        let reservation_id = crate::SessionId::try_from("01".repeat(16)).unwrap();
+        write_committed_direct_segment_for_with_versioning(
+            cluster,
+            bucket,
+            key,
+            crate::BucketVersioningState::Disabled,
+            [1; 16],
+            segment_okh,
+            payload,
+        )
+    }
+
+    fn write_committed_direct_segment_for_with_versioning(
+        cluster: &crate::StorageCluster,
+        bucket: &crate::BucketName,
+        key: &crate::ObjectKey,
+        versioning: crate::BucketVersioningState,
+        reservation_bytes: [u8; 16],
+        segment_okh: [u8; 16],
+        payload: &[u8],
+    ) -> CommittedDirectSegment {
+        let reservation_id = crate::SessionId::try_from(
+            reservation_bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        )
+        .unwrap();
         let generation_id = cluster
             .reserve_put_object_generation(bucket, key, &reservation_id)
             .unwrap();
@@ -1130,7 +1157,7 @@ mod tests {
             bucket: bucket.clone(),
             key: key.clone(),
             generation_reservation_id: reservation_id,
-            versioning: crate::BucketVersioningState::Disabled,
+            versioning,
             owner: crate::OwnerIdentity::from_principal("owner"),
             acl_grants: crate::AclGrants::default(),
             public_read: false,
@@ -1149,7 +1176,7 @@ mod tests {
             segment_vid: generation_id,
             data_pg_id: written.data_pg_id,
         };
-        cluster
+        let outcome = cluster
             .commit_direct_put_object_from_payload_shards(
                 &commit_req,
                 &written.written_shards,
@@ -1165,6 +1192,7 @@ mod tests {
             .unwrap();
 
         CommittedDirectSegment {
+            version_id: outcome.version_id,
             generation_id,
             segment_okh,
             payload: payload.to_vec(),
@@ -1233,6 +1261,32 @@ mod tests {
                 versioning: crate::BucketVersioningState::Disabled,
                 object_lock: crate::BucketObjectLockConfig::default(),
             })
+            .unwrap();
+    }
+
+    fn create_test_bucket_with_versioning(
+        cluster: &crate::StorageCluster,
+        bucket: &crate::BucketName,
+        versioning: crate::BucketVersioningState,
+    ) {
+        create_test_bucket(cluster, bucket);
+        if versioning != crate::BucketVersioningState::Disabled {
+            cluster
+                .put_bucket_versioning_and_load_info(bucket, versioning)
+                .unwrap();
+        }
+    }
+
+    fn put_test_lifecycle(cluster: &crate::StorageCluster, bucket: &crate::BucketName) {
+        cluster
+            .put_bucket_subresource_and_load_info(
+                bucket,
+                crate::PutBucketSubresource {
+                    kind: crate::BucketSubresourceKind::Lifecycle,
+                    body: "<LifecycleConfiguration/>",
+                    aux: crate::BucketSubresourceAux::None,
+                },
+            )
             .unwrap();
     }
 
@@ -3824,6 +3878,265 @@ mod tests {
                 .as_deref(),
                 Some(tags)
             );
+        }
+    }
+
+    #[test]
+    fn lifecycle_current_expiration_delete_command_applies_to_all_acting_object_pg_nodes() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        put_test_lifecycle(&cluster, &bucket);
+        let committed =
+            write_committed_direct_segment_for(&cluster, &bucket, &key, b"expired current");
+
+        let outcome = cluster
+            .expire_current_object_if_due(&bucket, &key, committed.version_id, |raw, record| {
+                assert_eq!(raw, Some("<LifecycleConfiguration/>"));
+                assert_eq!(record.generation_id, committed.generation_id);
+                Ok::<_, ()>(true)
+            })
+            .unwrap()
+            .unwrap()
+            .expect("current object should expire");
+        assert_eq!(outcome.reclaim_generation_id, Some(committed.generation_id));
+        assert!(matches!(
+            cluster.try_take_reclaim_work(),
+            Some(crate::ReclaimWorkItem::ObjectPayload((
+                queued_bucket,
+                queued_key,
+                queued_generation_id
+            ))) if queued_bucket == bucket
+                && queued_key == key
+                && queued_generation_id == committed.generation_id
+        ));
+        assert!(cluster.try_take_reclaim_work().is_none());
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+                Err(crate::MetadataError::ObjectNotFound)
+            ));
+            assert!(crate::PgMetadataStore::payload_reclaim_exists(
+                &*pg,
+                &bucket,
+                &key,
+                committed.generation_id
+            )
+            .unwrap());
+        }
+    }
+
+    #[test]
+    fn lifecycle_suspended_current_expiration_replaces_null_live_on_all_acting_nodes() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket_with_versioning(
+            &cluster,
+            &bucket,
+            crate::BucketVersioningState::Suspended,
+        );
+        put_test_lifecycle(&cluster, &bucket);
+        let committed =
+            write_committed_direct_segment_for(&cluster, &bucket, &key, b"suspended current");
+        assert_eq!(committed.version_id, crate::VersionId::Null);
+
+        let outcome = cluster
+            .expire_current_object_if_due(&bucket, &key, committed.version_id, |raw, record| {
+                assert_eq!(raw, Some("<LifecycleConfiguration/>"));
+                assert_eq!(record.generation_id, committed.generation_id);
+                Ok::<_, ()>(true)
+            })
+            .unwrap()
+            .unwrap()
+            .expect("suspended null live object should expire");
+        assert_eq!(outcome.reclaim_generation_id, Some(committed.generation_id));
+        assert!(matches!(
+            cluster.try_take_reclaim_work(),
+            Some(crate::ReclaimWorkItem::ObjectPayload((
+                queued_bucket,
+                queued_key,
+                queued_generation_id
+            ))) if queued_bucket == bucket
+                && queued_key == key
+                && queued_generation_id == committed.generation_id
+        ));
+        assert!(cluster.try_take_reclaim_work().is_none());
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            let stored = crate::PgMetadataStore::get_object_version(
+                &*pg,
+                &bucket,
+                &key,
+                crate::VersionId::Null,
+            )
+            .unwrap();
+            assert!(matches!(stored, crate::StoredObject::DeleteMarker(_)));
+            assert!(crate::PgMetadataStore::payload_reclaim_exists(
+                &*pg,
+                &bucket,
+                &key,
+                committed.generation_id
+            )
+            .unwrap());
+            assert!(
+                crate::PgMetadataStore::get_object_segments(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    crate::VersionId::Null,
+                )
+                .unwrap()
+                .is_empty(),
+                "null live segment rows should be removed on node {node_id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_noncurrent_and_delete_marker_expiration_use_object_commands() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket_with_versioning(
+            &cluster,
+            &bucket,
+            crate::BucketVersioningState::Enabled,
+        );
+        put_test_lifecycle(&cluster, &bucket);
+        let older = write_committed_direct_segment_for_with_versioning(
+            &cluster,
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Enabled,
+            [11; 16],
+            [51; 16],
+            b"older version",
+        );
+        let current = write_committed_direct_segment_for_with_versioning(
+            &cluster,
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Enabled,
+            [12; 16],
+            [52; 16],
+            b"current version",
+        );
+
+        let reclaimed = cluster
+            .delete_noncurrent_live_versions_if_due(&bucket, &key, |raw, versions| {
+                assert_eq!(raw, Some("<LifecycleConfiguration/>"));
+                assert!(versions
+                    .iter()
+                    .any(|stored| stored.version_id() == older.version_id));
+                Ok::<_, ()>(HashSet::from([older.version_id]))
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(reclaimed, vec![older.generation_id]);
+
+        let marker = cluster
+            .insert_current_delete_marker_if(
+                &bucket,
+                &key,
+                crate::OwnerIdentity::from_principal("owner"),
+                |_| Ok::<_, ()>(()),
+            )
+            .unwrap()
+            .unwrap();
+
+        let deleted_marker = cluster
+            .delete_expired_delete_marker_if_due(
+                &bucket,
+                &key,
+                marker.version_id,
+                |raw, versions| {
+                    assert_eq!(raw, Some("<LifecycleConfiguration/>"));
+                    assert!(versions.iter().any(|stored| {
+                        stored.version_id() == marker.version_id
+                            && matches!(stored, crate::StoredObject::DeleteMarker(_))
+                    }));
+                    Ok::<_, ()>(true)
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(deleted_marker);
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_version(&*pg, &bucket, &key, older.version_id,),
+                Err(crate::MetadataError::ObjectNotFound)
+            ));
+            assert!(crate::PgMetadataStore::payload_reclaim_exists(
+                &*pg,
+                &bucket,
+                &key,
+                older.generation_id
+            )
+            .unwrap());
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_version(&*pg, &bucket, &key, marker.version_id,),
+                Err(crate::MetadataError::ObjectNotFound)
+            ));
+            let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+            assert_eq!(stored.version_id(), current.version_id);
         }
     }
 

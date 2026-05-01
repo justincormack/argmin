@@ -905,6 +905,17 @@ impl StorageCluster {
                     );
                 }
             }
+            MetadataCommandPayload::InsertDeleteMarker(marker) => {
+                if let Some(stale_generation_id) =
+                    object_payload_reclaim_generation(&marker.stale_payload)
+                {
+                    self.enqueue_object_payload_reclaim(
+                        &marker.bucket,
+                        &marker.key,
+                        stale_generation_id,
+                    );
+                }
+            }
             _ => {}
         }
     }

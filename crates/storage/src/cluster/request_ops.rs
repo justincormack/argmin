@@ -25,6 +25,21 @@ use crate::*;
 
 const INTERNAL_LIST_PAGE_SIZE: u32 = 1_000;
 
+struct InsertDeleteMarkerDraft<'a> {
+    bucket: &'a BucketName,
+    key: &'a ObjectKey,
+    version_id: VersionId,
+    owner: &'a OwnerIdentity,
+    stale_payload: Option<ObjectPayloadReclaimCommand>,
+}
+
+struct BucketLifecycleContext<'a> {
+    bucket_node: &'a SharedStorageNode,
+    _bucket_guard: crate::node::BucketLockGuard<'a>,
+    bucket_info: BucketInfo,
+    raw_lifecycle: Option<String>,
+}
+
 #[cfg(test)]
 type MetadataCommandApplyTestHook =
     Arc<dyn Fn(NodeId, &MetadataCommandEnvelope) -> Result<(), StoreError> + Send + Sync>;
@@ -2026,6 +2041,36 @@ impl super::StorageCluster {
             .get_object_retention_if(bucket, key, version_id, action)
     }
 
+    fn load_bucket_lifecycle_context(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Option<BucketLifecycleContext<'_>>, ObjectPgActionError> {
+        let bucket_node = self.bucket_metadata_primary_node(bucket)?;
+        let bucket_guard = bucket_node.lock_bucket(bucket);
+        let bucket_pg = bucket_node.get_pg(self.bucket_metadata_pg_id(bucket))?;
+        let bucket_info = match PgMetadataStore::head_bucket(&*bucket_pg, bucket) {
+            Ok(info) => info,
+            Err(MetadataError::BucketNotFound { .. }) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let raw_lifecycle = if bucket_info.bucket_lifecycle_present {
+            PgMetadataStore::get_bucket_subresource(
+                &*bucket_pg,
+                bucket,
+                BucketSubresourceKind::Lifecycle,
+            )?
+            .map(|stored| stored.body)
+        } else {
+            None
+        };
+        Ok(Some(BucketLifecycleContext {
+            bucket_node,
+            _bucket_guard: bucket_guard,
+            bucket_info,
+            raw_lifecycle,
+        }))
+    }
+
     fn apply_new_object_metadata_command_for_bucket(
         &self,
         pg_id: PgId,
@@ -2116,6 +2161,34 @@ impl super::StorageCluster {
                 target,
             })),
         )
+    }
+
+    fn new_insert_delete_marker_command(
+        &self,
+        pg_id: PgId,
+        object_pg: &crate::PgStore,
+        draft: InsertDeleteMarkerDraft<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        let command_id = MetadataCommandId::new(
+            self.operation_epoch(),
+            pg_id,
+            self.local_map
+                .runtime_state()
+                .next_metadata_command_log_index(pg_id),
+        );
+        Ok(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                bucket: draft.bucket.clone(),
+                key: draft.key.clone(),
+                version_id: draft.version_id,
+                owner: draft.owner.clone(),
+                write_sequence: object_pg
+                    .next_object_write_sequence(draft.bucket.as_str(), draft.key.as_str())?,
+                last_modified_millis: crate::clock::current_time_millis(),
+                stale_payload: draft.stale_payload,
+            }),
+        ))
     }
 
     fn deleted_specific_from_command_target(
@@ -2382,23 +2455,17 @@ impl super::StorageCluster {
                     Err(error) => return Ok(Err(error)),
                 };
             let marker_vid = PgMetadataStore::next_version_id(&*object_pg, bucket, key)?;
-            let command_id = MetadataCommandId::new(
-                self.operation_epoch(),
+            let command = self.new_insert_delete_marker_command(
                 pg_id,
-                runtime_state.next_metadata_command_log_index(pg_id),
-            );
-            let command = MetadataCommandEnvelope::new(
-                command_id,
-                MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
-                    bucket: bucket.clone(),
-                    key: key.clone(),
+                &object_pg,
+                InsertDeleteMarkerDraft {
+                    bucket,
+                    key,
                     version_id: marker_vid,
-                    owner,
-                    write_sequence: object_pg
-                        .next_object_write_sequence(bucket.as_str(), key.as_str())?,
-                    last_modified_millis: crate::clock::current_time_millis(),
-                }),
-            );
+                    owner: &owner,
+                    stale_payload: None,
+                },
+            )?;
             drop(object_pg);
             runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
@@ -2416,8 +2483,228 @@ impl super::StorageCluster {
         expected_version_id: VersionId,
         should_expire: impl FnOnce(Option<&str>, &LiveObjectRecord) -> Result<bool, E>,
     ) -> Result<Result<Option<ExpireCurrentObjectOutcome>, E>, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .expire_current_object_if_due(bucket, key, expected_version_id, should_expire)
+        let Some(lifecycle_context) = self.load_bucket_lifecycle_context(bucket)? else {
+            return Ok(Ok(None));
+        };
+        let BucketLifecycleContext {
+            bucket_node: lifecycle_bucket_node,
+            _bucket_guard: _lifecycle_bucket_guard,
+            bucket_info,
+            raw_lifecycle,
+        } = lifecycle_context;
+        if raw_lifecycle.is_none() {
+            return Ok(Ok(None));
+        }
+
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let _object_bucket_guard = (!std::ptr::eq(lifecycle_bucket_node, primary_node))
+            .then(|| primary_node.lock_bucket(bucket));
+        let runtime_state = self.local_map.runtime_state();
+        let owner = OwnerIdentity::new(
+            bucket_info.owner_principal.clone(),
+            bucket_info.owner_canonical_id.clone(),
+        );
+        let mut should_expire = Some(should_expire);
+
+        loop {
+            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                match command.payload() {
+                    MetadataCommandPayload::DeleteObjectVersion(delete)
+                        if delete.matches_request(bucket, key, expected_version_id) =>
+                    {
+                        let object_pg = primary_node.get_pg(pg_id.get())?;
+                        let stored = match PgMetadataStore::get_object_version(
+                            &*object_pg,
+                            bucket,
+                            key,
+                            expected_version_id,
+                        ) {
+                            Ok(stored) => stored,
+                            Err(MetadataError::ObjectNotFound) => {
+                                drop(object_pg);
+                                self.apply_pending_object_metadata_command_for_bucket(
+                                    pg_id, bucket, &command,
+                                )?;
+                                return Ok(Ok(None));
+                            }
+                            Err(error) => return Err(error.into()),
+                        };
+                        let StoredObject::Live(record) = stored else {
+                            drop(object_pg);
+                            self.apply_pending_object_metadata_command_for_bucket(
+                                pg_id, bucket, &command,
+                            )?;
+                            return Ok(Ok(None));
+                        };
+                        let due = match should_expire
+                            .take()
+                            .expect("current expiration predicate used once")(
+                            raw_lifecycle.as_deref(),
+                            &record,
+                        ) {
+                            Ok(due) => due,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        drop(object_pg);
+                        self.apply_pending_object_metadata_command_for_bucket(
+                            pg_id, bucket, &command,
+                        )?;
+                        return Ok(Ok(due.then_some(ExpireCurrentObjectOutcome {
+                            reclaim_generation_id: super::delete_object_version_reclaim_generation(
+                                &delete.target,
+                            ),
+                        })));
+                    }
+                    MetadataCommandPayload::InsertDeleteMarker(marker)
+                        if marker.matches_request(bucket, key) =>
+                    {
+                        let object_pg = primary_node.get_pg(pg_id.get())?;
+                        let stored =
+                            match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
+                                Ok(stored) => stored,
+                                Err(MetadataError::ObjectNotFound) => {
+                                    drop(object_pg);
+                                    self.apply_pending_object_metadata_command_for_bucket(
+                                        pg_id, bucket, &command,
+                                    )?;
+                                    return Ok(Ok(None));
+                                }
+                                Err(error) => return Err(error.into()),
+                            };
+                        let StoredObject::Live(record) = stored else {
+                            drop(object_pg);
+                            self.apply_pending_object_metadata_command_for_bucket(
+                                pg_id, bucket, &command,
+                            )?;
+                            return Ok(Ok(None));
+                        };
+                        if record.version_id != expected_version_id {
+                            drop(object_pg);
+                            self.apply_pending_object_metadata_command_for_bucket(
+                                pg_id, bucket, &command,
+                            )?;
+                            return Ok(Ok(None));
+                        }
+                        let due = match should_expire
+                            .take()
+                            .expect("current expiration predicate used once")(
+                            raw_lifecycle.as_deref(),
+                            &record,
+                        ) {
+                            Ok(due) => due,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        let reclaim_generation_id =
+                            super::object_payload_reclaim_generation(&marker.stale_payload);
+                        drop(object_pg);
+                        self.apply_pending_object_metadata_command_for_bucket(
+                            pg_id, bucket, &command,
+                        )?;
+                        return Ok(Ok(due.then_some(ExpireCurrentObjectOutcome {
+                            reclaim_generation_id,
+                        })));
+                    }
+                    _ => {
+                        self.apply_pending_object_metadata_command_for_bucket(
+                            pg_id, bucket, &command,
+                        )?;
+                        continue;
+                    }
+                }
+            }
+
+            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let stored = match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
+                Ok(stored) => stored,
+                Err(MetadataError::ObjectNotFound) => return Ok(Ok(None)),
+                Err(error) => return Err(error.into()),
+            };
+            let StoredObject::Live(record) = stored else {
+                return Ok(Ok(None));
+            };
+            if record.version_id != expected_version_id {
+                return Ok(Ok(None));
+            }
+            let due = match should_expire
+                .take()
+                .expect("current expiration predicate used once")(
+                raw_lifecycle.as_deref(), &record
+            ) {
+                Ok(due) => due,
+                Err(error) => return Ok(Err(error)),
+            };
+            if !due {
+                return Ok(Ok(None));
+            }
+
+            let (command, reclaim_generation_id) = match bucket_info.versioning {
+                BucketVersioningState::Disabled => {
+                    let target =
+                        self.live_delete_command_target(&object_pg, bucket, key, &record)?;
+                    let reclaim_generation_id =
+                        super::delete_object_version_reclaim_generation(&target);
+                    (
+                        self.new_delete_object_version_command(
+                            pg_id,
+                            bucket,
+                            key,
+                            record.version_id,
+                            target,
+                        ),
+                        reclaim_generation_id,
+                    )
+                }
+                BucketVersioningState::Enabled => {
+                    let marker_vid = PgMetadataStore::next_version_id(&*object_pg, bucket, key)?;
+                    (
+                        self.new_insert_delete_marker_command(
+                            pg_id,
+                            &object_pg,
+                            InsertDeleteMarkerDraft {
+                                bucket,
+                                key,
+                                version_id: marker_vid,
+                                owner: &owner,
+                                stale_payload: None,
+                            },
+                        )?,
+                        None,
+                    )
+                }
+                BucketVersioningState::Suspended => {
+                    let stale_payload = self.snapshot_direct_put_stale_payload_command(
+                        &object_pg,
+                        bucket,
+                        key,
+                        crate::clock::current_time_millis(),
+                    )?;
+                    let reclaim_generation_id =
+                        super::object_payload_reclaim_generation(&stale_payload);
+                    (
+                        self.new_insert_delete_marker_command(
+                            pg_id,
+                            &object_pg,
+                            InsertDeleteMarkerDraft {
+                                bucket,
+                                key,
+                                version_id: VersionId::Null,
+                                owner: &owner,
+                                stale_payload,
+                            },
+                        )?,
+                        reclaim_generation_id,
+                    )
+                }
+            };
+            drop(object_pg);
+            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            return Ok(Ok(Some(ExpireCurrentObjectOutcome {
+                reclaim_generation_id,
+            })));
+        }
     }
 
     pub fn delete_noncurrent_live_versions_if_due<E>(
@@ -2426,8 +2713,128 @@ impl super::StorageCluster {
         key: &ObjectKey,
         select_versions: impl FnOnce(Option<&str>, &[StoredObject]) -> Result<HashSet<VersionId>, E>,
     ) -> Result<Result<Vec<GenerationId>, E>, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .delete_noncurrent_live_versions_if_due(bucket, key, select_versions)
+        let Some(lifecycle_context) = self.load_bucket_lifecycle_context(bucket)? else {
+            return Ok(Ok(Vec::new()));
+        };
+        let BucketLifecycleContext {
+            bucket_node: lifecycle_bucket_node,
+            _bucket_guard: _lifecycle_bucket_guard,
+            bucket_info: _bucket_info,
+            raw_lifecycle,
+        } = lifecycle_context;
+        if raw_lifecycle.is_none() {
+            return Ok(Ok(Vec::new()));
+        }
+
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let _object_bucket_guard = (!std::ptr::eq(lifecycle_bucket_node, primary_node))
+            .then(|| primary_node.lock_bucket(bucket));
+        let runtime_state = self.local_map.runtime_state();
+        let mut select_versions = Some(select_versions);
+
+        loop {
+            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                if let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() {
+                    if delete.bucket == *bucket && delete.key == *key {
+                        let object_pg = primary_node.get_pg(pg_id.get())?;
+                        let versions = match PgMetadataStore::list_object_versions_for_key(
+                            &*object_pg,
+                            bucket,
+                            key,
+                        ) {
+                            Ok(versions) => versions,
+                            Err(MetadataError::ObjectNotFound) => {
+                                drop(object_pg);
+                                self.apply_pending_object_metadata_command_for_bucket(
+                                    pg_id, bucket, &command,
+                                )?;
+                                return Ok(Ok(Vec::new()));
+                            }
+                            Err(error) => return Err(error.into()),
+                        };
+                        let due_version_ids = match select_versions
+                            .take()
+                            .expect("noncurrent expiration selector used once")(
+                            raw_lifecycle.as_deref(),
+                            &versions,
+                        ) {
+                            Ok(version_ids) => version_ids,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        let reclaim_generation_id = due_version_ids
+                            .contains(&delete.version_id)
+                            .then(|| {
+                                super::delete_object_version_reclaim_generation(&delete.target)
+                            })
+                            .flatten();
+                        drop(object_pg);
+                        self.apply_pending_object_metadata_command_for_bucket(
+                            pg_id, bucket, &command,
+                        )?;
+                        return Ok(Ok(reclaim_generation_id.into_iter().collect()));
+                    }
+                }
+                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                continue;
+            }
+
+            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let versions =
+                match PgMetadataStore::list_object_versions_for_key(&*object_pg, bucket, key) {
+                    Ok(versions) => versions,
+                    Err(MetadataError::ObjectNotFound) => return Ok(Ok(Vec::new())),
+                    Err(error) => return Err(error.into()),
+                };
+            let due_version_ids = match select_versions
+                .take()
+                .expect("noncurrent expiration selector used once")(
+                raw_lifecycle.as_deref(),
+                &versions,
+            ) {
+                Ok(version_ids) => version_ids,
+                Err(error) => return Ok(Err(error)),
+            };
+            if due_version_ids.is_empty() {
+                return Ok(Ok(Vec::new()));
+            }
+
+            let mut commands = Vec::new();
+            let mut reclaimed_generation_ids = Vec::new();
+            for stored in &versions {
+                let Some(record) = stored.as_live() else {
+                    continue;
+                };
+                if !due_version_ids.contains(&record.version_id) {
+                    continue;
+                }
+                let target = self.live_delete_command_target(&object_pg, bucket, key, record)?;
+                if let Some(generation_id) =
+                    super::delete_object_version_reclaim_generation(&target)
+                {
+                    reclaimed_generation_ids.push(generation_id);
+                }
+                commands.push(self.new_delete_object_version_command(
+                    pg_id,
+                    bucket,
+                    key,
+                    record.version_id,
+                    target,
+                ));
+            }
+            drop(object_pg);
+
+            for command in commands {
+                runtime_state.set_pending_metadata_command_for_bucket(
+                    pg_id,
+                    bucket,
+                    command.clone(),
+                );
+                self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            }
+            return Ok(Ok(reclaimed_generation_ids));
+        }
     }
 
     pub fn delete_expired_delete_marker_if_due<E>(
@@ -2437,8 +2844,100 @@ impl super::StorageCluster {
         expected_version_id: VersionId,
         should_delete: impl FnOnce(Option<&str>, &[StoredObject]) -> Result<bool, E>,
     ) -> Result<Result<bool, E>, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .delete_expired_delete_marker_if_due(bucket, key, expected_version_id, should_delete)
+        let Some(lifecycle_context) = self.load_bucket_lifecycle_context(bucket)? else {
+            return Ok(Ok(false));
+        };
+        let BucketLifecycleContext {
+            bucket_node: lifecycle_bucket_node,
+            _bucket_guard: _lifecycle_bucket_guard,
+            bucket_info: _bucket_info,
+            raw_lifecycle,
+        } = lifecycle_context;
+        if raw_lifecycle.is_none() {
+            return Ok(Ok(false));
+        }
+
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let _object_bucket_guard = (!std::ptr::eq(lifecycle_bucket_node, primary_node))
+            .then(|| primary_node.lock_bucket(bucket));
+        let runtime_state = self.local_map.runtime_state();
+        let mut should_delete = Some(should_delete);
+
+        loop {
+            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                if let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() {
+                    if delete.matches_request(bucket, key, expected_version_id)
+                        && matches!(delete.target, DeleteObjectVersionTarget::DeleteMarker)
+                    {
+                        let object_pg = primary_node.get_pg(pg_id.get())?;
+                        let versions = match PgMetadataStore::list_object_versions_for_key(
+                            &*object_pg,
+                            bucket,
+                            key,
+                        ) {
+                            Ok(versions) => versions,
+                            Err(MetadataError::ObjectNotFound) => {
+                                drop(object_pg);
+                                self.apply_pending_object_metadata_command_for_bucket(
+                                    pg_id, bucket, &command,
+                                )?;
+                                return Ok(Ok(false));
+                            }
+                            Err(error) => return Err(error.into()),
+                        };
+                        let due = match should_delete
+                            .take()
+                            .expect("delete-marker expiration predicate used once")(
+                            raw_lifecycle.as_deref(),
+                            &versions,
+                        ) {
+                            Ok(due) => due,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        drop(object_pg);
+                        self.apply_pending_object_metadata_command_for_bucket(
+                            pg_id, bucket, &command,
+                        )?;
+                        return Ok(Ok(due));
+                    }
+                }
+                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                continue;
+            }
+
+            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let versions =
+                match PgMetadataStore::list_object_versions_for_key(&*object_pg, bucket, key) {
+                    Ok(versions) => versions,
+                    Err(MetadataError::ObjectNotFound) => return Ok(Ok(false)),
+                    Err(error) => return Err(error.into()),
+                };
+            let due = match should_delete
+                .take()
+                .expect("delete-marker expiration predicate used once")(
+                raw_lifecycle.as_deref(),
+                &versions,
+            ) {
+                Ok(due) => due,
+                Err(error) => return Ok(Err(error)),
+            };
+            if !due {
+                return Ok(Ok(false));
+            }
+            let command = self.new_delete_object_version_command(
+                pg_id,
+                bucket,
+                key,
+                expected_version_id,
+                DeleteObjectVersionTarget::DeleteMarker,
+            );
+            drop(object_pg);
+            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            return Ok(Ok(true));
+        }
     }
 
     pub fn acquire_object_payload_lease(

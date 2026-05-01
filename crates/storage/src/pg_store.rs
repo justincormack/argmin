@@ -2773,6 +2773,14 @@ impl PgStore {
                     Err(error) => return Err(error),
                 }
 
+                if let Some(stale_payload) = &command.stale_payload {
+                    store.apply_multipart_overwrite_stale_payload_in_open_txn(
+                        &command.bucket,
+                        &command.key,
+                        command.version_id,
+                        stale_payload,
+                    )?;
+                }
                 store.put_delete_marker_explicit_in_open_txn(command)
             },
         )
@@ -4909,6 +4917,7 @@ impl PgMetadataStore for PgStore {
                     owner: req.owner.clone(),
                     write_sequence,
                     last_modified_millis: now,
+                    stale_payload: None,
                 })
             }
         })();

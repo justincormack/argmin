@@ -1326,8 +1326,17 @@ Work items:
      - include deterministic canonical encoding coverage, acting-set
        convergence coverage for every mutation kind, and a partial-primary
        apply retry regression for object tag updates
+     - route lifecycle current-object expiration, noncurrent live-version
+       expiration, and expired delete-marker removal through the object
+       metadata PG command stream
+     - extend null-version delete-marker commands to carry optional stale
+       payload reclaim metadata, so suspended-versioning lifecycle expiration
+       converges object replacement, segment-row cleanup, and reclaim rows on
+       every acting object-PG node
+     - include convergence coverage for disabled current expiration, suspended
+       null-current expiration, noncurrent live-version expiration, and expired
+       delete-marker removal
    - remaining slices:
-     - lifecycle expiry metadata
      - stream segment append/abort metadata and cleanup hardening
      - multipart create, part upload, upload-part stream staging, abort, and
        remaining multipart staging metadata
