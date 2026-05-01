@@ -1,12 +1,18 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
+#[cfg(test)]
+use std::sync::Arc;
 use std::sync::MutexGuard;
-#[cfg(test)]
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(any(test, feature = "test-hooks"))]
+use std::sync::{Mutex, OnceLock};
 
-#[cfg(test)]
 use placement::NodeId;
 
+#[cfg(any(test, feature = "test-hooks"))]
+use super::{
+    MetadataCommandApplyContextTestHook, MetadataCommandApplyContextTestHookGuard,
+    MetadataCommandApplyTestContext, MetadataCommandApplyTestKind,
+};
 use crate::metadata_command::{
     BucketPropertyMutation, BucketSubresourceMutation, CreateBucketCommand,
     MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload, PutBucketAclCommand,
@@ -24,6 +30,11 @@ type MetadataCommandApplyTestHook =
 static BEFORE_METADATA_COMMAND_APPLY_HOOK: OnceLock<Mutex<Option<MetadataCommandApplyTestHook>>> =
     OnceLock::new();
 
+#[cfg(any(test, feature = "test-hooks"))]
+static BEFORE_METADATA_COMMAND_APPLY_CONTEXT_HOOK: OnceLock<
+    Mutex<Option<MetadataCommandApplyContextTestHook>>,
+> = OnceLock::new();
+
 #[cfg(test)]
 pub(crate) struct MetadataCommandApplyTestHookGuard;
 
@@ -35,28 +46,96 @@ impl Drop for MetadataCommandApplyTestHookGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for MetadataCommandApplyContextTestHookGuard {
+    fn drop(&mut self) {
+        let hook = BEFORE_METADATA_COMMAND_APPLY_CONTEXT_HOOK.get_or_init(|| Mutex::new(None));
+        *hook.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
 fn maybe_run_before_metadata_command_apply_hook(
-    node_id: NodeId,
-    command: &MetadataCommandEnvelope,
+    _node_id: NodeId,
+    _command: &MetadataCommandEnvelope,
 ) -> Result<(), StoreError> {
-    let hook = BEFORE_METADATA_COMMAND_APPLY_HOOK
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    if let Some(hook) = hook {
-        hook(node_id, command)?;
+    #[cfg(any(test, feature = "test-hooks"))]
+    {
+        let hook = BEFORE_METADATA_COMMAND_APPLY_CONTEXT_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook(metadata_command_apply_test_context(_node_id, _command))?;
+        }
+    }
+    #[cfg(test)]
+    {
+        let hook = BEFORE_METADATA_COMMAND_APPLY_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook(_node_id, _command)?;
+        }
     }
     Ok(())
 }
 
-#[cfg(not(test))]
-fn maybe_run_before_metadata_command_apply_hook(
-    _node_id: placement::NodeId,
-    _command: &MetadataCommandEnvelope,
-) -> Result<(), StoreError> {
-    Ok(())
+#[cfg(any(test, feature = "test-hooks"))]
+fn metadata_command_apply_test_context(
+    node_id: NodeId,
+    command: &MetadataCommandEnvelope,
+) -> MetadataCommandApplyTestContext {
+    let (kind, bucket, key) = match command.payload() {
+        MetadataCommandPayload::CreateBucket(command) => (
+            MetadataCommandApplyTestKind::CreateBucket,
+            Some(command.name.clone()),
+            None,
+        ),
+        MetadataCommandPayload::PutBucketVersioning(command) => (
+            MetadataCommandApplyTestKind::PutBucketVersioning,
+            Some(command.name.clone()),
+            None,
+        ),
+        MetadataCommandPayload::PutBucketAcl(command) => (
+            MetadataCommandApplyTestKind::PutBucketAcl,
+            Some(command.name.clone()),
+            None,
+        ),
+        MetadataCommandPayload::PutBucketProperty(command) => (
+            MetadataCommandApplyTestKind::PutBucketProperty,
+            Some(command.name.clone()),
+            None,
+        ),
+        MetadataCommandPayload::PutBucketSubresource(command) => (
+            MetadataCommandApplyTestKind::PutBucketSubresource,
+            Some(command.name.clone()),
+            None,
+        ),
+        MetadataCommandPayload::ReserveObjectGeneration(command) => (
+            MetadataCommandApplyTestKind::ReserveObjectGeneration,
+            Some(command.bucket.clone()),
+            Some(command.key.clone()),
+        ),
+        MetadataCommandPayload::ReleaseObjectGeneration(command) => (
+            MetadataCommandApplyTestKind::ReleaseObjectGeneration,
+            Some(command.bucket.clone()),
+            Some(command.key.clone()),
+        ),
+        MetadataCommandPayload::CommitDirectPutObject(command) => (
+            MetadataCommandApplyTestKind::CommitDirectPutObject,
+            Some(command.object.bucket.clone()),
+            Some(command.object.key.clone()),
+        ),
+    };
+    MetadataCommandApplyTestContext {
+        node_id,
+        kind,
+        bucket,
+        key,
+    }
 }
 
 #[derive(Clone)]
@@ -126,9 +205,9 @@ fn conflicting_pending_metadata_command(context: &'static str) -> BucketSnapshot
     .into()
 }
 
-struct MetadataCommandApplyFailure {
-    applied_nodes: usize,
-    source: BucketSnapshotLoadError,
+pub(super) struct MetadataCommandApplyFailure {
+    pub(super) applied_nodes: usize,
+    pub(super) source: BucketSnapshotLoadError,
 }
 
 // Metadata routing moves incrementally in Phase 6. Single-PG bucket/object
@@ -143,6 +222,16 @@ impl super::StorageCluster {
         let slot = BEFORE_METADATA_COMMAND_APPLY_HOOK.get_or_init(|| Mutex::new(None));
         *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
         MetadataCommandApplyTestHookGuard
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_before_metadata_command_apply_context_hook(
+        &self,
+        hook: MetadataCommandApplyContextTestHook,
+    ) -> MetadataCommandApplyContextTestHookGuard {
+        let slot = BEFORE_METADATA_COMMAND_APPLY_CONTEXT_HOOK.get_or_init(|| Mutex::new(None));
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
+        MetadataCommandApplyContextTestHookGuard { _private: () }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -235,6 +324,13 @@ impl super::StorageCluster {
                         "unexpected pending put bucket subresource command for create bucket",
                     ));
                 }
+                MetadataCommandPayload::ReserveObjectGeneration(_)
+                | MetadataCommandPayload::ReleaseObjectGeneration(_)
+                | MetadataCommandPayload::CommitDirectPutObject(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending object command for create bucket",
+                    ));
+                }
             }
         } else {
             let command_id = MetadataCommandId::new(
@@ -275,7 +371,7 @@ impl super::StorageCluster {
         Ok(BucketCreateAttemptOutcome::Created(info))
     }
 
-    fn apply_metadata_command_to_acting_set(
+    pub(super) fn apply_metadata_command_to_acting_set(
         &self,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), MetadataCommandApplyFailure> {
@@ -684,6 +780,13 @@ impl super::StorageCluster {
                         "unexpected pending put bucket subresource command for versioning",
                     ));
                 }
+                MetadataCommandPayload::ReserveObjectGeneration(_)
+                | MetadataCommandPayload::ReleaseObjectGeneration(_)
+                | MetadataCommandPayload::CommitDirectPutObject(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending object command for versioning",
+                    ));
+                }
             }
         } else {
             let command_id = MetadataCommandId::new(
@@ -845,6 +948,13 @@ impl super::StorageCluster {
                         "unexpected pending put bucket subresource command for bucket acl",
                     ));
                 }
+                MetadataCommandPayload::ReserveObjectGeneration(_)
+                | MetadataCommandPayload::ReleaseObjectGeneration(_)
+                | MetadataCommandPayload::CommitDirectPutObject(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending object command for bucket acl",
+                    ));
+                }
             }
         } else {
             let command_id = MetadataCommandId::new(
@@ -929,6 +1039,13 @@ impl super::StorageCluster {
                 MetadataCommandPayload::PutBucketSubresource(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending put bucket subresource command for bucket property",
+                    ));
+                }
+                MetadataCommandPayload::ReserveObjectGeneration(_)
+                | MetadataCommandPayload::ReleaseObjectGeneration(_)
+                | MetadataCommandPayload::CommitDirectPutObject(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending object command for bucket property",
                     ));
                 }
             }
@@ -1038,6 +1155,13 @@ impl super::StorageCluster {
                 MetadataCommandPayload::PutBucketProperty(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending put bucket property command for bucket subresource",
+                    ));
+                }
+                MetadataCommandPayload::ReserveObjectGeneration(_)
+                | MetadataCommandPayload::ReleaseObjectGeneration(_)
+                | MetadataCommandPayload::CommitDirectPutObject(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending object command for bucket subresource",
                     ));
                 }
             }

@@ -11,7 +11,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex};
 use std::thread;
 use std::time::Duration;
-use storage::{install_bucket_scoped_test_hooks, BucketScopedTestHooks, StorageCluster};
+use storage::{
+    install_bucket_scoped_test_hooks, BucketScopedTestHooks, MetadataCommandApplyTestKind, PgId,
+    StorageCluster,
+};
 
 const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -203,6 +206,112 @@ fn put_object_persists_explicit_object_owner_identity() {
     let live = live.into_live().expect("expected live object");
     assert_eq!(live.owner.principal, owner.principal());
     assert_eq!(live.owner.canonical_id, owner_canonical_id);
+}
+
+#[test]
+fn direct_put_retry_converges_pending_partial_metadata_command() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let object_pg = storage_cluster.test_object_pg_id_for(&bucket, &key);
+    let primary_node = storage_cluster
+        .local_pg_route(PgId::new(object_pg))
+        .unwrap()
+        .primary_node_id();
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let fail_once = Arc::new(AtomicBool::new(true));
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let fail_once_hook = Arc::clone(&fail_once);
+    let hook_guard = storage_cluster.test_install_before_metadata_command_apply_context_hook(
+        Arc::new(move |context| {
+            if context.kind == MetadataCommandApplyTestKind::CommitDirectPutObject
+                && context.bucket.as_ref() == Some(&hook_bucket)
+                && context.key.as_ref() == Some(&hook_key)
+                && context.node_id == primary_node
+                && fail_once_hook.swap(false, Ordering::SeqCst)
+            {
+                return Err(storage::StoreError::Io {
+                    context: "injected coordinator direct put metadata command apply failure",
+                    source: std::io::Error::other(
+                        "injected coordinator direct put metadata command apply failure",
+                    ),
+                });
+            }
+            Ok(())
+        }),
+    );
+
+    let metadata = MetadataBlob::new();
+    let first_err = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"first-write",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            first_err,
+            ServerError::Store(storage::StoreError::Io {
+                context: "injected coordinator direct put metadata command apply failure",
+                ..
+            })
+        ),
+        "expected injected direct PUT command failure, got {first_err:?}"
+    );
+    assert!(!fail_once.load(Ordering::SeqCst));
+    drop(hook_guard);
+
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"retry-write",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let get = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(get.body.read_all().unwrap(), b"retry-write");
 }
 
 #[test]

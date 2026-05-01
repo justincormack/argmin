@@ -19,9 +19,11 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 use crate::error::{MetadataError, StoreError};
 use crate::metadata_command::{
-    BucketPropertyMutation, BucketSubresourceMutation, CreateBucketCommand,
-    MetadataCommandEnvelope, MetadataCommandPayload, PutBucketAclCommand, PutBucketPropertyCommand,
-    PutBucketSubresourceCommand, PutBucketVersioningCommand,
+    BucketPropertyMutation, BucketSubresourceMutation, CommitDirectPutObjectCommand,
+    CreateBucketCommand, DirectPutStalePayloadCommand, MetadataCommandEnvelope,
+    MetadataCommandPayload, PutBucketAclCommand, PutBucketPropertyCommand,
+    PutBucketSubresourceCommand, PutBucketVersioningCommand, ReleaseObjectGenerationCommand,
+    ReserveObjectGenerationCommand,
 };
 use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
@@ -2107,6 +2109,15 @@ impl PgStore {
             MetadataCommandPayload::PutBucketSubresource(subresource) => {
                 self.apply_put_bucket_subresource_command(subresource)
             }
+            MetadataCommandPayload::ReserveObjectGeneration(reservation) => {
+                self.apply_reserve_object_generation_command(reservation)
+            }
+            MetadataCommandPayload::ReleaseObjectGeneration(reservation) => {
+                self.apply_release_object_generation_command(reservation)
+            }
+            MetadataCommandPayload::CommitDirectPutObject(command) => {
+                self.apply_commit_direct_put_object_command(command)
+            }
         }
     }
 
@@ -2177,6 +2188,157 @@ impl PgStore {
             &command.mutation,
             BucketExecutionGeneration::Explicit(command.bucket_execution_generation),
         )
+    }
+
+    fn apply_reserve_object_generation_command(
+        &self,
+        command: &ReserveObjectGenerationCommand,
+    ) -> Result<(), MetadataError> {
+        self.reserve_object_generation_explicit(
+            &command.bucket,
+            &command.key,
+            &command.reservation_id,
+            command.generation_id,
+            command.created_at_millis,
+        )
+    }
+
+    fn apply_release_object_generation_command(
+        &self,
+        command: &ReleaseObjectGenerationCommand,
+    ) -> Result<(), MetadataError> {
+        self.delete_object_generation_reservation(
+            &command.bucket,
+            &command.key,
+            &command.reservation_id,
+        )
+    }
+
+    fn apply_commit_direct_put_object_command(
+        &self,
+        command: &CommitDirectPutObjectCommand,
+    ) -> Result<(), MetadataError> {
+        if self.direct_put_command_already_applied(command)? {
+            return Ok(());
+        }
+
+        let reserved_generation = self.get_object_generation_reservation(
+            &command.object.bucket,
+            &command.object.key,
+            &command.generation_reservation_id,
+        )?;
+        if reserved_generation != command.object.generation_id {
+            return Err(MetadataError::Db {
+                context: "commit direct put command reservation mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| MetadataError::Db {
+                context: "commit direct put command (begin txn)",
+                source: e,
+            })?;
+
+        let result: Result<(), MetadataError> = (|| {
+            self.put_object_with_segments_explicit_in_open_txn(
+                &command.object,
+                &command.segments,
+                command.write_sequence,
+                command.last_modified_millis,
+            )?;
+            self.delete_object_generation_reservation(
+                &command.object.bucket,
+                &command.object.key,
+                &command.generation_reservation_id,
+            )?;
+            if let Some(stale_payload) = &command.stale_payload {
+                self.apply_direct_put_stale_payload_in_open_txn(
+                    &command.object.bucket,
+                    &command.object.key,
+                    command.object.version_id,
+                    stale_payload,
+                )?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(MetadataError::Db {
+                        context: "commit direct put command (commit txn)",
+                        source: e,
+                    });
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    fn direct_put_command_already_applied(
+        &self,
+        command: &CommitDirectPutObjectCommand,
+    ) -> Result<bool, MetadataError> {
+        let stored = match self.get_object_version(
+            &command.object.bucket,
+            &command.object.key,
+            command.object.version_id,
+        ) {
+            Ok(StoredObject::Live(record)) => record,
+            Ok(StoredObject::DeleteMarker(_)) | Err(MetadataError::ObjectNotFound) => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        if stored.generation_id != command.object.generation_id
+            || stored.size != command.object.size
+            || stored.etag != command.object.etag
+            || stored.last_modified != command.last_modified_millis
+            || stored.ec != command.object.ec
+            || stored.layout != command.object.layout
+            || stored.tags != command.object.tags
+            || stored.metadata_blob != command.object.metadata_blob
+            || stored.system_metadata_blob != command.object.system_metadata_blob
+            || stored.object_lock != command.object.object_lock
+            || stored.encryption != command.object.encryption
+            || stored.owner != command.object.owner
+            || stored.acl_grants != command.object.acl_grants
+            || stored.public_read != command.object.public_read
+        {
+            return Ok(false);
+        }
+        let segments = self.get_object_segments(
+            &command.object.bucket,
+            &command.object.key,
+            command.object.version_id,
+        )?;
+        Ok(segments == command.segments)
+    }
+
+    fn apply_direct_put_stale_payload_in_open_txn(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        stale_payload: &DirectPutStalePayloadCommand,
+    ) -> Result<(), MetadataError> {
+        match stale_payload {
+            DirectPutStalePayloadCommand::Segments(reclaim) => {
+                self.put_object_segments_reclaim_in_open_txn(reclaim)
+            }
+            DirectPutStalePayloadCommand::Multipart(reclaim) => {
+                self.put_multipart_reclaim_in_open_txn(reclaim)?;
+                self.delete_multipart_part_segments(bucket, key, version_id)?;
+                self.delete_object_parts(bucket, key, version_id)
+            }
+        }
     }
 
     fn put_bucket_versioning_inner(
@@ -2647,7 +2809,11 @@ impl PgStore {
         Ok(generations)
     }
 
-    fn next_object_write_sequence(&self, bucket: &str, key: &str) -> Result<u64, MetadataError> {
+    pub(crate) fn next_object_write_sequence(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<u64, MetadataError> {
         let max: Option<i64> = self
             .conn
             .query_row(
@@ -2683,6 +2849,49 @@ impl PgStore {
                 })
             }
         }
+    }
+
+    fn advance_object_version_counter_in_open_txn(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<(), MetadataError> {
+        if version_id.is_null() {
+            return Ok(());
+        }
+        let following = version_id
+            .to_u64()
+            .checked_add(1)
+            .ok_or_else(|| MetadataError::Db {
+                context: "advance object version counter",
+                source: rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    Box::from("version_id overflow"),
+                ),
+            })?;
+        let following = i64::try_from(following).map_err(|_| MetadataError::Db {
+            context: "advance object version counter",
+            source: rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Integer,
+                Box::from("version_id exceeds SQLite integer range"),
+            ),
+        })?;
+        self.conn
+            .execute(
+                "INSERT INTO object_version_counters (bucket, key, next_version_id) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(bucket, key) DO UPDATE SET \
+                     next_version_id = max(object_version_counters.next_version_id, excluded.next_version_id)",
+                params![bucket, key, following],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "advance object version counter",
+                source: e,
+            })?;
+        Ok(())
     }
 
     fn object_write_sequence(
@@ -2883,6 +3092,370 @@ impl PgStore {
         Ok(uploads)
     }
 
+    fn reserve_object_generation_explicit(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+        generation_id: GenerationId,
+        created_at_millis: u64,
+    ) -> Result<(), MetadataError> {
+        match self.conn.execute(
+            "INSERT INTO object_generation_reservations \
+             (reservation_id, bucket, key, generation_id, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                reservation_id.as_str(),
+                bucket,
+                key,
+                generation_id.get() as i64,
+                created_at_millis as i64,
+            ],
+        ) {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(_, _)) => {
+                let existing = PgMetadataStore::get_object_generation_reservation(
+                    self,
+                    bucket,
+                    key,
+                    reservation_id,
+                );
+                if matches!(existing, Ok(existing_generation) if existing_generation == generation_id)
+                {
+                    Ok(())
+                } else {
+                    Err(MetadataError::Db {
+                        context: "reserve object generation explicit",
+                        source: rusqlite::Error::InvalidQuery,
+                    })
+                }
+            }
+            Err(source) => Err(MetadataError::Db {
+                context: "reserve object generation explicit",
+                source,
+            }),
+        }
+    }
+
+    fn put_object_segments_reclaim_in_open_txn(
+        &self,
+        reclaim: &ObjectSegmentsReclaimRecord,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO object_segments_reclaims \
+                 (bucket, key, generation_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    reclaim.bucket,
+                    reclaim.key,
+                    reclaim.generation_id.get() as i64,
+                    reclaim.created_at as i64,
+                ],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put object segments reclaim (root)",
+                source: e,
+            })?;
+
+        for segment in &reclaim.segments {
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO object_segment_reclaim_segments \
+                     (bucket, key, generation_id, segment_index, segment_okh, segment_vid, \
+                      data_pg_id, ec_k, ec_m) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        reclaim.bucket,
+                        reclaim.key,
+                        reclaim.generation_id.get() as i64,
+                        segment.segment_index as i64,
+                        &segment.segment_okh[..],
+                        segment.segment_vid.get() as i64,
+                        segment.data_pg_id as i64,
+                        segment.ec.k,
+                        segment.ec.m,
+                    ],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "put object segments reclaim (segment)",
+                    source: e,
+                })?;
+        }
+        Ok(())
+    }
+
+    fn put_multipart_reclaim_in_open_txn(
+        &self,
+        reclaim: &MultipartReclaimRecord,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO multipart_reclaims \
+                 (bucket, key, generation_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    reclaim.bucket,
+                    reclaim.key,
+                    reclaim.generation_id.get() as i64,
+                    reclaim.created_at as i64,
+                ],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put multipart reclaim (root)",
+                source: e,
+            })?;
+
+        for part in &reclaim.parts {
+            match part {
+                MultipartReclaimPartRecord::ShardSet {
+                    part_number,
+                    part_okh,
+                    part_vid,
+                    data_pg_id,
+                    ec,
+                } => {
+                    self.conn
+                        .execute(
+                            "INSERT OR REPLACE INTO multipart_reclaim_parts \
+                             (bucket, key, generation_id, part_number, storage_kind, part_okh, \
+                              part_vid, data_pg_id, ec_k, ec_m) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                            params![
+                                reclaim.bucket,
+                                reclaim.key,
+                                reclaim.generation_id.get() as i64,
+                                *part_number as i64,
+                                MultipartReclaimPartKind::ShardSet as u8,
+                                &part_okh[..],
+                                part_vid.get() as i64,
+                                *data_pg_id as i64,
+                                ec.k,
+                                ec.m,
+                            ],
+                        )
+                        .map_err(|e| MetadataError::Db {
+                            context: "put multipart reclaim (part shard set)",
+                            source: e,
+                        })?;
+                }
+                MultipartReclaimPartRecord::Segments {
+                    part_number,
+                    segments,
+                } => {
+                    self.conn
+                        .execute(
+                            "INSERT OR REPLACE INTO multipart_reclaim_parts \
+                             (bucket, key, generation_id, part_number, storage_kind, part_okh, \
+                              part_vid, data_pg_id, ec_k, ec_m) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL)",
+                            params![
+                                reclaim.bucket,
+                                reclaim.key,
+                                reclaim.generation_id.get() as i64,
+                                *part_number as i64,
+                                MultipartReclaimPartKind::Segments as u8,
+                            ],
+                        )
+                        .map_err(|e| MetadataError::Db {
+                            context: "put multipart reclaim (part segments)",
+                            source: e,
+                        })?;
+
+                    for segment in segments {
+                        self.conn
+                            .execute(
+                                "INSERT OR REPLACE INTO multipart_reclaim_part_segments \
+                                 (bucket, key, generation_id, part_number, segment_index, \
+                                  segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                params![
+                                    reclaim.bucket,
+                                    reclaim.key,
+                                    reclaim.generation_id.get() as i64,
+                                    segment.part_number as i64,
+                                    segment.segment_index as i64,
+                                    &segment.segment_okh[..],
+                                    segment.segment_vid.get() as i64,
+                                    segment.data_pg_id as i64,
+                                    segment.ec.k,
+                                    segment.ec.m,
+                                ],
+                            )
+                            .map_err(|e| MetadataError::Db {
+                                context: "put multipart reclaim (part segment)",
+                                source: e,
+                            })?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn put_object_with_segments_explicit_in_open_txn(
+        &self,
+        obj: &PutLiveObjectReq,
+        segments: &[ObjectSegmentRecord],
+        write_sequence: u64,
+        last_modified: u64,
+    ) -> Result<(), MetadataError> {
+        obj.validate().map_err(|msg| MetadataError::Db {
+            context: "put explicit segment object (etag/layout mismatch)",
+            source: rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Null,
+                Box::from(msg),
+            ),
+        })?;
+        if obj.layout != ObjectLayout::Standard {
+            return Err(MetadataError::Db {
+                context: "put explicit segment object (non-segment layout)",
+                source: rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Null,
+                    Box::from("put_object_with_segments requires Standard layout"),
+                ),
+            });
+        }
+
+        let data_layout = obj.layout.data_layout() as u8;
+        let etag_kind = obj.etag.etag_kind() as u8;
+        let status = ObjectState::Live as u8;
+        let parts_count = obj.layout.parts_count().map(|n| n as i64);
+        let tags = obj.tags.as_ref().map(SerializedTagSet::as_str);
+        let metadata_blob = obj
+            .metadata_blob
+            .as_ref()
+            .map(SerializedMetadataBlob::as_slice);
+        let system_metadata_blob = obj
+            .system_metadata_blob
+            .as_ref()
+            .map(SerializedSystemMetadataBlob::as_slice);
+        let (object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) =
+            Self::object_lock_sql_values(obj.object_lock).map_err(|e| MetadataError::Db {
+                context: "put explicit segment object (encode object lock)",
+                source: e,
+            })?;
+        let encryption_type = obj.encryption.encryption_type() as u8;
+        let encryption_state = obj.encryption.encode_state();
+        self.mark_current_live_noncurrent(
+            obj.bucket.as_str(),
+            obj.key.as_str(),
+            obj.version_id,
+            last_modified,
+        )
+        .map_err(|e| MetadataError::Db {
+            context: "put explicit segment object (mark noncurrent)",
+            source: e,
+        })?;
+        self.advance_object_version_counter_in_open_txn(&obj.bucket, &obj.key, obj.version_id)?;
+
+        let obj_sql = if obj.version_id.is_null() {
+            "INSERT OR REPLACE INTO objects \
+             (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
+              storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)"
+        } else {
+            "INSERT INTO objects \
+             (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
+              storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)"
+        };
+        self.conn
+            .execute(
+                obj_sql,
+                params![
+                    obj.bucket,
+                    obj.key,
+                    obj.version_id.to_u64() as i64,
+                    write_sequence as i64,
+                    obj.generation_id.get() as i64,
+                    obj.size as i64,
+                    obj.etag.as_bytes().as_slice(),
+                    etag_kind,
+                    last_modified as i64,
+                    obj.ec.k,
+                    obj.ec.m,
+                    status,
+                    data_layout,
+                    parts_count,
+                    tags,
+                    metadata_blob,
+                    system_metadata_blob,
+                    encryption_type,
+                    encryption_state,
+                    obj.owner.principal,
+                    obj.owner.canonical_id.as_str(),
+                    obj.acl_grants.serialized(),
+                    i32::from(obj.public_read),
+                    object_lock_retention_mode,
+                    object_lock_retain_until,
+                    object_lock_legal_hold,
+                ],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put explicit segment object (write object)",
+                source: e,
+            })?;
+
+        self.conn
+            .execute(
+                "DELETE FROM object_segments \
+                 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![obj.bucket, obj.key, obj.version_id.to_u64() as i64],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put explicit segment object (delete prior segments)",
+                source: e,
+            })?;
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "INSERT INTO object_segments \
+                 (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, segment_vid, \
+                  data_pg_id, ec_k, ec_m) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put explicit segment object (prepare insert segments)",
+                source: e,
+            })?;
+        for segment in segments {
+            if segment.bucket != obj.bucket
+                || segment.key != obj.key
+                || segment.version_id != obj.version_id
+            {
+                return Err(MetadataError::Db {
+                    context: "put explicit segment object (segment object mismatch)",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Null,
+                        Box::from("segment row does not match object identity"),
+                    ),
+                });
+            }
+            stmt.execute(params![
+                segment.bucket,
+                segment.key,
+                segment.version_id.to_u64() as i64,
+                segment.segment_index,
+                segment.size as i64,
+                segment.segment_crc64.map(|v| v as i64),
+                segment.segment_okh.as_slice(),
+                segment.segment_vid.get() as i64,
+                segment.data_pg_id,
+                segment.ec_k,
+                segment.ec_m,
+            ])
+            .map_err(|e| MetadataError::Db {
+                context: "put explicit segment object (insert segment)",
+                source: e,
+            })?;
+        }
+
+        Ok(())
+    }
+
     pub fn delete_completed_multipart_upload(
         &self,
         upload_id: &UploadId,
@@ -2944,6 +3517,10 @@ impl PgMetadataStore for PgStore {
             if deleted != 0 {
                 self.conn.execute(
                     "DELETE FROM completed_multipart_uploads WHERE bucket = ?1",
+                    params![name.as_str()],
+                )?;
+                self.conn.execute(
+                    "DELETE FROM object_version_counters WHERE bucket = ?1",
                     params![name.as_str()],
                 )?;
             }
@@ -3526,6 +4103,11 @@ impl PgMetadataStore for PgStore {
                     })?;
                 let encryption_type = req.encryption.encryption_type() as u8;
                 let encryption_state = req.encryption.encode_state();
+                self.advance_object_version_counter_in_open_txn(
+                    &req.bucket,
+                    &req.key,
+                    req.version_id,
+                )?;
                 let sql = if req.version_id.is_null() {
                     "INSERT OR REPLACE INTO objects \
                      (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
@@ -3588,6 +4170,11 @@ impl PgMetadataStore for PgStore {
                     context: "put object meta (mark noncurrent delete marker)",
                     source: e,
                 })?;
+                self.advance_object_version_counter_in_open_txn(
+                    &req.bucket,
+                    &req.key,
+                    req.version_id,
+                )?;
                 let sql = if req.version_id.is_null() {
                     "INSERT OR REPLACE INTO objects \
                      (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
@@ -4212,42 +4799,112 @@ impl PgMetadataStore for PgStore {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<VersionId, MetadataError> {
-        let max: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT MAX(version_id) FROM objects WHERE bucket = ?1 AND key = ?2",
-                params![bucket, key],
-                |row| row.get(0),
-            )
-            .optional()
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
-                context: "next version id",
+                context: "next version id (begin txn)",
                 source: e,
-            })?
-            .flatten();
+            })?;
 
-        let next = match max {
-            None => 1u64,
-            Some(v) => {
-                let current = u64::try_from(v).map_err(|_| MetadataError::Db {
-                    context: "negative version_id in database",
-                    source: rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Integer,
-                        Box::from(format!("negative MAX(version_id): {v}")),
-                    ),
-                })?;
-                current.checked_add(1).ok_or_else(|| MetadataError::Db {
-                    context: "version_id overflow",
-                    source: rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Integer,
-                        Box::from("MAX(version_id) overflow"),
-                    ),
+        let result: Result<VersionId, MetadataError> = (|| {
+            let max_existing: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT MAX(version_id) FROM objects WHERE bucket = ?1 AND key = ?2",
+                    params![bucket, key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| MetadataError::Db {
+                    context: "next version id (max existing)",
+                    source: e,
                 })?
+                .flatten();
+            let next_from_rows = match max_existing {
+                None => 1,
+                Some(v) => {
+                    let current = u64::try_from(v).map_err(|_| MetadataError::Db {
+                        context: "negative version_id in database",
+                        source: rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Integer,
+                            Box::from(format!("negative MAX(version_id): {v}")),
+                        ),
+                    })?;
+                    current.checked_add(1).ok_or_else(|| MetadataError::Db {
+                        context: "version_id overflow",
+                        source: rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Integer,
+                            Box::from("MAX(version_id) overflow"),
+                        ),
+                    })?
+                }
+            };
+
+            let stored_next: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT next_version_id FROM object_version_counters \
+                     WHERE bucket = ?1 AND key = ?2",
+                    params![bucket, key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| MetadataError::Db {
+                    context: "next version id (load counter)",
+                    source: e,
+                })?;
+            let next_from_counter = match stored_next {
+                None => 1,
+                Some(v) => u64::try_from(v).map_err(|_| MetadataError::Db {
+                    context: "negative next_version_id in database",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::from(format!("negative next_version_id: {v}")),
+                    ),
+                })?,
+            };
+            let next = next_from_rows.max(next_from_counter);
+            let following = next.checked_add(1).ok_or_else(|| MetadataError::Db {
+                context: "version_id overflow",
+                source: rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    Box::from("next_version_id overflow"),
+                ),
+            })?;
+            self.conn
+                .execute(
+                    "INSERT INTO object_version_counters (bucket, key, next_version_id) \
+                     VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(bucket, key) DO UPDATE SET next_version_id = excluded.next_version_id",
+                    params![bucket, key, following as i64],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "next version id (store counter)",
+                    source: e,
+                })?;
+            Ok(VersionId::from_u64(next))
+        })();
+
+        match result {
+            Ok(version_id) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(MetadataError::Db {
+                        context: "next version id (commit txn)",
+                        source: e,
+                    });
+                }
+                Ok(version_id)
             }
-        };
-        Ok(VersionId::from_u64(next))
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
     }
 
     fn next_generation_id(
@@ -6464,6 +7121,13 @@ impl PgMetadataStore for PgStore {
                 obj.version_id,
                 now,
             )?;
+            self.advance_object_version_counter_in_open_txn(&obj.bucket, &obj.key, obj.version_id)
+                .map_err(|error| match error {
+                    MetadataError::Db { source, .. } => source,
+                    other => rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        std::io::Error::other(other.to_string()),
+                    )),
+                })?;
 
             // 2. Write/overwrite object metadata row.
             let obj_sql = if obj.version_id.is_null() {
@@ -7116,6 +7780,7 @@ impl PgMetadataStore for PgStore {
                 context: "commit stream put (mark noncurrent)",
                 source: e,
             })?;
+            self.advance_object_version_counter_in_open_txn(&obj.bucket, &obj.key, obj.version_id)?;
 
             let obj_sql = if obj.version_id.is_null() {
                 "INSERT OR REPLACE INTO objects \
@@ -7329,6 +7994,7 @@ impl PgMetadataStore for PgStore {
                 context: "put segment object (mark noncurrent)",
                 source: e,
             })?;
+            self.advance_object_version_counter_in_open_txn(&obj.bucket, &obj.key, obj.version_id)?;
 
             let obj_sql = if obj.version_id.is_null() {
                 "INSERT OR REPLACE INTO objects \

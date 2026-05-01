@@ -9,21 +9,86 @@ use local::LocalClusterRuntimeState;
 pub use local::{LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute};
 
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
-use crate::node::{DirectPutCommitError, SharedStorageNode};
+use crate::metadata_command::{
+    CommitDirectPutObjectCommand, DirectPutStalePayloadCommand, MetadataCommandEnvelope,
+    MetadataCommandId, MetadataCommandPayload, ReleaseObjectGenerationCommand,
+    ReserveObjectGenerationCommand,
+};
+use crate::node::SharedStorageNode;
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
     BucketName, ClusterEpoch, CommitDirectPutObjectReq, DataPgId, DirectPutCommitSnapshot,
     DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
-    ObjectEncryption, ObjectKey, PgId, PrepareStreamUploadSegmentAppendReq,
-    SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey, StreamUploadRecord,
-    StreamUploadSegmentRecord, StreamUploadTarget, WriteAck, WrittenShardAck,
+    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
+    ObjectEncryption, ObjectKey, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord,
+    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, PgId,
+    PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SegmentStoredBytesRequest, SessionId,
+    ShardIndex, ShardKey, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadTarget,
+    VersionId, WriteAck, WrittenShardAck,
 };
-use crate::ObjectPgActionError;
+use crate::{BucketSnapshotLoadError, MetadataError, ObjectEtag, ObjectPgActionError};
 
 mod local;
 mod request_ops;
 
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataCommandApplyTestKind {
+    CreateBucket,
+    PutBucketVersioning,
+    PutBucketAcl,
+    PutBucketProperty,
+    PutBucketSubresource,
+    ReserveObjectGeneration,
+    ReleaseObjectGeneration,
+    CommitDirectPutObject,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataCommandApplyTestContext {
+    pub node_id: NodeId,
+    pub kind: MetadataCommandApplyTestKind,
+    pub bucket: Option<BucketName>,
+    pub key: Option<ObjectKey>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub type MetadataCommandApplyContextTestHook =
+    Arc<dyn Fn(MetadataCommandApplyTestContext) -> Result<(), StoreError> + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct MetadataCommandApplyContextTestHookGuard {
+    _private: (),
+}
+
 const TRACE_TARGET: &str = "storage";
+
+fn conflicting_pending_object_metadata_command(context: &'static str) -> ObjectPgActionError {
+    ObjectPgActionError::Store(StoreError::Io {
+        context,
+        source: std::io::Error::other("conflicting pending metadata command"),
+    })
+}
+
+fn direct_put_stale_payload_generation(
+    stale_payload: &Option<DirectPutStalePayloadCommand>,
+) -> Option<GenerationId> {
+    match stale_payload {
+        None => None,
+        Some(DirectPutStalePayloadCommand::Segments(reclaim)) => Some(reclaim.generation_id),
+        Some(DirectPutStalePayloadCommand::Multipart(reclaim)) => Some(reclaim.generation_id),
+    }
+}
+
+fn bucket_snapshot_error_to_object_pg_action_error(
+    error: BucketSnapshotLoadError,
+) -> ObjectPgActionError {
+    match error {
+        BucketSnapshotLoadError::Store(error) => ObjectPgActionError::Store(error),
+        BucketSnapshotLoadError::Metadata(error) => ObjectPgActionError::Metadata(error),
+    }
+}
 
 #[cfg(any(test, feature = "test-hooks"))]
 type StreamAbortHook = Arc<dyn Fn() + Send + Sync>;
@@ -675,8 +740,149 @@ impl StorageCluster {
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<GenerationId, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .reserve_put_object_generation(bucket, key, reservation_id)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let runtime_state = self.local_map.runtime_state();
+        loop {
+            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                let abandoned_reservation = match command.payload() {
+                    MetadataCommandPayload::ReserveObjectGeneration(reservation)
+                        if reservation.matches_request(bucket, key, reservation_id) =>
+                    {
+                        let generation_id = reservation.generation_id;
+                        self.apply_pending_object_metadata_command_for_bucket(
+                            pg_id, bucket, &command,
+                        )?;
+                        return Ok(generation_id);
+                    }
+                    MetadataCommandPayload::ReserveObjectGeneration(reservation) => {
+                        Some((reservation.key.clone(), reservation.reservation_id.clone()))
+                    }
+                    _ => None,
+                };
+
+                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                if let Some((abandoned_key, abandoned_reservation_id)) = abandoned_reservation {
+                    self.release_abandoned_object_generation_reservation(
+                        pg_id,
+                        bucket,
+                        &abandoned_key,
+                        &abandoned_reservation_id,
+                    )?;
+                }
+                continue;
+            }
+
+            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let generation_id = object_pg.next_generation_id(bucket, key)?;
+            drop(object_pg);
+            let command_id = MetadataCommandId::new(
+                self.operation_epoch(),
+                pg_id,
+                runtime_state.next_metadata_command_log_index(pg_id),
+            );
+            let command = MetadataCommandEnvelope::new(
+                command_id,
+                MetadataCommandPayload::ReserveObjectGeneration(
+                    ReserveObjectGenerationCommand::new(
+                        bucket.clone(),
+                        key.clone(),
+                        reservation_id.clone(),
+                        generation_id,
+                        crate::clock::current_time_millis(),
+                    ),
+                ),
+            );
+            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            match self.apply_metadata_command_to_acting_set(&command) {
+                Ok(()) => {
+                    self.local_map
+                        .runtime_state()
+                        .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                    match command.payload() {
+                        MetadataCommandPayload::ReserveObjectGeneration(reservation) => {
+                            return Ok(reservation.generation_id);
+                        }
+                        _ => unreachable!("reserve object generation pending command kind changed"),
+                    }
+                }
+                Err(error) => {
+                    if error.applied_nodes == 0 {
+                        self.local_map
+                            .runtime_state()
+                            .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                    }
+                    return Err(bucket_snapshot_error_to_object_pg_action_error(
+                        error.source,
+                    ));
+                }
+            }
+        }
+    }
+
+    fn apply_pending_object_metadata_command_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), ObjectPgActionError> {
+        match self.apply_metadata_command_to_acting_set(command) {
+            Ok(()) => {
+                self.local_map
+                    .runtime_state()
+                    .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                if let MetadataCommandPayload::CommitDirectPutObject(commit) = command.payload() {
+                    if let Some(stale_generation_id) =
+                        direct_put_stale_payload_generation(&commit.stale_payload)
+                    {
+                        self.enqueue_object_payload_reclaim(
+                            &commit.object.bucket,
+                            &commit.object.key,
+                            stale_generation_id,
+                        );
+                    }
+                }
+                Ok(())
+            }
+            Err(error) => Err(bucket_snapshot_error_to_object_pg_action_error(
+                error.source,
+            )),
+        }
+    }
+
+    fn release_abandoned_object_generation_reservation(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> Result<(), ObjectPgActionError> {
+        let runtime_state = self.local_map.runtime_state();
+        let command_id = MetadataCommandId::new(
+            self.operation_epoch(),
+            pg_id,
+            runtime_state.next_metadata_command_log_index(pg_id),
+        );
+        let command = MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::ReleaseObjectGeneration(ReleaseObjectGenerationCommand::new(
+                bucket.clone(),
+                key.clone(),
+                reservation_id.clone(),
+            )),
+        );
+        runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+        match self.apply_metadata_command_to_acting_set(&command) {
+            Ok(()) => {
+                runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                Ok(())
+            }
+            Err(error) => Err(bucket_snapshot_error_to_object_pg_action_error(
+                error.source,
+            )),
+        }
     }
 
     pub fn release_object_generation_reservation(
@@ -685,8 +891,62 @@ impl StorageCluster {
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .release_object_generation_reservation(bucket, key, reservation_id)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let runtime_state = self.local_map.runtime_state();
+        let (command, clear_pending_on_zero_apply) = if let Some(command) =
+            runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+        {
+            match command.payload() {
+                MetadataCommandPayload::ReleaseObjectGeneration(reservation)
+                    if reservation.matches_request(bucket, key, reservation_id) =>
+                {
+                    (command, false)
+                }
+                _ => {
+                    return Err(conflicting_pending_object_metadata_command(
+                        "conflicting pending command for object generation reservation release",
+                    ));
+                }
+            }
+        } else {
+            let command_id = MetadataCommandId::new(
+                self.operation_epoch(),
+                pg_id,
+                runtime_state.next_metadata_command_log_index(pg_id),
+            );
+            let command = MetadataCommandEnvelope::new(
+                command_id,
+                MetadataCommandPayload::ReleaseObjectGeneration(
+                    ReleaseObjectGenerationCommand::new(
+                        bucket.clone(),
+                        key.clone(),
+                        reservation_id.clone(),
+                    ),
+                ),
+            );
+            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            (command, true)
+        };
+        match self.apply_metadata_command_to_acting_set(&command) {
+            Ok(()) => {
+                self.local_map
+                    .runtime_state()
+                    .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                Ok(())
+            }
+            Err(error) => {
+                if clear_pending_on_zero_apply && error.applied_nodes == 0 {
+                    self.local_map
+                        .runtime_state()
+                        .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                }
+                Err(bucket_snapshot_error_to_object_pg_action_error(
+                    error.source,
+                ))
+            }
+        }
     }
 
     pub fn commit_direct_put_object_from_payload_shards<E>(
@@ -695,6 +955,7 @@ impl StorageCluster {
         written_shards: &[WrittenShardAck],
         action: impl FnOnce(DirectPutCommitSnapshot) -> Result<(), E>,
     ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, ObjectPgActionError> {
+        let pg_id = PgId::new(self.object_metadata_pg_id(&req.bucket, &req.key));
         let object_node = match self.object_metadata_primary_node(&req.bucket, &req.key) {
             Ok(node) => node,
             Err(error) => {
@@ -712,21 +973,111 @@ impl StorageCluster {
             .iter()
             .map(|written| (&written.key, written.ack))
             .collect();
+
+        let _bucket_guard = object_node.lock_bucket(&req.bucket);
+        let runtime_state = self.local_map.runtime_state();
+        let (command, new_pending_command) = if let Some(command) =
+            runtime_state.pending_metadata_command_for_bucket(pg_id, &req.bucket)
+        {
+            match command.payload() {
+                MetadataCommandPayload::CommitDirectPutObject(commit)
+                    if commit.matches_request(
+                        &req.bucket,
+                        &req.key,
+                        &req.generation_reservation_id,
+                        req.generation_id,
+                    ) =>
+                {
+                    (command, false)
+                }
+                _ => {
+                    return Err(conflicting_pending_object_metadata_command(
+                        "conflicting pending command for direct put commit",
+                    ));
+                }
+            }
+        } else {
+            let object_pg = object_node.get_pg(pg_id.get())?;
+            let command = match self
+                .prepare_commit_direct_put_object_command(pg_id, &object_pg, req, action)
+            {
+                Ok(Ok(command)) => command,
+                Ok(Err(error)) => {
+                    drop(object_pg);
+                    drop(_bucket_guard);
+                    let _ = self.release_object_generation_reservation(
+                        &req.bucket,
+                        &req.key,
+                        &req.generation_reservation_id,
+                    );
+                    self.delete_direct_put_segment_payload_shards(
+                        req.data_pg_id,
+                        req.ec,
+                        &req.segment_okh,
+                        req.segment_vid,
+                        written_shards,
+                    );
+                    return Ok(Err(error));
+                }
+                Err(error) => {
+                    drop(object_pg);
+                    drop(_bucket_guard);
+                    let _ = self.release_object_generation_reservation(
+                        &req.bucket,
+                        &req.key,
+                        &req.generation_reservation_id,
+                    );
+                    self.delete_direct_put_segment_payload_shards(
+                        req.data_pg_id,
+                        req.ec,
+                        &req.segment_okh,
+                        req.segment_vid,
+                        written_shards,
+                    );
+                    return Err(error);
+                }
+            };
+            drop(object_pg);
+            (command, true)
+        };
+
         if let Err(error) = self.register_payload_shard_acks(req.data_pg_id, &shard_batch) {
-            self.delete_direct_put_segment_payload_shards(
-                req.data_pg_id,
-                req.ec,
-                &req.segment_okh,
-                req.segment_vid,
-                written_shards,
-            );
+            if new_pending_command {
+                drop(_bucket_guard);
+                let _ = self.release_object_generation_reservation(
+                    &req.bucket,
+                    &req.key,
+                    &req.generation_reservation_id,
+                );
+                self.delete_direct_put_segment_payload_shards(
+                    req.data_pg_id,
+                    req.ec,
+                    &req.segment_okh,
+                    req.segment_vid,
+                    written_shards,
+                );
+            }
             return Err(error);
         }
+        if new_pending_command {
+            runtime_state.set_pending_metadata_command_for_bucket(
+                pg_id,
+                &req.bucket,
+                command.clone(),
+            );
+        }
 
-        let result = object_node.commit_direct_put_object(req, action);
-        match result {
-            Ok(Ok(outcome)) => Ok(Ok(outcome)),
-            Ok(Err(error)) => {
+        if let Err(error) = self.apply_metadata_command_to_acting_set(&command) {
+            if new_pending_command && error.applied_nodes == 0 {
+                self.local_map
+                    .runtime_state()
+                    .remove_pending_metadata_command_for_bucket(pg_id, &req.bucket);
+                drop(_bucket_guard);
+                let _ = self.release_object_generation_reservation(
+                    &req.bucket,
+                    &req.key,
+                    &req.generation_reservation_id,
+                );
                 self.delete_direct_put_segment_payload_shards(
                     req.data_pg_id,
                     req.ec,
@@ -734,19 +1085,282 @@ impl StorageCluster {
                     req.segment_vid,
                     written_shards,
                 );
-                Ok(Err(error))
             }
-            Err(DirectPutCommitError::PrePublish(error)) => {
-                self.delete_direct_put_segment_payload_shards(
-                    req.data_pg_id,
-                    req.ec,
-                    &req.segment_okh,
-                    req.segment_vid,
-                    written_shards,
-                );
-                Err(error)
+            return Err(bucket_snapshot_error_to_object_pg_action_error(
+                error.source,
+            ));
+        }
+
+        self.local_map
+            .runtime_state()
+            .remove_pending_metadata_command_for_bucket(pg_id, &req.bucket);
+
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::node::maybe_run_after_direct_put_metadata_publish_hook()?;
+
+        let object_pg = object_node.get_pg(pg_id.get())?;
+        let stored = PgMetadataStore::get_object_meta(&*object_pg, &req.bucket, &req.key)?;
+        let live_record = stored.as_live().ok_or_else(|| MetadataError::Db {
+            context: "stored object missing live record after direct put",
+            source: rusqlite::Error::QueryReturnedNoRows,
+        })?;
+
+        match command.payload() {
+            MetadataCommandPayload::CommitDirectPutObject(commit) => {
+                Ok(Ok(FinalizeDirectPutObjectOutcome {
+                    version_id: commit.object.version_id,
+                    encryption: commit.object.encryption.clone(),
+                    live_tags: live_record.tags.clone(),
+                    live_size: live_record.size,
+                    live_last_modified: live_record.last_modified,
+                    stale_generation_id: commit.stale_payload.as_ref().map(
+                        |payload| match payload {
+                            DirectPutStalePayloadCommand::Segments(reclaim) => {
+                                reclaim.generation_id
+                            }
+                            DirectPutStalePayloadCommand::Multipart(reclaim) => {
+                                reclaim.generation_id
+                            }
+                        },
+                    ),
+                }))
             }
-            Err(error @ DirectPutCommitError::PostPublish(_)) => Err(error.into_action_error()),
+            _ => unreachable!("direct put commit pending command kind changed"),
+        }
+    }
+
+    fn prepare_commit_direct_put_object_command<E>(
+        &self,
+        pg_id: PgId,
+        object_pg: &crate::PgStore,
+        req: &CommitDirectPutObjectReq,
+        action: impl FnOnce(DirectPutCommitSnapshot) -> Result<(), E>,
+    ) -> Result<Result<MetadataCommandEnvelope, E>, ObjectPgActionError> {
+        let reserved_generation = object_pg.get_object_generation_reservation(
+            &req.bucket,
+            &req.key,
+            &req.generation_reservation_id,
+        )?;
+        if reserved_generation != req.generation_id {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: format!(
+                    "object generation reservation mismatch: reserved {} but commit requested {}",
+                    reserved_generation.get(),
+                    req.generation_id.get()
+                ),
+            });
+        }
+
+        let existing_etag = match PgMetadataStore::get_object_meta(object_pg, &req.bucket, &req.key)
+        {
+            Ok(stored) => stored.as_live().map(|record| record.etag.format()),
+            Err(MetadataError::ObjectNotFound) => None,
+            Err(other) => return Err(other.into()),
+        };
+        if let Err(error) = action(DirectPutCommitSnapshot { existing_etag }) {
+            return Ok(Err(error));
+        }
+
+        let version_id = if req.versioning == crate::BucketVersioningState::Enabled {
+            PgMetadataStore::next_version_id(object_pg, &req.bucket, &req.key)?
+        } else {
+            VersionId::Null
+        };
+        let last_modified_millis = crate::clock::current_time_millis();
+        let write_sequence =
+            object_pg.next_object_write_sequence(req.bucket.as_str(), req.key.as_str())?;
+        let stale_payload = if version_id.is_null() {
+            self.snapshot_direct_put_stale_payload_command(
+                object_pg,
+                &req.bucket,
+                &req.key,
+                last_modified_millis,
+            )?
+        } else {
+            None
+        };
+
+        let segment_record = ObjectSegmentRecord {
+            bucket: req.bucket.clone(),
+            key: req.key.clone(),
+            version_id,
+            segment_index: req.segment_index,
+            size: req.size,
+            segment_crc64: req.segment_crc64,
+            segment_okh: req.segment_okh,
+            segment_vid: req.segment_vid,
+            data_pg_id: req.data_pg_id,
+            ec_k: req.ec.k,
+            ec_m: req.ec.m,
+        };
+        let object = PutLiveObjectReq {
+            bucket: req.bucket.clone(),
+            key: req.key.clone(),
+            version_id,
+            owner: req.owner.clone(),
+            acl_grants: req.acl_grants.clone(),
+            public_read: req.public_read,
+            generation_id: req.generation_id,
+            size: req.size,
+            etag: ObjectEtag::single_part(req.etag_crc64),
+            ec: req.ec,
+            layout: ObjectLayout::Standard,
+            tags: req.tags.clone(),
+            metadata_blob: Some(req.metadata_blob.clone()),
+            system_metadata_blob: Some(req.system_metadata_blob.clone()),
+            object_lock: req.object_lock,
+            encryption: req.encryption.clone(),
+        };
+        let command = CommitDirectPutObjectCommand {
+            object,
+            segments: vec![segment_record],
+            generation_reservation_id: req.generation_reservation_id.clone(),
+            write_sequence,
+            last_modified_millis,
+            stale_payload,
+        };
+        let command_id = MetadataCommandId::new(
+            self.operation_epoch(),
+            pg_id,
+            self.local_map
+                .runtime_state()
+                .next_metadata_command_log_index(pg_id),
+        );
+        Ok(Ok(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::CommitDirectPutObject(Box::new(command)),
+        )))
+    }
+
+    fn snapshot_direct_put_stale_payload_command(
+        &self,
+        pg: &crate::PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        created_at: u64,
+    ) -> Result<Option<DirectPutStalePayloadCommand>, MetadataError> {
+        let stored = match PgMetadataStore::get_object_version(pg, bucket, key, VersionId::Null) {
+            Ok(stored) => stored,
+            Err(MetadataError::ObjectNotFound) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let record = match stored {
+            crate::StoredObject::Live(record) => record,
+            crate::StoredObject::DeleteMarker(_) => return Ok(None),
+        };
+
+        match record.layout {
+            ObjectLayout::Standard => {
+                let segments =
+                    PgMetadataStore::get_object_segments(pg, bucket, key, VersionId::Null)?;
+                Ok(Some(DirectPutStalePayloadCommand::Segments(
+                    ObjectSegmentsReclaimRecord {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        generation_id: record.generation_id,
+                        created_at,
+                        segments: segments
+                            .into_iter()
+                            .map(|segment| ObjectSegmentsReclaimSegmentRecord {
+                                segment_index: segment.segment_index,
+                                segment_okh: segment.segment_okh,
+                                segment_vid: segment.segment_vid,
+                                data_pg_id: segment.data_pg_id,
+                                ec: EcShape {
+                                    k: segment.ec_k,
+                                    m: segment.ec_m,
+                                },
+                            })
+                            .collect(),
+                    },
+                )))
+            }
+            ObjectLayout::MultipartManifest { .. } => {
+                let parts = PgMetadataStore::get_object_parts(pg, bucket, key, VersionId::Null)?;
+                let mut streaming_segments = Vec::new();
+                for part in &parts {
+                    if part.part_okh == [0u8; 16] {
+                        streaming_segments.extend(PgMetadataStore::get_multipart_part_segments(
+                            pg,
+                            bucket,
+                            key,
+                            VersionId::Null,
+                            part.part_number,
+                        )?);
+                    }
+                }
+                Ok(Some(DirectPutStalePayloadCommand::Multipart(
+                    Self::multipart_reclaim_from_parts(
+                        bucket,
+                        key,
+                        record.generation_id,
+                        created_at,
+                        &parts,
+                        &streaming_segments,
+                    ),
+                )))
+            }
+        }
+    }
+
+    fn multipart_reclaim_from_parts(
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        created_at: u64,
+        parts: &[ObjectPartRecord],
+        streaming_segments: &[crate::MultipartPartSegmentRecord],
+    ) -> MultipartReclaimRecord {
+        use std::collections::BTreeMap;
+
+        let mut segments_by_part: BTreeMap<u32, Vec<MultipartReclaimPartSegmentRecord>> =
+            BTreeMap::new();
+        for segment in streaming_segments {
+            segments_by_part
+                .entry(segment.part_number)
+                .or_default()
+                .push(MultipartReclaimPartSegmentRecord {
+                    part_number: segment.part_number,
+                    segment_index: segment.segment_index,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    data_pg_id: segment.data_pg_id,
+                    ec: EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
+                });
+        }
+
+        MultipartReclaimRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            created_at,
+            parts: parts
+                .iter()
+                .map(|part| {
+                    if part.part_okh == [0u8; 16] {
+                        MultipartReclaimPartRecord::Segments {
+                            part_number: part.part_number,
+                            segments: segments_by_part
+                                .remove(&part.part_number)
+                                .unwrap_or_default(),
+                        }
+                    } else {
+                        MultipartReclaimPartRecord::ShardSet {
+                            part_number: part.part_number,
+                            part_okh: part.part_okh,
+                            part_vid: part.part_vid,
+                            data_pg_id: part.data_pg_id,
+                            ec: EcShape {
+                                k: part.ec_k,
+                                m: part.ec_m,
+                            },
+                        }
+                    }
+                })
+                .collect(),
         }
     }
 

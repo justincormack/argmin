@@ -1235,6 +1235,105 @@ mod tests {
             .unwrap();
     }
 
+    fn direct_put_commit_req(
+        bucket: &crate::BucketName,
+        key: &crate::ObjectKey,
+        reservation_id: crate::SessionId,
+        generation_id: crate::GenerationId,
+        payload: &[u8],
+        segment_okh: [u8; 16],
+        written: &crate::DirectPutWrittenSegment,
+    ) -> crate::CommitDirectPutObjectReq {
+        crate::CommitDirectPutObjectReq {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_reservation_id: reservation_id,
+            versioning: crate::BucketVersioningState::Disabled,
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            generation_id,
+            size: payload.len() as u64,
+            etag_crc64: checksum::crc64::checksum(payload),
+            ec: written.ec,
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            object_lock: crate::ObjectLockState::default(),
+            encryption: crate::ObjectEncryption::None,
+            segment_index: 0,
+            segment_crc64: Some(checksum::crc64::checksum(payload)),
+            segment_okh,
+            segment_vid: generation_id,
+            data_pg_id: written.data_pg_id,
+        }
+    }
+
+    fn assert_direct_put_metadata_on_acting_nodes(
+        map: &LocalClusterMap,
+        node_ids: &[NodeId],
+        object_pg: u32,
+        commit_req: &crate::CommitDirectPutObjectReq,
+        outcome: &crate::FinalizeDirectPutObjectOutcome,
+    ) {
+        let expected_segment = crate::ObjectSegmentRecord {
+            bucket: commit_req.bucket.clone(),
+            key: commit_req.key.clone(),
+            version_id: outcome.version_id,
+            segment_index: commit_req.segment_index,
+            size: commit_req.size,
+            segment_crc64: commit_req.segment_crc64,
+            segment_okh: commit_req.segment_okh,
+            segment_vid: commit_req.segment_vid,
+            data_pg_id: commit_req.data_pg_id,
+            ec_k: commit_req.ec.k,
+            ec_m: commit_req.ec.m,
+        };
+
+        for node_id in node_ids {
+            let node = map.node(*node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            let stored =
+                crate::PgMetadataStore::get_object_meta(&*pg, &commit_req.bucket, &commit_req.key)
+                    .unwrap();
+            let live = stored.as_live().unwrap();
+            assert_eq!(live.version_id, outcome.version_id);
+            assert_eq!(live.generation_id, commit_req.generation_id);
+            assert_eq!(live.size, commit_req.size);
+            assert_eq!(
+                live.etag,
+                crate::ObjectEtag::single_part(commit_req.etag_crc64)
+            );
+            assert_eq!(live.last_modified, outcome.live_last_modified);
+            assert_eq!(live.metadata_blob, Some(commit_req.metadata_blob.clone()));
+            assert_eq!(
+                live.system_metadata_blob,
+                Some(commit_req.system_metadata_blob.clone())
+            );
+            assert_eq!(live.object_lock, commit_req.object_lock);
+            assert_eq!(live.encryption, commit_req.encryption);
+            assert_eq!(
+                crate::PgMetadataStore::get_object_segments(
+                    &*pg,
+                    &commit_req.bucket,
+                    &commit_req.key,
+                    outcome.version_id,
+                )
+                .unwrap(),
+                vec![expected_segment.clone()]
+            );
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &commit_req.bucket,
+                    &commit_req.key,
+                    &commit_req.generation_reservation_id,
+                ),
+                Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+            ));
+        }
+    }
+
     fn seed_bucket_record(
         map: &LocalClusterMap,
         node_id: NodeId,
@@ -2182,6 +2281,408 @@ mod tests {
     }
 
     #[test]
+    fn object_generation_reservation_commands_apply_to_all_acting_object_pg_nodes() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "object-reservation-");
+            let object_pg = 2;
+            let key = key_for_object_pg(topology, &bucket, object_pg, "key-");
+            (bucket, key, object_pg)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let reservation_id = crate::SessionId::try_from("12".repeat(16)).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        assert_eq!(generation_id, crate::GenerationId::MIN);
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    &reservation_id,
+                )
+                .unwrap(),
+                generation_id
+            );
+        }
+
+        cluster
+            .release_object_generation_reservation(&bucket, &key, &reservation_id)
+            .unwrap();
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    &reservation_id,
+                ),
+                Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn direct_put_metadata_command_applies_to_all_acting_object_pg_nodes() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let reservation_id = crate::SessionId::try_from("13".repeat(16)).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        let payload = b"direct put metadata command replication";
+        let segment_okh = [63; 16];
+        let written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                payload,
+            )
+            .unwrap();
+        let commit_req = direct_put_commit_req(
+            &bucket,
+            &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            &written,
+        );
+
+        let outcome = cluster
+            .commit_direct_put_object_from_payload_shards(
+                &commit_req,
+                &written.written_shards,
+                |_| Ok::<(), ()>(()),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+        assert_direct_put_metadata_on_acting_nodes(
+            &map,
+            &node_ids,
+            object_pg,
+            &commit_req,
+            &outcome,
+        );
+    }
+
+    #[test]
+    fn direct_put_metadata_command_retry_reuses_pending_partial_replica_command() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let reservation_id = crate::SessionId::try_from("14".repeat(16)).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        let payload = b"direct put metadata command partial apply retry";
+        let segment_okh = [64; 16];
+        let written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                payload,
+            )
+            .unwrap();
+        let commit_req = direct_put_commit_req(
+            &bucket,
+            &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            &written,
+        );
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                        if commit.object.bucket == hook_bucket
+                            && commit.object.key == hook_key
+                            && node_id == NodeId::new(1)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected direct put metadata command apply failure",
+                            source: std::io::Error::other(
+                                "injected direct put metadata command apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .commit_direct_put_object_from_payload_shards(
+                &commit_req,
+                &written.written_shards,
+                |_| Ok::<(), ()>(()),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected direct put metadata command apply failure",
+                    ..
+                })
+            ),
+            "expected injected primary failure, got {err:?}"
+        );
+        drop(hook_guard);
+        assert!(!fail_once.load(Ordering::SeqCst));
+        assert!(
+            map.runtime_state()
+                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+                .is_some(),
+            "partial direct PUT metadata command must remain pending"
+        );
+        for node_id in [NodeId::new(0), NodeId::new(2)] {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+            assert_eq!(stored.as_live().unwrap().generation_id, generation_id);
+        }
+        {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = primary.get_pg(object_pg).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+                Err(crate::MetadataError::ObjectNotFound)
+            ));
+        }
+
+        let outcome = cluster
+            .commit_direct_put_object_from_payload_shards(
+                &commit_req,
+                &written.written_shards,
+                |_| -> Result<(), ()> { panic!("retry must reuse the pending direct PUT command") },
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+        assert_direct_put_metadata_on_acting_nodes(
+            &map,
+            &node_ids,
+            object_pg,
+            &commit_req,
+            &outcome,
+        );
+    }
+
+    #[test]
+    fn object_generation_reservation_entry_drains_pending_direct_put_commit() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let reservation_id = crate::SessionId::try_from("22".repeat(16)).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        let payload = b"direct put metadata command production retry";
+        let segment_okh = [72; 16];
+        let written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                payload,
+            )
+            .unwrap();
+        let commit_req = direct_put_commit_req(
+            &bucket,
+            &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            &written,
+        );
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                        if commit.object.bucket == hook_bucket
+                            && commit.object.key == hook_key
+                            && node_id == NodeId::new(1)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected direct put metadata command apply failure",
+                            source: std::io::Error::other(
+                                "injected direct put metadata command apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .commit_direct_put_object_from_payload_shards(
+                &commit_req,
+                &written.written_shards,
+                |_| Ok::<(), ()>(()),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected direct put metadata command apply failure",
+                    ..
+                })
+            ),
+            "expected injected primary failure, got {err:?}"
+        );
+        drop(hook_guard);
+        assert!(
+            map.runtime_state()
+                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+                .is_some(),
+            "partial direct PUT metadata command must remain pending"
+        );
+
+        let next_reservation_id = crate::SessionId::try_from("23".repeat(16)).unwrap();
+        let next_generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &next_reservation_id)
+            .unwrap();
+        assert!(next_generation_id.get() > generation_id.get());
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+            assert_eq!(stored.as_live().unwrap().generation_id, generation_id);
+            assert_eq!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    &next_reservation_id,
+                )
+                .unwrap(),
+                next_generation_id
+            );
+        }
+    }
+
+    #[test]
     fn stream_append_registers_payload_acks_on_routed_data_pg_primary() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -2429,6 +2930,12 @@ mod tests {
         );
 
         let bridge_node = map.node(NodeId::new(0)).unwrap().storage_node();
+        let bridge_pg_a = bridge_node.get_pg(1).unwrap();
+        crate::PgMetadataStore::delete_object_meta(&*bridge_pg_a, &bucket, &key_a).unwrap();
+        drop(bridge_pg_a);
+        let bridge_pg_b = bridge_node.get_pg(2).unwrap();
+        crate::PgMetadataStore::delete_object_meta(&*bridge_pg_b, &bucket, &key_b).unwrap();
+        drop(bridge_pg_b);
         assert!(bridge_node.test_get_object_meta(&bucket, &key_a).is_err());
         assert!(bridge_node.test_get_object_meta(&bucket, &key_b).is_err());
 
@@ -4467,9 +4974,7 @@ mod tests {
         );
 
         let bridge_node = map.node(NodeId::new(0)).unwrap().storage_node();
-        assert!(bridge_node
-            .test_get_object_meta(&bucket, &live_key)
-            .is_err());
+        assert!(bridge_node.test_get_object_meta(&bucket, &live_key).is_ok());
 
         let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
         assert!(
@@ -4480,11 +4985,13 @@ mod tests {
             "routed non-empty bucket should reject delete, got {err:?}"
         );
 
-        let node_two = map.node(NodeId::new(2)).unwrap().storage_node();
-        let node_two_pg = node_two.get_pg(2).unwrap();
-        crate::PgMetadataStore::delete_object_meta(&*node_two_pg, &bucket, &live_key).unwrap();
-        drop(node_two_pg);
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(2).unwrap();
+            crate::PgMetadataStore::delete_object_meta(&*pg, &bucket, &live_key).unwrap();
+        }
 
+        let node_two = map.node(NodeId::new(2)).unwrap().storage_node();
         let completed_upload = upload_id_from_label("deleteCompleted");
         seed_completed_multipart_upload_record(
             &map,

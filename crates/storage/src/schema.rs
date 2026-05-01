@@ -68,6 +68,15 @@ CREATE TABLE IF NOT EXISTS objects (
     PRIMARY KEY (bucket, key, version_id)
 )";
 
+/// Per-object-key durable version allocator.
+const CREATE_OBJECT_VERSION_COUNTERS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS object_version_counters (
+    bucket          TEXT NOT NULL,
+    key             TEXT NOT NULL,
+    next_version_id INTEGER NOT NULL CHECK (next_version_id > 0),
+    PRIMARY KEY (bucket, key)
+)";
+
 /// In-progress multipart upload tracking table.
 const CREATE_MULTIPART_UPLOADS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS multipart_uploads (
@@ -440,6 +449,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(PG_PRAGMAS)?;
     conn.execute(CREATE_SHARDS_TABLE, [])?;
     conn.execute(CREATE_OBJECTS_TABLE, [])?;
+    conn.execute(CREATE_OBJECT_VERSION_COUNTERS_TABLE, [])?;
     conn.execute(CREATE_OBJECTS_LIST_INDEX, [])?;
     conn.execute(CREATE_OBJECTS_VERSIONS_INDEX, [])?;
     conn.execute(CREATE_OBJECTS_WRITE_SEQUENCE_INDEX, [])?;

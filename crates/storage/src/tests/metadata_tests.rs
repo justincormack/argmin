@@ -634,6 +634,58 @@ fn delete_bucket_clears_completed_multipart_upload_records() {
 }
 
 #[test]
+fn delete_bucket_clears_object_version_counter_records() {
+    let (_dir, store) = make_pg_store();
+    let bucket = bucket_name("bucket");
+    let key = object_key("key");
+    store
+        .create_bucket(
+            &bucket,
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+
+    let v1 = store.next_version_id(&bucket, &key).unwrap();
+    assert_eq!(v1, VersionId::from_u64(1));
+    let counter_rows: i64 = store
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM object_version_counters WHERE bucket = ?1",
+            [bucket.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(counter_rows, 1);
+
+    store.delete_bucket(&bucket).unwrap();
+    let counter_rows: i64 = store
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM object_version_counters WHERE bucket = ?1",
+            [bucket.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(counter_rows, 0);
+
+    store
+        .create_bucket(
+            &bucket,
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+    assert_eq!(store.next_version_id(&bucket, &key).unwrap(), v1);
+}
+
+#[test]
 fn file_bucket_metadata_versioning_transitions() {
     let (_dir, store) = make_pg_store();
     store
@@ -7745,6 +7797,40 @@ fn next_version_id_increments() {
         .unwrap();
     assert!(matches!(v2, VersionId::Versioned(_)));
     assert_ne!(v1, v2);
+}
+
+#[test]
+fn next_version_id_does_not_reuse_deleted_version() {
+    let (_dir, store) = make_pg_store();
+    let bucket = bucket_name("bucket");
+    let key = object_key("k");
+
+    let v1 = store.next_version_id(&bucket, &key).unwrap();
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: v1,
+            owner: test_owner(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::MIN,
+            ec: EcShape { k: 4, m: 2 },
+            size: 10,
+            etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        }))
+        .unwrap();
+    store.delete_object_version(&bucket, &key, v1).unwrap();
+
+    let v2 = store.next_version_id(&bucket, &key).unwrap();
+    assert_ne!(v1, v2);
+    assert!(v2.to_u64() > v1.to_u64());
 }
 
 #[test]

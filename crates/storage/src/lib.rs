@@ -41,6 +41,11 @@ pub use cluster::{
     LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute, ObjectPayloadLease,
     ReleasedObjectPayloadLease, ShardLocation, StorageCluster,
 };
+#[cfg(feature = "test-hooks")]
+pub use cluster::{
+    MetadataCommandApplyContextTestHook, MetadataCommandApplyContextTestHookGuard,
+    MetadataCommandApplyTestContext, MetadataCommandApplyTestKind,
+};
 pub use error::{
     BucketSnapshotLoadError, BucketWriteDrainError, ClusterBuildError, MetadataError,
     ObjectPgActionError, ShardIoError, StoreError,

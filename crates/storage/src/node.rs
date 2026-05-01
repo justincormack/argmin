@@ -73,28 +73,6 @@ struct StorageEcWriteState {
     scratch: Arc<EncodeScratchPool>,
 }
 
-#[derive(Debug)]
-pub(crate) enum DirectPutCommitError {
-    PrePublish(ObjectPgActionError),
-    PostPublish(ObjectPgActionError),
-}
-
-impl DirectPutCommitError {
-    pub(crate) fn pre_publish(error: impl Into<ObjectPgActionError>) -> Self {
-        Self::PrePublish(error.into())
-    }
-
-    pub(crate) fn post_publish(error: impl Into<ObjectPgActionError>) -> Self {
-        Self::PostPublish(error.into())
-    }
-
-    pub(crate) fn into_action_error(self) -> ObjectPgActionError {
-        match self {
-            Self::PrePublish(error) | Self::PostPublish(error) => error,
-        }
-    }
-}
-
 pub struct BucketLockGuard<'a> {
     guard: MutexGuard<'a, ()>,
 }
@@ -288,7 +266,7 @@ pub(crate) fn maybe_run_before_completed_multipart_prune_hook(
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub(super) fn maybe_run_after_direct_put_metadata_publish_hook() -> Result<(), ObjectPgActionError>
+pub(crate) fn maybe_run_after_direct_put_metadata_publish_hook() -> Result<(), ObjectPgActionError>
 {
     let hook = AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOK
         .get_or_init(|| Mutex::new(None))

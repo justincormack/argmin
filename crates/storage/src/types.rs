@@ -2401,6 +2401,7 @@ pub enum PutObjectReq {
 /// Invariant: the ETag variant must match the layout — `SinglePart` with the
 /// standard layout, `MultipartComposite` with `MultipartManifest`. Use
 /// [`PutLiveObjectReq::validate`] or rely on `put_object_meta` which calls it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PutLiveObjectReq {
     pub bucket: BucketName,
     pub key: ObjectKey,
@@ -3141,7 +3142,7 @@ pub struct AbortMultipartUploadCleanup {
 }
 
 /// Committed segment record for a normal PutObject.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectSegmentRecord {
     pub bucket: BucketName,
     pub key: ObjectKey,

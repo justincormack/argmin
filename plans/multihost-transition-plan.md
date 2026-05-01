@@ -1254,8 +1254,34 @@ Work items:
      multipart create/part/finalize/abort metadata, omitted-part cleanup
      metadata, and reclaim rows
    - keep multi-step workflows serialized by the PG primary command path
-   - likely slices:
-     - object generation reservation/release and direct PUT publish
+   - first slice complete:
+     - add `ReserveObjectGeneration`, `ReleaseObjectGeneration`, and
+       `CommitDirectPutObject` metadata command payloads with deterministic
+       canonical encoding and CRC64 coverage
+     - route object generation reservation/release through the object metadata
+       PG acting set, with the routed primary applied last and in-process
+       pending-command retry for partial replica apply
+     - drain any pending object metadata command at direct PUT reservation
+       entry before allocating a new generation, so a normal client retry after
+       partial direct PUT publish converges the prior command stream before
+       starting the replacement write
+     - keep per-key object version allocation monotonic through explicit
+       `object_version_counters`, advance those counters on replicated object
+       command apply, and remove bucket-owned counter rows on bucket delete
+     - route direct PUT object publication through a prepared command carrying
+       the explicit live-object row, segment rows, write sequence, last-modified
+       timestamp, reservation ID, and any stale payload reclaim rows needed by
+       unversioned overwrite
+     - keep direct PUT payload shard placement and data-PG ack rows on the
+       Phase 4/5 bridge for now, but only register ack rows after the object-PG
+       command stream has accepted or prepared the matching direct PUT command
+     - remove the pending direct PUT command as soon as object metadata has
+       been published to every active acting node, before any post-publish
+       fallible work, because the object is already visible at that point
+     - include primary/replica convergence tests for reservation/release and
+       direct PUT publish, plus a partial-primary-apply retry regression proving
+       the same pending command is reused and replicas converge
+   - remaining slices:
      - object delete and lifecycle expiry metadata
      - object tag, ACL, retention, and legal-hold updates
      - stream session creation plus segment append/finalize/abort metadata
