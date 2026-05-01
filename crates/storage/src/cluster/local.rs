@@ -2702,6 +2702,516 @@ mod tests {
     }
 
     #[test]
+    fn stream_put_staging_commands_apply_to_all_acting_object_pg_nodes() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let session_id = crate::SessionId::try_from("32".repeat(16)).unwrap();
+        cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                &session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap();
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            let session = crate::PgMetadataStore::get_stream_upload(&*pg, &session_id).unwrap();
+            assert_eq!(session.bucket, bucket);
+            assert_eq!(session.key, key);
+            assert!(matches!(
+                session.target,
+                crate::StreamUploadTarget::PutObject
+            ));
+        }
+
+        let payload = b"stream staging command replication";
+        let (_target, segment) = cluster
+            .prepare_stream_segment_append(
+                &bucket,
+                &key,
+                &crate::PrepareStreamUploadSegmentAppendReq {
+                    session_id: session_id.clone(),
+                    segment_index: 0,
+                    size: payload.len() as u64,
+                    segment_crc64: Some(checksum::crc64::checksum(payload)),
+                    segment_okh: [88; 16],
+                },
+            )
+            .unwrap();
+        assert_eq!(segment.data_pg_id, data_pg);
+        let written_shards = cluster
+            .write_stream_segment_payload_shards(&segment, payload)
+            .unwrap();
+        let shard_batch: Vec<(&crate::ShardKey, crate::WriteAck)> = written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect();
+        cluster
+            .commit_stream_segment_append(
+                &bucket,
+                &key,
+                &session_id,
+                segment.segment_index,
+                &segment,
+                &shard_batch,
+            )
+            .unwrap();
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::list_stream_segments(&*pg, &session_id).unwrap(),
+                vec![segment.clone()]
+            );
+        }
+
+        cluster
+            .abort_stream_upload_session(&bucket, &key, &session_id)
+            .unwrap();
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_stream_upload(&*pg, &session_id),
+                Err(crate::MetadataError::StreamSessionNotFound { .. })
+            ));
+            assert!(
+                crate::PgMetadataStore::list_stream_segments(&*pg, &session_id)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        let mut readback = Vec::new();
+        assert!(cluster
+            .read_segment_payload_stored_bytes_into(
+                crate::SegmentStoredBytesRequest {
+                    data_pg_id: segment.data_pg_id,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    stored_size: payload.len(),
+                    segment_crc64: Some(checksum::crc64::checksum(payload)),
+                    ec: EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
+                },
+                &mut readback,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn stream_put_create_partial_apply_retry_reuses_existing_session() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let session_id = crate::SessionId::try_from("34".repeat(16)).unwrap();
+        let create = crate::CreateStreamUploadReq {
+            session_id: session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: crate::StreamUploadTarget::PutObject,
+            encryption: crate::ObjectEncryption::None,
+        };
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_session_id = session_id.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::CreateStreamUpload(create)
+                        if create.request.session_id == hook_session_id
+                            && node_id == NodeId::new(1)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected stream create metadata command apply failure",
+                            source: std::io::Error::other(
+                                "injected stream create metadata command apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .create_put_object_stream_session(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), create.clone()))
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Store(StoreError::Io {
+                    context: "injected stream create metadata command apply failure",
+                    ..
+                })
+            ),
+            "expected injected primary failure, got {err:?}"
+        );
+        drop(hook_guard);
+
+        assert!(
+            map.runtime_state()
+                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+                .is_some(),
+            "partial stream create command must remain pending"
+        );
+        let replica_created_at = {
+            let replica = map.node(NodeId::new(0)).unwrap().storage_node();
+            let pg = replica.get_pg(object_pg).unwrap();
+            crate::PgMetadataStore::get_stream_upload(&*pg, &session_id)
+                .unwrap()
+                .created_at
+        };
+        {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = primary.get_pg(object_pg).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_stream_upload(&*pg, &session_id),
+                Err(crate::MetadataError::StreamSessionNotFound { .. })
+            ));
+        }
+
+        let retry_value = cluster
+            .create_put_object_stream_session(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>((7_u8, create.clone()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry_value, 7);
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            let session = crate::PgMetadataStore::get_stream_upload(&*pg, &session_id).unwrap();
+            assert_eq!(session.bucket, bucket);
+            assert_eq!(session.key, key);
+            assert_eq!(session.created_at, replica_created_at);
+            assert!(matches!(
+                session.target,
+                crate::StreamUploadTarget::PutObject
+            ));
+            assert_eq!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    &session_id,
+                )
+                .unwrap(),
+                crate::GenerationId::MIN
+            );
+        }
+    }
+
+    #[test]
+    fn stream_abort_missing_session_does_not_succeed_after_unrelated_pending_command() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let missing_session_id = crate::SessionId::try_from("35".repeat(16)).unwrap();
+        let unrelated_session_id = crate::SessionId::try_from("36".repeat(16)).unwrap();
+        let pg_id = PgId::new(object_pg);
+        let command = MetadataCommandEnvelope::new(
+            crate::metadata_command::MetadataCommandId::new(
+                cluster.operation_epoch(),
+                pg_id,
+                map.runtime_state().next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::CreateStreamUpload(Box::new(
+                crate::metadata_command::CreateStreamUploadCommand {
+                    request: crate::CreateStreamUploadReq {
+                        session_id: unrelated_session_id.clone(),
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        target: crate::StreamUploadTarget::PutObject,
+                        encryption: crate::ObjectEncryption::None,
+                    },
+                    created_at_millis: 123,
+                },
+            )),
+        );
+        map.runtime_state()
+            .set_pending_metadata_command_for_bucket(pg_id, &bucket, command);
+
+        let error = cluster
+            .abort_stream_upload_session(&bucket, &key, &missing_session_id)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::ObjectPgActionError::Metadata(
+                    crate::MetadataError::StreamSessionNotFound { .. }
+                )
+            ),
+            "unrelated pending command must not make missing stream abort idempotent: {error:?}"
+        );
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(pg_id, &bucket)
+            .is_none());
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            let session =
+                crate::PgMetadataStore::get_stream_upload(&*pg, &unrelated_session_id).unwrap();
+            assert_eq!(session.bucket, bucket);
+            assert_eq!(session.key, key);
+        }
+    }
+
+    #[test]
+    fn stream_put_append_partial_apply_keeps_payload_for_pending_retry() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let session_id = crate::SessionId::try_from("33".repeat(16)).unwrap();
+        cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                &session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap();
+        let payload = b"stream append partial apply";
+        let (_target, segment) = cluster
+            .prepare_stream_segment_append(
+                &bucket,
+                &key,
+                &crate::PrepareStreamUploadSegmentAppendReq {
+                    session_id: session_id.clone(),
+                    segment_index: 0,
+                    size: payload.len() as u64,
+                    segment_crc64: Some(checksum::crc64::checksum(payload)),
+                    segment_okh: [89; 16],
+                },
+            )
+            .unwrap();
+        let written_shards = cluster
+            .write_stream_segment_payload_shards(&segment, payload)
+            .unwrap();
+        let shard_batch: Vec<(&crate::ShardKey, crate::WriteAck)> = written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect();
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_session_id = session_id.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::AppendStreamSegment(append)
+                        if append.segment.session_id == hook_session_id
+                            && node_id == NodeId::new(1)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected stream append metadata command apply failure",
+                            source: std::io::Error::other(
+                                "injected stream append metadata command apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .commit_stream_segment_append(
+                &bucket,
+                &key,
+                &session_id,
+                segment.segment_index,
+                &segment,
+                &shard_batch,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected stream append metadata command apply failure",
+                    ..
+                })
+            ),
+            "expected injected primary failure, got {err:?}"
+        );
+        drop(hook_guard);
+        assert!(
+            map.runtime_state()
+                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+                .is_some(),
+            "partial stream append command must remain pending"
+        );
+        {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = primary.get_pg(object_pg).unwrap();
+            assert!(
+                crate::PgMetadataStore::list_stream_segments(&*pg, &session_id)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        for node_id in [NodeId::new(0), NodeId::new(2)] {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::list_stream_segments(&*pg, &session_id).unwrap(),
+                vec![segment.clone()]
+            );
+        }
+
+        let mut readback = Vec::new();
+        cluster
+            .read_segment_payload_stored_bytes_into(
+                crate::SegmentStoredBytesRequest {
+                    data_pg_id: segment.data_pg_id,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    stored_size: payload.len(),
+                    segment_crc64: Some(checksum::crc64::checksum(payload)),
+                    ec: EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
+                },
+                &mut readback,
+            )
+            .unwrap();
+        assert_eq!(readback, payload);
+
+        cluster
+            .commit_stream_segment_append(
+                &bucket,
+                &key,
+                &session_id,
+                segment.segment_index,
+                &segment,
+                &shard_batch,
+            )
+            .unwrap();
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::list_stream_segments(&*pg, &session_id).unwrap(),
+                vec![segment.clone()]
+            );
+        }
+    }
+
+    #[test]
     fn direct_put_metadata_command_retry_reuses_pending_partial_replica_command() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

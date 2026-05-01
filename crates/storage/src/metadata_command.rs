@@ -8,11 +8,12 @@ use s3_types::{
 
 use crate::types::{
     BucketEncryptionConfig, BucketName, BucketObjectOwnership, BucketOwnershipControls,
-    BucketSubresourceAux, BucketSubresourceKind, ClusterEpoch, CreateBucketConfig, GenerationId,
-    ManagedEncryptionAlgorithm, MultipartPartRecord, MultipartPartSegmentRecord,
-    MultipartReclaimPartRecord, MultipartReclaimRecord, ObjectEncryption, ObjectEtag, ObjectKey,
-    ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
-    OwnerIdentity, PgId, PublicAccessBlockConfig, PutLiveObjectReq, SessionId, UploadId, VersionId,
+    BucketSubresourceAux, BucketSubresourceKind, ClusterEpoch, CreateBucketConfig,
+    CreateStreamUploadReq, GenerationId, ManagedEncryptionAlgorithm, MultipartPartRecord,
+    MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimRecord,
+    ObjectEncryption, ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord,
+    ObjectSegmentsReclaimRecord, OwnerIdentity, PgId, PublicAccessBlockConfig, PutLiveObjectReq,
+    SessionId, StreamUploadSegmentRecord, StreamUploadTarget, UploadId, VersionId,
 };
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
@@ -29,6 +30,9 @@ const METADATA_COMMAND_DELETE_OBJECT_VERSION: u16 = 9;
 const METADATA_COMMAND_INSERT_DELETE_MARKER: u16 = 10;
 const METADATA_COMMAND_COMMIT_MULTIPART_OBJECT: u16 = 11;
 const METADATA_COMMAND_PUT_OBJECT_METADATA: u16 = 12;
+const METADATA_COMMAND_CREATE_STREAM_UPLOAD: u16 = 13;
+const METADATA_COMMAND_APPEND_STREAM_SEGMENT: u16 = 14;
+const METADATA_COMMAND_ABORT_STREAM_UPLOAD: u16 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct MetadataCommandLogIndex(NonZeroU64);
@@ -154,6 +158,9 @@ pub(crate) enum MetadataCommandPayload {
     DeleteObjectVersion(Box<DeleteObjectVersionCommand>),
     InsertDeleteMarker(InsertDeleteMarkerCommand),
     PutObjectMetadata(Box<PutObjectMetadataCommand>),
+    CreateStreamUpload(Box<CreateStreamUploadCommand>),
+    AppendStreamSegment(Box<AppendStreamSegmentCommand>),
+    AbortStreamUpload(Box<AbortStreamUploadCommand>),
 }
 
 impl MetadataCommandPayload {
@@ -171,6 +178,9 @@ impl MetadataCommandPayload {
             Self::DeleteObjectVersion(_) => METADATA_COMMAND_DELETE_OBJECT_VERSION,
             Self::InsertDeleteMarker(_) => METADATA_COMMAND_INSERT_DELETE_MARKER,
             Self::PutObjectMetadata(_) => METADATA_COMMAND_PUT_OBJECT_METADATA,
+            Self::CreateStreamUpload(_) => METADATA_COMMAND_CREATE_STREAM_UPLOAD,
+            Self::AppendStreamSegment(_) => METADATA_COMMAND_APPEND_STREAM_SEGMENT,
+            Self::AbortStreamUpload(_) => METADATA_COMMAND_ABORT_STREAM_UPLOAD,
         }
     }
 }
@@ -546,6 +556,27 @@ impl PutObjectMetadataCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CreateStreamUploadCommand {
+    pub(crate) request: CreateStreamUploadReq,
+    pub(crate) created_at_millis: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AppendStreamSegmentCommand {
+    pub(crate) bucket: BucketName,
+    pub(crate) key: ObjectKey,
+    pub(crate) segment: StreamUploadSegmentRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AbortStreamUploadCommand {
+    pub(crate) bucket: BucketName,
+    pub(crate) key: ObjectKey,
+    pub(crate) session_id: SessionId,
+    pub(crate) staged_segments: Vec<StreamUploadSegmentRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MetadataCommandEnvelope {
     id: MetadataCommandId,
     payload: MetadataCommandPayload,
@@ -630,6 +661,15 @@ fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPaylo
         }
         MetadataCommandPayload::PutObjectMetadata(command) => {
             encode_put_object_metadata(&mut out, command);
+        }
+        MetadataCommandPayload::CreateStreamUpload(command) => {
+            encode_create_stream_upload(&mut out, command);
+        }
+        MetadataCommandPayload::AppendStreamSegment(command) => {
+            encode_append_stream_segment(&mut out, command);
+        }
+        MetadataCommandPayload::AbortStreamUpload(command) => {
+            encode_abort_stream_upload(&mut out, command);
         }
     }
     out
@@ -835,6 +875,31 @@ fn encode_put_object_metadata(out: &mut Vec<u8>, command: &PutObjectMetadataComm
     }
 }
 
+fn encode_create_stream_upload(out: &mut Vec<u8>, command: &CreateStreamUploadCommand) {
+    put_str(out, command.request.session_id.as_str());
+    put_str(out, command.request.bucket.as_str());
+    put_str(out, command.request.key.as_str());
+    encode_stream_upload_target(out, &command.request.target);
+    encode_object_encryption(out, &command.request.encryption);
+    put_u64(out, command.created_at_millis);
+}
+
+fn encode_append_stream_segment(out: &mut Vec<u8>, command: &AppendStreamSegmentCommand) {
+    put_str(out, command.bucket.as_str());
+    put_str(out, command.key.as_str());
+    encode_stream_upload_segment(out, &command.segment);
+}
+
+fn encode_abort_stream_upload(out: &mut Vec<u8>, command: &AbortStreamUploadCommand) {
+    put_str(out, command.bucket.as_str());
+    put_str(out, command.key.as_str());
+    put_str(out, command.session_id.as_str());
+    put_u32(out, command.staged_segments.len() as u32);
+    for segment in &command.staged_segments {
+        encode_stream_upload_segment(out, segment);
+    }
+}
+
 fn encode_put_live_object(out: &mut Vec<u8>, object: &PutLiveObjectReq) {
     put_str(out, object.bucket.as_str());
     put_str(out, object.key.as_str());
@@ -922,6 +987,32 @@ fn encode_multipart_part_segment(out: &mut Vec<u8>, segment: &MultipartPartSegme
     put_str(out, segment.upload_id.as_str());
     put_u64(out, segment.version_id);
     put_u32(out, segment.part_number);
+    put_u32(out, segment.segment_index);
+    put_u64(out, segment.size);
+    encode_optional_u64(out, segment.segment_crc64);
+    put_bytes(out, &segment.segment_okh);
+    put_u64(out, segment.segment_vid.get());
+    put_u32(out, segment.data_pg_id);
+    put_u8(out, segment.ec_k);
+    put_u8(out, segment.ec_m);
+}
+
+fn encode_stream_upload_target(out: &mut Vec<u8>, target: &StreamUploadTarget) {
+    match target {
+        StreamUploadTarget::PutObject => put_u8(out, 0),
+        StreamUploadTarget::UploadPart {
+            upload_id,
+            part_number,
+        } => {
+            put_u8(out, 1);
+            put_str(out, upload_id.as_str());
+            put_u32(out, *part_number);
+        }
+    }
+}
+
+fn encode_stream_upload_segment(out: &mut Vec<u8>, segment: &StreamUploadSegmentRecord) {
+    put_str(out, segment.session_id.as_str());
     put_u32(out, segment.segment_index);
     put_u64(out, segment.size);
     encode_optional_u64(out, segment.segment_crc64);
@@ -1560,6 +1651,18 @@ mod tests {
             last_modified: 444,
             checksum: None,
         };
+        let stream_session_id = SessionId::try_from("31".repeat(16)).unwrap();
+        let stream_segment = StreamUploadSegmentRecord {
+            session_id: stream_session_id.clone(),
+            segment_index: 3,
+            size: 17,
+            segment_crc64: Some(12),
+            segment_okh: [12; 16],
+            segment_vid: generation_id,
+            data_pg_id: 2,
+            ec_k: 2,
+            ec_m: 1,
+        };
         let selected_streaming_segment = MultipartPartSegmentRecord {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -1725,6 +1828,27 @@ mod tests {
                 version_id: VersionId::from_u64(8),
                 mutation: PutObjectMetadataMutation::PutLegalHold(StoredLegalHoldStatus::On),
             })),
+            MetadataCommandPayload::CreateStreamUpload(Box::new(CreateStreamUploadCommand {
+                request: CreateStreamUploadReq {
+                    session_id: stream_session_id.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    target: StreamUploadTarget::PutObject,
+                    encryption: ObjectEncryption::None,
+                },
+                created_at_millis: 561,
+            })),
+            MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                segment: stream_segment.clone(),
+            })),
+            MetadataCommandPayload::AbortStreamUpload(Box::new(AbortStreamUploadCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                session_id: stream_session_id,
+                staged_segments: vec![stream_segment],
+            })),
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
                 bucket,
                 key,
@@ -1768,7 +1892,10 @@ mod tests {
                 0x01cd87bdfd723201,
                 0x12751ef35639efd3,
                 0x22fd0e282e38997a,
-                0xfb00f982e5637056,
+                0xb0ae61b4136b6fee,
+                0x08ac52d90c51cc50,
+                0xf877e3e9352647f1,
+                0x98f153e9dac6e503,
             ]
         );
     }

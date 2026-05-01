@@ -3063,6 +3063,7 @@ pub struct StreamUploadRecord {
 }
 
 /// Request to create a streaming upload session.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateStreamUploadReq {
     pub session_id: SessionId,
     pub bucket: BucketName,
@@ -3084,7 +3085,7 @@ pub struct PrepareStreamUploadSegmentAppendReq {
 }
 
 /// Staging segment record for an in-progress streaming session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamUploadSegmentRecord {
     pub session_id: SessionId,
     pub segment_index: u32,

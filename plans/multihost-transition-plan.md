@@ -1292,9 +1292,20 @@ Work items:
        object delete
      - route stream PutObject generation reservation through the object
        metadata PG acting set and publish stream/copy finalization through the
-       same replicated standard-object command used by direct PUT, while
-       keeping stream segment staging metadata on the routed-primary bridge for
-       the remaining stream slice
+       same replicated standard-object command used by direct PUT
+     - add `CreateStreamUpload`, `AppendStreamSegment`, and `AbortStreamUpload`
+       command payloads for PutObject stream staging metadata, with canonical
+       encoding coverage
+     - route PutObject stream session creation, segment append, and abort
+       through the object metadata PG acting set; prepare drains pending object
+       commands before allocating the next staged segment generation
+     - harden stream append cleanup so zero-apply append command failures
+       remove the just-written payload shards and ack rows, while partial
+       replica apply keeps payload in place with the pending command for retry
+     - include acting-set convergence coverage for PutObject stream session
+       creation, append, and abort, plus a partial-primary-apply append retry
+       regression proving payload remains readable until the pending command
+       converges
      - add `CommitMultipartObject` command payloads as the actual completed
        multipart object publication path, carrying the exact live object,
        manifest parts, selected streamed part segment rows, completed-upload
@@ -1337,7 +1348,6 @@ Work items:
        null-current expiration, noncurrent live-version expiration, and expired
        delete-marker removal
    - remaining slices:
-     - stream segment append/abort metadata and cleanup hardening
      - multipart create, part upload, upload-part stream staging, abort, and
        remaining multipart staging metadata
      - reclaim rows and reclaim worker metadata transitions

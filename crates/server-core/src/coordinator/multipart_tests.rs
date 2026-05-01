@@ -7083,6 +7083,10 @@ fn stream_put_multiple_segments_correct_manifest() {
 
 #[test]
 fn stream_put_abort_cleans_up_shards() {
+    let _storage_serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap();
     let dir = test_util::tempdir();
     let coord = setup_coordinator(dir.path());
     coord

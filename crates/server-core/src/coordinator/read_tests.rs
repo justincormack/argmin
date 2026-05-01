@@ -481,7 +481,11 @@ fn stream_put_abort_ack_cleanup_failure_traces_after_placed_cleanup() {
 
 #[test]
 fn stream_put_abort_cleans_segment_committed_during_abort_window() {
-    let _serial = STREAM_APPEND_TEST_SERIAL
+    let _storage_serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _stream_serial = STREAM_APPEND_TEST_SERIAL
         .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
         .unwrap();

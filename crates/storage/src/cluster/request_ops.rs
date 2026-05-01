@@ -15,11 +15,12 @@ use super::{
 };
 use crate::metadata_command::{
     BucketPropertyMutation, BucketSubresourceMutation, CommitDirectPutObjectCommand,
-    CommitMultipartObjectCommand, CreateBucketCommand, DeleteObjectVersionCommand,
-    DeleteObjectVersionTarget, InsertDeleteMarkerCommand, MetadataCommandEnvelope,
-    MetadataCommandId, MetadataCommandPayload, ObjectPayloadReclaimCommand, PutBucketAclCommand,
-    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
-    PutObjectMetadataCommand, PutObjectMetadataMutation,
+    CommitMultipartObjectCommand, CreateBucketCommand, CreateStreamUploadCommand,
+    DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
+    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
+    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
+    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
+    PutObjectMetadataMutation,
 };
 use crate::*;
 
@@ -164,6 +165,21 @@ fn metadata_command_apply_test_context(
         ),
         MetadataCommandPayload::PutObjectMetadata(command) => (
             MetadataCommandApplyTestKind::PutObjectMetadata,
+            Some(command.bucket.clone()),
+            Some(command.key.clone()),
+        ),
+        MetadataCommandPayload::CreateStreamUpload(command) => (
+            MetadataCommandApplyTestKind::CreateStreamUpload,
+            Some(command.request.bucket.clone()),
+            Some(command.request.key.clone()),
+        ),
+        MetadataCommandPayload::AppendStreamSegment(command) => (
+            MetadataCommandApplyTestKind::AppendStreamSegment,
+            Some(command.bucket.clone()),
+            Some(command.key.clone()),
+        ),
+        MetadataCommandPayload::AbortStreamUpload(command) => (
+            MetadataCommandApplyTestKind::AbortStreamUpload,
             Some(command.bucket.clone()),
             Some(command.key.clone()),
         ),
@@ -365,7 +381,10 @@ impl super::StorageCluster {
                 | MetadataCommandPayload::CommitMultipartObject(_)
                 | MetadataCommandPayload::DeleteObjectVersion(_)
                 | MetadataCommandPayload::InsertDeleteMarker(_)
-                | MetadataCommandPayload::PutObjectMetadata(_) => {
+                | MetadataCommandPayload::PutObjectMetadata(_)
+                | MetadataCommandPayload::CreateStreamUpload(_)
+                | MetadataCommandPayload::AppendStreamSegment(_)
+                | MetadataCommandPayload::AbortStreamUpload(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending object command for create bucket",
                     ));
@@ -846,7 +865,10 @@ impl super::StorageCluster {
                 | MetadataCommandPayload::CommitMultipartObject(_)
                 | MetadataCommandPayload::DeleteObjectVersion(_)
                 | MetadataCommandPayload::InsertDeleteMarker(_)
-                | MetadataCommandPayload::PutObjectMetadata(_) => {
+                | MetadataCommandPayload::PutObjectMetadata(_)
+                | MetadataCommandPayload::CreateStreamUpload(_)
+                | MetadataCommandPayload::AppendStreamSegment(_)
+                | MetadataCommandPayload::AbortStreamUpload(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending object command for versioning",
                     ));
@@ -1018,7 +1040,10 @@ impl super::StorageCluster {
                 | MetadataCommandPayload::CommitMultipartObject(_)
                 | MetadataCommandPayload::DeleteObjectVersion(_)
                 | MetadataCommandPayload::InsertDeleteMarker(_)
-                | MetadataCommandPayload::PutObjectMetadata(_) => {
+                | MetadataCommandPayload::PutObjectMetadata(_)
+                | MetadataCommandPayload::CreateStreamUpload(_)
+                | MetadataCommandPayload::AppendStreamSegment(_)
+                | MetadataCommandPayload::AbortStreamUpload(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending object command for bucket acl",
                     ));
@@ -1115,7 +1140,10 @@ impl super::StorageCluster {
                 | MetadataCommandPayload::CommitMultipartObject(_)
                 | MetadataCommandPayload::DeleteObjectVersion(_)
                 | MetadataCommandPayload::InsertDeleteMarker(_)
-                | MetadataCommandPayload::PutObjectMetadata(_) => {
+                | MetadataCommandPayload::PutObjectMetadata(_)
+                | MetadataCommandPayload::CreateStreamUpload(_)
+                | MetadataCommandPayload::AppendStreamSegment(_)
+                | MetadataCommandPayload::AbortStreamUpload(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending object command for bucket property",
                     ));
@@ -1235,7 +1263,10 @@ impl super::StorageCluster {
                 | MetadataCommandPayload::CommitMultipartObject(_)
                 | MetadataCommandPayload::DeleteObjectVersion(_)
                 | MetadataCommandPayload::InsertDeleteMarker(_)
-                | MetadataCommandPayload::PutObjectMetadata(_) => {
+                | MetadataCommandPayload::PutObjectMetadata(_)
+                | MetadataCommandPayload::CreateStreamUpload(_)
+                | MetadataCommandPayload::AppendStreamSegment(_)
+                | MetadataCommandPayload::AbortStreamUpload(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending object command for bucket subresource",
                     ));
@@ -2071,7 +2102,7 @@ impl super::StorageCluster {
         }))
     }
 
-    fn apply_new_object_metadata_command_for_bucket(
+    pub(super) fn apply_new_object_metadata_command_for_bucket(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
@@ -3273,10 +3304,12 @@ impl super::StorageCluster {
             Option<StoredObject>,
         ) -> Result<(T, CreateStreamUploadReq), E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
-        let pg_id = self.object_metadata_pg_id(bucket, key);
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
         primary_node.with_bucket_write_reservation_snapshot(bucket, request, |snapshot| {
-            let object_pg = primary_node.get_pg(pg_id)?;
+            let object_pg = primary_node.get_pg(pg_id.get())?;
             let existing_object = match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
                 Ok(StoredObject::Live(record)) => Some(StoredObject::Live(record)),
                 Ok(StoredObject::DeleteMarker(_)) | Err(MetadataError::ObjectNotFound) => None,
@@ -3288,14 +3321,40 @@ impl super::StorageCluster {
                 Ok(prepared) => prepared,
                 Err(error) => return Ok(Err(error)),
             };
+            if self
+                .matching_stream_upload_exists(pg_id, &create)
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
+            {
+                return Ok(Ok(value));
+            }
             self.reserve_put_object_generation(bucket, key, &create.session_id)
                 .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
 
-            let object_pg = primary_node.get_pg(pg_id)?;
-            if let Err(error) = object_pg.create_stream_upload(&create) {
-                drop(object_pg);
-                let _ = self.release_object_generation_reservation(bucket, key, &create.session_id);
-                return Err(error.into());
+            let command = MetadataCommandEnvelope::new(
+                self.next_object_metadata_command_id(pg_id),
+                MetadataCommandPayload::CreateStreamUpload(Box::new(CreateStreamUploadCommand {
+                    request: create.clone(),
+                    created_at_millis: crate::clock::current_time_millis(),
+                })),
+            );
+            self.local_map
+                .runtime_state()
+                .set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            if let Err(error) =
+                self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
+            {
+                if self
+                    .local_map
+                    .runtime_state()
+                    .pending_metadata_command_for_bucket(pg_id, bucket)
+                    .is_none()
+                {
+                    let _ =
+                        self.release_object_generation_reservation(bucket, key, &create.session_id);
+                }
+                return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                    error,
+                ));
             }
 
             Ok(Ok(value))

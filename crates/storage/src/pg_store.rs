@@ -19,8 +19,9 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 use crate::error::{MetadataError, StoreError};
 use crate::metadata_command::{
-    BucketPropertyMutation, BucketSubresourceMutation, CommitDirectPutObjectCommand,
-    CommitMultipartObjectCommand, CreateBucketCommand, DeleteObjectVersionCommand,
+    AbortStreamUploadCommand, AppendStreamSegmentCommand, BucketPropertyMutation,
+    BucketSubresourceMutation, CommitDirectPutObjectCommand, CommitMultipartObjectCommand,
+    CreateBucketCommand, CreateStreamUploadCommand, DeleteObjectVersionCommand,
     DeleteObjectVersionTarget, InsertDeleteMarkerCommand, MetadataCommandEnvelope,
     MetadataCommandPayload, ObjectPayloadReclaimCommand, PutBucketAclCommand,
     PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
@@ -2132,6 +2133,15 @@ impl PgStore {
             MetadataCommandPayload::PutObjectMetadata(command) => {
                 self.apply_put_object_metadata_command(command)
             }
+            MetadataCommandPayload::CreateStreamUpload(command) => {
+                self.apply_create_stream_upload_command(command)
+            }
+            MetadataCommandPayload::AppendStreamSegment(command) => {
+                self.apply_append_stream_segment_command(command)
+            }
+            MetadataCommandPayload::AbortStreamUpload(command) => {
+                self.apply_abort_stream_upload_command(command)
+            }
         }
     }
 
@@ -2820,6 +2830,186 @@ impl PgStore {
                 *public_read,
             ),
         }
+    }
+
+    fn create_stream_upload_explicit(
+        &self,
+        req: &CreateStreamUploadReq,
+        created_at_millis: u64,
+    ) -> Result<(), MetadataError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::create_stream_upload_explicit",
+            "pg_id={} session_id={:?} bucket={:?} key={:?}",
+            self.pg_id,
+            req.session_id.as_str(),
+            req.bucket.as_str(),
+            req.key.as_str()
+        );
+        let op_kind = req.target.op_kind() as u8;
+        let upload_id = req.target.upload_id();
+        let part_number = req.target.part_number().map(|n| n as i64);
+        let encryption_type = req.encryption.encryption_type() as u8;
+        let encryption_state = req.encryption.encode_state();
+        self.conn
+            .execute(
+                "INSERT INTO stream_uploads \
+                 (session_id, bucket, key, op_kind, upload_id, part_number, state, created_at, encryption_type, encryption_state) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9)",
+                params![
+                    req.session_id,
+                    req.bucket,
+                    req.key,
+                    op_kind,
+                    upload_id,
+                    part_number,
+                    created_at_millis as i64,
+                    encryption_type,
+                    encryption_state,
+                ],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "create stream upload explicit",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn advance_stream_segment_vid_at_least(
+        &self,
+        segment: &StreamUploadSegmentRecord,
+    ) -> Result<(), MetadataError> {
+        let next_segment_vid =
+            segment
+                .segment_vid
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| MetadataError::Db {
+                    context: "stream segment command vid overflow",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Integer,
+                        Box::from("next_segment_vid overflow"),
+                    ),
+                })? as i64;
+        self.conn
+            .execute(
+                "UPDATE stream_uploads \
+                 SET next_segment_vid = CASE WHEN next_segment_vid < ?1 THEN ?1 ELSE next_segment_vid END \
+                 WHERE session_id = ?2",
+                params![next_segment_vid, segment.session_id.as_str()],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "advance stream segment command vid",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn apply_create_stream_upload_command(
+        &self,
+        command: &CreateStreamUploadCommand,
+    ) -> Result<(), MetadataError> {
+        match self.get_stream_upload(&command.request.session_id) {
+            Ok(existing)
+                if existing.bucket == command.request.bucket
+                    && existing.key == command.request.key
+                    && existing.target == command.request.target
+                    && existing.state == StreamUploadState::InProgress
+                    && existing.created_at == command.created_at_millis
+                    && existing.encryption == command.request.encryption =>
+            {
+                Ok(())
+            }
+            Ok(_) => Err(MetadataError::Db {
+                context: "create stream upload command existing session mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            }),
+            Err(MetadataError::StreamSessionNotFound { .. }) => {
+                self.create_stream_upload_explicit(&command.request, command.created_at_millis)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn apply_append_stream_segment_command(
+        &self,
+        command: &AppendStreamSegmentCommand,
+    ) -> Result<(), MetadataError> {
+        self.with_immediate_txn(
+            "append stream segment command (begin txn)",
+            "append stream segment command (commit txn)",
+            |store| {
+                let session = store.get_stream_upload(&command.segment.session_id)?;
+                if session.bucket != command.bucket || session.key != command.key {
+                    return Err(MetadataError::Db {
+                        context: "append stream segment command session binding mismatch",
+                        source: rusqlite::Error::InvalidQuery,
+                    });
+                }
+                if session.state != StreamUploadState::InProgress {
+                    return Err(MetadataError::StreamSessionNotInProgress {
+                        state: session.state as u8,
+                    });
+                }
+
+                let existing = store
+                    .list_stream_segments(&command.segment.session_id)?
+                    .into_iter()
+                    .find(|segment| segment.segment_index == command.segment.segment_index);
+                match existing {
+                    Some(existing) if existing == command.segment => {
+                        store.advance_stream_segment_vid_at_least(&command.segment)?;
+                        Ok(())
+                    }
+                    Some(_) => Err(MetadataError::Db {
+                        context: "append stream segment command existing segment mismatch",
+                        source: rusqlite::Error::InvalidQuery,
+                    }),
+                    None => {
+                        store.append_stream_segment(&command.segment)?;
+                        store.advance_stream_segment_vid_at_least(&command.segment)
+                    }
+                }
+            },
+        )
+    }
+
+    fn apply_abort_stream_upload_command(
+        &self,
+        command: &AbortStreamUploadCommand,
+    ) -> Result<(), MetadataError> {
+        self.with_immediate_txn(
+            "abort stream upload command (begin txn)",
+            "abort stream upload command (commit txn)",
+            |store| {
+                let session = match store.get_stream_upload(&command.session_id) {
+                    Ok(session) => session,
+                    Err(MetadataError::StreamSessionNotFound { .. }) => return Ok(()),
+                    Err(error) => return Err(error),
+                };
+                if session.bucket != command.bucket || session.key != command.key {
+                    return Err(MetadataError::Db {
+                        context: "abort stream upload command session binding mismatch",
+                        source: rusqlite::Error::InvalidQuery,
+                    });
+                }
+                if session.state != StreamUploadState::InProgress {
+                    return Err(MetadataError::StreamSessionNotInProgress {
+                        state: session.state as u8,
+                    });
+                }
+                let staged_segments = store.list_stream_segments(&command.session_id)?;
+                if staged_segments != command.staged_segments {
+                    return Err(MetadataError::Db {
+                        context: "abort stream upload command staged segment mismatch",
+                        source: rusqlite::Error::InvalidQuery,
+                    });
+                }
+                store.set_stream_upload_state(&command.session_id, StreamUploadState::Aborted)?;
+                store.delete_stream_upload(&command.session_id)
+            },
+        )
     }
 
     fn put_delete_marker_explicit_in_open_txn(
