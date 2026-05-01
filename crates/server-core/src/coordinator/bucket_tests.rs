@@ -282,6 +282,7 @@ fn put_bucket_tags_for_tag_resource_test(
             account_id,
         },
         config,
+        request_tags: &[],
     })
 }
 

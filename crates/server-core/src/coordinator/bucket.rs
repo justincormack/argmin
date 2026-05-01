@@ -18,7 +18,8 @@ use super::{
     PutBucketAclRequest, PutBucketConfigRequest, PutBucketEncryptionRequest,
     PutBucketObjectLockConfigurationRequest, PutBucketOwnershipControlsRequest,
     PutBucketPolicyRequest, PutBucketPublicAccessBlockRequest, PutBucketTagControlRequest,
-    PutBucketVersioningRequest, TRACE_TARGET,
+    PutBucketTagsForUntagResourceRequest, PutBucketVersioningRequest, UntagBucketTagControlRequest,
+    TRACE_TARGET,
 };
 use crate::error::ServerError;
 
@@ -583,7 +584,7 @@ impl Coordinator {
             "bucket={:?}",
             req.bucket.name
         );
-        let authorized = self.authorize_bucket_tag_control(req)?;
+        let authorized = self.authorize_bucket_tag_control_merge_read(req)?;
         self.load_authorized_bucket_subresource(&AuthorizedBucketSubresourceGet {
             bucket: authorized.bucket,
             kind: storage::BucketSubresourceKind::Tagging,
@@ -601,7 +602,7 @@ impl Coordinator {
             req.control.bucket.name,
             req.config.len()
         );
-        let authorized = self.authorize_bucket_tag_control(&req.control)?;
+        let authorized = self.authorize_put_bucket_tag_control(req)?;
         let info = self.store_bucket_subresource(
             &authorized.bucket,
             storage::PutBucketSubresource {
@@ -625,6 +626,50 @@ impl Coordinator {
             req.bucket.name
         );
         let authorized = self.authorize_bucket_tag_control(req)?;
+        let info =
+            self.remove_authorized_bucket_subresource(&AuthorizedBucketSubresourceDelete {
+                bucket: authorized.bucket,
+                kind: storage::BucketSubresourceKind::Tagging,
+            })?;
+        self.clear_bucket_fast_path(&info);
+        Ok(())
+    }
+
+    pub fn put_bucket_tags_for_untag_resource(
+        &self,
+        req: &PutBucketTagsForUntagResourceRequest<'_>,
+    ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_bucket_tags_for_untag_resource",
+            "bucket={:?} bytes={}",
+            req.control.bucket.name,
+            req.config.len()
+        );
+        let authorized = self.authorize_put_bucket_tags_for_untag_resource(req)?;
+        let info = self.store_bucket_subresource(
+            &authorized.bucket,
+            storage::PutBucketSubresource {
+                kind: storage::BucketSubresourceKind::Tagging,
+                body: req.config,
+                aux: storage::BucketSubresourceAux::None,
+            },
+        )?;
+        self.clear_bucket_fast_path(&info);
+        Ok(())
+    }
+
+    pub fn delete_bucket_tags_for_untag_resource(
+        &self,
+        req: &UntagBucketTagControlRequest<'_>,
+    ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::delete_bucket_tags_for_untag_resource",
+            "bucket={:?}",
+            req.control.bucket.name
+        );
+        let authorized = self.authorize_untag_bucket_tag_control(req)?;
         let info =
             self.remove_authorized_bucket_subresource(&AuthorizedBucketSubresourceDelete {
                 bucket: authorized.bucket,

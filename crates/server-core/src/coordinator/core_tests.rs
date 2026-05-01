@@ -1996,6 +1996,7 @@ fn head_object_does_not_wait_for_bucket_pg_when_boe_policy_and_abac_tags_fast_pa
             },
             config:
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
+            request_tags: &[],
         })
         .unwrap();
     assert!(admin
@@ -2947,6 +2948,7 @@ fn put_bucket_tags_invalidates_warm_fast_path_tags() {
             },
             config:
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
+            request_tags: &[],
         })
         .unwrap();
 

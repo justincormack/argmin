@@ -2720,6 +2720,7 @@ fn upload_part_copy_boe_source_bucket_tag_abac_controls_access() {
             },
             config:
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
+            request_tags: &[],
         })
         .unwrap();
 

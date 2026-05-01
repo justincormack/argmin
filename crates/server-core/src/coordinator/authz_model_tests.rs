@@ -10436,6 +10436,7 @@ mod phase12_harness {
                                     account_id: "111122223333",
                                 },
                                 config,
+                                request_tags: &[],
                             })
                             .unwrap_or_else(|err| {
                                 panic!("failed to set bucket tags through tag control: {err:?}")

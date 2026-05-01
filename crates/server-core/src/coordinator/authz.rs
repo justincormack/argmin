@@ -56,8 +56,9 @@ use super::request_types::{
     ObjectVersionRequest, PutBucketAbacRequest, PutBucketAclInput, PutBucketAclRequest,
     PutBucketConfigRequest, PutBucketEncryptionRequest, PutBucketObjectLockConfigurationRequest,
     PutBucketOwnershipControlsRequest, PutBucketPolicyRequest, PutBucketPublicAccessBlockRequest,
-    PutBucketVersioningRequest, PutObjectAcl, PutObjectPolicyContext, PutObjectWriteAcl, Requester,
-    TaggingDirective, UploadPartCopyRequest,
+    PutBucketTagControlRequest, PutBucketTagsForUntagResourceRequest, PutBucketVersioningRequest,
+    PutObjectAcl, PutObjectPolicyContext, PutObjectWriteAcl, Requester, TaggingDirective,
+    UntagBucketTagControlRequest, UploadPartCopyRequest,
 };
 use super::response_types::{BucketSummary, GetBucketAclResult, ModernBucketSummary};
 use super::Coordinator;

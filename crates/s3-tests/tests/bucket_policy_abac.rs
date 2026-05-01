@@ -1001,6 +1001,74 @@ fn test_bucket_policy_get_bucket_tagging_bucket_tag_condition_when_abac_enabled(
 }
 
 #[test]
+fn test_bucket_policy_get_bucket_tagging_resource_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_sse_c(client).await;
+        client
+            .put_bucket_tagging()
+            .bucket(&bucket)
+            .tagging(simple_bucket_tagging("security", "allow"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_abac()
+            .bucket(&bucket)
+            .abac_status(enabled_abac_status())
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:GetBucketTagging",
+                        "Resource": bucket_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "aws:ResourceTag/security": "allow"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let response = eventually_ok(
+            "GetBucketTagging allowed by aws:ResourceTag/security=allow",
+            || alt_client.get_bucket_tagging().bucket(&bucket).send(),
+        )
+        .await;
+        assert_eq!(response.tag_set().len(), 1);
+        assert_eq!(response.tag_set()[0].key(), "security");
+        assert_eq!(response.tag_set()[0].value(), "allow");
+
+        let tag = tag_resource(&bucket, &[("security", "deny")]);
+        assert_eq!(tag.status, 204, "TagResource failed: {:?}", tag);
+
+        eventually_access_denied(
+            "GetBucketTagging denied after aws:ResourceTag/security changes to deny",
+            || alt_client.get_bucket_tagging().bucket(&bucket).send(),
+        )
+        .await;
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_list_bucket_bucket_tag_condition_when_abac_enabled() {
     s3_tests::run(async {
         let principal = alt_policy_principal();

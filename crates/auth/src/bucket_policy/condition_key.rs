@@ -20,9 +20,10 @@ use super::{
 ///
 /// Mirrors the existing evaluator's distinction between "known absent",
 /// "present with this value", and "cannot be determined in this context".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ResolvedValue<'a> {
     Present(&'a str),
+    PresentValues(Vec<&'a str>),
     Absent,
     Unavailable,
 }
@@ -108,11 +109,39 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
         supported_for_action: Some(bucket_tag_supported_for_action),
     },
     ConditionKeyResolver {
+        key: KeyMatch::Prefix("aws:ResourceTag/"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_bucket_tag,
+        evaluable_for_action: None,
+        supported_for_action: Some(bucket_tag_supported_for_action),
+    },
+    ConditionKeyResolver {
         key: KeyMatch::Prefix("s3:RequestObjectTag/"),
         operator_support: OperatorSupport::AnyEvaluable,
         resolve: resolve_request_object_tag,
         evaluable_for_action: None,
         supported_for_action: Some(request_object_tag_supported_for_action),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Prefix("aws:RequestTag/"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_request_object_tag,
+        evaluable_for_action: None,
+        supported_for_action: Some(request_tag_supported_for_action),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:RequestObjectTagKeys"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_request_tag_keys,
+        evaluable_for_action: None,
+        supported_for_action: Some(request_object_tag_supported_for_action),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("aws:TagKeys"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_request_tag_keys,
+        evaluable_for_action: None,
+        supported_for_action: Some(tag_keys_supported_for_action),
     },
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:x-amz-copy-source"),
@@ -257,6 +286,15 @@ fn resolve_request_object_tag<'a>(request: &PolicyRequest<'a>, param: &str) -> R
     option_to_resolved(request.request_object_tag_value(param))
 }
 
+fn resolve_request_tag_keys<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    let keys = request.request_tag_keys();
+    if keys.is_empty() {
+        ResolvedValue::Absent
+    } else {
+        ResolvedValue::PresentValues(keys)
+    }
+}
+
 fn resolve_bucket_tag<'a>(request: &PolicyRequest<'a>, param: &str) -> ResolvedValue<'a> {
     match request.bucket_tag_value(param) {
         BucketTagValue::Unavailable => ResolvedValue::Unavailable,
@@ -374,11 +412,25 @@ fn existing_object_tag_supported_for_action(action: PolicyAction) -> bool {
 }
 
 fn request_object_tag_supported_for_action(action: PolicyAction) -> bool {
-    !matches!(
+    matches!(
         action,
-        PolicyAction::PutObjectAcl
-            | PolicyAction::PutObjectRetention
-            | PolicyAction::PutObjectLegalHold
+        PolicyAction::PutObject
+            | PolicyAction::PutObjectTagging
+            | PolicyAction::PutObjectVersionTagging
+    )
+}
+
+fn tag_keys_supported_for_action(action: PolicyAction) -> bool {
+    matches!(
+        action,
+        PolicyAction::TagResource | PolicyAction::UntagResource
+    )
+}
+
+fn request_tag_supported_for_action(action: PolicyAction) -> bool {
+    matches!(
+        action,
+        PolicyAction::TagResource | PolicyAction::UntagResource
     )
 }
 
@@ -431,6 +483,8 @@ fn bucket_tag_supported_for_action(action: PolicyAction) -> bool {
             | PolicyAction::PutLifecycleConfiguration
             | PolicyAction::PutBucketPublicAccessBlock
             | PolicyAction::PutBucketObjectLockConfiguration
+            | PolicyAction::TagResource
+            | PolicyAction::UntagResource
     )
 }
 
@@ -558,6 +612,7 @@ pub(super) fn evaluate_clause(
     }
     let actual = match (resolver.resolve)(request, param) {
         ResolvedValue::Present(value) => ActualValue::Present(value),
+        ResolvedValue::PresentValues(values) => ActualValue::PresentValues(values),
         ResolvedValue::Absent => ActualValue::Absent,
         ResolvedValue::Unavailable => return ConditionMatchResult::InputUnavailable,
     };
@@ -602,6 +657,49 @@ mod tests {
         assert_eq!(param, "classification");
         assert_eq!(resolver.operator_support, OperatorSupport::AnyEvaluable);
         assert!(resolver.evaluable_for_action.is_none());
+    }
+
+    #[test]
+    fn lookup_multivalue_tag_keys_returns_exact_resolvers() {
+        let (request_tag_keys, param) = lookup("s3:RequestObjectTagKeys").unwrap();
+        assert_eq!(param, "");
+        assert_eq!(
+            request_tag_keys.operator_support,
+            OperatorSupport::AnyEvaluable
+        );
+        assert!(request_tag_keys.supported_for_action.is_some());
+
+        let (aws_tag_keys, param) = lookup("aws:TagKeys").unwrap();
+        assert_eq!(param, "");
+        assert_eq!(aws_tag_keys.operator_support, OperatorSupport::AnyEvaluable);
+        let predicate = aws_tag_keys
+            .supported_for_action
+            .expect("aws:TagKeys has an action support predicate");
+        assert!(predicate(PolicyAction::TagResource));
+        assert!(predicate(PolicyAction::UntagResource));
+        assert!(!predicate(PolicyAction::PutObjectTagging));
+    }
+
+    #[test]
+    fn lookup_request_tag_returns_tag_resource_resolver() {
+        let (resolver, param) = lookup("aws:RequestTag/classification").unwrap();
+        assert_eq!(param, "classification");
+        assert_eq!(resolver.operator_support, OperatorSupport::AnyEvaluable);
+        let predicate = resolver
+            .supported_for_action
+            .expect("aws:RequestTag has an action support predicate");
+        assert!(predicate(PolicyAction::TagResource));
+        assert!(predicate(PolicyAction::UntagResource));
+        assert!(!predicate(PolicyAction::PutObjectTagging));
+    }
+
+    #[test]
+    fn lookup_resource_tag_returns_bucket_tag_resolver() {
+        let (resolver, param) = lookup("aws:ResourceTag/classification").unwrap();
+        assert_eq!(param, "classification");
+        assert_eq!(resolver.operator_support, OperatorSupport::AnyEvaluable);
+        assert!(resolver.evaluable_for_action.is_none());
+        assert!(resolver.supported_for_action.is_some());
     }
 
     #[test]
@@ -712,13 +810,36 @@ mod tests {
         assert!(!predicate(PolicyAction::PutObjectRetention));
         assert!(!predicate(PolicyAction::PutObjectLegalHold));
         assert!(predicate(PolicyAction::PutObject));
+        assert!(predicate(PolicyAction::PutObjectTagging));
+        assert!(predicate(PolicyAction::PutObjectVersionTagging));
+    }
+
+    #[test]
+    fn request_object_tag_unsupported_for_control_tagging_actions() {
+        let (request_tag, _) = lookup("s3:RequestObjectTag/x").unwrap();
+        let request_tag_predicate = request_tag
+            .supported_for_action
+            .expect("RequestObjectTag has a support predicate");
+        assert!(!request_tag_predicate(PolicyAction::TagResource));
+        assert!(!request_tag_predicate(PolicyAction::UntagResource));
+
+        let (request_tag_keys, _) = lookup("s3:RequestObjectTagKeys").unwrap();
+        let request_tag_keys_predicate = request_tag_keys
+            .supported_for_action
+            .expect("RequestObjectTagKeys has a support predicate");
+        assert!(!request_tag_keys_predicate(PolicyAction::TagResource));
+        assert!(!request_tag_keys_predicate(PolicyAction::UntagResource));
     }
 
     #[test]
     fn every_expected_key_has_a_row() {
         for key in [
             "s3:ExistingObjectTag/x",
+            "aws:ResourceTag/x",
             "s3:RequestObjectTag/x",
+            "aws:RequestTag/x",
+            "s3:RequestObjectTagKeys",
+            "aws:TagKeys",
             "s3:x-amz-copy-source",
             "s3:x-amz-metadata-directive",
             "s3:x-amz-acl",

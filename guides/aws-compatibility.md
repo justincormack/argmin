@@ -50,18 +50,21 @@ clients:
 - in `crates/s3-tests`, use the bounded recreate helper rather than a fixed
   sleep for delete-then-recreate flows
 
-### `x-amz-copy-source` percent-encoded NUL is intentionally rejected as a client error
+### Some AWS `500 InternalError` responses are intentionally rejected as client errors
 
-AWS currently responds with `500 InternalError` for at least one malformed
-`x-amz-copy-source` case: a percent-encoded NUL byte in the source object key.
+AWS currently responds with `500 InternalError` for a small number of malformed
+client requests where the input is not a server fault. Known cases:
 
-Argmin intentionally does not match that behavior. We reject this as
-`400 InvalidArgument` because the input is client-invalid and treating it as a
-server fault would be the wrong contract to preserve.
+- `CopyObject` with a percent-encoded NUL byte in `x-amz-copy-source`.
+  Argmin returns `400 InvalidArgument`.
+- S3 Control `UntagResource` with more than 50 `tagKeys` query parameters.
+  Argmin returns `400 InvalidTag`.
 
-The AWS-backed `s3-tests` coverage for this case is allowed to diverge
-explicitly, and should not be treated as a general license to ignore AWS
-results elsewhere.
+Argmin intentionally does not match the `500 InternalError` status in these
+cases. Treating malformed client input as a server fault would be the wrong
+contract to preserve. The AWS-backed `s3-tests` coverage for these cases is
+allowed to accept either the live AWS `500` or Argmin's `4xx` response, and this
+should not be treated as a general license to ignore AWS results elsewhere.
 
 ### Streaming write prepare failures can differ at the transport level
 
@@ -121,6 +124,24 @@ The AWS-pinned coverage is in:
 Source with the contradictory note:
 
 - https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes-enforce.html
+
+### `aws:RequestTag/*` on S3 Control `UntagResource`
+
+AWS's S3 service authorization reference lists `aws:TagKeys` for
+`s3:UntagResource`, but does not list `aws:RequestTag/${TagKey}` for that
+action.
+
+Live AWS accepts bucket policies that use `aws:RequestTag/${TagKey}` on
+`s3:UntagResource`. For a requested tag key, AWS evaluates the corresponding
+`aws:RequestTag/${TagKey}` value as an empty string:
+
+- `StringEquals { "aws:RequestTag/security": "allow" }` does not match
+- `StringEquals { "aws:RequestTag/security": "" }` matches
+
+The AWS-pinned coverage is in:
+
+- `test_bucket_policy_request_tag_condition_on_untag_resource_is_accepted_but_does_not_match_value`
+- `test_bucket_policy_request_tag_condition_on_untag_resource_matches_empty_value`
 
 ## Current known gaps
 

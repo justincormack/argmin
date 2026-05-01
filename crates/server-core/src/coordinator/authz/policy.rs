@@ -256,7 +256,6 @@ pub(super) fn bucket_policy_decision_for_bucket_loaded_with_tags(
         .flat_map(|tags| tags.iter())
         .map(|(key, value)| auth::PolicyTag::new(key, value))
         .collect();
-
     let request = auth::PolicyRequest::for_bucket(
         action,
         bucket.name.as_str(),
@@ -308,6 +307,12 @@ pub(super) fn bucket_policy_decision_for_loaded_handle_with_context(
         .flat_map(|tags| tags.iter())
         .map(|(key, value)| auth::PolicyTag::new(key, value))
         .collect();
+    let request_tags: Vec<auth::PolicyTag<'_>> = policy_context
+        .request_tags
+        .unwrap_or(&[])
+        .iter()
+        .map(|(key, value)| auth::PolicyTag::new(key, value))
+        .collect();
 
     let request = auth::PolicyRequest::for_bucket(
         action,
@@ -320,6 +325,7 @@ pub(super) fn bucket_policy_decision_for_loaded_handle_with_context(
             auth::bucket_policy::BucketTags::Unavailable
         },
     )
+    .with_request_object_tags(&request_tags)
     .with_canned_acl(policy_context.canned_acl)
     .with_grant_read(policy_context.grant_read)
     .with_grant_write(policy_context.grant_write)

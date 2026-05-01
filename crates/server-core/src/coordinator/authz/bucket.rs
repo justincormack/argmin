@@ -263,6 +263,92 @@ impl Coordinator {
         })
     }
 
+    pub(in crate::coordinator) fn authorize_bucket_tag_control_merge_read(
+        &self,
+        req: &BucketTagControlRequest<'_>,
+    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
+        self.with_bucket_write_handle_for(&req.bucket, BucketHandleRequest::new(), |bucket| {
+            Self::validate_tag_resource_account_id(bucket.bucket(), req.account_id)?;
+            Ok(AuthorizedBucketConfigAccess {
+                bucket: req.bucket.name_typed().clone(),
+            })
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_put_bucket_tag_control(
+        &self,
+        req: &PutBucketTagControlRequest<'_>,
+    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
+        self.authorize_bucket_tag_resource_action(
+            &req.control,
+            req.request_tags,
+            auth::PolicyAction::TagResource,
+        )
+    }
+
+    pub(in crate::coordinator) fn authorize_put_bucket_tags_for_untag_resource(
+        &self,
+        req: &PutBucketTagsForUntagResourceRequest<'_>,
+    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
+        self.authorize_bucket_tag_resource_action(
+            &req.control,
+            req.request_tags,
+            auth::PolicyAction::UntagResource,
+        )
+    }
+
+    pub(in crate::coordinator) fn authorize_untag_bucket_tag_control(
+        &self,
+        req: &UntagBucketTagControlRequest<'_>,
+    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
+        self.authorize_bucket_tag_resource_action(
+            &req.control,
+            req.request_tags,
+            auth::PolicyAction::UntagResource,
+        )
+    }
+
+    fn authorize_bucket_tag_resource_action(
+        &self,
+        control: &BucketTagControlRequest<'_>,
+        request_tags: &[(String, String)],
+        action: auth::PolicyAction,
+    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
+        self.with_bucket_write_handle_for(
+            &control.bucket,
+            BucketHandleRequest::new()
+                .requiring_policy_view()
+                .requiring_bucket_tags_if_abac_enabled(),
+            |bucket| {
+                Self::validate_tag_resource_account_id(bucket.bucket(), control.account_id)?;
+                let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+                let policy_decision = self.bucket_policy_decision_for_loaded_handle_with_context(
+                    &control.bucket.requester,
+                    &bucket,
+                    action,
+                    PutObjectPolicyContext::default().with_request_tags(Some(request_tags)),
+                    bucket_policy.as_deref(),
+                )?;
+                if !Self::bucket_policy_allows_with_fallback(
+                    &control.bucket.requester,
+                    bucket.bucket(),
+                    policy_decision,
+                    || {
+                        Self::requester_can_bucket_owner_account_admin(
+                            &control.bucket.requester,
+                            bucket.bucket(),
+                        )
+                    },
+                ) {
+                    return Err(ServerError::AccessDenied);
+                }
+                Ok(AuthorizedBucketConfigAccess {
+                    bucket: control.bucket.name_typed().clone(),
+                })
+            },
+        )
+    }
+
     pub(in crate::coordinator) fn authorize_put_bucket_abac(
         &self,
         req: &PutBucketAbacRequest<'_>,

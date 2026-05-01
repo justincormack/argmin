@@ -205,6 +205,20 @@ fn parse_bucket_resource_arn(resource_arn: &str) -> Result<BucketName, ServerErr
     parse_bucket_name(bucket)
 }
 
+fn validate_untag_resource_tag_keys(tag_keys: &[String]) -> Result<(), ServerError> {
+    if tag_keys.is_empty() || tag_keys.iter().any(String::is_empty) {
+        return Err(ServerError::InvalidTag {
+            reason: "At least one tag is required.".to_string(),
+        });
+    }
+    if tag_keys.len() > 50 {
+        return Err(ServerError::InvalidTag {
+            reason: "too many tagKeys in UntagResource request".to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn parse_object_key(key: &str) -> Result<ObjectKey, ServerError> {
     ObjectKey::try_from(key.to_string()).map_err(|error| ServerError::InvalidRequest {
         reason: error.to_string(),
@@ -1167,6 +1181,7 @@ impl HttpFrontend {
                     &crate::coordinator::PutBucketTagControlRequest {
                         control,
                         config: &merged_xml,
+                        request_tags: tags.as_slice(),
                     },
                 )?;
                 Ok(S3Response::tag_resource())
@@ -1178,6 +1193,11 @@ impl HttpFrontend {
                     .query_params_lossy("tagKeys")
                     .into_iter()
                     .map(std::borrow::Cow::into_owned)
+                    .collect::<Vec<_>>();
+                validate_untag_resource_tag_keys(&tag_keys)?;
+                let request_tags = tag_keys
+                    .iter()
+                    .map(|key| (key.clone(), String::new()))
                     .collect::<Vec<_>>();
                 let requester = Self::requester_from_auth(auth);
                 let control = crate::coordinator::BucketTagControlRequest {
@@ -1192,14 +1212,19 @@ impl HttpFrontend {
                     .unwrap_or_else(|| xml::TagSet::empty(50));
                 let remaining_tags = existing_tags.remove_keys(&tag_keys);
                 if remaining_tags.is_empty() {
-                    self.coordinator
-                        .delete_bucket_tags_for_tag_resource(&control)?;
+                    self.coordinator.delete_bucket_tags_for_untag_resource(
+                        &crate::coordinator::UntagBucketTagControlRequest {
+                            control,
+                            request_tags: request_tags.as_slice(),
+                        },
+                    )?;
                 } else {
                     let remaining_xml = remaining_tags.to_xml();
-                    self.coordinator.put_bucket_tags_for_tag_resource(
-                        &crate::coordinator::PutBucketTagControlRequest {
+                    self.coordinator.put_bucket_tags_for_untag_resource(
+                        &crate::coordinator::PutBucketTagsForUntagResourceRequest {
                             control,
                             config: &remaining_xml,
+                            request_tags: request_tags.as_slice(),
                         },
                     )?;
                 }

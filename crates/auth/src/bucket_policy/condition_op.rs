@@ -19,9 +19,10 @@ use super::{wildcard_matches, ConditionMatchResult};
 /// determined in this context" — is handled by the condition-key resolver
 /// (see `super::condition_key::evaluate_clause`) before the operator is
 /// called, so operators do not need to model it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ActualValue<'a> {
     Present(&'a str),
+    PresentValues(Vec<&'a str>),
     Absent,
 }
 
@@ -74,6 +75,18 @@ pub(super) const CONDITION_OPS: &[ConditionOpDef] = &[
         name: "StringEquals",
         kind: ConditionOpKind::StringEquals,
         evaluate: eval_string_equals,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "ForAllValues:StringEquals",
+        kind: ConditionOpKind::StringEquals,
+        evaluate: eval_for_all_values_string_equals,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "ForAnyValue:StringEquals",
+        kind: ConditionOpKind::StringEquals,
+        evaluate: eval_for_any_value_string_equals,
         evaluable_on_evaluable_object_actions: true,
     },
     ConditionOpDef {
@@ -161,6 +174,7 @@ fn eval_bool(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResu
                 ConditionMatchResult::NoMatch
             }
         }
+        ActualValue::PresentValues(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -169,6 +183,59 @@ fn eval_string_equals(operands: &[String], actual: ActualValue<'_>) -> Condition
     match actual {
         ActualValue::Present(actual) => {
             if operands.iter().any(|expected| expected == actual) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(_) => ConditionMatchResult::NoMatch,
+        ActualValue::Absent => ConditionMatchResult::NoMatch,
+    }
+}
+
+fn eval_for_all_values_string_equals(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands.iter().any(|expected| expected == actual) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(actuals) => {
+            if actuals
+                .iter()
+                .all(|actual| operands.iter().any(|expected| expected == actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::Absent => ConditionMatchResult::Matches,
+    }
+}
+
+fn eval_for_any_value_string_equals(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands.iter().any(|expected| expected == actual) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(actuals) => {
+            if actuals
+                .iter()
+                .any(|actual| operands.iter().any(|expected| expected == actual))
+            {
                 ConditionMatchResult::Matches
             } else {
                 ConditionMatchResult::NoMatch
@@ -183,7 +250,9 @@ fn eval_string_equals_if_exists(
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
-        ActualValue::Present(_) => eval_string_equals(operands, actual),
+        ActualValue::Present(_) | ActualValue::PresentValues(_) => {
+            eval_string_equals(operands, actual)
+        }
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -197,6 +266,7 @@ fn eval_string_not_equals(operands: &[String], actual: ActualValue<'_>) -> Condi
                 ConditionMatchResult::NoMatch
             }
         }
+        ActualValue::PresentValues(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -213,6 +283,7 @@ fn eval_string_like(operands: &[String], actual: ActualValue<'_>) -> ConditionMa
                 ConditionMatchResult::NoMatch
             }
         }
+        ActualValue::PresentValues(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -222,7 +293,9 @@ fn eval_string_like_if_exists(
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
-        ActualValue::Present(_) => eval_string_like(operands, actual),
+        ActualValue::Present(_) | ActualValue::PresentValues(_) => {
+            eval_string_like(operands, actual)
+        }
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -239,6 +312,7 @@ fn eval_string_not_like(operands: &[String], actual: ActualValue<'_>) -> Conditi
                 ConditionMatchResult::NoMatch
             }
         }
+        ActualValue::PresentValues(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -262,6 +336,10 @@ mod tests {
 
     fn present<'a>(value: &'a str) -> ActualValue<'a> {
         ActualValue::Present(value)
+    }
+
+    fn present_values<'a>(values: &[&'a str]) -> ActualValue<'a> {
+        ActualValue::PresentValues(values.to_vec())
     }
 
     fn operands(values: &[&str]) -> Vec<String> {
@@ -335,6 +413,69 @@ mod tests {
         );
         assert_eq!(
             (op.evaluate)(&expected, present("deny")),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn string_equals_does_not_match_multivalue_context() {
+        let op = lookup("StringEquals").unwrap();
+        assert_eq!(
+            (op.evaluate)(
+                &operands(&["security", "team"]),
+                present_values(&["security"])
+            ),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (op.evaluate)(
+                &operands(&["security", "team"]),
+                present_values(&["security", "team"])
+            ),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn for_all_values_string_equals_requires_every_actual_value_to_match() {
+        let op = lookup("ForAllValues:StringEquals").unwrap();
+        let expected = operands(&["security", "team"]);
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["security"])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["security", "team"])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["security", "project"])),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&[])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, ActualValue::Absent),
+            ConditionMatchResult::Matches
+        );
+    }
+
+    #[test]
+    fn for_any_value_string_equals_requires_at_least_one_actual_value_to_match() {
+        let op = lookup("ForAnyValue:StringEquals").unwrap();
+        let expected = operands(&["security"]);
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["security", "project"])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["project"])),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, ActualValue::Absent),
             ConditionMatchResult::NoMatch
         );
     }

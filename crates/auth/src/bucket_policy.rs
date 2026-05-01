@@ -150,6 +150,8 @@ pub enum PolicyAction {
     PutLifecycleConfiguration,
     PutBucketPublicAccessBlock,
     PutBucketObjectLockConfiguration,
+    TagResource,
+    UntagResource,
     GetObject,
     GetObjectVersion,
     GetObjectAttributes,
@@ -206,6 +208,8 @@ impl PolicyAction {
             Self::PutLifecycleConfiguration => "s3:PutLifecycleConfiguration",
             Self::PutBucketPublicAccessBlock => "s3:PutBucketPublicAccessBlock",
             Self::PutBucketObjectLockConfiguration => "s3:PutBucketObjectLockConfiguration",
+            Self::TagResource => "s3:TagResource",
+            Self::UntagResource => "s3:UntagResource",
             Self::GetObject => "s3:GetObject",
             Self::GetObjectVersion => "s3:GetObjectVersion",
             Self::GetObjectAttributes => "s3:GetObjectAttributes",
@@ -417,6 +421,11 @@ impl<'a> PolicyRequest<'a> {
                 tags.iter().find(|tag| tag.key == key).map(|tag| tag.value),
             ),
         }
+    }
+
+    #[must_use]
+    fn request_tag_keys(&self) -> Vec<&'a str> {
+        self.request_object_tags.iter().map(|tag| tag.key).collect()
     }
 
     #[must_use]
@@ -721,15 +730,17 @@ impl PolicyStatement {
     }
 
     fn references_request_object_tag_condition(&self) -> bool {
-        self.conditions
-            .iter()
-            .any(|clause| clause.key.starts_with("s3:RequestObjectTag/"))
+        self.conditions.iter().any(|clause| {
+            clause.key.starts_with("s3:RequestObjectTag/")
+                || clause.key.starts_with("aws:RequestTag/")
+                || clause.key == "s3:RequestObjectTagKeys"
+        })
     }
 
     fn references_bucket_tag_condition(&self) -> bool {
-        self.conditions
-            .iter()
-            .any(|clause| clause.key.starts_with("s3:BucketTag/"))
+        self.conditions.iter().any(|clause| {
+            clause.key.starts_with("s3:BucketTag/") || clause.key.starts_with("aws:ResourceTag/")
+        })
     }
 
     fn conditions_supported_for_policy_actions(&self) -> bool {
@@ -1224,7 +1235,7 @@ fn validate_resource_applicability(
     Ok(())
 }
 
-const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 27] = [
+const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 29] = [
     PolicyAction::DeleteBucket,
     PolicyAction::GetBucketPolicy,
     PolicyAction::PutBucketPolicy,
@@ -1252,6 +1263,8 @@ const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 27] = [
     PolicyAction::PutLifecycleConfiguration,
     PolicyAction::PutBucketPublicAccessBlock,
     PolicyAction::PutBucketObjectLockConfiguration,
+    PolicyAction::TagResource,
+    PolicyAction::UntagResource,
 ];
 
 const SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS: [PolicyAction; 23] = [
@@ -2151,6 +2164,13 @@ mod tests {
         assert!(policy.requires_request_object_tags_for_action(PolicyAction::PutObject));
         assert!(!policy.requires_request_object_tags_for_action(PolicyAction::GetObject));
         assert!(!policy.requires_request_object_tags_for_action(PolicyAction::PutObjectTagging));
+
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObjectTagging","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:RequestObjectTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+
+        assert!(policy.requires_request_object_tags_for_action(PolicyAction::PutObjectTagging));
     }
 
     #[test]
@@ -3202,6 +3222,34 @@ mod tests {
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketTagging","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"s3:BucketTag/security":"public"}}}]}"#,
         )
         .unwrap();
+        let public = [PolicyTag::new("security", "public")];
+        let private = [PolicyTag::new("security", "private")];
+
+        let request = bucket_request_with_tags(
+            PolicyAction::GetBucketTagging,
+            "bucket",
+            Some("caller"),
+            &public,
+        );
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+
+        let request = bucket_request_with_tags(
+            PolicyAction::GetBucketTagging,
+            "bucket",
+            Some("caller"),
+            &private,
+        );
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn get_bucket_tagging_matches_resource_tag_condition() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketTagging","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"aws:ResourceTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+        assert!(policy.requires_bucket_tags_for_action(PolicyAction::GetBucketTagging));
+        assert!(policy.references_bucket_tag_conditions());
         let public = [PolicyTag::new("security", "public")];
         let private = [PolicyTag::new("security", "private")];
 

@@ -70,6 +70,7 @@ pub struct PutObjectPolicyContext<'a> {
     pub grant_write_acp: Option<&'a str>,
     pub grant_full_control: Option<&'a str>,
     pub request_object_tags_xml: Option<&'a str>,
+    pub request_tags: Option<&'a [(String, String)]>,
     pub if_match: Option<&'a str>,
     pub if_none_match: Option<&'a str>,
     pub object_creation_operation: Option<bool>,
@@ -96,6 +97,7 @@ impl<'a> PutObjectPolicyContext<'a> {
             grant_write_acp: None,
             grant_full_control: None,
             request_object_tags_xml: None,
+            request_tags: None,
             if_match: None,
             if_none_match: None,
             object_creation_operation: None,
@@ -128,6 +130,12 @@ impl<'a> PutObjectPolicyContext<'a> {
         request_object_tags_xml: Option<&'a str>,
     ) -> Self {
         self.request_object_tags_xml = request_object_tags_xml;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_request_tags(mut self, request_tags: Option<&'a [(String, String)]>) -> Self {
+        self.request_tags = request_tags;
         self
     }
 
@@ -483,6 +491,23 @@ pub struct BucketTagControlRequest<'a> {
 pub struct PutBucketTagControlRequest<'a> {
     pub control: BucketTagControlRequest<'a>,
     pub config: &'a str,
+    pub request_tags: &'a [(String, String)],
+}
+
+/// Request for an `s3-control` `UntagResource` operation.
+#[derive(Debug)]
+pub struct UntagBucketTagControlRequest<'a> {
+    pub control: BucketTagControlRequest<'a>,
+    pub request_tags: &'a [(String, String)],
+}
+
+/// Request for a partial `s3-control` `UntagResource` operation that stores
+/// the tags left after removing the requested keys.
+#[derive(Debug)]
+pub struct PutBucketTagsForUntagResourceRequest<'a> {
+    pub control: BucketTagControlRequest<'a>,
+    pub config: &'a str,
+    pub request_tags: &'a [(String, String)],
 }
 
 /// Request for a PutBucketPolicy operation.
