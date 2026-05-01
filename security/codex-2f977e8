@@ -1,0 +1,343 @@
+Pending direct PUT can resurrect deleted objects
+Link: https://chatgpt.com/codex/cloud/security/findings/042318b2fbf48191a6edbe6d7410d83c?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Resolution
+This finding was valid for commit `2f977e8`. The current branch fixed the
+reported delete path in `1a4ff75e2005d7e9088c1b73f732c940f43704cd` by routing
+object deletes and delete-marker insertion through the object metadata command
+stream, so they drain any pending command for the bucket before reading or
+mutating current object state.
+
+The pinned local regression is
+`object_delete_drains_pending_direct_put_commit_before_delete`: a partial
+direct PUT commit leaves a pending command, current-object delete first applies
+that command and deletes the new generation, and a later reservation does not
+resurrect the deleted object.
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 2f977e8
+Author: justin@specialbusservice.com
+Created: 01/05/2026, 10:10:10
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Historical summary for commit `2f977e8`: the new pending direct-PUT command
+mechanism was not integrated with object delete operations. Pending direct PUTs
+were replayed by later reservation calls, but deletes neither applied nor
+conflicted with pending object metadata commands before modifying primary
+metadata.
+
+Direct PUT metadata was staged as a pending metadata command and applied to all
+acting metadata nodes. If application failed after at least one non-primary node
+had applied the command, the command remained pending. Because the acting set was
+sorted so the primary applied last, such a failure could leave the primary
+unaware of the new object while replicas and the in-memory pending-command table
+remembered it. The only object path that drained these pending commands was
+reserve_put_object_generation. Current-object and version delete operations
+routed directly to the primary node and read/deleted the primary metadata without
+checking pending_metadata_commands. Therefore, after a failed direct PUT left a
+pending CommitDirectPutObject, a delete could succeed against the primary state,
+and a later PUT reservation in the same bucket would apply the stale pending
+commit and restore the previously failed object. This violated object deletion
+and conditional-write integrity under transient metadata-node failures.
+
+# Validation
+## Rubric
+- [x] Confirm metadata command application can partially succeed on non-primary nodes before failing on the primary.
+- [x] Confirm direct PUT leaves `CommitDirectPutObject` pending after a partial apply failure and does not clear it except on zero-node failure.
+- [x] Confirm delete-current/delete-specific object paths route directly to primary metadata and do not inspect or drain `pending_metadata_commands`.
+- [x] Dynamically reproduce that delete succeeds while the pending direct-PUT commit remains and the primary object metadata is removed.
+- [x] Dynamically reproduce that a later generation reservation drains the stale pending direct-PUT commit and makes the previously failed object live again on all acting nodes.
+## Report
+Validated against commit `2f977e8` with a targeted Rust unit-test PoC plus a non-interactive LLDB trace. The relevant code supports the suspected flow: `crates/storage/src/cluster/request_ops.rs:374-410` applies metadata commands to acting nodes with the primary sorted last; `crates/storage/src/cluster.rs:1063-1090` stores a pending `CommitDirectPutObject` and only removes it on zero-node failure, so a failure at the primary after replica application leaves the command pending; `crates/storage/src/cluster.rs:748-766` is the only object path observed draining pending metadata commands during `reserve_put_object_generation`; `crates/storage/src/cluster/request_ops.rs:1832-1839` routes current-object delete directly to the object metadata primary; and `crates/storage/src/node/object_delete_ops.rs:340-380` reads/deletes primary PG metadata without checking pending commands.
+
+Dynamic reproduction: I added a targeted test `delete_does_not_drain_pending_direct_put_commit_and_later_reserve_restores_it` in `crates/storage/src/cluster/local.rs`. The test creates a 3-node local cluster, commits an old object, reserves/writes a new direct PUT, injects a failure on the object-PG primary for `CommitDirectPutObject` so the command remains pending after non-primary nodes apply it, then calls `delete_current_object_if`. The test asserts: pending command exists after the failed direct PUT; primary still has the old generation; delete succeeds and deletes the old generation; pending command is still present after delete; primary then reports `ObjectNotFound`; a later `reserve_put_object_generation` drains the stale pending command; and all acting nodes subsequently show the failed direct PUT generation as live again. Command output: `test cluster::local::tests::delete_does_not_drain_pending_direct_put_commit_and_later_reserve_restores_it ... ok`.
+
+Crash/valgrind/debugger attempts: the PoC is a logic-integrity bug and does not crash; running the debug test profile produced no crash but did reproduce the invalid state transition. `valgrind` was not installed (`bash: valgrind: command not found`). I then used LLDB non-interactively against the debug test binary. LLDB hit `StorageCluster::delete_current_object_if` at `request_ops.rs:1838`, called from the PoC at `local.rs:2796`, confirming the primary-only delete path. It also hit `StorageCluster::reserve_put_object_generation` at `cluster.rs:748`, called from the PoC at `local.rs:2827`, confirming the later reservation enters the pending-command drain path after the delete.
+
+# Evidence
+crates/storage/src/cluster.rs (L1062 to 1092)
+  Note: Direct PUT stores a pending CommitDirectPutObject command before applying it, and only clears it on zero-node failure. Partial failures leave the command pending for later replay.
+```
+        if new_pending_command {
+            runtime_state.set_pending_metadata_command_for_bucket(
+                pg_id,
+                &req.bucket,
+                command.clone(),
+            );
+        }
+
+        if let Err(error) = self.apply_metadata_command_to_acting_set(&command) {
+            if new_pending_command && error.applied_nodes == 0 {
+                self.local_map
+                    .runtime_state()
+                    .remove_pending_metadata_command_for_bucket(pg_id, &req.bucket);
+                drop(_bucket_guard);
+                let _ = self.release_object_generation_reservation(
+                    &req.bucket,
+                    &req.key,
+                    &req.generation_reservation_id,
+                );
+                self.delete_direct_put_segment_payload_shards(
+                    req.data_pg_id,
+                    req.ec,
+                    &req.segment_okh,
+                    req.segment_vid,
+                    written_shards,
+                );
+            }
+            return Err(bucket_snapshot_error_to_object_pg_action_error(
+                error.source,
+            ));
+        }
+```
+
+crates/storage/src/cluster.rs (L740 to 820)
+  Note: Pending object metadata commands are drained only when reserving a generation for a later PUT, meaning stale failed PUTs can be applied by an unrelated future write.
+```
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> Result<GenerationId, ObjectPgActionError> {
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let runtime_state = self.local_map.runtime_state();
+        loop {
+            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                let abandoned_reservation = match command.payload() {
+                    MetadataCommandPayload::ReserveObjectGeneration(reservation)
+                        if reservation.matches_request(bucket, key, reservation_id) =>
+                    {
+                        let generation_id = reservation.generation_id;
+                        self.apply_pending_object_metadata_command_for_bucket(
+                            pg_id, bucket, &command,
+                        )?;
+                        return Ok(generation_id);
+                    }
+                    MetadataCommandPayload::ReserveObjectGeneration(reservation) => {
+                        Some((reservation.key.clone(), reservation.reservation_id.clone()))
+                    }
+                    _ => None,
+                };
+
+                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                if let Some((abandoned_key, abandoned_reservation_id)) = abandoned_reservation {
+                    self.release_abandoned_object_generation_reservation(
+                        pg_id,
+                        bucket,
+                        &abandoned_key,
+                        &abandoned_reservation_id,
+                    )?;
+                }
+                continue;
+            }
+
+            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let generation_id = object_pg.next_generation_id(bucket, key)?;
+            drop(object_pg);
+            let command_id = MetadataCommandId::new(
+                self.operation_epoch(),
+                pg_id,
+                runtime_state.next_metadata_command_log_index(pg_id),
+            );
+            let command = MetadataCommandEnvelope::new(
+                command_id,
+                MetadataCommandPayload::ReserveObjectGeneration(
+                    ReserveObjectGenerationCommand::new(
+                        bucket.clone(),
+                        key.clone(),
+                        reservation_id.clone(),
+                        generation_id,
+                        crate::clock::current_time_millis(),
+                    ),
+                ),
+            );
+            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            match self.apply_metadata_command_to_acting_set(&command) {
+                Ok(()) => {
+                    self.local_map
+                        .runtime_state()
+                        .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                    match command.payload() {
+                        MetadataCommandPayload::ReserveObjectGeneration(reservation) => {
+                            return Ok(reservation.generation_id);
+                        }
+                        _ => unreachable!("reserve object generation pending command kind changed"),
+                    }
+                }
+                Err(error) => {
+                    if error.applied_nodes == 0 {
+                        self.local_map
+                            .runtime_state()
+                            .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                    }
+                    return Err(bucket_snapshot_error_to_object_pg_action_error(
+                        error.source,
+                    ));
+                }
+```
+
+crates/storage/src/cluster/request_ops.rs (L1821 to 1840)
+  Note: Object delete operations route directly to the object metadata primary and do not check or drain pending metadata commands for the bucket/key first.
+```
+    pub fn delete_specific_object_version_if<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        action: impl FnOnce(Option<&StoredObject>) -> Result<T, E>,
+    ) -> Result<Result<DeleteSpecificObjectVersionOutcome<T>, E>, ObjectPgActionError> {
+        self.object_metadata_primary_node(bucket, key)?
+            .delete_specific_object_version_if(bucket, key, version_id, action)
+    }
+
+    pub fn delete_current_object_if<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        action: impl FnOnce(Option<&StoredObject>) -> Result<T, E>,
+    ) -> Result<Result<DeleteCurrentObjectOutcome<T>, E>, ObjectPgActionError> {
+        self.object_metadata_primary_node(bucket, key)?
+            .delete_current_object_if(bucket, key, action)
+    }
+```
+
+crates/storage/src/cluster/request_ops.rs (L374 to 410)
+  Note: Metadata commands are applied across acting nodes with the primary sorted last. A failure after applying to non-primary nodes can leave a pending command that is not visible through primary-only object operations.
+```
+    pub(super) fn apply_metadata_command_to_acting_set(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), MetadataCommandApplyFailure> {
+        let pg_id = command.id().pg_id();
+        let mut nodes = self
+            .local_map
+            .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id)
+            .map_err(|source| MetadataCommandApplyFailure {
+                applied_nodes: 0,
+                source: source.into(),
+            })?;
+        let primary_node_id = self
+            .local_map
+            .pg_route(pg_id)
+            .expect("validated metadata PG command route must exist")
+            .primary_node_id();
+        nodes.sort_by_key(|node| node.node_id() == primary_node_id);
+        for (applied_nodes, node) in nodes.into_iter().enumerate() {
+            maybe_run_before_metadata_command_apply_hook(node.node_id(), command).map_err(
+                |source| MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                },
+            )?;
+            let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
+                MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                }
+            })?;
+            pg.apply_metadata_command(command)
+                .map_err(|source| MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                })?;
+        }
+```
+
+crates/storage/src/node/object_delete_ops.rs (L340 to 380)
+  Note: The current-object delete implementation reads and deletes only the primary PG's current metadata, so it can delete stale primary state while a pending direct PUT for the same object remains replayable.
+```
+    pub fn delete_current_object_if<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        action: impl FnOnce(Option<&StoredObject>) -> Result<T, E>,
+    ) -> Result<Result<DeleteCurrentObjectOutcome<T>, E>, ObjectPgActionError> {
+        let meta_pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        let stored = match PgMetadataStore::get_object_meta(&*meta_pg, bucket, key) {
+            Ok(stored) => Some(stored),
+            Err(crate::error::MetadataError::ObjectNotFound) => None,
+            Err(other) => return Err(other.into()),
+        };
+
+        let value = match action(stored.as_ref()) {
+            Ok(value) => value,
+            Err(error) => return Ok(Err(error)),
+        };
+
+        let deleted = match stored.as_ref() {
+            None => DeletedCurrentObject::Missing,
+            Some(StoredObject::DeleteMarker(_)) => DeletedCurrentObject::DeleteMarker,
+            Some(StoredObject::Live(record)) => {
+                let deleted = Self::delete_live_object_from_pg(&meta_pg, bucket, key, record)?;
+                match deleted {
+                    DeletedSpecificObjectVersion::Missing => DeletedCurrentObject::Missing,
+                    DeletedSpecificObjectVersion::DeleteMarker => {
+                        DeletedCurrentObject::DeleteMarker
+                    }
+                    DeletedSpecificObjectVersion::Live {
+                        generation_id,
+                        layout,
+                    } => DeletedCurrentObject::Live {
+                        generation_id,
+                        layout,
+                    },
+                }
+            }
+        };
+
+        Ok(Ok(DeleteCurrentObjectOutcome { value, deleted }))
+    }
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Kept at medium. Static evidence and prior executable validation support the bug: direct PUT pending commands can survive partial application, delete paths operate primary-only, and later generation reservation drains stale commands. This is security-relevant data integrity/deletion-integrity impact in the main S3 service. It does not warrant high or critical because it requires existing write/delete authorization and a transient partial metadata failure, and the demonstrated impact is object resurrection/consistency violation rather than authentication bypass, broad unauthorized data modification, data exfiltration, code execution, or compromise of credentials.
+## Likelihood
+high - The HTTP PutObject/DeleteObject paths are normal in-scope runtime paths, and executable validation reproduced the state transition. However, reliable exploitation requires an authorized writer plus a transient partial metadata-node apply failure at a precise point, making exploitation higher-complexity and less likely than a straightforward request-only flaw. | Remote network vector
+## Impact
+medium - Integrity impact is significant for affected objects: a deleted object generation can reappear, and conditional write/delete expectations can be violated. The impact is limited to buckets/objects the requester can already write/delete or where public/policy write access exists; no evidence shows auth bypass, arbitrary cross-tenant tampering, RCE, or secret exposure.
+## Assumptions
+- The argmin-s3 HTTP service is reachable by an attacker over its configured listen address; the default bind is localhost-only, but ARGMIN_LISTEN_ADDR can expose it.
+- The attacker has valid S3 write/delete capability for the affected bucket/object, either via configured credentials or bucket policy/ACL.
+- A transient or induced storage/metadata apply failure occurs after at least one non-primary metadata node applies the direct PUT command but before the primary applies it.
+- network reachability to argmin-s3 or local access if left at the default 127.0.0.1:9000
+- authorized S3 PutObject/DeleteObject permissions for the affected bucket/key
+- partial metadata command application failure with primary applied last
+- later PUT generation reservation in the same bucket to drain the stale pending command
+## Path
+S3 client -> HTTP frontend -> Coordinator authz -> direct PUT pending command -> partial metadata apply (primary last) -> DeleteObject primary-only -> later PUT reservation drains stale command -> deleted object reappears
+## Path evidence
+- `crates/argmin-s3/src/config.rs:68` - ARGMIN_LISTEN_ADDR controls exposure; default is 127.0.0.1:9000, so public reachability depends on deployment configuration.
+- `crates/argmin-s3/src/main.rs:106-108` - The production binary opens a StorageCluster over local nodes, placing the affected storage code in the main application runtime.
+- `crates/argmin-s3/src/main.rs:130-143` - Configured access key/secret are loaded into the credential store with OwnerAccountAdmin authorization.
+- `crates/argmin-s3/src/main.rs:152-206` - The application binds a TCP listener and serves HTTP/TLS S3 traffic on the configured address.
+- `crates/server-http/src/http/mod.rs:1514-1537` - Normal S3 PutObject requests from the HTTP frontend call coordinator.put_object with attacker-controlled bucket, key, body, metadata, conditions, and ACL context after auth.
+- `crates/server-http/src/http/mod.rs:1723-1737` - Normal S3 DeleteObject requests call coordinator.delete_object for attacker-selected bucket/key/version after auth.
+- `crates/server-core/src/coordinator/put.rs:23-69` - Coordinator PutObject is the production authorization and write path; small objects proceed through the direct put path after authorize_put_object_write.
+- `crates/server-core/src/coordinator/put.rs:244-249` - The direct put commit reaches storage_node.commit_direct_put_object_from_payload_shards.
+- `crates/storage/src/cluster.rs:977-1003` - Direct PUT checks or creates a pending metadata command for the bucket/key before preparing the commit command.
+- `crates/storage/src/cluster.rs:1062-1091` - A new pending direct PUT command is stored before application and is only removed on zero-node application failure; partial failures leave it pending.
+- `crates/storage/src/cluster/request_ops.rs:374-410` - Metadata command application orders the acting nodes with the primary last and reports how many nodes applied before failure.
+- `crates/storage/src/cluster/request_ops.rs:1821-1839` - Version and current-object deletes route directly to the object metadata primary without checking the pending command table.
+- `crates/storage/src/node/object_delete_ops.rs:340-380` - The node-level current-object delete reads and deletes only the primary PG metadata and has no pending-command drain or conflict logic.
+- `crates/storage/src/cluster.rs:737-767` - reserve_put_object_generation drains any pending metadata command for the bucket, allowing a stale CommitDirectPutObject to be replayed on a later PUT reservation.
+## Narrative
+The finding is real and in scope. Normal S3 PutObject reaches server-core put_object and, for direct single-segment writes, commit_direct_put_object_from_payload_shards. That code records a pending CommitDirectPutObject before applying it to acting metadata nodes. apply_metadata_command_to_acting_set sorts the primary last, so a transient failure can leave replicas updated and the primary stale while the command remains pending. DeleteObject reaches delete_current_object_if, which routes directly to the object metadata primary and does not inspect pending metadata commands. reserve_put_object_generation is the observed object path that drains pending commands, so a later write can replay the stale failed direct PUT and make the deleted object live again. Severity remains medium because the integrity impact is meaningful, but exploitation requires authorization to the object plus a timing/failure precondition and does not demonstrate authentication bypass, code execution, or cross-tenant compromise.
+## Controls
+- AWS Signature Version 4 authentication for non-anonymous requests
+- Coordinator bucket/object authorization, ACL, bucket policy, and public access block checks
+- Default listener is localhost-only: 127.0.0.1:9000
+- Optional TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- Per-bucket/object metadata locking, but deletes currently do not resolve pending object metadata commands
+## Blindspots
+- No repository deployment manifests were found to confirm whether the service is publicly exposed; default configuration is localhost-only.
+- Static review did not prove a practical remote method for an attacker to induce the required partial metadata-node failure.
+- The repository appears primarily single-service/local-node; real-world multi-user or cross-boundary impact depends on bucket policies, public write ACLs, and operational topology.
+- Validation evidence used a targeted unit-test failure hook; production failure frequency and exploit reliability remain uncertain.

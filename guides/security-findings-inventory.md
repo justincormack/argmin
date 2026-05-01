@@ -40,6 +40,12 @@ for the current local security suite.
 | `security/codex-cece86a` RequestObjectTag policies ignored for PutObjectTagging | fixed | `./scripts/security-tests authz` | Covered by request-tag condition regressions. |
 | `security/codex-1b2e520` CreateBucket can drop pending ACL metadata commands | fixed | `cargo nextest run -p storage existing_create_bucket_preserves_pending_acl_command_for_retry` | Covered by a local metadata-command convergence regression; existing CreateBucket no longer clears unrelated pending bucket commands. |
 
+## Metadata Command Ordering and Convergence
+
+| Finding | Status | Local deterministic path | Notes |
+| --- | --- | --- | --- |
+| `security/codex-2f977e8` Pending direct PUT can resurrect deleted objects | fixed in `1a4ff75` | `cargo nextest run -p storage object_delete_drains_pending_direct_put_commit_before_delete` | The finding was valid for `2f977e8`; object deletes now drain pending object metadata commands before observing or deleting current object state. |
+
 ## Stateful Multipart, Reclaim, Lifecycle, and Object Lock
 
 | Finding | Status | Local deterministic path | Notes |
