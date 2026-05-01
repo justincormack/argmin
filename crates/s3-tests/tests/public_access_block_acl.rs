@@ -7,6 +7,7 @@ use std::time::Duration;
 
 const AUTHENTICATED_USERS_GROUP_URI: &str =
     "http://acs.amazonaws.com/groups/global/AuthenticatedUsers";
+const ALL_USERS_GROUP_URI: &str = "http://acs.amazonaws.com/groups/global/AllUsers";
 
 fn assert_canonical_owner_id(id: &str) {
     assert_eq!(
@@ -26,6 +27,31 @@ fn assert_error_code(body: &str, code: &str) {
     assert!(
         body.contains(&expected),
         "expected {expected} in body, got {body}"
+    );
+}
+
+fn grants_contain_group(grants: &[Grant], uri: &str, permission: Permission) -> bool {
+    grants.iter().any(|grant| {
+        grant.permission() == Some(&permission)
+            && grant.grantee().and_then(|g| g.uri()) == Some(uri)
+    })
+}
+
+fn assert_effective_owner_only_acl(grants: &[Grant], owner_id: &str) {
+    assert_eq!(
+        grants.len(),
+        1,
+        "expected effective ACL to contain only owner FULL_CONTROL, got {grants:?}"
+    );
+    assert_eq!(
+        grants[0].permission(),
+        Some(&Permission::FullControl),
+        "expected owner FULL_CONTROL grant, got {grants:?}"
+    );
+    assert_eq!(
+        grants[0].grantee().and_then(|g| g.id()),
+        Some(owner_id),
+        "expected owner canonical user grant, got {grants:?}"
     );
 }
 
@@ -508,6 +534,132 @@ fn test_ignore_public_acls() {
             .delete_object()
             .bucket(&bucket)
             .key("key1")
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket).await;
+    });
+}
+
+#[test]
+fn test_ignore_public_acls_get_bucket_acl_returns_effective_acl() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_acl_enabled_bucket().await;
+
+        client
+            .put_bucket_acl()
+            .bucket(&bucket)
+            .acl(BucketCannedAcl::PublicReadWrite)
+            .send()
+            .await
+            .unwrap();
+
+        let before = client
+            .get_bucket_acl()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let owner_id = before
+            .owner()
+            .and_then(|owner| owner.id())
+            .expect("expected bucket owner canonical ID")
+            .to_string();
+        let before_grants = before.grants();
+        assert!(
+            grants_contain_group(before_grants, ALL_USERS_GROUP_URI, Permission::Read),
+            "expected stored public READ grant before IgnorePublicAcls, got {before_grants:?}"
+        );
+        assert!(
+            grants_contain_group(before_grants, ALL_USERS_GROUP_URI, Permission::Write),
+            "expected stored public WRITE grant before IgnorePublicAcls, got {before_grants:?}"
+        );
+
+        let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
+            .ignore_public_acls(true)
+            .build();
+        client
+            .put_public_access_block()
+            .bucket(&bucket)
+            .public_access_block_configuration(pab)
+            .send()
+            .await
+            .unwrap();
+        wait_for_ignore_public_acls(&bucket, true).await;
+
+        let effective = client
+            .get_bucket_acl()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        assert_effective_owner_only_acl(effective.grants(), &owner_id);
+
+        cleanup(&bucket).await;
+    });
+}
+
+#[test]
+fn test_ignore_public_acls_get_object_acl_returns_effective_acl() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_acl_enabled_bucket().await;
+        let key = "key1";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .acl(ObjectCannedAcl::PublicRead)
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"abcde"))
+            .send()
+            .await
+            .unwrap();
+
+        let before = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let owner_id = before
+            .owner()
+            .and_then(|owner| owner.id())
+            .expect("expected object owner canonical ID")
+            .to_string();
+        let before_grants = before.grants();
+        assert!(
+            grants_contain_group(before_grants, ALL_USERS_GROUP_URI, Permission::Read),
+            "expected stored public READ grant before IgnorePublicAcls, got {before_grants:?}"
+        );
+
+        let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
+            .ignore_public_acls(true)
+            .build();
+        client
+            .put_public_access_block()
+            .bucket(&bucket)
+            .public_access_block_configuration(pab)
+            .send()
+            .await
+            .unwrap();
+        wait_for_ignore_public_acls(&bucket, true).await;
+
+        let effective = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_effective_owner_only_acl(effective.grants(), &owner_id);
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
             .send()
             .await
             .unwrap();

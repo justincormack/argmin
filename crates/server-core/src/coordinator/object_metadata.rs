@@ -744,10 +744,12 @@ impl Coordinator {
                             version_id: live.version_id,
                         }
                     } else {
+                        let acl_grants =
+                            Self::effective_acl_grants(&bucket_info, &live.acl_grants).into_owned();
                         GetObjectAclResult {
                             owner_principal: live.owner.principal.clone(),
                             owner_canonical_id: live.owner.canonical_id.clone(),
-                            acl_grants: live.acl_grants.clone(),
+                            acl_grants,
                             version_id: live.version_id,
                         }
                     };

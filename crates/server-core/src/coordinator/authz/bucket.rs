@@ -876,11 +876,12 @@ impl Coordinator {
                 )]),
             }
         } else {
-            let bucket = bucket.bucket().clone();
+            let bucket = bucket.bucket();
+            let acl_grants = Self::effective_acl_grants(bucket, &bucket.acl_grants).into_owned();
             GetBucketAclResult {
-                owner_principal: bucket.owner_principal,
-                owner_canonical_id: bucket.owner_canonical_id,
-                acl_grants: bucket.acl_grants,
+                owner_principal: bucket.owner_principal.clone(),
+                owner_canonical_id: bucket.owner_canonical_id.clone(),
+                acl_grants,
             }
         };
         Ok(AuthorizedGetBucketAcl { result })
