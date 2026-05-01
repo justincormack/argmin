@@ -129,6 +129,11 @@ pub(super) fn evaluate_bucket_policy_for_object_request(
         .iter()
         .map(|(key, value)| auth::PolicyTag::new(key, value))
         .collect();
+    let version_id = version_id_policy_value(
+        context.action,
+        context.policy_context.version_id,
+        Some(object.version_id()),
+    );
     let policy_request = auth::PolicyRequest::for_object(
         context.action,
         context.bucket_name,
@@ -173,7 +178,8 @@ pub(super) fn evaluate_bucket_policy_for_object_request(
         .with_grant_full_control(context.policy_context.grant_full_control)
         .with_if_match(context.policy_context.if_match)
         .with_if_none_match(context.policy_context.if_none_match)
-        .with_object_creation_operation(context.policy_context.object_creation_operation);
+        .with_object_creation_operation(context.policy_context.object_creation_operation)
+        .with_version_id(version_id.as_deref());
     Ok(context.policy.evaluate(&policy_request))
 }
 
@@ -191,6 +197,8 @@ pub(super) fn bucket_policy_decision_for_key(
         .iter()
         .map(|(key, value)| auth::PolicyTag::new(key, value))
         .collect();
+    let version_id =
+        version_id_policy_value(request.action, request.policy_context.version_id, None);
     let policy_request = auth::PolicyRequest::for_object(
         request.action,
         request.bucket.name.as_str(),
@@ -226,7 +234,8 @@ pub(super) fn bucket_policy_decision_for_key(
     .with_grant_full_control(request.policy_context.grant_full_control)
     .with_if_match(request.policy_context.if_match)
     .with_if_none_match(request.policy_context.if_none_match)
-    .with_object_creation_operation(request.policy_context.object_creation_operation);
+    .with_object_creation_operation(request.policy_context.object_creation_operation)
+    .with_version_id(version_id.as_deref());
     Ok(policy.evaluate(&policy_request))
 }
 
@@ -363,6 +372,8 @@ pub(super) fn bucket_policy_decision_for_put_object_action(
         .iter()
         .map(|(key, value)| auth::PolicyTag::new(key, value))
         .collect();
+    let version_id =
+        version_id_policy_value(request.action, request.policy_context.version_id, None);
     let policy_request = auth::PolicyRequest::for_object(
         request.action,
         request.bucket.name.as_str(),
@@ -398,8 +409,36 @@ pub(super) fn bucket_policy_decision_for_put_object_action(
     .with_grant_full_control(request.policy_context.grant_full_control)
     .with_if_match(request.policy_context.if_match)
     .with_if_none_match(request.policy_context.if_none_match)
-    .with_object_creation_operation(request.policy_context.object_creation_operation);
+    .with_object_creation_operation(request.policy_context.object_creation_operation)
+    .with_version_id(version_id.as_deref());
     Ok(policy.evaluate(&policy_request))
+}
+
+fn version_id_policy_value(
+    action: auth::PolicyAction,
+    context_version_id: Option<VersionId>,
+    object_version_id: Option<VersionId>,
+) -> Option<String> {
+    let version_id = context_version_id.or_else(|| {
+        version_id_condition_applies_to_action(action)
+            .then_some(object_version_id)
+            .flatten()
+    })?;
+    Some(version_id.to_string())
+}
+
+fn version_id_condition_applies_to_action(action: auth::PolicyAction) -> bool {
+    matches!(
+        action,
+        auth::PolicyAction::GetObjectVersion
+            | auth::PolicyAction::GetObjectVersionAttributes
+            | auth::PolicyAction::GetObjectVersionAcl
+            | auth::PolicyAction::GetObjectVersionTagging
+            | auth::PolicyAction::PutObjectVersionAcl
+            | auth::PolicyAction::PutObjectVersionTagging
+            | auth::PolicyAction::DeleteObjectVersion
+            | auth::PolicyAction::DeleteObjectVersionTagging
+    )
 }
 
 pub(super) fn requester_can_put_object_action_with_bucket_policy(

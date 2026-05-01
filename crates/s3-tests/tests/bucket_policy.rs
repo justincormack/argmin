@@ -4,7 +4,7 @@ use aws_sdk_s3::types::{
     AccessControlPolicy, BlockedEncryptionTypes, BucketCannedAcl, BucketLifecycleConfiguration,
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, CorsConfiguration, CorsRule,
     DefaultRetention, EncryptionType, ExpirationStatus, Grant, Grantee, LifecycleExpiration,
-    LifecycleRule, LifecycleRuleFilter, ObjectCannedAcl, ObjectLockConfiguration,
+    LifecycleRule, LifecycleRuleFilter, ObjectAttributes, ObjectCannedAcl, ObjectLockConfiguration,
     ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule, ObjectOwnership, Owner,
     OwnershipControls, OwnershipControlsRule, Permission, PublicAccessBlockConfiguration,
     ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
@@ -5235,6 +5235,639 @@ fn test_bucket_policy_put_object_version_acl_cross_account_allow() {
             .await
             .unwrap();
         cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_version_id_condition_get_object_version() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let allowed_version_id = client
+            .put_object()
+            .bucket(&bucket)
+            .key("versioned")
+            .body(ByteStream::from_static(b"allowed-version"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected VersionId for versioned object")
+            .to_string();
+        let denied_version_id = client
+            .put_object()
+            .bucket(&bucket)
+            .key("versioned")
+            .body(ByteStream::from_static(b"denied-version"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected VersionId for versioned object")
+            .to_string();
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:GetObjectVersion",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:versionid": allowed_version_id.clone()
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let allowed = eventually_ok_with_retry(
+            "GetObjectVersion allowed by s3:versionid condition",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key("versioned")
+                    .version_id(&allowed_version_id)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(
+            allowed.body.collect().await.unwrap().into_bytes().as_ref(),
+            b"allowed-version"
+        );
+
+        eventually_access_denied(
+            "GetObjectVersion denied by nonmatching s3:versionid condition",
+            || {
+                alt_client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key("versioned")
+                    .version_id(&denied_version_id)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_version_id_condition_get_object_version_attributes() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let allowed_version_id = client
+            .put_object()
+            .bucket(&bucket)
+            .key("attributes-version")
+            .body(ByteStream::from_static(b"allowed-version"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected VersionId for versioned object")
+            .to_string();
+        let denied_version_id = client
+            .put_object()
+            .bucket(&bucket)
+            .key("attributes-version")
+            .body(ByteStream::from_static(b"denied-version"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected VersionId for versioned object")
+            .to_string();
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": ["s3:GetObjectVersion", "s3:GetObjectVersionAttributes"],
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:versionid": allowed_version_id.clone()
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let attrs = eventually_ok_with_retry(
+            "GetObjectVersionAttributes allowed by s3:versionid condition",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .get_object_attributes()
+                    .bucket(&bucket)
+                    .key("attributes-version")
+                    .version_id(&allowed_version_id)
+                    .object_attributes(ObjectAttributes::ObjectSize)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(attrs.object_size(), Some(15));
+
+        eventually_access_denied(
+            "GetObjectVersionAttributes denied by nonmatching s3:versionid condition",
+            || {
+                alt_client
+                    .get_object_attributes()
+                    .bucket(&bucket)
+                    .key("attributes-version")
+                    .version_id(&denied_version_id)
+                    .object_attributes(ObjectAttributes::ObjectSize)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_version_id_condition_object_version_acl() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        set_object_writer_ownership(&bucket).await;
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let allowed_version_id = client
+            .put_object()
+            .bucket(&bucket)
+            .key("acl-version")
+            .body(ByteStream::from_static(b"allowed-version"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected VersionId for versioned object")
+            .to_string();
+        let denied_version_id = client
+            .put_object()
+            .bucket(&bucket)
+            .key("acl-version")
+            .body(ByteStream::from_static(b"denied-version"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected VersionId for versioned object")
+            .to_string();
+
+        let alt_id = client_canonical_id(alt_client).await;
+        let grant_read_header = format!("id=\"{alt_id}\"");
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": ["s3:GetObjectVersionAcl", "s3:PutObjectVersionAcl"],
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:versionid": allowed_version_id.clone()
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok_with_retry(
+            "PutObjectVersionAcl allowed by s3:versionid condition",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                let grant_read_header = grant_read_header.clone();
+                alt_client
+                    .put_object_acl()
+                    .bucket(&bucket)
+                    .key("acl-version")
+                    .version_id(&allowed_version_id)
+                    .customize()
+                    .mutate_request(move |req| {
+                        req.headers_mut()
+                            .insert("x-amz-grant-read", grant_read_header.clone());
+                    })
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "PutObjectVersionAcl denied by nonmatching s3:versionid condition",
+            || {
+                let grant_read_header = grant_read_header.clone();
+                alt_client
+                    .put_object_acl()
+                    .bucket(&bucket)
+                    .key("acl-version")
+                    .version_id(&denied_version_id)
+                    .customize()
+                    .mutate_request(move |req| {
+                        req.headers_mut()
+                            .insert("x-amz-grant-read", grant_read_header.clone());
+                    })
+                    .send()
+            },
+        )
+        .await;
+
+        let acl = eventually_ok_with_retry(
+            "GetObjectVersionAcl allowed by s3:versionid condition",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .get_object_acl()
+                    .bucket(&bucket)
+                    .key("acl-version")
+                    .version_id(&allowed_version_id)
+                    .send()
+            },
+        )
+        .await;
+        assert!(
+            acl.owner().is_some(),
+            "expected owner in GetObjectVersionAcl"
+        );
+
+        eventually_access_denied(
+            "GetObjectVersionAcl denied by nonmatching s3:versionid condition",
+            || {
+                alt_client
+                    .get_object_acl()
+                    .bucket(&bucket)
+                    .key("acl-version")
+                    .version_id(&denied_version_id)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_version_id_condition_object_version_tagging() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let allowed_version_id = client
+            .put_object()
+            .bucket(&bucket)
+            .key("tagged-version")
+            .body(ByteStream::from_static(b"allowed-version"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected VersionId for versioned object")
+            .to_string();
+        let denied_version_id = client
+            .put_object()
+            .bucket(&bucket)
+            .key("tagged-version")
+            .body(ByteStream::from_static(b"denied-version"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected VersionId for versioned object")
+            .to_string();
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": [
+                    "s3:PutObjectVersionTagging",
+                    "s3:GetObjectVersionTagging",
+                    "s3:DeleteObjectVersionTagging"
+                ],
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:versionid": allowed_version_id.clone()
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok_with_retry(
+            "PutObjectVersionTagging allowed by s3:versionid condition",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key("tagged-version")
+                    .version_id(&allowed_version_id)
+                    .tagging(simple_bucket_tagging("security", "allow"))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "PutObjectVersionTagging denied by nonmatching s3:versionid condition",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key("tagged-version")
+                    .version_id(&denied_version_id)
+                    .tagging(simple_bucket_tagging("security", "deny"))
+                    .send()
+            },
+        )
+        .await;
+
+        let tags = eventually_ok_with_retry(
+            "GetObjectVersionTagging allowed by s3:versionid condition",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .get_object_tagging()
+                    .bucket(&bucket)
+                    .key("tagged-version")
+                    .version_id(&allowed_version_id)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(
+            tags.tag_set()
+                .iter()
+                .map(|tag| (tag.key(), tag.value()))
+                .collect::<Vec<_>>(),
+            vec![("security", "allow")]
+        );
+
+        eventually_access_denied(
+            "GetObjectVersionTagging denied by nonmatching s3:versionid condition",
+            || {
+                alt_client
+                    .get_object_tagging()
+                    .bucket(&bucket)
+                    .key("tagged-version")
+                    .version_id(&denied_version_id)
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_ok_with_retry(
+            "DeleteObjectVersionTagging allowed by s3:versionid condition",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .delete_object_tagging()
+                    .bucket(&bucket)
+                    .key("tagged-version")
+                    .version_id(&allowed_version_id)
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "DeleteObjectVersionTagging denied by nonmatching s3:versionid condition",
+            || {
+                alt_client
+                    .delete_object_tagging()
+                    .bucket(&bucket)
+                    .key("tagged-version")
+                    .version_id(&denied_version_id)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_version_id_condition_delete_object_version() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let allowed_version_id = client
+            .put_object()
+            .bucket(&bucket)
+            .key("delete-version")
+            .body(ByteStream::from_static(b"allowed-version"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected VersionId for versioned object")
+            .to_string();
+        let denied_version_id = client
+            .put_object()
+            .bucket(&bucket)
+            .key("delete-version")
+            .body(ByteStream::from_static(b"denied-version"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected VersionId for versioned object")
+            .to_string();
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:DeleteObjectVersion",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:versionid": allowed_version_id.clone()
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok_with_retry(
+            "DeleteObjectVersion allowed by s3:versionid condition",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .delete_object()
+                    .bucket(&bucket)
+                    .key("delete-version")
+                    .version_id(&allowed_version_id)
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_ok_with_retry(
+            "DeleteObjectVersion missing version allowed by s3:versionid request condition",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .delete_object()
+                    .bucket(&bucket)
+                    .key("delete-version")
+                    .version_id(&allowed_version_id)
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "DeleteObjectVersion denied by nonmatching s3:versionid condition",
+            || {
+                alt_client
+                    .delete_object()
+                    .bucket(&bucket)
+                    .key("delete-version")
+                    .version_id(&denied_version_id)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &bucket).await;
     });
 }
 

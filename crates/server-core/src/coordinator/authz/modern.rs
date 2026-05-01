@@ -691,14 +691,16 @@ impl Coordinator {
                     Err(storage::ObjectPgActionError::Metadata(
                         storage::MetadataError::ObjectNotFound,
                     )) => {
-                        let allowed = delete_object_authorization_with_bucket_policy(
+                        let policy_context =
+                            PutObjectPolicyContext::default().with_version_id(Some(version_id));
+                        let allowed = delete_object_authorization_with_policy_context(
                             requester,
                             modern_bucket,
                             modern_bucket_tags,
                             key_str,
                             None,
                             Self::delete_object_policy_action(Some(version_id)),
-                            bucket_policy.as_deref(),
+                            (bucket_policy.as_deref(), &policy_context),
                         )?;
                         if !allowed {
                             return Err(ServerError::AccessDenied);
@@ -852,6 +854,9 @@ fn bucket_policy_decision_for_put_object_action_modern(
         .flat_map(|tags| tags.iter())
         .map(|(key, value)| auth::PolicyTag::new(key, value))
         .collect();
+    let version_id = policy_context
+        .version_id
+        .map(|version_id| version_id.to_string());
     let policy_request = auth::PolicyRequest::for_object(
         action,
         bucket.name.as_str(),
@@ -884,7 +889,8 @@ fn bucket_policy_decision_for_put_object_action_modern(
     .with_grant_full_control(policy_context.grant_full_control)
     .with_if_match(policy_context.if_match)
     .with_if_none_match(policy_context.if_none_match)
-    .with_object_creation_operation(policy_context.object_creation_operation);
+    .with_object_creation_operation(policy_context.object_creation_operation)
+    .with_version_id(version_id.as_deref());
     Ok(policy.evaluate(&policy_request))
 }
 
@@ -999,6 +1005,27 @@ pub(in crate::coordinator) fn delete_object_authorization_with_bucket_policy(
     action: auth::PolicyAction,
     policy: Option<&auth::BucketPolicy>,
 ) -> Result<bool, ServerError> {
+    delete_object_authorization_with_policy_context(
+        requester,
+        bucket,
+        bucket_tags,
+        key,
+        object,
+        action,
+        (policy, &PutObjectPolicyContext::default()),
+    )
+}
+
+fn delete_object_authorization_with_policy_context(
+    requester: &Requester,
+    bucket: BoeBucketSummary<'_>,
+    bucket_tags: PreloadedBucketTags<'_>,
+    key: &str,
+    object: Option<&StoredObject>,
+    action: auth::PolicyAction,
+    policy_and_context: (Option<&auth::BucketPolicy>, &PutObjectPolicyContext<'_>),
+) -> Result<bool, ServerError> {
+    let (policy, policy_context) = policy_and_context;
     let decision = match object {
         Some(object) => bucket_policy_decision_for_object_with_preloaded_tags_modern(
             requester,
@@ -1015,7 +1042,7 @@ pub(in crate::coordinator) fn delete_object_authorization_with_bucket_policy(
             bucket_tags,
             key,
             action,
-            &PutObjectPolicyContext::default(),
+            policy_context,
             policy,
         )?,
     };

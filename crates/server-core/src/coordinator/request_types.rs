@@ -76,6 +76,7 @@ pub struct PutObjectPolicyContext<'a> {
     pub object_creation_operation: Option<bool>,
     pub prefix: Option<&'a str>,
     pub object_ownership: Option<&'a str>,
+    pub version_id: Option<VersionId>,
 }
 
 impl<'a> PutObjectPolicyContext<'a> {
@@ -103,6 +104,7 @@ impl<'a> PutObjectPolicyContext<'a> {
             object_creation_operation: None,
             prefix: None,
             object_ownership: None,
+            version_id: None,
         }
     }
 
@@ -200,6 +202,12 @@ impl<'a> PutObjectPolicyContext<'a> {
     #[must_use]
     pub const fn with_object_ownership(mut self, object_ownership: Option<&'a str>) -> Self {
         self.object_ownership = object_ownership;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_version_id(mut self, version_id: Option<VersionId>) -> Self {
+        self.version_id = version_id;
         self
     }
 }

@@ -1208,7 +1208,7 @@ impl Coordinator {
         let read_allowed = self.requester_can_missing_object_action_with_bucket_policy(
             access.request(
                 Self::get_object_policy_action(version_id),
-                PutObjectPolicyContext::default(),
+                PutObjectPolicyContext::default().with_version_id(version_id),
             ),
             key,
             || Self::requester_can_discover_missing_object(access.requester, access.bucket),
@@ -1216,7 +1216,7 @@ impl Coordinator {
         let attrs_allowed = self.requester_can_missing_object_action_with_bucket_policy(
             access.request(
                 Self::get_object_attributes_policy_action(version_id),
-                PutObjectPolicyContext::default(),
+                PutObjectPolicyContext::default().with_version_id(version_id),
             ),
             key,
             || Self::requester_can_discover_missing_object_attrs(access.requester, access.bucket),
@@ -1275,8 +1275,42 @@ impl Coordinator {
         object: Option<&StoredObject>,
         action: auth::PolicyAction,
     ) -> Result<bool, ServerError> {
+        self.requester_can_delete_object_with_policy_context(
+            access,
+            key,
+            object,
+            action,
+            PutObjectPolicyContext::default(),
+        )
+    }
+
+    pub(super) fn requester_can_delete_object_version_with_bucket_policy(
+        &self,
+        access: BucketPolicyAccess<'_>,
+        key: &str,
+        object: Option<&StoredObject>,
+        action: auth::PolicyAction,
+        version_id: VersionId,
+    ) -> Result<bool, ServerError> {
+        self.requester_can_delete_object_with_policy_context(
+            access,
+            key,
+            object,
+            action,
+            PutObjectPolicyContext::default().with_version_id(Some(version_id)),
+        )
+    }
+
+    fn requester_can_delete_object_with_policy_context(
+        &self,
+        access: BucketPolicyAccess<'_>,
+        key: &str,
+        object: Option<&StoredObject>,
+        action: auth::PolicyAction,
+        policy_context: PutObjectPolicyContext<'_>,
+    ) -> Result<bool, ServerError> {
         let decision = self.object_policy_decision(
-            access.request(action, PutObjectPolicyContext::default()),
+            access.request(action, policy_context),
             match object {
                 Some(object) => ObjectPolicyTarget::Existing(object),
                 None => ObjectPolicyTarget::MissingKey(key),

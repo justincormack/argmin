@@ -259,6 +259,13 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
         evaluable_for_action: None,
         supported_for_action: Some(object_ownership_supported_for_action),
     },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:versionid"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_version_id,
+        evaluable_for_action: None,
+        supported_for_action: Some(version_id_supported_for_action),
+    },
 ];
 
 /// Look up a resolver for a given condition-key name.
@@ -381,6 +388,10 @@ fn resolve_location_constraint<'a>(
 
 fn resolve_object_ownership<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
     option_to_resolved(request.object_ownership())
+}
+
+fn resolve_version_id<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    option_to_resolved(request.version_id())
 }
 
 fn option_to_resolved(value: Option<&str>) -> ResolvedValue<'_> {
@@ -530,6 +541,20 @@ fn location_constraint_supported_for_action(_action: PolicyAction) -> bool {
 
 fn object_ownership_supported_for_action(action: PolicyAction) -> bool {
     matches!(action, PolicyAction::PutBucketOwnershipControls)
+}
+
+fn version_id_supported_for_action(action: PolicyAction) -> bool {
+    matches!(
+        action,
+        PolicyAction::GetObjectVersion
+            | PolicyAction::GetObjectVersionAttributes
+            | PolicyAction::GetObjectVersionAcl
+            | PolicyAction::GetObjectVersionTagging
+            | PolicyAction::PutObjectVersionAcl
+            | PolicyAction::PutObjectVersionTagging
+            | PolicyAction::DeleteObjectVersion
+            | PolicyAction::DeleteObjectVersionTagging
+    )
 }
 
 /// Whether a condition clause is supported on a given action at
@@ -849,6 +874,44 @@ mod tests {
             .expect("RequestObjectTagKeys has a support predicate");
         assert!(!request_tag_keys_predicate(PolicyAction::TagResource));
         assert!(!request_tag_keys_predicate(PolicyAction::UntagResource));
+    }
+
+    #[test]
+    fn version_id_is_supported_for_version_scoped_object_actions() {
+        let (resolver, param) = lookup("s3:versionid").unwrap();
+        assert_eq!(param, "");
+        assert_eq!(resolver.operator_support, OperatorSupport::AnyEvaluable);
+        let predicate = resolver
+            .supported_for_action
+            .expect("VersionId has a support predicate");
+
+        for action in [
+            PolicyAction::GetObjectVersion,
+            PolicyAction::GetObjectVersionAttributes,
+            PolicyAction::GetObjectVersionAcl,
+            PolicyAction::GetObjectVersionTagging,
+            PolicyAction::PutObjectVersionAcl,
+            PolicyAction::PutObjectVersionTagging,
+            PolicyAction::DeleteObjectVersion,
+            PolicyAction::DeleteObjectVersionTagging,
+        ] {
+            assert!(predicate(action), "{action:?}");
+        }
+
+        for action in [
+            PolicyAction::GetObject,
+            PolicyAction::GetObjectAttributes,
+            PolicyAction::GetObjectAcl,
+            PolicyAction::GetObjectTagging,
+            PolicyAction::PutObject,
+            PolicyAction::PutObjectAcl,
+            PolicyAction::PutObjectTagging,
+            PolicyAction::DeleteObject,
+            PolicyAction::DeleteObjectTagging,
+            PolicyAction::ListBucketVersions,
+        ] {
+            assert!(!predicate(action), "{action:?}");
+        }
     }
 
     #[test]

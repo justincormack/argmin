@@ -298,6 +298,7 @@ pub struct PolicyRequest<'a> {
     object_creation_operation: Option<bool>,
     prefix: Option<&'a str>,
     object_ownership: Option<&'a str>,
+    version_id: Option<&'a str>,
 }
 
 impl<'a> PolicyRequest<'a> {
@@ -335,6 +336,7 @@ impl<'a> PolicyRequest<'a> {
             object_creation_operation: None,
             prefix: None,
             object_ownership: None,
+            version_id: None,
         }
     }
 
@@ -371,6 +373,7 @@ impl<'a> PolicyRequest<'a> {
             object_creation_operation: None,
             prefix: None,
             object_ownership: None,
+            version_id: None,
         }
     }
 
@@ -534,6 +537,12 @@ impl<'a> PolicyRequest<'a> {
     }
 
     #[must_use]
+    pub fn with_version_id(mut self, version_id: Option<&'a str>) -> Self {
+        self.version_id = version_id;
+        self
+    }
+
+    #[must_use]
     fn copy_source(&self) -> Option<&'a str> {
         self.copy_source
     }
@@ -614,6 +623,11 @@ impl<'a> PolicyRequest<'a> {
     #[must_use]
     fn object_ownership(&self) -> Option<&'a str> {
         self.object_ownership
+    }
+
+    #[must_use]
+    fn version_id(&self) -> Option<&'a str> {
+        self.version_id
     }
 }
 
@@ -1688,6 +1702,33 @@ mod tests {
             existing_object_tags,
         )
         .with_bucket_tags(BucketTags::Available(bucket_tags))
+    }
+
+    #[test]
+    fn version_id_condition_matches_version_scoped_object_request() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObjectVersion","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:versionid":"42"}}}]}"#,
+        )
+        .unwrap();
+        let allowed = request(
+            PolicyAction::GetObjectVersion,
+            "bucket",
+            "key",
+            Some("caller"),
+            &[],
+        )
+        .with_version_id(Some("42"));
+        let denied = request(
+            PolicyAction::GetObjectVersion,
+            "bucket",
+            "key",
+            Some("caller"),
+            &[],
+        )
+        .with_version_id(Some("43"));
+
+        assert_eq!(policy.evaluate(&allowed), PolicyEvaluation::ExplicitAllow);
+        assert_eq!(policy.evaluate(&denied), PolicyEvaluation::NoMatch);
     }
 
     #[test]

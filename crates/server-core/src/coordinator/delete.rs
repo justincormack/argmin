@@ -126,7 +126,7 @@ impl Coordinator {
                         &key,
                         version_id,
                         |stored| -> Result<(), ServerError> {
-                            if !self.requester_can_delete_object_with_bucket_policy(
+                            if !self.requester_can_delete_object_version_with_bucket_policy(
                                 crate::coordinator::authz::BucketPolicyAccess {
                                     requester: &requester,
                                     bucket: &bucket_info,
@@ -136,6 +136,7 @@ impl Coordinator {
                                 key.as_str(),
                                 stored,
                                 Self::delete_object_policy_action(Some(version_id)),
+                                version_id,
                             )? {
                                 return Err(ServerError::AccessDenied);
                             }

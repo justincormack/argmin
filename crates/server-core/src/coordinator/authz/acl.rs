@@ -260,7 +260,7 @@ impl Coordinator {
                     Err(storage::ObjectPgActionError::Metadata(
                         storage::MetadataError::ObjectNotFound,
                     )) => {
-                        let allowed = self.requester_can_delete_object_with_bucket_policy(
+                        let allowed = self.requester_can_delete_object_version_with_bucket_policy(
                             BucketPolicyAccess {
                                 requester,
                                 bucket: &bucket_info,
@@ -270,6 +270,7 @@ impl Coordinator {
                             key_str,
                             None,
                             Self::delete_object_policy_action(Some(version_id)),
+                            version_id,
                         )?;
                         if !allowed {
                             return Err(ServerError::AccessDenied);
