@@ -14,13 +14,13 @@ use super::{
     MetadataCommandApplyTestContext, MetadataCommandApplyTestKind,
 };
 use crate::metadata_command::{
-    BucketPropertyMutation, BucketSubresourceMutation, CommitDirectPutObjectCommand,
-    CommitMultipartObjectCommand, CreateBucketCommand, CreateStreamUploadCommand,
-    DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
-    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
-    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
-    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
-    PutObjectMetadataMutation,
+    AbortMultipartUploadCommand, BucketPropertyMutation, BucketSubresourceMutation,
+    CommitDirectPutObjectCommand, CommitMultipartObjectCommand, CreateBucketCommand,
+    CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteObjectVersionCommand,
+    DeleteObjectVersionTarget, InsertDeleteMarkerCommand, MetadataCommandEnvelope,
+    MetadataCommandId, MetadataCommandPayload, ObjectPayloadReclaimCommand, PutBucketAclCommand,
+    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
+    PutObjectMetadataCommand, PutObjectMetadataMutation,
 };
 use crate::*;
 
@@ -180,6 +180,16 @@ fn metadata_command_apply_test_context(
         ),
         MetadataCommandPayload::AbortStreamUpload(command) => (
             MetadataCommandApplyTestKind::AbortStreamUpload,
+            Some(command.bucket.clone()),
+            Some(command.key.clone()),
+        ),
+        MetadataCommandPayload::CreateMultipartUpload(command) => (
+            MetadataCommandApplyTestKind::CreateMultipartUpload,
+            Some(command.request.bucket.clone()),
+            Some(command.request.key.clone()),
+        ),
+        MetadataCommandPayload::AbortMultipartUpload(command) => (
+            MetadataCommandApplyTestKind::AbortMultipartUpload,
             Some(command.bucket.clone()),
             Some(command.key.clone()),
         ),
@@ -384,7 +394,9 @@ impl super::StorageCluster {
                 | MetadataCommandPayload::PutObjectMetadata(_)
                 | MetadataCommandPayload::CreateStreamUpload(_)
                 | MetadataCommandPayload::AppendStreamSegment(_)
-                | MetadataCommandPayload::AbortStreamUpload(_) => {
+                | MetadataCommandPayload::AbortStreamUpload(_)
+                | MetadataCommandPayload::CreateMultipartUpload(_)
+                | MetadataCommandPayload::AbortMultipartUpload(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending object command for create bucket",
                     ));
@@ -868,7 +880,9 @@ impl super::StorageCluster {
                 | MetadataCommandPayload::PutObjectMetadata(_)
                 | MetadataCommandPayload::CreateStreamUpload(_)
                 | MetadataCommandPayload::AppendStreamSegment(_)
-                | MetadataCommandPayload::AbortStreamUpload(_) => {
+                | MetadataCommandPayload::AbortStreamUpload(_)
+                | MetadataCommandPayload::CreateMultipartUpload(_)
+                | MetadataCommandPayload::AbortMultipartUpload(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending object command for versioning",
                     ));
@@ -1043,7 +1057,9 @@ impl super::StorageCluster {
                 | MetadataCommandPayload::PutObjectMetadata(_)
                 | MetadataCommandPayload::CreateStreamUpload(_)
                 | MetadataCommandPayload::AppendStreamSegment(_)
-                | MetadataCommandPayload::AbortStreamUpload(_) => {
+                | MetadataCommandPayload::AbortStreamUpload(_)
+                | MetadataCommandPayload::CreateMultipartUpload(_)
+                | MetadataCommandPayload::AbortMultipartUpload(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending object command for bucket acl",
                     ));
@@ -1143,7 +1159,9 @@ impl super::StorageCluster {
                 | MetadataCommandPayload::PutObjectMetadata(_)
                 | MetadataCommandPayload::CreateStreamUpload(_)
                 | MetadataCommandPayload::AppendStreamSegment(_)
-                | MetadataCommandPayload::AbortStreamUpload(_) => {
+                | MetadataCommandPayload::AbortStreamUpload(_)
+                | MetadataCommandPayload::CreateMultipartUpload(_)
+                | MetadataCommandPayload::AbortMultipartUpload(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending object command for bucket property",
                     ));
@@ -1266,7 +1284,9 @@ impl super::StorageCluster {
                 | MetadataCommandPayload::PutObjectMetadata(_)
                 | MetadataCommandPayload::CreateStreamUpload(_)
                 | MetadataCommandPayload::AppendStreamSegment(_)
-                | MetadataCommandPayload::AbortStreamUpload(_) => {
+                | MetadataCommandPayload::AbortStreamUpload(_)
+                | MetadataCommandPayload::CreateMultipartUpload(_)
+                | MetadataCommandPayload::AbortMultipartUpload(_) => {
                     return Err(conflicting_pending_metadata_command(
                         "unexpected pending object command for bucket subresource",
                     ));
@@ -3242,7 +3262,10 @@ impl super::StorageCluster {
         self.delete_multipart_part_segments_best_effort(&cleanup.displaced_segments);
     }
 
-    fn delete_abort_multipart_cleanup_best_effort(&self, cleanup: &AbortMultipartUploadCleanup) {
+    pub(super) fn delete_abort_multipart_cleanup_best_effort(
+        &self,
+        cleanup: &AbortMultipartUploadCleanup,
+    ) {
         for part in &cleanup.parts {
             if part.part_okh == [0u8; 16] {
                 continue;
@@ -3565,8 +3588,67 @@ impl super::StorageCluster {
             Option<StoredObject>,
         ) -> Result<(T, CreateMultipartUploadReq), E>,
     ) -> Result<Result<CreateMultipartUploadOutcome<T>, E>, BucketSnapshotLoadError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .create_multipart_upload(bucket, key, request, action)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        primary_node.with_bucket_write_reservation_snapshot(bucket, request, |snapshot| {
+            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let existing_object = match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
+                Ok(StoredObject::Live(record)) => Some(StoredObject::Live(record)),
+                Ok(StoredObject::DeleteMarker(_)) | Err(MetadataError::ObjectNotFound) => None,
+                Err(error) => return Err(error.into()),
+            };
+            drop(object_pg);
+
+            let (value, create) = match action(snapshot, existing_object) {
+                Ok(prepared) => prepared,
+                Err(error) => return Ok(Err(error)),
+            };
+            if let Some(initiated_at) = self
+                .matching_multipart_upload_initiated_at(pg_id, &create)
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
+            {
+                return Ok(Ok(CreateMultipartUploadOutcome {
+                    value,
+                    initiated_at,
+                }));
+            }
+
+            let object_generation_id = {
+                let object_pg = primary_node.get_pg(pg_id.get())?;
+                PgMetadataStore::next_generation_id(&*object_pg, bucket, key)?
+            };
+            let command = MetadataCommandEnvelope::new(
+                self.next_object_metadata_command_id(pg_id),
+                MetadataCommandPayload::CreateMultipartUpload(Box::new(
+                    CreateMultipartUploadCommand {
+                        request: create.clone(),
+                        object_generation_id,
+                        initiated_at_millis: crate::clock::current_time_millis(),
+                    },
+                )),
+            );
+            self.local_map
+                .runtime_state()
+                .set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            if let Err(error) =
+                self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
+            {
+                return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                    error,
+                ));
+            }
+
+            let initiated_at = {
+                let object_pg = primary_node.get_pg(pg_id.get())?;
+                PgMetadataStore::get_multipart_upload(&*object_pg, &create.upload_id)?.initiated_at
+            };
+            Ok(Ok(CreateMultipartUploadOutcome {
+                value,
+                initiated_at,
+            }))
+        })
     }
 
     pub fn load_multipart_upload(
@@ -4135,13 +4217,62 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<bool, ObjectPgActionError> {
-        let cleanup = self
-            .object_metadata_primary_node(bucket, key)?
-            .abort_multipart_upload(bucket, key, upload_id)?;
-        if let Some(cleanup) = cleanup.as_ref() {
-            self.delete_abort_multipart_cleanup_best_effort(cleanup);
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let runtime_state = self.local_map.runtime_state();
+        while let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket) {
+            let matching_abort = matches!(
+                command.payload(),
+                MetadataCommandPayload::AbortMultipartUpload(abort)
+                    if abort.bucket == *bucket
+                        && abort.key == *key
+                        && abort.upload_id == *upload_id
+            );
+            if matching_abort {
+                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                return Ok(true);
+            }
+            self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
         }
-        Ok(cleanup.is_some())
+
+        let Some(command) =
+            self.prepare_abort_multipart_upload_command(pg_id, bucket, key, upload_id)?
+        else {
+            return Ok(false);
+        };
+        let MetadataCommandPayload::AbortMultipartUpload(_) = command.payload() else {
+            unreachable!("prepared abort multipart command changed payload kind");
+        };
+        runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+        self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+        Ok(true)
+    }
+
+    fn prepare_abort_multipart_upload_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let cleanup = {
+            let object_pg = primary_node.get_pg(pg_id.get())?;
+            object_pg.prepare_abort_multipart_upload_cleanup(bucket, key, upload_id)?
+        };
+        let cleanup = match cleanup {
+            Some(cleanup) => cleanup,
+            None => return Ok(None),
+        };
+
+        Ok(Some(MetadataCommandEnvelope::new(
+            self.next_object_metadata_command_id(pg_id),
+            MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                upload_id: upload_id.clone(),
+                cleanup,
+            })),
+        )))
     }
 
     pub fn abort_multipart_upload_if_due<E>(
@@ -4151,17 +4282,65 @@ impl super::StorageCluster {
         upload_id: &UploadId,
         should_abort: impl FnOnce(Option<&str>, &MultipartUploadRecord) -> Result<bool, E>,
     ) -> Result<Result<bool, E>, ObjectPgActionError> {
-        match self
-            .object_metadata_primary_node(bucket, key)?
-            .abort_multipart_upload_if_due(bucket, key, upload_id, should_abort)?
+        let Some(lifecycle_context) = self.load_bucket_lifecycle_context(bucket)? else {
+            return Ok(Ok(false));
+        };
+        let BucketLifecycleContext {
+            _bucket_guard: _lifecycle_bucket_guard,
+            raw_lifecycle,
+            ..
+        } = lifecycle_context;
+
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        while let Some(command) = self
+            .local_map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(pg_id, bucket)
         {
-            Ok(Some(cleanup)) => {
-                self.delete_abort_multipart_cleanup_best_effort(&cleanup);
-                Ok(Ok(true))
+            let matching_abort = matches!(
+                command.payload(),
+                MetadataCommandPayload::AbortMultipartUpload(abort)
+                    if abort.bucket == *bucket
+                        && abort.key == *key
+                        && abort.upload_id == *upload_id
+            );
+            self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            if matching_abort {
+                return Ok(Ok(true));
             }
-            Ok(None) => Ok(Ok(false)),
-            Err(error) => Ok(Err(error)),
         }
+
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let upload = {
+            let object_pg = primary_node.get_pg(pg_id.get())?;
+            match PgMetadataStore::get_multipart_upload(&*object_pg, upload_id) {
+                Ok(upload) => {
+                    if upload.bucket != *bucket || upload.key != *key {
+                        return Ok(Ok(false));
+                    }
+                    upload
+                }
+                Err(MetadataError::NoSuchUpload { .. }) => return Ok(Ok(false)),
+                Err(error) => return Err(error.into()),
+            }
+        };
+
+        if upload.state == UploadState::Aborting {
+            return self.abort_multipart_upload(bucket, key, upload_id).map(Ok);
+        }
+        if upload.state != UploadState::InProgress || raw_lifecycle.is_none() {
+            return Ok(Ok(false));
+        }
+
+        let should_abort = match should_abort(raw_lifecycle.as_deref(), &upload) {
+            Ok(should_abort) => should_abort,
+            Err(error) => return Ok(Err(error)),
+        };
+        if !should_abort {
+            return Ok(Ok(false));
+        }
+
+        self.abort_multipart_upload(bucket, key, upload_id).map(Ok)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

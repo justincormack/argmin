@@ -2748,7 +2748,7 @@ impl UploadState {
 }
 
 /// In-progress multipart upload record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultipartUploadRecord {
     pub upload_id: UploadId,
     pub bucket: BucketName,
@@ -2900,6 +2900,7 @@ pub struct ObjectPartRangeRecord {
 }
 
 /// Request to create a multipart upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateMultipartUploadReq {
     pub upload_id: UploadId,
     pub bucket: BucketName,
@@ -3135,7 +3136,7 @@ pub struct FinalizeStreamPartStorageOutcome<T, E> {
     pub cleanup: Option<FinalizeStreamPartCleanup>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbortMultipartUploadCleanup {
     pub upload: MultipartUploadRecord,
     pub parts: Vec<MultipartPartRecord>,

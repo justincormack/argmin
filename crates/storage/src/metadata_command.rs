@@ -7,11 +7,12 @@ use s3_types::{
 };
 
 use crate::types::{
-    BucketEncryptionConfig, BucketName, BucketObjectOwnership, BucketOwnershipControls,
-    BucketSubresourceAux, BucketSubresourceKind, ClusterEpoch, CreateBucketConfig,
-    CreateStreamUploadReq, GenerationId, ManagedEncryptionAlgorithm, MultipartPartRecord,
-    MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimRecord,
-    ObjectEncryption, ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord,
+    AbortMultipartUploadCleanup, BucketEncryptionConfig, BucketName, BucketObjectOwnership,
+    BucketOwnershipControls, BucketSubresourceAux, BucketSubresourceKind, ClusterEpoch,
+    CreateBucketConfig, CreateMultipartUploadReq, CreateStreamUploadReq, GenerationId,
+    ManagedEncryptionAlgorithm, MultipartPartRecord, MultipartPartSegmentRecord,
+    MultipartReclaimPartRecord, MultipartReclaimRecord, MultipartUploadRecord, ObjectEncryption,
+    ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord,
     ObjectSegmentsReclaimRecord, OwnerIdentity, PgId, PublicAccessBlockConfig, PutLiveObjectReq,
     SessionId, StreamUploadSegmentRecord, StreamUploadTarget, UploadId, VersionId,
 };
@@ -33,6 +34,8 @@ const METADATA_COMMAND_PUT_OBJECT_METADATA: u16 = 12;
 const METADATA_COMMAND_CREATE_STREAM_UPLOAD: u16 = 13;
 const METADATA_COMMAND_APPEND_STREAM_SEGMENT: u16 = 14;
 const METADATA_COMMAND_ABORT_STREAM_UPLOAD: u16 = 15;
+const METADATA_COMMAND_CREATE_MULTIPART_UPLOAD: u16 = 16;
+const METADATA_COMMAND_ABORT_MULTIPART_UPLOAD: u16 = 17;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct MetadataCommandLogIndex(NonZeroU64);
@@ -161,6 +164,8 @@ pub(crate) enum MetadataCommandPayload {
     CreateStreamUpload(Box<CreateStreamUploadCommand>),
     AppendStreamSegment(Box<AppendStreamSegmentCommand>),
     AbortStreamUpload(Box<AbortStreamUploadCommand>),
+    CreateMultipartUpload(Box<CreateMultipartUploadCommand>),
+    AbortMultipartUpload(Box<AbortMultipartUploadCommand>),
 }
 
 impl MetadataCommandPayload {
@@ -181,6 +186,8 @@ impl MetadataCommandPayload {
             Self::CreateStreamUpload(_) => METADATA_COMMAND_CREATE_STREAM_UPLOAD,
             Self::AppendStreamSegment(_) => METADATA_COMMAND_APPEND_STREAM_SEGMENT,
             Self::AbortStreamUpload(_) => METADATA_COMMAND_ABORT_STREAM_UPLOAD,
+            Self::CreateMultipartUpload(_) => METADATA_COMMAND_CREATE_MULTIPART_UPLOAD,
+            Self::AbortMultipartUpload(_) => METADATA_COMMAND_ABORT_MULTIPART_UPLOAD,
         }
     }
 }
@@ -577,6 +584,21 @@ pub(crate) struct AbortStreamUploadCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CreateMultipartUploadCommand {
+    pub(crate) request: CreateMultipartUploadReq,
+    pub(crate) object_generation_id: GenerationId,
+    pub(crate) initiated_at_millis: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AbortMultipartUploadCommand {
+    pub(crate) bucket: BucketName,
+    pub(crate) key: ObjectKey,
+    pub(crate) upload_id: UploadId,
+    pub(crate) cleanup: AbortMultipartUploadCleanup,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MetadataCommandEnvelope {
     id: MetadataCommandId,
     payload: MetadataCommandPayload,
@@ -670,6 +692,12 @@ fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPaylo
         }
         MetadataCommandPayload::AbortStreamUpload(command) => {
             encode_abort_stream_upload(&mut out, command);
+        }
+        MetadataCommandPayload::CreateMultipartUpload(command) => {
+            encode_create_multipart_upload(&mut out, command);
+        }
+        MetadataCommandPayload::AbortMultipartUpload(command) => {
+            encode_abort_multipart_upload(&mut out, command);
         }
     }
     out
@@ -898,6 +926,63 @@ fn encode_abort_stream_upload(out: &mut Vec<u8>, command: &AbortStreamUploadComm
     for segment in &command.staged_segments {
         encode_stream_upload_segment(out, segment);
     }
+}
+
+fn encode_create_multipart_upload(out: &mut Vec<u8>, command: &CreateMultipartUploadCommand) {
+    let request = &command.request;
+    put_str(out, request.upload_id.as_str());
+    put_str(out, request.bucket.as_str());
+    put_str(out, request.key.as_str());
+    encode_optional_str(out, request.tags.as_ref().map(|tags| tags.as_str()));
+    put_bytes(out, request.metadata_blob.as_slice());
+    put_bytes(out, request.system_metadata_blob.as_slice());
+    encode_optional_owner_identity(out, request.initiator.as_ref());
+    encode_owner_identity(out, &request.owner);
+    put_str(out, &request.acl_grants.serialized());
+    put_bool(out, request.public_read);
+    encode_object_lock_state(out, request.object_lock);
+    encode_optional_multipart_checksum_config(out, request.checksum);
+    encode_object_encryption(out, &request.encryption);
+    put_u64(out, command.object_generation_id.get());
+    put_u64(out, command.initiated_at_millis);
+}
+
+fn encode_abort_multipart_upload(out: &mut Vec<u8>, command: &AbortMultipartUploadCommand) {
+    put_str(out, command.bucket.as_str());
+    put_str(out, command.key.as_str());
+    put_str(out, command.upload_id.as_str());
+    encode_abort_multipart_upload_cleanup(out, &command.cleanup);
+}
+
+fn encode_abort_multipart_upload_cleanup(out: &mut Vec<u8>, cleanup: &AbortMultipartUploadCleanup) {
+    encode_multipart_upload(out, &cleanup.upload);
+    put_u32(out, cleanup.parts.len() as u32);
+    for part in &cleanup.parts {
+        encode_multipart_part(out, part);
+    }
+    put_u32(out, cleanup.streaming_segments.len() as u32);
+    for segment in &cleanup.streaming_segments {
+        encode_multipart_part_segment(out, segment);
+    }
+}
+
+fn encode_multipart_upload(out: &mut Vec<u8>, upload: &MultipartUploadRecord) {
+    put_str(out, upload.upload_id.as_str());
+    put_str(out, upload.bucket.as_str());
+    put_str(out, upload.key.as_str());
+    put_u64(out, upload.initiated_at);
+    put_u8(out, upload.state as u8);
+    encode_optional_str(out, upload.tags.as_ref().map(|tags| tags.as_str()));
+    put_bytes(out, upload.metadata_blob.as_slice());
+    put_bytes(out, upload.system_metadata_blob.as_slice());
+    encode_optional_owner_identity(out, upload.initiator.as_ref());
+    encode_owner_identity(out, &upload.owner);
+    put_str(out, &upload.acl_grants.serialized());
+    put_bool(out, upload.public_read);
+    put_u64(out, upload.object_generation_id.get());
+    encode_object_lock_state(out, upload.object_lock);
+    encode_optional_multipart_checksum_config(out, upload.checksum);
+    encode_object_encryption(out, &upload.encryption);
 }
 
 fn encode_put_live_object(out: &mut Vec<u8>, object: &PutLiveObjectReq) {
@@ -1132,6 +1217,35 @@ fn encode_object_lock_state(out: &mut Vec<u8>, object_lock: ObjectLockState) {
 fn encode_object_encryption(out: &mut Vec<u8>, encryption: &ObjectEncryption) {
     put_u8(out, encryption.encryption_type() as u8);
     encode_optional_bytes(out, encryption.encode_state().as_deref());
+}
+
+fn encode_owner_identity(out: &mut Vec<u8>, owner: &OwnerIdentity) {
+    put_str(out, &owner.principal);
+    put_str(out, owner.canonical_id.as_str());
+}
+
+fn encode_optional_owner_identity(out: &mut Vec<u8>, owner: Option<&OwnerIdentity>) {
+    match owner {
+        None => put_u8(out, 0),
+        Some(owner) => {
+            put_u8(out, 1);
+            encode_owner_identity(out, owner);
+        }
+    }
+}
+
+fn encode_optional_multipart_checksum_config(
+    out: &mut Vec<u8>,
+    checksum: Option<crate::MultipartChecksumConfig>,
+) {
+    match checksum {
+        None => put_u8(out, 0),
+        Some(checksum) => {
+            put_u8(out, 1);
+            put_u8(out, checksum.algorithm() as u8);
+            put_u8(out, checksum.checksum_type() as u8);
+        }
+    }
 }
 
 fn encode_optional_str(out: &mut Vec<u8>, value: Option<&str>) {
@@ -1637,6 +1751,24 @@ mod tests {
             checksum: None,
         };
         let upload_id = UploadId::try_from(format!("{}{}", "upload", ".".repeat(122))).unwrap();
+        let multipart_upload = MultipartUploadRecord {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            initiated_at: 560,
+            state: crate::UploadState::Aborting,
+            tags: Some(crate::SerializedTagSet::new("<Tagging/>".to_string())),
+            metadata_blob: SerializedMetadataBlob::new(vec![1, 2, 3]),
+            system_metadata_blob: SerializedSystemMetadataBlob::new(vec![4, 5, 6]),
+            initiator: Some(OwnerIdentity::from_principal("initiator")),
+            owner: OwnerIdentity::from_principal("owner"),
+            acl_grants: AclGrants::default(),
+            public_read: true,
+            object_generation_id: generation_id,
+            object_lock: ObjectLockState::default(),
+            checksum: None,
+            encryption: ObjectEncryption::None,
+        };
         let uploaded_part = MultipartPartRecord {
             upload_id: upload_id.clone(),
             part_number: 2,
@@ -1745,12 +1877,12 @@ mod tests {
                 stale_payload: Some(multipart_reclaim.clone()),
             })),
             MetadataCommandPayload::CommitMultipartObject(Box::new(CommitMultipartObjectCommand {
-                upload_id,
+                upload_id: upload_id.clone(),
                 object: multipart_object,
                 parts: vec![part],
-                selected_streaming_segments: vec![selected_streaming_segment],
-                omitted_parts: vec![uploaded_part],
-                omitted_streaming_segments: vec![omitted_streaming_segment],
+                selected_streaming_segments: vec![selected_streaming_segment.clone()],
+                omitted_parts: vec![uploaded_part.clone()],
+                omitted_streaming_segments: vec![omitted_streaming_segment.clone()],
                 write_sequence: 43,
                 completion_order: 12,
                 completed_at_millis: 556,
@@ -1828,6 +1960,35 @@ mod tests {
                 version_id: VersionId::from_u64(8),
                 mutation: PutObjectMetadataMutation::PutLegalHold(StoredLegalHoldStatus::On),
             })),
+            MetadataCommandPayload::CreateMultipartUpload(Box::new(CreateMultipartUploadCommand {
+                request: CreateMultipartUploadReq {
+                    upload_id: upload_id.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    tags: Some(crate::SerializedTagSet::new("<Tagging/>".to_string())),
+                    metadata_blob: SerializedMetadataBlob::new(vec![1, 2, 3]),
+                    system_metadata_blob: SerializedSystemMetadataBlob::new(vec![4, 5, 6]),
+                    initiator: Some(OwnerIdentity::from_principal("initiator")),
+                    owner: OwnerIdentity::from_principal("owner"),
+                    acl_grants: AclGrants::default(),
+                    public_read: true,
+                    object_lock: ObjectLockState::default(),
+                    checksum: None,
+                    encryption: ObjectEncryption::None,
+                },
+                object_generation_id: generation_id,
+                initiated_at_millis: 560,
+            })),
+            MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                upload_id: upload_id.clone(),
+                cleanup: AbortMultipartUploadCleanup {
+                    upload: multipart_upload,
+                    parts: vec![uploaded_part],
+                    streaming_segments: vec![omitted_streaming_segment],
+                },
+            })),
             MetadataCommandPayload::CreateStreamUpload(Box::new(CreateStreamUploadCommand {
                 request: CreateStreamUploadReq {
                     session_id: stream_session_id.clone(),
@@ -1892,10 +2053,12 @@ mod tests {
                 0x01cd87bdfd723201,
                 0x12751ef35639efd3,
                 0x22fd0e282e38997a,
-                0xb0ae61b4136b6fee,
-                0x08ac52d90c51cc50,
-                0xf877e3e9352647f1,
-                0x98f153e9dac6e503,
+                0x1c7aebe9c981fa68,
+                0x2c69c1feb283495d,
+                0xb67d60bbbb74f9d1,
+                0xf1b058002ad6040e,
+                0x7555192579a20442,
+                0xd6e957899583feaa,
             ]
         );
     }

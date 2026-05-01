@@ -1,8 +1,7 @@
 use super::*;
-use crate::types::{
-    AbortMultipartUploadCleanup, CreateMultipartUploadOutcome, CreateMultipartUploadReq,
-    FinalizeStreamPartCleanup, FinalizeStreamPartStorageOutcome, StoredObject,
-};
+#[cfg(test)]
+use crate::types::{CreateMultipartUploadOutcome, CreateMultipartUploadReq, StoredObject};
+use crate::types::{FinalizeStreamPartCleanup, FinalizeStreamPartStorageOutcome};
 
 impl SharedStorageNode {
     pub fn next_completed_multipart_upload_order_for_bucket(
@@ -43,7 +42,8 @@ impl SharedStorageNode {
         Ok(upload)
     }
 
-    pub fn create_multipart_upload<T, E>(
+    #[cfg(test)]
+    pub(crate) fn create_multipart_upload<T, E>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -230,7 +230,9 @@ impl SharedStorageNode {
                 upload_id,
                 part_number,
             )?;
-            let upload = Self::load_multipart_upload_from_object_pg(&pg, bucket, key, upload_id)?;
+            let upload = Self::load_in_progress_multipart_upload_from_object_pg(
+                &pg, bucket, key, upload_id,
+            )?;
             let existing_part = match pg.get_multipart_part(upload_id, part_number) {
                 Ok(existing) => Some(existing),
                 Err(crate::error::MetadataError::PartNotFound { .. }) => None,
@@ -336,100 +338,6 @@ impl SharedStorageNode {
             }
             Err(error) => Err(error.into()),
         }
-    }
-
-    pub fn abort_multipart_upload(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-    ) -> Result<Option<AbortMultipartUploadCleanup>, ObjectPgActionError> {
-        let (upload, parts, streaming_segments) = {
-            let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
-            let upload =
-                match Self::load_multipart_upload_from_object_pg(&pg, bucket, key, upload_id) {
-                    Ok(upload) => upload,
-                    Err(crate::error::MetadataError::NoSuchUpload { .. }) => return Ok(None),
-                    Err(error) => return Err(error.into()),
-                };
-
-            match pg.set_upload_state(upload_id, UploadState::Aborting) {
-                Ok(()) => {}
-                Err(crate::error::MetadataError::UploadNotInProgress { state })
-                    if state == UploadState::Aborting as u8 => {}
-                Err(crate::error::MetadataError::UploadNotInProgress { .. }) => return Ok(None),
-                Err(error) => return Err(error.into()),
-            }
-
-            let parts = pg
-                .list_multipart_parts(&ListPartsReq {
-                    upload_id: upload_id.clone(),
-                    part_number_marker: None,
-                    max_parts: u32::MAX,
-                })?
-                .parts;
-            let streaming_segments = pg.get_all_multipart_part_segments_for_upload(upload_id)?;
-            (upload, parts, streaming_segments)
-        };
-
-        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
-        if !streaming_segments.is_empty() {
-            pg.delete_multipart_part_segments_by_upload_id(upload_id)?;
-        }
-        match pg.delete_multipart_upload(upload_id) {
-            Ok(()) | Err(crate::error::MetadataError::NoSuchUpload { .. }) => {
-                Ok(Some(AbortMultipartUploadCleanup {
-                    upload,
-                    parts,
-                    streaming_segments,
-                }))
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    pub fn abort_multipart_upload_if_due<E>(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-        should_abort: impl FnOnce(Option<&str>, &MultipartUploadRecord) -> Result<bool, E>,
-    ) -> Result<Result<Option<AbortMultipartUploadCleanup>, E>, ObjectPgActionError> {
-        let Some((_bucket_guard, _bucket_info, raw_lifecycle)) =
-            self.lock_bucket_and_load_lifecycle_context(bucket)?
-        else {
-            return Ok(Ok(None));
-        };
-
-        let upload = match self.load_multipart_upload(bucket, key, upload_id) {
-            Ok(upload) => upload,
-            Err(crate::error::BucketSnapshotLoadError::Metadata(
-                crate::error::MetadataError::NoSuchUpload { .. },
-            )) => return Ok(Ok(None)),
-            Err(crate::error::BucketSnapshotLoadError::Store(error)) => {
-                return Err(error.into());
-            }
-            Err(crate::error::BucketSnapshotLoadError::Metadata(error)) => {
-                return Err(error.into());
-            }
-        };
-
-        if upload.state == UploadState::Aborting {
-            return self.abort_multipart_upload(bucket, key, upload_id).map(Ok);
-        }
-        if upload.state != UploadState::InProgress || raw_lifecycle.is_none() {
-            return Ok(Ok(None));
-        }
-
-        let should_abort = match should_abort(raw_lifecycle.as_deref(), &upload) {
-            Ok(should_abort) => should_abort,
-            Err(error) => return Ok(Err(error)),
-        };
-        if !should_abort {
-            return Ok(Ok(None));
-        }
-
-        self.abort_multipart_upload(bucket, key, upload_id).map(Ok)
     }
 
     pub(super) fn validate_upload_part_stream_session(

@@ -1347,9 +1347,33 @@ Work items:
      - include convergence coverage for disabled current expiration, suspended
        null-current expiration, noncurrent live-version expiration, and expired
        delete-marker removal
+     - add a `CreateMultipartUpload` command payload carrying the exact upload
+       row, initiated timestamp, and reserved object generation
+     - route multipart upload creation through the object metadata PG acting set
+       with pending-command retry for partial replica apply, while preserving
+       the raw upload-id generation reservation used by completion/abort
+     - include acting-set convergence coverage for multipart create and a
+       partial-primary-apply retry regression proving the same pending command
+       converges before the retry returns
+     - add an `AbortMultipartUpload` command payload so explicit abort deletes
+       the multipart upload row, generation reservation, part rows, and streamed
+       part staging metadata from every acting object-PG node
+     - keep payload shard deletion cluster-owned; abort preparation first marks
+       the upload `Aborting` on the object-PG primary, then carries the primary
+       cleanup snapshot in the abort command so partial-apply retries can still
+       clean uploaded part payloads after metadata converges
+     - include regression coverage for create -> abort -> fresh create on the
+       same key, proving abort does not leave replica-local generation
+       reservations that poison the next create
+     - include partial-apply abort retry coverage with uploaded part payload
+       shards, proving the pending command keeps enough cleanup refs to delete
+       placed payload files after retry
+     - route lifecycle-driven MPU abort through the same command path after the
+       bucket-lifecycle recheck, and cover it with acting-set convergence plus
+       placed payload cleanup assertions
    - remaining slices:
-     - multipart create, part upload, upload-part stream staging, abort, and
-       remaining multipart staging metadata
+     - multipart part upload, upload-part stream staging, and remaining
+       multipart staging metadata
      - reclaim rows and reclaim worker metadata transitions
 5. Phase 6.5: synchronous replica apply.
    - apply every metadata command to all required replicas before acknowledging

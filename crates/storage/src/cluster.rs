@@ -50,6 +50,8 @@ pub enum MetadataCommandApplyTestKind {
     CreateStreamUpload,
     AppendStreamSegment,
     AbortStreamUpload,
+    CreateMultipartUpload,
+    AbortMultipartUpload,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -130,6 +132,26 @@ fn stream_upload_matches_create(
         && existing.key == create.key
         && existing.target == create.target
         && existing.state == StreamUploadState::InProgress
+        && existing.encryption == create.encryption
+}
+
+fn multipart_upload_matches_create(
+    existing: &crate::MultipartUploadRecord,
+    create: &crate::CreateMultipartUploadReq,
+) -> bool {
+    existing.upload_id == create.upload_id
+        && existing.bucket == create.bucket
+        && existing.key == create.key
+        && existing.state == crate::UploadState::InProgress
+        && existing.tags == create.tags
+        && existing.metadata_blob == create.metadata_blob
+        && existing.system_metadata_blob == create.system_metadata_blob
+        && existing.initiator == create.initiator
+        && existing.owner == create.owner
+        && existing.acl_grants == create.acl_grants
+        && existing.public_read == create.public_read
+        && existing.object_lock == create.object_lock
+        && existing.checksum == create.checksum
         && existing.encryption == create.encryption
 }
 
@@ -961,6 +983,27 @@ impl StorageCluster {
         }
     }
 
+    pub(super) fn matching_multipart_upload_initiated_at(
+        &self,
+        pg_id: PgId,
+        create: &crate::CreateMultipartUploadReq,
+    ) -> Result<Option<u64>, ObjectPgActionError> {
+        let object_node = self.object_metadata_primary_node(&create.bucket, &create.key)?;
+        let object_pg = object_node.get_pg(pg_id.get())?;
+        match object_pg.get_multipart_upload(&create.upload_id) {
+            Ok(existing) if multipart_upload_matches_create(&existing, create) => {
+                Ok(Some(existing.initiated_at))
+            }
+            Ok(_) => Err(MetadataError::Db {
+                context: "create multipart upload existing upload mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            }
+            .into()),
+            Err(MetadataError::NoSuchUpload { .. }) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn apply_new_stream_append_command(
         &self,
         pg_id: PgId,
@@ -1049,6 +1092,9 @@ impl StorageCluster {
                 self.delete_staged_stream_segment_payload_shards_best_effort(
                     &abort.staged_segments,
                 );
+            }
+            MetadataCommandPayload::AbortMultipartUpload(abort) => {
+                self.delete_abort_multipart_cleanup_best_effort(&abort.cleanup);
             }
             _ => {}
         }

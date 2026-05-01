@@ -1681,6 +1681,31 @@ mod tests {
         }
     }
 
+    fn write_test_payload_shard_set(
+        cluster: &crate::StorageCluster,
+        data_pg_id: u32,
+        ec: EcShape,
+        okh: &[u8; 16],
+        generation_id: crate::GenerationId,
+    ) -> Vec<ShardKey> {
+        let placement_key = super::super::segment_payload_placement_key(okh, generation_id);
+        let locations = cluster
+            .place_payload_shards(DataPgId::new(PgId::new(data_pg_id)), ec, &placement_key)
+            .unwrap();
+        let mut keys = Vec::new();
+        for shard_index in 0..ec.k + ec.m {
+            let key = ShardKey::new(okh, generation_id.get(), shard_index);
+            cluster
+                .write_payload_shard(locations[usize::from(shard_index)], &key, &[shard_index; 3])
+                .unwrap();
+            assert!(cluster
+                .test_payload_shard_file_exists(data_pg_id, ec, okh, generation_id, shard_index)
+                .unwrap());
+            keys.push(key);
+        }
+        keys
+    }
+
     fn seed_completed_multipart_upload_record(
         map: &LocalClusterMap,
         node_id: NodeId,
@@ -2830,6 +2855,771 @@ mod tests {
                 &mut readback,
             )
             .is_err());
+    }
+
+    #[test]
+    fn multipart_create_command_applies_to_all_acting_object_pg_nodes() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let upload_id = upload_id_from_label("mpucreatecommand");
+        let create = crate::CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: Some(crate::SerializedTagSet::new("<Tagging/>".to_string())),
+            metadata_blob: crate::SerializedMetadataBlob::new(vec![1, 2, 3]),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::new(vec![4, 5, 6]),
+            initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: true,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
+
+        let outcome = cluster
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>((11_u8, create.clone()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.value, 11);
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+
+        let mut generation_id = None;
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            let upload = crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap();
+            assert_eq!(upload.bucket, bucket);
+            assert_eq!(upload.key, key);
+            assert_eq!(upload.initiated_at, outcome.initiated_at);
+            assert_eq!(upload.tags, create.tags);
+            assert_eq!(upload.metadata_blob, create.metadata_blob);
+            assert_eq!(upload.system_metadata_blob, create.system_metadata_blob);
+            assert_eq!(upload.initiator, create.initiator);
+            assert_eq!(upload.owner, create.owner);
+            assert_eq!(upload.acl_grants, create.acl_grants);
+            assert_eq!(upload.public_read, create.public_read);
+            assert_eq!(upload.object_lock, create.object_lock);
+            assert_eq!(upload.checksum, create.checksum);
+            assert_eq!(upload.encryption, create.encryption);
+            if let Some(generation_id) = generation_id {
+                assert_eq!(upload.object_generation_id, generation_id);
+            } else {
+                generation_id = Some(upload.object_generation_id);
+            }
+        }
+    }
+
+    #[test]
+    fn multipart_create_partial_apply_retry_reuses_pending_command() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let upload_id = upload_id_from_label("mpucreateretry");
+        let create = crate::CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_upload_id = upload_id.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::CreateMultipartUpload(create)
+                        if create.request.upload_id == hook_upload_id
+                            && node_id == NodeId::new(1)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected multipart create metadata command apply failure",
+                            source: std::io::Error::other(
+                                "injected multipart create metadata command apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), create.clone()))
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Store(StoreError::Io {
+                    context: "injected multipart create metadata command apply failure",
+                    ..
+                })
+            ),
+            "expected injected primary failure, got {err:?}"
+        );
+        drop(hook_guard);
+
+        assert!(
+            map.runtime_state()
+                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+                .is_some(),
+            "partial multipart create command must remain pending"
+        );
+        let replica_upload = {
+            let replica = map.node(NodeId::new(0)).unwrap().storage_node();
+            let pg = replica.get_pg(object_pg).unwrap();
+            crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap()
+        };
+        {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = primary.get_pg(object_pg).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id),
+                Err(crate::MetadataError::NoSuchUpload { .. })
+            ));
+        }
+
+        let retry = cluster
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>((7_u8, create.clone()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.value, 7);
+        assert_eq!(retry.initiated_at, replica_upload.initiated_at);
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            let upload = crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap();
+            assert_eq!(upload.bucket, bucket);
+            assert_eq!(upload.key, key);
+            assert_eq!(upload.initiated_at, replica_upload.initiated_at);
+            assert_eq!(
+                upload.object_generation_id,
+                replica_upload.object_generation_id
+            );
+        }
+    }
+
+    #[test]
+    fn multipart_abort_command_removes_upload_from_all_acting_object_pg_nodes() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let first_upload_id = upload_id_from_label("mpuabortonallnodes");
+        let first_create = crate::CreateMultipartUploadReq {
+            upload_id: first_upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
+        cluster
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), first_create.clone()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(cluster
+            .abort_multipart_upload(&bucket, &key, &first_upload_id)
+            .unwrap());
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_multipart_upload(&*pg, &first_upload_id),
+                Err(crate::MetadataError::NoSuchUpload { .. })
+            ));
+        }
+
+        let second_upload_id = upload_id_from_label("mpuabortedfresh");
+        let second_create = crate::CreateMultipartUploadReq {
+            upload_id: second_upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
+        cluster
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), second_create.clone()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let mut second_generation = None;
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            let upload =
+                crate::PgMetadataStore::get_multipart_upload(&*pg, &second_upload_id).unwrap();
+            assert_eq!(upload.bucket, bucket);
+            assert_eq!(upload.key, key);
+            if let Some(second_generation) = second_generation {
+                assert_eq!(upload.object_generation_id, second_generation);
+            } else {
+                second_generation = Some(upload.object_generation_id);
+            }
+        }
+    }
+
+    #[test]
+    fn multipart_abort_partial_apply_retry_cleans_uploaded_part_payload() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let upload_id = upload_id_from_label("mpuabandretryclean");
+        let create = crate::CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
+        cluster
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), create.clone()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+        let object_pg_store = primary.get_pg(object_pg).unwrap();
+        let upload =
+            crate::PgMetadataStore::get_multipart_upload(&*object_pg_store, &upload_id).unwrap();
+        let part_vid = crate::GenerationId::new(upload.object_generation_id.get() + 1).unwrap();
+        let part_okh = [0xAB; 16];
+        let part_number = 1;
+        let part = crate::MultipartPartRecord {
+            upload_id: upload_id.clone(),
+            part_number,
+            generation: 1,
+            size: 9,
+            etag: vec![0xCD; 8],
+            etag_kind: crate::EtagKind::Crc64,
+            part_okh,
+            part_vid,
+            ec_k: ec_shape.k,
+            ec_m: ec_shape.m,
+            last_modified: 123,
+            checksum: None,
+        };
+        crate::PgMetadataStore::upsert_multipart_part(&*object_pg_store, &part).unwrap();
+        let data_pg_id = primary
+            .pg_topology()
+            .object_generation_multipart_part_data_pg(
+                &bucket,
+                &key,
+                upload.object_generation_id,
+                part_number,
+            )
+            .get();
+        drop(object_pg_store);
+
+        let shard_keys =
+            write_test_payload_shard_set(&cluster, data_pg_id, ec_shape, &part_okh, part_vid);
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_upload_id = upload_id.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::AbortMultipartUpload(abort)
+                        if abort.upload_id == hook_upload_id
+                            && node_id == NodeId::new(1)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected multipart abort metadata command apply failure",
+                            source: std::io::Error::other(
+                                "injected multipart abort metadata command apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .abort_multipart_upload(&bucket, &key, &upload_id)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected multipart abort metadata command apply failure",
+                    ..
+                })
+            ),
+            "expected injected primary failure, got {err:?}"
+        );
+        drop(hook_guard);
+
+        assert!(
+            map.runtime_state()
+                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+                .is_some(),
+            "partial multipart abort command must remain pending with cleanup refs"
+        );
+        {
+            let primary_pg = primary.get_pg(object_pg).unwrap();
+            let upload =
+                crate::PgMetadataStore::get_multipart_upload(&*primary_pg, &upload_id).unwrap();
+            assert_eq!(upload.state, crate::UploadState::Aborting);
+            assert!(crate::PgMetadataStore::get_multipart_part(
+                &*primary_pg,
+                &upload_id,
+                part_number
+            )
+            .is_ok());
+        }
+        for shard_index in 0..ec_shape.k + ec_shape.m {
+            assert!(cluster
+                .test_payload_shard_file_exists(
+                    data_pg_id,
+                    ec_shape,
+                    &part_okh,
+                    part_vid,
+                    shard_index
+                )
+                .unwrap());
+        }
+
+        assert!(cluster
+            .abort_multipart_upload(&bucket, &key, &upload_id)
+            .unwrap());
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id),
+                Err(crate::MetadataError::NoSuchUpload { .. })
+            ));
+        }
+        for (shard_index, key) in shard_keys.iter().enumerate() {
+            assert!(
+                !cluster
+                    .test_payload_shard_file_exists(
+                        data_pg_id,
+                        ec_shape,
+                        &part_okh,
+                        part_vid,
+                        shard_index as u8
+                    )
+                    .unwrap(),
+                "retrying pending abort should delete placed shard {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multipart_abort_zero_apply_marks_upload_aborting_before_part_finalize() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let upload_id = upload_id_from_label("mpuabortingblocks");
+        let create = crate::CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
+        cluster
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), create.clone()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        let session_id = crate::SessionId::try_from("0123456789abcdef0123456789abcdef").unwrap();
+        cluster
+            .create_upload_part_stream_session(&bucket, &key, &upload_id, 1, &session_id)
+            .unwrap();
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_upload_id = upload_id.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::AbortMultipartUpload(abort)
+                        if abort.upload_id == hook_upload_id
+                            && node_id == NodeId::new(0)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected zero-apply multipart abort failure",
+                            source: std::io::Error::other(
+                                "injected zero-apply multipart abort failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .abort_multipart_upload(&bucket, &key, &upload_id)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected zero-apply multipart abort failure",
+                    ..
+                })
+            ),
+            "expected injected zero-apply failure, got {err:?}"
+        );
+        drop(hook_guard);
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+        {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = primary.get_pg(object_pg).unwrap();
+            let upload = crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap();
+            assert_eq!(upload.state, crate::UploadState::Aborting);
+        }
+
+        let err = cluster
+            .finalize_upload_part_stream(
+                &bucket,
+                &key,
+                &upload_id,
+                &session_id,
+                1,
+                |_| -> Result<crate::PreparedStreamPartCommit<()>, ()> {
+                    panic!("finalize action must not run for an aborting upload")
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Metadata(crate::MetadataError::NoSuchUpload { .. })
+            ),
+            "expected aborting upload to reject part finalize, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn lifecycle_multipart_abort_uses_command_and_cleans_uploaded_part_payload() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        put_test_lifecycle(&cluster, &bucket);
+
+        let upload_id = upload_id_from_label("mpulifecycleabort");
+        let create = crate::CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
+        cluster
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), create.clone()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+        let object_pg_store = primary.get_pg(object_pg).unwrap();
+        let upload =
+            crate::PgMetadataStore::get_multipart_upload(&*object_pg_store, &upload_id).unwrap();
+        let part_vid = crate::GenerationId::new(upload.object_generation_id.get() + 1).unwrap();
+        let part_okh = [0xBC; 16];
+        let part_number = 1;
+        let part = crate::MultipartPartRecord {
+            upload_id: upload_id.clone(),
+            part_number,
+            generation: 1,
+            size: 9,
+            etag: vec![0xDE; 8],
+            etag_kind: crate::EtagKind::Crc64,
+            part_okh,
+            part_vid,
+            ec_k: ec_shape.k,
+            ec_m: ec_shape.m,
+            last_modified: 123,
+            checksum: None,
+        };
+        crate::PgMetadataStore::upsert_multipart_part(&*object_pg_store, &part).unwrap();
+        let data_pg_id = primary
+            .pg_topology()
+            .object_generation_multipart_part_data_pg(
+                &bucket,
+                &key,
+                upload.object_generation_id,
+                part_number,
+            )
+            .get();
+        drop(object_pg_store);
+
+        let shard_keys =
+            write_test_payload_shard_set(&cluster, data_pg_id, ec_shape, &part_okh, part_vid);
+
+        let aborted = cluster
+            .abort_multipart_upload_if_due(&bucket, &key, &upload_id, |raw_lifecycle, upload| {
+                assert_eq!(raw_lifecycle, Some("<LifecycleConfiguration/>"));
+                assert_eq!(upload.state, crate::UploadState::InProgress);
+                Ok::<bool, ()>(true)
+            })
+            .unwrap()
+            .unwrap();
+        assert!(aborted);
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id),
+                Err(crate::MetadataError::NoSuchUpload { .. })
+            ));
+        }
+        for (shard_index, key) in shard_keys.iter().enumerate() {
+            assert!(
+                !cluster
+                    .test_payload_shard_file_exists(
+                        data_pg_id,
+                        ec_shape,
+                        &part_okh,
+                        part_vid,
+                        shard_index as u8
+                    )
+                    .unwrap(),
+                "lifecycle abort should delete placed shard {key:?}"
+            );
+        }
     }
 
     #[test]
