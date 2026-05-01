@@ -40,6 +40,11 @@ pub(super) enum ConditionOpKind {
     StringLike,
     StringNotLike,
     NumericEquals,
+    NumericNotEquals,
+    NumericLessThan,
+    NumericLessThanEquals,
+    NumericGreaterThan,
+    NumericGreaterThanEquals,
     Null,
 }
 
@@ -215,6 +220,72 @@ pub(super) const CONDITION_OPS: &[ConditionOpDef] = &[
         evaluable_on_evaluable_object_actions: true,
     },
     ConditionOpDef {
+        name: "NumericEqualsIfExists",
+        kind: ConditionOpKind::NumericEquals,
+        evaluate: eval_numeric_equals_if_exists,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "NumericNotEquals",
+        kind: ConditionOpKind::NumericNotEquals,
+        evaluate: eval_numeric_not_equals,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "NumericNotEqualsIfExists",
+        kind: ConditionOpKind::NumericNotEquals,
+        evaluate: eval_numeric_not_equals,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "NumericLessThan",
+        kind: ConditionOpKind::NumericLessThan,
+        evaluate: eval_numeric_less_than,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "NumericLessThanIfExists",
+        kind: ConditionOpKind::NumericLessThan,
+        evaluate: eval_numeric_less_than_if_exists,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "NumericLessThanEquals",
+        kind: ConditionOpKind::NumericLessThanEquals,
+        evaluate: eval_numeric_less_than_equals,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "NumericLessThanEqualsIfExists",
+        kind: ConditionOpKind::NumericLessThanEquals,
+        evaluate: eval_numeric_less_than_equals_if_exists,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "NumericGreaterThan",
+        kind: ConditionOpKind::NumericGreaterThan,
+        evaluate: eval_numeric_greater_than,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "NumericGreaterThanIfExists",
+        kind: ConditionOpKind::NumericGreaterThan,
+        evaluate: eval_numeric_greater_than_if_exists,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "NumericGreaterThanEquals",
+        kind: ConditionOpKind::NumericGreaterThanEquals,
+        evaluate: eval_numeric_greater_than_equals,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "NumericGreaterThanEqualsIfExists",
+        kind: ConditionOpKind::NumericGreaterThanEquals,
+        evaluate: eval_numeric_greater_than_equals_if_exists,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
         name: "Null",
         kind: ConditionOpKind::Null,
         evaluate: eval_null,
@@ -254,7 +325,16 @@ pub(super) const fn is_string_condition_kind(kind: ConditionOpKind) -> bool {
 }
 
 pub(super) const fn is_numeric_condition_kind(kind: ConditionOpKind) -> bool {
-    matches!(kind, ConditionOpKind::NumericEquals | ConditionOpKind::Null)
+    matches!(
+        kind,
+        ConditionOpKind::NumericEquals
+            | ConditionOpKind::NumericNotEquals
+            | ConditionOpKind::NumericLessThan
+            | ConditionOpKind::NumericLessThanEquals
+            | ConditionOpKind::NumericGreaterThan
+            | ConditionOpKind::NumericGreaterThanEquals
+            | ConditionOpKind::Null
+    )
 }
 
 fn eval_bool(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
@@ -704,25 +784,147 @@ fn eval_for_any_value_string_not_like(
     }
 }
 
-fn eval_numeric_equals(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+#[derive(Clone, Copy)]
+enum NumericComparison {
+    Equals,
+    NotEquals,
+    LessThan,
+    LessThanEquals,
+    GreaterThan,
+    GreaterThanEquals,
+}
+
+fn eval_numeric_comparison(
+    operands: &[String],
+    actual: ActualValue<'_>,
+    comparison: NumericComparison,
+    if_exists: bool,
+) -> ConditionMatchResult {
     match actual {
         ActualValue::Present(actual) => {
             let Some(actual) = parse_numeric(actual) else {
                 return ConditionMatchResult::NoMatch;
             };
-            if operands
-                .iter()
-                .filter_map(|expected| parse_numeric(expected))
-                .any(|expected| expected == actual)
-            {
-                ConditionMatchResult::Matches
-            } else {
-                ConditionMatchResult::NoMatch
-            }
+            eval_numeric_operands(operands, actual, comparison)
         }
         ActualValue::PresentValues(_) => ConditionMatchResult::NoMatch,
+        ActualValue::Absent if if_exists || matches!(comparison, NumericComparison::NotEquals) => {
+            ConditionMatchResult::Matches
+        }
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
+}
+
+fn eval_numeric_operands(
+    operands: &[String],
+    actual: f64,
+    comparison: NumericComparison,
+) -> ConditionMatchResult {
+    let matches = match comparison {
+        NumericComparison::Equals => operands
+            .iter()
+            .filter_map(|expected| parse_numeric(expected))
+            .any(|expected| actual.total_cmp(&expected).is_eq()),
+        NumericComparison::NotEquals => {
+            operands
+                .iter()
+                .all(|expected| match parse_numeric(expected) {
+                    Some(expected) => actual.total_cmp(&expected).is_ne(),
+                    None => true,
+                })
+        }
+        NumericComparison::LessThan => operands
+            .iter()
+            .filter_map(|expected| parse_numeric(expected))
+            .any(|expected| actual < expected),
+        NumericComparison::LessThanEquals => operands
+            .iter()
+            .filter_map(|expected| parse_numeric(expected))
+            .any(|expected| actual <= expected),
+        NumericComparison::GreaterThan => operands
+            .iter()
+            .filter_map(|expected| parse_numeric(expected))
+            .any(|expected| actual > expected),
+        NumericComparison::GreaterThanEquals => operands
+            .iter()
+            .filter_map(|expected| parse_numeric(expected))
+            .any(|expected| actual >= expected),
+    };
+    if matches {
+        ConditionMatchResult::Matches
+    } else {
+        ConditionMatchResult::NoMatch
+    }
+}
+
+fn eval_numeric_equals(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+    eval_numeric_comparison(operands, actual, NumericComparison::Equals, false)
+}
+
+fn eval_numeric_equals_if_exists(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    eval_numeric_comparison(operands, actual, NumericComparison::Equals, true)
+}
+
+fn eval_numeric_not_equals(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+    eval_numeric_comparison(operands, actual, NumericComparison::NotEquals, false)
+}
+
+fn eval_numeric_less_than(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+    eval_numeric_comparison(operands, actual, NumericComparison::LessThan, false)
+}
+
+fn eval_numeric_less_than_if_exists(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    eval_numeric_comparison(operands, actual, NumericComparison::LessThan, true)
+}
+
+fn eval_numeric_less_than_equals(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    eval_numeric_comparison(operands, actual, NumericComparison::LessThanEquals, false)
+}
+
+fn eval_numeric_less_than_equals_if_exists(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    eval_numeric_comparison(operands, actual, NumericComparison::LessThanEquals, true)
+}
+
+fn eval_numeric_greater_than(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+    eval_numeric_comparison(operands, actual, NumericComparison::GreaterThan, false)
+}
+
+fn eval_numeric_greater_than_if_exists(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    eval_numeric_comparison(operands, actual, NumericComparison::GreaterThan, true)
+}
+
+fn eval_numeric_greater_than_equals(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    eval_numeric_comparison(
+        operands,
+        actual,
+        NumericComparison::GreaterThanEquals,
+        false,
+    )
+}
+
+fn eval_numeric_greater_than_equals_if_exists(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    eval_numeric_comparison(operands, actual, NumericComparison::GreaterThanEquals, true)
 }
 
 fn parse_numeric(value: &str) -> Option<f64> {
@@ -828,6 +1030,67 @@ mod tests {
         assert_eq!(
             (op.evaluate)(&operands(&["2"]), ActualValue::Absent),
             ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn numeric_comparison_operators_match_expected_ordering() {
+        let cases = [
+            ("NumericNotEquals", "3", ConditionMatchResult::Matches),
+            ("NumericNotEquals", "2", ConditionMatchResult::NoMatch),
+            ("NumericLessThan", "3", ConditionMatchResult::Matches),
+            ("NumericLessThan", "2", ConditionMatchResult::NoMatch),
+            ("NumericLessThanEquals", "2", ConditionMatchResult::Matches),
+            ("NumericLessThanEquals", "1", ConditionMatchResult::NoMatch),
+            ("NumericGreaterThan", "1", ConditionMatchResult::Matches),
+            ("NumericGreaterThan", "2", ConditionMatchResult::NoMatch),
+            (
+                "NumericGreaterThanEquals",
+                "2",
+                ConditionMatchResult::Matches,
+            ),
+            (
+                "NumericGreaterThanEquals",
+                "3",
+                ConditionMatchResult::NoMatch,
+            ),
+        ];
+
+        for (operator, expected, outcome) in cases {
+            let op = lookup(operator).expect("numeric operator is in the table");
+            assert_eq!((op.evaluate)(&operands(&[expected]), present("2")), outcome);
+        }
+    }
+
+    #[test]
+    fn numeric_if_exists_variants_match_absent_values() {
+        for operator in [
+            "NumericEqualsIfExists",
+            "NumericNotEqualsIfExists",
+            "NumericLessThanIfExists",
+            "NumericLessThanEqualsIfExists",
+            "NumericGreaterThanIfExists",
+            "NumericGreaterThanEqualsIfExists",
+        ] {
+            let op = lookup(operator).expect("numeric IfExists operator is in the table");
+            assert_eq!(
+                (op.evaluate)(&operands(&["2"]), ActualValue::Absent),
+                ConditionMatchResult::Matches,
+                "{operator} should match absent context values"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_not_equals_matches_absent_and_invalid_policy_operands() {
+        let op = lookup("NumericNotEquals").expect("NumericNotEquals is in the table");
+        assert_eq!(
+            (op.evaluate)(&operands(&["2"]), ActualValue::Absent),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&operands(&["not-a-number"]), present("2")),
+            ConditionMatchResult::Matches
         );
     }
 

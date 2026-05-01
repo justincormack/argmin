@@ -12122,6 +12122,132 @@ fn test_bucket_policy_list_bucket_max_keys_numeric_equals_condition() {
     });
 }
 
+async fn put_max_keys_condition_policy(bucket: &str, operator: &str, policy_value: i32) {
+    let mut condition = serde_json::Map::new();
+    condition.insert(operator.to_string(), json!({ "s3:max-keys": policy_value }));
+
+    CTX.client()
+        .put_bucket_policy()
+        .bucket(bucket)
+        .policy(
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": "s3:ListBucket",
+                    "Resource": bucket_resource(bucket),
+                    "Condition": condition,
+                }],
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+}
+
+async fn assert_max_keys_condition_operator(
+    operator: &str,
+    policy_value: i32,
+    allowed_max_keys: i32,
+    denied_max_keys: i32,
+    omitted_should_match: bool,
+) {
+    let client = CTX.client();
+    let alt_client = CTX.alt_client();
+    let bucket = create_bucket_allowing_public_policy(client).await;
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("one")
+        .body(ByteStream::from_static(b"body"))
+        .send()
+        .await
+        .unwrap();
+
+    put_max_keys_condition_policy(&bucket, operator, policy_value).await;
+
+    let allow_description =
+        format!("ListObjectsV2 allowed for {operator} when max-keys is {allowed_max_keys}");
+    let listed = eventually_ok(&allow_description, || {
+        alt_client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .max_keys(allowed_max_keys)
+            .send()
+    })
+    .await;
+    assert_eq!(listed.max_keys(), Some(allowed_max_keys));
+
+    if omitted_should_match {
+        let omitted_description =
+            format!("ListObjectsV2 allowed for {operator} when max-keys is omitted");
+        eventually_ok(&omitted_description, || {
+            alt_client.list_objects_v2().bucket(&bucket).send()
+        })
+        .await;
+    }
+
+    let deny_description =
+        format!("ListObjectsV2 denied for {operator} when max-keys is {denied_max_keys}");
+    eventually_access_denied(&deny_description, || {
+        alt_client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .max_keys(denied_max_keys)
+            .send()
+    })
+    .await;
+
+    cleanup(&bucket, &["one"]).await;
+}
+
+#[test]
+fn test_bucket_policy_list_bucket_max_keys_numeric_comparison_operators() {
+    s3_tests::run(async {
+        for (operator, policy_value, allowed_max_keys, denied_max_keys) in [
+            ("NumericNotEquals", 2, 3, 2),
+            ("NumericLessThan", 2, 1, 2),
+            ("NumericLessThanEquals", 2, 2, 3),
+            ("NumericGreaterThan", 2, 3, 2),
+            ("NumericGreaterThanEquals", 2, 2, 1),
+        ] {
+            assert_max_keys_condition_operator(
+                operator,
+                policy_value,
+                allowed_max_keys,
+                denied_max_keys,
+                false,
+            )
+            .await;
+        }
+    });
+}
+
+#[test]
+fn test_bucket_policy_list_bucket_max_keys_numeric_if_exists_operators() {
+    s3_tests::run(async {
+        for (operator, policy_value, allowed_max_keys, denied_max_keys) in [
+            ("NumericEqualsIfExists", 2, 2, 3),
+            ("NumericNotEqualsIfExists", 2, 3, 2),
+            ("NumericLessThanIfExists", 2, 1, 2),
+            ("NumericLessThanEqualsIfExists", 2, 2, 3),
+            ("NumericGreaterThanIfExists", 2, 3, 2),
+            ("NumericGreaterThanEqualsIfExists", 2, 2, 1),
+        ] {
+            assert_max_keys_condition_operator(
+                operator,
+                policy_value,
+                allowed_max_keys,
+                denied_max_keys,
+                true,
+            )
+            .await;
+        }
+    });
+}
+
 #[test]
 fn test_bucket_policy_list_bucket_max_keys_string_equals_condition() {
     s3_tests::run(async {

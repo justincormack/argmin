@@ -1028,11 +1028,6 @@ mod tests {
             key: "s3:max-keys".to_string(),
             values: vec!["2".to_string()],
         };
-        let numeric_clause = PolicyConditionClause {
-            operator: "NumericEquals".to_string(),
-            key: "s3:max-keys".to_string(),
-            values: vec!["2".to_string()],
-        };
         let bool_clause = PolicyConditionClause {
             operator: "Bool".to_string(),
             key: "s3:max-keys".to_string(),
@@ -1043,10 +1038,30 @@ mod tests {
             &string_clause,
             PolicyAction::ListBucket
         ));
-        assert!(supports_clause_for_action(
-            &numeric_clause,
-            PolicyAction::ListBucket
-        ));
+        for operator in [
+            "NumericEquals",
+            "NumericEqualsIfExists",
+            "NumericNotEquals",
+            "NumericNotEqualsIfExists",
+            "NumericLessThan",
+            "NumericLessThanIfExists",
+            "NumericLessThanEquals",
+            "NumericLessThanEqualsIfExists",
+            "NumericGreaterThan",
+            "NumericGreaterThanIfExists",
+            "NumericGreaterThanEquals",
+            "NumericGreaterThanEqualsIfExists",
+        ] {
+            let numeric_clause = PolicyConditionClause {
+                operator: operator.to_string(),
+                key: "s3:max-keys".to_string(),
+                values: vec!["2".to_string()],
+            };
+            assert!(
+                supports_clause_for_action(&numeric_clause, PolicyAction::ListBucket),
+                "{operator} should be supported for s3:max-keys"
+            );
+        }
         assert!(!supports_clause_for_action(
             &bool_clause,
             PolicyAction::ListBucket
