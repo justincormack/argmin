@@ -1409,6 +1409,7 @@ impl S3Response {
     pub fn list_object_versions(
         bucket: &str,
         prefix: Option<&str>,
+        delimiter: Option<&str>,
         key_marker: Option<&str>,
         encoding_type: Option<&str>,
         max_keys: u32,
@@ -1417,6 +1418,7 @@ impl S3Response {
         let body = xml::list_object_versions_xml(
             bucket,
             prefix,
+            delimiter,
             key_marker,
             encoding_type,
             max_keys,
@@ -3563,13 +3565,15 @@ mod tests {
                 checksum_algorithm: None,
                 checksum_type: None,
             }],
+            common_prefixes: vec![],
             is_truncated: false,
             next_key_marker: None,
             next_version_id_marker: None,
             owner_principal: "owner".into(),
             owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
-        let resp = S3Response::list_object_versions("bucket", None, None, None, 1000, &result);
+        let resp =
+            S3Response::list_object_versions("bucket", None, None, None, None, 1000, &result);
         assert_eq!(resp.status_code, 200);
         assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
         assert_eq!(find_header(&resp, "Content-Length"), None);

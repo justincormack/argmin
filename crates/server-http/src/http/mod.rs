@@ -1299,7 +1299,12 @@ impl HttpFrontend {
                         reason: "allow-unordered is not supported with delimiter".to_string(),
                     });
                 }
-                let max_keys: u32 = parse_max_keys(req.query_param_lossy("max-keys"))?;
+                let max_keys_param = req.query_param_lossy("max-keys");
+                let max_keys: u32 = parse_max_keys(max_keys_param.as_deref())?;
+                let requested_max_keys = max_keys_param
+                    .as_deref()
+                    .map(|value| parse_requested_max_keys(Some(value)))
+                    .transpose()?;
                 let requester = Self::requester_from_auth(auth);
 
                 let result = self.coordinator.list_objects_v2(
@@ -1309,6 +1314,7 @@ impl HttpFrontend {
                         delimiter: delimiter.as_deref(),
                         continuation_token: marker.as_deref(),
                         max_keys,
+                        requested_max_keys,
                     },
                 )?;
                 Ok(S3Response::list_objects_v1(
@@ -1350,7 +1356,12 @@ impl HttpFrontend {
                     .as_deref()
                     .or(start_after_raw.as_deref())
                     .filter(|v| !v.is_empty());
-                let max_keys: u32 = parse_max_keys(req.query_param_lossy("max-keys"))?;
+                let max_keys_param = req.query_param_lossy("max-keys");
+                let max_keys: u32 = parse_max_keys(max_keys_param.as_deref())?;
+                let requested_max_keys = max_keys_param
+                    .as_deref()
+                    .map(|value| parse_requested_max_keys(Some(value)))
+                    .transpose()?;
                 let requester = Self::requester_from_auth(auth);
 
                 let result = self.coordinator.list_objects_v2(
@@ -1360,6 +1371,7 @@ impl HttpFrontend {
                         delimiter: delimiter.as_deref(),
                         continuation_token,
                         max_keys,
+                        requested_max_keys,
                     },
                 )?;
                 Ok(S3Response::list_objects_v2(
@@ -2943,6 +2955,7 @@ impl HttpFrontend {
             }
             S3Operation::ListObjectVersions { bucket } => {
                 let prefix = req.query_param_lossy("prefix");
+                let delimiter = req.query_param_lossy("delimiter").filter(|d| !d.is_empty());
                 let key_marker = req.query_param_lossy("key-marker");
                 let encoding_type = req.query_param_lossy("encoding-type");
                 let version_id_marker = parse_optional_version_id(
@@ -2955,22 +2968,29 @@ impl HttpFrontend {
                             .to_string(),
                     });
                 }
-                let requested_max_keys =
-                    parse_requested_max_keys(req.query_param_lossy("max-keys"))?;
+                let max_keys_param = req.query_param_lossy("max-keys");
+                let requested_max_keys = parse_requested_max_keys(max_keys_param.as_deref())?;
+                let policy_requested_max_keys = max_keys_param
+                    .as_deref()
+                    .map(|value| parse_requested_max_keys(Some(value)))
+                    .transpose()?;
                 let requester = Self::requester_from_auth(auth);
 
                 let result = self.coordinator.list_object_versions(
                     &crate::coordinator::ListObjectVersionsRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
                         prefix: prefix.as_deref(),
+                        delimiter: delimiter.as_deref(),
                         key_marker: key_marker.as_deref(),
                         version_id_marker,
                         max_keys: requested_max_keys,
+                        requested_max_keys: policy_requested_max_keys,
                     },
                 )?;
                 Ok(S3Response::list_object_versions(
                     bucket.as_str(),
                     prefix.as_deref(),
+                    delimiter.as_deref(),
                     key_marker.as_deref(),
                     encoding_type.as_deref(),
                     requested_max_keys,

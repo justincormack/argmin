@@ -10,7 +10,7 @@
 //! The existing evaluator continues to use its hand-rolled dispatch until
 //! the migration commits route through [`CONDITION_KEYS`].
 
-use super::condition_op::{self, ActualValue, ConditionOpKind};
+use super::condition_op::{self, ActualValue};
 use super::{
     BucketTagValue, ConditionMatchResult, ExistingObjectTagValue, PolicyAction,
     PolicyConditionClause, PolicyRequest,
@@ -38,6 +38,7 @@ pub(super) enum ResolvedValue<'a> {
 pub(super) enum OperatorSupport {
     AnyEvaluable,
     BoolOnly,
+    StringOrNumeric,
     StringEqualsOnly,
 }
 
@@ -243,7 +244,21 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
         operator_support: OperatorSupport::AnyEvaluable,
         resolve: resolve_prefix,
         evaluable_for_action: None,
-        supported_for_action: Some(prefix_supported_for_action),
+        supported_for_action: Some(list_condition_supported_for_action),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:delimiter"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_delimiter,
+        evaluable_for_action: None,
+        supported_for_action: Some(list_condition_supported_for_action),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:max-keys"),
+        operator_support: OperatorSupport::StringOrNumeric,
+        resolve: resolve_max_keys,
+        evaluable_for_action: None,
+        supported_for_action: Some(list_condition_supported_for_action),
     },
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:locationconstraint"),
@@ -377,6 +392,14 @@ fn resolve_object_creation_operation<'a>(
 
 fn resolve_prefix<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
     option_to_resolved(request.prefix())
+}
+
+fn resolve_delimiter<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    option_to_resolved(request.delimiter())
+}
+
+fn resolve_max_keys<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    option_to_resolved(request.max_keys())
 }
 
 fn resolve_location_constraint<'a>(
@@ -528,7 +551,7 @@ fn conditional_write_supported_for_action(action: PolicyAction) -> bool {
     matches!(action, PolicyAction::PutObject)
 }
 
-fn prefix_supported_for_action(action: PolicyAction) -> bool {
+fn list_condition_supported_for_action(action: PolicyAction) -> bool {
     matches!(
         action,
         PolicyAction::ListBucket | PolicyAction::ListBucketVersions
@@ -571,15 +594,7 @@ pub(super) fn supports_clause_for_action(
         return false;
     };
     let operator = clause.operator.as_str();
-    let operator_ok = match resolver.operator_support {
-        OperatorSupport::AnyEvaluable => {
-            condition_op::is_evaluable_on_evaluable_object_actions(operator)
-        }
-        OperatorSupport::StringEqualsOnly => {
-            matches!(operator, "StringEquals" | "StringEqualsIfExists")
-        }
-        OperatorSupport::BoolOnly => operator == "Bool",
-    };
+    let operator_ok = operator_supported_for_key(operator, resolver.operator_support);
     if !operator_ok {
         return false;
     }
@@ -622,18 +637,8 @@ pub(super) fn evaluate_clause(
     let Some(op) = condition_op::lookup(clause.operator.as_str()) else {
         return ConditionMatchResult::Unsupported;
     };
-    match resolver.operator_support {
-        OperatorSupport::AnyEvaluable => {}
-        OperatorSupport::StringEqualsOnly => {
-            if op.kind != ConditionOpKind::StringEquals {
-                return ConditionMatchResult::Unsupported;
-            }
-        }
-        OperatorSupport::BoolOnly => {
-            if op.kind != ConditionOpKind::Bool {
-                return ConditionMatchResult::Unsupported;
-            }
-        }
+    if !operator_supported_for_key(op.name, resolver.operator_support) {
+        return ConditionMatchResult::Unsupported;
     }
     let actual = match (resolver.resolve)(request, param) {
         ResolvedValue::Present(value) => ActualValue::Present(value),
@@ -642,6 +647,24 @@ pub(super) fn evaluate_clause(
         ResolvedValue::Unavailable => return ConditionMatchResult::InputUnavailable,
     };
     (op.evaluate)(&clause.values, actual)
+}
+
+fn operator_supported_for_key(operator: &str, support: OperatorSupport) -> bool {
+    match support {
+        OperatorSupport::AnyEvaluable => condition_op::lookup(operator).is_some_and(|op| {
+            op.evaluable_on_evaluable_object_actions
+                && condition_op::is_string_condition_kind(op.kind)
+        }),
+        OperatorSupport::StringOrNumeric => condition_op::lookup(operator).is_some_and(|op| {
+            op.evaluable_on_evaluable_object_actions
+                && (condition_op::is_string_condition_kind(op.kind)
+                    || condition_op::is_numeric_condition_kind(op.kind))
+        }),
+        OperatorSupport::StringEqualsOnly => {
+            matches!(operator, "StringEquals" | "StringEqualsIfExists")
+        }
+        OperatorSupport::BoolOnly => operator == "Bool",
+    }
 }
 
 #[cfg(test)]
@@ -937,6 +960,8 @@ mod tests {
             "s3:if-none-match",
             "s3:ObjectCreationOperation",
             "s3:prefix",
+            "s3:delimiter",
+            "s3:max-keys",
             "s3:locationconstraint",
             "s3:x-amz-object-ownership",
         ] {
@@ -964,6 +989,66 @@ mod tests {
         ));
         assert!(!supports_clause_for_action(
             &clause,
+            PolicyAction::ListBucket
+        ));
+    }
+
+    #[test]
+    fn list_condition_keys_are_action_scoped() {
+        let prefix = PolicyConditionClause {
+            operator: "StringEquals".to_string(),
+            key: "s3:prefix".to_string(),
+            values: vec!["allowed/".to_string()],
+        };
+        let delimiter = PolicyConditionClause {
+            operator: "StringEquals".to_string(),
+            key: "s3:delimiter".to_string(),
+            values: vec!["/".to_string()],
+        };
+        let max_keys = PolicyConditionClause {
+            operator: "NumericEquals".to_string(),
+            key: "s3:max-keys".to_string(),
+            values: vec!["2".to_string()],
+        };
+
+        for clause in [&prefix, &delimiter, &max_keys] {
+            assert!(supports_clause_for_action(clause, PolicyAction::ListBucket));
+            assert!(supports_clause_for_action(
+                clause,
+                PolicyAction::ListBucketVersions
+            ));
+            assert!(!supports_clause_for_action(clause, PolicyAction::GetObject));
+        }
+    }
+
+    #[test]
+    fn max_keys_accepts_string_and_numeric_operators() {
+        let string_clause = PolicyConditionClause {
+            operator: "StringEquals".to_string(),
+            key: "s3:max-keys".to_string(),
+            values: vec!["2".to_string()],
+        };
+        let numeric_clause = PolicyConditionClause {
+            operator: "NumericEquals".to_string(),
+            key: "s3:max-keys".to_string(),
+            values: vec!["2".to_string()],
+        };
+        let bool_clause = PolicyConditionClause {
+            operator: "Bool".to_string(),
+            key: "s3:max-keys".to_string(),
+            values: vec!["true".to_string()],
+        };
+
+        assert!(supports_clause_for_action(
+            &string_clause,
+            PolicyAction::ListBucket
+        ));
+        assert!(supports_clause_for_action(
+            &numeric_clause,
+            PolicyAction::ListBucket
+        ));
+        assert!(!supports_clause_for_action(
+            &bool_clause,
             PolicyAction::ListBucket
         ));
     }

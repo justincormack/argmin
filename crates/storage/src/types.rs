@@ -2714,6 +2714,7 @@ pub struct ListedBucketObjects {
 #[derive(Debug, Clone)]
 pub struct ListedBucketObjectVersions {
     pub versions: Vec<StoredObject>,
+    pub common_prefixes: Vec<ObjectKey>,
     pub is_truncated: bool,
     pub next_key_marker: Option<ObjectKey>,
     pub next_version_id_marker: Option<VersionId>,

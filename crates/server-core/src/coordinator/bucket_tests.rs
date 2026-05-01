@@ -1685,6 +1685,7 @@ mod lifecycle_prop_tests {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: UNPAGINATED_MAX_KEYS,
+                requested_max_keys: Some(UNPAGINATED_MAX_KEYS),
             })
             .map_err(|err| TestCaseError::fail(format!("list_objects_v2 failed: {err:?}")))?;
 
@@ -1717,9 +1718,11 @@ mod lifecycle_prop_tests {
             .list_object_versions(&ListObjectVersionsRequest {
                 bucket: bucket_request_with_expected_owner(PROP_BUCKET, test_requester(), None),
                 prefix: None,
+                delimiter: None,
                 key_marker: None,
                 version_id_marker: None,
                 max_keys: UNPAGINATED_MAX_KEYS,
+                requested_max_keys: Some(UNPAGINATED_MAX_KEYS),
             })
             .map_err(|err| TestCaseError::fail(format!("list_object_versions failed: {err:?}")))?;
 
@@ -2159,9 +2162,11 @@ fn lifecycle_sweep_expires_suspended_null_current_with_null_delete_marker() {
         .list_object_versions(&ListObjectVersionsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             version_id_marker: None,
             max_keys: 100,
+            requested_max_keys: Some(100),
         })
         .unwrap();
     assert_eq!(versions.versions.len(), 2);
@@ -2861,9 +2866,11 @@ fn lifecycle_sweep_expires_explicit_expired_object_delete_marker() {
         .list_object_versions(&ListObjectVersionsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             version_id_marker: None,
             max_keys: 100,
+            requested_max_keys: Some(100),
         })
         .unwrap();
     assert!(versions.versions.is_empty());
@@ -4302,6 +4309,7 @@ fn authorize_list_bucket_bucket_tag_policy_applies_when_abac_enabled() {
             delimiter: None,
             continuation_token: None,
             max_keys: 1000,
+            requested_max_keys: Some(1000),
         })
         .unwrap();
 
@@ -4328,6 +4336,7 @@ fn authorize_list_bucket_bucket_tag_policy_applies_when_abac_enabled() {
             delimiter: None,
             continuation_token: None,
             max_keys: 1000,
+            requested_max_keys: Some(1000),
         })
         .unwrap_err();
     assert!(matches!(err, ServerError::AccessDenied));

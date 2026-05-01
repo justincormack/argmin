@@ -2342,6 +2342,7 @@ pub fn get_bucket_lifecycle_configuration_xml(config: &BucketLifecycleConfigurat
 pub fn list_object_versions_xml(
     bucket: &str,
     prefix: Option<&str>,
+    delimiter: Option<&str>,
     key_marker: Option<&str>,
     encoding_type: Option<&str>,
     max_keys: u32,
@@ -2364,6 +2365,15 @@ pub fn list_object_versions_xml(
         )));
     }
     xml.push_str("</Prefix>");
+
+    if let Some(delimiter) = delimiter {
+        xml.push_str("<Delimiter>");
+        xml.push_str(&xml_escape_list_value(&encode_list_versions_value(
+            delimiter,
+            encoding_type,
+        )));
+        xml.push_str("</Delimiter>");
+    }
 
     xml.push_str("<KeyMarker>");
     if let Some(km) = key_marker {
@@ -2471,6 +2481,15 @@ pub fn list_object_versions_xml(
             xml.push_str("<StorageClass>STANDARD</StorageClass>");
             xml.push_str("</Version>");
         }
+    }
+
+    for prefix in &result.common_prefixes {
+        xml.push_str("<CommonPrefixes><Prefix>");
+        xml.push_str(&xml_escape_list_value(&encode_list_versions_value(
+            prefix,
+            encoding_type,
+        )));
+        xml.push_str("</Prefix></CommonPrefixes>");
     }
 
     xml.push_str("</ListVersionsResult>");
@@ -5282,13 +5301,14 @@ mod tests {
                 checksum_algorithm: Some(ChecksumAlgorithm::Crc32),
                 checksum_type: Some(checksum::ChecksumType::FullObject),
             }],
+            common_prefixes: vec![],
             is_truncated: false,
             next_key_marker: None,
             next_version_id_marker: None,
             owner_principal: "owner".to_string(),
             owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
-        let xml = list_object_versions_xml("bucket", None, None, None, 1000, &result);
+        let xml = list_object_versions_xml("bucket", None, None, None, None, 1000, &result);
         assert!(xml.contains("ListVersionsResult"));
         assert!(xml.contains("<Version>"));
         assert!(xml.contains("<Key>my-key</Key>"));
@@ -5311,13 +5331,14 @@ mod tests {
         use crate::coordinator::ListObjectVersionsResult;
         let result = ListObjectVersionsResult {
             versions: vec![],
+            common_prefixes: vec![],
             is_truncated: false,
             next_key_marker: None,
             next_version_id_marker: None,
             owner_principal: "owner".to_string(),
             owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
-        let xml = list_object_versions_xml("bucket", None, None, None, 1000, &result);
+        let xml = list_object_versions_xml("bucket", None, None, None, None, 1000, &result);
         assert!(xml.contains("ListVersionsResult"));
         assert!(!xml.contains("<Version>"));
     }
@@ -5327,14 +5348,22 @@ mod tests {
         use crate::coordinator::ListObjectVersionsResult;
         let result = ListObjectVersionsResult {
             versions: vec![],
+            common_prefixes: vec![],
             is_truncated: false,
             next_key_marker: None,
             next_version_id_marker: None,
             owner_principal: "owner".to_string(),
             owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
-        let xml =
-            list_object_versions_xml("bucket", Some("photos/"), Some("key1"), None, 100, &result);
+        let xml = list_object_versions_xml(
+            "bucket",
+            Some("photos/"),
+            None,
+            Some("key1"),
+            None,
+            100,
+            &result,
+        );
         assert!(xml.contains("<Prefix>photos/</Prefix>"));
         assert!(xml.contains("<KeyMarker>key1</KeyMarker>"));
     }
@@ -5354,13 +5383,14 @@ mod tests {
                 checksum_algorithm: None,
                 checksum_type: None,
             }],
+            common_prefixes: vec![],
             is_truncated: false,
             next_key_marker: None,
             next_version_id_marker: None,
             owner_principal: "owner".to_string(),
             owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
-        let xml = list_object_versions_xml("bucket", None, None, None, 1000, &result);
+        let xml = list_object_versions_xml("bucket", None, None, None, None, 1000, &result);
         assert!(xml.contains("<DeleteMarker>"));
         assert!(xml.contains(&format!(
             "<Owner><ID>{}</ID></Owner>",
@@ -5384,6 +5414,7 @@ mod tests {
                 checksum_algorithm: None,
                 checksum_type: None,
             }],
+            common_prefixes: vec!["dir/common/".to_string()],
             is_truncated: true,
             next_key_marker: Some("dir/next key+".to_string()),
             next_version_id_marker: Some(VersionId::Null),
@@ -5393,6 +5424,7 @@ mod tests {
         let xml = list_object_versions_xml(
             "bucket",
             Some("dir/prefix here"),
+            None,
             Some("dir/key marker+"),
             Some("url"),
             1000,
@@ -5403,6 +5435,7 @@ mod tests {
         assert!(xml.contains("<KeyMarker>dir/key+marker%2B</KeyMarker>"));
         assert!(xml.contains("<NextKeyMarker>dir/next+key%2B</NextKeyMarker>"));
         assert!(xml.contains("<Key>dir/hello+world%26plus%2B</Key>"));
+        assert!(xml.contains("<CommonPrefixes><Prefix>dir/common/</Prefix></CommonPrefixes>"));
     }
 
     #[test]
@@ -7480,15 +7513,24 @@ mod tests {
             .list_object_versions(&ListObjectVersionsRequest {
                 bucket: test_bucket_request("test-bucket"),
                 prefix: None,
+                delimiter: None,
                 key_marker: None,
                 version_id_marker: None,
                 max_keys: 1000,
+                requested_max_keys: Some(1000),
             })
             .unwrap();
         assert_eq!(versions_result.versions.len(), 3);
 
-        let versions_xml =
-            list_object_versions_xml("test-bucket", None, None, None, 1000, &versions_result);
+        let versions_xml = list_object_versions_xml(
+            "test-bucket",
+            None,
+            None,
+            None,
+            None,
+            1000,
+            &versions_result,
+        );
         assert!(versions_xml.contains("<Key>dir/file1.txt</Key>"));
         assert!(versions_xml.contains("<Key>dir/file2.txt</Key>"));
         assert!(versions_xml.contains("<Key>root.txt</Key>"));
@@ -7503,6 +7545,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
+                requested_max_keys: Some(1000),
             })
             .unwrap();
         assert_eq!(list_result.objects.len(), 3);
@@ -7542,6 +7585,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
+                requested_max_keys: Some(1000),
             })
             .unwrap();
         assert!(list_after.objects.is_empty());
@@ -7588,6 +7632,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 2,
+                requested_max_keys: Some(2),
             })
             .unwrap();
         assert_eq!(page1.objects.len(), 2);
@@ -7601,6 +7646,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: Some(&token),
                 max_keys: 2,
+                requested_max_keys: Some(2),
             })
             .unwrap();
         assert_eq!(page2.objects.len(), 2);
@@ -7613,6 +7659,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: Some(&token2),
                 max_keys: 2,
+                requested_max_keys: Some(2),
             })
             .unwrap();
         assert_eq!(page3.objects.len(), 1);

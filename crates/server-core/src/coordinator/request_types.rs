@@ -75,6 +75,8 @@ pub struct PutObjectPolicyContext<'a> {
     pub if_none_match: Option<&'a str>,
     pub object_creation_operation: Option<bool>,
     pub prefix: Option<&'a str>,
+    pub delimiter: Option<&'a str>,
+    pub requested_max_keys: Option<u32>,
     pub object_ownership: Option<&'a str>,
     pub version_id: Option<VersionId>,
 }
@@ -103,6 +105,8 @@ impl<'a> PutObjectPolicyContext<'a> {
             if_none_match: None,
             object_creation_operation: None,
             prefix: None,
+            delimiter: None,
+            requested_max_keys: None,
             object_ownership: None,
             version_id: None,
         }
@@ -196,6 +200,18 @@ impl<'a> PutObjectPolicyContext<'a> {
     #[must_use]
     pub const fn with_prefix(mut self, prefix: Option<&'a str>) -> Self {
         self.prefix = prefix;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_delimiter(mut self, delimiter: Option<&'a str>) -> Self {
+        self.delimiter = delimiter;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_requested_max_keys(mut self, requested_max_keys: Option<u32>) -> Self {
+        self.requested_max_keys = requested_max_keys;
         self
     }
 
@@ -683,6 +699,7 @@ pub struct ListObjectsV2Request<'a> {
     pub delimiter: Option<&'a str>,
     pub continuation_token: Option<&'a str>,
     pub max_keys: u32,
+    pub requested_max_keys: Option<u32>,
 }
 
 /// Request for a ListObjectVersions operation.
@@ -690,9 +707,11 @@ pub struct ListObjectsV2Request<'a> {
 pub struct ListObjectVersionsRequest<'a> {
     pub bucket: BucketRequest<'a>,
     pub prefix: Option<&'a str>,
+    pub delimiter: Option<&'a str>,
     pub key_marker: Option<&'a str>,
     pub version_id_marker: Option<VersionId>,
     pub max_keys: u32,
+    pub requested_max_keys: Option<u32>,
 }
 
 /// Request for a ListParts operation.

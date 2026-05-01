@@ -106,6 +106,7 @@ impl Coordinator {
         );
         let bucket = req.bucket.name_typed();
         let prefix = req.prefix;
+        let delimiter = req.delimiter;
         let key_marker = req.key_marker;
         let version_id_marker = req.version_id_marker;
         let AuthorizedListObjectVersions { bucket_info } =
@@ -116,6 +117,7 @@ impl Coordinator {
         if max_keys == 0 {
             return Ok(ListObjectVersionsResult {
                 versions: Vec::new(),
+                common_prefixes: Vec::new(),
                 is_truncated: false,
                 next_key_marker: None,
                 next_version_id_marker: None,
@@ -131,6 +133,7 @@ impl Coordinator {
             .list_object_versions_for_bucket(
                 bucket,
                 list_prefix.as_ref(),
+                delimiter,
                 list_key_marker.as_ref(),
                 version_id_marker,
                 max_keys,
@@ -179,6 +182,11 @@ impl Coordinator {
 
         Ok(ListObjectVersionsResult {
             versions,
+            common_prefixes: listed
+                .common_prefixes
+                .into_iter()
+                .map(|prefix| prefix.to_string())
+                .collect(),
             is_truncated: listed.is_truncated,
             next_key_marker: listed.next_key_marker.map(|key| key.to_string()),
             next_version_id_marker: listed.next_version_id_marker,

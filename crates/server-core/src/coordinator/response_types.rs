@@ -329,6 +329,7 @@ pub struct VersionEntry {
 #[derive(Debug)]
 pub struct ListObjectVersionsResult {
     pub versions: Vec<VersionEntry>,
+    pub common_prefixes: Vec<String>,
     pub is_truncated: bool,
     pub next_key_marker: Option<String>,
     pub next_version_id_marker: Option<VersionId>,

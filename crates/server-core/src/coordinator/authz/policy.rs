@@ -322,6 +322,9 @@ pub(super) fn bucket_policy_decision_for_loaded_handle_with_context(
         .iter()
         .map(|(key, value)| auth::PolicyTag::new(key, value))
         .collect();
+    let requested_max_keys = policy_context
+        .requested_max_keys
+        .map(|max_keys| max_keys.to_string());
 
     let request = auth::PolicyRequest::for_bucket(
         action,
@@ -342,6 +345,8 @@ pub(super) fn bucket_policy_decision_for_loaded_handle_with_context(
     .with_grant_write_acp(policy_context.grant_write_acp)
     .with_grant_full_control(policy_context.grant_full_control)
     .with_prefix(policy_context.prefix)
+    .with_delimiter(policy_context.delimiter)
+    .with_max_keys(requested_max_keys.as_deref())
     .with_object_ownership(policy_context.object_ownership);
     Ok(policy.evaluate(&request))
 }

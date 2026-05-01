@@ -7041,6 +7041,7 @@ fn list_objects_ignores_authenticated_read_bucket_acl_when_ignore_public_acls_en
             delimiter: None,
             continuation_token: None,
             max_keys: 1000,
+            requested_max_keys: Some(1000),
         })
         .unwrap();
     assert_eq!(before.objects.len(), 1);
@@ -7063,6 +7064,7 @@ fn list_objects_ignores_authenticated_read_bucket_acl_when_ignore_public_acls_en
             delimiter: None,
             continuation_token: None,
             max_keys: 1000,
+            requested_max_keys: Some(1000),
         })
         .unwrap_err();
     assert!(matches!(err, ServerError::AccessDenied));
@@ -7201,6 +7203,7 @@ fn list_objects_rejects_non_owner_requester() {
             delimiter: None,
             continuation_token: None,
             max_keys: 1000,
+            requested_max_keys: Some(1000),
         })
         .unwrap_err();
     assert!(matches!(err, ServerError::AccessDenied));
@@ -7225,6 +7228,7 @@ fn authorize_list_objects_v2_rejects_non_owner_requester() {
             delimiter: None,
             continuation_token: None,
             max_keys: 1000,
+            requested_max_keys: Some(1000),
         })
         .unwrap_err();
     assert!(matches!(err, ServerError::AccessDenied));
@@ -7254,6 +7258,7 @@ fn authorize_list_objects_v2_allows_explicit_bucket_policy_allow() {
             delimiter: None,
             continuation_token: None,
             max_keys: 1000,
+            requested_max_keys: Some(1000),
         })
         .unwrap();
 }
@@ -7304,6 +7309,7 @@ fn list_objects_allows_explicit_bucket_policy_allow() {
             delimiter: None,
             continuation_token: None,
             max_keys: 1000,
+            requested_max_keys: Some(1000),
         })
         .unwrap();
     assert_eq!(result.objects.len(), 1);
@@ -7326,9 +7332,11 @@ fn authorize_list_object_versions_rejects_non_owner_requester() {
                 None,
             ),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             version_id_marker: None,
             max_keys: 1000,
+            requested_max_keys: Some(1000),
         })
         .unwrap_err();
     assert!(matches!(err, ServerError::AccessDenied));
@@ -7376,6 +7384,7 @@ fn list_objects_bucket_policy_deny_overrides_public_read_acl() {
             delimiter: None,
             continuation_token: None,
             max_keys: 1000,
+            requested_max_keys: Some(1000),
         })
         .unwrap_err();
     assert!(matches!(err, ServerError::AccessDenied));
@@ -7561,9 +7570,11 @@ fn list_object_versions_bucket_policy_allow_applies() {
                 None,
             ),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             version_id_marker: None,
             max_keys: 1000,
+            requested_max_keys: Some(1000),
         })
         .unwrap();
     assert!(result.versions.len() >= 2);

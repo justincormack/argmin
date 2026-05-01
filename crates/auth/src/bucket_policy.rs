@@ -297,6 +297,8 @@ pub struct PolicyRequest<'a> {
     if_none_match: Option<&'a str>,
     object_creation_operation: Option<bool>,
     prefix: Option<&'a str>,
+    delimiter: Option<&'a str>,
+    max_keys: Option<&'a str>,
     object_ownership: Option<&'a str>,
     version_id: Option<&'a str>,
 }
@@ -335,6 +337,8 @@ impl<'a> PolicyRequest<'a> {
             if_none_match: None,
             object_creation_operation: None,
             prefix: None,
+            delimiter: None,
+            max_keys: None,
             object_ownership: None,
             version_id: None,
         }
@@ -372,6 +376,8 @@ impl<'a> PolicyRequest<'a> {
             if_none_match: None,
             object_creation_operation: None,
             prefix: None,
+            delimiter: None,
+            max_keys: None,
             object_ownership: None,
             version_id: None,
         }
@@ -531,6 +537,18 @@ impl<'a> PolicyRequest<'a> {
     }
 
     #[must_use]
+    pub fn with_delimiter(mut self, delimiter: Option<&'a str>) -> Self {
+        self.delimiter = delimiter;
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_keys(mut self, max_keys: Option<&'a str>) -> Self {
+        self.max_keys = max_keys;
+        self
+    }
+
+    #[must_use]
     pub fn with_object_ownership(mut self, object_ownership: Option<&'a str>) -> Self {
         self.object_ownership = object_ownership;
         self
@@ -618,6 +636,16 @@ impl<'a> PolicyRequest<'a> {
     #[must_use]
     fn prefix(&self) -> Option<&'a str> {
         self.prefix
+    }
+
+    #[must_use]
+    fn delimiter(&self) -> Option<&'a str> {
+        self.delimiter
+    }
+
+    #[must_use]
+    fn max_keys(&self) -> Option<&'a str> {
+        self.max_keys
     }
 
     #[must_use]
@@ -1407,9 +1435,9 @@ fn parse_conditions(value: &Value) -> Result<Vec<PolicyConditionClause>, BucketP
             clauses.push(PolicyConditionClause {
                 operator: operator.clone(),
                 key: key.clone(),
-                values: parse_string_or_array(
+                values: parse_condition_value(
                     value,
-                    "Condition value must be a string or array of strings",
+                    "Condition value must be a string, number, or array of strings or numbers",
                 )?,
             });
         }
@@ -1435,6 +1463,33 @@ fn parse_string_or_array(
                     .as_str()
                     .ok_or(BucketPolicyError::Malformed { reason: field_name })?;
                 parsed.push(value.to_string());
+            }
+            Ok(parsed)
+        }
+        _ => Err(BucketPolicyError::Malformed { reason: field_name }),
+    }
+}
+
+fn parse_condition_value(
+    value: &Value,
+    field_name: &'static str,
+) -> Result<Vec<String>, BucketPolicyError> {
+    match value {
+        Value::String(value) => Ok(vec![value.clone()]),
+        Value::Number(value) => Ok(vec![value.to_string()]),
+        Value::Array(values) => {
+            if values.is_empty() {
+                return Err(BucketPolicyError::Malformed {
+                    reason: "array field must not be empty",
+                });
+            }
+            let mut parsed = Vec::with_capacity(values.len());
+            for value in values {
+                match value {
+                    Value::String(value) => parsed.push(value.clone()),
+                    Value::Number(value) => parsed.push(value.to_string()),
+                    _ => return Err(BucketPolicyError::Malformed { reason: field_name }),
+                }
             }
             Ok(parsed)
         }
@@ -3669,6 +3724,55 @@ mod tests {
         let request = bucket_request(PolicyAction::ListBucketVersions, "bucket", Some("caller"));
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn list_bucket_delimiter_condition_matches_requested_delimiter() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"s3:delimiter":"/"}}}]}"#,
+        )
+        .unwrap();
+        let matching = bucket_request(PolicyAction::ListBucket, "bucket", Some("caller"))
+            .with_delimiter(Some("/"));
+        let missing = bucket_request(PolicyAction::ListBucket, "bucket", Some("caller"));
+        let nonmatching = bucket_request(PolicyAction::ListBucket, "bucket", Some("caller"))
+            .with_delimiter(Some("."));
+
+        assert_eq!(policy.evaluate(&matching), PolicyEvaluation::ExplicitAllow);
+        assert_eq!(policy.evaluate(&missing), PolicyEvaluation::NoMatch);
+        assert_eq!(policy.evaluate(&nonmatching), PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn list_bucket_numeric_max_keys_condition_matches_only_requested_value() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"NumericEquals":{"s3:max-keys":2}}}]}"#,
+        )
+        .unwrap();
+        let matching = bucket_request(PolicyAction::ListBucket, "bucket", Some("caller"))
+            .with_max_keys(Some("2"));
+        let missing = bucket_request(PolicyAction::ListBucket, "bucket", Some("caller"));
+        let nonmatching = bucket_request(PolicyAction::ListBucket, "bucket", Some("caller"))
+            .with_max_keys(Some("3"));
+
+        assert_eq!(policy.evaluate(&matching), PolicyEvaluation::ExplicitAllow);
+        assert_eq!(policy.evaluate(&missing), PolicyEvaluation::NoMatch);
+        assert_eq!(policy.evaluate(&nonmatching), PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn list_bucket_string_max_keys_condition_matches_requested_value() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"s3:max-keys":"2"}}}]}"#,
+        )
+        .unwrap();
+        let matching = bucket_request(PolicyAction::ListBucket, "bucket", Some("caller"))
+            .with_max_keys(Some("2"));
+        let nonmatching = bucket_request(PolicyAction::ListBucket, "bucket", Some("caller"))
+            .with_max_keys(Some("3"));
+
+        assert_eq!(policy.evaluate(&matching), PolicyEvaluation::ExplicitAllow);
+        assert_eq!(policy.evaluate(&nonmatching), PolicyEvaluation::NoMatch);
     }
 
     #[test]

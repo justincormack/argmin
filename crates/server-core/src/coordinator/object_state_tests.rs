@@ -2323,9 +2323,11 @@ fn list_object_versions_suspended_null_live_is_latest() {
         .list_object_versions(&ListObjectVersionsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             version_id_marker: None,
             max_keys: 100,
+            requested_max_keys: Some(100),
         })
         .unwrap();
     assert_eq!(resp.versions.len(), 2);

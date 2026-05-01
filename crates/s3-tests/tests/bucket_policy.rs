@@ -11970,6 +11970,386 @@ fn test_bucket_policy_list_bucket_prefix_condition() {
 }
 
 #[test]
+fn test_bucket_policy_list_bucket_delimiter_condition() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        for key in ["allowed/one", "allowed/two"] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"body"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:ListBucket",
+                        "Resource": bucket_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:delimiter": "/"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let listed = eventually_ok(
+            "ListObjectsV2 allowed with matching delimiter condition",
+            || {
+                alt_client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .delimiter("/")
+                    .send()
+            },
+        )
+        .await;
+        assert!(listed
+            .common_prefixes()
+            .iter()
+            .any(|prefix| prefix.prefix() == Some("allowed/")));
+
+        eventually_access_denied(
+            "ListObjectsV2 denied without delimiter condition value",
+            || alt_client.list_objects_v2().bucket(&bucket).send(),
+        )
+        .await;
+        eventually_access_denied(
+            "ListObjectsV2 denied with nonmatching delimiter condition",
+            || {
+                alt_client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .delimiter(".")
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &["allowed/one", "allowed/two"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_list_bucket_max_keys_numeric_equals_condition() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        for key in ["one", "two", "three"] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"body"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:ListBucket",
+                        "Resource": bucket_resource(&bucket),
+                        "Condition": {
+                            "NumericEquals": {
+                                "s3:max-keys": 2
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let listed = eventually_ok(
+            "ListObjectsV2 allowed with matching max-keys condition",
+            || {
+                alt_client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .max_keys(2)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(listed.max_keys(), Some(2));
+
+        eventually_access_denied(
+            "ListObjectsV2 denied without max-keys condition value",
+            || alt_client.list_objects_v2().bucket(&bucket).send(),
+        )
+        .await;
+        eventually_access_denied(
+            "ListObjectsV2 denied with nonmatching max-keys condition",
+            || {
+                alt_client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .max_keys(3)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &["one", "two", "three"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_list_bucket_max_keys_string_equals_condition() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        for key in ["one", "two", "three"] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"body"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:ListBucket",
+                        "Resource": bucket_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:max-keys": "2"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let listed = eventually_ok(
+            "ListObjectsV2 allowed with matching string max-keys condition",
+            || {
+                alt_client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .max_keys(2)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(listed.max_keys(), Some(2));
+
+        eventually_access_denied(
+            "ListObjectsV2 denied with nonmatching string max-keys condition",
+            || {
+                alt_client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .max_keys(3)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &["one", "two", "three"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_list_bucket_max_keys_omitted_is_absent_for_numeric_condition() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("one")
+            .body(ByteStream::from_static(b"body"))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:ListBucket",
+                        "Resource": bucket_resource(&bucket),
+                        "Condition": {
+                            "NumericEquals": {
+                                "s3:max-keys": 1000
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let listed = eventually_ok(
+            "ListObjectsV2 allowed with explicit default max-keys condition",
+            || {
+                alt_client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .max_keys(1000)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(listed.max_keys(), Some(1000));
+
+        eventually_access_denied("ListObjectsV2 denied when max-keys is omitted", || {
+            alt_client.list_objects_v2().bucket(&bucket).send()
+        })
+        .await;
+        eventually_access_denied(
+            "ListObjectsV2 denied with explicit nonmatching max-keys condition",
+            || {
+                alt_client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .max_keys(999)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &["one"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_list_bucket_max_keys_numeric_equals_nonnumeric_value_does_not_match() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("allowed/one")
+            .body(ByteStream::from_static(b"body"))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:ListBucket",
+                            "Resource": bucket_resource(&bucket),
+                            "Condition": {
+                                "StringEquals": {
+                                    "s3:prefix": "allowed/"
+                                }
+                            }
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:ListBucket",
+                            "Resource": bucket_resource(&bucket),
+                            "Condition": {
+                                "StringEquals": {
+                                    "s3:prefix": "denied/"
+                                },
+                                "NumericEquals": {
+                                    "s3:max-keys": "not-a-number"
+                                }
+                            }
+                        }
+                    ],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let listed = eventually_ok(
+            "ListObjectsV2 allowed by the control prefix statement",
+            || {
+                alt_client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix("allowed/")
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(listed.contents().len(), 1);
+
+        eventually_access_denied(
+            "ListObjectsV2 denied when NumericEquals operand is not numeric",
+            || {
+                alt_client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix("denied/")
+                    .max_keys(2)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &["allowed/one"]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_list_bucket_versions_prefix_condition() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -12049,6 +12429,214 @@ fn test_bucket_policy_list_bucket_versions_prefix_condition() {
                     .list_object_versions()
                     .bucket(&bucket)
                     .prefix("blocked/")
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_list_bucket_versions_delimiter_condition() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        for key in ["allowed/versioned", "allowed/again", "z-versioned"] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"body"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:ListBucketVersions",
+                        "Resource": bucket_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:delimiter": "/"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let listed = eventually_ok(
+            "ListObjectVersions allowed with matching delimiter condition",
+            || {
+                alt_client
+                    .list_object_versions()
+                    .bucket(&bucket)
+                    .delimiter("/")
+                    .max_keys(1)
+                    .send()
+            },
+        )
+        .await;
+        assert!(listed.versions().is_empty());
+        assert_eq!(listed.common_prefixes().len(), 1);
+        assert_eq!(listed.common_prefixes()[0].prefix(), Some("allowed/"));
+        assert_eq!(listed.is_truncated(), Some(true));
+        assert_eq!(listed.next_key_marker(), Some("allowed/"));
+        assert_eq!(listed.next_version_id_marker(), None);
+
+        let listed_second_page = alt_client
+            .list_object_versions()
+            .bucket(&bucket)
+            .delimiter("/")
+            .key_marker(listed.next_key_marker().unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert!(listed_second_page.common_prefixes().is_empty());
+        assert!(listed_second_page
+            .versions()
+            .iter()
+            .any(|version| version.key() == Some("z-versioned")));
+
+        let listed_after_marker_inside_prefix = alt_client
+            .list_object_versions()
+            .bucket(&bucket)
+            .delimiter("/")
+            .key_marker("allowed/again")
+            .send()
+            .await
+            .unwrap();
+        assert!(listed_after_marker_inside_prefix
+            .common_prefixes()
+            .is_empty());
+        assert!(listed_after_marker_inside_prefix
+            .versions()
+            .iter()
+            .any(|version| version.key() == Some("z-versioned")));
+
+        eventually_access_denied(
+            "ListObjectVersions denied without delimiter condition value",
+            || alt_client.list_object_versions().bucket(&bucket).send(),
+        )
+        .await;
+        eventually_access_denied(
+            "ListObjectVersions denied with nonmatching delimiter condition",
+            || {
+                alt_client
+                    .list_object_versions()
+                    .bucket(&bucket)
+                    .delimiter(".")
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_list_bucket_versions_max_keys_numeric_equals_condition() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        for key in ["one", "two", "three"] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"body"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:ListBucketVersions",
+                        "Resource": bucket_resource(&bucket),
+                        "Condition": {
+                            "NumericEquals": {
+                                "s3:max-keys": 2
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let listed = eventually_ok(
+            "ListObjectVersions allowed with matching max-keys condition",
+            || {
+                alt_client
+                    .list_object_versions()
+                    .bucket(&bucket)
+                    .max_keys(2)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(listed.max_keys(), Some(2));
+
+        eventually_access_denied(
+            "ListObjectVersions denied without max-keys condition value",
+            || alt_client.list_object_versions().bucket(&bucket).send(),
+        )
+        .await;
+        eventually_access_denied(
+            "ListObjectVersions denied with nonmatching max-keys condition",
+            || {
+                alt_client
+                    .list_object_versions()
+                    .bucket(&bucket)
+                    .max_keys(3)
                     .send()
             },
         )

@@ -81,7 +81,9 @@ pub struct BucketPgTestGuard<'a> {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct DirectPutMetadataPublishTestHookGuard;
+pub struct DirectPutMetadataPublishTestHookGuard {
+    scope_id: usize,
+}
 
 impl Drop for BucketLockGuard<'_> {
     fn drop(&mut self) {
@@ -99,8 +101,9 @@ impl Drop for BucketPgTestGuard<'_> {
 #[cfg(any(test, feature = "test-hooks"))]
 impl Drop for DirectPutMetadataPublishTestHookGuard {
     fn drop(&mut self) {
-        let hook = AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOK.get_or_init(|| Mutex::new(None));
-        *hook.lock().unwrap() = None;
+        let hooks =
+            AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks.lock().unwrap().remove(&self.scope_id);
     }
 }
 
@@ -142,8 +145,8 @@ static BUCKET_SCOPED_TEST_HOOKS: OnceLock<Mutex<BucketScopedTestHooks>> = OnceLo
 type DirectPutMetadataPublishHook = Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
-static AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOK: OnceLock<
-    Mutex<Option<DirectPutMetadataPublishHook>>,
+static AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOKS: OnceLock<
+    Mutex<HashMap<usize, DirectPutMetadataPublishHook>>,
 > = OnceLock::new();
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -264,13 +267,15 @@ pub(crate) fn maybe_run_before_completed_multipart_prune_hook(
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn maybe_run_after_direct_put_metadata_publish_hook() -> Result<(), ObjectPgActionError>
-{
-    let hook = AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOK
-        .get_or_init(|| Mutex::new(None))
+pub(crate) fn maybe_run_after_direct_put_metadata_publish_hook(
+    scope_id: usize,
+) -> Result<(), ObjectPgActionError> {
+    let hook = AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap()
-        .clone();
+        .get(&scope_id)
+        .cloned();
     if let Some(hook) = hook {
         hook()?;
     }
@@ -1089,13 +1094,20 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_hook_scope_id(&self) -> usize {
+        std::ptr::from_ref(self).addr()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_install_after_direct_put_metadata_publish_hook(
         &self,
         hook: Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>,
     ) -> DirectPutMetadataPublishTestHookGuard {
-        let slot = AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOK.get_or_init(|| Mutex::new(None));
-        *slot.lock().unwrap() = Some(hook);
-        DirectPutMetadataPublishTestHookGuard
+        let scope_id = self.test_hook_scope_id();
+        let hooks =
+            AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks.lock().unwrap().insert(scope_id, hook);
+        DirectPutMetadataPublishTestHookGuard { scope_id }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

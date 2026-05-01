@@ -747,7 +747,10 @@ impl Coordinator {
             &req.bucket.requester,
             &bucket,
             auth::PolicyAction::ListBucket,
-            PutObjectPolicyContext::default().with_prefix(req.prefix),
+            PutObjectPolicyContext::default()
+                .with_prefix(req.prefix)
+                .with_delimiter(req.delimiter)
+                .with_requested_max_keys(req.requested_max_keys),
             bucket_policy.as_deref(),
         )?;
         if !Self::bucket_policy_allows_with_fallback(
@@ -791,7 +794,10 @@ impl Coordinator {
             &req.bucket.requester,
             &bucket,
             auth::PolicyAction::ListBucketVersions,
-            PutObjectPolicyContext::default().with_prefix(req.prefix),
+            PutObjectPolicyContext::default()
+                .with_prefix(req.prefix)
+                .with_delimiter(req.delimiter)
+                .with_requested_max_keys(req.requested_max_keys),
             bucket_policy.as_deref(),
         )?;
         if !Self::bucket_policy_allows_with_fallback(

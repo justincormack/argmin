@@ -9417,9 +9417,11 @@ mod phase9_harness {
                 .authorize_list_object_versions(&ListObjectVersionsRequest {
                     bucket: bucket_request,
                     prefix: None,
+                    delimiter: None,
                     key_marker: None,
                     version_id_marker: None,
                     max_keys: 1000,
+                    requested_max_keys: Some(1000),
                 })
                 .map(|_| ()),
             BucketAction::ListBucketMultipartUploads => coord

@@ -47,55 +47,68 @@ type MetadataCommandApplyTestHook =
     Arc<dyn Fn(NodeId, &MetadataCommandEnvelope) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(test)]
-static BEFORE_METADATA_COMMAND_APPLY_HOOK: OnceLock<Mutex<Option<MetadataCommandApplyTestHook>>> =
-    OnceLock::new();
+static BEFORE_METADATA_COMMAND_APPLY_HOOKS: OnceLock<
+    Mutex<HashMap<usize, MetadataCommandApplyTestHook>>,
+> = OnceLock::new();
 
 #[cfg(any(test, feature = "test-hooks"))]
-static BEFORE_METADATA_COMMAND_APPLY_CONTEXT_HOOK: OnceLock<
-    Mutex<Option<MetadataCommandApplyContextTestHook>>,
+static BEFORE_METADATA_COMMAND_APPLY_CONTEXT_HOOKS: OnceLock<
+    Mutex<HashMap<usize, MetadataCommandApplyContextTestHook>>,
 > = OnceLock::new();
 
 #[cfg(test)]
-pub(crate) struct MetadataCommandApplyTestHookGuard;
+pub(crate) struct MetadataCommandApplyTestHookGuard {
+    scope_id: usize,
+}
 
 #[cfg(test)]
 impl Drop for MetadataCommandApplyTestHookGuard {
     fn drop(&mut self) {
-        let hook = BEFORE_METADATA_COMMAND_APPLY_HOOK.get_or_init(|| Mutex::new(None));
-        *hook.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let hooks = BEFORE_METADATA_COMMAND_APPLY_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
     }
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
 impl Drop for MetadataCommandApplyContextTestHookGuard {
     fn drop(&mut self) {
-        let hook = BEFORE_METADATA_COMMAND_APPLY_CONTEXT_HOOK.get_or_init(|| Mutex::new(None));
-        *hook.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let hooks =
+            BEFORE_METADATA_COMMAND_APPLY_CONTEXT_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
     }
 }
 
 fn maybe_run_before_metadata_command_apply_hook(
+    _scope_id: usize,
     _node_id: NodeId,
     _command: &MetadataCommandEnvelope,
 ) -> Result<(), StoreError> {
     #[cfg(any(test, feature = "test-hooks"))]
     {
-        let hook = BEFORE_METADATA_COMMAND_APPLY_CONTEXT_HOOK
-            .get_or_init(|| Mutex::new(None))
+        let hook = BEFORE_METADATA_COMMAND_APPLY_CONTEXT_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone();
+            .get(&_scope_id)
+            .cloned();
         if let Some(hook) = hook {
             hook(metadata_command_apply_test_context(_node_id, _command))?;
         }
     }
     #[cfg(test)]
     {
-        let hook = BEFORE_METADATA_COMMAND_APPLY_HOOK
-            .get_or_init(|| Mutex::new(None))
+        let hook = BEFORE_METADATA_COMMAND_APPLY_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone();
+            .get(&_scope_id)
+            .cloned();
         if let Some(hook) = hook {
             hook(_node_id, _command)?;
         }
@@ -233,8 +246,11 @@ impl ObjectCursor {
 }
 
 struct VersionCursor {
+    pg_id: u32,
     versions: Vec<StoredObject>,
     next_index: usize,
+    next_key_marker: Option<ObjectKey>,
+    next_version_id_marker: Option<VersionId>,
 }
 
 impl VersionCursor {
@@ -294,9 +310,12 @@ impl super::StorageCluster {
         &self,
         hook: MetadataCommandApplyTestHook,
     ) -> MetadataCommandApplyTestHookGuard {
-        let slot = BEFORE_METADATA_COMMAND_APPLY_HOOK.get_or_init(|| Mutex::new(None));
-        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
-        MetadataCommandApplyTestHookGuard
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = BEFORE_METADATA_COMMAND_APPLY_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        MetadataCommandApplyTestHookGuard { scope_id }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -304,9 +323,17 @@ impl super::StorageCluster {
         &self,
         hook: MetadataCommandApplyContextTestHook,
     ) -> MetadataCommandApplyContextTestHookGuard {
-        let slot = BEFORE_METADATA_COMMAND_APPLY_CONTEXT_HOOK.get_or_init(|| Mutex::new(None));
-        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
-        MetadataCommandApplyContextTestHookGuard { _private: () }
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot =
+            BEFORE_METADATA_COMMAND_APPLY_CONTEXT_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        MetadataCommandApplyContextTestHookGuard { scope_id }
+    }
+
+    fn metadata_command_apply_test_hook_scope_id(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.local_map) as usize
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -479,12 +506,15 @@ impl super::StorageCluster {
             .primary_node_id();
         nodes.sort_by_key(|node| node.node_id() == primary_node_id);
         for (applied_nodes, node) in nodes.into_iter().enumerate() {
-            maybe_run_before_metadata_command_apply_hook(node.node_id(), command).map_err(
-                |source| MetadataCommandApplyFailure {
-                    applied_nodes,
-                    source: source.into(),
-                },
-            )?;
+            maybe_run_before_metadata_command_apply_hook(
+                self.metadata_command_apply_test_hook_scope_id(),
+                node.node_id(),
+                command,
+            )
+            .map_err(|source| MetadataCommandApplyFailure {
+                applied_nodes,
+                source: source.into(),
+            })?;
             if let MetadataCommandPayload::CommitMultipartObject(commit) = command.payload() {
                 let bucket_pg_id = node
                     .storage_node()
@@ -1493,8 +1523,11 @@ impl super::StorageCluster {
                 version_id_marker = resp.next_version_id_marker;
             }
             cursors.push(VersionCursor {
+                pg_id,
                 versions,
                 next_index: 0,
+                next_key_marker: None,
+                next_version_id_marker: None,
             });
         }
 
@@ -1791,6 +1824,7 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
         prefix: Option<&ObjectKey>,
+        delimiter: Option<&str>,
         key_marker: Option<&ObjectKey>,
         version_id_marker: Option<VersionId>,
         max_keys: u32,
@@ -1798,6 +1832,7 @@ impl super::StorageCluster {
         if max_keys == 0 {
             return Ok(ListedBucketObjectVersions {
                 versions: Vec::new(),
+                common_prefixes: Vec::new(),
                 is_truncated: false,
                 next_key_marker: None,
                 next_version_id_marker: None,
@@ -1807,59 +1842,146 @@ impl super::StorageCluster {
         let fetch_limit = max_keys.saturating_add(1);
         let prefix = prefix.cloned();
         let key_marker = key_marker.cloned();
-        let mut cursors = Vec::new();
-        for pg_id in self.metadata_pg_ids() {
-            let pg = self.metadata_pg(pg_id)?;
+        let delimiter = delimiter.filter(|delimiter| !delimiter.is_empty());
+        let prefix_str = prefix.as_ref().map_or("", ObjectKey::as_str);
+        let fetch_versions_page = |cursor: &mut VersionCursor,
+                                   key_marker: Option<ObjectKey>,
+                                   version_id_marker: Option<VersionId>|
+         -> Result<(), ObjectPgActionError> {
+            let pg = self.metadata_pg(cursor.pg_id)?;
             let resp = pg.list_object_versions(&ListObjectVersionsReq {
                 bucket: bucket.clone(),
                 prefix: prefix.clone(),
-                key_marker: key_marker.clone(),
+                key_marker,
                 version_id_marker,
                 max_keys: fetch_limit,
             })?;
-            cursors.push(VersionCursor {
-                versions: resp.versions,
+            cursor.versions = resp.versions;
+            cursor.next_index = 0;
+            cursor.next_key_marker = resp.next_key_marker;
+            cursor.next_version_id_marker = resp.next_version_id_marker;
+            Ok(())
+        };
+
+        let refill_cursor = |cursor: &mut VersionCursor| -> Result<(), ObjectPgActionError> {
+            while cursor.current().is_none() {
+                let Some(next_key_marker) = cursor.next_key_marker.clone() else {
+                    break;
+                };
+                let next_version_id_marker = cursor.next_version_id_marker;
+                fetch_versions_page(cursor, Some(next_key_marker), next_version_id_marker)?;
+            }
+            Ok(())
+        };
+
+        let skip_cursor_prefix =
+            |cursor: &mut VersionCursor, common_prefix: &str| -> Result<(), ObjectPgActionError> {
+                while cursor
+                    .current()
+                    .is_some_and(|obj| obj.key().as_str().starts_with(common_prefix))
+                {
+                    cursor.next_index += 1;
+                    refill_cursor(cursor)?;
+                }
+                Ok(())
+            };
+
+        let mut cursors = Vec::new();
+        for pg_id in self.metadata_pg_ids() {
+            let mut cursor = VersionCursor {
+                pg_id,
+                versions: Vec::new(),
                 next_index: 0,
-            });
+                next_key_marker: None,
+                next_version_id_marker: None,
+            };
+            fetch_versions_page(&mut cursor, key_marker.clone(), version_id_marker)?;
+            cursors.push(cursor);
         }
 
         let max = max_keys as usize;
-        let mut merged_versions = Vec::with_capacity(max.saturating_add(1));
-        while merged_versions.len() <= max {
-            let Some((cursor_index, _)) = cursors
-                .iter()
-                .enumerate()
-                .filter_map(|(cursor_index, cursor)| {
-                    cursor.current().map(|version| (cursor_index, version))
-                })
-                .min_by(|(left_index, left), (right_index, right)| {
-                    left.key()
-                        .cmp(right.key())
-                        .then_with(|| left_index.cmp(right_index))
-                })
-            else {
-                break;
-            };
-            merged_versions.push(cursors[cursor_index].pop_current());
-        }
+        let mut versions = Vec::new();
+        let mut common_prefixes = Vec::new();
+        let mut is_truncated = false;
+        let mut next_key_marker = None;
+        let mut next_version_id_marker = None;
+        let mut active_common_prefix = key_marker.as_ref().and_then(|marker| {
+            let delimiter = delimiter?;
+            let after_prefix = marker.as_str().strip_prefix(prefix_str)?;
+            after_prefix.ends_with(delimiter).then(|| marker.clone())
+        });
 
-        let is_truncated = merged_versions.len() > max;
-        let versions: Vec<StoredObject> = merged_versions.into_iter().take(max).collect();
-        let (next_key_marker, next_version_id_marker) = if is_truncated {
-            if let Some(last) = versions.last() {
-                (Some(last.key().clone()), Some(last.version_id()))
-            } else {
-                (None, None)
+        while let Some((cursor_index, current_key)) = cursors
+            .iter()
+            .enumerate()
+            .filter_map(|(cursor_index, cursor)| {
+                cursor
+                    .current()
+                    .map(|version| (cursor_index, version.key().clone()))
+            })
+            .min_by(|(left_index, left_key), (right_index, right_key)| {
+                left_key
+                    .cmp(right_key)
+                    .then_with(|| left_index.cmp(right_index))
+            })
+        {
+            if let Some(ref common_prefix) = active_common_prefix {
+                if current_key.as_str().starts_with(common_prefix.as_str()) {
+                    skip_cursor_prefix(&mut cursors[cursor_index], common_prefix.as_str())?;
+                    continue;
+                }
+                active_common_prefix = None;
             }
-        } else {
-            (None, None)
-        };
+
+            let current = cursors[cursor_index]
+                .current()
+                .expect("selected cursor should have a current object")
+                .clone();
+            if let Some(delimiter) = delimiter {
+                if let Some(common_prefix_key) =
+                    crate::object_key_common_prefix(current.key(), prefix_str, delimiter)
+                {
+                    active_common_prefix = Some(common_prefix_key.clone());
+                    if key_marker
+                        .as_ref()
+                        .is_some_and(|marker| common_prefix_key.as_str() <= marker.as_str())
+                    {
+                        skip_cursor_prefix(&mut cursors[cursor_index], common_prefix_key.as_str())?;
+                        continue;
+                    }
+                    if versions.len() + common_prefixes.len() >= max {
+                        is_truncated = true;
+                        break;
+                    }
+                    next_key_marker = Some(common_prefix_key.clone());
+                    next_version_id_marker = None;
+                    common_prefixes.push(common_prefix_key);
+                    continue;
+                }
+            }
+
+            if versions.len() + common_prefixes.len() >= max {
+                is_truncated = true;
+                break;
+            }
+
+            next_key_marker = Some(current.key().clone());
+            next_version_id_marker = Some(current.version_id());
+            versions.push(current);
+            cursors[cursor_index].next_index += 1;
+            refill_cursor(&mut cursors[cursor_index])?;
+        }
 
         Ok(ListedBucketObjectVersions {
             versions,
+            common_prefixes,
             is_truncated,
-            next_key_marker,
-            next_version_id_marker,
+            next_key_marker: if is_truncated { next_key_marker } else { None },
+            next_version_id_marker: if is_truncated {
+                next_version_id_marker
+            } else {
+                None
+            },
         })
     }
 

@@ -2891,6 +2891,7 @@ fn complete_multipart_upload_list_shows_composite_etag() {
             delimiter: None,
             continuation_token: None,
             max_keys: 100,
+            requested_max_keys: Some(100),
         })
         .unwrap();
     assert_eq!(list.objects.len(), 1);
@@ -2943,9 +2944,11 @@ fn complete_multipart_upload_list_versions_shows_composite_etag() {
         .list_object_versions(&ListObjectVersionsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             version_id_marker: None,
             max_keys: 100,
+            requested_max_keys: Some(100),
         })
         .unwrap();
     assert_eq!(versions.versions.len(), 1);
@@ -3242,6 +3245,7 @@ fn list_requests_reject_oversized_user_supplied_keys() {
             delimiter: None,
             continuation_token: None,
             max_keys: 100,
+            requested_max_keys: Some(100),
         })
         .unwrap_err();
     assert!(matches!(err, ServerError::InvalidArgument { .. }));
@@ -3253,6 +3257,7 @@ fn list_requests_reject_oversized_user_supplied_keys() {
             delimiter: Some("/"),
             continuation_token: Some(oversized.as_str()),
             max_keys: 100,
+            requested_max_keys: Some(100),
         })
         .unwrap_err();
     assert!(matches!(err, ServerError::InvalidArgument { .. }));
@@ -3261,9 +3266,11 @@ fn list_requests_reject_oversized_user_supplied_keys() {
         .list_object_versions(&ListObjectVersionsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             prefix: None,
+            delimiter: None,
             key_marker: Some(oversized.as_str()),
             version_id_marker: None,
             max_keys: 100,
+            requested_max_keys: Some(100),
         })
         .unwrap_err();
     assert!(matches!(err, ServerError::InvalidArgument { .. }));
@@ -3422,6 +3429,7 @@ fn abort_completed_multipart_upload_succeeds_and_does_not_affect_object() {
             delimiter: None,
             continuation_token: None,
             max_keys: 100,
+            requested_max_keys: Some(100),
         })
         .unwrap();
     assert_eq!(list.objects.len(), 1);
@@ -6188,9 +6196,11 @@ fn list_object_versions_defaults_explicit_single_part_checksum_type_to_full_obje
         .list_object_versions(&ListObjectVersionsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             version_id_marker: None,
             max_keys: 100,
+            requested_max_keys: Some(100),
         })
         .unwrap();
 

@@ -6712,7 +6712,7 @@ mod tests {
         );
 
         let listed_versions = cluster
-            .list_object_versions_for_bucket(&bucket, None, None, None, 100)
+            .list_object_versions_for_bucket(&bucket, None, None, None, None, 100)
             .unwrap();
         assert_eq!(
             listed_versions

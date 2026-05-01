@@ -39,6 +39,7 @@ pub(super) enum ConditionOpKind {
     StringNotEqualsIgnoreCase,
     StringLike,
     StringNotLike,
+    NumericEquals,
     Null,
 }
 
@@ -208,6 +209,12 @@ pub(super) const CONDITION_OPS: &[ConditionOpDef] = &[
         evaluable_on_evaluable_object_actions: true,
     },
     ConditionOpDef {
+        name: "NumericEquals",
+        kind: ConditionOpKind::NumericEquals,
+        evaluate: eval_numeric_equals,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
         name: "Null",
         kind: ConditionOpKind::Null,
         evaluate: eval_null,
@@ -228,8 +235,26 @@ pub(super) fn lookup(name: &str) -> Option<&'static ConditionOpDef> {
 /// so the migration can replace the existing
 /// `evaluable_string_condition_operator_supported` predicate with a single
 /// table-driven lookup.
-pub(super) fn is_evaluable_on_evaluable_object_actions(name: &str) -> bool {
+#[cfg(test)]
+fn is_evaluable_on_evaluable_object_actions(name: &str) -> bool {
     lookup(name).is_some_and(|op| op.evaluable_on_evaluable_object_actions)
+}
+
+pub(super) const fn is_string_condition_kind(kind: ConditionOpKind) -> bool {
+    matches!(
+        kind,
+        ConditionOpKind::StringEquals
+            | ConditionOpKind::StringEqualsIgnoreCase
+            | ConditionOpKind::StringNotEquals
+            | ConditionOpKind::StringNotEqualsIgnoreCase
+            | ConditionOpKind::StringLike
+            | ConditionOpKind::StringNotLike
+            | ConditionOpKind::Null
+    )
+}
+
+pub(super) const fn is_numeric_condition_kind(kind: ConditionOpKind) -> bool {
+    matches!(kind, ConditionOpKind::NumericEquals | ConditionOpKind::Null)
 }
 
 fn eval_bool(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
@@ -679,6 +704,32 @@ fn eval_for_any_value_string_not_like(
     }
 }
 
+fn eval_numeric_equals(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            let Some(actual) = parse_numeric(actual) else {
+                return ConditionMatchResult::NoMatch;
+            };
+            if operands
+                .iter()
+                .filter_map(|expected| parse_numeric(expected))
+                .any(|expected| expected == actual)
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(_) => ConditionMatchResult::NoMatch,
+        ActualValue::Absent => ConditionMatchResult::NoMatch,
+    }
+}
+
+fn parse_numeric(value: &str) -> Option<f64> {
+    let parsed: f64 = value.parse().ok()?;
+    parsed.is_finite().then_some(parsed)
+}
+
 fn eval_null(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
     let is_null = matches!(actual, ActualValue::Absent);
     if operands.iter().any(|expected| match expected.as_str() {
@@ -750,6 +801,32 @@ mod tests {
         );
         assert_eq!(
             (op.evaluate)(&operands(&["true"]), ActualValue::Absent),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn numeric_equals_matches_numeric_strings() {
+        let op = lookup("NumericEquals").expect("NumericEquals is in the table");
+        assert_eq!(op.kind, ConditionOpKind::NumericEquals);
+        assert_eq!(
+            (op.evaluate)(&operands(&["2"]), present("2")),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&operands(&["2.0"]), present("2")),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&operands(&["3"]), present("2")),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (op.evaluate)(&operands(&["not-a-number"]), present("2")),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (op.evaluate)(&operands(&["2"]), ActualValue::Absent),
             ConditionMatchResult::NoMatch
         );
     }

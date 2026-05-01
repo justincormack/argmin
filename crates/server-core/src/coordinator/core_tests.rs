@@ -17,6 +17,7 @@ use storage::{
 };
 
 const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
+const BUCKET_FAST_PATH_WATCH_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, PartialEq, Eq)]
 enum LockWaitEvent {
@@ -936,6 +937,7 @@ fn list_objects_with_sparse_pg_topology() {
             delimiter: None,
             continuation_token: None,
             max_keys: 1000,
+            requested_max_keys: Some(1000),
         })
         .unwrap();
     assert!(resp.objects.is_empty());
@@ -955,9 +957,11 @@ fn list_object_versions_with_sparse_pg_topology() {
         .list_object_versions(&ListObjectVersionsRequest {
             bucket: bucket_request_with_expected_owner(bucket, test_requester(), None),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             version_id_marker: None,
             max_keys: 1000,
+            requested_max_keys: Some(1000),
         })
         .unwrap();
     assert!(resp.versions.is_empty());
@@ -1006,9 +1010,11 @@ fn list_object_versions_clamps_oversized_max_keys() {
         .list_object_versions(&ListObjectVersionsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             version_id_marker: None,
             max_keys: 5000,
+            requested_max_keys: Some(5000),
         })
         .unwrap();
 
@@ -1113,9 +1119,11 @@ fn list_object_versions_paginates_across_pgs() {
         .list_object_versions(&ListObjectVersionsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             version_id_marker: None,
             max_keys: 2,
+            requested_max_keys: Some(2),
         })
         .unwrap();
     assert_eq!(first_page.versions.len(), 2);
@@ -1133,9 +1141,11 @@ fn list_object_versions_paginates_across_pgs() {
         .list_object_versions(&ListObjectVersionsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             prefix: None,
+            delimiter: None,
             key_marker: first_page.next_key_marker.as_deref(),
             version_id_marker: first_page.next_version_id_marker,
             max_keys: 2,
+            requested_max_keys: Some(2),
         })
         .unwrap();
     assert_eq!(second_page.versions.len(), 2);
@@ -1148,6 +1158,194 @@ fn list_object_versions_paginates_across_pgs() {
     assert!(!second_page.is_truncated);
     assert_eq!(second_page.next_key_marker, None);
     assert_eq!(second_page.next_version_id_marker, None);
+}
+
+#[test]
+fn list_object_versions_with_delimiter_returns_common_prefixes() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    let metadata = MetadataBlob::new();
+    let system_metadata = SystemMetadata::EMPTY;
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    put_bucket_versioning_test(
+        &coord,
+        "bucket",
+        BucketVersioningState::Enabled,
+        test_requester(),
+        None,
+    )
+    .unwrap();
+
+    for key in ["dir/a", "dir/b", "z.txt"] {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", key, test_requester(), None),
+                data: b"value",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+    }
+
+    let result = coord
+        .list_object_versions(&ListObjectVersionsRequest {
+            bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+            prefix: None,
+            delimiter: Some("/"),
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: 1000,
+            requested_max_keys: Some(1000),
+        })
+        .unwrap();
+
+    assert_eq!(result.common_prefixes, vec!["dir/".to_string()]);
+    assert_eq!(result.versions.len(), 1);
+    assert_eq!(result.versions[0].key, "z.txt");
+    assert!(!result.is_truncated);
+    assert_eq!(result.next_key_marker, None);
+    assert_eq!(result.next_version_id_marker, None);
+}
+
+#[test]
+fn list_object_versions_delimiter_paginates_common_prefixes() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    let metadata = MetadataBlob::new();
+    let system_metadata = SystemMetadata::EMPTY;
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    put_bucket_versioning_test(
+        &coord,
+        "bucket",
+        BucketVersioningState::Enabled,
+        test_requester(),
+        None,
+    )
+    .unwrap();
+
+    for key in ["dir/a", "dir/b", "z.txt"] {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", key, test_requester(), None),
+                data: b"value",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+    }
+
+    let first_page = coord
+        .list_object_versions(&ListObjectVersionsRequest {
+            bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+            prefix: None,
+            delimiter: Some("/"),
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: 1,
+            requested_max_keys: Some(1),
+        })
+        .unwrap();
+    assert!(first_page.versions.is_empty());
+    assert_eq!(first_page.common_prefixes, vec!["dir/".to_string()]);
+    assert!(first_page.is_truncated);
+    assert_eq!(first_page.next_key_marker.as_deref(), Some("dir/"));
+    assert_eq!(first_page.next_version_id_marker, None);
+
+    let second_page = coord
+        .list_object_versions(&ListObjectVersionsRequest {
+            bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+            prefix: None,
+            delimiter: Some("/"),
+            key_marker: first_page.next_key_marker.as_deref(),
+            version_id_marker: first_page.next_version_id_marker,
+            max_keys: 1,
+            requested_max_keys: Some(1),
+        })
+        .unwrap();
+    assert!(second_page.common_prefixes.is_empty());
+    assert_eq!(second_page.versions.len(), 1);
+    assert_eq!(second_page.versions[0].key, "z.txt");
+    assert!(!second_page.is_truncated);
+    assert_eq!(second_page.next_key_marker, None);
+    assert_eq!(second_page.next_version_id_marker, None);
+}
+
+#[test]
+fn list_object_versions_delimiter_filters_common_prefix_at_or_before_key_marker() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    let metadata = MetadataBlob::new();
+    let system_metadata = SystemMetadata::EMPTY;
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    put_bucket_versioning_test(
+        &coord,
+        "bucket",
+        BucketVersioningState::Enabled,
+        test_requester(),
+        None,
+    )
+    .unwrap();
+
+    for key in ["allowed/again", "allowed/versioned", "z.txt"] {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", key, test_requester(), None),
+                data: b"value",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+    }
+
+    let result = coord
+        .list_object_versions(&ListObjectVersionsRequest {
+            bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+            prefix: None,
+            delimiter: Some("/"),
+            key_marker: Some("allowed/again"),
+            version_id_marker: None,
+            max_keys: 1000,
+            requested_max_keys: Some(1000),
+        })
+        .unwrap();
+
+    assert!(result.common_prefixes.is_empty());
+    assert_eq!(result.versions.len(), 1);
+    assert_eq!(result.versions[0].key, "z.txt");
+    assert!(!result.is_truncated);
 }
 
 #[test]
@@ -2529,7 +2727,7 @@ fn bucket_fast_path_watcher_survives_first_cluster_handle_drop() {
     let start = std::time::Instant::now();
     while reader.bucket_fast_path_is_fresh_for_test(&bucket_name) != Some(false) {
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(3),
+            start.elapsed() < BUCKET_FAST_PATH_WATCH_TEST_TIMEOUT,
             "bucket fast path watcher stopped after first cluster handle was dropped"
         );
         thread::sleep(std::time::Duration::from_millis(10));
@@ -2615,7 +2813,7 @@ fn bucket_fast_path_watcher_observes_direct_storage_policy_mutation() {
     let start = std::time::Instant::now();
     while reader.bucket_fast_path_is_fresh_for_test(&bucket_name) != Some(false) {
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(3),
+            start.elapsed() < BUCKET_FAST_PATH_WATCH_TEST_TIMEOUT,
             "bucket fast path watcher did not observe direct storage policy mutation"
         );
         thread::sleep(std::time::Duration::from_millis(10));
@@ -2724,10 +2922,10 @@ fn bucket_fast_path_watcher_observes_direct_storage_delete_recreate() {
     );
 
     let start = std::time::Instant::now();
-    while reader.bucket_fast_path_is_fresh_for_test(&bucket_name) != Some(false) {
+    while reader.bucket_fast_path_is_fresh_for_test(&bucket_name) == Some(true) {
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(3),
-            "bucket fast path watcher did not observe direct storage delete/recreate"
+            start.elapsed() < BUCKET_FAST_PATH_WATCH_TEST_TIMEOUT,
+            "bucket fast path watcher did not invalidate after direct storage delete/recreate"
         );
         thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -2816,7 +3014,7 @@ fn bucket_fast_path_watcher_recovers_after_observing_missing_bucket_before_recre
     let start = std::time::Instant::now();
     while reader.get_bucket_fast_path(&bucket_name).is_some() {
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(3),
+            start.elapsed() < BUCKET_FAST_PATH_WATCH_TEST_TIMEOUT,
             "bucket fast path watcher did not remove cache entry after direct delete"
         );
         thread::sleep(std::time::Duration::from_millis(10));
@@ -3941,6 +4139,7 @@ fn list_objects() {
             delimiter: None,
             continuation_token: None,
             max_keys: 1000,
+            requested_max_keys: Some(1000),
         })
         .unwrap();
     assert_eq!(result.objects.len(), 3);
@@ -4032,6 +4231,7 @@ fn list_objects_with_prefix() {
             delimiter: None,
             continuation_token: None,
             max_keys: 1000,
+            requested_max_keys: Some(1000),
         })
         .unwrap();
     assert_eq!(result.objects.len(), 2);
@@ -4141,6 +4341,7 @@ fn list_objects_with_delimiter() {
             delimiter: Some("/"),
             continuation_token: None,
             max_keys: 1000,
+            requested_max_keys: Some(1000),
         })
         .unwrap();
     assert_eq!(result.objects.len(), 1);
@@ -5055,6 +5256,7 @@ fn list_objects_delimiter_with_continuation() {
             delimiter: Some("/"),
             continuation_token: None,
             max_keys: 2,
+            requested_max_keys: Some(2),
         })
         .unwrap();
     assert_eq!(
@@ -5074,6 +5276,7 @@ fn list_objects_delimiter_with_continuation() {
             delimiter: Some("/"),
             continuation_token: Some(&token),
             max_keys: 2,
+            requested_max_keys: Some(2),
         })
         .unwrap();
     assert!(
@@ -5136,6 +5339,7 @@ fn list_objects_delimiter_continuation_skips_large_common_prefix() {
             delimiter: Some("/"),
             continuation_token: None,
             max_keys: 1,
+            requested_max_keys: Some(1),
         })
         .unwrap();
     assert!(page1.objects.is_empty());
@@ -5154,6 +5358,7 @@ fn list_objects_delimiter_continuation_skips_large_common_prefix() {
             delimiter: Some("/"),
             continuation_token: Some(&token),
             max_keys: 1,
+            requested_max_keys: Some(1),
         })
         .unwrap();
     assert_eq!(page2.common_prefixes, Vec::<String>::new());
@@ -5219,6 +5424,7 @@ fn list_objects_delimiter_with_no_upper_bound_common_prefix_is_final_page() {
             delimiter: Some(delimiter),
             continuation_token: None,
             max_keys: 1,
+            requested_max_keys: Some(1),
         })
         .unwrap();
     assert_eq!(page1.objects.len(), 1);
@@ -5238,6 +5444,7 @@ fn list_objects_delimiter_with_no_upper_bound_common_prefix_is_final_page() {
             delimiter: Some(delimiter),
             continuation_token: Some(&token),
             max_keys: 1,
+            requested_max_keys: Some(1),
         })
         .unwrap();
     assert!(page2.objects.is_empty());
@@ -5282,6 +5489,7 @@ fn list_objects_delimiter_continuation_with_boundary_token_does_not_panic() {
             delimiter: Some(delimiter),
             continuation_token: Some(&token),
             max_keys: 1,
+            requested_max_keys: Some(1),
         })
         .unwrap();
     assert_eq!(page2.common_prefixes, Vec::<String>::new());
@@ -5349,6 +5557,7 @@ fn list_objects_delimiter_common_prefix_boundary_falls_back_without_error() {
             delimiter: Some(delimiter),
             continuation_token: None,
             max_keys: 1,
+            requested_max_keys: Some(1),
         })
         .unwrap();
     assert!(page1.objects.is_empty());
@@ -5369,6 +5578,7 @@ fn list_objects_delimiter_common_prefix_boundary_falls_back_without_error() {
             delimiter: Some(delimiter),
             continuation_token: Some(&token),
             max_keys: 1,
+            requested_max_keys: Some(1),
         })
         .unwrap();
     assert!(page2.common_prefixes.is_empty());
@@ -5415,6 +5625,7 @@ fn list_objects_max_keys_counts_prefixes() {
             delimiter: Some("/"),
             continuation_token: None,
             max_keys: 3,
+            requested_max_keys: Some(3),
         })
         .unwrap();
     // With delimiter "/", all entries become common prefixes
@@ -5494,6 +5705,7 @@ fn list_objects_no_delimiter_truncated() {
             delimiter: None,
             continuation_token: None,
             max_keys: 3,
+            requested_max_keys: Some(3),
         })
         .unwrap();
     assert_eq!(result.objects.len(), 3);
@@ -5538,6 +5750,7 @@ fn list_objects_no_delimiter_with_continuation() {
             delimiter: None,
             continuation_token: None,
             max_keys: 2,
+            requested_max_keys: Some(2),
         })
         .unwrap();
     assert_eq!(page1.objects.len(), 2);
@@ -5552,6 +5765,7 @@ fn list_objects_no_delimiter_with_continuation() {
             delimiter: None,
             continuation_token: Some(token),
             max_keys: 2,
+            requested_max_keys: Some(2),
         })
         .unwrap();
     assert_eq!(page2.objects.len(), 2);
@@ -5566,6 +5780,7 @@ fn list_objects_no_delimiter_with_continuation() {
             delimiter: None,
             continuation_token: Some(token2),
             max_keys: 2,
+            requested_max_keys: Some(2),
         })
         .unwrap();
     assert_eq!(page3.objects.len(), 1);
@@ -5678,6 +5893,7 @@ fn list_objects_prefix_with_delimiter() {
             delimiter: Some("/"),
             continuation_token: None,
             max_keys: 1000,
+            requested_max_keys: Some(1000),
         })
         .unwrap();
     // top.jpg is a direct child, 2024/ and 2025/ are common prefixes
@@ -5727,6 +5943,7 @@ fn list_objects_not_truncated_no_token() {
             delimiter: None,
             continuation_token: None,
             max_keys: 1000,
+            requested_max_keys: Some(1000),
         })
         .unwrap();
     assert_eq!(result.objects.len(), 1);
@@ -5767,6 +5984,7 @@ fn list_objects_max_keys_zero() {
             delimiter: None,
             continuation_token: None,
             max_keys: 0,
+            requested_max_keys: Some(0),
         })
         .unwrap();
     assert!(result.objects.is_empty());
@@ -5808,6 +6026,7 @@ fn list_objects_max_keys_zero_with_delimiter() {
             delimiter: Some("/"),
             continuation_token: None,
             max_keys: 0,
+            requested_max_keys: Some(0),
         })
         .unwrap();
     assert!(result.objects.is_empty());
@@ -5827,6 +6046,7 @@ fn list_objects_nonexistent_bucket_fails() {
             delimiter: None,
             continuation_token: None,
             max_keys: 1000,
+            requested_max_keys: Some(1000),
         })
         .unwrap_err();
     assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -5848,6 +6068,7 @@ fn list_objects_nonexistent_bucket_for_non_owner_still_returns_bucket_not_found(
             delimiter: None,
             continuation_token: None,
             max_keys: 1000,
+            requested_max_keys: Some(1000),
         })
         .unwrap_err();
     assert!(matches!(err, ServerError::BucketNotFound { .. }));

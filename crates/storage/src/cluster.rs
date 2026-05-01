@@ -71,7 +71,7 @@ pub type MetadataCommandApplyContextTestHook =
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct MetadataCommandApplyContextTestHookGuard {
-    _private: (),
+    pub(super) scope_id: usize,
 }
 
 const TRACE_TARGET: &str = "storage";
@@ -1422,7 +1422,9 @@ impl StorageCluster {
             .remove_pending_metadata_command_for_bucket(pg_id, &req.bucket);
 
         #[cfg(any(test, feature = "test-hooks"))]
-        crate::node::maybe_run_after_direct_put_metadata_publish_hook()?;
+        crate::node::maybe_run_after_direct_put_metadata_publish_hook(
+            self.metadata_primary_test_hook_node().test_hook_scope_id(),
+        )?;
 
         let object_pg = object_node.get_pg(pg_id.get())?;
         let stored = PgMetadataStore::get_object_meta(&*object_pg, &req.bucket, &req.key)?;
