@@ -411,6 +411,57 @@ The current implemented evaluator is strongest on:
 - the supported `s3:x-amz-*` request condition keys already threaded through
   `PolicyRequest`
 
+Current supported condition operators are:
+
+- `Bool`
+- `Null`
+- `StringEquals`, `StringEqualsIfExists`
+- `StringEqualsIgnoreCase`, `StringEqualsIgnoreCaseIfExists`
+- `StringNotEquals`, `StringNotEqualsIfExists`
+- `StringNotEqualsIgnoreCase`, `StringNotEqualsIgnoreCaseIfExists`
+- `StringLike`, `StringLikeIfExists`
+- `StringNotLike`, `StringNotLikeIfExists`
+- `ForAllValues:StringEquals`, `ForAnyValue:StringEquals`
+- `ForAllValues:StringEqualsIgnoreCase`,
+  `ForAnyValue:StringEqualsIgnoreCase`
+- `ForAllValues:StringNotEquals`, `ForAnyValue:StringNotEquals`
+- `ForAllValues:StringNotEqualsIgnoreCase`,
+  `ForAnyValue:StringNotEqualsIgnoreCase`
+- `ForAllValues:StringLike`, `ForAnyValue:StringLike`
+- `ForAllValues:StringNotLike`, `ForAnyValue:StringNotLike`
+
+Compared with the IAM condition-operator reference, unsupported operator
+families are:
+
+- numeric operators: `NumericEquals`, `NumericNotEquals`,
+  `NumericLessThan`, `NumericLessThanEquals`, `NumericGreaterThan`,
+  `NumericGreaterThanEquals`, and their applicable set/`IfExists` forms
+- date operators, including date comparisons and their applicable
+  set/`IfExists` forms
+- IP address operators: `IpAddress`, `NotIpAddress`, and their applicable
+  set/`IfExists` forms
+- ARN operators: `ArnEquals`, `ArnLike`, `ArnNotEquals`, `ArnNotLike`, and
+  their applicable set/`IfExists` forms
+- binary operators: `BinaryEquals` and any applicable qualified forms. IAM
+  policies encode the binary value as base64 text, but AWS still treats this
+  as the binary condition-operator family rather than ordinary string
+  matching.
+- boolean set operators: `ForAllValues:Bool` and `ForAnyValue:Bool`
+
+Policy variables are also not implemented. AWS supports variables such as
+`${aws:PrincipalTag/team}` in `Resource` ARNs and in string/ARN condition
+values. Argmin currently treats policy values literally; it does not expand
+variables from principal tags, request tags, session context, or other request
+attributes. This mostly affects reusable ABAC policies that compare object or
+bucket tags against IAM principal tags.
+
+References:
+
+- AWS IAM condition operators:
+  <https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_condition_operators.html>
+- AWS IAM policy variables:
+  <https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_variables.html>
+
 So a bucket policy may now be AWS-accepted and storable even if some condition
 clauses are still not runtime-evaluable locally. That is the correct direction
 for upload-time conformance, but it remains a known compatibility gap until
