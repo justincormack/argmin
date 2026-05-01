@@ -1,0 +1,224 @@
+CreateBucket can drop pending ACL metadata commands
+Link: https://chatgpt.com/codex/cloud/security/findings/5a9fc1519eec8191971db13b91fd7475?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 1b2e520
+Author: justin@specialbusservice.com
+Created: 30/04/2026, 21:33:06
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Bug introduced. The commit removed per-kind pending-command keys and replaced remove_pending_create_bucket_command with remove_pending_metadata_command_for_bucket in the existing-bucket CreateBucket path, allowing unrelated pending ACL/versioning commands to be deleted.
+Pending metadata commands are now keyed only by (PG, bucket), so the pending entry may be a CreateBucket, PutBucketVersioning, or PutBucketAcl command. However, create_bucket_with_config_and_load_info still clears the pending entry as soon as the bucket exists on the primary. This happens before verifying the pending command kind and before the server-core owner check decides whether the CreateBucket caller actually owns the bucket. As a result, any authenticated caller who issues CreateBucket for an existing bucket during a partial metadata-command failure window can remove a pending ACL/versioning command. For the new ACL command path, this can leave replicas with divergent public_read/public_write state. A later retry with different ACL values can also become permanently conflicting because the partially-updated replica may already have the same execution generation with different ACL contents. If routing/failover later uses that stale replica, authorization decisions can incorrectly treat a private bucket as public-readable or public-writable.
+
+# Reviewer note
+This report was valid.
+
+Fixed in commit `92523a82d60c2de49e173697e1eb1dcf93b3355c`.
+
+The fix removes the unconditional pending-command clear from the existing-bucket CreateBucket path. Returning `Exists` is now a read of the bucket-primary state only; it does not mutate the per-bucket pending command stream. Successful command application paths still clear their own pending command after convergence, and finalized bucket delete remains the explicit bucket-incarnation cleanup point.
+
+Regression coverage is in `storage::cluster::local::tests::existing_create_bucket_preserves_pending_acl_command_for_retry`. It reproduces a partial `PutBucketAcl(public_read=true)` apply, calls CreateBucket for the existing bucket with a different requested owner, verifies the pending ACL command is still present with the same command id/payload, and then retries the ACL command to convergence across all acting nodes.
+
+# Validation
+## Rubric
+- [x] Confirm pending metadata commands are now keyed only by PG and bucket, not by command kind.
+- [x] Confirm existing-bucket CreateBucket removes the bucket pending entry before checking the pending command payload kind.
+- [x] Confirm a partial PutBucketAcl failure leaves a pending ACL command and divergent replica ACL state.
+- [x] Confirm an existing-bucket CreateBucket call with a different owner can invoke the storage path that clears pending state before server-core ownership rejection.
+- [x] Dynamically reproduce the unsafe state: pending ACL is present before CreateBucket, absent after CreateBucket, and a stale replica remains public-readable while the primary is private.
+## Report
+Validated the finding with a targeted Rust regression PoC in the storage crate. Code review showed the pending metadata map is keyed only by `(PgId, BucketName)` (`crates/storage/src/cluster/local.rs:211-215`), and `remove_pending_metadata_command_for_bucket` removes whatever payload is stored there (`local.rs:287-295`). The existing-bucket CreateBucket fast path calls this unconditional remover before returning `Exists` (`crates/storage/src/cluster/request_ops.rs:186-193`), while the ACL path depends on a failed partial `PutBucketAcl` remaining pending for retry/convergence (`request_ops.rs:725-779`). Server-core invokes storage CreateBucket before checking whether the existing bucket is owned by the caller (`crates/server-core/src/coordinator/bucket.rs:224-249`), so a non-owner request can reach the storage-side clear.
+
+I added a narrow unit test PoC to `crates/storage/src/cluster/local.rs` that: creates a 3-node local cluster; creates a private bucket; injects a one-time failure during `PutBucketAcl(public_read=true)` application to leave a pending ACL command and one updated replica; then calls `create_bucket_with_config_and_load_info` for the already-existing bucket using an `attacker` owner. The test asserts the safe invariant that the pending ACL command should still exist. On the vulnerable commit, the test prints `after existing CreateBucket: pending_after_create=false, stale_replica_public_read=true, primary_public_read=false` and panics at the invariant, proving the unrelated pending ACL command was deleted and replica ACL state diverged.
+
+Crash attempt: successful via targeted regression-test panic. Valgrind attempt: `valgrind` is not installed in the container. Debugger attempt: LLDB was run non-interactively with a breakpoint on `panic_fmt` and confirmed the panic stack reaches `storage::cluster::local::tests::poc_existing_create_clears_unrelated_pending_acl_command` at `local.rs:5395`.
+
+# Evidence
+crates/server-core/src/coordinator/bucket.rs (L224 to 249)
+  Note: The storage CreateBucket call that can clear the pending command runs before server-core checks whether an existing bucket is owned by the caller, so even a non-owner authenticated request can trigger the storage-side clear.
+```
+        match self
+            .storage_node
+            .create_bucket_with_config_and_load_info(&storage::CreateBucketConfig {
+                name: name.as_str(),
+                owner_principal: owner.principal.as_str(),
+                owner_canonical_id: &owner.canonical_id,
+                acl_grants: &acl_grants,
+                public_read,
+                public_write,
+                versioning: initial_versioning,
+                object_lock: initial_object_lock,
+            })
+            .map_err(Self::map_bucket_snapshot_load_error)?
+        {
+            storage::node::BucketCreateAttemptOutcome::Created(_info) => {
+                Ok(BucketCreateOutcome::Created)
+            }
+            storage::node::BucketCreateAttemptOutcome::Exists(existing) => match existing.state {
+                BucketState::Active
+                    if existing.owner_principal == owner.principal
+                        && existing.owner_canonical_id == owner.canonical_id =>
+                {
+                    Ok(BucketCreateOutcome::AlreadyOwned)
+                }
+                BucketState::Active | BucketState::Deleting => {
+                    Err(ServerError::BucketAlreadyExists)
+```
+
+crates/storage/src/cluster/local.rs (L211 to 215)
+  Note: The pending command map is now keyed only by PG and bucket, not by command kind, so a pending entry can represent ACL or versioning as well as create-bucket.
+```
+pub(crate) struct LocalClusterRuntimeState {
+    object_payload_leases: Mutex<HashMap<LocalReclaimRoot, usize>>,
+    reclaim_queue: (Mutex<LocalReclaimQueueState>, Condvar),
+    metadata_command_indexes: Mutex<HashMap<PgId, u64>>,
+    pending_metadata_commands: Mutex<HashMap<(PgId, BucketName), MetadataCommandEnvelope>>,
+```
+
+crates/storage/src/cluster/local.rs (L287 to 295)
+  Note: remove_pending_metadata_command_for_bucket removes whatever command is pending for that bucket, regardless of whether it is the create command.
+```
+    pub(crate) fn remove_pending_metadata_command_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) {
+        self.pending_metadata_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(pg_id, bucket.clone()));
+```
+
+crates/storage/src/cluster/request_ops.rs (L186 to 193)
+  Note: When the bucket already exists, CreateBucket unconditionally removes the bucket's pending metadata command before returning Exists, which can drop a pending ACL/versioning command.
+```
+        {
+            let bucket_pg = primary_node.get_pg(pg_id)?;
+            match PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket) {
+                Ok(info) => {
+                    self.local_map
+                        .runtime_state()
+                        .remove_pending_metadata_command_for_bucket(PgId::new(pg_id), &bucket);
+                    return Ok(BucketCreateAttemptOutcome::Exists(info));
+```
+
+crates/storage/src/cluster/request_ops.rs (L725 to 779)
+  Note: The new ACL command path relies on the pending bucket command remaining available for retry/convergence after partial replica application.
+```
+        let runtime_state = self.local_map.runtime_state();
+        let command = if let Some(command) =
+            runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+        {
+            match command.payload() {
+                MetadataCommandPayload::PutBucketAcl(acl)
+                    if acl.matches_request(bucket, acl_grants, public_read, public_write) =>
+                {
+                    command
+                }
+                MetadataCommandPayload::PutBucketAcl(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "conflicting pending put bucket acl command",
+                    ));
+                }
+                MetadataCommandPayload::CreateBucket(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending create bucket command for bucket acl",
+                    ));
+                }
+                MetadataCommandPayload::PutBucketVersioning(_) => {
+                    return Err(conflicting_pending_metadata_command(
+                        "unexpected pending put bucket versioning command for bucket acl",
+                    ));
+                }
+            }
+        } else {
+            let command_id = MetadataCommandId::new(
+                self.operation_epoch(),
+                pg_id,
+                runtime_state.next_metadata_command_log_index(pg_id),
+            );
+            let bucket_pg = primary_node.get_pg(pg_id.get())?;
+            let bucket_execution_generation = bucket_pg.reserve_bucket_execution_generation()?;
+            drop(bucket_pg);
+            let command = MetadataCommandEnvelope::new(
+                command_id,
+                MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::new(
+                    bucket.clone(),
+                    acl_grants.clone(),
+                    public_read,
+                    public_write,
+                    bucket_execution_generation,
+                )),
+            );
+            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            command
+        };
+        self.apply_metadata_command_to_acting_set(&command)?;
+
+        let bucket_pg = primary_node.get_pg(pg_id.get())?;
+        let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
+        self.local_map
+            .runtime_state()
+            .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Adjusted down from high to medium. Evidence confirms a real in-scope bug: pending commands are keyed only by PG/bucket, CreateBucket for an existing bucket removes the pending command unconditionally, and server-core performs this storage-side mutation before existing-owner verification. The validation PoC demonstrates pending ACL loss and divergent public_read state under a partial apply failure. The reason this does not remain high is exploitability: an attacker needs valid authentication, a simultaneous or pre-existing partial metadata failure, and later stale replica routing/failover for authorization impact. The default argmin-s3 binary also builds a single OwnerAccountAdmin credential from environment variables, so the strongest non-owner cross-account story is not clearly present in the standard deployment. The impact can be serious if the stale node is promoted, but the probability and deployment dependence keep this below high.
+## Likelihood
+high - The CreateBucket request is easy for any valid credential to send, and the vulnerable code is directly reachable. However, successful security exploitation requires a narrow partial metadata-apply failure window plus later stale replica use; default argmin-s3 also configures a single admin credential, limiting non-owner exploitability in the standard binary. | Remote network vector
+## Impact
+medium - If the lost pending command is a partially applied ACL update, local nodes can disagree about public_read/public_write. Later use of a stale node can cause incorrect authorization, including treating a bucket as public-readable or public-writable. The demonstrated effect is security-relevant data confidentiality/integrity exposure, but it is conditional on stale-route/failover behavior rather than an immediate direct read/write bypass.
+## Assumptions
+- The attacker has at least one valid SigV4 credential accepted by the server, because CreateBucket requires an authenticated account.
+- A partial metadata command application failure occurs after at least one non-primary local node applies a bucket ACL/versioning command but before the primary converges.
+- Security impact requires later reads/authorization decisions to be served from the stale node, such as after route change, failover, or future multi-host/local-node promotion.
+- The standalone argmin-s3 binary only configures one credential from environment variables by default; broader non-owner/multi-account impact depends on deployments or embedding that populate multiple CredentialStore records.
+- valid SigV4 authentication
+- existing target bucket
+- pending bucket metadata command for the same PG/bucket
+- partial metadata apply failure window
+- later use of stale replica/route for authorization impact
+## Path
+Authenticated client
+  -> PUT /existing-bucket
+  -> server-http CreateBucket
+  -> server-core authorize_create_bucket
+  -> storage existing-bucket path
+  -> remove pending command for (PG,bucket)
+  -> ACL/versioning retry state lost
+  -> stale local node may authorize with divergent public_read/public_write after failover/route use
+## Path evidence
+- `crates/argmin-s3/src/config.rs:23-42` - Runtime configuration exposes the S3 service listen address, defaulting to 127.0.0.1:9000, and takes credentials/secrets from environment variables.
+- `crates/argmin-s3/src/main.rs:107-154` - Main product opens the local storage cluster, builds Coordinator/HttpFrontend workers, and installs a configured credential as OwnerAccountAdmin.
+- `crates/argmin-s3/src/main.rs:158-203` - Main product binds the TCP listener and serves HTTP or HTTPS using server-http.
+- `crates/server-http/src/http/router.rs:395-407` - HTTP PUT /bucket?acl routes to PutBucketAcl, while HTTP PUT /bucket without a subresource routes to CreateBucket.
+- `crates/server-http/src/http/mod.rs:1220-1237` - CreateBucket HTTP operation constructs a requester from authentication context and calls Coordinator::create_bucket.
+- `crates/server-http/src/http/mod.rs:2516-2561` - PutBucketAcl HTTP operation validates and applies bucket ACL updates through Coordinator::put_bucket_acl.
+- `crates/server-core/src/coordinator/authz/bucket.rs:4-40` - CreateBucket authorization requires an authenticated account and prepares owner/ACL data, but does not check ownership of an already-existing bucket before storage is called.
+- `crates/server-core/src/coordinator/bucket.rs:224-249` - server-core calls storage create_bucket_with_config_and_load_info first, then checks whether the existing bucket owner matches the caller only after storage returns Exists.
+- `crates/storage/src/cluster/local.rs:211-215` - Pending metadata commands are keyed only by (PgId, BucketName), not by command kind.
+- `crates/storage/src/cluster/local.rs:287-295` - remove_pending_metadata_command_for_bucket removes whatever command is pending for that PG/bucket.
+- `crates/storage/src/cluster/request_ops.rs:186-193` - The existing-bucket CreateBucket fast path unconditionally removes the bucket pending metadata command before returning Exists.
+- `crates/storage/src/cluster/request_ops.rs:725-779` - PutBucketAcl uses the same pending metadata slot and depends on the pending command remaining available until apply_metadata_command_to_acting_set succeeds.
+- `crates/storage/src/cluster/request_ops.rs:257-275` - Metadata commands are applied across acting nodes; a failure partway through can leave replicas divergent while the pending command is needed for retry/convergence.
+## Narrative
+The bug is real and in the main runtime path. The pending metadata map stores one command per (PgId, BucketName), so a pending entry may be CreateBucket, PutBucketAcl, or PutBucketVersioning. The existing-bucket CreateBucket storage path removes that entry unconditionally before returning Exists. server-core calls this storage function before checking whether the existing bucket belongs to the caller, so a signed CreateBucket request can perform the storage-side clear even when it will later receive BucketAlreadyExists. The ACL update path relies on pending commands remaining present for retry/convergence after partial application. Prior validation produced an executable Rust regression PoC with an injected partial PutBucketAcl(public_read=true) failure; the subsequent existing-bucket CreateBucket cleared the pending command and left one replica public_read while the primary remained private. Severity is adjusted from high to medium because exploitation requires a partial storage failure window and later stale-replica routing/failover; the default argmin-s3 binary also exposes only one configured credential, reducing clear cross-tenant exploitability.
+## Controls
+- SigV4 request authentication in server-http/auth
+- Bucket authorization in server-core
+- Bucket public access block checks for ACL updates
+- Configurable max_connections and max_inflight_requests
+- Default listener is 127.0.0.1:9000 unless ARGMIN_LISTEN_ADDR is changed
+- Optional TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+## Blindspots
+- Static-only review did not run the full server or reproduce the issue through live HTTP; it relies on code reachability plus the earlier storage-level executable PoC.
+- No Kubernetes, Terraform, Docker Compose, or other deployment manifests were present, so public exposure and load balancer posture could not be verified from repository artifacts.
+- The repository contains local-cluster route/failover abstractions, but the default production path appears to build static local routes; operational mechanisms for stale replica promotion are not fully evidenced in the inspected files.
+- The default binary configures one credential, but library consumers or tests may populate CredentialStore with multiple accounts; cross-account reach depends on such usage.

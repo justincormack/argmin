@@ -38,6 +38,7 @@ for the current local security suite.
 | `security/codex-a25af39` Constrained same-account users still read/manage data as owners | fixed | `./scripts/security-tests authz` | Covered by ownership and constrained-user matrix tests. |
 | `security/codex-bb033e7` Object lock auth order leaks bucket lock configuration | fixed | `./scripts/security-tests authz lifecycle` | Covered by local authz ordering tests and the lifecycle/object-lock group. |
 | `security/codex-cece86a` RequestObjectTag policies ignored for PutObjectTagging | fixed | `./scripts/security-tests authz` | Covered by request-tag condition regressions. |
+| `security/codex-1b2e520` CreateBucket can drop pending ACL metadata commands | fixed | `cargo nextest run -p storage existing_create_bucket_preserves_pending_acl_command_for_retry` | Covered by a local metadata-command convergence regression; existing CreateBucket no longer clears unrelated pending bucket commands. |
 
 ## Stateful Multipart, Reclaim, Lifecycle, and Object Lock
 
