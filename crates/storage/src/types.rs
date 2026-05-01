@@ -3131,11 +3131,6 @@ pub struct FinalizeStreamPartCleanup {
     pub displaced_segments: Vec<MultipartPartSegmentRecord>,
 }
 
-pub struct FinalizeStreamPartStorageOutcome<T, E> {
-    pub result: Result<FinalizeStreamPartOutcome<T>, E>,
-    pub cleanup: Option<FinalizeStreamPartCleanup>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbortMultipartUploadCleanup {
     pub upload: MultipartUploadRecord,

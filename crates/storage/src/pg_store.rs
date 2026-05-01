@@ -21,12 +21,13 @@ use crate::error::{MetadataError, StoreError};
 use crate::metadata_command::{
     AbortMultipartUploadCommand, AbortStreamUploadCommand, AppendStreamSegmentCommand,
     BucketPropertyMutation, BucketSubresourceMutation, CommitDirectPutObjectCommand,
-    CommitMultipartObjectCommand, CreateBucketCommand, CreateMultipartUploadCommand,
-    CreateStreamUploadCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
-    InsertDeleteMarkerCommand, MetadataCommandEnvelope, MetadataCommandPayload,
-    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
-    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
-    PutObjectMetadataMutation, ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
+    CommitMultipartObjectCommand, CommitStreamPartCommand, CreateBucketCommand,
+    CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteObjectVersionCommand,
+    DeleteObjectVersionTarget, InsertDeleteMarkerCommand, MetadataCommandEnvelope,
+    MetadataCommandPayload, ObjectPayloadReclaimCommand, PutBucketAclCommand,
+    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
+    PutObjectMetadataCommand, PutObjectMetadataMutation, ReleaseObjectGenerationCommand,
+    ReserveObjectGenerationCommand,
 };
 use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
@@ -2165,6 +2166,9 @@ impl PgStore {
             MetadataCommandPayload::AbortStreamUpload(command) => {
                 self.apply_abort_stream_upload_command(command)
             }
+            MetadataCommandPayload::CommitStreamPart(command) => {
+                self.apply_commit_stream_part_command(command)
+            }
             MetadataCommandPayload::CreateMultipartUpload(command) => {
                 self.apply_create_multipart_upload_command(command)
             }
@@ -2939,6 +2943,7 @@ impl PgStore {
         &self,
         command: &CreateStreamUploadCommand,
     ) -> Result<(), MetadataError> {
+        self.validate_create_stream_upload_command_target(command)?;
         match self.get_stream_upload(&command.request.session_id) {
             Ok(existing)
                 if existing.bucket == command.request.bucket
@@ -2958,6 +2963,33 @@ impl PgStore {
                 self.create_stream_upload_explicit(&command.request, command.created_at_millis)
             }
             Err(error) => Err(error),
+        }
+    }
+
+    fn validate_create_stream_upload_command_target(
+        &self,
+        command: &CreateStreamUploadCommand,
+    ) -> Result<(), MetadataError> {
+        match &command.request.target {
+            StreamUploadTarget::PutObject => Ok(()),
+            StreamUploadTarget::UploadPart { upload_id, .. } => {
+                let upload = self.get_multipart_upload(upload_id)?;
+                if upload.bucket != command.request.bucket
+                    || upload.key != command.request.key
+                    || upload.state != UploadState::InProgress
+                {
+                    return Err(MetadataError::NoSuchUpload {
+                        upload_id: upload_id.to_string(),
+                    });
+                }
+                if upload.encryption != command.request.encryption {
+                    return Err(MetadataError::Db {
+                        context: "create stream upload command upload encryption mismatch",
+                        source: rusqlite::Error::InvalidQuery,
+                    });
+                }
+                Ok(())
+            }
         }
     }
 
@@ -3039,6 +3071,304 @@ impl PgStore {
                 store.delete_stream_upload(&command.session_id)
             },
         )
+    }
+
+    fn apply_commit_stream_part_command(
+        &self,
+        command: &CommitStreamPartCommand,
+    ) -> Result<(), MetadataError> {
+        if self.commit_stream_part_command_already_applied(command)? {
+            return Ok(());
+        }
+
+        self.with_immediate_txn(
+            "commit stream part command (begin txn)",
+            "commit stream part command (commit txn)",
+            |store| {
+                store.validate_commit_stream_part_command(command)?;
+
+                store
+                    .set_stream_upload_state(&command.session_id, StreamUploadState::Completing)?;
+                store.insert_multipart_part_explicit(&command.part)?;
+                store.delete_multipart_part_segments_for_upload_part(
+                    &command.bucket,
+                    &command.key,
+                    &command.upload.upload_id,
+                    command.part.part_number,
+                )?;
+                store.insert_multipart_part_segments_explicit(&command.segments)?;
+                store.delete_stream_upload(&command.session_id)
+            },
+        )
+    }
+
+    fn commit_stream_part_command_already_applied(
+        &self,
+        command: &CommitStreamPartCommand,
+    ) -> Result<bool, MetadataError> {
+        match self.get_stream_upload(&command.session_id) {
+            Ok(_) => Ok(false),
+            Err(MetadataError::StreamSessionNotFound { .. }) => {
+                let part = match self
+                    .get_multipart_part(&command.part.upload_id, command.part.part_number)
+                {
+                    Ok(part) => part,
+                    Err(MetadataError::PartNotFound { .. }) => return Ok(false),
+                    Err(error) => return Err(error),
+                };
+                let segments = self.get_multipart_part_segments_for_upload_part(
+                    &command.bucket,
+                    &command.key,
+                    &command.upload.upload_id,
+                    command.part.part_number,
+                )?;
+                if part == command.part && segments == command.segments {
+                    Ok(true)
+                } else {
+                    Err(MetadataError::Db {
+                        context: "commit stream part command applied result mismatch",
+                        source: rusqlite::Error::InvalidQuery,
+                    })
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn validate_commit_stream_part_command(
+        &self,
+        command: &CommitStreamPartCommand,
+    ) -> Result<(), MetadataError> {
+        if command.upload.bucket != command.bucket
+            || command.upload.key != command.key
+            || command.upload.state != UploadState::InProgress
+            || command.part.upload_id != command.upload.upload_id
+        {
+            return Err(MetadataError::Db {
+                context: "commit stream part command upload binding mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        if command.part.part_okh != [0u8; 16] {
+            return Err(MetadataError::Db {
+                context: "commit stream part command non-streamed part",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        let expected_generation = match command.existing_part.as_ref() {
+            Some(existing) => {
+                if existing.upload_id != command.upload.upload_id
+                    || existing.part_number != command.part.part_number
+                {
+                    return Err(MetadataError::Db {
+                        context: "commit stream part command existing part binding mismatch",
+                        source: rusqlite::Error::InvalidQuery,
+                    });
+                }
+                existing
+                    .generation
+                    .checked_add(1)
+                    .ok_or(MetadataError::Db {
+                        context: "commit stream part command generation overflow",
+                        source: rusqlite::Error::InvalidQuery,
+                    })?
+            }
+            None => 0,
+        };
+        if command.part.generation != expected_generation {
+            return Err(MetadataError::Db {
+                context: "commit stream part command generation mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+
+        let session = self.get_stream_upload(&command.session_id)?;
+        if session.state != StreamUploadState::InProgress {
+            return Err(MetadataError::StreamSessionNotInProgress {
+                state: session.state as u8,
+            });
+        }
+        match &session.target {
+            StreamUploadTarget::UploadPart {
+                upload_id,
+                part_number,
+            } if upload_id == &command.upload.upload_id
+                && *part_number == command.part.part_number => {}
+            _ => {
+                return Err(MetadataError::StreamSessionNotFound {
+                    session_id: command.session_id.as_str().to_owned(),
+                })
+            }
+        }
+        if session.bucket != command.bucket || session.key != command.key {
+            return Err(MetadataError::Db {
+                context: "commit stream part command session binding mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+
+        let upload = self.get_multipart_upload(&command.upload.upload_id)?;
+        if upload != command.upload {
+            return Err(MetadataError::Db {
+                context: "commit stream part command upload mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+
+        let existing_part =
+            match self.get_multipart_part(&command.part.upload_id, command.part.part_number) {
+                Ok(part) => Some(part),
+                Err(MetadataError::PartNotFound { .. }) => None,
+                Err(error) => return Err(error),
+            };
+        if existing_part != command.existing_part {
+            return Err(MetadataError::Db {
+                context: "commit stream part command existing part mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+
+        let displaced_segments = self.get_multipart_part_segments_for_upload_part(
+            &command.bucket,
+            &command.key,
+            &command.upload.upload_id,
+            command.part.part_number,
+        )?;
+        if displaced_segments != command.displaced_segments {
+            return Err(MetadataError::Db {
+                context: "commit stream part command displaced segments mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+
+        let staged_segments = self.list_stream_segments(&command.session_id)?;
+        let expected_staged_segments: Vec<StreamUploadSegmentRecord> = command
+            .segments
+            .iter()
+            .map(|segment| StreamUploadSegmentRecord {
+                session_id: command.session_id.clone(),
+                segment_index: segment.segment_index,
+                size: segment.size,
+                segment_crc64: segment.segment_crc64,
+                segment_okh: segment.segment_okh,
+                segment_vid: segment.segment_vid,
+                data_pg_id: segment.data_pg_id,
+                ec_k: segment.ec_k,
+                ec_m: segment.ec_m,
+            })
+            .collect();
+        if staged_segments != expected_staged_segments {
+            return Err(MetadataError::Db {
+                context: "commit stream part command staged segments mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        for segment in &command.segments {
+            if segment.bucket != command.bucket
+                || segment.key != command.key
+                || segment.upload_id != command.upload.upload_id
+                || segment.version_id != PART_SEGMENT_STAGING_VERSION_ID.to_u64()
+                || segment.part_number != command.part.part_number
+            {
+                return Err(MetadataError::Db {
+                    context: "commit stream part command segment binding mismatch",
+                    source: rusqlite::Error::InvalidQuery,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_multipart_part_explicit(
+        &self,
+        part: &MultipartPartRecord,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO multipart_parts \
+                 (upload_id, part_number, generation, size, etag, etag_kind, \
+                  part_okh, part_vid, ec_k, ec_m, last_modified, checksum) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    part.upload_id,
+                    part.part_number,
+                    part.generation,
+                    part.size as i64,
+                    part.etag,
+                    part.etag_kind as u8,
+                    part.part_okh.as_slice(),
+                    part.part_vid.get() as i64,
+                    part.ec_k,
+                    part.ec_m,
+                    part.last_modified as i64,
+                    part.checksum.as_ref().map(|checksum| checksum.as_slice()),
+                ],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "insert multipart part explicit",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn delete_multipart_part_segments_for_upload_part(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        part_number: u32,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM multipart_part_segments \
+                 WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3 AND part_number = ?4",
+                params![bucket, key, upload_id, part_number],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete multipart part segments for upload part",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn insert_multipart_part_segments_explicit(
+        &self,
+        segments: &[MultipartPartSegmentRecord],
+    ) -> Result<(), MetadataError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "INSERT INTO multipart_part_segments \
+                 (bucket, key, upload_id, version_id, part_number, segment_index, size, \
+                  segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "prepare insert multipart part segments explicit",
+                source: e,
+            })?;
+        for segment in segments {
+            stmt.execute(params![
+                segment.bucket,
+                segment.key,
+                segment.upload_id,
+                segment.version_id as i64,
+                segment.part_number,
+                segment.segment_index,
+                segment.size as i64,
+                segment.segment_crc64.map(|v| v as i64),
+                segment.segment_okh.as_slice(),
+                segment.segment_vid.get() as i64,
+                segment.data_pg_id,
+                segment.ec_k,
+                segment.ec_m,
+            ])
+            .map_err(|e| MetadataError::Db {
+                context: "insert multipart part segment explicit",
+                source: e,
+            })?;
+        }
+        Ok(())
     }
 
     fn apply_create_multipart_upload_command(
@@ -9617,6 +9947,63 @@ impl PgMetadataStore for PgStore {
             })?);
         }
         Ok(segments)
+    }
+
+    fn get_multipart_part_segments_for_upload_part(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        part_number: u32,
+    ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT bucket, key, upload_id, version_id, part_number, segment_index, \
+                 size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
+                 FROM multipart_part_segments \
+                 WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3 AND part_number = ?4 \
+                 ORDER BY segment_index ASC",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "prepare get multipart part segments for upload part",
+                source: e,
+            })?;
+
+        let rows = stmt
+            .query_map(params![bucket, key, upload_id, part_number], |row| {
+                let okh_blob: Vec<u8> = row.get(8)?;
+                let segment_okh = PgStore::parse_okh_blob(&okh_blob, 8)?;
+                Ok(MultipartPartSegmentRecord {
+                    bucket: row.get(0)?,
+                    key: row.get(1)?,
+                    upload_id: row.get(2)?,
+                    version_id: row.get::<_, i64>(3)? as u64,
+                    part_number: row.get(4)?,
+                    segment_index: row.get(5)?,
+                    size: row.get::<_, i64>(6)? as u64,
+                    segment_crc64: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+                    segment_okh,
+                    segment_vid: Self::parse_generation_id(
+                        row.get::<_, i64>(9)?,
+                        9,
+                        "segment_vid",
+                    )?,
+                    data_pg_id: row.get(10)?,
+                    ec_k: row.get(11)?,
+                    ec_m: row.get(12)?,
+                })
+            })
+            .map_err(|e| MetadataError::Db {
+                context: "get multipart part segments for upload part",
+                source: e,
+            })?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| MetadataError::Db {
+                context: "get multipart part segments for upload part row",
+                source: e,
+            })
     }
 
     fn delete_multipart_part_segments(

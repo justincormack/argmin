@@ -50,6 +50,7 @@ pub enum MetadataCommandApplyTestKind {
     CreateStreamUpload,
     AppendStreamSegment,
     AbortStreamUpload,
+    CommitStreamPart,
     CreateMultipartUpload,
     AbortMultipartUpload,
 }
@@ -167,6 +168,9 @@ fn pending_command_completes_stream_session(
         }
         MetadataCommandPayload::AbortStreamUpload(abort) => {
             abort.bucket == *bucket && abort.key == *key && abort.session_id == *session_id
+        }
+        MetadataCommandPayload::CommitStreamPart(commit) => {
+            commit.bucket == *bucket && commit.key == *key && commit.session_id == *session_id
         }
         _ => false,
     }
@@ -1111,6 +1115,15 @@ impl StorageCluster {
                     &abort.staged_segments,
                 );
             }
+            MetadataCommandPayload::CommitStreamPart(commit) => {
+                self.delete_finalize_upload_part_cleanup_best_effort(
+                    &crate::FinalizeStreamPartCleanup {
+                        upload: commit.upload.clone(),
+                        existing_part: commit.existing_part.clone(),
+                        displaced_segments: commit.displaced_segments.clone(),
+                    },
+                );
+            }
             MetadataCommandPayload::AbortMultipartUpload(abort) => {
                 self.delete_abort_multipart_cleanup_best_effort(&abort.cleanup);
             }
@@ -1875,31 +1888,27 @@ impl StorageCluster {
                 return Err(error.into());
             }
         };
-        let use_command_path = matches!(session.target, StreamUploadTarget::PutObject);
-        let existing_stream_segment = if use_command_path {
-            match object_pg.list_stream_segments(session_id) {
-                Ok(segments) => segments
-                    .into_iter()
-                    .find(|segment| segment.segment_index == segment_index),
-                Err(error) => {
-                    drop(object_pg);
-                    self.delete_payload_shard_keys_best_effort(
-                        segment_record.data_pg_id,
-                        EcShape {
-                            k: segment_record.ec_k,
-                            m: segment_record.ec_m,
-                        },
-                        &segment_record.segment_okh,
-                        segment_record.segment_vid,
-                        shard_batch.iter().map(|(key, _)| (*key).clone()),
-                    );
-                    return Err(error.into());
-                }
+        let existing_stream_segment = match object_pg.list_stream_segments(session_id) {
+            Ok(segments) => segments
+                .into_iter()
+                .find(|segment| segment.segment_index == segment_index),
+            Err(error) => {
+                drop(object_pg);
+                self.delete_payload_shard_keys_best_effort(
+                    segment_record.data_pg_id,
+                    EcShape {
+                        k: segment_record.ec_k,
+                        m: segment_record.ec_m,
+                    },
+                    &segment_record.segment_okh,
+                    segment_record.segment_vid,
+                    shard_batch.iter().map(|(key, _)| (*key).clone()),
+                );
+                return Err(error.into());
             }
-        } else {
-            None
         };
         drop(object_pg);
+        let _ = session;
         match existing_stream_segment {
             Some(existing) if existing == *segment_record => return Ok(()),
             Some(_) => {
@@ -1935,51 +1944,20 @@ impl StorageCluster {
             return Err(error);
         }
 
-        if use_command_path {
-            let command = MetadataCommandEnvelope::new(
-                self.next_object_metadata_command_id(pg_id),
-                MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    segment: segment_record.clone(),
-                })),
-            );
-            if let Err(error) = self.set_pending_metadata_command_for_bucket(
-                pg_id,
-                bucket,
-                &command,
-                "conflicting pending command for stream segment append",
-            ) {
-                self.delete_payload_shard_keys_best_effort(
-                    segment_record.data_pg_id,
-                    EcShape {
-                        k: segment_record.ec_k,
-                        m: segment_record.ec_m,
-                    },
-                    &segment_record.segment_okh,
-                    segment_record.segment_vid,
-                    shard_batch.iter().map(|(key, _)| (*key).clone()),
-                );
-                return Err(error);
-            }
-            return self.apply_new_stream_append_command(
-                pg_id,
-                bucket,
-                &command,
-                segment_record,
-                shard_batch,
-            );
-        }
-
-        let result = object_node.commit_stream_segment_append(
-            bucket,
-            key,
-            session_id,
-            segment_index,
-            segment_record,
-            shard_batch,
+        let command = MetadataCommandEnvelope::new(
+            self.next_object_metadata_command_id(pg_id),
+            MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                segment: segment_record.clone(),
+            })),
         );
-        if result.is_err() {
+        if let Err(error) = self.set_pending_metadata_command_for_bucket(
+            pg_id,
+            bucket,
+            &command,
+            "conflicting pending command for stream segment append",
+        ) {
             self.delete_payload_shard_keys_best_effort(
                 segment_record.data_pg_id,
                 EcShape {
@@ -1990,8 +1968,9 @@ impl StorageCluster {
                 segment_record.segment_vid,
                 shard_batch.iter().map(|(key, _)| (*key).clone()),
             );
+            return Err(error);
         }
-        result
+        self.apply_new_stream_append_command(pg_id, bucket, &command, segment_record, shard_batch)
     }
 
     fn register_payload_shard_acks(
@@ -2045,31 +2024,25 @@ impl StorageCluster {
             }
             Err(error) => return Err(error.into()),
         };
-        let use_command_path = matches!(session.target, StreamUploadTarget::PutObject);
-        if use_command_path {
-            let staged_segments = object_pg.list_stream_segments(session_id)?;
-            drop(object_pg);
-            let command = MetadataCommandEnvelope::new(
-                self.next_object_metadata_command_id(pg_id),
-                MetadataCommandPayload::AbortStreamUpload(Box::new(AbortStreamUploadCommand {
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    session_id: session_id.clone(),
-                    staged_segments,
-                })),
-            );
-            self.set_pending_metadata_command_for_bucket(
-                pg_id,
-                bucket,
-                &command,
-                "conflicting pending command for stream upload abort",
-            )?;
-            return self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command);
-        }
+        let _ = session;
+        let staged_segments = object_pg.list_stream_segments(session_id)?;
         drop(object_pg);
-        let staged_segments = node.abort_stream_upload_session(bucket, key, session_id)?;
-        self.delete_staged_stream_segment_payload_shards_best_effort(&staged_segments);
-        Ok(())
+        let command = MetadataCommandEnvelope::new(
+            self.next_object_metadata_command_id(pg_id),
+            MetadataCommandPayload::AbortStreamUpload(Box::new(AbortStreamUploadCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                session_id: session_id.clone(),
+                staged_segments,
+            })),
+        );
+        self.set_pending_metadata_command_for_bucket(
+            pg_id,
+            bucket,
+            &command,
+            "conflicting pending command for stream upload abort",
+        )?;
+        self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
     }
 
     pub fn list_stream_upload_sessions_best_effort(&self) -> Vec<StreamUploadRecord> {

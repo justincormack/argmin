@@ -921,8 +921,8 @@ impl Coordinator {
             }
         }
         let FinalizeStreamPartOutcome {
-            value: result,
-            ..
+            value: mut result,
+            last_modified,
         } = self
             .storage_node
             .finalize_upload_part_stream(
@@ -1105,6 +1105,7 @@ impl Coordinator {
             )
             .map_err(Self::map_object_pg_action_error)??;
 
+        result.last_modified = last_modified;
         Ok(result)
     }
 

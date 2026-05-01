@@ -15,12 +15,13 @@ use super::{
 };
 use crate::metadata_command::{
     AbortMultipartUploadCommand, BucketPropertyMutation, BucketSubresourceMutation,
-    CommitDirectPutObjectCommand, CommitMultipartObjectCommand, CreateBucketCommand,
-    CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteObjectVersionCommand,
-    DeleteObjectVersionTarget, InsertDeleteMarkerCommand, MetadataCommandEnvelope,
-    MetadataCommandId, MetadataCommandPayload, ObjectPayloadReclaimCommand, PutBucketAclCommand,
-    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
-    PutObjectMetadataCommand, PutObjectMetadataMutation,
+    CommitDirectPutObjectCommand, CommitMultipartObjectCommand, CommitStreamPartCommand,
+    CreateBucketCommand, CreateMultipartUploadCommand, CreateStreamUploadCommand,
+    DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
+    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
+    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
+    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
+    PutObjectMetadataMutation,
 };
 use crate::*;
 
@@ -180,6 +181,11 @@ fn metadata_command_apply_test_context(
         ),
         MetadataCommandPayload::AbortStreamUpload(command) => (
             MetadataCommandApplyTestKind::AbortStreamUpload,
+            Some(command.bucket.clone()),
+            Some(command.key.clone()),
+        ),
+        MetadataCommandPayload::CommitStreamPart(command) => (
+            MetadataCommandApplyTestKind::CommitStreamPart,
             Some(command.bucket.clone()),
             Some(command.key.clone()),
         ),
@@ -395,6 +401,7 @@ impl super::StorageCluster {
                 | MetadataCommandPayload::CreateStreamUpload(_)
                 | MetadataCommandPayload::AppendStreamSegment(_)
                 | MetadataCommandPayload::AbortStreamUpload(_)
+                | MetadataCommandPayload::CommitStreamPart(_)
                 | MetadataCommandPayload::CreateMultipartUpload(_)
                 | MetadataCommandPayload::AbortMultipartUpload(_) => {
                     return Err(conflicting_pending_metadata_command(
@@ -887,6 +894,7 @@ impl super::StorageCluster {
                 | MetadataCommandPayload::CreateStreamUpload(_)
                 | MetadataCommandPayload::AppendStreamSegment(_)
                 | MetadataCommandPayload::AbortStreamUpload(_)
+                | MetadataCommandPayload::CommitStreamPart(_)
                 | MetadataCommandPayload::CreateMultipartUpload(_)
                 | MetadataCommandPayload::AbortMultipartUpload(_) => {
                     return Err(conflicting_pending_metadata_command(
@@ -1070,6 +1078,7 @@ impl super::StorageCluster {
                 | MetadataCommandPayload::CreateStreamUpload(_)
                 | MetadataCommandPayload::AppendStreamSegment(_)
                 | MetadataCommandPayload::AbortStreamUpload(_)
+                | MetadataCommandPayload::CommitStreamPart(_)
                 | MetadataCommandPayload::CreateMultipartUpload(_)
                 | MetadataCommandPayload::AbortMultipartUpload(_) => {
                     return Err(conflicting_pending_metadata_command(
@@ -1178,6 +1187,7 @@ impl super::StorageCluster {
                 | MetadataCommandPayload::CreateStreamUpload(_)
                 | MetadataCommandPayload::AppendStreamSegment(_)
                 | MetadataCommandPayload::AbortStreamUpload(_)
+                | MetadataCommandPayload::CommitStreamPart(_)
                 | MetadataCommandPayload::CreateMultipartUpload(_)
                 | MetadataCommandPayload::AbortMultipartUpload(_) => {
                     return Err(conflicting_pending_metadata_command(
@@ -1309,6 +1319,7 @@ impl super::StorageCluster {
                 | MetadataCommandPayload::CreateStreamUpload(_)
                 | MetadataCommandPayload::AppendStreamSegment(_)
                 | MetadataCommandPayload::AbortStreamUpload(_)
+                | MetadataCommandPayload::CommitStreamPart(_)
                 | MetadataCommandPayload::CreateMultipartUpload(_)
                 | MetadataCommandPayload::AbortMultipartUpload(_) => {
                     return Err(conflicting_pending_metadata_command(
@@ -3294,7 +3305,10 @@ impl super::StorageCluster {
         self.delete_multipart_part_segments_best_effort(&cleanup.omitted_streaming_segments);
     }
 
-    fn delete_finalize_upload_part_cleanup_best_effort(&self, cleanup: &FinalizeStreamPartCleanup) {
+    pub(super) fn delete_finalize_upload_part_cleanup_best_effort(
+        &self,
+        cleanup: &FinalizeStreamPartCleanup,
+    ) {
         if let Some(part) = cleanup
             .existing_part
             .as_ref()
@@ -3757,15 +3771,58 @@ impl super::StorageCluster {
         session_id: &SessionId,
         action: impl FnOnce(&MultipartUploadRecord) -> Result<T, E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .begin_upload_part_stream_session(
-                bucket,
-                key,
-                upload_id,
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let object_pg = primary_node.get_pg(pg_id.get())?;
+        let upload = PgMetadataStore::get_multipart_upload(&*object_pg, upload_id)?;
+        if upload.bucket != *bucket || upload.key != *key || upload.state != UploadState::InProgress
+        {
+            return Err(BucketSnapshotLoadError::Metadata(
+                MetadataError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                },
+            ));
+        }
+        let result = action(&upload);
+        if result.is_err() {
+            return Ok(result);
+        }
+        let create = CreateStreamUploadReq {
+            session_id: session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: StreamUploadTarget::UploadPart {
+                upload_id: upload_id.clone(),
                 part_number,
-                session_id,
-                action,
-            )
+            },
+            encryption: upload.encryption.clone(),
+        };
+        drop(object_pg);
+        if self
+            .matching_stream_upload_exists(pg_id, &create)
+            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
+        {
+            return Ok(result);
+        }
+        let command = MetadataCommandEnvelope::new(
+            self.next_object_metadata_command_id(pg_id),
+            MetadataCommandPayload::CreateStreamUpload(Box::new(CreateStreamUploadCommand {
+                request: create,
+                created_at_millis: crate::clock::current_time_millis(),
+            })),
+        );
+        self.set_pending_metadata_command_for_bucket(
+            pg_id,
+            bucket,
+            &command,
+            "conflicting pending command for upload part stream creation",
+        )
+        .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+        self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
+            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+        Ok(result)
     }
 
     pub fn create_upload_part_stream_session(
@@ -3776,8 +3833,57 @@ impl super::StorageCluster {
         part_number: u32,
         session_id: &SessionId,
     ) -> Result<SessionId, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .create_upload_part_stream_session(bucket, key, upload_id, part_number, session_id)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        loop {
+            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+            let primary_node = self.object_metadata_primary_node(bucket, key)?;
+            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let upload = PgMetadataStore::get_multipart_upload(&*object_pg, upload_id)?;
+            if upload.bucket != *bucket
+                || upload.key != *key
+                || upload.state != UploadState::InProgress
+            {
+                return Err(MetadataError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                }
+                .into());
+            }
+            let create = CreateStreamUploadReq {
+                session_id: session_id.clone(),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                target: StreamUploadTarget::UploadPart {
+                    upload_id: upload_id.clone(),
+                    part_number,
+                },
+                encryption: upload.encryption,
+            };
+            drop(object_pg);
+            if self.matching_stream_upload_exists(pg_id, &create)? {
+                return Ok(session_id.clone());
+            }
+            let command = MetadataCommandEnvelope::new(
+                self.next_object_metadata_command_id(pg_id),
+                MetadataCommandPayload::CreateStreamUpload(Box::new(CreateStreamUploadCommand {
+                    request: create,
+                    created_at_millis: crate::clock::current_time_millis(),
+                })),
+            );
+            if self
+                .set_pending_metadata_command_for_bucket(
+                    pg_id,
+                    bucket,
+                    &command,
+                    "conflicting pending command for upload part stream creation",
+                )
+                .is_err()
+            {
+                self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                continue;
+            }
+            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            return Ok(session_id.clone());
+        }
     }
 
     pub fn load_in_progress_multipart_upload(
@@ -4217,6 +4323,46 @@ impl super::StorageCluster {
         Ok(Self::complete_multipart_outcome_from_command(commit))
     }
 
+    fn validate_upload_part_stream_session(
+        session: &StreamUploadRecord,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        part_number: u32,
+    ) -> Result<(), ObjectPgActionError> {
+        if session.state != StreamUploadState::InProgress {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "stream session is not in progress".to_string(),
+            });
+        }
+        if session.bucket != *bucket || session.key != *key {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "session bucket/key mismatch".to_string(),
+            });
+        }
+        match &session.target {
+            StreamUploadTarget::UploadPart {
+                upload_id: sess_upload_id,
+                part_number: sess_part_number,
+            } if sess_upload_id == upload_id && *sess_part_number == part_number => Ok(()),
+            StreamUploadTarget::UploadPart { .. } => Err(ObjectPgActionError::InvalidRequest {
+                reason: "session upload_id/part_number mismatch".to_string(),
+            }),
+            StreamUploadTarget::PutObject => Err(ObjectPgActionError::InvalidRequest {
+                reason: "session is not an UploadPart session".to_string(),
+            }),
+        }
+    }
+
+    fn commit_stream_part_commands_match_retry(
+        pending: &CommitStreamPartCommand,
+        candidate: &CommitStreamPartCommand,
+    ) -> bool {
+        let mut adjusted = candidate.clone();
+        adjusted.part.last_modified = pending.part.last_modified;
+        pending == &adjusted
+    }
+
     pub fn finalize_upload_part_stream<T, E>(
         &self,
         bucket: &BucketName,
@@ -4226,13 +4372,117 @@ impl super::StorageCluster {
         part_number: u32,
         action: impl FnOnce(StreamUploadPartSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, ObjectPgActionError> {
-        let outcome = self
-            .object_metadata_primary_node(bucket, key)?
-            .finalize_upload_part_stream(bucket, key, upload_id, session_id, part_number, action)?;
-        if let Some(cleanup) = outcome.cleanup.as_ref() {
-            self.delete_finalize_upload_part_cleanup_best_effort(cleanup);
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let runtime_state = self.local_map.runtime_state();
+
+        while let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket) {
+            let is_matching_stream_part_commit = matches!(
+                command.payload(),
+                MetadataCommandPayload::CommitStreamPart(commit)
+                    if commit.matches_request(bucket, key, upload_id, session_id, part_number)
+            );
+            if is_matching_stream_part_commit {
+                break;
+            }
+            self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
         }
-        Ok(outcome.result)
+
+        let pending_command = runtime_state
+            .pending_metadata_command_for_bucket(pg_id, bucket)
+            .filter(|command| {
+                matches!(
+                    command.payload(),
+                    MetadataCommandPayload::CommitStreamPart(commit)
+                        if commit.matches_request(bucket, key, upload_id, session_id, part_number)
+                )
+            });
+
+        let object_pg = primary_node.get_pg(pg_id.get())?;
+        let session = object_pg.get_stream_upload(session_id)?;
+        Self::validate_upload_part_stream_session(&session, bucket, key, upload_id, part_number)?;
+        let upload = PgMetadataStore::get_multipart_upload(&*object_pg, upload_id)?;
+        if upload.bucket != *bucket || upload.key != *key || upload.state != UploadState::InProgress
+        {
+            return Err(MetadataError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            }
+            .into());
+        }
+        let existing_part =
+            match PgMetadataStore::get_multipart_part(&*object_pg, upload_id, part_number) {
+                Ok(existing) => Some(existing),
+                Err(MetadataError::PartNotFound { .. }) => None,
+                Err(other) => return Err(other.into()),
+            };
+        let existing_part_generation = existing_part.as_ref().map(|part| part.generation);
+        let staging_segments = object_pg.list_stream_segments(session_id)?;
+        let displaced_segments =
+            PgMetadataStore::get_all_multipart_part_segments_for_upload(&*object_pg, upload_id)?
+                .into_iter()
+                .filter(|segment| segment.part_number == part_number)
+                .collect::<Vec<_>>();
+
+        let prepared = match action(StreamUploadPartSnapshot {
+            session,
+            upload: upload.clone(),
+            existing_part_generation,
+            staging_segments,
+        }) {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok(Err(error)),
+        };
+
+        let command_payload = CommitStreamPartCommand {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            session_id: session_id.clone(),
+            upload,
+            part: prepared.part.clone(),
+            segments: prepared.segments.clone(),
+            existing_part,
+            displaced_segments,
+        };
+        let command_is_pending = pending_command.is_some();
+        let command = if let Some(command) = pending_command {
+            let MetadataCommandPayload::CommitStreamPart(pending) = command.payload() else {
+                unreachable!("filtered pending command changed kind");
+            };
+            if !Self::commit_stream_part_commands_match_retry(pending, &command_payload) {
+                return Err(ObjectPgActionError::InvalidRequest {
+                    reason: "pending stream part commit does not match retry".to_string(),
+                });
+            }
+            command
+        } else {
+            let command = MetadataCommandEnvelope::new(
+                self.next_object_metadata_command_id(pg_id),
+                MetadataCommandPayload::CommitStreamPart(Box::new(command_payload)),
+            );
+            self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                bucket,
+                &command,
+                "conflicting pending command for stream part finalization",
+            )?;
+            command
+        };
+        drop(object_pg);
+
+        let MetadataCommandPayload::CommitStreamPart(commit) = command.payload() else {
+            unreachable!("stream part pending command kind changed");
+        };
+        let last_modified = commit.part.last_modified;
+        if command_is_pending {
+            self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+        } else {
+            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+        }
+        Ok(Ok(FinalizeStreamPartOutcome {
+            value: prepared.value,
+            last_modified,
+        }))
     }
 
     pub fn list_multipart_uploads_for_bucket(

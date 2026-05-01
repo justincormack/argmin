@@ -1,7 +1,6 @@
 use super::*;
 #[cfg(test)]
 use crate::types::{CreateMultipartUploadOutcome, CreateMultipartUploadReq, StoredObject};
-use crate::types::{FinalizeStreamPartCleanup, FinalizeStreamPartStorageOutcome};
 
 impl SharedStorageNode {
     pub fn next_completed_multipart_upload_order_for_bucket(
@@ -84,57 +83,6 @@ impl SharedStorageNode {
         )?)
     }
 
-    pub fn begin_upload_part_stream_session<T, E>(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-        part_number: u32,
-        session_id: &SessionId,
-        action: impl FnOnce(&MultipartUploadRecord) -> Result<T, E>,
-    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
-        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
-        let upload = Self::load_multipart_upload_from_object_pg(&pg, bucket, key, upload_id)?;
-        let result = action(&upload);
-        if result.is_ok() {
-            pg.create_stream_upload(&CreateStreamUploadReq {
-                session_id: session_id.clone(),
-                bucket: bucket.clone(),
-                key: key.clone(),
-                target: StreamUploadTarget::UploadPart {
-                    upload_id: upload_id.clone(),
-                    part_number,
-                },
-                encryption: upload.encryption.clone(),
-            })?;
-        }
-        Ok(result)
-    }
-
-    pub fn create_upload_part_stream_session(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-        part_number: u32,
-        session_id: &SessionId,
-    ) -> Result<SessionId, ObjectPgActionError> {
-        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
-        let upload =
-            Self::load_in_progress_multipart_upload_from_object_pg(&pg, bucket, key, upload_id)?;
-        pg.create_stream_upload(&CreateStreamUploadReq {
-            session_id: session_id.clone(),
-            bucket: bucket.clone(),
-            key: key.clone(),
-            target: StreamUploadTarget::UploadPart {
-                upload_id: upload_id.clone(),
-                part_number,
-            },
-            encryption: upload.encryption,
-        })?;
-        Ok(session_id.clone())
-    }
-
     pub fn load_in_progress_multipart_upload(
         &self,
         bucket: &BucketName,
@@ -211,68 +159,6 @@ impl SharedStorageNode {
         Ok(MultipartCompletionPreflight { existing_etag })
     }
 
-    pub fn finalize_upload_part_stream<T, E>(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-        session_id: &SessionId,
-        part_number: u32,
-        action: impl FnOnce(StreamUploadPartSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
-    ) -> Result<FinalizeStreamPartStorageOutcome<T, E>, ObjectPgActionError> {
-        let (result, cleanup) = {
-            let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
-            let session = pg.get_stream_upload(session_id)?;
-            Self::validate_upload_part_stream_session(
-                &session,
-                bucket,
-                key,
-                upload_id,
-                part_number,
-            )?;
-            let upload = Self::load_in_progress_multipart_upload_from_object_pg(
-                &pg, bucket, key, upload_id,
-            )?;
-            let existing_part = match pg.get_multipart_part(upload_id, part_number) {
-                Ok(existing) => Some(existing),
-                Err(crate::error::MetadataError::PartNotFound { .. }) => None,
-                Err(other) => return Err(other.into()),
-            };
-            let existing_part_generation = existing_part.as_ref().map(|part| part.generation);
-            let staging_segments = pg.list_stream_segments(session_id)?;
-            match action(StreamUploadPartSnapshot {
-                session,
-                upload: upload.clone(),
-                existing_part_generation,
-                staging_segments,
-            }) {
-                Ok(prepared) => {
-                    let displaced_segments =
-                        pg.commit_stream_part(session_id, &prepared.part, &prepared.segments)?;
-                    let cleanup = (!displaced_segments.is_empty()
-                        || existing_part
-                            .as_ref()
-                            .is_some_and(|part| part.part_okh != [0u8; 16]))
-                    .then_some(FinalizeStreamPartCleanup {
-                        upload: upload.clone(),
-                        existing_part,
-                        displaced_segments,
-                    });
-                    (
-                        Ok(FinalizeStreamPartOutcome {
-                            value: prepared.value,
-                            last_modified: prepared.part.last_modified,
-                        }),
-                        cleanup,
-                    )
-                }
-                Err(error) => (Err(error), None),
-            }
-        };
-
-        Ok(FinalizeStreamPartStorageOutcome { result, cleanup })
-    }
-
     pub fn load_in_progress_multipart_upload_for_listing(
         &self,
         bucket: &BucketName,
@@ -337,37 +223,6 @@ impl SharedStorageNode {
                 Ok(AbortMultipartUploadLookup::Completed(completed))
             }
             Err(error) => Err(error.into()),
-        }
-    }
-
-    pub(super) fn validate_upload_part_stream_session(
-        session: &crate::StreamUploadRecord,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-        part_number: u32,
-    ) -> Result<(), ObjectPgActionError> {
-        if session.state != StreamUploadState::InProgress {
-            return Err(ObjectPgActionError::InvalidRequest {
-                reason: "stream session is not in progress".to_string(),
-            });
-        }
-        if session.bucket != bucket.as_str() || session.key != key.as_str() {
-            return Err(ObjectPgActionError::InvalidRequest {
-                reason: "session bucket/key mismatch".to_string(),
-            });
-        }
-        match &session.target {
-            StreamUploadTarget::UploadPart {
-                upload_id: sess_upload_id,
-                part_number: sess_part_number,
-            } if sess_upload_id == upload_id && *sess_part_number == part_number => Ok(()),
-            StreamUploadTarget::UploadPart { .. } => Err(ObjectPgActionError::InvalidRequest {
-                reason: "session upload_id/part_number mismatch".to_string(),
-            }),
-            StreamUploadTarget::PutObject => Err(ObjectPgActionError::InvalidRequest {
-                reason: "session is not an UploadPart session".to_string(),
-            }),
         }
     }
 }

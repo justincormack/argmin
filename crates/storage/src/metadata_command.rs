@@ -36,6 +36,7 @@ const METADATA_COMMAND_APPEND_STREAM_SEGMENT: u16 = 14;
 const METADATA_COMMAND_ABORT_STREAM_UPLOAD: u16 = 15;
 const METADATA_COMMAND_CREATE_MULTIPART_UPLOAD: u16 = 16;
 const METADATA_COMMAND_ABORT_MULTIPART_UPLOAD: u16 = 17;
+const METADATA_COMMAND_COMMIT_STREAM_PART: u16 = 18;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct MetadataCommandLogIndex(NonZeroU64);
@@ -164,6 +165,7 @@ pub(crate) enum MetadataCommandPayload {
     CreateStreamUpload(Box<CreateStreamUploadCommand>),
     AppendStreamSegment(Box<AppendStreamSegmentCommand>),
     AbortStreamUpload(Box<AbortStreamUploadCommand>),
+    CommitStreamPart(Box<CommitStreamPartCommand>),
     CreateMultipartUpload(Box<CreateMultipartUploadCommand>),
     AbortMultipartUpload(Box<AbortMultipartUploadCommand>),
 }
@@ -186,6 +188,7 @@ impl MetadataCommandPayload {
             Self::CreateStreamUpload(_) => METADATA_COMMAND_CREATE_STREAM_UPLOAD,
             Self::AppendStreamSegment(_) => METADATA_COMMAND_APPEND_STREAM_SEGMENT,
             Self::AbortStreamUpload(_) => METADATA_COMMAND_ABORT_STREAM_UPLOAD,
+            Self::CommitStreamPart(_) => METADATA_COMMAND_COMMIT_STREAM_PART,
             Self::CreateMultipartUpload(_) => METADATA_COMMAND_CREATE_MULTIPART_UPLOAD,
             Self::AbortMultipartUpload(_) => METADATA_COMMAND_ABORT_MULTIPART_UPLOAD,
         }
@@ -584,6 +587,35 @@ pub(crate) struct AbortStreamUploadCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommitStreamPartCommand {
+    pub(crate) bucket: BucketName,
+    pub(crate) key: ObjectKey,
+    pub(crate) session_id: SessionId,
+    pub(crate) upload: MultipartUploadRecord,
+    pub(crate) part: MultipartPartRecord,
+    pub(crate) segments: Vec<MultipartPartSegmentRecord>,
+    pub(crate) existing_part: Option<MultipartPartRecord>,
+    pub(crate) displaced_segments: Vec<MultipartPartSegmentRecord>,
+}
+
+impl CommitStreamPartCommand {
+    pub(crate) fn matches_request(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        session_id: &SessionId,
+        part_number: u32,
+    ) -> bool {
+        self.bucket == *bucket
+            && self.key == *key
+            && self.upload.upload_id == *upload_id
+            && self.session_id == *session_id
+            && self.part.part_number == part_number
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CreateMultipartUploadCommand {
     pub(crate) request: CreateMultipartUploadReq,
     pub(crate) object_generation_id: GenerationId,
@@ -692,6 +724,9 @@ fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPaylo
         }
         MetadataCommandPayload::AbortStreamUpload(command) => {
             encode_abort_stream_upload(&mut out, command);
+        }
+        MetadataCommandPayload::CommitStreamPart(command) => {
+            encode_commit_stream_part(&mut out, command);
         }
         MetadataCommandPayload::CreateMultipartUpload(command) => {
             encode_create_multipart_upload(&mut out, command);
@@ -925,6 +960,29 @@ fn encode_abort_stream_upload(out: &mut Vec<u8>, command: &AbortStreamUploadComm
     put_u32(out, command.staged_segments.len() as u32);
     for segment in &command.staged_segments {
         encode_stream_upload_segment(out, segment);
+    }
+}
+
+fn encode_commit_stream_part(out: &mut Vec<u8>, command: &CommitStreamPartCommand) {
+    put_str(out, command.bucket.as_str());
+    put_str(out, command.key.as_str());
+    put_str(out, command.session_id.as_str());
+    encode_multipart_upload(out, &command.upload);
+    encode_multipart_part(out, &command.part);
+    put_u32(out, command.segments.len() as u32);
+    for segment in &command.segments {
+        encode_multipart_part_segment(out, segment);
+    }
+    match &command.existing_part {
+        None => put_u8(out, 0),
+        Some(part) => {
+            put_u8(out, 1);
+            encode_multipart_part(out, part);
+        }
+    }
+    put_u32(out, command.displaced_segments.len() as u32);
+    for segment in &command.displaced_segments {
+        encode_multipart_part_segment(out, segment);
     }
 }
 
@@ -1984,9 +2042,9 @@ mod tests {
                 key: key.clone(),
                 upload_id: upload_id.clone(),
                 cleanup: AbortMultipartUploadCleanup {
-                    upload: multipart_upload,
-                    parts: vec![uploaded_part],
-                    streaming_segments: vec![omitted_streaming_segment],
+                    upload: multipart_upload.clone(),
+                    parts: vec![uploaded_part.clone()],
+                    streaming_segments: vec![omitted_streaming_segment.clone()],
                 },
             })),
             MetadataCommandPayload::CreateStreamUpload(Box::new(CreateStreamUploadCommand {
@@ -2007,8 +2065,18 @@ mod tests {
             MetadataCommandPayload::AbortStreamUpload(Box::new(AbortStreamUploadCommand {
                 bucket: bucket.clone(),
                 key: key.clone(),
+                session_id: stream_session_id.clone(),
+                staged_segments: vec![stream_segment.clone()],
+            })),
+            MetadataCommandPayload::CommitStreamPart(Box::new(CommitStreamPartCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
                 session_id: stream_session_id,
-                staged_segments: vec![stream_segment],
+                upload: multipart_upload,
+                part: uploaded_part.clone(),
+                segments: vec![omitted_streaming_segment.clone()],
+                existing_part: Some(uploaded_part),
+                displaced_segments: vec![omitted_streaming_segment],
             })),
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
                 bucket,
@@ -2058,7 +2126,8 @@ mod tests {
                 0xb67d60bbbb74f9d1,
                 0xf1b058002ad6040e,
                 0x7555192579a20442,
-                0xd6e957899583feaa,
+                0x505fc17b646186f2,
+                0xb9a1ca30cfa59630,
             ]
         );
     }

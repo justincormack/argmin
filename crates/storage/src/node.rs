@@ -25,13 +25,11 @@ use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 use crate::types::{
     AbortMultipartUploadLookup, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
     BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind,
-    CreateStreamUploadReq, EcShape, FinalizeStreamPartOutcome, GenerationId,
-    ListMultipartUploadsReq, ListObjectVersionsReq, ListPartsReq, ListedMultipartParts,
-    LoadedBucketSubresource, MultipartCompletionPreflight, MultipartCompletionSnapshot,
-    MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, ObjectReadSnapshot,
-    ObjectReadSnapshotOutcome, PreparedStreamPartCommit, SessionId, ShardKey, StoredObject,
-    StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
-    WriteAck,
+    CreateStreamUploadReq, EcShape, GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq,
+    ListPartsReq, ListedMultipartParts, LoadedBucketSubresource, MultipartCompletionPreflight,
+    MultipartCompletionSnapshot, MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey,
+    ObjectReadSnapshot, ObjectReadSnapshotOutcome, SessionId, ShardKey, StoredObject,
+    StreamUploadState, StreamUploadTarget, UploadId, UploadState, WriteAck,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::types::{

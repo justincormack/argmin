@@ -637,6 +637,15 @@ pub trait PgMetadataStore {
         part_number: u32,
     ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError>;
 
+    /// Read staged segments for one multipart upload part.
+    fn get_multipart_part_segments_for_upload_part(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        part_number: u32,
+    ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError>;
+
     /// Delete all committed part segments for an object version.
     fn delete_multipart_part_segments(
         &self,

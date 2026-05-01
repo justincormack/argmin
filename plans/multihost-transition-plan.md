@@ -1371,9 +1371,31 @@ Work items:
      - route lifecycle-driven MPU abort through the same command path after the
        bucket-lifecycle recheck, and cover it with acting-set convergence plus
        placed payload cleanup assertions
+     - add a `CommitStreamPart` command payload carrying the exact multipart
+       upload row, committed part row, selected staged segment rows, previous
+       part row, and displaced staged segment rows needed for replacement
+       cleanup
+     - route streamed UploadPart session creation, segment append, finalization,
+       and abort through the object metadata PG acting set; append and abort now
+       use the same command path for PutObject and UploadPart stream sessions
+     - make stream-part command apply validate the explicit part generation,
+       upload/session binding, staged segment snapshot, and displaced replacement
+       segment snapshot before deleting stream staging rows
+     - return the committed command timestamp from streamed UploadPart
+       finalization, so partial-apply retry converges to the accepted metadata
+       timestamp instead of a retry-local timestamp
+     - include acting-set convergence coverage for streamed UploadPart staging
+       and finalization, asserting every active object-PG node has the part and
+       staged segment rows and no residual stream session after finalize
+     - make `CreateStreamUpload` command apply revalidate `UploadPart` targets
+       against the current multipart upload row on each acting node, so an
+       abort/complete that wins after preflight cannot leave a new stream
+       session for a non-in-progress upload
+     - remove the obsolete `SharedStorageNode` streamed UploadPart create and
+       finalize helpers, leaving streamed UploadPart metadata mutation on the
+       cluster command path
    - remaining slices:
-     - multipart part upload, upload-part stream staging, and remaining
-       multipart staging metadata
+     - audit any remaining non-command multipart metadata paths
      - reclaim rows and reclaim worker metadata transitions
 5. Phase 6.5: synchronous replica apply.
    - apply every metadata command to all required replicas before acknowledging
