@@ -1,0 +1,198 @@
+Unguarded stream-create pending commands can be lost
+Link: https://chatgpt.com/codex/cloud/security/findings/79a50b60f2ec8191a18ee53983177a8e?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: d403b97
+Author: justin@specialbusservice.com
+Created: 01/05/2026, 18:49:03
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced. The commit added CreateStreamUpload metadata commands and calls set_pending_metadata_command_for_bucket from stream creation paths without bucket-level serialization. Existing pending-command storage only debug-asserts on overwrite, making the newly unguarded paths capable of losing retry state under concurrent streaming PUTs and a partial metadata apply failure.
+This commit moves PutObject stream-upload session creation onto the replicated metadata-command path. However, both create_put_object_stream_session_record and create_put_object_stream_session set a pending metadata command directly after reserve_put_object_generation returns, without holding the same bucket lock used by other object metadata command flows. The pending-command map is keyed only by (PG, bucket), and set_pending_metadata_command_for_bucket uses HashMap::insert with only a debug_assert when a previous command exists. In release builds, a concurrent object operation can therefore overwrite a stream-create pending command, or a stream-create can overwrite another pending command. This is especially dangerous because partial metadata-command application relies on the pending command remaining present for later retry; apply_pending_object_metadata_command_for_bucket intentionally leaves a failed partially-applied command pending. If the pending entry is overwritten/removed during a race, replicas can be left permanently inconsistent, reservations can leak, or subsequent writes/aborts/finalization can fail or operate on divergent stream-upload metadata.
+
+# Resolution
+Fixed in commit `1cc2543` (`Prevent pending metadata command overwrite`).
+
+The fix replaces release-build overwriting of the per-`(PG,bucket)` pending metadata command slot with a checked insert that returns `PendingMetadataCommandConflict` and preserves the existing pending command. All metadata-command publishers now go through the checked `StorageCluster` helper, so bucket commands, object commands, stream-create, stream append/abort, multipart create/complete/abort, and direct PUT cannot silently discard another pending convergence record.
+
+The stream-create path now handles a pending-slot collision by draining the existing pending object metadata command and releasing the losing generation reservation before retrying or returning an explicit error. Direct PUT cleanup paths also drain before releasing a generation reservation, so cleanup does not get blocked by the conflicting pending slot.
+
+Regression coverage:
+- `pending_metadata_command_insert_rejects_existing_without_overwrite`
+- `stream_put_create_drains_unrelated_pending_create_before_new_session`
+- existing partial-apply coverage including `stream_put_create_partial_apply_retry_reuses_existing_session`
+
+Verified before commit:
+- `cargo fmt`
+- `cargo clippy -p storage --all-targets --all-features -- -D warnings`
+- `cargo nextest run -p storage`
+
+# Validation
+## Rubric
+- [x] Confirm pending metadata command storage is a single entry per `(PG,bucket)` and overwrites via `HashMap::insert`.
+- [x] Confirm overwrite protection is only `debug_assert!`, so optimized/release builds do not enforce it.
+- [x] Confirm the stream `CreateStreamUpload` paths added by the commit call `set_pending_metadata_command_for_bucket` after drain/reservation and depend on this shared slot.
+- [x] Confirm partial metadata apply intentionally leaves commands pending for retry, so losing the slot loses retry state.
+- [x] Dynamically demonstrate debug collision crash and release silent overwrite of a first `CreateStreamUpload` pending command by a second command with the same `(PG,bucket)`.
+## Report
+Validated the core finding. Code review showed the pending-command slot is keyed only by (PgId, BucketName) and `set_pending_metadata_command_for_bucket` performs `HashMap::insert` followed only by `debug_assert!(previous.is_none())` at `crates/storage/src/cluster/local.rs:270-284`; therefore release builds silently overwrite an existing pending command. The new stream-create paths publish `CreateStreamUpload` commands into that slot at `crates/storage/src/cluster.rs:1611-1627` and `crates/storage/src/cluster/request_ops.rs:3307-3344` after a drain/check/reservation sequence, so a concurrent operation that has already passed its drain can later publish another command for the same bucket/PG. Partial apply retry semantics depend on the pending command remaining present: `apply_pending_object_metadata_command_for_bucket` removes only on success at `crates/storage/src/cluster.rs:885-901`, and `apply_new_object_metadata_command_for_bucket` removes on error only when `applied_nodes == 0` at `crates/storage/src/cluster/request_ops.rs:2119-2128`. I added a focused unit PoC that inserts two `CreateStreamUpload` commands for the same `(PG,bucket)`. In debug, it crashes exactly at the debug assertion, proving the collision is reachable. In release, the same PoC succeeds and prints `PoC overwrite: first_log_index=1 stored_log_index=2 command_a_lost=true`, proving the first pending retry state is silently discarded. I also ran the existing `stream_put_create_partial_apply_retry_reuses_existing_session` test, which passed and confirms the intended invariant that a partially applied stream create remains pending for retry. Valgrind was attempted but unavailable; LLDB was used non-interactively to run the release PoC and observed the same overwrite behavior with process exit 0.
+
+# Evidence
+crates/storage/src/cluster.rs (L1611 to 1627)
+  Note: The new stream session record path drains and reserves, then publishes a CreateStreamUpload pending command without holding a bucket lock across the check/set/apply sequence.
+```
+        self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+        if self.matching_stream_upload_exists(pg_id, &request)? {
+            return Ok(());
+        }
+        self.reserve_put_object_generation(bucket, key, session_id)?;
+        let command = MetadataCommandEnvelope::new(
+            self.next_object_metadata_command_id(pg_id),
+            MetadataCommandPayload::CreateStreamUpload(Box::new(CreateStreamUploadCommand {
+                request,
+                created_at_millis: crate::clock::current_time_millis(),
+            })),
+        );
+        self.local_map
+            .runtime_state()
+            .set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+        if let Err(error) =
+            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
+```
+
+crates/storage/src/cluster.rs (L885 to 901)
+  Note: Partially-applied metadata commands are intentionally left pending for retry. If the unguarded stream-create path allows that entry to be overwritten or removed, the retry state is lost.
+```
+    fn apply_pending_object_metadata_command_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), ObjectPgActionError> {
+        match self.apply_metadata_command_to_acting_set(command) {
+            Ok(()) => {
+                self.local_map
+                    .runtime_state()
+                    .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                self.after_object_metadata_command_applied(command);
+                Ok(())
+            }
+            Err(error) => Err(bucket_snapshot_error_to_object_pg_action_error(
+                error.source,
+            )),
+```
+
+crates/storage/src/cluster/local.rs (L270 to 283)
+  Note: The pending command slot is a single HashMap entry per PG and bucket; insert overwrites an existing command in release builds because the collision check is only a debug_assert.
+```
+    pub(crate) fn set_pending_metadata_command_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: MetadataCommandEnvelope,
+    ) {
+        let previous = self
+            .pending_metadata_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((pg_id, bucket.clone()), command);
+        debug_assert!(
+            previous.is_none(),
+            "bucket metadata command stream already has a pending command"
+```
+
+crates/storage/src/cluster/request_ops.rs (L3307 to 3345)
+  Note: The request-oriented stream PUT creation path has the same unguarded pending-command publication after authorization/reservation.
+```
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        primary_node.with_bucket_write_reservation_snapshot(bucket, request, |snapshot| {
+            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let existing_object = match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
+                Ok(StoredObject::Live(record)) => Some(StoredObject::Live(record)),
+                Ok(StoredObject::DeleteMarker(_)) | Err(MetadataError::ObjectNotFound) => None,
+                Err(error) => return Err(error.into()),
+            };
+            drop(object_pg);
+
+            let (value, create) = match action(snapshot, existing_object) {
+                Ok(prepared) => prepared,
+                Err(error) => return Ok(Err(error)),
+            };
+            if self
+                .matching_stream_upload_exists(pg_id, &create)
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
+            {
+                return Ok(Ok(value));
+            }
+            self.reserve_put_object_generation(bucket, key, &create.session_id)
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+
+            let command = MetadataCommandEnvelope::new(
+                self.next_object_metadata_command_id(pg_id),
+                MetadataCommandPayload::CreateStreamUpload(Box::new(CreateStreamUploadCommand {
+                    request: create.clone(),
+                    created_at_millis: crate::clock::current_time_millis(),
+                })),
+            );
+            self.local_map
+                .runtime_state()
+                .set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            if let Err(error) =
+                self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
+            {
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Kept at medium. Static evidence and the validation PoC support a real release-build overwrite bug in the core storage runtime: the pending command map overwrites by (PgId, BucketName), while stream-create paths publish pending CreateStreamUpload commands without bucket-level serialization, and partial apply retry logic relies on the pending entry surviving. Reachability is through the in-scope S3 PutObject API, including authenticated writers and public-write buckets. However, the attack is high-complexity and primarily affects integrity/availability rather than confidentiality or identity: it requires concurrent same-bucket/PG writes and usually a partial metadata apply failure, and it does not demonstrate auth bypass, RCE, credential exposure, or broad cross-boundary compromise. That supports medium rather than high/critical.
+## Likelihood
+high - The vulnerable code is reachable from the normal network PutObject path, but exploitation requires write permission or a public-write bucket, concurrent operations landing on the same bucket/object-metadata PG, and typically a transient partial metadata apply failure. These preconditions make reliable exploitation non-trivial. | Remote network vector
+## Impact
+medium - Successful exploitation can lose pending metadata-command retry state after a partial replicated apply, potentially causing durable object metadata divergence, leaked generation reservations, and failed or inconsistent stream upload finalization/abort/write behavior. The impact is serious for integrity and availability of stored object metadata, but it is scoped to buckets/PGs the attacker can write and does not directly expose secrets or bypass authentication.
+## Assumptions
+- Production/release builds disable debug_assert, so the pending-command collision check does not stop overwrites.
+- An attacker can issue PutObject requests to a bucket they are authorized to write, or to a public-write bucket if one is configured.
+- Reliable exploitation requires concurrent streaming/large PutObject operations targeting the same bucket/object-metadata placement group and, for the most durable inconsistency scenario, a partial metadata-command apply failure or transient node/store error.
+- Repository artifacts show a local S3-compatible server; no cloud APIs or external deployment state were queried.
+- argmin-s3 runtime exposed on its configured TCP listener
+- valid SigV4 credentials with PutObject permission or bucket configuration allowing public write
+- streaming/large PutObject path that creates a stream upload session
+- concurrent same-bucket/same-PG metadata commands
+- partial metadata apply failure or very tight set/apply race for strongest impact
+## Path
+Remote PutObject client -> HTTP listener -> SigV4/public-write authz -> streaming PutObject session -> pending_metadata_commands[(PG,bucket)] -> replicated apply retry -> lost retry state / metadata divergence
+## Path evidence
+- `crates/storage/src/cluster/local.rs:270-284` - set_pending_metadata_command_for_bucket inserts into pending_metadata_commands keyed by (pg_id, bucket) and only debug_asserts that no previous command existed, so release builds can overwrite.
+- `crates/storage/src/cluster.rs:1596-1627` - create_put_object_stream_session_record drains pending commands, reserves a generation, then publishes a CreateStreamUpload pending command before applying it.
+- `crates/storage/src/cluster/request_ops.rs:3297-3345` - request-oriented create_put_object_stream_session follows the same drain/check/reserve/set/apply pattern for CreateStreamUpload.
+- `crates/storage/src/cluster.rs:885-903` - apply_pending_object_metadata_command_for_bucket removes pending state only after successful apply, showing failed pending commands are intended to remain available for retry.
+- `crates/storage/src/cluster/request_ops.rs:2119-2128` - new-command apply errors remove pending state only when applied_nodes == 0, confirming partial apply depends on retained pending retry state.
+- `crates/server-core/src/coordinator/put.rs:325-370` - normal coordinator streaming PutObject setup calls create_put_object_stream_session and builds a CreateStreamUploadReq.
+- `crates/server-http/src/http/mod.rs:1499-1528` - HTTP S3 PutObject dispatch constructs a PutObjectRequest from attacker-controlled request fields and sends it to the coordinator.
+- `crates/server-core/src/coordinator/authz.rs:1360-1395` - PutObject authorization allows writes based on owner/admin, ACL permissions, effective public write, and bucket policy, establishing required write-auth preconditions.
+- `crates/argmin-s3/src/config.rs:31-70` - runtime configuration uses environment credentials and defaults ARGMIN_LISTEN_ADDR to 127.0.0.1:9000, with listener exposure operator-configurable.
+- `crates/argmin-s3/src/main.rs:152-188` - main binds the configured TCP listener and starts the HTTP/TLS server for argmin-s3.
+## Narrative
+The finding is valid and in-scope. The HTTP PutObject path is a normal runtime API, and the coordinator's streaming PutObject flow reaches create_put_object_stream_session/create_put_object_stream_session_record. Those functions publish CreateStreamUpload commands into a runtime pending-command map after drain/check/reservation. The map is a single HashMap entry per (PgId, BucketName), and insertion overwrites in release builds because the only collision guard is debug_assert. Retry semantics depend on preserving the pending command when apply partially fails: pending commands are removed on success, and new-command errors remove only when applied_nodes == 0. Thus a concurrent same-bucket/PG operation can lose retry state and cause durable metadata consistency or availability failures. Severity remains medium: the issue is attacker-reachable through PutObject, but requires write authorization or public-write configuration plus a race and usually a transient partial apply failure; it does not provide auth bypass, data exfiltration, RCE, or cross-tenant compromise.
+## Controls
+- SigV4 request authentication for non-anonymous requests
+- Bucket ACL, bucket policy, ownership controls, and public access block authorization checks
+- Anonymous requests are represented but require public-write policy/ACL to write
+- Default listen address is 127.0.0.1:9000 unless ARGMIN_LISTEN_ADDR is changed
+- Connection and in-flight request limits are configurable
+- TLS is optional via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- debug_assert collision check exists only in debug builds and is not a production mitigation
+## Blindspots
+- No cloud, Kubernetes, or load-balancer manifests were present or queried, so actual public exposure cannot be proven from repository artifacts.
+- The validation PoC proved the release-build overwrite behavior using an internal unit-style trigger; an end-to-end HTTP race exploit was not run in this static attack-path stage.
+- The exact probability of partial metadata apply failure depends on runtime storage/node health and deployment topology, which are not knowable from the repository alone.
+- Default ARGMIN_LISTEN_ADDR is localhost, but operators can configure a public or internal network bind address.
