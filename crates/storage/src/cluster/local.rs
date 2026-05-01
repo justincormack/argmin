@@ -4447,6 +4447,142 @@ mod tests {
     }
 
     #[test]
+    fn existing_create_bucket_preserves_pending_acl_command_for_retry() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "partial-acl-create-exists-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let acl_grants = crate::AclGrants::default();
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let _hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::PutBucketAcl(acl)
+                        if acl.name == hook_bucket
+                            && node_id == NodeId::new(2)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected metadata command apply failure",
+                            source: std::io::Error::other(
+                                "injected metadata command apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .put_bucket_acl_and_load_info(&bucket, &acl_grants, true, false)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Store(StoreError::Io {
+                    context: "injected metadata command apply failure",
+                    ..
+                })
+            ),
+            "expected injected replica failure, got {err:?}"
+        );
+        assert!(!fail_once.load(Ordering::SeqCst));
+
+        let pending_before = map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(1), &bucket)
+            .expect("failed ACL command should remain pending");
+        assert!(matches!(
+            pending_before.payload(),
+            MetadataCommandPayload::PutBucketAcl(acl)
+                if acl.name == bucket && acl.public_read && !acl.public_write
+        ));
+        let partial_info = {
+            let applied_replica = map.node(NodeId::new(0)).unwrap().storage_node();
+            let pg = applied_replica.get_pg(1).unwrap();
+            crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap()
+        };
+        assert!(partial_info.public_read);
+        assert!(!partial_info.public_write);
+        let primary_info = {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = primary.get_pg(1).unwrap();
+            crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap()
+        };
+        assert!(!primary_info.public_read);
+        assert!(!primary_info.public_write);
+
+        let attacker_owner = crate::CanonicalUserId::from_principal("attacker");
+        let exists = cluster
+            .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+                name: bucket.as_str(),
+                owner_principal: "attacker",
+                owner_canonical_id: &attacker_owner,
+                acl_grants: &acl_grants,
+                public_read: false,
+                public_write: false,
+                versioning: crate::BucketVersioningState::Disabled,
+                object_lock: crate::BucketObjectLockConfig::default(),
+            })
+            .unwrap();
+        assert!(matches!(
+            exists,
+            crate::BucketCreateAttemptOutcome::Exists(info)
+                if info.owner_principal == "owner"
+                    && info.owner_canonical_id
+                        == crate::CanonicalUserId::from_principal("owner")
+        ));
+
+        let pending_after = map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(1), &bucket)
+            .expect("existing CreateBucket must not drop the pending ACL command");
+        assert_eq!(pending_after.id(), pending_before.id());
+        assert_eq!(pending_after.payload(), pending_before.payload());
+
+        let retried = cluster
+            .put_bucket_acl_and_load_info(&bucket, &acl_grants, true, false)
+            .unwrap();
+        assert!(retried.public_read);
+        assert!(!retried.public_write);
+        assert_eq!(
+            retried.bucket_execution_generation,
+            partial_info.bucket_execution_generation
+        );
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert!(info.public_read);
+            assert!(!info.public_write);
+            assert_eq!(
+                info.bucket_execution_generation,
+                partial_info.bucket_execution_generation
+            );
+        }
+    }
+
+    #[test]
     fn bucket_property_commands_apply_to_all_acting_pg_nodes() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

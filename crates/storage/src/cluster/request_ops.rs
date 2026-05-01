@@ -299,9 +299,6 @@ impl super::StorageCluster {
             let bucket_pg = primary_node.get_pg(pg_id)?;
             match PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket) {
                 Ok(info) => {
-                    self.local_map
-                        .runtime_state()
-                        .remove_pending_metadata_command_for_bucket(PgId::new(pg_id), &bucket);
                     return Ok(BucketCreateAttemptOutcome::Exists(info));
                 }
                 Err(MetadataError::BucketNotFound { .. }) => {}
