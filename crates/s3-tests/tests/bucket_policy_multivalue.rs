@@ -590,6 +590,306 @@ fn test_bucket_policy_request_object_tag_keys_for_any_value() {
 }
 
 #[test]
+fn test_bucket_policy_request_object_tag_keys_for_all_values_string_equals_ignore_case() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_policy(client).await;
+        let key = "request-object-tag-keys-for-all-ignore-case";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:PutObjectTagging",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "ForAllValues:StringEqualsIgnoreCase": {
+                                "s3:RequestObjectTagKeys": ["security", "team"]
+                            },
+                            "Null": {
+                                "s3:RequestObjectTagKeys": "false"
+                            }
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObjectTagging allowed when every request tag key matches ignoring case",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .tagging(tagging(vec![
+                        tag("SECURITY", "allow"),
+                        tag("TEAM", "storage"),
+                    ]))
+                    .send()
+            },
+        )
+        .await;
+        eventually_access_denied(
+            "PutObjectTagging denied when any request tag key does not match ignoring case",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .tagging(tagging(vec![
+                        tag("SECURITY", "allow"),
+                        tag("project", "argmin"),
+                    ]))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_request_object_tag_keys_for_any_value_string_equals_ignore_case() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_policy(client).await;
+        let key = "request-object-tag-keys-for-any-ignore-case";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:PutObjectTagging",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "ForAnyValue:StringEqualsIgnoreCase": {
+                                "s3:RequestObjectTagKeys": ["SECURITY"]
+                            }
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObjectTagging allowed when at least one request tag key matches ignoring case",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .tagging(tagging(vec![
+                        tag("security", "allow"),
+                        tag("project", "argmin"),
+                    ]))
+                    .send()
+            },
+        )
+        .await;
+        eventually_access_denied(
+            "PutObjectTagging denied when no request tag key matches ignoring case",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .tagging(tagging(vec![tag("project", "argmin")]))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_request_object_tag_keys_for_all_values_string_not_equals_ignore_case() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_policy(client).await;
+        let key = "request-object-tag-keys-for-all-not-ignore-case";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:PutObjectTagging",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "ForAllValues:StringNotEqualsIgnoreCase": {
+                                "s3:RequestObjectTagKeys": ["security"]
+                            },
+                            "Null": {
+                                "s3:RequestObjectTagKeys": "false"
+                            }
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObjectTagging allowed when every request tag key differs ignoring case",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .tagging(tagging(vec![
+                        tag("project", "argmin"),
+                        tag("team", "storage"),
+                    ]))
+                    .send()
+            },
+        )
+        .await;
+        eventually_access_denied(
+            "PutObjectTagging denied when any request tag key equals ignoring case",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .tagging(tagging(vec![
+                        tag("project", "argmin"),
+                        tag("SECURITY", "allow"),
+                    ]))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_request_object_tag_keys_for_any_value_string_not_equals_ignore_case() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_policy(client).await;
+        let key = "request-object-tag-keys-for-any-not-ignore-case";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:PutObjectTagging",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "ForAnyValue:StringNotEqualsIgnoreCase": {
+                                "s3:RequestObjectTagKeys": ["security"]
+                            }
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObjectTagging allowed when at least one request tag key differs ignoring case",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .tagging(tagging(vec![
+                        tag("security", "allow"),
+                        tag("project", "argmin"),
+                    ]))
+                    .send()
+            },
+        )
+        .await;
+        eventually_access_denied(
+            "PutObjectTagging denied when every request tag key equals ignoring case",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .tagging(tagging(vec![tag("SECURITY", "allow")]))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_tag_resource_tag_keys_for_all_values() {
     s3_tests::run(async {
         let client = CTX.client();

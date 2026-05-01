@@ -660,6 +660,26 @@ mod tests {
     }
 
     #[test]
+    fn string_equals_only_keys_do_not_accept_ignore_case_variants() {
+        let clause = PolicyConditionClause {
+            operator: "StringEqualsIgnoreCase".to_string(),
+            key: "s3:ExistingObjectTag/classification".to_string(),
+            values: vec!["public".to_string()],
+        };
+        assert!(!supports_clause_for_action(
+            &clause,
+            PolicyAction::GetObject
+        ));
+
+        let clause = PolicyConditionClause {
+            operator: "StringEqualsIgnoreCase".to_string(),
+            key: "s3:RequestObjectTag/classification".to_string(),
+            values: vec!["public".to_string()],
+        };
+        assert!(supports_clause_for_action(&clause, PolicyAction::PutObject));
+    }
+
+    #[test]
     fn lookup_multivalue_tag_keys_returns_exact_resolvers() {
         let (request_tag_keys, param) = lookup("s3:RequestObjectTagKeys").unwrap();
         assert_eq!(param, "");

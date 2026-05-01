@@ -34,7 +34,9 @@ pub(super) enum ActualValue<'a> {
 pub(super) enum ConditionOpKind {
     Bool,
     StringEquals,
+    StringEqualsIgnoreCase,
     StringNotEquals,
+    StringNotEqualsIgnoreCase,
     StringLike,
     StringNotLike,
     Null,
@@ -96,6 +98,30 @@ pub(super) const CONDITION_OPS: &[ConditionOpDef] = &[
         evaluable_on_evaluable_object_actions: true,
     },
     ConditionOpDef {
+        name: "StringEqualsIgnoreCase",
+        kind: ConditionOpKind::StringEqualsIgnoreCase,
+        evaluate: eval_string_equals_ignore_case,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "ForAllValues:StringEqualsIgnoreCase",
+        kind: ConditionOpKind::StringEqualsIgnoreCase,
+        evaluate: eval_for_all_values_string_equals_ignore_case,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "ForAnyValue:StringEqualsIgnoreCase",
+        kind: ConditionOpKind::StringEqualsIgnoreCase,
+        evaluate: eval_for_any_value_string_equals_ignore_case,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "StringEqualsIgnoreCaseIfExists",
+        kind: ConditionOpKind::StringEqualsIgnoreCase,
+        evaluate: eval_string_equals_ignore_case_if_exists,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
         name: "StringNotEquals",
         kind: ConditionOpKind::StringNotEquals,
         evaluate: eval_string_not_equals,
@@ -107,6 +133,32 @@ pub(super) const CONDITION_OPS: &[ConditionOpDef] = &[
         // StringNotEquals already treats Absent as Matches, so the IfExists
         // variant shares the same evaluator.
         evaluate: eval_string_not_equals,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "StringNotEqualsIgnoreCase",
+        kind: ConditionOpKind::StringNotEqualsIgnoreCase,
+        evaluate: eval_string_not_equals_ignore_case,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "ForAllValues:StringNotEqualsIgnoreCase",
+        kind: ConditionOpKind::StringNotEqualsIgnoreCase,
+        evaluate: eval_for_all_values_string_not_equals_ignore_case,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "ForAnyValue:StringNotEqualsIgnoreCase",
+        kind: ConditionOpKind::StringNotEqualsIgnoreCase,
+        evaluate: eval_for_any_value_string_not_equals_ignore_case,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "StringNotEqualsIgnoreCaseIfExists",
+        kind: ConditionOpKind::StringNotEqualsIgnoreCase,
+        // StringNotEqualsIgnoreCase already treats Absent as Matches, so
+        // the IfExists variant shares the same evaluator.
+        evaluate: eval_string_not_equals_ignore_case,
         evaluable_on_evaluable_object_actions: true,
     },
     ConditionOpDef {
@@ -257,6 +309,98 @@ fn eval_string_equals_if_exists(
     }
 }
 
+fn eval_string_equals_ignore_case(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands
+                .iter()
+                .any(|expected| expected.eq_ignore_ascii_case(actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(_) => ConditionMatchResult::NoMatch,
+        ActualValue::Absent => ConditionMatchResult::NoMatch,
+    }
+}
+
+fn eval_for_all_values_string_equals_ignore_case(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands
+                .iter()
+                .any(|expected| expected.eq_ignore_ascii_case(actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(actuals) => {
+            if actuals.iter().all(|actual| {
+                operands
+                    .iter()
+                    .any(|expected| expected.eq_ignore_ascii_case(actual))
+            }) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::Absent => ConditionMatchResult::Matches,
+    }
+}
+
+fn eval_for_any_value_string_equals_ignore_case(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands
+                .iter()
+                .any(|expected| expected.eq_ignore_ascii_case(actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(actuals) => {
+            if actuals.iter().any(|actual| {
+                operands
+                    .iter()
+                    .any(|expected| expected.eq_ignore_ascii_case(actual))
+            }) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::Absent => ConditionMatchResult::NoMatch,
+    }
+}
+
+fn eval_string_equals_ignore_case_if_exists(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(_) | ActualValue::PresentValues(_) => {
+            eval_string_equals_ignore_case(operands, actual)
+        }
+        ActualValue::Absent => ConditionMatchResult::Matches,
+    }
+}
+
 fn eval_string_not_equals(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
     match actual {
         ActualValue::Present(actual) => {
@@ -268,6 +412,86 @@ fn eval_string_not_equals(operands: &[String], actual: ActualValue<'_>) -> Condi
         }
         ActualValue::PresentValues(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
+    }
+}
+
+fn eval_string_not_equals_ignore_case(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands
+                .iter()
+                .all(|expected| !expected.eq_ignore_ascii_case(actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(_) => ConditionMatchResult::NoMatch,
+        ActualValue::Absent => ConditionMatchResult::Matches,
+    }
+}
+
+fn eval_for_all_values_string_not_equals_ignore_case(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands
+                .iter()
+                .all(|expected| !expected.eq_ignore_ascii_case(actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(actuals) => {
+            if actuals.iter().all(|actual| {
+                operands
+                    .iter()
+                    .all(|expected| !expected.eq_ignore_ascii_case(actual))
+            }) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::Absent => ConditionMatchResult::Matches,
+    }
+}
+
+fn eval_for_any_value_string_not_equals_ignore_case(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands
+                .iter()
+                .all(|expected| !expected.eq_ignore_ascii_case(actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(actuals) => {
+            if actuals.iter().any(|actual| {
+                operands
+                    .iter()
+                    .all(|expected| !expected.eq_ignore_ascii_case(actual))
+            }) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
 
@@ -437,6 +661,33 @@ mod tests {
     }
 
     #[test]
+    fn string_equals_ignore_case_present_value() {
+        let op = lookup("StringEqualsIgnoreCase").unwrap();
+        assert_eq!(op.kind, ConditionOpKind::StringEqualsIgnoreCase);
+        let expected = operands(&["allow", "VALUE"]);
+        assert_eq!(
+            (op.evaluate)(&expected, present("value")),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present("deny")),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn string_equals_ignore_case_does_not_match_multivalue_context() {
+        let op = lookup("StringEqualsIgnoreCase").unwrap();
+        assert_eq!(
+            (op.evaluate)(
+                &operands(&["security", "team"]),
+                present_values(&["SECURITY"])
+            ),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
     fn for_all_values_string_equals_requires_every_actual_value_to_match() {
         let op = lookup("ForAllValues:StringEquals").unwrap();
         let expected = operands(&["security", "team"]);
@@ -481,9 +732,70 @@ mod tests {
     }
 
     #[test]
+    fn for_all_values_string_equals_ignore_case_requires_every_actual_value_to_match() {
+        let op = lookup("ForAllValues:StringEqualsIgnoreCase").unwrap();
+        assert_eq!(op.kind, ConditionOpKind::StringEqualsIgnoreCase);
+        let expected = operands(&["security", "TEAM"]);
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["SECURITY"])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["SECURITY", "team"])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["SECURITY", "project"])),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&[])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, ActualValue::Absent),
+            ConditionMatchResult::Matches
+        );
+    }
+
+    #[test]
+    fn for_any_value_string_equals_ignore_case_requires_at_least_one_actual_value_to_match() {
+        let op = lookup("ForAnyValue:StringEqualsIgnoreCase").unwrap();
+        assert_eq!(op.kind, ConditionOpKind::StringEqualsIgnoreCase);
+        let expected = operands(&["SECURITY"]);
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["security", "project"])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["project"])),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, ActualValue::Absent),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
     fn string_equals_absent_is_no_match_but_if_exists_is_match() {
         let base = lookup("StringEquals").unwrap();
         let if_exists = lookup("StringEqualsIfExists").unwrap();
+        let expected = operands(&["value"]);
+        assert_eq!(
+            (base.evaluate)(&expected, ActualValue::Absent),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (if_exists.evaluate)(&expected, ActualValue::Absent),
+            ConditionMatchResult::Matches
+        );
+    }
+
+    #[test]
+    fn string_equals_ignore_case_absent_is_no_match_but_if_exists_is_match() {
+        let base = lookup("StringEqualsIgnoreCase").unwrap();
+        let if_exists = lookup("StringEqualsIgnoreCaseIfExists").unwrap();
         let expected = operands(&["value"]);
         assert_eq!(
             (base.evaluate)(&expected, ActualValue::Absent),
@@ -520,6 +832,82 @@ mod tests {
         );
         assert_eq!(
             (op.evaluate)(&expected, present("a")),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn string_not_equals_ignore_case_absent_matches_regardless_of_if_exists() {
+        let base = lookup("StringNotEqualsIgnoreCase").unwrap();
+        let if_exists = lookup("StringNotEqualsIgnoreCaseIfExists").unwrap();
+        let expected = operands(&["value"]);
+        assert_eq!(
+            (base.evaluate)(&expected, ActualValue::Absent),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (if_exists.evaluate)(&expected, ActualValue::Absent),
+            ConditionMatchResult::Matches
+        );
+    }
+
+    #[test]
+    fn string_not_equals_ignore_case_present_matches_only_when_all_differ() {
+        let op = lookup("StringNotEqualsIgnoreCase").unwrap();
+        assert_eq!(op.kind, ConditionOpKind::StringNotEqualsIgnoreCase);
+        let expected = operands(&["a", "B"]);
+        assert_eq!(
+            (op.evaluate)(&expected, present("c")),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present("b")),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn for_all_values_string_not_equals_ignore_case_requires_every_actual_value_to_differ() {
+        let op = lookup("ForAllValues:StringNotEqualsIgnoreCase").unwrap();
+        assert_eq!(op.kind, ConditionOpKind::StringNotEqualsIgnoreCase);
+        let expected = operands(&["security", "TEAM"]);
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["project"])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["project", "owner"])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["project", "team"])),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&[])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, ActualValue::Absent),
+            ConditionMatchResult::Matches
+        );
+    }
+
+    #[test]
+    fn for_any_value_string_not_equals_ignore_case_requires_one_actual_value_to_differ() {
+        let op = lookup("ForAnyValue:StringNotEqualsIgnoreCase").unwrap();
+        assert_eq!(op.kind, ConditionOpKind::StringNotEqualsIgnoreCase);
+        let expected = operands(&["SECURITY"]);
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["security", "project"])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["security"])),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, ActualValue::Absent),
             ConditionMatchResult::NoMatch
         );
     }

@@ -2194,6 +2194,45 @@ mod tests {
     }
 
     #[test]
+    fn request_object_tag_ignore_case_condition_matches() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEqualsIgnoreCase":{"s3:RequestObjectTag/security":"public"}}},{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEqualsIgnoreCase":{"s3:RequestObjectTag/classification":"internal"}}}]}"#,
+        )
+        .unwrap();
+        let request_tags = [
+            PolicyTag::new("security", "PUBLIC"),
+            PolicyTag::new("classification", "Internal"),
+        ];
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_request_object_tags(&request_tags);
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+
+        let request_tags = [
+            PolicyTag::new("security", "PUBLIC"),
+            PolicyTag::new("classification", "external"),
+        ];
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_request_object_tags(&request_tags);
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
+    }
+
+    #[test]
     fn request_object_tag_null_condition_matches_missing_tag() {
         let policy = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"s3:RequestObjectTag/security":"true"}}}]}"#,
