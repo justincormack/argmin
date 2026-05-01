@@ -423,7 +423,13 @@ impl super::StorageCluster {
                 command_id,
                 MetadataCommandPayload::CreateBucket(command),
             );
-            runtime_state.set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone());
+            self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                &bucket,
+                &command,
+                "conflicting pending command for create bucket",
+            )
+            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
             (command, true)
         };
         self.apply_pending_metadata_command_to_acting_set(
@@ -905,7 +911,13 @@ impl super::StorageCluster {
                     bucket_execution_generation,
                 )),
             );
-            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                bucket,
+                &command,
+                "conflicting pending command for bucket versioning",
+            )
+            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
             (command, true)
         };
         self.apply_pending_metadata_command_to_acting_set(
@@ -1084,7 +1096,13 @@ impl super::StorageCluster {
                     bucket_execution_generation,
                 )),
             );
-            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                bucket,
+                &command,
+                "conflicting pending command for bucket ACL",
+            )
+            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
             (command, true)
         };
         self.apply_pending_metadata_command_to_acting_set(
@@ -1184,7 +1202,13 @@ impl super::StorageCluster {
                     bucket_execution_generation,
                 )),
             );
-            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                bucket,
+                &command,
+                "conflicting pending command for bucket property",
+            )
+            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
             (command, true)
         };
         self.apply_pending_metadata_command_to_acting_set(
@@ -1309,7 +1333,13 @@ impl super::StorageCluster {
                     bucket_execution_generation,
                 )),
             );
-            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                bucket,
+                &command,
+                "conflicting pending command for bucket subresource",
+            )
+            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
             (command, true)
         };
         self.apply_pending_metadata_command_to_acting_set(
@@ -1977,7 +2007,12 @@ impl super::StorageCluster {
             let command =
                 self.new_put_object_metadata_command(pg_id, bucket, key, version_id, mutation);
             drop(object_pg);
-            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                bucket,
+                &command,
+                "conflicting pending command for object metadata mutation",
+            )?;
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             return Ok(Ok(value));
         }
@@ -2345,7 +2380,12 @@ impl super::StorageCluster {
             let command =
                 self.new_delete_object_version_command(pg_id, bucket, key, version_id, target);
             drop(object_pg);
-            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                bucket,
+                &command,
+                "conflicting pending command for object version delete",
+            )?;
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() else {
                 unreachable!("new delete object command changed payload kind");
@@ -2437,7 +2477,12 @@ impl super::StorageCluster {
                 target,
             );
             drop(object_pg);
-            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                bucket,
+                &command,
+                "conflicting pending command for current object delete",
+            )?;
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() else {
                 unreachable!("new delete object command changed payload kind");
@@ -2518,7 +2563,12 @@ impl super::StorageCluster {
                 },
             )?;
             drop(object_pg);
-            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                bucket,
+                &command,
+                "conflicting pending command for delete marker insertion",
+            )?;
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             return Ok(Ok(InsertCurrentDeleteMarkerOutcome {
                 value,
@@ -2750,7 +2800,12 @@ impl super::StorageCluster {
                 }
             };
             drop(object_pg);
-            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                bucket,
+                &command,
+                "conflicting pending command for lifecycle current object expiry",
+            )?;
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             return Ok(Ok(Some(ExpireCurrentObjectOutcome {
                 reclaim_generation_id,
@@ -2877,11 +2932,12 @@ impl super::StorageCluster {
             drop(object_pg);
 
             for command in commands {
-                runtime_state.set_pending_metadata_command_for_bucket(
+                self.set_pending_metadata_command_for_bucket(
                     pg_id,
                     bucket,
-                    command.clone(),
-                );
+                    &command,
+                    "conflicting pending command for lifecycle noncurrent object expiry",
+                )?;
                 self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             }
             return Ok(Ok(reclaimed_generation_ids));
@@ -2985,7 +3041,12 @@ impl super::StorageCluster {
                 DeleteObjectVersionTarget::DeleteMarker,
             );
             drop(object_pg);
-            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                bucket,
+                &command,
+                "conflicting pending command for expired delete marker removal",
+            )?;
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             return Ok(Ok(true));
         }
@@ -3360,9 +3421,26 @@ impl super::StorageCluster {
                     created_at_millis: crate::clock::current_time_millis(),
                 })),
             );
-            self.local_map
-                .runtime_state()
-                .set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            if let Err(error) = self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                bucket,
+                &command,
+                "conflicting pending command for stream upload creation",
+            ) {
+                let cleanup = self
+                    .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+                    .and_then(|_| {
+                        self.release_object_generation_reservation(bucket, key, &create.session_id)
+                    });
+                if let Err(cleanup_error) = cleanup {
+                    return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                        cleanup_error,
+                    ));
+                }
+                return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                    error,
+                ));
+            }
             if let Err(error) =
                 self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
             {
@@ -3547,7 +3625,12 @@ impl super::StorageCluster {
                     },
                 )),
             );
-            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                bucket,
+                &command,
+                "conflicting pending command for stream PUT finalization",
+            )?;
             (command, true)
         };
         drop(object_pg);
@@ -3629,9 +3712,13 @@ impl super::StorageCluster {
                     },
                 )),
             );
-            self.local_map
-                .runtime_state()
-                .set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                bucket,
+                &command,
+                "conflicting pending command for multipart upload creation",
+            )
+            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
             if let Err(error) =
                 self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
             {
@@ -4110,7 +4197,12 @@ impl super::StorageCluster {
                 stale_payload: stale_payload_command,
             })),
         );
-        runtime_state.set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone());
+        self.set_pending_metadata_command_for_bucket(
+            pg_id,
+            &bucket,
+            &command,
+            "conflicting pending command for multipart completion",
+        )?;
         self.apply_multipart_completion_command(pg_id, &bucket, &command)?;
 
         let MetadataCommandPayload::CommitMultipartObject(commit) = command.payload() else {
@@ -4242,7 +4334,12 @@ impl super::StorageCluster {
         let MetadataCommandPayload::AbortMultipartUpload(_) = command.payload() else {
             unreachable!("prepared abort multipart command changed payload kind");
         };
-        runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+        self.set_pending_metadata_command_for_bucket(
+            pg_id,
+            bucket,
+            &command,
+            "conflicting pending command for multipart abort",
+        )?;
         self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
         Ok(true)
     }

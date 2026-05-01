@@ -541,6 +541,19 @@ impl StorageCluster {
         self.single_node.as_ref()
     }
 
+    fn set_pending_metadata_command_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        context: &'static str,
+    ) -> Result<(), ObjectPgActionError> {
+        self.local_map
+            .runtime_state()
+            .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
+            .map_err(|_| conflicting_pending_object_metadata_command(context))
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     fn metadata_primary_test_hook_node(&self) -> &SharedStorageNode {
         self.metadata_primary_bridge_node()
@@ -877,7 +890,12 @@ impl StorageCluster {
                     ),
                 ),
             );
-            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                bucket,
+                &command,
+                "conflicting pending command for object generation reservation",
+            )?;
             match self.apply_metadata_command_to_acting_set(&command) {
                 Ok(()) => {
                     self.local_map
@@ -1121,7 +1139,12 @@ impl StorageCluster {
                 reservation_id.clone(),
             )),
         );
-        runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+        self.set_pending_metadata_command_for_bucket(
+            pg_id,
+            bucket,
+            &command,
+            "conflicting pending command for abandoned object generation reservation release",
+        )?;
         match self.apply_metadata_command_to_acting_set(&command) {
             Ok(()) => {
                 runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
@@ -1131,6 +1154,18 @@ impl StorageCluster {
                 error.source,
             )),
         }
+    }
+
+    fn release_object_generation_reservation_after_pending_drain_best_effort(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) {
+        let _ = self
+            .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+            .and_then(|_| self.release_object_generation_reservation(bucket, key, reservation_id));
     }
 
     pub fn release_object_generation_reservation(
@@ -1174,7 +1209,12 @@ impl StorageCluster {
                     ),
                 ),
             );
-            runtime_state.set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                bucket,
+                &command,
+                "conflicting pending command for object generation reservation release",
+            )?;
             (command, true)
         };
         match self.apply_metadata_command_to_acting_set(&command) {
@@ -1253,7 +1293,8 @@ impl StorageCluster {
                 Ok(Err(error)) => {
                     drop(object_pg);
                     drop(_bucket_guard);
-                    let _ = self.release_object_generation_reservation(
+                    self.release_object_generation_reservation_after_pending_drain_best_effort(
+                        pg_id,
                         &req.bucket,
                         &req.key,
                         &req.generation_reservation_id,
@@ -1270,7 +1311,8 @@ impl StorageCluster {
                 Err(error) => {
                     drop(object_pg);
                     drop(_bucket_guard);
-                    let _ = self.release_object_generation_reservation(
+                    self.release_object_generation_reservation_after_pending_drain_best_effort(
+                        pg_id,
                         &req.bucket,
                         &req.key,
                         &req.generation_reservation_id,
@@ -1292,7 +1334,8 @@ impl StorageCluster {
         if let Err(error) = self.register_payload_shard_acks(req.data_pg_id, &shard_batch) {
             if new_pending_command {
                 drop(_bucket_guard);
-                let _ = self.release_object_generation_reservation(
+                self.release_object_generation_reservation_after_pending_drain_best_effort(
+                    pg_id,
                     &req.bucket,
                     &req.key,
                     &req.generation_reservation_id,
@@ -1308,11 +1351,28 @@ impl StorageCluster {
             return Err(error);
         }
         if new_pending_command {
-            runtime_state.set_pending_metadata_command_for_bucket(
+            if let Err(error) = self.set_pending_metadata_command_for_bucket(
                 pg_id,
                 &req.bucket,
-                command.clone(),
-            );
+                &command,
+                "conflicting pending command for direct PUT object commit",
+            ) {
+                drop(_bucket_guard);
+                self.release_object_generation_reservation_after_pending_drain_best_effort(
+                    pg_id,
+                    &req.bucket,
+                    &req.key,
+                    &req.generation_reservation_id,
+                );
+                self.delete_direct_put_segment_payload_shards(
+                    req.data_pg_id,
+                    req.ec,
+                    &req.segment_okh,
+                    req.segment_vid,
+                    written_shards,
+                );
+                return Err(error);
+            }
         }
 
         if let Err(error) = self.apply_metadata_command_to_acting_set(&command) {
@@ -1321,7 +1381,8 @@ impl StorageCluster {
                     .runtime_state()
                     .remove_pending_metadata_command_for_bucket(pg_id, &req.bucket);
                 drop(_bucket_guard);
-                let _ = self.release_object_generation_reservation(
+                self.release_object_generation_reservation_after_pending_drain_best_effort(
+                    pg_id,
                     &req.bucket,
                     &req.key,
                     &req.generation_reservation_id,
@@ -1654,35 +1715,51 @@ impl StorageCluster {
             target: StreamUploadTarget::PutObject,
             encryption,
         };
-        self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
-        if self.matching_stream_upload_exists(pg_id, &request)? {
+        loop {
+            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+            if self.matching_stream_upload_exists(pg_id, &request)? {
+                return Ok(());
+            }
+            self.reserve_put_object_generation(bucket, key, session_id)?;
+            let command = MetadataCommandEnvelope::new(
+                self.next_object_metadata_command_id(pg_id),
+                MetadataCommandPayload::CreateStreamUpload(Box::new(CreateStreamUploadCommand {
+                    request: request.clone(),
+                    created_at_millis: crate::clock::current_time_millis(),
+                })),
+            );
+            if self
+                .set_pending_metadata_command_for_bucket(
+                    pg_id,
+                    bucket,
+                    &command,
+                    "conflicting pending command for stream upload creation",
+                )
+                .is_err()
+            {
+                let cleanup = self
+                    .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+                    .and_then(|_| {
+                        self.release_object_generation_reservation(bucket, key, session_id)
+                    });
+                cleanup?;
+                continue;
+            }
+            if let Err(error) =
+                self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
+            {
+                if self
+                    .local_map
+                    .runtime_state()
+                    .pending_metadata_command_for_bucket(pg_id, bucket)
+                    .is_none()
+                {
+                    let _ = self.release_object_generation_reservation(bucket, key, session_id);
+                }
+                return Err(error);
+            }
             return Ok(());
         }
-        self.reserve_put_object_generation(bucket, key, session_id)?;
-        let command = MetadataCommandEnvelope::new(
-            self.next_object_metadata_command_id(pg_id),
-            MetadataCommandPayload::CreateStreamUpload(Box::new(CreateStreamUploadCommand {
-                request,
-                created_at_millis: crate::clock::current_time_millis(),
-            })),
-        );
-        self.local_map
-            .runtime_state()
-            .set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
-        if let Err(error) =
-            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
-        {
-            if self
-                .local_map
-                .runtime_state()
-                .pending_metadata_command_for_bucket(pg_id, bucket)
-                .is_none()
-            {
-                let _ = self.release_object_generation_reservation(bucket, key, session_id);
-            }
-            return Err(error);
-        }
-        Ok(())
     }
 
     pub fn load_stream_upload_session(
@@ -1867,9 +1944,24 @@ impl StorageCluster {
                     segment: segment_record.clone(),
                 })),
             );
-            self.local_map
-                .runtime_state()
-                .set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            if let Err(error) = self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                bucket,
+                &command,
+                "conflicting pending command for stream segment append",
+            ) {
+                self.delete_payload_shard_keys_best_effort(
+                    segment_record.data_pg_id,
+                    EcShape {
+                        k: segment_record.ec_k,
+                        m: segment_record.ec_m,
+                    },
+                    &segment_record.segment_okh,
+                    segment_record.segment_vid,
+                    shard_batch.iter().map(|(key, _)| (*key).clone()),
+                );
+                return Err(error);
+            }
             return self.apply_new_stream_append_command(
                 pg_id,
                 bucket,
@@ -1966,9 +2058,12 @@ impl StorageCluster {
                     staged_segments,
                 })),
             );
-            self.local_map
-                .runtime_state()
-                .set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone());
+            self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                bucket,
+                &command,
+                "conflicting pending command for stream upload abort",
+            )?;
             return self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command);
         }
         drop(object_pg);

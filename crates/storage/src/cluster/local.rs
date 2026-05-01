@@ -225,6 +225,9 @@ struct LocalReclaimQueueState {
     queued_bucket_deletes: HashSet<BucketName>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingMetadataCommandConflict;
+
 impl LocalClusterRuntimeState {
     fn new() -> Self {
         Self {
@@ -267,21 +270,23 @@ impl LocalClusterRuntimeState {
             .cloned()
     }
 
-    pub(crate) fn set_pending_metadata_command_for_bucket(
+    pub(crate) fn try_set_pending_metadata_command_for_bucket(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
         command: MetadataCommandEnvelope,
-    ) {
-        let previous = self
+    ) -> Result<(), PendingMetadataCommandConflict> {
+        let mut pending_commands = self
             .pending_metadata_commands
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert((pg_id, bucket.clone()), command);
-        debug_assert!(
-            previous.is_none(),
-            "bucket metadata command stream already has a pending command"
-        );
+            .unwrap_or_else(|e| e.into_inner());
+        match pending_commands.entry((pg_id, bucket.clone())) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(command);
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(_) => Err(PendingMetadataCommandConflict),
+        }
     }
 
     pub(crate) fn remove_pending_metadata_command_for_bucket(
@@ -3765,6 +3770,115 @@ mod tests {
     }
 
     #[test]
+    fn stream_put_create_drains_unrelated_pending_create_before_new_session() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let first_session_id = crate::SessionId::try_from("37".repeat(16)).unwrap();
+        let second_session_id = crate::SessionId::try_from("38".repeat(16)).unwrap();
+        let first_create = crate::CreateStreamUploadReq {
+            session_id: first_session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: crate::StreamUploadTarget::PutObject,
+            encryption: crate::ObjectEncryption::None,
+        };
+        let second_create = crate::CreateStreamUploadReq {
+            session_id: second_session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: crate::StreamUploadTarget::PutObject,
+            encryption: crate::ObjectEncryption::None,
+        };
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_session_id = first_session_id.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::CreateStreamUpload(create)
+                        if create.request.session_id == hook_session_id
+                            && node_id == NodeId::new(1)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected stream create metadata command apply failure",
+                            source: std::io::Error::other(
+                                "injected stream create metadata command apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        cluster
+            .create_put_object_stream_session(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), first_create.clone()))
+                },
+            )
+            .unwrap_err();
+        drop(hook_guard);
+
+        assert!(
+            map.runtime_state()
+                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+                .is_some(),
+            "partial first stream create command must remain pending"
+        );
+
+        let value = cluster
+            .create_put_object_stream_session(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>((9_u8, second_create.clone()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(value, 9);
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            crate::PgMetadataStore::get_stream_upload(&*pg, &first_session_id).unwrap();
+            crate::PgMetadataStore::get_stream_upload(&*pg, &second_session_id).unwrap();
+        }
+    }
+
+    #[test]
     fn stream_abort_missing_session_does_not_succeed_after_unrelated_pending_command() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -3806,7 +3920,8 @@ mod tests {
             )),
         );
         map.runtime_state()
-            .set_pending_metadata_command_for_bucket(pg_id, &bucket, command);
+            .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command)
+            .unwrap();
 
         let error = cluster
             .abort_stream_upload_session(&bucket, &key, &missing_session_id)
@@ -3833,6 +3948,50 @@ mod tests {
             assert_eq!(session.bucket, bucket);
             assert_eq!(session.key, key);
         }
+    }
+
+    #[test]
+    fn pending_metadata_command_insert_rejects_existing_without_overwrite() {
+        let runtime_state = LocalClusterRuntimeState::new();
+        let pg_id = PgId::new(3);
+        let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+        let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+        let session_one = crate::SessionId::try_from("41".repeat(16)).unwrap();
+        let session_two = crate::SessionId::try_from("42".repeat(16)).unwrap();
+
+        let make_release_command = |session_id: crate::SessionId| {
+            let command_id = crate::metadata_command::MetadataCommandId::new(
+                crate::ClusterEpoch::INITIAL,
+                pg_id,
+                runtime_state.next_metadata_command_log_index(pg_id),
+            );
+            MetadataCommandEnvelope::new(
+                command_id,
+                MetadataCommandPayload::ReleaseObjectGeneration(
+                    crate::metadata_command::ReleaseObjectGenerationCommand::new(
+                        bucket.clone(),
+                        key.clone(),
+                        session_id,
+                    ),
+                ),
+            )
+        };
+        let command_one = make_release_command(session_one);
+        let command_two = make_release_command(session_two);
+
+        runtime_state
+            .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command_one.clone())
+            .unwrap();
+        let result =
+            runtime_state.try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command_two);
+
+        assert_eq!(result, Err(PendingMetadataCommandConflict));
+        assert_eq!(
+            runtime_state
+                .pending_metadata_command_for_bucket(pg_id, &bucket)
+                .unwrap(),
+            command_one
+        );
     }
 
     #[test]
