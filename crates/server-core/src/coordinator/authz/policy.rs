@@ -170,7 +170,10 @@ pub(super) fn evaluate_bucket_policy_for_object_request(
         .with_grant_write(context.policy_context.grant_write)
         .with_grant_read_acp(context.policy_context.grant_read_acp)
         .with_grant_write_acp(context.policy_context.grant_write_acp)
-        .with_grant_full_control(context.policy_context.grant_full_control);
+        .with_grant_full_control(context.policy_context.grant_full_control)
+        .with_if_match(context.policy_context.if_match)
+        .with_if_none_match(context.policy_context.if_none_match)
+        .with_object_creation_operation(context.policy_context.object_creation_operation);
     Ok(context.policy.evaluate(&policy_request))
 }
 
@@ -204,7 +207,26 @@ pub(super) fn bucket_policy_decision_for_key(
         } else {
             auth::bucket_policy::BucketTags::Unavailable
         },
-    );
+    )
+    .with_request_object_tags(&[])
+    .with_copy_source(request.policy_context.copy_source)
+    .with_metadata_directive(request.policy_context.metadata_directive)
+    .with_canned_acl(request.policy_context.canned_acl)
+    .with_server_side_encryption(
+        request
+            .policy_context
+            .managed_encryption
+            .map(ManagedEncryptionAlgorithm::as_str),
+    )
+    .with_sse_customer_algorithm(request.policy_context.sse_customer_algorithm)
+    .with_grant_read(request.policy_context.grant_read)
+    .with_grant_write(request.policy_context.grant_write)
+    .with_grant_read_acp(request.policy_context.grant_read_acp)
+    .with_grant_write_acp(request.policy_context.grant_write_acp)
+    .with_grant_full_control(request.policy_context.grant_full_control)
+    .with_if_match(request.policy_context.if_match)
+    .with_if_none_match(request.policy_context.if_none_match)
+    .with_object_creation_operation(request.policy_context.object_creation_operation);
     Ok(policy.evaluate(&policy_request))
 }
 
@@ -303,7 +325,9 @@ pub(super) fn bucket_policy_decision_for_loaded_handle_with_context(
     .with_grant_write(policy_context.grant_write)
     .with_grant_read_acp(policy_context.grant_read_acp)
     .with_grant_write_acp(policy_context.grant_write_acp)
-    .with_grant_full_control(policy_context.grant_full_control);
+    .with_grant_full_control(policy_context.grant_full_control)
+    .with_prefix(policy_context.prefix)
+    .with_object_ownership(policy_context.object_ownership);
     Ok(policy.evaluate(&request))
 }
 
@@ -365,7 +389,10 @@ pub(super) fn bucket_policy_decision_for_put_object_action(
     .with_grant_write(request.policy_context.grant_write)
     .with_grant_read_acp(request.policy_context.grant_read_acp)
     .with_grant_write_acp(request.policy_context.grant_write_acp)
-    .with_grant_full_control(request.policy_context.grant_full_control);
+    .with_grant_full_control(request.policy_context.grant_full_control)
+    .with_if_match(request.policy_context.if_match)
+    .with_if_none_match(request.policy_context.if_none_match)
+    .with_object_creation_operation(request.policy_context.object_creation_operation);
     Ok(policy.evaluate(&policy_request))
 }
 

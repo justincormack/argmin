@@ -70,6 +70,11 @@ pub struct PutObjectPolicyContext<'a> {
     pub grant_write_acp: Option<&'a str>,
     pub grant_full_control: Option<&'a str>,
     pub request_object_tags_xml: Option<&'a str>,
+    pub if_match: Option<&'a str>,
+    pub if_none_match: Option<&'a str>,
+    pub object_creation_operation: Option<bool>,
+    pub prefix: Option<&'a str>,
+    pub object_ownership: Option<&'a str>,
 }
 
 impl<'a> PutObjectPolicyContext<'a> {
@@ -91,6 +96,11 @@ impl<'a> PutObjectPolicyContext<'a> {
             grant_write_acp: None,
             grant_full_control: None,
             request_object_tags_xml: None,
+            if_match: None,
+            if_none_match: None,
+            object_creation_operation: None,
+            prefix: None,
+            object_ownership: None,
         }
     }
 
@@ -143,6 +153,45 @@ impl<'a> PutObjectPolicyContext<'a> {
         if self.canned_acl.is_none() {
             self.canned_acl = canned_acl;
         }
+        self
+    }
+
+    #[must_use]
+    pub const fn with_if_match(mut self, if_match: Option<&'a str>) -> Self {
+        self.if_match = if_match;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_if_none_match(mut self, if_none_match: Option<&'a str>) -> Self {
+        self.if_none_match = if_none_match;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_object_creation_operation(mut self, object_creation_operation: bool) -> Self {
+        self.object_creation_operation = Some(object_creation_operation);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_optional_object_creation_operation(
+        mut self,
+        object_creation_operation: Option<bool>,
+    ) -> Self {
+        self.object_creation_operation = object_creation_operation;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_prefix(mut self, prefix: Option<&'a str>) -> Self {
+        self.prefix = prefix;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_object_ownership(mut self, object_ownership: Option<&'a str>) -> Self {
+        self.object_ownership = object_ownership;
         self
     }
 }
@@ -1061,7 +1110,7 @@ impl<'a> GetObjectAttributesRequest<'a> {
 
 impl<'a> BeginStreamPartRequest<'a> {
     pub(super) fn effective_policy_context(&self) -> PutObjectPolicyContext<'a> {
-        self.policy_context
+        self.policy_context.with_object_creation_operation(false)
     }
 }
 
@@ -1251,6 +1300,12 @@ pub(super) fn authorization_policy_context_for_put_object_write_acl<'a>(
     acl: &PutObjectWriteAcl<'_>,
     policy_context: PutObjectPolicyContext<'a>,
 ) -> Result<PutObjectPolicyContext<'a>, ServerError> {
+    let base_policy_context = || {
+        PutObjectPolicyContext::default()
+            .with_if_match(policy_context.if_match)
+            .with_if_none_match(policy_context.if_none_match)
+            .with_optional_object_creation_operation(policy_context.object_creation_operation)
+    };
     match acl {
         PutObjectWriteAcl::None => {
             if policy_context.canned_acl.is_some() {
@@ -1263,7 +1318,7 @@ pub(super) fn authorization_policy_context_for_put_object_write_acl<'a>(
                     reason: format!("{operation} policy context cannot include grant headers"),
                 });
             }
-            Ok(PutObjectPolicyContext::default())
+            Ok(base_policy_context())
         }
         PutObjectWriteAcl::Canned(acl) => {
             if policy_context.grant_read.is_some()
@@ -1286,10 +1341,7 @@ pub(super) fn authorization_policy_context_for_put_object_write_acl<'a>(
                     reason: format!("{operation} canned ACL policy context mismatch"),
                 });
             }
-            Ok(
-                PutObjectPolicyContext::default()
-                    .with_default_canned_acl(policy_context.canned_acl),
-            )
+            Ok(base_policy_context().with_default_canned_acl(policy_context.canned_acl))
         }
         PutObjectWriteAcl::Grants(acl_grants) => {
             if policy_context.canned_acl.is_some() {
@@ -1304,7 +1356,7 @@ pub(super) fn authorization_policy_context_for_put_object_write_acl<'a>(
                         reason: format!("{operation} grant policy context mismatch"),
                     });
                 }
-                Ok(PutObjectPolicyContext::default().with_acl_grant_headers(
+                Ok(base_policy_context().with_acl_grant_headers(
                     policy_context.grant_read,
                     policy_context.grant_write,
                     policy_context.grant_read_acp,
@@ -1312,7 +1364,7 @@ pub(super) fn authorization_policy_context_for_put_object_write_acl<'a>(
                     policy_context.grant_full_control,
                 ))
             } else {
-                Ok(PutObjectPolicyContext::default())
+                Ok(base_policy_context())
             }
         }
     }
@@ -1633,6 +1685,10 @@ impl<'a> PutObjectRequest<'a> {
         let policy_context = self
             .encryption
             .with_policy_context(self.authorization_policy_context()?);
+        let policy_context = policy_context
+            .with_if_match(self.cond.if_match_policy_value())
+            .with_if_none_match(self.cond.if_none_match_policy_value())
+            .with_object_creation_operation(true);
         if policy_context.request_object_tags_xml.is_some() {
             Ok(policy_context)
         } else {
@@ -1658,6 +1714,7 @@ impl<'a> CreateMultipartUploadRequest<'a> {
         let policy_context = self
             .encryption
             .with_policy_context(self.authorization_policy_context()?);
+        let policy_context = policy_context.with_object_creation_operation(false);
         if policy_context.request_object_tags_xml.is_some() {
             Ok(policy_context)
         } else {

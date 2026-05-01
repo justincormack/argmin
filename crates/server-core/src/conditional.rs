@@ -126,6 +126,24 @@ pub enum WriteCondition {
     IfNoneMatchStar,
 }
 
+impl WriteCondition {
+    #[must_use]
+    pub fn if_match_policy_value(&self) -> Option<&str> {
+        match self {
+            Self::IfMatch(etag) => Some(etag.as_str()),
+            Self::None | Self::IfNoneMatchStar => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn if_none_match_policy_value(&self) -> Option<&'static str> {
+        match self {
+            Self::IfNoneMatchStar => Some("*"),
+            Self::None | Self::IfMatch(_) => None,
+        }
+    }
+}
+
 /// Conditions for delete operations (DELETE, `DeleteObjects`).
 ///
 /// AWS S3 only supports `If-Match` on DeleteObject for general-purpose buckets.

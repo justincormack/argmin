@@ -31,6 +31,7 @@ pub(super) enum ActualValue<'a> {
 /// example, filtering supportedness predicates) without string comparisons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ConditionOpKind {
+    Bool,
     StringEquals,
     StringNotEquals,
     StringLike,
@@ -63,6 +64,12 @@ pub(super) struct ConditionOpDef {
 /// predicate preserves the asymmetry currently encoded in
 /// `evaluable_string_condition_operator_supported`.
 pub(super) const CONDITION_OPS: &[ConditionOpDef] = &[
+    ConditionOpDef {
+        name: "Bool",
+        kind: ConditionOpKind::Bool,
+        evaluate: eval_bool,
+        evaluable_on_evaluable_object_actions: true,
+    },
     ConditionOpDef {
         name: "StringEquals",
         kind: ConditionOpKind::StringEquals,
@@ -140,6 +147,22 @@ pub(super) fn lookup(name: &str) -> Option<&'static ConditionOpDef> {
 /// table-driven lookup.
 pub(super) fn is_evaluable_on_evaluable_object_actions(name: &str) -> bool {
     lookup(name).is_some_and(|op| op.evaluable_on_evaluable_object_actions)
+}
+
+fn eval_bool(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands
+                .iter()
+                .any(|expected| expected.eq_ignore_ascii_case(actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::Absent => ConditionMatchResult::NoMatch,
+    }
 }
 
 fn eval_string_equals(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
@@ -266,6 +289,28 @@ mod tests {
         assert_eq!(
             (if_exists.evaluate)(&operands, ActualValue::Absent),
             ConditionMatchResult::Matches
+        );
+    }
+
+    #[test]
+    fn bool_operator_matches_case_insensitive_boolean_strings() {
+        let op = lookup("Bool").expect("Bool is in the table");
+        assert_eq!(op.kind, ConditionOpKind::Bool);
+        assert_eq!(
+            (op.evaluate)(&operands(&["true"]), present("true")),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&operands(&["TRUE"]), present("true")),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&operands(&["false"]), present("true")),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (op.evaluate)(&operands(&["true"]), ActualValue::Absent),
+            ConditionMatchResult::NoMatch
         );
     }
 

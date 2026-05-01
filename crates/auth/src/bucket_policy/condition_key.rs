@@ -36,6 +36,7 @@ pub(super) enum ResolvedValue<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OperatorSupport {
     AnyEvaluable,
+    BoolOnly,
     StringEqualsOnly,
 }
 
@@ -187,6 +188,48 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
         evaluable_for_action: None,
         supported_for_action: Some(request_header_supported_for_action_non_get),
     },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:if-match"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_if_match,
+        evaluable_for_action: None,
+        supported_for_action: Some(conditional_write_supported_for_action),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:if-none-match"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_if_none_match,
+        evaluable_for_action: None,
+        supported_for_action: Some(conditional_write_supported_for_action),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:ObjectCreationOperation"),
+        operator_support: OperatorSupport::BoolOnly,
+        resolve: resolve_object_creation_operation,
+        evaluable_for_action: None,
+        supported_for_action: Some(conditional_write_supported_for_action),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:prefix"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_prefix,
+        evaluable_for_action: None,
+        supported_for_action: Some(prefix_supported_for_action),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:locationconstraint"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_location_constraint,
+        evaluable_for_action: None,
+        supported_for_action: Some(location_constraint_supported_for_action),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:x-amz-object-ownership"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_object_ownership,
+        evaluable_for_action: None,
+        supported_for_action: Some(object_ownership_supported_for_action),
+    },
 ];
 
 /// Look up a resolver for a given condition-key name.
@@ -266,6 +309,40 @@ fn resolve_grant_write_acp<'a>(request: &PolicyRequest<'a>, _param: &str) -> Res
 
 fn resolve_grant_full_control<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
     option_to_resolved(request.grant_full_control())
+}
+
+fn resolve_if_match<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    option_to_resolved(request.if_match())
+}
+
+fn resolve_if_none_match<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    option_to_resolved(request.if_none_match())
+}
+
+fn resolve_object_creation_operation<'a>(
+    request: &PolicyRequest<'a>,
+    _param: &str,
+) -> ResolvedValue<'a> {
+    match request.object_creation_operation() {
+        Some(true) => ResolvedValue::Present("true"),
+        Some(false) => ResolvedValue::Present("false"),
+        None => ResolvedValue::Absent,
+    }
+}
+
+fn resolve_prefix<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    option_to_resolved(request.prefix())
+}
+
+fn resolve_location_constraint<'a>(
+    _request: &PolicyRequest<'a>,
+    _param: &str,
+) -> ResolvedValue<'a> {
+    ResolvedValue::Absent
+}
+
+fn resolve_object_ownership<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    option_to_resolved(request.object_ownership())
 }
 
 fn option_to_resolved(value: Option<&str>) -> ResolvedValue<'_> {
@@ -382,6 +459,25 @@ fn server_side_encryption_supported_for_action(action: PolicyAction) -> bool {
         )
 }
 
+fn conditional_write_supported_for_action(action: PolicyAction) -> bool {
+    matches!(action, PolicyAction::PutObject)
+}
+
+fn prefix_supported_for_action(action: PolicyAction) -> bool {
+    matches!(
+        action,
+        PolicyAction::ListBucket | PolicyAction::ListBucketVersions
+    )
+}
+
+fn location_constraint_supported_for_action(_action: PolicyAction) -> bool {
+    false
+}
+
+fn object_ownership_supported_for_action(action: PolicyAction) -> bool {
+    matches!(action, PolicyAction::PutBucketOwnershipControls)
+}
+
 /// Whether a condition clause is supported on a given action at
 /// statement-validation time.
 ///
@@ -403,6 +499,7 @@ pub(super) fn supports_clause_for_action(
         OperatorSupport::StringEqualsOnly => {
             matches!(operator, "StringEquals" | "StringEqualsIfExists")
         }
+        OperatorSupport::BoolOnly => operator == "Bool",
     };
     if !operator_ok {
         return false;
@@ -450,6 +547,11 @@ pub(super) fn evaluate_clause(
         OperatorSupport::AnyEvaluable => {}
         OperatorSupport::StringEqualsOnly => {
             if op.kind != ConditionOpKind::StringEquals {
+                return ConditionMatchResult::Unsupported;
+            }
+        }
+        OperatorSupport::BoolOnly => {
+            if op.kind != ConditionOpKind::Bool {
                 return ConditionMatchResult::Unsupported;
             }
         }
@@ -627,8 +729,38 @@ mod tests {
             "s3:x-amz-grant-read-acp",
             "s3:x-amz-grant-write-acp",
             "s3:x-amz-grant-full-control",
+            "s3:if-match",
+            "s3:if-none-match",
+            "s3:ObjectCreationOperation",
+            "s3:prefix",
+            "s3:locationconstraint",
+            "s3:x-amz-object-ownership",
         ] {
             assert!(lookup(key).is_some(), "missing resolver for {key}");
         }
+    }
+
+    #[test]
+    fn object_creation_operation_requires_bool_operator_on_put_object() {
+        let clause = PolicyConditionClause {
+            operator: "Bool".to_string(),
+            key: "s3:ObjectCreationOperation".to_string(),
+            values: vec!["true".to_string()],
+        };
+        assert!(supports_clause_for_action(&clause, PolicyAction::PutObject));
+
+        let wrong_operator = PolicyConditionClause {
+            operator: "StringEquals".to_string(),
+            key: "s3:ObjectCreationOperation".to_string(),
+            values: vec!["true".to_string()],
+        };
+        assert!(!supports_clause_for_action(
+            &wrong_operator,
+            PolicyAction::PutObject
+        ));
+        assert!(!supports_clause_for_action(
+            &clause,
+            PolicyAction::ListBucket
+        ));
     }
 }

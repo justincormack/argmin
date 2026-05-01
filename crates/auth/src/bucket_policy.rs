@@ -68,9 +68,7 @@ impl BucketPolicy {
 
     pub fn validate_evaluable_object_conditions(&self) -> Result<(), BucketPolicyError> {
         for statement in &self.statements {
-            if statement.references_evaluable_object_action()
-                && !statement.conditions_supported_for_evaluable_object_actions()
-            {
+            if !statement.conditions_supported_for_policy_actions() {
                 return Err(BucketPolicyError::Malformed {
                     reason: "unsupported Condition for currently enforced bucket policy action",
                 });
@@ -291,6 +289,11 @@ pub struct PolicyRequest<'a> {
     grant_read_acp: Option<&'a str>,
     grant_write_acp: Option<&'a str>,
     grant_full_control: Option<&'a str>,
+    if_match: Option<&'a str>,
+    if_none_match: Option<&'a str>,
+    object_creation_operation: Option<bool>,
+    prefix: Option<&'a str>,
+    object_ownership: Option<&'a str>,
 }
 
 impl<'a> PolicyRequest<'a> {
@@ -323,6 +326,11 @@ impl<'a> PolicyRequest<'a> {
             grant_read_acp: None,
             grant_write_acp: None,
             grant_full_control: None,
+            if_match: None,
+            if_none_match: None,
+            object_creation_operation: None,
+            prefix: None,
+            object_ownership: None,
         }
     }
 
@@ -354,6 +362,11 @@ impl<'a> PolicyRequest<'a> {
             grant_read_acp: None,
             grant_write_acp: None,
             grant_full_control: None,
+            if_match: None,
+            if_none_match: None,
+            object_creation_operation: None,
+            prefix: None,
+            object_ownership: None,
         }
     }
 
@@ -479,6 +492,39 @@ impl<'a> PolicyRequest<'a> {
     }
 
     #[must_use]
+    pub fn with_if_match(mut self, if_match: Option<&'a str>) -> Self {
+        self.if_match = if_match;
+        self
+    }
+
+    #[must_use]
+    pub fn with_if_none_match(mut self, if_none_match: Option<&'a str>) -> Self {
+        self.if_none_match = if_none_match;
+        self
+    }
+
+    #[must_use]
+    pub fn with_object_creation_operation(
+        mut self,
+        object_creation_operation: Option<bool>,
+    ) -> Self {
+        self.object_creation_operation = object_creation_operation;
+        self
+    }
+
+    #[must_use]
+    pub fn with_prefix(mut self, prefix: Option<&'a str>) -> Self {
+        self.prefix = prefix;
+        self
+    }
+
+    #[must_use]
+    pub fn with_object_ownership(mut self, object_ownership: Option<&'a str>) -> Self {
+        self.object_ownership = object_ownership;
+        self
+    }
+
+    #[must_use]
     fn copy_source(&self) -> Option<&'a str> {
         self.copy_source
     }
@@ -534,6 +580,31 @@ impl<'a> PolicyRequest<'a> {
     #[must_use]
     fn grant_full_control(&self) -> Option<&'a str> {
         self.grant_full_control
+    }
+
+    #[must_use]
+    fn if_match(&self) -> Option<&'a str> {
+        self.if_match
+    }
+
+    #[must_use]
+    fn if_none_match(&self) -> Option<&'a str> {
+        self.if_none_match
+    }
+
+    #[must_use]
+    fn object_creation_operation(&self) -> Option<bool> {
+        self.object_creation_operation
+    }
+
+    #[must_use]
+    fn prefix(&self) -> Option<&'a str> {
+        self.prefix
+    }
+
+    #[must_use]
+    fn object_ownership(&self) -> Option<&'a str> {
+        self.object_ownership
     }
 }
 
@@ -661,17 +732,10 @@ impl PolicyStatement {
             .any(|clause| clause.key.starts_with("s3:BucketTag/"))
     }
 
-    fn references_evaluable_object_action(&self) -> bool {
-        self.actions.iter().any(|pattern| {
-            EVALUABLE_OBJECT_POLICY_ACTIONS
-                .iter()
-                .any(|action| action_pattern_matches(pattern, action.as_str()))
-        })
-    }
-
-    fn conditions_supported_for_evaluable_object_actions(&self) -> bool {
-        EVALUABLE_OBJECT_POLICY_ACTIONS
+    fn conditions_supported_for_policy_actions(&self) -> bool {
+        SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS
             .iter()
+            .chain(SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS.iter())
             .copied()
             .filter(|action| {
                 self.actions
@@ -680,7 +744,8 @@ impl PolicyStatement {
             })
             .all(|action| {
                 self.conditions.iter().all(|clause| {
-                    condition_clause_supported_for_evaluable_object_action(action, clause)
+                    condition_key::supports_clause_for_action(clause, action)
+                        || policy_upload_accepts_condition_without_runtime_evaluation(clause)
                 })
             })
     }
@@ -758,32 +823,6 @@ impl PolicyEffect {
         }
     }
 }
-
-const EVALUABLE_OBJECT_POLICY_ACTIONS: [PolicyAction; 23] = [
-    PolicyAction::GetObject,
-    PolicyAction::GetObjectVersion,
-    PolicyAction::GetObjectAttributes,
-    PolicyAction::GetObjectVersionAttributes,
-    PolicyAction::GetObjectAcl,
-    PolicyAction::GetObjectVersionAcl,
-    PolicyAction::GetObjectTagging,
-    PolicyAction::GetObjectVersionTagging,
-    PolicyAction::GetObjectRetention,
-    PolicyAction::GetObjectLegalHold,
-    PolicyAction::PutObject,
-    PolicyAction::PutObjectAcl,
-    PolicyAction::PutObjectVersionAcl,
-    PolicyAction::PutObjectTagging,
-    PolicyAction::PutObjectVersionTagging,
-    PolicyAction::PutObjectRetention,
-    PolicyAction::PutObjectLegalHold,
-    PolicyAction::BypassGovernanceRetention,
-    PolicyAction::AbortMultipartUpload,
-    PolicyAction::DeleteObject,
-    PolicyAction::DeleteObjectVersion,
-    PolicyAction::DeleteObjectTagging,
-    PolicyAction::DeleteObjectVersionTagging,
-];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExistingObjectTagValue<'a> {
@@ -1380,18 +1419,17 @@ fn conditions_constrain_public_principal(conditions: &[PolicyConditionClause]) -
     conditions.iter().any(is_non_public_condition_clause)
 }
 
+fn policy_upload_accepts_condition_without_runtime_evaluation(
+    clause: &PolicyConditionClause,
+) -> bool {
+    clause.key == "aws:SourceIp" && matches!(clause.operator.as_str(), "IpAddress" | "NotIpAddress")
+}
+
 fn condition_clause_matches_request(
     clause: &PolicyConditionClause,
     request: &PolicyRequest<'_>,
 ) -> ConditionMatchResult {
     condition_key::evaluate_clause(clause, request)
-}
-
-fn condition_clause_supported_for_evaluable_object_action(
-    action: PolicyAction,
-    clause: &PolicyConditionClause,
-) -> bool {
-    condition_key::supports_clause_for_action(clause, action)
 }
 
 #[doc(hidden)]
@@ -2654,6 +2692,16 @@ mod tests {
                 reason: "unsupported Condition for currently enforced bucket policy action",
             })
         );
+    }
+
+    #[test]
+    fn source_ip_condition_is_accepted_for_policy_status_classification() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"IpAddress":{"aws:SourceIp":"fd00::/8"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(policy.validate_evaluable_object_conditions(), Ok(()));
     }
 
     #[test]

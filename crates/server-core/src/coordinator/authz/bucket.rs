@@ -411,10 +411,36 @@ impl Coordinator {
         &self,
         req: &PutBucketOwnershipControlsRequest<'_>,
     ) -> Result<AuthorizedPutBucketOwnershipControls, ServerError> {
-        let bucket = self.authorize_loaded_bucket_write_action_for(
+        let bucket = self.with_bucket_write_handle_for(
             &req.bucket,
-            auth::PolicyAction::PutBucketOwnershipControls,
-            Self::requester_can_bucket_owner_account_admin,
+            BucketHandleRequest::new()
+                .requiring_policy_view()
+                .requiring_bucket_tags_if_abac_enabled(),
+            |bucket| {
+                let default_allowed = Self::requester_can_bucket_owner_account_admin(
+                    req.bucket.requester(),
+                    bucket.bucket(),
+                );
+                let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+                let policy_context = PutObjectPolicyContext::default()
+                    .with_object_ownership(Some(req.config.object_ownership.as_str()));
+                let policy_decision = self.bucket_policy_decision_for_loaded_handle_with_context(
+                    req.bucket.requester(),
+                    &bucket,
+                    auth::PolicyAction::PutBucketOwnershipControls,
+                    policy_context,
+                    bucket_policy.as_deref(),
+                )?;
+                if !Self::bucket_policy_allows_with_fallback(
+                    req.bucket.requester(),
+                    bucket.bucket(),
+                    policy_decision,
+                    || default_allowed,
+                ) {
+                    return Err(ServerError::AccessDenied);
+                }
+                Ok(bucket)
+            },
         )?;
         if Self::is_bucket_owner_enforced(Some(&req.config))
             && !Self::acl_grants_owner_full_control_only(
@@ -631,10 +657,11 @@ impl Coordinator {
     ) -> Result<AuthorizedListObjectsV2, ServerError> {
         let bucket = self.load_bucket_handle_for_bucket_policy_read(&req.bucket)?;
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
-        let policy_decision = self.bucket_policy_decision_for_loaded_handle(
+        let policy_decision = self.bucket_policy_decision_for_loaded_handle_with_context(
             &req.bucket.requester,
             &bucket,
             auth::PolicyAction::ListBucket,
+            PutObjectPolicyContext::default().with_prefix(req.prefix),
             bucket_policy.as_deref(),
         )?;
         if !Self::bucket_policy_allows_with_fallback(
@@ -674,10 +701,11 @@ impl Coordinator {
     ) -> Result<AuthorizedListObjectVersions, ServerError> {
         let bucket = self.load_bucket_handle_for_bucket_policy_read(&req.bucket)?;
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
-        let policy_decision = self.bucket_policy_decision_for_loaded_handle(
+        let policy_decision = self.bucket_policy_decision_for_loaded_handle_with_context(
             &req.bucket.requester,
             &bucket,
             auth::PolicyAction::ListBucketVersions,
+            PutObjectPolicyContext::default().with_prefix(req.prefix),
             bucket_policy.as_deref(),
         )?;
         if !Self::bucket_policy_allows_with_fallback(

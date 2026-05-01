@@ -2621,7 +2621,8 @@ impl HttpFrontend {
                     None,
                     acl.policy_condition_value(),
                     sse_s3.then_some(ManagedEncryptionAlgorithm::Aes256),
-                );
+                )
+                .with_object_creation_operation(false);
 
                 let result = self.coordinator.create_multipart_upload(
                     &crate::coordinator::CreateMultipartUploadRequest {
@@ -3792,20 +3793,27 @@ impl HttpFrontend {
                         acl_grants.as_ref(),
                     ),
                     policy_context: put_object_policy_context_from_request_fields(
-                        inline_tags_xml.as_deref(),
-                        None,
-                        None,
-                        parse_put_object_acl(req.header("x-amz-acl")).policy_condition_value(),
-                        managed_encryption,
-                        sse_customer_request
-                            .as_ref()
-                            .map(SseCustomerRequest::algorithm),
-                        PutObjectGrantHeaders {
-                            grant_read: req.header("x-amz-grant-read"),
-                            grant_write: req.header("x-amz-grant-write"),
-                            grant_read_acp: req.header("x-amz-grant-read-acp"),
-                            grant_write_acp: req.header("x-amz-grant-write-acp"),
-                            grant_full_control: req.header("x-amz-grant-full-control"),
+                        PutObjectPolicyContextFields {
+                            tags_xml: inline_tags_xml.as_deref(),
+                            copy_source: None,
+                            metadata_directive: None,
+                            canned_acl: parse_put_object_acl(req.header("x-amz-acl"))
+                                .policy_condition_value(),
+                            managed_encryption,
+                            sse_customer_algorithm: sse_customer_request
+                                .as_ref()
+                                .map(SseCustomerRequest::algorithm),
+                            grants: PutObjectGrantHeaders {
+                                grant_read: req.header("x-amz-grant-read"),
+                                grant_write: req.header("x-amz-grant-write"),
+                                grant_read_acp: req.header("x-amz-grant-read-acp"),
+                                grant_write_acp: req.header("x-amz-grant-write-acp"),
+                                grant_full_control: req.header("x-amz-grant-full-control"),
+                            },
+                            conditions: PutObjectConditionalHeaders {
+                                if_match: req.header("if-match"),
+                                if_none_match: req.header("if-none-match"),
+                            },
                         },
                     ),
                     object_lock,
@@ -4036,7 +4044,8 @@ impl HttpFrontend {
                         sse_customer_request
                             .as_ref()
                             .map(SseCustomerRequest::algorithm),
-                    ),
+                    )
+                    .with_object_creation_operation(false),
                 sse_customer: sse_customer_request.as_ref(),
             })?;
 
@@ -5522,21 +5531,25 @@ fn put_object_policy_context_from_request<'a>(
     canned_acl: Option<&'a str>,
     managed_encryption: Option<ManagedEncryptionAlgorithm>,
 ) -> crate::coordinator::PutObjectPolicyContext<'a> {
-    put_object_policy_context_from_request_fields(
+    put_object_policy_context_from_request_fields(PutObjectPolicyContextFields {
         tags_xml,
         copy_source,
         metadata_directive,
         canned_acl,
         managed_encryption,
-        req.header(SSE_C_ALGORITHM_HEADER),
-        PutObjectGrantHeaders {
+        sse_customer_algorithm: req.header(SSE_C_ALGORITHM_HEADER),
+        grants: PutObjectGrantHeaders {
             grant_read: req.header("x-amz-grant-read"),
             grant_write: req.header("x-amz-grant-write"),
             grant_read_acp: req.header("x-amz-grant-read-acp"),
             grant_write_acp: req.header("x-amz-grant-write-acp"),
             grant_full_control: req.header("x-amz-grant-full-control"),
         },
-    )
+        conditions: PutObjectConditionalHeaders {
+            if_match: req.header("if-match"),
+            if_none_match: req.header("if-none-match"),
+        },
+    })
 }
 
 #[derive(Clone, Copy, Default)]
@@ -5548,7 +5561,14 @@ struct PutObjectGrantHeaders<'a> {
     grant_full_control: Option<&'a str>,
 }
 
-fn put_object_policy_context_from_request_fields<'a>(
+#[derive(Clone, Copy, Default)]
+struct PutObjectConditionalHeaders<'a> {
+    if_match: Option<&'a str>,
+    if_none_match: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PutObjectPolicyContextFields<'a> {
     tags_xml: Option<&'a str>,
     copy_source: Option<&'a str>,
     metadata_directive: Option<&'a str>,
@@ -5556,18 +5576,30 @@ fn put_object_policy_context_from_request_fields<'a>(
     managed_encryption: Option<ManagedEncryptionAlgorithm>,
     sse_customer_algorithm: Option<&'a str>,
     grants: PutObjectGrantHeaders<'a>,
+    conditions: PutObjectConditionalHeaders<'a>,
+}
+
+fn put_object_policy_context_from_request_fields<'a>(
+    fields: PutObjectPolicyContextFields<'a>,
 ) -> crate::coordinator::PutObjectPolicyContext<'a> {
-    crate::coordinator::PutObjectPolicyContext::new(copy_source, metadata_directive, canned_acl)
-        .with_managed_encryption(managed_encryption)
-        .with_sse_customer_algorithm(sse_customer_algorithm)
-        .with_request_object_tags_xml(tags_xml)
-        .with_acl_grant_headers(
-            grants.grant_read,
-            grants.grant_write,
-            grants.grant_read_acp,
-            grants.grant_write_acp,
-            grants.grant_full_control,
-        )
+    crate::coordinator::PutObjectPolicyContext::new(
+        fields.copy_source,
+        fields.metadata_directive,
+        fields.canned_acl,
+    )
+    .with_managed_encryption(fields.managed_encryption)
+    .with_sse_customer_algorithm(fields.sse_customer_algorithm)
+    .with_request_object_tags_xml(fields.tags_xml)
+    .with_acl_grant_headers(
+        fields.grants.grant_read,
+        fields.grants.grant_write,
+        fields.grants.grant_read_acp,
+        fields.grants.grant_write_acp,
+        fields.grants.grant_full_control,
+    )
+    .with_if_match(fields.conditions.if_match)
+    .with_if_none_match(fields.conditions.if_none_match)
+    .with_object_creation_operation(true)
 }
 
 fn parse_bucket_ownership(

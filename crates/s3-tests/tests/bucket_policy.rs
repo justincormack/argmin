@@ -13,9 +13,10 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, create_public_bucket,
-    disable_bucket_public_access_block, err_status, put_bucket_lifecycle_with_md5,
-    send_signed_request_to_endpoint_for_service_with_credentials, sse_c_header_values,
-    test_sse_c_key, unique_bucket, SignedRequestCredentials, CTX,
+    disable_bucket_public_access_block, err_status, object_url, put_bucket_lifecycle_with_md5,
+    send_signed_request_to_endpoint_for_service_with_credentials,
+    send_signed_request_with_credentials, sse_c_header_values, test_sse_c_key, unique_bucket,
+    SignedRequestCredentials, CTX,
 };
 use serde_json::json;
 use std::future::Future;
@@ -589,6 +590,15 @@ fn raw_primary_credentials() -> SignedRequestCredentials<'static> {
     SignedRequestCredentials {
         access_key: CTX.access_key(),
         secret_key: CTX.secret_key(),
+        region: CTX.region(),
+        tls_ca_pem: CTX.tls_ca_pem(),
+    }
+}
+
+fn raw_alt_credentials() -> SignedRequestCredentials<'static> {
+    SignedRequestCredentials {
+        access_key: CTX.alt_access_key(),
+        secret_key: CTX.alt_secret_key(),
         region: CTX.region(),
         tls_ca_pem: CTX.tls_ca_pem(),
     }
@@ -14597,6 +14607,926 @@ fn test_bucket_policy_condition_operator_if_exists() {
         assert_eq!(body.as_ref(), b"bar");
 
         cleanup(&bucket, &["foo"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_object_if_none_match_condition() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:PutObject",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:if-none-match": "*"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_access_denied(
+            "PutObject denied without If-None-Match condition header",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("if-none-match-missing")
+                    .body(ByteStream::from_static(b"missing"))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_ok(
+            "PutObject allowed with matching If-None-Match condition",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("if-none-match-present")
+                    .if_none_match("*")
+                    .body(ByteStream::from_static(b"present"))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &["if-none-match-present"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_object_if_match_condition() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let key = "if-match-object";
+        let etag = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"old"))
+            .send()
+            .await
+            .unwrap()
+            .e_tag()
+            .expect("expected ETag")
+            .to_string();
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:PutObject",
+                            "Resource": bucket_wildcard_resource(&bucket),
+                            "Condition": {
+                                "StringEquals": {
+                                    "s3:if-match": etag
+                                }
+                            }
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:GetObject",
+                            "Resource": bucket_wildcard_resource(&bucket)
+                        }
+                    ],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_access_denied("PutObject denied without If-Match condition header", || {
+            alt_client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"missing"))
+                .send()
+        })
+        .await;
+
+        eventually_ok("PutObject allowed with matching If-Match condition", || {
+            alt_client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .if_match(&etag)
+                .body(ByteStream::from_static(b"new"))
+                .send()
+        })
+        .await;
+
+        let body = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(body.as_ref(), b"new");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_copy_object_if_match_condition() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let src_key = "copy-if-match-source";
+        let dst_key = "copy-if-match-destination";
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .body(ByteStream::from_static(b"source"))
+            .send()
+            .await
+            .unwrap();
+        let dst_etag = client
+            .put_object()
+            .bucket(&bucket)
+            .key(dst_key)
+            .body(ByteStream::from_static(b"destination"))
+            .send()
+            .await
+            .unwrap()
+            .e_tag()
+            .unwrap()
+            .to_string();
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:PutObject",
+                            "Resource": bucket_wildcard_resource(&bucket),
+                            "Condition": {
+                                "Null": {
+                                    "s3:if-match": "false"
+                                },
+                                "Bool": {
+                                    "s3:ObjectCreationOperation": "true"
+                                }
+                            }
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:GetObject",
+                            "Resource": bucket_wildcard_resource(&bucket)
+                        }
+                    ],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_access_denied(
+            "CopyObject denied without If-Match condition header",
+            || {
+                alt_client
+                    .copy_object()
+                    .bucket(&bucket)
+                    .key(dst_key)
+                    .copy_source(format!("{bucket}/{src_key}"))
+                    .send()
+            },
+        )
+        .await;
+
+        let raw_copy_url = object_url(CTX.endpoint(), &bucket, dst_key, None);
+        let conditional_copy = send_signed_request_with_credentials(
+            "PUT",
+            &raw_copy_url,
+            b"",
+            [
+                ("x-amz-copy-source", format!("{bucket}/{src_key}")),
+                ("if-match", dst_etag),
+            ],
+            raw_alt_credentials(),
+        );
+        assert_eq!(
+            conditional_copy.status, 200,
+            "unexpected CopyObject If-Match response: {}",
+            conditional_copy.body
+        );
+        let copied = client
+            .get_object()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(copied.as_ref(), b"source");
+
+        cleanup(&bucket, &[src_key, dst_key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_copy_object_if_none_match_condition() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let src_key = "copy-if-none-match-source";
+        let dst_key = "copy-if-none-match-destination";
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .body(ByteStream::from_static(b"source"))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:PutObject",
+                            "Resource": bucket_wildcard_resource(&bucket),
+                            "Condition": {
+                                "Null": {
+                                    "s3:if-none-match": "false"
+                                },
+                                "Bool": {
+                                    "s3:ObjectCreationOperation": "true"
+                                }
+                            }
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:GetObject",
+                            "Resource": bucket_wildcard_resource(&bucket)
+                        }
+                    ],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_access_denied(
+            "CopyObject denied without If-None-Match condition header",
+            || {
+                alt_client
+                    .copy_object()
+                    .bucket(&bucket)
+                    .key(dst_key)
+                    .copy_source(format!("{bucket}/{src_key}"))
+                    .send()
+            },
+        )
+        .await;
+
+        let raw_copy_url = object_url(CTX.endpoint(), &bucket, dst_key, None);
+        let conditional_copy = send_signed_request_with_credentials(
+            "PUT",
+            &raw_copy_url,
+            b"",
+            [
+                ("x-amz-copy-source", format!("{bucket}/{src_key}")),
+                ("if-none-match", "*".to_string()),
+            ],
+            raw_alt_credentials(),
+        );
+        assert_eq!(
+            conditional_copy.status, 200,
+            "unexpected CopyObject If-None-Match response: {}",
+            conditional_copy.body
+        );
+        let copied = client
+            .get_object()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(copied.as_ref(), b"source");
+
+        cleanup(&bucket, &[src_key, dst_key]).await;
+    });
+}
+
+async fn prepare_single_part_multipart_upload(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    body: &'static [u8],
+) -> (String, String) {
+    let create = client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    let upload_id = create.upload_id().unwrap().to_string();
+    let part = client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(body))
+        .send()
+        .await
+        .unwrap();
+    (upload_id, part.e_tag().unwrap().to_string())
+}
+
+fn single_part_complete_payload(part_etag: &str) -> CompletedMultipartUpload {
+    CompletedMultipartUpload::builder()
+        .parts(
+            CompletedPart::builder()
+                .part_number(1)
+                .e_tag(part_etag)
+                .build(),
+        )
+        .build()
+}
+
+#[test]
+fn test_bucket_policy_complete_multipart_upload_if_none_match_condition() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let key = "conditional-complete-if-none-match";
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:PutObject",
+                            "Resource": bucket_wildcard_resource(&bucket)
+                        },
+                        {
+                            "Effect": "Deny",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:PutObject",
+                            "Resource": bucket_wildcard_resource(&bucket),
+                            "Condition": {
+                                "Null": {
+                                    "s3:if-none-match": "true"
+                                },
+                                "Bool": {
+                                    "s3:ObjectCreationOperation": "true"
+                                }
+                            }
+                        }
+                    ],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let (denied_upload_id, denied_part_etag) =
+            prepare_single_part_multipart_upload(alt_client, &bucket, key, b"denied").await;
+        eventually_access_denied(
+            "CompleteMultipartUpload denied without required If-None-Match condition",
+            || {
+                alt_client
+                    .complete_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&denied_upload_id)
+                    .multipart_upload(single_part_complete_payload(&denied_part_etag))
+                    .send()
+            },
+        )
+        .await;
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&denied_upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        let (upload_id, part_etag) =
+            prepare_single_part_multipart_upload(alt_client, &bucket, key, b"created").await;
+        eventually_ok(
+            "CompleteMultipartUpload allowed with matching If-None-Match condition",
+            || {
+                alt_client
+                    .complete_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .if_none_match("*")
+                    .multipart_upload(single_part_complete_payload(&part_etag))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_complete_multipart_upload_if_match_condition() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let key = "conditional-complete-if-match";
+        let etag = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"old"))
+            .send()
+            .await
+            .unwrap()
+            .e_tag()
+            .unwrap()
+            .to_string();
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:PutObject",
+                            "Resource": bucket_wildcard_resource(&bucket)
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:GetObject",
+                            "Resource": bucket_wildcard_resource(&bucket)
+                        },
+                        {
+                            "Effect": "Deny",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:PutObject",
+                            "Resource": bucket_wildcard_resource(&bucket),
+                            "Condition": {
+                                "Null": {
+                                    "s3:if-match": "true"
+                                },
+                                "Bool": {
+                                    "s3:ObjectCreationOperation": "true"
+                                }
+                            }
+                        }
+                    ],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let (denied_upload_id, denied_part_etag) =
+            prepare_single_part_multipart_upload(alt_client, &bucket, key, b"denied").await;
+        eventually_access_denied(
+            "CompleteMultipartUpload denied without required If-Match condition",
+            || {
+                alt_client
+                    .complete_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&denied_upload_id)
+                    .multipart_upload(single_part_complete_payload(&denied_part_etag))
+                    .send()
+            },
+        )
+        .await;
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&denied_upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        let (upload_id, part_etag) =
+            prepare_single_part_multipart_upload(alt_client, &bucket, key, b"new").await;
+        eventually_ok(
+            "CompleteMultipartUpload allowed with matching If-Match condition",
+            || {
+                alt_client
+                    .complete_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .if_match(&etag)
+                    .multipart_upload(single_part_complete_payload(&part_etag))
+                    .send()
+            },
+        )
+        .await;
+
+        let body = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(body.as_ref(), b"new");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_list_bucket_prefix_condition() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        for key in ["allowed/one", "blocked/one"] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"body"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:ListBucket",
+                        "Resource": bucket_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:prefix": "allowed/"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let listed = eventually_ok(
+            "ListObjectsV2 allowed with matching prefix condition",
+            || {
+                alt_client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix("allowed/")
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(listed.contents().len(), 1);
+        assert_eq!(listed.contents()[0].key(), Some("allowed/one"));
+
+        eventually_access_denied(
+            "ListObjectsV2 denied without prefix condition value",
+            || alt_client.list_objects_v2().bucket(&bucket).send(),
+        )
+        .await;
+        eventually_access_denied(
+            "ListObjectsV2 denied with nonmatching prefix condition",
+            || {
+                alt_client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix("blocked/")
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &["allowed/one", "blocked/one"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_list_bucket_versions_prefix_condition() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        for key in ["allowed/versioned", "blocked/versioned"] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"body"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:ListBucketVersions",
+                        "Resource": bucket_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:prefix": "allowed/"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let listed = eventually_ok(
+            "ListObjectVersions allowed with matching prefix condition",
+            || {
+                alt_client
+                    .list_object_versions()
+                    .bucket(&bucket)
+                    .prefix("allowed/")
+                    .send()
+            },
+        )
+        .await;
+        assert!(listed
+            .versions()
+            .iter()
+            .any(|version| version.key() == Some("allowed/versioned")));
+
+        eventually_access_denied(
+            "ListObjectVersions denied without prefix condition value",
+            || alt_client.list_object_versions().bucket(&bucket).send(),
+        )
+        .await;
+        eventually_access_denied(
+            "ListObjectVersions denied with nonmatching prefix condition",
+            || {
+                alt_client
+                    .list_object_versions()
+                    .bucket(&bucket)
+                    .prefix("blocked/")
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_list_multipart_uploads_prefix_condition_is_rejected() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+
+        let result = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:ListBucketMultipartUploads",
+                        "Resource": bucket_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:prefix": "allowed/"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+        assert_s3_err_code(&result, "MalformedPolicy");
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+fn ownership_controls(object_ownership: ObjectOwnership) -> OwnershipControls {
+    let rule = OwnershipControlsRule::builder()
+        .object_ownership(object_ownership)
+        .build()
+        .unwrap();
+    OwnershipControls::builder().rules(rule).build().unwrap()
+}
+
+#[test]
+fn test_bucket_policy_get_bucket_location_location_constraint_condition_is_rejected() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+
+        let result = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:GetBucketLocation",
+                        "Resource": bucket_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:locationconstraint": CTX.region()
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+        assert_s3_err_code(&result, "MalformedPolicy");
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_bucket_ownership_controls_object_ownership_condition() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:PutBucketOwnershipControls",
+                        "Resource": bucket_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:x-amz-object-ownership": "BucketOwnerPreferred"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_access_denied(
+            "PutBucketOwnershipControls denied with nonmatching s3:x-amz-object-ownership",
+            || {
+                alt_client
+                    .put_bucket_ownership_controls()
+                    .bucket(&bucket)
+                    .ownership_controls(ownership_controls(ObjectOwnership::ObjectWriter))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_ok(
+            "PutBucketOwnershipControls allowed with matching s3:x-amz-object-ownership",
+            || {
+                alt_client
+                    .put_bucket_ownership_controls()
+                    .bucket(&bucket)
+                    .ownership_controls(ownership_controls(ObjectOwnership::BucketOwnerPreferred))
+                    .send()
+            },
+        )
+        .await;
+
+        let controls = client
+            .get_bucket_ownership_controls()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            controls
+                .ownership_controls()
+                .and_then(|controls| controls.rules().first())
+                .map(|rule| rule.object_ownership()),
+            Some(&ObjectOwnership::BucketOwnerPreferred)
+        );
+
+        cleanup(&bucket, &[]).await;
     });
 }
 

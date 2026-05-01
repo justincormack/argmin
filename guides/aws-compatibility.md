@@ -89,6 +89,39 @@ practical. Exact transport timing, and whether an unread-body rejection is
 reported as a normal S3 error or an early connection close, can still differ
 slightly from AWS in these edge cases.
 
+## AWS documentation divergences
+
+This section records cases where AWS's public S3 documentation and live AWS
+behavior diverge. These are not Argmin compatibility exceptions. When this
+happens, live AWS behavior remains the compatibility target, and the relevant
+AWS-backed test should be treated as the oracle.
+
+### Conditional-write bucket policies and `CopyObject`
+
+AWS's conditional-write bucket policy guide says that if a bucket policy
+enforces `s3:if-match` or `s3:if-none-match`, `CopyObject` requests without
+those HTTP headers fail with `403 AccessDenied`, and `CopyObject` requests
+with those HTTP headers fail with `501 NotImplemented`.
+
+Live AWS behavior is narrower than that statement. With a bucket policy that
+allows `s3:PutObject` only when both of the following are true:
+
+- the raw destination `If-Match` or `If-None-Match` HTTP header is present
+- `Bool { "s3:ObjectCreationOperation": "true" }` matches
+
+AWS treats `CopyObject` as an object-creation operation and allows the copy
+when the raw destination conditional header is present. Without the header,
+the policy does not match and the request is denied.
+
+The AWS-pinned coverage is in:
+
+- `test_bucket_policy_copy_object_if_match_condition`
+- `test_bucket_policy_copy_object_if_none_match_condition`
+
+Source with the contradictory note:
+
+- https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes-enforce.html
+
 ## Current known gaps
 
 ### 1. Single-part `ETag` is not AWS MD5

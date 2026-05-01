@@ -215,7 +215,8 @@ impl Coordinator {
         );
         let policy_context =
             PutObjectPolicyContext::new(Some(copy_source_policy_value.as_str()), None, None)
-                .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm));
+                .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm))
+                .with_object_creation_operation(false);
         let dst_bucket_info = ValidatedBucket(dst_bucket_handle.bucket().clone());
         let modern_bucket_info = ModernBucketSummary::from(&*dst_bucket_info);
         let modern_bucket = BoeBucketSummary::assume_boe(&modern_bucket_info);
@@ -368,7 +369,10 @@ impl Coordinator {
             .map_err(Self::map_object_pg_action_error)?;
         let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
             PutObjectPolicyContext::default()
-                .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm)),
+                .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm))
+                .with_if_match(req.cond.if_match_policy_value())
+                .with_if_none_match(req.cond.if_none_match_policy_value())
+                .with_object_creation_operation(true),
             &upload,
         );
         let modern_bucket_tags = PreloadedBucketTags::new(bucket_tags.as_deref());
@@ -877,7 +881,10 @@ fn bucket_policy_decision_for_put_object_action_modern(
     .with_grant_write(policy_context.grant_write)
     .with_grant_read_acp(policy_context.grant_read_acp)
     .with_grant_write_acp(policy_context.grant_write_acp)
-    .with_grant_full_control(policy_context.grant_full_control);
+    .with_grant_full_control(policy_context.grant_full_control)
+    .with_if_match(policy_context.if_match)
+    .with_if_none_match(policy_context.if_none_match)
+    .with_object_creation_operation(policy_context.object_creation_operation);
     Ok(policy.evaluate(&policy_request))
 }
 

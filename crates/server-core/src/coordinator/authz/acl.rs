@@ -418,7 +418,10 @@ impl Coordinator {
             acl_policy_context.grant_write_acp,
             acl_policy_context.grant_full_control,
         )
-        .with_request_object_tags_xml(request_object_tags_xml);
+        .with_request_object_tags_xml(request_object_tags_xml)
+        .with_if_match(acl_policy_context.if_match)
+        .with_if_none_match(acl_policy_context.if_none_match)
+        .with_object_creation_operation(true);
         let dst_policy_context = req
             .destination_encryption
             .with_policy_context(copy_policy_context);
@@ -524,7 +527,8 @@ impl Coordinator {
         );
         let policy_context =
             PutObjectPolicyContext::new(Some(copy_source_policy_value.as_str()), None, None)
-                .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm));
+                .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm))
+                .with_object_creation_operation(false);
 
         let dst_bucket_info = ValidatedBucket(dst_bucket_handle.bucket().clone());
         let dst_bucket_policy = self.cached_bucket_policy_for_loaded_handle(&dst_bucket_handle)?;
@@ -689,7 +693,10 @@ impl Coordinator {
             .map_err(Self::map_object_pg_action_error)?;
         let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
             PutObjectPolicyContext::default()
-                .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm)),
+                .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm))
+                .with_if_match(req.cond.if_match_policy_value())
+                .with_if_none_match(req.cond.if_none_match_policy_value())
+                .with_object_creation_operation(true),
             &upload,
         );
         if !self.requester_can_write_multipart_upload_with_bucket_policy(
