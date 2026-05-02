@@ -1406,13 +1406,15 @@ Work items:
        read-only/preflight helpers, while active mutation goes through the
        cluster command path
    - remaining slices: none; Phase 6.4 is complete.
-5. Phase 6.5: synchronous replica apply.
-   - apply every metadata command to all required replicas before acknowledging
-     success
-   - make replicas reject non-primary-origin, stale-epoch, wrong-PG, or
-     out-of-order commands
-   - writes fail closed when any required metadata replica is unavailable
-   - metadata replicas converge in no-failure tests
+5. Phase 6.5: replica command acceptance hardening.
+   - keep the Phase 6.4 invariant that metadata commands are applied to every
+     required acting-set replica before acknowledging success
+   - add replica-side validation so commands are rejected when they come from a
+     non-primary origin, stale epoch, wrong PG, or out-of-order log position
+   - make fail-closed replica rejection explicit: writes fail when any required
+     metadata replica rejects or cannot validate the command
+   - cover accepted-command convergence and rejected-command non-mutation in
+     no-failure and injected-rejection tests
 6. Phase 6.6: log chain and state digest.
    - add a durable command-log hash chain or equivalent replay state:
      epoch, PG ID, monotonically increasing log index, previous log hash, and
