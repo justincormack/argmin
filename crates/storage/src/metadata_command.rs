@@ -37,6 +37,7 @@ const METADATA_COMMAND_ABORT_STREAM_UPLOAD: u16 = 15;
 const METADATA_COMMAND_CREATE_MULTIPART_UPLOAD: u16 = 16;
 const METADATA_COMMAND_ABORT_MULTIPART_UPLOAD: u16 = 17;
 const METADATA_COMMAND_COMMIT_STREAM_PART: u16 = 18;
+const METADATA_COMMAND_DELETE_OBJECT_PAYLOAD_RECLAIM: u16 = 19;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct MetadataCommandLogIndex(NonZeroU64);
@@ -168,6 +169,7 @@ pub(crate) enum MetadataCommandPayload {
     CommitStreamPart(Box<CommitStreamPartCommand>),
     CreateMultipartUpload(Box<CreateMultipartUploadCommand>),
     AbortMultipartUpload(Box<AbortMultipartUploadCommand>),
+    DeleteObjectPayloadReclaim(Box<DeleteObjectPayloadReclaimCommand>),
 }
 
 impl MetadataCommandPayload {
@@ -191,6 +193,7 @@ impl MetadataCommandPayload {
             Self::CommitStreamPart(_) => METADATA_COMMAND_COMMIT_STREAM_PART,
             Self::CreateMultipartUpload(_) => METADATA_COMMAND_CREATE_MULTIPART_UPLOAD,
             Self::AbortMultipartUpload(_) => METADATA_COMMAND_ABORT_MULTIPART_UPLOAD,
+            Self::DeleteObjectPayloadReclaim(_) => METADATA_COMMAND_DELETE_OBJECT_PAYLOAD_RECLAIM,
         }
     }
 }
@@ -485,6 +488,39 @@ pub(crate) enum ObjectPayloadReclaimCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeleteObjectPayloadReclaimCommand {
+    pub(crate) bucket: BucketName,
+    pub(crate) key: ObjectKey,
+    pub(crate) generation_id: GenerationId,
+    pub(crate) payload: ObjectPayloadReclaimCommand,
+}
+
+impl DeleteObjectPayloadReclaimCommand {
+    pub(crate) fn new(
+        bucket: BucketName,
+        key: ObjectKey,
+        generation_id: GenerationId,
+        payload: ObjectPayloadReclaimCommand,
+    ) -> Self {
+        Self {
+            bucket,
+            key,
+            generation_id,
+            payload,
+        }
+    }
+
+    pub(crate) fn matches_request(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> bool {
+        self.bucket == *bucket && self.key == *key && self.generation_id == generation_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DeleteObjectVersionTarget {
     DeleteMarker,
     Live {
@@ -733,6 +769,9 @@ fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPaylo
         }
         MetadataCommandPayload::AbortMultipartUpload(command) => {
             encode_abort_multipart_upload(&mut out, command);
+        }
+        MetadataCommandPayload::DeleteObjectPayloadReclaim(command) => {
+            encode_delete_object_payload_reclaim(&mut out, command);
         }
     }
     out
@@ -1010,6 +1049,29 @@ fn encode_abort_multipart_upload(out: &mut Vec<u8>, command: &AbortMultipartUplo
     put_str(out, command.key.as_str());
     put_str(out, command.upload_id.as_str());
     encode_abort_multipart_upload_cleanup(out, &command.cleanup);
+}
+
+fn encode_delete_object_payload_reclaim(
+    out: &mut Vec<u8>,
+    command: &DeleteObjectPayloadReclaimCommand,
+) {
+    put_str(out, command.bucket.as_str());
+    put_str(out, command.key.as_str());
+    put_u64(out, command.generation_id.get());
+    encode_object_payload_reclaim(out, &command.payload);
+}
+
+fn encode_object_payload_reclaim(out: &mut Vec<u8>, reclaim: &ObjectPayloadReclaimCommand) {
+    match reclaim {
+        ObjectPayloadReclaimCommand::Segments(reclaim) => {
+            put_u8(out, 0);
+            encode_object_segments_reclaim(out, reclaim);
+        }
+        ObjectPayloadReclaimCommand::Multipart(reclaim) => {
+            put_u8(out, 1);
+            encode_multipart_reclaim(out, reclaim);
+        }
+    }
 }
 
 fn encode_abort_multipart_upload_cleanup(out: &mut Vec<u8>, cleanup: &AbortMultipartUploadCleanup) {
@@ -1980,7 +2042,7 @@ mod tests {
                 owner: OwnerIdentity::from_principal("owner"),
                 write_sequence: 47,
                 last_modified_millis: 559,
-                stale_payload: Some(segment_reclaim),
+                stale_payload: Some(segment_reclaim.clone()),
             }),
             MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
                 bucket: bucket.clone(),
@@ -1989,7 +2051,7 @@ mod tests {
                 owner: OwnerIdentity::from_principal("owner"),
                 write_sequence: 48,
                 last_modified_millis: 560,
-                stale_payload: Some(multipart_reclaim),
+                stale_payload: Some(multipart_reclaim.clone()),
             }),
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
                 bucket: bucket.clone(),
@@ -2078,6 +2140,22 @@ mod tests {
                 existing_part: Some(uploaded_part),
                 displaced_segments: vec![omitted_streaming_segment],
             })),
+            MetadataCommandPayload::DeleteObjectPayloadReclaim(Box::new(
+                DeleteObjectPayloadReclaimCommand::new(
+                    bucket.clone(),
+                    key.clone(),
+                    generation_id,
+                    segment_reclaim,
+                ),
+            )),
+            MetadataCommandPayload::DeleteObjectPayloadReclaim(Box::new(
+                DeleteObjectPayloadReclaimCommand::new(
+                    bucket.clone(),
+                    key.clone(),
+                    generation_id,
+                    multipart_reclaim,
+                ),
+            )),
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
                 bucket,
                 key,
@@ -2127,7 +2205,9 @@ mod tests {
                 0xf1b058002ad6040e,
                 0x7555192579a20442,
                 0x505fc17b646186f2,
-                0xb9a1ca30cfa59630,
+                0xff13404730caba1e,
+                0x98ce7d1649b15c26,
+                0xf7b9ce5080e08d99,
             ]
         );
     }

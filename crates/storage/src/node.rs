@@ -24,18 +24,19 @@ use crate::pg_topology::PgTopology;
 use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 use crate::types::{
     AbortMultipartUploadLookup, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
-    BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind,
-    CreateStreamUploadReq, EcShape, GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq,
-    ListPartsReq, ListedMultipartParts, LoadedBucketSubresource, MultipartCompletionPreflight,
-    MultipartCompletionSnapshot, MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey,
-    ObjectReadSnapshot, ObjectReadSnapshotOutcome, SessionId, ShardKey, StoredObject,
-    StreamUploadState, StreamUploadTarget, UploadId, UploadState, WriteAck,
+    BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind, EcShape,
+    GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq, ListPartsReq,
+    ListedMultipartParts, LoadedBucketSubresource, MultipartCompletionPreflight,
+    MultipartCompletionSnapshot, MultipartUploadRecord, ObjectKey, ObjectReadSnapshot,
+    ObjectReadSnapshotOutcome, SessionId, ShardKey, StoredObject, StreamUploadState,
+    StreamUploadTarget, UploadId, UploadState, WriteAck,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::types::{
-    CreateBucketConfig, ListPartsResp, MultipartPartRecord, MultipartReclaimRecord,
-    ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord, PayloadReclaimRoot,
-    PutLiveObjectReq, StreamUploadRecord, StreamUploadSegmentRecord,
+    CreateBucketConfig, CreateStreamUploadReq, ListPartsResp, MultipartPartRecord,
+    MultipartPartSegmentRecord, MultipartReclaimRecord, ObjectPartRecord, ObjectSegmentRecord,
+    ObjectSegmentsReclaimRecord, PayloadReclaimRoot, PutLiveObjectReq, StreamUploadRecord,
+    StreamUploadSegmentRecord,
 };
 
 const TRACE_TARGET: &str = "storage";
@@ -44,7 +45,6 @@ const LOCK_WAIT_EVENT_THRESHOLD_US: u128 = 1_000;
 const RECLAIM_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 mod bucket_ops;
 mod multipart_ops;
-mod object_delete_ops;
 mod object_metadata_ops;
 mod object_read_ops;
 mod stream_ops;
@@ -1900,165 +1900,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, Err("action failed"));
-    }
-
-    #[test]
-    fn create_multipart_upload_releases_bucket_write_reservation_on_error() {
-        let tmp = test_util::tempdir();
-        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
-        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
-        let key = ObjectKey::try_from("key").unwrap();
-
-        let result = node.create_multipart_upload(&bucket, &key, Default::default(), |_, _| {
-            Ok::<_, ()>((
-                (),
-                crate::types::CreateMultipartUploadReq {
-                    upload_id: crate::tests::multipart_upload_id("upload"),
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    tags: None,
-                    metadata_blob: vec![].into(),
-                    system_metadata_blob: crate::types::SerializedSystemMetadataBlob::default(),
-                    initiator: None,
-                    owner: crate::types::OwnerIdentity::new(
-                        "o".repeat(300),
-                        s3_types::CanonicalUserId::from_principal("owner"),
-                    ),
-                    acl_grants: s3_types::AclGrants::default(),
-                    public_read: false,
-                    object_lock: crate::types::ObjectLockState::default(),
-                    checksum: None,
-                    encryption: crate::types::ObjectEncryption::default(),
-                },
-            ))
-        });
-        assert!(result.is_err());
-
-        let bucket_pg = node
-            .get_pg(node.pg_topology().bucket_pg_for(&bucket))
-            .unwrap();
-        let raw = bucket_pg.head_bucket_raw(&bucket).unwrap();
-        assert_eq!(raw.active_write_reservations, 0);
-    }
-
-    #[test]
-    fn create_put_object_stream_session_releases_bucket_write_reservation_on_error() {
-        let tmp = test_util::tempdir();
-        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
-        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
-        let key = ObjectKey::try_from("key").unwrap();
-        let session_id = crate::tests::stream_session_id("session");
-
-        node.create_put_object_stream_session_record(
-            &bucket,
-            &key,
-            &session_id,
-            crate::types::ObjectEncryption::default(),
-        )
-        .unwrap();
-
-        let result =
-            node.create_put_object_stream_session(&bucket, &key, Default::default(), |_, _| {
-                Ok::<_, ()>((
-                    (),
-                    crate::types::CreateStreamUploadReq {
-                        session_id: session_id.clone(),
-                        bucket: bucket.clone(),
-                        key: key.clone(),
-                        target: crate::types::StreamUploadTarget::PutObject,
-                        encryption: crate::types::ObjectEncryption::default(),
-                    },
-                ))
-            });
-        assert!(result.is_err());
-
-        let bucket_pg = node
-            .get_pg(node.pg_topology().bucket_pg_for(&bucket))
-            .unwrap();
-        let raw = bucket_pg.head_bucket_raw(&bucket).unwrap();
-        assert_eq!(raw.active_write_reservations, 0);
-    }
-
-    #[test]
-    fn commit_stream_segment_append_leaves_payload_cleanup_to_cluster_on_late_duplicate() {
-        let tmp = test_util::tempdir();
-        let node = SharedStorageNode::open(tmp.path(), &[0, 1, 2, 3]).unwrap();
-        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
-        let key = ObjectKey::try_from("key").unwrap();
-        let meta_pg_id = node.pg_topology().object_pg_for(&bucket, &key);
-
-        let (session_id, request, loser_record) = (0..128)
-            .find_map(|i| {
-                let session_id = crate::tests::stream_session_id(format!("session{i}"));
-                node.create_put_object_stream_session_record(
-                    &bucket,
-                    &key,
-                    &session_id,
-                    crate::types::ObjectEncryption::default(),
-                )
-                .unwrap();
-                let request = crate::types::PrepareStreamUploadSegmentAppendReq {
-                    session_id: session_id.clone(),
-                    segment_index: 0,
-                    size: 5,
-                    segment_crc64: Some(checksum::crc64::checksum(b"hello")),
-                    segment_okh: [i as u8; 16],
-                };
-                let (_, record) = node
-                    .prepare_stream_segment_append(&bucket, &key, &request)
-                    .unwrap();
-                (record.data_pg_id != meta_pg_id).then_some((session_id, request, record))
-            })
-            .expect("expected a cross-PG streaming segment routing case");
-
-        let shard_key = ShardKey::new(&loser_record.segment_okh, loser_record.segment_vid.get(), 0);
-        let ack = {
-            let data_pg = node.get_pg(loser_record.data_pg_id).unwrap();
-            data_pg.write_shard(&shard_key, b"hello").unwrap()
-        };
-        let shard_batch = vec![(&shard_key, ack)];
-
-        let winner_vid = {
-            let meta_pg = node.get_pg(meta_pg_id).unwrap();
-            let winner_vid = meta_pg.allocate_stream_segment_vid(&session_id).unwrap();
-            meta_pg
-                .append_stream_segment(&crate::types::StreamUploadSegmentRecord {
-                    session_id: session_id.clone(),
-                    segment_index: request.segment_index,
-                    size: request.size,
-                    segment_crc64: request.segment_crc64,
-                    segment_okh: [0x55; 16],
-                    segment_vid: winner_vid,
-                    data_pg_id: meta_pg_id,
-                    ec_k: node.default_ec_shape.k,
-                    ec_m: node.default_ec_shape.m,
-                })
-                .unwrap();
-            winner_vid
-        };
-
-        let err = node
-            .commit_stream_segment_append(
-                &bucket,
-                &key,
-                &session_id,
-                request.segment_index,
-                &loser_record,
-                &shard_batch,
-            )
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::error::ObjectPgActionError::InvalidRequest { reason }
-                if reason == "duplicate segment_index 0"
-        ));
-
-        let data_pg = node.get_pg(loser_record.data_pg_id).unwrap();
-        assert_eq!(data_pg.read_shard(&shard_key).unwrap().data, b"hello");
-        let meta_pg = node.get_pg(meta_pg_id).unwrap();
-        let segments = meta_pg.list_stream_segments(&session_id).unwrap();
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].segment_vid, winner_vid);
     }
 
     #[test]

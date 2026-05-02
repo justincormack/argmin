@@ -53,6 +53,7 @@ pub enum MetadataCommandApplyTestKind {
     CommitStreamPart,
     CreateMultipartUpload,
     AbortMultipartUpload,
+    DeleteObjectPayloadReclaim,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -1126,6 +1127,9 @@ impl StorageCluster {
             }
             MetadataCommandPayload::AbortMultipartUpload(abort) => {
                 self.delete_abort_multipart_cleanup_best_effort(&abort.cleanup);
+            }
+            MetadataCommandPayload::DeleteObjectPayloadReclaim(delete) => {
+                self.enqueue_bucket_delete_finalize(&delete.bucket);
             }
             _ => {}
         }

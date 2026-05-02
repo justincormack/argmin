@@ -209,13 +209,20 @@ impl LocalPgRoute {
 
 #[derive(Debug)]
 pub(crate) struct LocalClusterRuntimeState {
-    object_payload_leases: Mutex<HashMap<LocalReclaimRoot, usize>>,
+    object_payload_leases: Mutex<LocalObjectPayloadLeaseState>,
     reclaim_queue: (Mutex<LocalReclaimQueueState>, Condvar),
     metadata_command_indexes: Mutex<HashMap<PgId, u64>>,
     pending_metadata_commands: Mutex<HashMap<(PgId, BucketName), MetadataCommandEnvelope>>,
 }
 
 type LocalReclaimRoot = (BucketName, ObjectKey, GenerationId);
+
+#[derive(Debug, Default)]
+struct LocalObjectPayloadLeaseState {
+    leases: HashMap<LocalReclaimRoot, usize>,
+    reclaim_fences: HashSet<LocalReclaimRoot>,
+    active_reclaims: HashSet<LocalReclaimRoot>,
+}
 
 #[derive(Debug)]
 struct LocalReclaimQueueState {
@@ -231,7 +238,7 @@ pub(crate) struct PendingMetadataCommandConflict;
 impl LocalClusterRuntimeState {
     fn new() -> Self {
         Self {
-            object_payload_leases: Mutex::new(HashMap::new()),
+            object_payload_leases: Mutex::new(LocalObjectPayloadLeaseState::default()),
             reclaim_queue: (
                 Mutex::new(LocalReclaimQueueState {
                     object_queue: VecDeque::new(),
@@ -318,14 +325,17 @@ impl LocalClusterRuntimeState {
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-    ) {
-        let mut leases = self
+    ) -> bool {
+        let root = (bucket.clone(), key.clone(), generation_id);
+        let mut state = self
             .object_payload_leases
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        *leases
-            .entry((bucket.clone(), key.clone(), generation_id))
-            .or_insert(0) += 1;
+        if state.reclaim_fences.contains(&root) {
+            return false;
+        }
+        *state.leases.entry(root).or_insert(0) += 1;
+        true
     }
 
     pub(crate) fn release_object_payload_lease(
@@ -334,20 +344,73 @@ impl LocalClusterRuntimeState {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> usize {
-        let mut leases = self
+        let mut state = self
             .object_payload_leases
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let root = (bucket.clone(), key.clone(), generation_id);
-        let entry = leases
+        let entry = state
+            .leases
             .get_mut(&root)
             .expect("object payload lease release without acquire");
         *entry -= 1;
         let remaining = *entry;
         if remaining == 0 {
-            leases.remove(&root);
+            state.leases.remove(&root);
         }
         remaining
+    }
+
+    pub(crate) fn try_begin_object_payload_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> bool {
+        let root = (bucket.clone(), key.clone(), generation_id);
+        let mut state = self
+            .object_payload_leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if state.leases.get(&root).copied().unwrap_or(0) != 0
+            || state.active_reclaims.contains(&root)
+        {
+            return false;
+        }
+        state.active_reclaims.insert(root.clone());
+        state.reclaim_fences.insert(root);
+        true
+    }
+
+    pub(crate) fn finish_object_payload_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        keep_fence: bool,
+    ) {
+        let mut state = self
+            .object_payload_leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = (bucket.clone(), key.clone(), generation_id);
+        state.active_reclaims.remove(&root);
+        if !keep_fence {
+            state.reclaim_fences.remove(&root);
+        }
+    }
+
+    pub(crate) fn clear_object_payload_reclaim_fence(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) {
+        self.object_payload_leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reclaim_fences
+            .remove(&(bucket.clone(), key.clone(), generation_id));
     }
 
     pub(crate) fn object_payload_lease_count(
@@ -356,22 +419,24 @@ impl LocalClusterRuntimeState {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> usize {
-        let leases = self
+        let state = self
             .object_payload_leases
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        leases
+        state
+            .leases
             .get(&(bucket.clone(), key.clone(), generation_id))
             .copied()
             .unwrap_or(0)
     }
 
     pub(crate) fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize {
-        let leases = self
+        let state = self
             .object_payload_leases
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        leases
+        state
+            .leases
             .iter()
             .filter(|((lease_bucket, _, _), _)| lease_bucket == bucket)
             .map(|(_, count)| *count)
@@ -1076,9 +1141,17 @@ mod tests {
     use std::time::Duration;
 
     static METADATA_COMMAND_APPLY_HOOK_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+    static PAYLOAD_CLEANUP_HOOK_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn lock_metadata_command_apply_hook_test() -> std::sync::MutexGuard<'static, ()> {
         METADATA_COMMAND_APPLY_HOOK_TEST_SERIAL
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lock_payload_cleanup_hook_test() -> std::sync::MutexGuard<'static, ()> {
+        PAYLOAD_CLEANUP_HOOK_TEST_SERIAL
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -6158,6 +6231,393 @@ mod tests {
                 "retried reclaim should delete placed shard {shard_index}"
             );
         }
+    }
+
+    #[test]
+    fn payload_reclaim_in_progress_blocks_new_payload_leases() {
+        let _serial = lock_payload_cleanup_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+        let committed =
+            write_committed_direct_segment_for(&cluster, &bucket, &key, b"reclaim race payload");
+        cluster
+            .delete_current_object_if(&bucket, &key, |stored| {
+                assert!(matches!(stored, Some(crate::StoredObject::Live(_))));
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+            .unwrap();
+
+        let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let hook_gate = Arc::clone(&gate);
+        let _hook_guard =
+            cluster.test_install_before_placed_payload_shard_delete_hook(Arc::new(move |_| {
+                let (lock, cv) = &*hook_gate;
+                let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+                if !state.0 {
+                    state.0 = true;
+                    cv.notify_all();
+                    while !state.1 {
+                        state = cv.wait(state).unwrap_or_else(|e| e.into_inner());
+                    }
+                }
+                Ok(())
+            }));
+
+        let reclaim_cluster = Arc::clone(&cluster);
+        let reclaim_bucket = bucket.clone();
+        let reclaim_key = key.clone();
+        let reclaim_generation_id = committed.generation_id;
+        let reclaim_thread = std::thread::spawn(move || {
+            reclaim_cluster.reclaim_object_payload_if_unleased(
+                &reclaim_bucket,
+                &reclaim_key,
+                reclaim_generation_id,
+            )
+        });
+
+        let (lock, cv) = &*gate;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while !state.0 {
+            state = cv.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        let err = match cluster.acquire_object_payload_lease(&bucket, &key, committed.generation_id)
+        {
+            Ok(_) => panic!("new lease acquired after payload reclaim started"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(err, crate::StoreError::NotFound),
+            "new leases must be rejected once reclaim starts deleting payload, got {err:?}"
+        );
+        state.1 = true;
+        cv.notify_all();
+        drop(state);
+
+        assert!(reclaim_thread.join().unwrap().unwrap());
+        assert!(!cluster
+            .payload_reclaim_exists(&bucket, &key, committed.generation_id)
+            .unwrap());
+    }
+
+    #[test]
+    fn reclaim_payload_cleanup_failure_keeps_payload_lease_fence_until_retry() {
+        let _serial = lock_payload_cleanup_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+        let committed =
+            write_committed_direct_segment_for(&cluster, &bucket, &key, b"cleanup fence payload");
+        cluster
+            .delete_current_object_if(&bucket, &key, |stored| {
+                assert!(matches!(stored, Some(crate::StoredObject::Live(_))));
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+            .unwrap();
+
+        let failed_ack_delete = Arc::new(AtomicBool::new(false));
+        let failed_ack_delete_hook = Arc::clone(&failed_ack_delete);
+        let hook_guard = cluster.test_install_before_metadata_primary_payload_ack_delete_hook(
+            Arc::new(move |_shard_key| {
+                if !failed_ack_delete_hook.swap(true, Ordering::SeqCst) {
+                    return Err(crate::StoreError::Io {
+                        context: "injected reclaim ack delete failure",
+                        source: std::io::Error::other("injected reclaim ack delete failure"),
+                    });
+                }
+                Ok(())
+            }),
+        );
+        let err = cluster
+            .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::ObjectPgActionError::Store(crate::StoreError::Io {
+                context: "injected reclaim ack delete failure",
+                ..
+            })
+        ));
+        assert!(failed_ack_delete.load(Ordering::SeqCst));
+        assert!(
+            map.runtime_state()
+                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+                .is_none(),
+            "ack cleanup failure happens before the reclaim metadata delete command is installed"
+        );
+        assert!(cluster
+            .payload_reclaim_exists(&bucket, &key, committed.generation_id)
+            .unwrap());
+        for shard_index in 0..committed.written.ec.k + committed.written.ec.m {
+            assert!(
+                !cluster
+                    .test_payload_shard_file_exists(
+                        committed.written.data_pg_id,
+                        committed.written.ec,
+                        &committed.segment_okh,
+                        committed.generation_id,
+                        shard_index,
+                    )
+                    .unwrap(),
+                "placed shard {shard_index} should already be deleted before ack cleanup fails"
+            );
+        }
+
+        let err = match cluster.acquire_object_payload_lease(&bucket, &key, committed.generation_id)
+        {
+            Ok(_) => panic!("new lease acquired after payload cleanup failed mid-reclaim"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(err, crate::StoreError::NotFound),
+            "failed mid-reclaim cleanup must keep leases fenced until retry converges, got {err:?}"
+        );
+        drop(hook_guard);
+
+        assert!(cluster
+            .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
+            .unwrap());
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+        assert!(!cluster
+            .payload_reclaim_exists(&bucket, &key, committed.generation_id)
+            .unwrap());
+    }
+
+    #[test]
+    fn reclaim_payload_metadata_delete_applies_to_object_pg_acting_set() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+        let committed =
+            write_committed_direct_segment_for(&cluster, &bucket, &key, b"reclaim payload");
+        cluster
+            .delete_current_object_if(&bucket, &key, |stored| {
+                assert!(matches!(stored, Some(crate::StoredObject::Live(_))));
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+            .unwrap();
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert!(
+                crate::PgMetadataStore::payload_reclaim_exists(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    committed.generation_id,
+                )
+                .unwrap(),
+                "delete should publish reclaim metadata on node {node_id:?}"
+            );
+        }
+
+        assert!(cluster
+            .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
+            .unwrap());
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert!(
+                !crate::PgMetadataStore::payload_reclaim_exists(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    committed.generation_id,
+                )
+                .unwrap(),
+                "reclaim command should delete metadata on node {node_id:?}"
+            );
+        }
+        for shard_index in 0..committed.written.ec.k + committed.written.ec.m {
+            assert!(!cluster
+                .test_payload_shard_file_exists(
+                    committed.written.data_pg_id,
+                    committed.written.ec,
+                    &committed.segment_okh,
+                    committed.generation_id,
+                    shard_index,
+                )
+                .unwrap());
+        }
+    }
+
+    #[test]
+    fn reclaim_payload_metadata_delete_retry_reuses_pending_partial_command() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+        let committed =
+            write_committed_direct_segment_for(&cluster, &bucket, &key, b"retry payload");
+        cluster
+            .delete_current_object_if(&bucket, &key, |stored| {
+                assert!(matches!(stored, Some(crate::StoredObject::Live(_))));
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+            .unwrap();
+
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            |node_id, command| {
+                if matches!(
+                    command.payload(),
+                    MetadataCommandPayload::DeleteObjectPayloadReclaim(_)
+                ) && node_id == NodeId::new(2)
+                {
+                    return Err(crate::StoreError::Io {
+                        context: "injected reclaim metadata command apply failure",
+                        source: std::io::Error::other(
+                            "injected reclaim metadata command apply failure",
+                        ),
+                    });
+                }
+                Ok(())
+            },
+        ));
+        let err = cluster
+            .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::ObjectPgActionError::Store(crate::StoreError::Io {
+                context: "injected reclaim metadata command apply failure",
+                ..
+            })
+        ));
+        let pending = map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .expect("partial reclaim metadata delete must keep pending command");
+        assert!(matches!(
+            pending.payload(),
+            MetadataCommandPayload::DeleteObjectPayloadReclaim(delete)
+                if delete.matches_request(&bucket, &key, committed.generation_id)
+        ));
+        let err = match cluster.acquire_object_payload_lease(&bucket, &key, committed.generation_id)
+        {
+            Ok(_) => panic!("new lease acquired while reclaim metadata delete was pending"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(err, crate::StoreError::NotFound),
+            "pending reclaim metadata delete must fence new leases after payload deletion starts, got {err:?}"
+        );
+        for (node_id, expected_exists) in [
+            (NodeId::new(0), false),
+            (NodeId::new(1), true),
+            (NodeId::new(2), true),
+        ] {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::payload_reclaim_exists(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    committed.generation_id,
+                )
+                .unwrap(),
+                expected_exists,
+                "partial apply state mismatch on node {node_id:?}"
+            );
+        }
+        drop(hook_guard);
+
+        assert!(cluster
+            .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
+            .unwrap());
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert!(!crate::PgMetadataStore::payload_reclaim_exists(
+                &*pg,
+                &bucket,
+                &key,
+                committed.generation_id,
+            )
+            .unwrap());
+        }
+        let lease = cluster
+            .acquire_object_payload_lease(&bucket, &key, committed.generation_id)
+            .expect("converged reclaim metadata delete must clear the in-memory lease fence");
+        drop(lease);
     }
 
     #[test]

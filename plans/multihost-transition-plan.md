@@ -1394,9 +1394,18 @@ Work items:
      - remove the obsolete `SharedStorageNode` streamed UploadPart create and
        finalize helpers, leaving streamed UploadPart metadata mutation on the
        cluster command path
-   - remaining slices:
-     - audit any remaining non-command multipart metadata paths
-     - reclaim rows and reclaim worker metadata transitions
+     - add a `DeleteObjectPayloadReclaim` command payload carrying the exact
+       reclaim row being removed after placed payload cleanup, so reclaim worker
+       metadata transitions converge across the object-PG acting set and
+       partial apply leaves a retryable pending command
+     - include acting-set convergence and partial-apply retry coverage for
+       reclaim-row deletion after payload cleanup
+     - audit and remove the remaining dead node-local metadata mutation
+       bypasses for direct object delete, streamed PutObject mutation, and
+       test-only multipart create; retained node-local multipart methods are
+       read-only/preflight helpers, while active mutation goes through the
+       cluster command path
+   - remaining slices: none; Phase 6.4 is ready for closeout review.
 5. Phase 6.5: synchronous replica apply.
    - apply every metadata command to all required replicas before acknowledging
      success

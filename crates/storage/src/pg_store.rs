@@ -22,12 +22,12 @@ use crate::metadata_command::{
     AbortMultipartUploadCommand, AbortStreamUploadCommand, AppendStreamSegmentCommand,
     BucketPropertyMutation, BucketSubresourceMutation, CommitDirectPutObjectCommand,
     CommitMultipartObjectCommand, CommitStreamPartCommand, CreateBucketCommand,
-    CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteObjectVersionCommand,
-    DeleteObjectVersionTarget, InsertDeleteMarkerCommand, MetadataCommandEnvelope,
-    MetadataCommandPayload, ObjectPayloadReclaimCommand, PutBucketAclCommand,
-    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
-    PutObjectMetadataCommand, PutObjectMetadataMutation, ReleaseObjectGenerationCommand,
-    ReserveObjectGenerationCommand,
+    CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteObjectPayloadReclaimCommand,
+    DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
+    MetadataCommandEnvelope, MetadataCommandPayload, ObjectPayloadReclaimCommand,
+    PutBucketAclCommand, PutBucketPropertyCommand, PutBucketSubresourceCommand,
+    PutBucketVersioningCommand, PutObjectMetadataCommand, PutObjectMetadataMutation,
+    ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
 };
 use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
@@ -2175,6 +2175,9 @@ impl PgStore {
             MetadataCommandPayload::AbortMultipartUpload(command) => {
                 self.apply_abort_multipart_upload_command(command)
             }
+            MetadataCommandPayload::DeleteObjectPayloadReclaim(command) => {
+                self.apply_delete_object_payload_reclaim_command(command)
+            }
         }
     }
 
@@ -2711,6 +2714,106 @@ impl PgStore {
                 self.put_multipart_reclaim_in_open_txn(reclaim)?;
                 self.delete_multipart_part_segments(bucket, key, version_id)?;
                 self.delete_object_parts(bucket, key, version_id)
+            }
+        }
+    }
+
+    fn validate_delete_payload_reclaim_command_root(
+        command: &DeleteObjectPayloadReclaimCommand,
+    ) -> Result<(), MetadataError> {
+        let matches_root = match &command.payload {
+            ObjectPayloadReclaimCommand::Segments(reclaim) => {
+                reclaim.bucket == command.bucket
+                    && reclaim.key == command.key
+                    && reclaim.generation_id == command.generation_id
+            }
+            ObjectPayloadReclaimCommand::Multipart(reclaim) => {
+                reclaim.bucket == command.bucket
+                    && reclaim.key == command.key
+                    && reclaim.generation_id == command.generation_id
+            }
+        };
+        if matches_root {
+            Ok(())
+        } else {
+            Err(MetadataError::Db {
+                context: "delete object payload reclaim command root mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            })
+        }
+    }
+
+    fn apply_delete_object_payload_reclaim_command(
+        &self,
+        command: &DeleteObjectPayloadReclaimCommand,
+    ) -> Result<(), MetadataError> {
+        Self::validate_delete_payload_reclaim_command_root(command)?;
+        match &command.payload {
+            ObjectPayloadReclaimCommand::Segments(expected) => {
+                match self.get_object_segments_reclaim(
+                    &command.bucket,
+                    &command.key,
+                    command.generation_id,
+                )? {
+                    Some(existing) if existing == *expected => self.delete_object_segments_reclaim(
+                        &command.bucket,
+                        &command.key,
+                        command.generation_id,
+                    ),
+                    Some(_) => Err(MetadataError::Db {
+                        context: "delete object payload reclaim command segment mismatch",
+                        source: rusqlite::Error::InvalidQuery,
+                    }),
+                    None => {
+                        if self
+                            .get_multipart_reclaim(
+                                &command.bucket,
+                                &command.key,
+                                command.generation_id,
+                            )?
+                            .is_some()
+                        {
+                            return Err(MetadataError::Db {
+                                context: "delete object payload reclaim command kind mismatch",
+                                source: rusqlite::Error::InvalidQuery,
+                            });
+                        }
+                        Ok(())
+                    }
+                }
+            }
+            ObjectPayloadReclaimCommand::Multipart(expected) => {
+                match self.get_multipart_reclaim(
+                    &command.bucket,
+                    &command.key,
+                    command.generation_id,
+                )? {
+                    Some(existing) if existing == *expected => self.delete_multipart_reclaim(
+                        &command.bucket,
+                        &command.key,
+                        command.generation_id,
+                    ),
+                    Some(_) => Err(MetadataError::Db {
+                        context: "delete object payload reclaim command multipart mismatch",
+                        source: rusqlite::Error::InvalidQuery,
+                    }),
+                    None => {
+                        if self
+                            .get_object_segments_reclaim(
+                                &command.bucket,
+                                &command.key,
+                                command.generation_id,
+                            )?
+                            .is_some()
+                        {
+                            return Err(MetadataError::Db {
+                                context: "delete object payload reclaim command kind mismatch",
+                                source: rusqlite::Error::InvalidQuery,
+                            });
+                        }
+                        Ok(())
+                    }
+                }
             }
         }
     }

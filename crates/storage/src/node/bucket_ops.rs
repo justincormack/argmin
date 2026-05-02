@@ -310,32 +310,6 @@ impl SharedStorageNode {
         )
     }
 
-    pub(super) fn lock_bucket_and_load_lifecycle_context(
-        &self,
-        bucket: &BucketName,
-    ) -> Result<Option<(BucketLockGuard<'_>, BucketInfo, Option<String>)>, ObjectPgActionError>
-    {
-        let bucket_guard = self.lock_bucket(bucket);
-        let bucket_pg = self.get_pg(self.pg_topology.bucket_pg_for(bucket))?;
-        let bucket_info = match PgMetadataStore::head_bucket(&*bucket_pg, bucket) {
-            Ok(info) => info,
-            Err(crate::error::MetadataError::BucketNotFound { .. }) => return Ok(None),
-            Err(other) => return Err(other.into()),
-        };
-        let raw_lifecycle = if bucket_info.bucket_lifecycle_present {
-            PgMetadataStore::get_bucket_subresource(
-                &*bucket_pg,
-                bucket,
-                BucketSubresourceKind::Lifecycle,
-            )?
-            .map(|stored| stored.body)
-        } else {
-            None
-        };
-        drop(bucket_pg);
-        Ok(Some((bucket_guard, bucket_info, raw_lifecycle)))
-    }
-
     pub fn try_finalize_bucket_delete(
         &self,
         bucket: &BucketName,

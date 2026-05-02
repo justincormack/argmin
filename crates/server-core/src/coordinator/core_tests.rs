@@ -3654,6 +3654,10 @@ fn delete_object_then_get_fails() {
 
 #[test]
 fn delete_object_eventually_reclaims_simple_shards() {
+    let _storage_serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
 
