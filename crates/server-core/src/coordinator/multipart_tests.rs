@@ -2342,7 +2342,7 @@ fn complete_multipart_upload_happy_path() {
 #[test]
 fn delete_multipart_object_eventually_reclaims_part_shards() {
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator(tmp.path());
+    let coord = setup_coordinator_without_reclaim_sweeper(tmp.path());
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
@@ -7324,7 +7324,7 @@ fn stream_put_delete_eventually_reclaims_segment_shards() {
         .lock()
         .unwrap();
     let dir = test_util::tempdir();
-    let coord = setup_coordinator(dir.path());
+    let coord = setup_coordinator_without_reclaim_sweeper(dir.path());
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();

@@ -3450,6 +3450,124 @@ mod tests {
     }
 
     #[test]
+    fn multipart_abort_retries_after_pending_install_conflict() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let upload_id = upload_id_from_label("mpuabortinstall");
+        let create = crate::CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
+        cluster
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), create.clone()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        let pg_id = PgId::new(object_pg);
+        let unrelated_session_id = crate::SessionId::try_from("37".repeat(16)).unwrap();
+        let injected = Arc::new(AtomicBool::new(false));
+        let injected_for_hook = Arc::clone(&injected);
+        let map_for_hook = Arc::clone(&map);
+        let bucket_for_hook = bucket.clone();
+        let key_for_hook = key.clone();
+        let session_for_hook = unrelated_session_id.clone();
+        let command_epoch = cluster.operation_epoch();
+        let _hook_guard =
+            cluster.test_install_before_abort_multipart_pending_install_hook(Arc::new(move || {
+                if injected_for_hook.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let command = MetadataCommandEnvelope::new(
+                    crate::metadata_command::MetadataCommandId::new(
+                        command_epoch,
+                        pg_id,
+                        map_for_hook
+                            .runtime_state()
+                            .next_metadata_command_log_index(pg_id),
+                    ),
+                    MetadataCommandPayload::CreateStreamUpload(Box::new(
+                        crate::metadata_command::CreateStreamUploadCommand {
+                            request: crate::CreateStreamUploadReq {
+                                session_id: session_for_hook.clone(),
+                                bucket: bucket_for_hook.clone(),
+                                key: key_for_hook.clone(),
+                                target: crate::StreamUploadTarget::PutObject,
+                                encryption: crate::ObjectEncryption::None,
+                            },
+                            created_at_millis: 123,
+                        },
+                    )),
+                );
+                map_for_hook
+                    .runtime_state()
+                    .try_set_pending_metadata_command_for_bucket(pg_id, &bucket_for_hook, command)
+                    .expect("abort pending-install hook should win the empty pending slot");
+            }));
+
+        assert!(cluster
+            .abort_multipart_upload(&bucket, &key, &upload_id)
+            .unwrap());
+        assert!(
+            injected.load(Ordering::SeqCst),
+            "test hook must exercise the abort pending-install conflict window"
+        );
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(pg_id, &bucket)
+            .is_none());
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id),
+                Err(crate::MetadataError::NoSuchUpload { .. })
+            ));
+            let session =
+                crate::PgMetadataStore::get_stream_upload(&*pg, &unrelated_session_id).unwrap();
+            assert_eq!(session.bucket, bucket);
+            assert_eq!(session.key, key);
+            assert_eq!(session.target, crate::StreamUploadTarget::PutObject);
+        }
+    }
+
+    #[test]
     fn multipart_abort_zero_apply_marks_upload_aborting_before_part_finalize() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

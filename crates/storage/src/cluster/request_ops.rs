@@ -47,8 +47,16 @@ type MetadataCommandApplyTestHook =
     Arc<dyn Fn(NodeId, &MetadataCommandEnvelope) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(test)]
+type AbortMultipartPendingInstallTestHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
 static BEFORE_METADATA_COMMAND_APPLY_HOOKS: OnceLock<
     Mutex<HashMap<usize, MetadataCommandApplyTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static BEFORE_ABORT_MULTIPART_PENDING_INSTALL_HOOKS: OnceLock<
+    Mutex<HashMap<usize, AbortMultipartPendingInstallTestHook>>,
 > = OnceLock::new();
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -62,9 +70,26 @@ pub(crate) struct MetadataCommandApplyTestHookGuard {
 }
 
 #[cfg(test)]
+pub(crate) struct AbortMultipartPendingInstallTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
 impl Drop for MetadataCommandApplyTestHookGuard {
     fn drop(&mut self) {
         let hooks = BEFORE_METADATA_COMMAND_APPLY_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for AbortMultipartPendingInstallTestHookGuard {
+    fn drop(&mut self) {
+        let hooks =
+            BEFORE_ABORT_MULTIPART_PENDING_INSTALL_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -114,6 +139,19 @@ fn maybe_run_before_metadata_command_apply_hook(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn maybe_run_before_abort_multipart_pending_install_hook(_scope_id: usize) {
+    let hook = BEFORE_ABORT_MULTIPART_PENDING_INSTALL_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&_scope_id)
+        .cloned();
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -316,6 +354,20 @@ impl super::StorageCluster {
             .unwrap_or_else(|e| e.into_inner())
             .insert(scope_id, hook);
         MetadataCommandApplyTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_before_abort_multipart_pending_install_hook(
+        &self,
+        hook: AbortMultipartPendingInstallTestHook,
+    ) -> AbortMultipartPendingInstallTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot =
+            BEFORE_ABORT_MULTIPART_PENDING_INSTALL_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        AbortMultipartPendingInstallTestHookGuard { scope_id }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -4748,37 +4800,44 @@ impl super::StorageCluster {
     ) -> Result<bool, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let runtime_state = self.local_map.runtime_state();
-        while let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket) {
-            let matching_abort = matches!(
-                command.payload(),
-                MetadataCommandPayload::AbortMultipartUpload(abort)
-                    if abort.bucket == *bucket
-                        && abort.key == *key
-                        && abort.upload_id == *upload_id
-            );
-            if matching_abort {
+        'retry_after_pending_conflict: loop {
+            while let Some(command) =
+                runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                let matching_abort = matches!(
+                    command.payload(),
+                    MetadataCommandPayload::AbortMultipartUpload(abort)
+                        if abort.bucket == *bucket
+                            && abort.key == *key
+                            && abort.upload_id == *upload_id
+                );
                 self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
-                return Ok(true);
+                if matching_abort {
+                    return Ok(true);
+                }
             }
-            self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
-        }
 
-        let Some(command) =
-            self.prepare_abort_multipart_upload_command(pg_id, bucket, key, upload_id)?
-        else {
-            return Ok(false);
-        };
-        let MetadataCommandPayload::AbortMultipartUpload(_) = command.payload() else {
-            unreachable!("prepared abort multipart command changed payload kind");
-        };
-        self.set_pending_metadata_command_for_bucket(
-            pg_id,
-            bucket,
-            &command,
-            "conflicting pending command for multipart abort",
-        )?;
-        self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
-        Ok(true)
+            let Some(command) =
+                self.prepare_abort_multipart_upload_command(pg_id, bucket, key, upload_id)?
+            else {
+                return Ok(false);
+            };
+            let MetadataCommandPayload::AbortMultipartUpload(_) = command.payload() else {
+                unreachable!("prepared abort multipart command changed payload kind");
+            };
+            #[cfg(test)]
+            maybe_run_before_abort_multipart_pending_install_hook(
+                self.metadata_command_apply_test_hook_scope_id(),
+            );
+            if runtime_state
+                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
+                .is_err()
+            {
+                continue 'retry_after_pending_conflict;
+            }
+            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            return Ok(true);
+        }
     }
 
     fn prepare_abort_multipart_upload_command(

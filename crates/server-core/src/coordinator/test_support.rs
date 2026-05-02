@@ -92,6 +92,23 @@ pub(crate) fn setup_coordinator(dir: &Path) -> Coordinator {
     setup_coordinator_with_pg_count(dir, DEFAULT_TEST_PG_COUNT)
 }
 
+pub(crate) fn setup_coordinator_without_reclaim_sweeper(dir: &Path) -> Coordinator {
+    let mut coord = setup_coordinator(dir);
+    stop_reclaim_sweeper_for_test(&mut coord);
+    coord
+}
+
+fn stop_reclaim_sweeper_for_test(coord: &mut Coordinator) {
+    coord
+        ._reclaim_sweeper
+        .stop
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    coord.storage_node.wake_reclaim_workers();
+    if let Some(handle) = coord._reclaim_sweeper.handle.take() {
+        let _ = handle.join();
+    }
+}
+
 pub(crate) fn setup_coordinator_in_region(dir: &Path, region: &str) -> Coordinator {
     let pg_ids: Vec<u32> = (0..DEFAULT_TEST_PG_COUNT).collect();
     let storage_cluster = open_test_storage_cluster(dir, &pg_ids);

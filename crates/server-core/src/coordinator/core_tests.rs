@@ -3859,7 +3859,7 @@ fn delete_object_eventually_reclaims_simple_shards() {
         .lock()
         .unwrap();
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator(tmp.path());
+    let coord = setup_coordinator_without_reclaim_sweeper(tmp.path());
 
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
@@ -3936,7 +3936,7 @@ fn reclaim_object_payload_delete_failure_keeps_retryable_reclaim_record() {
         .lock()
         .unwrap();
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator(tmp.path());
+    let coord = setup_coordinator_without_reclaim_sweeper(tmp.path());
 
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
