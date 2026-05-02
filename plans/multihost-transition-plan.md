@@ -1246,7 +1246,7 @@ Work items:
      - include deterministic command encoding coverage, primary/replica
        convergence tests, a partial-replica retry regression, and stale or
        same-generation divergent command rejection coverage
-4. Phase 6.4: object, stream, multipart, and reclaim command migration.
+4. Phase 6.4: object, stream, multipart, and reclaim command migration. Complete.
    - migrate ordinary object mutations, including generation
      reservation/release, direct PUT publish, delete, tag, ACL, retention, and
      legal-hold changes
@@ -1254,7 +1254,7 @@ Work items:
      multipart create/part/finalize/abort metadata, omitted-part cleanup
      metadata, and reclaim rows
    - keep multi-step workflows serialized by the PG primary command path
-   - completed so far:
+   - completed:
      - add `ReserveObjectGeneration`, `ReleaseObjectGeneration`, and
        `CommitDirectPutObject` metadata command payloads with deterministic
        canonical encoding and CRC64 coverage
@@ -1405,7 +1405,7 @@ Work items:
        test-only multipart create; retained node-local multipart methods are
        read-only/preflight helpers, while active mutation goes through the
        cluster command path
-   - remaining slices: none; Phase 6.4 is ready for closeout review.
+   - remaining slices: none; Phase 6.4 is complete.
 5. Phase 6.5: synchronous replica apply.
    - apply every metadata command to all required replicas before acknowledging
      success
