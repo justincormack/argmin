@@ -544,6 +544,25 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
     ) -> Result<(), MetadataCommandApplyFailure> {
         let pg_id = command.id().pg_id();
+        let primary_node_id = self
+            .local_map
+            .metadata_pg_primary_node(command.id().cluster_epoch(), pg_id)
+            .map_err(|source| MetadataCommandApplyFailure {
+                applied_nodes: 0,
+                source: source.into(),
+            })?
+            .node_id();
+        self.apply_metadata_command_to_acting_set_from_origin(primary_node_id, command)
+    }
+
+    fn apply_metadata_command_to_acting_set_from_origin(
+        &self,
+        origin_node_id: NodeId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), MetadataCommandApplyFailure> {
+        let runtime_state = self.local_map.runtime_state();
+        let _apply_guard = runtime_state.lock_metadata_command_apply();
+        let pg_id = command.id().pg_id();
         let mut nodes = self
             .local_map
             .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id)
@@ -558,6 +577,21 @@ impl super::StorageCluster {
             .primary_node_id();
         nodes.sort_by_key(|node| node.node_id() == primary_node_id);
         for (applied_nodes, node) in nodes.into_iter().enumerate() {
+            let acceptance = self
+                .local_map
+                .validate_metadata_command_for_replica(
+                    origin_node_id,
+                    node.node_id(),
+                    pg_id,
+                    command,
+                )
+                .map_err(|source| MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                })?;
+            if acceptance == super::local::MetadataCommandAcceptance::AlreadyApplied {
+                continue;
+            }
             maybe_run_before_metadata_command_apply_hook(
                 self.metadata_command_apply_test_hook_scope_id(),
                 node.node_id(),
@@ -599,8 +633,19 @@ impl super::StorageCluster {
                     applied_nodes,
                     source: source.into(),
                 })?;
+            runtime_state.mark_metadata_command_applied(node.node_id(), pg_id, command);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_apply_metadata_command_to_acting_set_from_origin(
+        &self,
+        origin_node_id: NodeId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.apply_metadata_command_to_acting_set_from_origin(origin_node_id, command)
+            .map_err(|error| error.source)
     }
 
     fn apply_pending_metadata_command_to_acting_set(

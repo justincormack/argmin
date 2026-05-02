@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
 
@@ -212,6 +212,8 @@ pub(crate) struct LocalClusterRuntimeState {
     object_payload_leases: Mutex<LocalObjectPayloadLeaseState>,
     reclaim_queue: (Mutex<LocalReclaimQueueState>, Condvar),
     metadata_command_indexes: Mutex<HashMap<PgId, u64>>,
+    metadata_command_apply_lock: Mutex<()>,
+    applied_metadata_commands: Mutex<HashMap<(NodeId, PgId, u64), u64>>,
     pending_metadata_commands: Mutex<HashMap<(PgId, BucketName), MetadataCommandEnvelope>>,
 }
 
@@ -235,6 +237,12 @@ struct LocalReclaimQueueState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PendingMetadataCommandConflict;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetadataCommandAcceptance {
+    Apply,
+    AlreadyApplied,
+}
+
 impl LocalClusterRuntimeState {
     fn new() -> Self {
         Self {
@@ -249,8 +257,16 @@ impl LocalClusterRuntimeState {
                 Condvar::new(),
             ),
             metadata_command_indexes: Mutex::new(HashMap::new()),
+            metadata_command_apply_lock: Mutex::new(()),
+            applied_metadata_commands: Mutex::new(HashMap::new()),
             pending_metadata_commands: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn lock_metadata_command_apply(&self) -> MutexGuard<'_, ()> {
+        self.metadata_command_apply_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     pub(crate) fn next_metadata_command_log_index(&self, pg_id: PgId) -> MetadataCommandLogIndex {
@@ -305,6 +321,51 @@ impl LocalClusterRuntimeState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&(pg_id, bucket.clone()));
+    }
+
+    fn metadata_command_acceptance(
+        &self,
+        target_node_id: NodeId,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        let command_log_index = command.id().log_index().get();
+        let applied_checksum = self
+            .applied_metadata_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(target_node_id, pg_id, command_log_index))
+            .copied();
+
+        let Some(applied_checksum) = applied_checksum else {
+            return Ok(MetadataCommandAcceptance::Apply);
+        };
+
+        if command.checksum_crc64() == applied_checksum {
+            return Ok(MetadataCommandAcceptance::AlreadyApplied);
+        }
+        Err(StoreError::MetadataCommandLogConflict {
+            node_id: target_node_id.as_u32(),
+            pg_id: pg_id.get(),
+            cluster_epoch,
+            log_index: command_log_index,
+        })
+    }
+
+    pub(crate) fn mark_metadata_command_applied(
+        &self,
+        target_node_id: NodeId,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) {
+        self.applied_metadata_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                (target_node_id, pg_id, command.id().log_index().get()),
+                command.checksum_crc64(),
+            );
     }
 
     pub(crate) fn clear_pending_metadata_command_for_bucket(
@@ -779,6 +840,95 @@ impl LocalClusterMap {
             .collect()
     }
 
+    pub(crate) fn validate_metadata_command_for_replica(
+        &self,
+        origin_node_id: NodeId,
+        target_node_id: NodeId,
+        target_pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        let command_pg_id = command.id().pg_id();
+        if command_pg_id != target_pg_id {
+            return Err(StoreError::MetadataCommandWrongPg {
+                node_id: target_node_id.as_u32(),
+                command_pg_id: command_pg_id.get(),
+                target_pg_id: target_pg_id.get(),
+                cluster_epoch: self.epoch,
+            });
+        }
+
+        let command_epoch = command.id().cluster_epoch();
+        if command_epoch != self.epoch {
+            return Err(StoreError::StaleMetadataCommand {
+                node_id: target_node_id.as_u32(),
+                pg_id: target_pg_id.get(),
+                command_epoch,
+                current_epoch: self.epoch,
+            });
+        }
+
+        let route = self
+            .pg_routes
+            .get(&target_pg_id)
+            .ok_or(StoreError::ClusterPgNotFound {
+                pg_id: target_pg_id.get(),
+                cluster_epoch: self.epoch,
+            })?;
+        if route.cluster_epoch() != self.epoch {
+            return Err(StoreError::StaleMetadataRoute {
+                pg_id: target_pg_id.get(),
+                route_epoch: route.cluster_epoch(),
+                current_epoch: self.epoch,
+            });
+        }
+        if !route.is_active() {
+            return Err(StoreError::PgNotActive {
+                pg_id: target_pg_id.get(),
+                cluster_epoch: self.epoch,
+                state: route.state(),
+            });
+        }
+
+        let primary_node_id = route.primary_node_id();
+        if !route.contains_node(primary_node_id) {
+            return Err(StoreError::NodeNotInActingSet {
+                node_id: primary_node_id.as_u32(),
+                pg_id: target_pg_id.get(),
+                cluster_epoch: self.epoch,
+            });
+        }
+        if origin_node_id != primary_node_id {
+            return Err(StoreError::MetadataCommandFromNonPrimary {
+                node_id: target_node_id.as_u32(),
+                pg_id: target_pg_id.get(),
+                cluster_epoch: self.epoch,
+                origin_node_id: origin_node_id.as_u32(),
+                primary_node_id: primary_node_id.as_u32(),
+            });
+        }
+        if !route.contains_node(target_node_id) {
+            return Err(StoreError::NodeNotInActingSet {
+                node_id: target_node_id.as_u32(),
+                pg_id: target_pg_id.get(),
+                cluster_epoch: self.epoch,
+            });
+        }
+        if !self.nodes.contains_key(&target_node_id) {
+            return Err(StoreError::NodeNotFound {
+                node_id: target_node_id.as_u32(),
+                pg_id: target_pg_id.get(),
+                cluster_epoch: self.epoch,
+            });
+        }
+
+        self.runtime_state.metadata_command_acceptance(
+            target_node_id,
+            target_pg_id,
+            self.epoch,
+            command,
+        )
+    }
+
     pub fn place_payload_shards(
         &self,
         operation_epoch: ClusterEpoch,
@@ -1131,7 +1281,9 @@ fn prepare_local_node_data_dir(
 mod tests {
     use super::*;
     use crate::metadata_command::{
-        BucketPropertyMutation, BucketSubresourceMutation, MetadataCommandPayload,
+        BucketPropertyMutation, BucketSubresourceMutation, CreateBucketCommand,
+        MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
+        MetadataCommandPayload,
     };
     use proptest::prelude::*;
     use proptest::test_runner::{TestCaseError, TestCaseResult};
@@ -1340,6 +1492,33 @@ mod tests {
                 object_lock: crate::BucketObjectLockConfig::default(),
             })
             .unwrap();
+    }
+
+    fn create_bucket_metadata_command(
+        pg_id: PgId,
+        log_index: u64,
+        bucket: crate::BucketName,
+    ) -> MetadataCommandEnvelope {
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                MetadataCommandLogIndex::new(log_index).unwrap(),
+            ),
+            MetadataCommandPayload::CreateBucket(CreateBucketCommand {
+                name: bucket,
+                owner_principal: "owner".to_string(),
+                owner_canonical_id: owner,
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                public_write: false,
+                versioning: crate::BucketVersioningState::Disabled,
+                object_lock: crate::BucketObjectLockConfig::default(),
+                created_at_millis: 1_234,
+                bucket_execution_generation: log_index,
+            }),
+        )
     }
 
     fn create_test_bucket_with_versioning(
@@ -2557,6 +2736,220 @@ mod tests {
                 cluster_epoch,
             } if cluster_epoch == ClusterEpoch::INITIAL
         ));
+    }
+
+    #[test]
+    fn metadata_command_replica_acceptance_rejects_invalid_route_context() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "replica-acceptance-");
+        let command = create_bucket_metadata_command(PgId::new(1), 1, bucket);
+        {
+            let route = map.pg_routes.get_mut(&PgId::new(1)).unwrap();
+            route.primary_node_id = NodeId::new(1);
+        }
+
+        let err = map
+            .validate_metadata_command_for_replica(
+                NodeId::new(0),
+                NodeId::new(2),
+                PgId::new(1),
+                &command,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::MetadataCommandFromNonPrimary {
+                node_id: 2,
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                origin_node_id: 0,
+                primary_node_id: 1,
+            }
+        ));
+
+        let stale_command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(2).unwrap(),
+                PgId::new(1),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            command.payload().clone(),
+        );
+        let err = map
+            .validate_metadata_command_for_replica(
+                NodeId::new(1),
+                NodeId::new(2),
+                PgId::new(1),
+                &stale_command,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::StaleMetadataCommand {
+                node_id: 2,
+                pg_id: 1,
+                command_epoch,
+                current_epoch: ClusterEpoch::INITIAL,
+            } if command_epoch == ClusterEpoch::new(2).unwrap()
+        ));
+
+        let err = map
+            .validate_metadata_command_for_replica(
+                NodeId::new(1),
+                NodeId::new(2),
+                PgId::new(0),
+                &command,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::MetadataCommandWrongPg {
+                node_id: 2,
+                command_pg_id: 1,
+                target_pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+            }
+        ));
+
+        let err = map
+            .validate_metadata_command_for_replica(
+                NodeId::new(1),
+                NodeId::new(99),
+                PgId::new(1),
+                &command,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::NodeNotInActingSet {
+                node_id: 99,
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+            }
+        ));
+    }
+
+    #[test]
+    fn metadata_command_apply_validates_origin_and_duplicate_conflict_without_mutation() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let first_bucket = bucket_for_pg(topology, 1, "accepted-command-");
+        let conflict_bucket = bucket_for_pg(topology, 1, "conflicting-command-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let first_command = create_bucket_metadata_command(PgId::new(1), 1, first_bucket.clone());
+
+        let err = cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(0), &first_command)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::BucketSnapshotLoadError::Store(StoreError::MetadataCommandFromNonPrimary {
+                node_id: 0,
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                origin_node_id: 0,
+                primary_node_id: 1,
+            })
+        ));
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::head_bucket(&*pg, &first_bucket),
+                Err(crate::MetadataError::BucketNotFound { .. })
+            ));
+        }
+
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &first_command)
+            .unwrap();
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &first_command)
+            .unwrap();
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket(&*pg, &first_bucket).unwrap();
+            assert_eq!(info.name, first_bucket);
+        }
+
+        let conflicting_command =
+            create_bucket_metadata_command(PgId::new(1), 1, conflict_bucket.clone());
+        let err = cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(
+                NodeId::new(1),
+                &conflicting_command,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+                node_id: 0,
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 1,
+            })
+        ));
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::head_bucket(&*pg, &conflict_bucket),
+                Err(crate::MetadataError::BucketNotFound { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn metadata_command_apply_accepts_unseen_lower_index_after_higher_index() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let earlier_bucket = bucket_for_pg(topology, 1, "earlier-command-");
+        let later_bucket = bucket_for_pg(topology, 1, "later-command-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let earlier_command =
+            create_bucket_metadata_command(PgId::new(1), 1, earlier_bucket.clone());
+        let later_command = create_bucket_metadata_command(PgId::new(1), 2, later_bucket.clone());
+
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &later_command)
+            .unwrap();
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &earlier_command)
+            .unwrap();
+
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let earlier = crate::PgMetadataStore::head_bucket(&*pg, &earlier_bucket).unwrap();
+            assert_eq!(earlier.name, earlier_bucket);
+            let later = crate::PgMetadataStore::head_bucket(&*pg, &later_bucket).unwrap();
+            assert_eq!(later.name, later_bucket);
+        }
     }
 
     #[test]

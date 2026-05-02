@@ -691,7 +691,6 @@ impl MetadataCommandEnvelope {
         &self.payload
     }
 
-    #[cfg(test)]
     pub(crate) fn checksum_crc64(&self) -> u64 {
         self.checksum_crc64
     }

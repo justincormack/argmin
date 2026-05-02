@@ -1406,15 +1406,34 @@ Work items:
        read-only/preflight helpers, while active mutation goes through the
        cluster command path
    - remaining slices: none; Phase 6.4 is complete.
-5. Phase 6.5: replica command acceptance hardening.
+5. Phase 6.5: replica command acceptance hardening. Complete.
    - keep the Phase 6.4 invariant that metadata commands are applied to every
      required acting-set replica before acknowledging success
    - add replica-side validation so commands are rejected when they come from a
-     non-primary origin, stale epoch, wrong PG, or out-of-order log position
+     non-primary origin, stale epoch, wrong PG, or a conflicting duplicate log
+     position
    - make fail-closed replica rejection explicit: writes fail when any required
      metadata replica rejects or cannot validate the command
    - cover accepted-command convergence and rejected-command non-mutation in
      no-failure and injected-rejection tests
+   - completed:
+     - replica acceptance now validates command origin, command epoch, target
+       PG, active acting-set membership, and per-replica log position before
+       mutating the local `PgStore`
+     - exact duplicate delivery of an already accepted command is treated as an
+       already-applied no-op, so partial-apply retry remains idempotent without
+       re-running local mutation
+     - same-index divergent commands fail closed with a typed `StoreError`
+       variant and do not mutate replica state
+     - unseen out-of-allocation-order log indexes are accepted in this
+       in-memory phase, because command indexes are allocated before the
+       apply lock and different buckets on the same PG can validly apply in a
+       different order until Phase 6.6 introduces a durable PG command log
+     - contiguous durable log-chain enforcement, hash chaining, and state
+       digests remain Phase 6.6 work
+     - tests cover invalid origin/epoch/PG/acting-set context, accepted
+       convergence, duplicate retry no-op, conflicting duplicate rejection,
+       valid out-of-allocation-order application, and non-mutation on rejection
 6. Phase 6.6: log chain and state digest.
    - add a durable command-log hash chain or equivalent replay state:
      epoch, PG ID, monotonically increasing log index, previous log hash, and

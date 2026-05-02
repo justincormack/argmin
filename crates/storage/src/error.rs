@@ -91,6 +91,47 @@ pub enum StoreError {
     },
 
     #[error(
+        "metadata command for local node {node_id} PG {pg_id} has epoch {command_epoch}, current cluster epoch is {current_epoch}"
+    )]
+    StaleMetadataCommand {
+        node_id: u32,
+        pg_id: u32,
+        command_epoch: ClusterEpoch,
+        current_epoch: ClusterEpoch,
+    },
+
+    #[error(
+        "metadata command for local node {node_id} targets PG {command_pg_id}, but was delivered to PG {target_pg_id} in epoch {cluster_epoch}"
+    )]
+    MetadataCommandWrongPg {
+        node_id: u32,
+        command_pg_id: u32,
+        target_pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+
+    #[error(
+        "metadata command for local node {node_id} PG {pg_id} epoch {cluster_epoch} came from node {origin_node_id}, expected primary node {primary_node_id}"
+    )]
+    MetadataCommandFromNonPrimary {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        origin_node_id: u32,
+        primary_node_id: u32,
+    },
+
+    #[error(
+        "metadata command for local node {node_id} PG {pg_id} epoch {cluster_epoch} conflicts with already-applied log index {log_index}"
+    )]
+    MetadataCommandLogConflict {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+    },
+
+    #[error(
         "shard operation for local node {node_id} PG {pg_id} has epoch {operation_epoch}, current cluster epoch is {current_epoch}"
     )]
     StaleShardOperation {
