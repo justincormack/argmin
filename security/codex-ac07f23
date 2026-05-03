@@ -1,0 +1,151 @@
+Bucket tags read before TagResource authorization
+Link: https://chatgpt.com/codex/cloud/security/findings/b1acb6289f2481919631b558294ef6bb?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: low (attack path: low)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: ac07f23
+Author: justin@specialbusservice.com
+Created: 02/05/2026, 11:06:51
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: the new merge-read authorization path permits loading bucket tags before requester authorization, and the HTTP TagResource path performs merge/validation using those tags before the final TagResource authorization.
+TagResource now reads the existing bucket tagging document and merges the requested tags before the s3:TagResource bucket-policy/owner authorization check is performed. The new authorize_bucket_tag_control_merge_read helper only validates that the supplied account id matches the bucket owner; it does not verify that the requester is the bucket owner or is allowed by bucket policy. Because merge validation can fail before the later authorize_put_bucket_tag_control call, an unauthorized or anonymous caller who knows the bucket name and owner account id can distinguish cases such as whether the existing tag set plus a crafted 50-tag request exceeds the tag limit. This can leak limited bucket tag metadata, such as tag count/key membership properties. Before this commit, get_bucket_tags_for_tag_resource used the stricter owner-admin authorization path before loading tags.
+
+# Resolution
+Fixed in commit [fb1678c](https://github.com/justincormack/argmin/commit/fb1678c) (`Authorize bucket tag merge reads before loading tags`).
+
+The weak `authorize_bucket_tag_control_merge_read` path was removed. TagResource and UntagResource now pass the requested tag context and concrete policy action into `get_bucket_tags_for_tag_resource`, which runs the same bucket-policy/owner authorization used by the write path before loading existing bucket tags for merge/removal. The write path still re-authorizes before storing or deleting tags.
+
+The fix also adds an AWS-facing regression test, `test_tag_resource_unauthorized_request_does_not_validate_merged_hidden_tags`, which creates a bucket with 49 hidden existing tags and verifies that an unauthorized alternate-account TagResource request adding two tags returns `AccessDenied` rather than leaking merged tag validation through `InvalidTag`.
+
+# Validation
+## Rubric
+- [x] Confirm the merge-read helper performs only bucket-owner account-id validation and not requester/bucket-policy authorization.
+- [x] Confirm TagResource HTTP dispatch loads existing tags and merges request tags before final TagResource authorization.
+- [x] Confirm merge validation can fail based on existing bucket tag state, specifically the 50-tag limit.
+- [x] Demonstrate an unauthorized cross-account requester who knows bucket name and owner account id can reach the merge path.
+- [x] Demonstrate observable differential results for two hidden tag states using the same unauthorized request.
+## Report
+Validated the finding as a real authorization-ordering information disclosure/oracle. Relevant code evidence: `crates/server-core/src/coordinator/authz/bucket.rs:266-275` defines `authorize_bucket_tag_control_merge_read`, which only opens the bucket and calls `validate_tag_resource_account_id`; it does not check the requester or bucket policy. `crates/server-core/src/coordinator/bucket.rs:587-591` uses that weak authorization before loading the Tagging subresource. `crates/server-http/src/http/mod.rs:1172-1178` then parses existing tags and calls `existing_tags.merge(&tags)?` before `put_bucket_tags_for_tag_resource` is invoked at `mod.rs:1180-1185`. The real TagResource authorization is later in `crates/server-core/src/coordinator/authz/bucket.rs:311-335`, where policy/owner checks are performed. I added a targeted unit-test PoC that creates two private buckets owned by `111122223333`, one with 48 tags and one with 49 tags, then performs the same cross-account TagResource request as `444455556666` with two new tags and the correct `x-amz-account-id`. Command output: `48-existing-tags unauthorized TagResource result: AccessDenied`; `49-existing-tags unauthorized TagResource result: InvalidTag { reason: "tags cannot be greater than 50, got 51" }`; test passed. This proves an unauthorized requester can distinguish existing tag-count state because the merge/validation error is observable before final authorization. I also ran LLDB non-interactively. The debugger trace hit `authorize_bucket_tag_resource_action` only after `HttpFrontend::dispatch_routed` called `put_bucket_tags_for_tag_resource` at `bucket.rs:605` / `mod.rs:1180`, confirming the final auth path is deferred until after merge. Valgrind was attempted but unavailable in the container (`bash: command not found: valgrind`). A direct crash is not expected because this is a logic/authorization flaw, not memory corruption; the targeted debug test reproduced the security behavior without a process crash.
+
+# Evidence
+crates/server-core/src/coordinator/authz/bucket.rs (L266 to 275)
+  Note: New merge-read authorization only validates the supplied account id against the bucket owner and does not check requester permissions or bucket policy before allowing the tag subresource to be loaded.
+```
+    pub(in crate::coordinator) fn authorize_bucket_tag_control_merge_read(
+        &self,
+        req: &BucketTagControlRequest<'_>,
+    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
+        self.with_bucket_write_handle_for(&req.bucket, BucketHandleRequest::new(), |bucket| {
+            Self::validate_tag_resource_account_id(bucket.bucket(), req.account_id)?;
+            Ok(AuthorizedBucketConfigAccess {
+                bucket: req.bucket.name_typed().clone(),
+            })
+        })
+```
+
+crates/server-core/src/coordinator/authz/bucket.rs (L311 to 335)
+  Note: The real bucket-policy/owner authorization for TagResource/UntagResource is deferred to this later write authorization path, after existing tags may already have influenced observable errors.
+```
+    fn authorize_bucket_tag_resource_action(
+        &self,
+        control: &BucketTagControlRequest<'_>,
+        request_tags: &[(String, String)],
+        action: auth::PolicyAction,
+    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
+        self.with_bucket_write_handle_for(
+            &control.bucket,
+            BucketHandleRequest::new()
+                .requiring_policy_view()
+                .requiring_bucket_tags_if_abac_enabled(),
+            |bucket| {
+                Self::validate_tag_resource_account_id(bucket.bucket(), control.account_id)?;
+                let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+                let policy_decision = self.bucket_policy_decision_for_loaded_handle_with_context(
+                    &control.bucket.requester,
+                    &bucket,
+                    action,
+                    PutObjectPolicyContext::default().with_request_tags(Some(request_tags)),
+                    bucket_policy.as_deref(),
+                )?;
+                if !Self::bucket_policy_allows_with_fallback(
+                    &control.bucket.requester,
+                    bucket.bucket(),
+                    policy_decision,
+```
+
+crates/server-core/src/coordinator/bucket.rs (L580 to 588)
+  Note: get_bucket_tags_for_tag_resource now uses the weak merge-read authorization and then loads the bucket Tagging subresource.
+```
+    ) -> Result<Option<String>, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_tags_for_tag_resource",
+            "bucket={:?}",
+            req.bucket.name
+        );
+        let authorized = self.authorize_bucket_tag_control_merge_read(req)?;
+        self.load_authorized_bucket_subresource(&AuthorizedBucketSubresourceGet {
+```
+
+crates/server-http/src/http/mod.rs (L1172 to 1184)
+  Note: The TagResource handler reads existing tags and performs merge validation before calling put_bucket_tags_for_tag_resource, where the actual s3:TagResource authorization is performed.
+```
+                let existing_tags = self
+                    .coordinator
+                    .get_bucket_tags_for_tag_resource(&control)?
+                    .map(|tagging_xml| xml::TagSet::parse_tagging_xml(tagging_xml.as_bytes(), 50))
+                    .transpose()?
+                    .unwrap_or_else(|| xml::TagSet::empty(50));
+                let merged_tags = existing_tags.merge(&tags)?;
+                let merged_xml = merged_tags.to_xml();
+                self.coordinator.put_bucket_tags_for_tag_resource(
+                    &crate::coordinator::PutBucketTagControlRequest {
+                        control,
+                        config: &merged_xml,
+                        request_tags: tags.as_slice(),
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Severity remains low. The vulnerability is in-scope and validated: production TagResource handling reads and merges existing bucket tags before the real requester/bucket-policy authorization, and an executable PoC showed differential AccessDenied versus InvalidTag results for unauthorized cross-account requests. However, the disclosed information is narrow metadata state, not object data, secrets, or write capability. Preconditions include knowing the bucket name and owner account id and having network reachability to the service. These factors support low impact and low exploitation likelihood rather than medium/high severity.
+## Likelihood
+high - The path is a normal HTTP API and can be reached without valid credentials, but useful exploitation requires service reachability plus knowledge of both bucket name and owner account id and carefully crafted tag sets. Repository defaults bind to localhost and no public ingress manifests were found. | Remote network vector
+## Impact
+low - The bug leaks limited bucket tag metadata properties such as count thresholds and possible key membership through error differences. It does not disclose object contents, tag values directly, credentials, or permit unauthorized modification because the real write authorization still executes before storage when merge succeeds.
+## Assumptions
+- Analysis is limited to repository artifacts in /workspace/argmin; no cloud APIs or live deployment checks were performed.
+- The argmin-s3 HTTP service may be bound beyond localhost by setting ARGMIN_LISTEN_ADDR, but the repository contains no deployment manifests proving public internet exposure.
+- An attacker must know or guess a bucket name and the bucket owner's 12-digit account id supplied through x-amz-account-id.
+- argmin-s3 HTTP endpoint reachable by attacker
+- target bucket exists
+- attacker knows bucket name
+- attacker knows or can guess bucket owner account id
+- existing bucket tags are in a state where merge validation differs, such as near the 50-tag limit or overlapping crafted keys
+## Path
+HTTP client -> TagResource route -> parse account id/XML -> weak merge-read auth -> load existing tags -> merge/validate -> [InvalidTag before auth OR final AccessDenied]
+## Path evidence
+- `crates/server-http/src/http/router.rs:319-323` - Production router exposes POST /v20180820/tags/* as the TagResource operation.
+- `crates/server-http/src/http/mod.rs:1163-1186` - TagResource dispatch parses attacker input, loads existing tags, merges and validates them before calling put_bucket_tags_for_tag_resource.
+- `crates/server-core/src/coordinator/authz/bucket.rs:266-275` - authorize_bucket_tag_control_merge_read only validates the supplied account id against the bucket owner and returns AuthorizedBucketConfigAccess without requester or bucket-policy authorization.
+- `crates/server-core/src/coordinator/bucket.rs:580-591` - get_bucket_tags_for_tag_resource uses the weak merge-read authorization and then loads the private bucket Tagging subresource.
+- `crates/server-core/src/coordinator/authz/bucket.rs:311-337` - The real TagResource/UntagResource authorization using bucket policy and owner fallback occurs later, after merge validation can already have produced an observable error.
+- `crates/argmin-s3/src/config.rs:35-68` - Main service configuration shows the HTTP listen address is environment-controlled with default 127.0.0.1:9000; no repository manifests prove public exposure.
+## Narrative
+The finding is real and reachable in the production HTTP API. The router maps POST /v20180820/tags/* to TagResource. The handler reads existing bucket tags and merges attacker-supplied tags before calling the function that performs the actual s3:TagResource bucket-policy/owner authorization. The pre-merge helper only validates that x-amz-account-id matches the bucket owner; it does not authorize the requester. This creates an oracle: an unauthorized or anonymous caller who knows the bucket name and owner account id can distinguish hidden tag states from different errors, such as InvalidTag when the merged count exceeds 50 versus AccessDenied when final authorization is reached. Impact is limited to low-sensitivity bucket tag metadata properties, not object data or write access, so low severity is appropriate.
+## Controls
+- AWS SigV4 authentication exists, but MissingAuth is converted to anonymous context for request dispatch.
+- Final bucket policy/owner authorization for TagResource exists but is performed after the vulnerable metadata-dependent merge.
+- x-amz-account-id must match the bucket owner account id.
+- Bucket tag XML parsing validates tag format and the 50-tag bucket limit.
+- Default listen address is localhost; external exposure depends on deployment configuration.
+- Optional TLS can be configured with ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH.
+## Blindspots
+- No deployment manifests, Kubernetes Services, load balancers, or Terraform were present, so actual public exposure cannot be determined statically.
+- Static analysis did not enumerate every possible tag-state oracle beyond the validated count/merge behavior.
+- Operational controls such as reverse proxies, network ACLs, or rate limits outside the repository are unknown.
