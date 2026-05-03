@@ -1171,7 +1171,11 @@ impl HttpFrontend {
                 };
                 let existing_tags = self
                     .coordinator
-                    .get_bucket_tags_for_tag_resource(&control)?
+                    .get_bucket_tags_for_tag_resource(
+                        &control,
+                        tags.as_slice(),
+                        auth::PolicyAction::TagResource,
+                    )?
                     .map(|tagging_xml| xml::TagSet::parse_tagging_xml(tagging_xml.as_bytes(), 50))
                     .transpose()?
                     .unwrap_or_else(|| xml::TagSet::empty(50));
@@ -1206,7 +1210,11 @@ impl HttpFrontend {
                 };
                 let existing_tags = self
                     .coordinator
-                    .get_bucket_tags_for_tag_resource(&control)?
+                    .get_bucket_tags_for_tag_resource(
+                        &control,
+                        request_tags.as_slice(),
+                        auth::PolicyAction::UntagResource,
+                    )?
                     .map(|tagging_xml| xml::TagSet::parse_tagging_xml(tagging_xml.as_bytes(), 50))
                     .transpose()?
                     .unwrap_or_else(|| xml::TagSet::empty(50));

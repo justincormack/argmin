@@ -2129,3 +2129,47 @@ fn test_untag_resource_rejects_missing_empty_and_invalid_tag_keys() {
         cleanup(&bucket, &[]).await;
     });
 }
+
+#[test]
+fn test_tag_resource_unauthorized_request_does_not_validate_merged_hidden_tags() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_policy(client).await;
+
+        let existing_tags = (0..49)
+            .map(|idx| tag(&format!("existing-{idx}"), "value"))
+            .collect::<Vec<_>>();
+        client
+            .put_bucket_tagging()
+            .bucket(&bucket)
+            .tagging(tagging(existing_tags))
+            .send()
+            .await
+            .unwrap();
+
+        let new_tags = [
+            ("new-tag-0".to_string(), "value".to_string()),
+            ("new-tag-1".to_string(), "value".to_string()),
+        ];
+        let new_tag_refs = new_tags
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        let denied = eventually_raw_status(
+            "Unauthorized TagResource should deny before validating the hidden merged tag set",
+            403,
+            || tag_resource_with_credentials(&bucket, &new_tag_refs, raw_alt_credentials()),
+        )
+        .await;
+        assert!(
+            denied.body.contains("<Code>AccessDenied</Code>"),
+            "unexpected denied response: {denied:?}"
+        );
+        assert!(
+            !denied.body.contains("<Code>InvalidTag</Code>"),
+            "unauthorized TagResource leaked merged tag validation: {denied:?}"
+        );
+
+        cleanup(&bucket, &[]).await;
+    });
+}

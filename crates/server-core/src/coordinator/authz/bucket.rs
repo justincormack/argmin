@@ -263,18 +263,6 @@ impl Coordinator {
         })
     }
 
-    pub(in crate::coordinator) fn authorize_bucket_tag_control_merge_read(
-        &self,
-        req: &BucketTagControlRequest<'_>,
-    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
-        self.with_bucket_write_handle_for(&req.bucket, BucketHandleRequest::new(), |bucket| {
-            Self::validate_tag_resource_account_id(bucket.bucket(), req.account_id)?;
-            Ok(AuthorizedBucketConfigAccess {
-                bucket: req.bucket.name_typed().clone(),
-            })
-        })
-    }
-
     pub(in crate::coordinator) fn authorize_put_bucket_tag_control(
         &self,
         req: &PutBucketTagControlRequest<'_>,
@@ -308,7 +296,7 @@ impl Coordinator {
         )
     }
 
-    fn authorize_bucket_tag_resource_action(
+    pub(in crate::coordinator) fn authorize_bucket_tag_resource_action(
         &self,
         control: &BucketTagControlRequest<'_>,
         request_tags: &[(String, String)],

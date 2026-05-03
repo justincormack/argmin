@@ -577,6 +577,8 @@ impl Coordinator {
     pub fn get_bucket_tags_for_tag_resource(
         &self,
         req: &BucketTagControlRequest<'_>,
+        request_tags: &[(String, String)],
+        action: auth::PolicyAction,
     ) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -584,7 +586,7 @@ impl Coordinator {
             "bucket={:?}",
             req.bucket.name
         );
-        let authorized = self.authorize_bucket_tag_control_merge_read(req)?;
+        let authorized = self.authorize_bucket_tag_resource_action(req, request_tags, action)?;
         self.load_authorized_bucket_subresource(&AuthorizedBucketSubresourceGet {
             bucket: authorized.bucket,
             kind: storage::BucketSubresourceKind::Tagging,
