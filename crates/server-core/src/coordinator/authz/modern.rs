@@ -139,6 +139,7 @@ impl Coordinator {
         &self,
         req: &AuthorizePutObjectRequest<'_>,
         bucket: BoeLoadedBucketHandle<'_>,
+        existing_object: Option<&StoredObject>,
     ) -> Result<AuthorizedPutObjectWrite, ServerError> {
         let key = req.object.key();
         let bucket_info = ValidatedBucket(bucket.bucket().clone());
@@ -158,6 +159,19 @@ impl Coordinator {
         )? != ModernObjectWriteAuthorization::Allowed
         {
             return Err(ServerError::AccessDenied);
+        }
+        if let (Some(_), Some(object)) = (req.policy_context.if_match, existing_object) {
+            let can_read = read_object_authorization_with_bucket_policy(
+                req.object.requester(),
+                modern_bucket,
+                modern_bucket_tags,
+                object,
+                ModernReadAction::ReadCurrent,
+                bucket_policy.as_deref(),
+            )? == ModernObjectReadAuthorization::Allowed;
+            if !can_read {
+                return Err(ServerError::AccessDenied);
+            }
         }
         self.finalize_authorized_put_object_write_after_auth(req, &bucket_info)
     }

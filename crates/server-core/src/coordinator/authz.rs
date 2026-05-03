@@ -196,9 +196,8 @@ impl Coordinator {
         existing_object: Option<&StoredObject>,
     ) -> Result<AuthorizedPutObjectWrite, ServerError> {
         match ObjectAuthLoadedBucketHandle::classify(bucket) {
-            ObjectAuthLoadedBucketHandle::Boe(bucket) => {
-                self.authorize_put_object_write_with_existing_object_boe(req, bucket)
-            }
+            ObjectAuthLoadedBucketHandle::Boe(bucket) => self
+                .authorize_put_object_write_with_existing_object_boe(req, bucket, existing_object),
             ObjectAuthLoadedBucketHandle::NonBoe(bucket) => self
                 .authorize_put_object_write_with_existing_object_non_boe(
                     req,
@@ -1406,6 +1405,20 @@ impl Coordinator {
         )?;
         if !can_put_object {
             return Ok(false);
+        }
+
+        if let (Some(_), Some(object)) = (policy_context.if_match, existing_object) {
+            let can_read = self.requester_can_read_object_with_bucket_policy(
+                access.requester,
+                access.bucket,
+                access.bucket_tags,
+                object,
+                auth::PolicyAction::GetObject,
+                access.policy,
+            )?;
+            if !can_read {
+                return Ok(false);
+            }
         }
 
         if policy_context.request_object_tags_xml.is_none() {

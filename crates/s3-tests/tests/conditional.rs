@@ -4,12 +4,20 @@ use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration,
 };
 use s3_tests::{cleanup_versioned_bucket, err_status, unique_bucket, CTX};
+use serde_json::json;
 
 /// Create a bucket, returning its name.
 async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
     s3_tests::create_bucket(client, &bucket).await.unwrap();
+    bucket
+}
+
+async fn setup_bucket_allowing_policy() -> String {
+    let client = CTX.client();
+    let bucket = setup_bucket().await;
+    s3_tests::disable_bucket_public_access_block(client, &bucket).await;
     bucket
 }
 
@@ -62,6 +70,76 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
         let _ = client.delete_object().bucket(bucket).key(*key).send().await;
     }
     client.delete_bucket().bucket(bucket).send().await.unwrap();
+}
+
+fn bucket_wildcard_resource(bucket: &str) -> String {
+    format!("arn:aws:s3:::{bucket}/*")
+}
+
+fn alt_policy_principal() -> serde_json::Value {
+    json!({ "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) })
+}
+
+async fn put_bucket_policy_for_alt(bucket: &str, actions: serde_json::Value) {
+    CTX.client()
+        .put_bucket_policy()
+        .bucket(bucket)
+        .policy(
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": actions,
+                    "Resource": bucket_wildcard_resource(bucket)
+                }],
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+}
+
+async fn wait_for_alt_put_object(bucket: &str, key: &str) {
+    for attempt in 0..20 {
+        let result = CTX
+            .alt_client()
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"policy-convergence"))
+            .send()
+            .await;
+        if result.is_ok() {
+            return;
+        }
+        if attempt + 1 < 20 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    panic!("alt PutObject policy allow did not converge");
+}
+
+async fn wait_for_alt_get_object(bucket: &str, key: &str) {
+    for attempt in 0..20 {
+        let result = CTX
+            .alt_client()
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
+        if result.is_ok() {
+            return;
+        }
+        if attempt + 1 < 20 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    panic!("alt GetObject policy allow did not converge");
 }
 
 // ── GET If-Match ────────────────────────────────────────────────────────
@@ -587,6 +665,68 @@ fn test_put_object_ifnonmatch_overwrite_existed_failed() {
     });
 }
 
+#[test]
+fn test_put_object_ifnonmatch_requires_put_object_only() {
+    s3_tests::run(async {
+        let bucket = setup_bucket_allowing_policy().await;
+        put_object(&bucket, "existing", b"original").await;
+        put_bucket_policy_for_alt(&bucket, json!("s3:PutObject")).await;
+
+        let allowed_key = "if-none-match-put-only-new";
+        for attempt in 0..20 {
+            let result = CTX
+                .alt_client()
+                .put_object()
+                .bucket(&bucket)
+                .key(allowed_key)
+                .if_none_match("*")
+                .body(ByteStream::from_static(b"created"))
+                .send()
+                .await;
+            if result.is_ok() {
+                break;
+            }
+            if attempt + 1 == 20 {
+                panic!("alt conditional PutObject policy allow did not converge");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        let denied_read = CTX
+            .alt_client()
+            .get_object()
+            .bucket(&bucket)
+            .key("existing")
+            .send()
+            .await;
+        assert_eq!(err_status(&denied_read), 403);
+
+        let existing_write = CTX
+            .alt_client()
+            .put_object()
+            .bucket(&bucket)
+            .key("existing")
+            .if_none_match("*")
+            .body(ByteStream::from_static(b"overwrite"))
+            .send()
+            .await;
+        assert_eq!(err_status(&existing_write), 412);
+
+        let owner_read = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key("existing")
+            .send()
+            .await
+            .unwrap();
+        let data = owner_read.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"original");
+
+        cleanup(&bucket, &["existing", allowed_key]).await;
+    });
+}
+
 // ── PUT If-Match (conditional overwrite) ────────────────────────────────
 
 #[test]
@@ -652,6 +792,54 @@ fn test_put_object_ifmatch_failed() {
         assert_eq!(&data[..], b"v1");
 
         cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_put_object_ifmatch_requires_put_object_and_get_object() {
+    s3_tests::run(async {
+        let bucket = setup_bucket_allowing_policy().await;
+        let etag = put_object(&bucket, "existing", b"original").await;
+        put_bucket_policy_for_alt(&bucket, json!("s3:PutObject")).await;
+
+        wait_for_alt_put_object(&bucket, "if-match-put-only-control").await;
+
+        let missing_get = CTX
+            .alt_client()
+            .put_object()
+            .bucket(&bucket)
+            .key("existing")
+            .if_match(&etag)
+            .body(ByteStream::from_static(b"without-get"))
+            .send()
+            .await;
+        assert_eq!(err_status(&missing_get), 403);
+
+        put_bucket_policy_for_alt(&bucket, json!(["s3:PutObject", "s3:GetObject"])).await;
+        wait_for_alt_get_object(&bucket, "existing").await;
+
+        CTX.alt_client()
+            .put_object()
+            .bucket(&bucket)
+            .key("existing")
+            .if_match(&etag)
+            .body(ByteStream::from_static(b"with-get"))
+            .send()
+            .await
+            .unwrap();
+
+        let overwritten = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key("existing")
+            .send()
+            .await
+            .unwrap();
+        let data = overwritten.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"with-get");
+
+        cleanup(&bucket, &["existing", "if-match-put-only-control"]).await;
     });
 }
 
