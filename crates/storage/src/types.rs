@@ -2692,6 +2692,7 @@ pub struct ListObjectVersionsReq {
     pub prefix: Option<ObjectKey>,
     pub key_marker: Option<ObjectKey>,
     pub version_id_marker: Option<VersionId>,
+    pub start_at: Option<ObjectKey>,
     pub max_keys: u32,
 }
 

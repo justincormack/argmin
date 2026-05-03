@@ -7014,7 +7014,11 @@ impl PgMetadataStore for PgStore {
             vec![Box::new(req.bucket.clone())];
         let mut param_idx = 2;
 
-        if let Some(ref key_marker) = req.key_marker {
+        if let Some(ref start_at) = req.start_at {
+            where_clauses.push(format!("key >= ?{param_idx}"));
+            params_vec.push(Box::new(start_at.clone()));
+            param_idx += 1;
+        } else if let Some(ref key_marker) = req.key_marker {
             if let Some(vid_marker) = req.version_id_marker {
                 if let Some(write_sequence) = self.object_write_sequence(
                     req.bucket.as_str(),

@@ -308,6 +308,15 @@ enum ListObjectsPageStart {
     At(ObjectKey),
 }
 
+#[derive(Clone)]
+enum ListVersionsPageStart {
+    After {
+        key_marker: ObjectKey,
+        version_id_marker: Option<VersionId>,
+    },
+    At(ObjectKey),
+}
+
 struct ObjectCursor {
     pg_id: u32,
     objects: Vec<StoredObject>,
@@ -325,8 +334,7 @@ struct VersionCursor {
     pg_id: u32,
     versions: Vec<StoredObject>,
     next_index: usize,
-    next_key_marker: Option<ObjectKey>,
-    next_version_id_marker: Option<VersionId>,
+    next_page_start: Option<ListVersionsPageStart>,
 }
 
 impl VersionCursor {
@@ -1052,6 +1060,7 @@ impl super::StorageCluster {
                 prefix: None,
                 key_marker: None,
                 version_id_marker: None,
+                start_at: None,
                 max_keys: 1,
             })?;
             if !versions.versions.is_empty() {
@@ -1797,6 +1806,7 @@ impl super::StorageCluster {
                     prefix: None,
                     key_marker: key_marker.clone(),
                     version_id_marker,
+                    start_at: None,
                     max_keys: INTERNAL_LIST_PAGE_SIZE,
                 })?;
                 drop(pg);
@@ -1811,8 +1821,7 @@ impl super::StorageCluster {
                 pg_id,
                 versions,
                 next_index: 0,
-                next_key_marker: None,
-                next_version_id_marker: None,
+                next_page_start: None,
             });
         }
 
@@ -2130,33 +2139,53 @@ impl super::StorageCluster {
         let delimiter = delimiter.filter(|delimiter| !delimiter.is_empty());
         let prefix_str = prefix.as_ref().map_or("", ObjectKey::as_str);
         let fetch_versions_page = |cursor: &mut VersionCursor,
-                                   key_marker: Option<ObjectKey>,
-                                   version_id_marker: Option<VersionId>|
+                                   start: Option<ListVersionsPageStart>|
          -> Result<(), ObjectPgActionError> {
+            let (key_marker, version_id_marker, start_at) = match start {
+                Some(ListVersionsPageStart::After {
+                    key_marker,
+                    version_id_marker,
+                }) => (Some(key_marker), version_id_marker, None),
+                Some(ListVersionsPageStart::At(key)) => (None, None, Some(key)),
+                None => (None, None, None),
+            };
             let pg = self.metadata_pg(cursor.pg_id)?;
             let resp = pg.list_object_versions(&ListObjectVersionsReq {
                 bucket: bucket.clone(),
                 prefix: prefix.clone(),
                 key_marker,
                 version_id_marker,
+                start_at,
                 max_keys: fetch_limit,
             })?;
             cursor.versions = resp.versions;
             cursor.next_index = 0;
-            cursor.next_key_marker = resp.next_key_marker;
-            cursor.next_version_id_marker = resp.next_version_id_marker;
+            cursor.next_page_start =
+                resp.next_key_marker
+                    .map(|key_marker| ListVersionsPageStart::After {
+                        key_marker,
+                        version_id_marker: resp.next_version_id_marker,
+                    });
             Ok(())
         };
 
         let refill_cursor = |cursor: &mut VersionCursor| -> Result<(), ObjectPgActionError> {
             while cursor.current().is_none() {
-                let Some(next_key_marker) = cursor.next_key_marker.clone() else {
+                let Some(next_start) = cursor.next_page_start.clone() else {
                     break;
                 };
-                let next_version_id_marker = cursor.next_version_id_marker;
-                fetch_versions_page(cursor, Some(next_key_marker), next_version_id_marker)?;
+                fetch_versions_page(cursor, Some(next_start))?;
             }
             Ok(())
+        };
+
+        let jump_cursor_to = |cursor: &mut VersionCursor,
+                              start: ListVersionsPageStart|
+         -> Result<(), ObjectPgActionError> {
+            cursor.versions.clear();
+            cursor.next_index = 0;
+            cursor.next_page_start = Some(start);
+            refill_cursor(cursor)
         };
 
         let skip_cursor_prefix =
@@ -2177,10 +2206,15 @@ impl super::StorageCluster {
                 pg_id,
                 versions: Vec::new(),
                 next_index: 0,
-                next_key_marker: None,
-                next_version_id_marker: None,
+                next_page_start: None,
             };
-            fetch_versions_page(&mut cursor, key_marker.clone(), version_id_marker)?;
+            let initial_start = key_marker
+                .clone()
+                .map(|key_marker| ListVersionsPageStart::After {
+                    key_marker,
+                    version_id_marker,
+                });
+            fetch_versions_page(&mut cursor, initial_start)?;
             cursors.push(cursor);
         }
 
@@ -2193,7 +2227,9 @@ impl super::StorageCluster {
         let mut active_common_prefix = key_marker.as_ref().and_then(|marker| {
             let delimiter = delimiter?;
             let after_prefix = marker.as_str().strip_prefix(prefix_str)?;
-            after_prefix.ends_with(delimiter).then(|| marker.clone())
+            after_prefix
+                .ends_with(delimiter)
+                .then(|| (marker.clone(), crate::object_key_prefix_upper_bound(marker)))
         });
 
         while let Some((cursor_index, current_key)) = cursors
@@ -2210,9 +2246,16 @@ impl super::StorageCluster {
                     .then_with(|| left_index.cmp(right_index))
             })
         {
-            if let Some(ref common_prefix) = active_common_prefix {
+            if let Some((ref common_prefix, ref upper_bound)) = active_common_prefix {
                 if current_key.as_str().starts_with(common_prefix.as_str()) {
-                    skip_cursor_prefix(&mut cursors[cursor_index], common_prefix.as_str())?;
+                    if let Some(upper_bound) = upper_bound.clone() {
+                        jump_cursor_to(
+                            &mut cursors[cursor_index],
+                            ListVersionsPageStart::At(upper_bound),
+                        )?;
+                    } else {
+                        skip_cursor_prefix(&mut cursors[cursor_index], common_prefix.as_str())?;
+                    }
                     continue;
                 }
                 active_common_prefix = None;
@@ -2226,12 +2269,23 @@ impl super::StorageCluster {
                 if let Some(common_prefix_key) =
                     crate::object_key_common_prefix(current.key(), prefix_str, delimiter)
                 {
-                    active_common_prefix = Some(common_prefix_key.clone());
+                    let upper_bound = crate::object_key_prefix_upper_bound(&common_prefix_key);
+                    active_common_prefix = Some((common_prefix_key.clone(), upper_bound.clone()));
                     if key_marker
                         .as_ref()
                         .is_some_and(|marker| common_prefix_key.as_str() <= marker.as_str())
                     {
-                        skip_cursor_prefix(&mut cursors[cursor_index], common_prefix_key.as_str())?;
+                        if let Some(upper_bound) = upper_bound {
+                            jump_cursor_to(
+                                &mut cursors[cursor_index],
+                                ListVersionsPageStart::At(upper_bound),
+                            )?;
+                        } else {
+                            skip_cursor_prefix(
+                                &mut cursors[cursor_index],
+                                common_prefix_key.as_str(),
+                            )?;
+                        }
                         continue;
                     }
                     if versions.len() + common_prefixes.len() >= max {

@@ -4292,6 +4292,7 @@ mod prop_tests {
             prefix: None,
             key_marker: None,
             version_id_marker: None,
+            start_at: None,
             max_keys: UNPAGINATED_MAX_KEYS,
         }) {
             Ok(resp) => {
@@ -4343,6 +4344,7 @@ mod prop_tests {
             prefix: None,
             key_marker,
             version_id_marker,
+            start_at: None,
             max_keys,
         }) {
             Ok(resp) => Ok((
@@ -7153,6 +7155,7 @@ fn list_object_versions_basic() {
             prefix: None,
             key_marker: None,
             version_id_marker: None,
+            start_at: None,
             max_keys: 10,
         })
         .unwrap();
@@ -7196,6 +7199,7 @@ fn list_object_versions_pagination() {
             prefix: None,
             key_marker: None,
             version_id_marker: None,
+            start_at: None,
             max_keys: 2,
         })
         .unwrap();
@@ -7211,11 +7215,59 @@ fn list_object_versions_pagination() {
             prefix: None,
             key_marker: resp.next_key_marker,
             version_id_marker: resp.next_version_id_marker,
+            start_at: None,
             max_keys: 2,
         })
         .unwrap();
     assert_eq!(resp2.versions.len(), 1);
     assert!(!resp2.is_truncated);
+}
+
+#[test]
+fn list_object_versions_start_at_uses_inclusive_key_lower_bound() {
+    let (_dir, store) = make_pg_store();
+
+    for key in ["largeprefix/a", "largeprefix/b", "z.txt"] {
+        store
+            .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+                bucket: bucket_name("bucket"),
+                key: object_key(key),
+                version_id: VersionId::Null,
+                owner: test_owner(),
+                acl_grants: AclGrants::default(),
+                public_read: false,
+                generation_id: GenerationId::MIN,
+                ec: EcShape { k: 4, m: 2 },
+                size: 10,
+                etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
+                layout: ObjectLayout::Standard,
+                tags: None,
+                metadata_blob: None,
+                system_metadata_blob: None,
+                object_lock: ObjectLockState::default(),
+                encryption: ObjectEncryption::None,
+            }))
+            .unwrap();
+    }
+
+    let resp = store
+        .list_object_versions(&ListObjectVersionsReq {
+            bucket: bucket_name("bucket"),
+            prefix: None,
+            key_marker: None,
+            version_id_marker: None,
+            start_at: crate::object_key_prefix_upper_bound(&object_key("largeprefix/")),
+            max_keys: 10,
+        })
+        .unwrap();
+
+    let keys = resp
+        .versions
+        .iter()
+        .map(|version| version.key().as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(keys, vec!["z.txt"]);
+    assert!(!resp.is_truncated);
 }
 
 #[test]
@@ -7251,6 +7303,7 @@ fn list_object_versions_with_prefix() {
             prefix: Some(object_key("photos/")),
             key_marker: None,
             version_id_marker: None,
+            start_at: None,
             max_keys: 100,
         })
         .unwrap();
@@ -7299,6 +7352,7 @@ fn list_object_versions_includes_delete_markers() {
             prefix: None,
             key_marker: None,
             version_id_marker: None,
+            start_at: None,
             max_keys: 10,
         })
         .unwrap();
@@ -7402,6 +7456,7 @@ fn suspended_null_live_version_stays_current_when_last_modified_ties() {
             prefix: None,
             key_marker: None,
             version_id_marker: None,
+            start_at: None,
             max_keys: 10,
         })
         .unwrap();
@@ -7488,6 +7543,7 @@ fn suspended_null_delete_marker_stays_current_when_last_modified_ties() {
             prefix: None,
             key_marker: None,
             version_id_marker: None,
+            start_at: None,
             max_keys: 10,
         })
         .unwrap();

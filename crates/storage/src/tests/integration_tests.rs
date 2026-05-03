@@ -753,6 +753,7 @@ fn versioned_object_lifecycle() {
             prefix: None,
             key_marker: None,
             version_id_marker: None,
+            start_at: None,
             max_keys: 10,
         })
         .unwrap();
@@ -791,6 +792,7 @@ fn versioned_object_lifecycle() {
             prefix: None,
             key_marker: None,
             version_id_marker: None,
+            start_at: None,
             max_keys: 10,
         })
         .unwrap();

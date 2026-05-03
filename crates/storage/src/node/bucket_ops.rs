@@ -110,6 +110,7 @@ impl SharedStorageNode {
                 prefix: None,
                 key_marker: None,
                 version_id_marker: None,
+                start_at: None,
                 max_keys: 1,
             })?;
             if !versions.versions.is_empty() {
@@ -341,6 +342,7 @@ impl SharedStorageNode {
                 prefix: None,
                 key_marker: None,
                 version_id_marker: None,
+                start_at: None,
                 max_keys: 1,
             })?;
             if !versions.versions.is_empty() {
