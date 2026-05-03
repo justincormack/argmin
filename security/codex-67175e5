@@ -1,0 +1,506 @@
+POST Object conditional-policy bypass allows overwrites
+Link: https://chatgpt.com/codex/cloud/security/findings/35c2361a3d848191a9448f954b43de02?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: high (attack path: high)
+Status: invalid
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 67175e5
+Author: justin@specialbusservice.com
+Created: 03/05/2026, 11:14:55
+Assignee: Unassigned
+Signals: Security, Validated, Patch generated, Attack-path
+
+# Summary
+Introduced: POST Object authorization now uses conditional header values for bucket policy evaluation without applying those conditions to the storage commit. Existing PUT Object keeps the condition in StreamingPutContext and passes it at finalization, but POST Object does not.
+POST Object now parses If-Match/If-None-Match and forwards their values into the PutObjectPolicyContext used for bucket policy authorization. However, the parsed WriteCondition is not stored in StreamingPostContext and finalize_streaming_post_object always passes WriteCondition::default() to finalize_authorized_stream_put. As a result, a client can send If-None-Match: * or an arbitrary If-Match value to satisfy a bucket policy condition such as Deny when s3:if-none-match is null or not '*', but the actual object write will not enforce create-only or ETag matching semantics. This allows overwriting an existing object even when the bucket policy was intended to allow only conditional writes.
+
+# Resolution
+Reviewed against the AWS-facing oracle tests added in commit [67175e5](https://github.com/justincormack/argmin/commit/67175e5) (`Align POST object policy conditions with AWS`) and the related invalid finding in `security/codex-22d83bb`.
+
+This finding is not valid for AWS compatibility. AWS exposes `POST Object` HTTP `If-Match` and `If-None-Match` headers to bucket-policy condition keys (`s3:if-match` and `s3:if-none-match`), but those headers are policy context only for `POST Object`; they are not enforced as write preconditions. Repeated `POST Object` requests with `If-None-Match: *` are expected to return 204 and overwrite the object, matching the current local behavior.
+
+The practical policy outcome is that a bucket policy cannot make `POST Object` into a create-only conditional write using `s3:if-none-match`. If a deployment needs to enforce `If-None-Match` write preconditions, it must allow the object-write APIs that actually support conditional writes and deny/block `POST Object` for that path.
+
+Existing AWS-facing coverage locking this down:
+
+- `test_post_object_bucket_policy_if_none_match_header_is_policy_only`
+- `test_post_object_bucket_policy_if_none_match_string_equals`
+- `test_post_object_bucket_policy_if_match_string_equals_is_policy_only`
+- `test_post_object_bucket_policy_object_creation_operation_condition_is_absent`
+
+# Validation
+## Rubric
+- [x] Confirm POST Object parses If-Match/If-None-Match and exposes those values to bucket policy authorization.
+- [x] Confirm the parsed WriteCondition is not retained in StreamingPostContext.
+- [x] Confirm POST finalization passes WriteCondition::default() to storage commit while storage has enforcement for non-default conditions.
+- [x] Dynamically reproduce policy behavior: POST without If-None-Match is denied while POST with If-None-Match:* is authorized.
+- [x] Dynamically reproduce commit bypass: a second POST with If-None-Match:* to an existing key succeeds and overwrites the object; also attempted crash/Valgrind/ASan/debugger workflow and captured LLDB trace.
+## Report
+Validated the suspected authorization/commit mismatch at commit 67175e5b94e6b60937f6352515d0952dc1ea66ff. Code review showed POST Object parses conditional headers at crates/server-http/src/http/mod.rs:3476 and puts those values into PutObjectPolicyContext at lines 3495-3501, so bucket policy evaluation sees s3:if-match / s3:if-none-match. However StreamingPostContext at lines 3532-3545 does not store the parsed WriteCondition. During POST finalization, crates/server-http/src/http/mod.rs:3586-3595 calls finalize_authorized_stream_put with cond: &WriteCondition::default(), making the storage commit unconditional. The enforcement that should reject If-None-Match:* overwrites exists in crates/server-core/src/conditional.rs:255-276, and streaming commit only invokes it when cond is non-empty in crates/server-core/src/coordinator/put.rs:533-545.
+
+Dynamic PoC: I added a targeted integration test that creates a bucket policy denying PutObject when s3:if-none-match is null. The PoC output was: no If-None-Match POST: status=403 with AccessDenied; first If-None-Match:* POST: status=204; repeat If-None-Match:* POST to the same key: status=204; final object body="overwrite". A correct implementation should reject the repeat create-only write with 412 once the object exists. Command used: RUST_BACKTRACE=1 cargo test -p s3-tests --test validation_post_if_none_match_poc -- --nocapture.
+
+Crash/Valgrind/ASan/debugger attempts: this is a logic bug, so no crash was expected or observed. valgrind was unavailable in the container (bash: command not found: valgrind). ASan for Rust required nightly; nightly download failed due blocked network, and stable rejected -Z sanitizer=address. I then used LLDB non-interactively. The debugger trace stopped in HttpFrontend::finalize_streaming_post_object at mod.rs:3586, then in Coordinator::finalize_authorized_stream_put with the stack showing the call originated from finalize_streaming_post_object. The source at that call site constructs the request with cond: &WriteCondition::default() at mod.rs:3594, confirming the POST path reaches storage finalization without the If-None-Match condition that was used for policy authorization.
+
+# Evidence
+crates/s3-tests/tests/post_object.rs (L986 to 1016)
+  Note: The added test demonstrates the vulnerable behavior: a POST with If-None-Match:* succeeds, and a repeat POST with the same create-only header also succeeds and overwrites the object.
+```
+        let (status, body) = post_object_with_headers(
+            &bucket,
+            &field_refs,
+            file_data,
+            "test.txt",
+            &[("If-None-Match", "*")],
+        );
+        assert_eq!(status, 204, "expected 204, got {status} body={body}");
+
+        let repeat = post_object_with_headers(
+            &bucket,
+            &field_refs,
+            b"overwrite",
+            "test.txt",
+            &[("If-None-Match", "*")],
+        );
+        assert_eq!(
+            repeat.0, 204,
+            "expected 204, got {} body={}",
+            repeat.0, repeat.1
+        );
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(header_key)
+            .send()
+            .await
+            .unwrap();
+        let data = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"overwrite");
+```
+
+crates/server-core/src/conditional.rs (L255 to 276)
+  Note: This is the enforcement logic that would reject overwrites for If-None-Match:* or stale If-Match values, but POST Object finalization does not pass the parsed condition to it.
+```
+pub fn check_write_conditions(
+    cond: &WriteCondition,
+    existing_etag: Option<&str>,
+) -> Result<(), ServerError> {
+    match cond {
+        WriteCondition::None => Ok(()),
+        WriteCondition::IfNoneMatchStar => {
+            if existing_etag.is_some() {
+                Err(ServerError::PreconditionFailed)
+            } else {
+                Ok(())
+            }
+        }
+        WriteCondition::IfMatch(required_etag) => match existing_etag {
+            None => Err(ServerError::PreconditionFailed),
+            Some(obj_etag) => {
+                if etags_match(required_etag.as_str(), obj_etag) {
+                    Ok(())
+                } else {
+                    Err(ServerError::PreconditionFailed)
+                }
+            }
+```
+
+crates/server-http/src/http/mod.rs (L3476 to 3501)
+  Note: The new code parses POST Object conditional headers and uses them only to populate the bucket policy context.
+```
+        let cond = write_condition_from_headers(req)?;
+
+        let requester = Self::requester_from_auth(effective_auth);
+        let acl = parse_put_object_acl(field("acl"));
+        let request_encryption = crate::coordinator::WriteEncryptionRequest::from_request_parts(
+            sse_customer_request.as_ref(),
+            managed_encryption,
+        );
+        let bucket_name = parse_bucket_name(bucket)?;
+        let prepared_put = self
+            .coordinator
+            .begin_stream_put(&AuthorizePutObjectRequest {
+                object: ObjectRequest::new(
+                    bucket_name.clone(),
+                    key.clone(),
+                    requester.clone(),
+                    None,
+                ),
+                acl: acl.into(),
+                policy_context: crate::coordinator::PutObjectPolicyContext::new(
+                    None,
+                    None,
+                    acl.policy_condition_value(),
+                )
+                .with_if_match(cond.if_match_policy_value())
+                .with_if_none_match(cond.if_none_match_policy_value())
+```
+
+crates/server-http/src/http/mod.rs (L3532 to 3545)
+  Note: StreamingPostContext stores the authorized write but does not store the parsed WriteCondition, so it cannot be enforced later.
+```
+        Ok(StreamingPostContext {
+            trace: current_trace_context(),
+            session_id: prepared_put.session_id,
+            metadata_blob,
+            system_metadata,
+            success_status,
+            success_redirect,
+            response_location,
+            post_policy,
+            checksum_sha256_b64: field("x-amz-checksum-sha256")
+                .map(std::string::ToString::to_string),
+            sse_customer: sse_customer_request,
+            authorized_write: prepared_put.authorized_write,
+        })
+```
+
+crates/server-http/src/http/mod.rs (L3586 to 3595)
+  Note: POST Object finalization always passes the default unconditional WriteCondition, so If-Match/If-None-Match are not enforced during commit.
+```
+        let result = self.coordinator.finalize_authorized_stream_put(
+            &crate::coordinator::AuthorizedFinalizeStreamPutRequest {
+                session_id: ctx.session_id(),
+                crc64,
+                total_size,
+                metadata_blob: &ctx.metadata_blob,
+                system_metadata: &ctx.system_metadata,
+                write_encryption: crate::coordinator::ActiveWriteEncryptionRef::None,
+                cond: &crate::conditional::WriteCondition::default(),
+            },
+```
+
+Proposed patch:
+diff --git a/crates/s3-tests/tests/post_object.rs b/crates/s3-tests/tests/post_object.rs
+index 78383670ef54ff363bda14211f422c6b94a76241..b2cbff5e7c73d221fd44eb3d5a535c866430292b 100644
+--- a/crates/s3-tests/tests/post_object.rs
++++ b/crates/s3-tests/tests/post_object.rs
+@@ -914,51 +914,51 @@ fn test_post_object_bucket_policy_object_creation_operation_condition_is_absent(
+             .bucket(&bucket)
+             .key(post_key)
+             .send()
+             .await
+             .unwrap();
+ 
+         client
+             .delete_object()
+             .bucket(&bucket)
+             .key(put_allowed_key)
+             .send()
+             .await
+             .unwrap();
+         client
+             .delete_object()
+             .bucket(&bucket)
+             .key(convergence_key)
+             .send()
+             .await
+             .unwrap();
+         client.delete_bucket().bucket(&bucket).send().await.unwrap();
+     });
+ }
+ 
+ #[test]
+-fn test_post_object_bucket_policy_if_none_match_header_is_policy_only() {
++fn test_post_object_bucket_policy_if_none_match_header_enforced_on_write() {
+     s3_tests::run(async {
+         let client = CTX.client();
+         let bucket = setup_bucket().await;
+         let missing_key = "post-object-if-none-match-missing";
+         let header_key = "post-object-if-none-match-header";
+         let convergence_key = "post-object-if-none-match-convergence";
+         let file_data = b"POST Object with If-None-Match";
+ 
+         let policy = serde_json::json!({
+             "Version": "2012-10-17",
+             "Statement": [{
+                 "Effect": "Deny",
+                 "Principal": "*",
+                 "Action": "s3:PutObject",
+                 "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                 "Condition": {
+                     "Null": {
+                         "s3:if-none-match": "true"
+                     }
+                 }
+             }],
+         })
+         .to_string();
+         client
+             .put_bucket_policy()
+@@ -978,64 +978,64 @@ fn test_post_object_bucket_policy_if_none_match_header_is_policy_only() {
+         assert_eq!(status, 403, "expected 403, got {status} body={body}");
+         assert_error_code(&body, "AccessDenied");
+ 
+         let fields = sigv4_fields(&bucket, header_key, &[]);
+         let field_refs: Vec<(&str, &str)> = fields
+             .iter()
+             .map(|(k, v)| (k.as_str(), v.as_str()))
+             .collect();
+         let (status, body) = post_object_with_headers(
+             &bucket,
+             &field_refs,
+             file_data,
+             "test.txt",
+             &[("If-None-Match", "*")],
+         );
+         assert_eq!(status, 204, "expected 204, got {status} body={body}");
+ 
+         let repeat = post_object_with_headers(
+             &bucket,
+             &field_refs,
+             b"overwrite",
+             "test.txt",
+             &[("If-None-Match", "*")],
+         );
+         assert_eq!(
+-            repeat.0, 204,
+-            "expected 204, got {} body={}",
++            repeat.0, 412,
++            "expected 412, got {} body={}",
+             repeat.0, repeat.1
+         );
+ 
+         let get = client
+             .get_object()
+             .bucket(&bucket)
+             .key(header_key)
+             .send()
+             .await
+             .unwrap();
+         let data = get.body.collect().await.unwrap().into_bytes();
+-        assert_eq!(&data[..], b"overwrite");
++        assert_eq!(&data[..], file_data);
+ 
+         client
+             .delete_object()
+             .bucket(&bucket)
+             .key(header_key)
+             .send()
+             .await
+             .unwrap();
+         client
+             .delete_object()
+             .bucket(&bucket)
+             .key(convergence_key)
+             .send()
+             .await
+             .unwrap();
+         client.delete_bucket().bucket(&bucket).send().await.unwrap();
+     });
+ }
+ 
+ #[test]
+ fn test_post_object_bucket_policy_if_none_match_string_equals() {
+     s3_tests::run(async {
+         let client = CTX.client();
+         let bucket = setup_bucket().await;
+         let missing_key = "post-object-if-none-match-equals-missing";
+
+
+diff --git a/crates/server-http/src/http/mod.rs b/crates/server-http/src/http/mod.rs
+index a27fe112ee5d98385f94da9029fbfd0ff8565847..2c14376499406924078f71db2c307841fea38f64 100644
+--- a/crates/server-http/src/http/mod.rs
++++ b/crates/server-http/src/http/mod.rs
+@@ -3520,50 +3520,51 @@ impl HttpFrontend {
+         let success_status = field("success_action_status")
+             .and_then(|s| s.parse::<u16>().ok())
+             .unwrap_or(204);
+         let success_redirect = field("success_action_redirect")
+             .or_else(|| field("redirect"))
+             .filter(|s| !s.is_empty())
+             .map(std::string::ToString::to_string);
+         let response_location = req.header("host").map(|host| {
+             let scheme = if req.transport_security.is_secure() {
+                 "https"
+             } else {
+                 "http"
+             };
+             format!(
+                 "{scheme}://{host}/{}/{}",
+                 percent_encode_location_path_segment(bucket_name.as_str()),
+                 percent_encode_location_key(key.as_str())
+             )
+         });
+ 
+         Ok(StreamingPostContext {
+             trace: current_trace_context(),
+             session_id: prepared_put.session_id,
+             metadata_blob,
+             system_metadata,
++            cond,
+             success_status,
+             success_redirect,
+             response_location,
+             post_policy,
+             checksum_sha256_b64: field("x-amz-checksum-sha256")
+                 .map(std::string::ToString::to_string),
+             sse_customer: sse_customer_request,
+             authorized_write: prepared_put.authorized_write,
+         })
+     }
+ 
+     /// Finalize a streaming `PostObject` session and return a POST response.
+     fn finalize_streaming_post_object(
+         &self,
+         ctx: &StreamingPostContext,
+         crc64: u64,
+         total_size: u64,
+         actual_sha256_b64: &str,
+     ) -> Result<S3Response, ServerError> {
+         let _trace = observability::AttachedTrace::new(ctx.trace.clone());
+         observability::trace_scope!(
+             TRACE_TARGET,
+             "HttpFrontend::finalize_streaming_post_object",
+             "bucket={:?} key={:?} bytes={}",
+             ctx.bucket(),
+@@ -3577,51 +3578,51 @@ impl HttpFrontend {
+                     size: total_size,
+                     max: crate::coordinator::MAX_OBJECT_SIZE,
+                 })?;
+ 
+             auth::validate_prepared_post_policy_size(post_policy, file_size)
+                 .map_err(Self::map_post_policy_error)?;
+         }
+ 
+         // Validate optional x-amz-checksum-sha256 form field.
+         if let Some(claimed) = ctx.checksum_sha256_b64.as_deref() {
+             if claimed != actual_sha256_b64 {
+                 return Err(ServerError::InvalidRequest {
+                     reason: "checksum mismatch".to_string(),
+                 });
+             }
+         }
+ 
+         let result = self.coordinator.finalize_authorized_stream_put(
+             &crate::coordinator::AuthorizedFinalizeStreamPutRequest {
+                 session_id: ctx.session_id(),
+                 crc64,
+                 total_size,
+                 metadata_blob: &ctx.metadata_blob,
+                 system_metadata: &ctx.system_metadata,
+                 write_encryption: crate::coordinator::ActiveWriteEncryptionRef::None,
+-                cond: &crate::conditional::WriteCondition::default(),
++                cond: &ctx.cond,
+             },
+             &ctx.authorized_write,
+             ctx.sse_customer.as_ref(),
+         )?;
+ 
+         let mut resp = S3Response::post_object(
+             &result,
+             ctx.bucket().as_str(),
+             ctx.key().as_str(),
+             ctx.success_status,
+             ctx.success_redirect.as_deref(),
+             ctx.response_location.as_deref(),
+         );
+         apply_sse_customer_write_response_headers(&mut resp, ctx.sse_customer.as_ref());
+         Ok(resp)
+     }
+ 
+     fn map_post_policy_error(error: auth::PostPolicyError) -> ServerError {
+         match error {
+             auth::PostPolicyError::Malformed(_) => ServerError::InvalidRequest {
+                 reason: error.to_string(),
+             },
+             auth::PostPolicyError::ConditionFailed {
+                 condition: "content-length-range",
+                 ..
+@@ -4309,50 +4310,51 @@ struct StreamingPartChecksumContract {
+ }
+ 
+ /// Context for an in-progress streaming `PutObject`.
+ ///
+ /// Created by `prepare_streaming_put`, used across async/blocking boundaries.
+ struct StreamingPutContext {
+     trace: observability::TraceContext,
+     bucket: BucketName,
+     key: ObjectKey,
+     metadata_blob: crate::metadata_blob::MetadataBlob,
+     system_metadata: SystemMetadata,
+     cond: crate::conditional::WriteCondition,
+     checksum: StreamingPutChecksumContract,
+     sse_customer: Option<SseCustomerRequest>,
+     authorized_write: RwLock<AuthorizedPutObjectWrite>,
+     /// Signing context for aws-chunked modes, None for unsigned/plain.
+     streaming_signing: Option<auth::StreamingSigningContext>,
+ }
+ 
+ /// Context for an in-progress streaming `PostObject`.
+ struct StreamingPostContext {
+     trace: observability::TraceContext,
+     session_id: SessionId,
+     metadata_blob: crate::metadata_blob::MetadataBlob,
+     system_metadata: SystemMetadata,
++    cond: crate::conditional::WriteCondition,
+     success_status: u16,
+     success_redirect: Option<String>,
+     response_location: Option<String>,
+     post_policy: Option<auth::PreparedPostPolicy>,
+     checksum_sha256_b64: Option<String>,
+     sse_customer: Option<SseCustomerRequest>,
+     authorized_write: AuthorizedPutObjectWrite,
+ }
+ 
+ /// Context for an in-progress streaming `UploadPart`.
+ ///
+ /// Created by `prepare_streaming_part`, used across async/blocking boundaries.
+ struct StreamingPartContext {
+     trace: observability::TraceContext,
+     binding: StreamPartBinding,
+     requester: crate::coordinator::Requester,
+     expected_bucket_owner: Option<String>,
+     checksum: StreamingPartChecksumContract,
+     sse_customer: Option<SseCustomerWriteContext>,
+     /// Signing context for aws-chunked modes, None for unsigned/plain.
+     streaming_signing: Option<auth::StreamingSigningContext>,
+ }
+ 
+ impl StreamObjectBinding {
+     fn new(session_id: SessionId, bucket: BucketName, key: ObjectKey) -> Self {
+
+# Attack-path analysis
+Final: high | Decider: model_decided | Matrix severity: high | Policy adjusted: high
+## Rationale
+Kept at high. Evidence shows a real authorization/commit mismatch in in-scope production code: conditional headers satisfy bucket policy but are not enforced at storage commit, and validation reproduced an overwrite of an existing object using If-None-Match:*. The impact is materially security-relevant data integrity compromise, potentially unauthenticated for public-write buckets. It is not raised to critical because exploitation requires a bucket policy/ACL configuration that relies on s3:if-none-match or s3:if-match, no repository deployment artifacts prove broad internet exposure, and the bug does not directly provide RCE, credential compromise, or a universal private-bucket auth bypass.
+## Likelihood
+high - The exploit is simple and uses normal HTTP POST Object requests, but it depends on a non-default authorization pattern: a reachable bucket must allow POST/PutObject based on conditional header policy values. Repository artifacts do not show a public deployment or concrete bucket policies. | Remote network vector
+## Impact
+high - An attacker who is only supposed to perform conditional creates or ETag-matched overwrites can modify existing object data by using POST Object, violating object integrity and bucket policy intent. In a public-write bucket using s3:if-none-match to enforce create-only uploads, this can be unauthenticated object overwrite.
+## Assumptions
+- The argmin-s3 HTTP service is deployed where the attacker can reach it; repository defaults bind to 127.0.0.1:9000, but ARGMIN_LISTEN_ADDR can expose it on a network interface.
+- At least one bucket policy or ACL configuration permits PutObject/POST Object only when conditional write headers such as If-None-Match:* or If-Match are present, intending create-only or ETag-match semantics.
+- The target object key already exists when the attacker submits the second conditional POST Object request.
+- argmin-s3 runtime reachable over HTTP/HTTPS
+- POST Object route for a bucket is accessible to the attacker, either anonymously through public-write configuration or as an authenticated write principal
+- bucket policy/authorization uses s3:if-none-match or s3:if-match condition values to constrain PutObject
+- existing object at the chosen key for overwrite impact
+## Path
+attacker POST Object + If-None-Match:* -> router PostObject -> bucket policy sees s3:if-none-match='*' -> StreamingPostContext stores authorized_write but not WriteCondition -> finalize passes WriteCondition::default() -> existing object overwritten
+## Path evidence
+- `crates/argmin-s3/src/config.rs:59-68` - Runtime configuration uses environment-supplied credentials and ARGMIN_LISTEN_ADDR, defaulting to 127.0.0.1:9000; exposure is deployment-dependent.
+- `crates/argmin-s3/src/main.rs:136-153` - The main product binary registers the configured access key as OwnerAccountAdmin and binds a TCP listener for the HTTP service.
+- `crates/server-http/src/http/router.rs:546-553` - POST /bucket without the delete query parameter is routed to the in-scope PostObject operation.
+- `crates/server-http/src/http/mod.rs:3405-3411` - POST Object can fall back to header auth, which the code notes may be anonymous for public-write buckets.
+- `crates/server-http/src/http/mod.rs:3476-3501` - POST Object parses conditional headers and forwards their policy values into PutObjectPolicyContext, so bucket policy authorization sees s3:if-match/s3:if-none-match.
+- `crates/server-http/src/http/mod.rs:3532-3545` - StreamingPostContext is constructed without storing the parsed WriteCondition, losing the condition before finalization.
+- `crates/server-http/src/http/mod.rs:4320-4333` - The StreamingPostContext struct fields confirm there is no WriteCondition member.
+- `crates/server-http/src/http/mod.rs:3586-3595` - POST finalization passes WriteCondition::default() to the core storage commit, making the write unconditional.
+- `crates/server-core/src/coordinator/put.rs:533-545` - The core commit path only invokes conditional-write enforcement when cond is non-empty, so the default condition skips the protection.
+- `crates/server-core/src/conditional.rs:255-276` - The missing enforcement would reject If-None-Match:* overwrites or stale If-Match values with PreconditionFailed.
+## Narrative
+This is a real, reachable security flaw in the main S3-compatible HTTP service. POST Object accepts attacker-controlled If-Match/If-None-Match headers and exposes them to bucket policy authorization, so policies can allow the request because s3:if-none-match='*' or s3:if-match is present. The parsed WriteCondition is then dropped before streaming finalization, and finalize_streaming_post_object explicitly passes WriteCondition::default(), so the core conditional-write check that would reject overwrites is skipped. The validated PoC exercised normal POST Object behavior: a POST without If-None-Match was denied by policy, the first If-None-Match:* POST succeeded, and a repeat If-None-Match:* POST to the same key also succeeded and overwrote the object. Severity remains high for integrity impact when exposed on public-write or conditionally writable buckets, but not critical because exploitation requires a specific bucket policy/ACL setup and does not directly bypass all authentication, disclose secrets, or execute code.
+## Controls
+- SigV4/header/POST authentication
+- public bucket ACL and bucket policy authorization
+- POST policy validation
+- conditional write checks in server-core for non-default conditions
+- optional TLS via ARGMIN_TLS_CERT_PATH/ARGMIN_TLS_KEY_PATH
+- max connection and max in-flight request limits
+## Blindspots
+- Static repository review found no Kubernetes, Terraform, Docker Compose, or load-balancer manifests to prove actual public ingress.
+- Actual tenant/bucket policy usage in deployments is unknown; severity assumes operators use the newly supported conditional policy keys for create-only or ETag-match writes.
+- The dynamic PoC evidence was provided from the earlier validation stage rather than rerun during this static attack-path pass.
