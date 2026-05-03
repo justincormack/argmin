@@ -1,0 +1,357 @@
+Ignore-case policy operators only fold ASCII
+Link: https://chatgpt.com/codex/cloud/security/findings/4f47fd77fb3081918ffc397a4fca11e6?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Resolution
+Reviewed against AWS on 03/05/2026. The finding is valid: AWS
+`StringEqualsIgnoreCase` and `StringNotEqualsIgnoreCase` match non-ASCII UTF-8
+case variants such as `sëcret` and `SËCRET` in request object tag values, while
+the local evaluator previously used Rust `eq_ignore_ascii_case` and only folded
+ASCII.
+
+Fixed in commit `17ae032` (`Match S3 ignore-case Unicode policy matching`) by
+changing the ignore-case string condition operators to compare Unicode lowercase
+forms rather than ASCII-only case folding. Added auth unit coverage and
+AWS-facing s3-tests for both positive and negative operators:
+
+- `string_equals_ignore_case_matches_non_ascii_case_variants`
+- `string_not_equals_ignore_case_rejects_non_ascii_case_variants`
+- `test_bucket_policy_string_equals_ignore_case_request_object_tag_non_ascii`
+- `test_bucket_policy_string_not_equals_ignore_case_request_object_tag_non_ascii`
+
+Validation:
+
+- `cargo test -p auth non_ascii_case_variants -- --nocapture`
+- `cargo nextest run -p s3-tests --test bucket_policy test_bucket_policy_string_equals_ignore_case_request_object_tag_non_ascii test_bucket_policy_string_not_equals_ignore_case_request_object_tag_non_ascii`
+- `./scripts/aws-tests --test bucket_policy test_bucket_policy_string_equals_ignore_case_request_object_tag_non_ascii -- --nocapture`
+- `./scripts/aws-tests --test bucket_policy test_bucket_policy_string_not_equals_ignore_case_request_object_tag_non_ascii -- --nocapture`
+- `cargo clippy -p auth -p s3-tests --tests -- -D warnings`
+
+# Metadata
+Repo: justincormack/argmin
+Commit: aa6f5a6
+Author: justin@specialbusservice.com
+Created: 02/05/2026, 11:05:26
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: the newly added ignore-case condition evaluators use ASCII-only case-insensitive comparison for general policy strings, including user-controlled UTF-8 tag values.
+The commit adds ignore-case bucket-policy operators but implements all of them with `str::eq_ignore_ascii_case`. That routine only folds ASCII A-Z/a-z. S3 object tag keys and values are parsed as UTF-8 and may contain non-ASCII characters, so a policy author using these operators with non-ASCII labels gets incorrect authorization results. For example, an Allow guarded by `StringNotEqualsIgnoreCase` intended to allow all classifications except `sëcret`, or a Deny guarded by `StringEqualsIgnoreCase` intended to block `sëcret` in any case, can be bypassed by using a differently cased non-ASCII variant such as `SËCRET`, because the evaluator treats `ë` and `Ë` as different.
+
+# Validation
+## Rubric
+- [x] Confirm the commit introduced ignore-case bucket-policy operators and that they compare with ASCII-only `eq_ignore_ascii_case`.
+- [x] Confirm user-controlled request object tags can reach those operators for supported S3 actions such as `PutObject`.
+- [x] Confirm tag parsing accepts percent-encoded multibyte UTF-8 non-ASCII values without restricting them to ASCII.
+- [x] Dynamically reproduce incorrect authorization outcomes for non-ASCII case variants and include an ASCII-only control case.
+- [x] Follow compiled-stack validation sequence as far as applicable: assertion-panic reproduction, valgrind attempt, and non-interactive debugger trace through the evaluator.
+## Report
+Validated the finding with a targeted Rust PoC against the real `auth` policy evaluator and `server_http::http::xml::parse_url_encoded_tags`. Code review confirmed the introduced ignore-case evaluators use Rust `str::eq_ignore_ascii_case`: `crates/auth/src/bucket_policy/condition_op.rs:312-320` for `StringEqualsIgnoreCase` and `crates/auth/src/bucket_policy/condition_op.rs:418-426` for `StringNotEqualsIgnoreCase`. Request object tags are accepted as evaluable condition input: `crates/auth/src/bucket_policy/condition_key.rs:119-123` registers `s3:RequestObjectTag/` with `AnyEvaluable`, `condition_key.rs:285-287` resolves the request tag value, and `condition_key.rs:597-620` dispatches to the operator. User-supplied URL tags decode UTF-8 without an ASCII-only restriction: `crates/server-http/src/http/xml.rs:3380-3398` parses key/value pairs, `xml.rs:3400-3416` only enforces length/aws-prefix checks, and `xml.rs:3445-3468` percent-decodes bytes then calls `String::from_utf8`. Dynamic PoC output: `parsed tag: [("classification", "SËCRET")]`; `std eq_ignore_ascii_case('sëcret','SËCRET') = false`; `Deny StringEqualsIgnoreCase(sëcret) with actual SËCRET => NoMatch`; `Allow StringNotEqualsIgnoreCase(sëcret) with actual SËCRET => ExplicitAllow`; ASCII-only control `SëCRET` produced `ExplicitDeny`. This demonstrates both a Deny bypass and an unintended Allow for non-ASCII case variants. Per required compiled-stack flow, I attempted a direct assertion-failure reproduction, attempted valgrind (`valgrind_unavailable` in this container), and used LLDB. The LLDB trace stopped inside `auth::bucket_policy::condition_op::eval_string_equals_ignore_case` at `condition_op.rs:316`, with the stack flowing through `condition_key::evaluate_clause` at `condition_key.rs:619`, `condition_clause_matches_request` at `bucket_policy.rs:1445`, `PolicyStatement::condition_match_result` at `bucket_policy.rs:769`, and `BucketPolicy::evaluate` at `bucket_policy.rs:87`, confirming the real vulnerable evaluator path.
+
+# Evidence
+crates/auth/src/bucket_policy/condition_op.rs (L312 to 390)
+  Note: The StringEqualsIgnoreCase evaluators use `eq_ignore_ascii_case`, which only ignores ASCII case and treats non-ASCII case variants as unequal.
+```
+fn eval_string_equals_ignore_case(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands
+                .iter()
+                .any(|expected| expected.eq_ignore_ascii_case(actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(_) => ConditionMatchResult::NoMatch,
+        ActualValue::Absent => ConditionMatchResult::NoMatch,
+    }
+}
+
+fn eval_for_all_values_string_equals_ignore_case(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands
+                .iter()
+                .any(|expected| expected.eq_ignore_ascii_case(actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(actuals) => {
+            if actuals.iter().all(|actual| {
+                operands
+                    .iter()
+                    .any(|expected| expected.eq_ignore_ascii_case(actual))
+            }) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::Absent => ConditionMatchResult::Matches,
+    }
+}
+
+fn eval_for_any_value_string_equals_ignore_case(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands
+                .iter()
+                .any(|expected| expected.eq_ignore_ascii_case(actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(actuals) => {
+            if actuals.iter().any(|actual| {
+                operands
+                    .iter()
+                    .any(|expected| expected.eq_ignore_ascii_case(actual))
+            }) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::Absent => ConditionMatchResult::NoMatch,
+    }
+}
+```
+
+crates/auth/src/bucket_policy/condition_op.rs (L418 to 490)
+  Note: The StringNotEqualsIgnoreCase evaluators also rely on ASCII-only comparison, so non-ASCII values can incorrectly satisfy NotEquals-style allow conditions or avoid Equals-style deny logic.
+```
+fn eval_string_not_equals_ignore_case(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands
+                .iter()
+                .all(|expected| !expected.eq_ignore_ascii_case(actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(_) => ConditionMatchResult::NoMatch,
+        ActualValue::Absent => ConditionMatchResult::Matches,
+    }
+}
+
+fn eval_for_all_values_string_not_equals_ignore_case(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands
+                .iter()
+                .all(|expected| !expected.eq_ignore_ascii_case(actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(actuals) => {
+            if actuals.iter().all(|actual| {
+                operands
+                    .iter()
+                    .all(|expected| !expected.eq_ignore_ascii_case(actual))
+            }) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::Absent => ConditionMatchResult::Matches,
+    }
+}
+
+fn eval_for_any_value_string_not_equals_ignore_case(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands
+                .iter()
+                .all(|expected| !expected.eq_ignore_ascii_case(actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(actuals) => {
+            if actuals.iter().any(|actual| {
+                operands
+                    .iter()
+                    .all(|expected| !expected.eq_ignore_ascii_case(actual))
+            }) {
+                ConditionMatchResult::Matches
+            } else {
+```
+
+crates/server-http/src/http/xml.rs (L3380 to 3424)
+  Note: Request object tags are attacker-controlled condition values; tag keys and values are accepted after UTF-8 decoding and length checks without restricting them to ASCII.
+```
+pub fn parse_url_encoded_tags(input: &str) -> Result<Vec<(String, String)>, ServerError> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut tags = Vec::new();
+    let mut seen_keys = std::collections::HashSet::new();
+
+    for pair in input.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (raw_key, raw_value) = match pair.find('=') {
+            Some(pos) => (&pair[..pos], &pair[pos + 1..]),
+            None => (pair, ""),
+        };
+
+        let key = percent_decode_tag(raw_key)?;
+        let value = percent_decode_tag(raw_value)?;
+
+        let key_chars = key.chars().count();
+        if key_chars == 0 || key_chars > 128 {
+            return Err(ServerError::InvalidTag {
+                reason: format!("tag key must be 1-128 characters, got {key_chars}"),
+            });
+        }
+        if key.starts_with("aws:") {
+            return Err(ServerError::InvalidTag {
+                reason: "tag key must not start with 'aws:'".to_string(),
+            });
+        }
+        let value_chars = value.chars().count();
+        if value_chars > 256 {
+            return Err(ServerError::InvalidTag {
+                reason: format!("tag value must be 0-256 characters, got {value_chars}"),
+            });
+        }
+
+        if !seen_keys.insert(key.clone()) {
+            return Err(ServerError::InvalidTag {
+                reason: format!("duplicate tag key: {key}"),
+            });
+        }
+
+        tags.push((key, value));
+```
+
+crates/server-http/src/http/xml.rs (L3441 to 3467)
+  Note: Tag percent-decoding explicitly supports multibyte UTF-8, making non-ASCII tag values valid inputs to the new policy operators.
+```
+/// Percent-decode a tag key or value from URL-encoded form.
+///
+/// Collects decoded bytes first, then converts to UTF-8, so multibyte
+/// percent-encoded sequences (e.g. `%C3%A9` for `é`) decode correctly.
+fn percent_decode_tag(input: &str) -> Result<String, ServerError> {
+    let mut bytes = Vec::with_capacity(input.len());
+    let mut iter = input.bytes();
+    while let Some(b) = iter.next() {
+        if b == b'+' {
+            bytes.push(b' ');
+        } else if b == b'%' {
+            let hi = iter.next().ok_or(ServerError::InvalidArgument {
+                reason: "invalid percent-encoding in tagging header".to_string(),
+            })?;
+            let lo = iter.next().ok_or(ServerError::InvalidArgument {
+                reason: "invalid percent-encoding in tagging header".to_string(),
+            })?;
+            let byte = decode_hex_pair(hi, lo).ok_or(ServerError::InvalidArgument {
+                reason: "invalid percent-encoding in tagging header".to_string(),
+            })?;
+            bytes.push(byte);
+        } else {
+            bytes.push(b);
+        }
+    }
+    String::from_utf8(bytes).map_err(|_| ServerError::InvalidTag {
+        reason: "The TagValue you have provided is invalid".to_string(),
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Kept at medium. The issue is in-scope runtime authz code and is reachable through normal S3 HTTP request handling: x-amz-tagging is attacker-controlled and accepted as UTF-8, then passed into s3:RequestObjectTag bucket-policy evaluation. The vulnerable StringEqualsIgnoreCase/StringNotEqualsIgnoreCase operators use eq_ignore_ascii_case, producing incorrect decisions for non-ASCII case variants. This can bypass intended Deny or trigger unintended Allow and therefore is a real security vulnerability. It does not warrant high or critical because exploitation depends on a specific policy configuration using ignore-case operators with non-ASCII authorization labels, and it does not provide general unauthenticated access, account takeover, secret disclosure, RCE, or broad cross-tenant compromise by itself.
+## Likelihood
+high - Once a vulnerable policy exists, exploitation is straightforward through normal S3 requests by choosing a Unicode case variant in an attacker-controlled tag value. However, the precondition is relatively specific: the operator must be used with non-ASCII policy strings, and the attacker must already be able to reach the service and invoke the relevant operation as authenticated or public-policy-allowed. | Remote network vector
+## Impact
+medium - The bug can cause bucket policy authorization decisions to differ from policy-author intent for non-ASCII ignore-case conditions. It can permit object write/tagging/copy/multipart operations, or potentially other policy-guarded actions, that should have been denied. The impact is meaningful authorization bypass but limited to buckets using these specific operators with non-ASCII security labels; it is not a general authentication bypass or credential compromise.
+## Assumptions
+- The S3 HTTP service is deployed where an attacker can send S3 API requests to it.
+- A bucket policy uses the newly added StringEqualsIgnoreCase or StringNotEqualsIgnoreCase operators with a non-ASCII security-relevant string, such as an object tag value.
+- The policy author expects ignore-case matching to apply to Unicode case variants, while Rust str::eq_ignore_ascii_case only folds ASCII characters.
+- reachable argmin-s3 HTTP endpoint
+- bucket policy using StringEqualsIgnoreCase/StringNotEqualsIgnoreCase or their ForAny/ForAll variants
+- policy value or request/existing tag value contains non-ASCII case variants
+- attacker can issue the relevant S3 operation, either as an authenticated principal or as anonymous when policy/ACL permits public access
+## Path
+S3 client
+  -> argmin-s3 HTTP listener
+  -> x-amz-tagging parser accepts UTF-8 tag
+  -> policy context s3:RequestObjectTag/classification
+  -> StringEqualsIgnoreCase/StringNotEqualsIgnoreCase uses eq_ignore_ascii_case
+  -> Deny bypass or unintended Allow
+## Path evidence
+- `Cargo.toml:3-13` - Workspace includes auth, server-core, server-http, and argmin-s3 as product crates.
+- `crates/argmin-s3/Cargo.toml:1-8` - argmin-s3 is a production binary target using src/main.rs.
+- `crates/argmin-s3/src/config.rs:31-36` - Runtime service is configured by environment and defaults to ARGMIN_LISTEN_ADDR 127.0.0.1:9000, with TLS optional.
+- `crates/argmin-s3/src/main.rs:152-211` - The binary binds the configured TCP listener and starts HTTP or TLS serving.
+- `crates/argmin-s3/src/main.rs:130-144` - Configured credentials are loaded into CredentialStore as OwnerAccountAdmin.
+- `crates/server-http/src/http/mod.rs:821-881` - HTTP frontend routes requests, authenticates them, then dispatches to S3 operation handlers.
+- `crates/server-http/src/http/mod.rs:2992-3063` - Requests go through SigV4 authentication, with missing auth becoming an anonymous context for public-policy/ACL handling.
+- `crates/server-http/src/http/mod.rs:1513-1520` - PutObject parses attacker-controlled x-amz-tagging into inline tags before policy-controlled write handling.
+- `crates/server-http/src/http/mod.rs:2629-2635` - CreateMultipartUpload also accepts x-amz-tagging as request object tags.
+- `crates/server-http/src/http/mod.rs:3746-3753` - Streaming PutObject path parses x-amz-tagging before beginning the upload.
+- `crates/server-http/src/http/xml.rs:3380-3424` - URL-encoded tag parser accepts user-supplied keys/values, enforcing length/count and aws-prefix constraints but not ASCII-only content.
+- `crates/server-http/src/http/xml.rs:3441-3468` - Tag percent-decoding collects bytes and converts with String::from_utf8, allowing multibyte UTF-8 tag values.
+- `crates/server-http/src/http/xml.rs:6275-6280` - Repository test confirms multibyte UTF-8 URL-encoded tags such as café/crème are intended to parse successfully.
+- `crates/auth/src/bucket_policy/condition_key.rs:116-123` - s3:RequestObjectTag/ condition keys are registered with AnyEvaluable operator support.
+- `crates/auth/src/bucket_policy/condition_key.rs:285-287` - s3:RequestObjectTag values are resolved from request_object_tag_value.
+- `crates/auth/src/bucket_policy/condition_key.rs:597-620` - Condition key dispatch looks up the operator and invokes its evaluate function on the resolved actual value.
+- `crates/auth/src/bucket_policy/condition_op.rs:100-122` - StringEqualsIgnoreCase and variants are registered as evaluable condition operators.
+- `crates/auth/src/bucket_policy/condition_op.rs:139-162` - StringNotEqualsIgnoreCase and variants are registered as evaluable condition operators.
+- `crates/auth/src/bucket_policy/condition_op.rs:312-390` - StringEqualsIgnoreCase evaluators use str::eq_ignore_ascii_case, which only folds ASCII case.
+- `crates/auth/src/bucket_policy/condition_op.rs:418-490` - StringNotEqualsIgnoreCase evaluators also rely on ASCII-only case-insensitive comparison.
+- `crates/server-core/src/coordinator/authz/policy.rs:340-402` - Put-object bucket-policy decision builds an auth::PolicyRequest with request object tags and evaluates the bucket policy.
+- `crates/server-core/src/coordinator/authz/policy.rs:419-436` - ExplicitDeny blocks access and ExplicitAllow can grant access, so an incorrect match result directly affects authorization.
+## Narrative
+The finding is real and reachable in the main product. argmin-s3 exposes an HTTP S3 API and authenticates requests before dispatch. PutObject, CopyObject, multipart creation, and streaming PutObject parse attacker-controlled x-amz-tagging headers using parse_url_encoded_tags. That parser percent-decodes bytes and accepts any valid UTF-8 with length/count checks, so non-ASCII tag values are valid request inputs. server-core then includes request tags in PolicyRequest when a bucket policy references s3:RequestObjectTag, and the auth operator table marks StringEqualsIgnoreCase/StringNotEqualsIgnoreCase as evaluable. The vulnerable evaluators use Rust eq_ignore_ascii_case, so ë and Ë compare unequal. As validated earlier, this can turn Deny StringEqualsIgnoreCase(sëcret) with actual SËCRET into NoMatch and Allow StringNotEqualsIgnoreCase(sëcret) into ExplicitAllow. Severity remains medium rather than high because exploitation requires a specific bucket-policy configuration using ignore-case operators with non-ASCII authorization labels; it does not bypass SigV4 generally, steal credentials, or provide broad unauthenticated access by itself.
+## Controls
+- SigV4 authentication is enforced before normal S3 dispatch; missing auth is represented as anonymous for public bucket/policy decisions.
+- Bucket policy deny/allow evaluation exists and deny normally overrides allow.
+- Default listener is localhost 127.0.0.1:9000, but ARGMIN_LISTEN_ADDR can expose the service on other interfaces.
+- TLS is optional via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH.
+- Tag parsing enforces tag count and key/value length limits and rejects invalid UTF-8, but intentionally permits valid non-ASCII UTF-8.
+- Connection and in-flight request limits are configurable, but they do not mitigate this authorization logic issue.
+## Blindspots
+- Static review did not inspect deployment manifests or network infrastructure; no public ingress or load balancer artifact was present in the checked evidence.
+- Exact AWS/IAM Unicode case-folding semantics were not verified from live cloud APIs because cloud API calls are out of scope.
+- Impact depends on operator-created bucket policies and data-classification practices, which are deployment-specific and not fully knowable from repository artifacts.
+- Review focused on the provided finding path and did not exhaustively enumerate every condition key affected by the shared operator table.
