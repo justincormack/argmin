@@ -1,0 +1,260 @@
+POST Object bypasses conditional write bucket policies
+Link: https://chatgpt.com/codex/cloud/security/findings/c7a9d576e19881918edfe24a8cbbe91f?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: high (attack path: high)
+Status: invalid
+
+# Resolution
+Reviewed against AWS on 03/05/2026. The reported security issue is invalid for
+AWS compatibility: POST Object does not populate `s3:ObjectCreationOperation` in
+bucket-policy evaluation, so a Deny guarded by
+`Bool: { "s3:ObjectCreationOperation": "true" }` is not expected to apply to
+POST Object. The proposed patch in this report, which set
+`ObjectCreationOperation=true` for POST Object, would have made local behavior
+less AWS-compatible.
+
+The review did expose a related conformance nuance. AWS does expose POST Object
+HTTP `If-Match` and `If-None-Match` headers to bucket-policy condition keys
+`s3:if-match` and `s3:if-none-match`, including exact `StringEquals` matching,
+but those headers are policy context only for POST Object. They do not enforce
+normal write preconditions: repeated POST Object requests with
+`If-None-Match: *` or a matching `If-Match` still return 204 and overwrite the
+object.
+
+Resolved in commit `5fa01b0` (`Align POST object policy conditions with AWS`):
+the POST Object path now passes `If-Match` / `If-None-Match` into bucket-policy
+context without setting `s3:ObjectCreationOperation` and without converting them
+into write conditions. AWS-facing s3-tests were added to lock down the behavior:
+
+- `test_post_object_bucket_policy_object_creation_operation_condition_is_absent`
+- `test_post_object_bucket_policy_if_none_match_header_is_policy_only`
+- `test_post_object_bucket_policy_if_none_match_string_equals`
+- `test_post_object_bucket_policy_if_match_string_equals_is_policy_only`
+
+Validation run:
+`./scripts/aws-tests --test post_object test_post_object_bucket_policy -- --nocapture`
+passed all four tests against AWS.
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 22d83bb
+Author: justin@specialbusservice.com
+Created: 02/05/2026, 11:07:04
+Assignee: Unassigned
+Signals: Security, Validated, Patch generated, Attack-path
+
+# Summary
+Introduced: the commit added runtime support for conditional bucket-policy keys but omitted POST Object from the object-creation policy context, creating an authorization-policy bypass for conditional write enforcement.
+The new s3:ObjectCreationOperation condition key is evaluated from PolicyRequest.object_creation_operation. Normal PUT/Copy/CompleteMultipart paths populate this context, but prepare_streaming_post_object constructs a PutObjectPolicyContext for POST Object without setting with_object_creation_operation(true). For a bucket policy that allows PutObject but adds a Deny such as Bool s3:ObjectCreationOperation=true plus Null s3:if-none-match=true to require conditional creation writes, POST Object sees s3:ObjectCreationOperation as absent. The Bool condition evaluates to NoMatch, so the Deny does not apply. The POST finalization then commits with WriteCondition::default(), making the upload unconditional. An attacker who is otherwise granted PutObject by the bucket policy, including an anonymous Principal="*" public policy, can overwrite/create objects through POST Object despite the new conditional-write policy guard.
+
+# Validation
+## Rubric
+- [x] Confirm `s3:ObjectCreationOperation` is a supported Bool condition key and absent values cause Bool conditions to not match.
+- [x] Confirm PutObject authorization receives the value solely from `PutObjectPolicyContext.object_creation_operation`.
+- [x] Confirm normal PUT-style paths populate `object_creation_operation=true` while POST Object does not.
+- [x] Confirm POST Object finalization uses default/unconditional write conditions.
+- [x] Reproduce the policy behavior dynamically: normal unconditional PUT denied, POST-like request allowed under the same conditional-write bucket policy.
+## Report
+Validated the finding. Direct crash reproduction is not applicable because this is an authorization logic bug, not memory corruption; the PoC ran successfully and demonstrated the policy bypass. Valgrind was attempted but is unavailable in the container (`bash: command not found: valgrind`). I then used a functional Rust PoC plus an LLDB trace.
+
+Key evidence:
+1. `crates/auth/src/bucket_policy/condition_key.rs:205-210` registers `s3:ObjectCreationOperation` as a Bool-only condition key, and `condition_key.rs:322-330` resolves `None` to `ResolvedValue::Absent`.
+2. `crates/auth/src/bucket_policy/condition_op.rs:152-165` makes Bool conditions return `NoMatch` when the actual value is absent.
+3. `crates/auth/src/bucket_policy.rs:753-760` returns `NoMatch` for the whole statement when any condition clause does not match, and `bucket_policy.rs:690-692` then skips that Deny statement.
+4. `crates/server-core/src/coordinator/authz/policy.rs:393-395` forwards `PutObjectPolicyContext.object_creation_operation` into the `PolicyRequest`.
+5. `crates/server-http/src/http/mod.rs:3449-3458` constructs the POST Object `PutObjectPolicyContext` without `.with_object_creation_operation(true)`, while the normal PUT-style helper at `http/mod.rs:5600-5602` does set it.
+6. `crates/server-http/src/http/mod.rs:3538-3547` finalizes POST Object with `WriteCondition::default()`, and `crates/server-core/src/conditional.rs:118-122` shows the default is `WriteCondition::None`, i.e. unconditional write.
+
+The auth-layer PoC evaluated a policy with Allow PutObject plus Deny when `Bool s3:ObjectCreationOperation=true` and `Null s3:if-none-match=true`. Output:
+`POST-like request (ObjectCreationOperation absent, no if-none-match): ExplicitAllow`
+`PUT request (ObjectCreationOperation=true, no if-none-match): ExplicitDeny`
+`PUT request (ObjectCreationOperation=true, if-none-match=*): ExplicitAllow`
+
+I also added and ran a targeted server-http regression test that installs the same bucket policy, verifies a normal signed PUT without `if-none-match` is denied, and verifies signed POST Object preparation succeeds. Command output: `running 1 test ... test result: ok. 1 passed; 0 failed; 689 filtered out`.
+
+The LLDB trace broke inside `eval_bool` and showed the first POST-like evaluation receives `ActualValue::Absent` for the Bool condition, confirming the Deny condition does not match: `value = auth::bucket_policy::condition_op::ActualValue::Absent`.
+
+# Evidence
+crates/auth/src/bucket_policy/condition_key.rs (L201 to 207)
+  Note: The commit adds s3:ObjectCreationOperation as a Bool-only policy condition key for PutObject-family authorization.
+```
+        resolve: resolve_if_none_match,
+        evaluable_for_action: None,
+        supported_for_action: Some(conditional_write_supported_for_action),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:ObjectCreationOperation"),
+        operator_support: OperatorSupport::BoolOnly,
+```
+
+crates/auth/src/bucket_policy/condition_op.rs (L152 to 165)
+  Note: Bool conditions do not match when the actual value is absent; therefore a Deny guarded by Bool s3:ObjectCreationOperation=true is skipped if the request context does not populate the key.
+```
+fn eval_bool(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands
+                .iter()
+                .any(|expected| expected.eq_ignore_ascii_case(actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::Absent => ConditionMatchResult::NoMatch,
+    }
+```
+
+crates/server-core/src/coordinator/authz/policy.rs (L393 to 395)
+  Note: PutObject bucket-policy evaluation takes s3:ObjectCreationOperation directly from PutObjectPolicyContext, so missing context becomes an absent condition value.
+```
+    .with_if_match(request.policy_context.if_match)
+    .with_if_none_match(request.policy_context.if_none_match)
+    .with_object_creation_operation(request.policy_context.object_creation_operation);
+```
+
+crates/server-http/src/http/mod.rs (L3449 to 3458)
+  Note: The POST Object path builds a PutObjectPolicyContext but never calls with_object_creation_operation(true), unlike other object-creation paths.
+```
+                policy_context: crate::coordinator::PutObjectPolicyContext::new(
+                    None,
+                    None,
+                    acl.policy_condition_value(),
+                )
+                .with_managed_encryption(managed_encryption)
+                .with_sse_customer_algorithm(
+                    sse_customer_request.as_ref().map(|req| req.algorithm()),
+                )
+                .with_request_object_tags_xml(tags_xml.as_deref()),
+```
+
+crates/server-http/src/http/mod.rs (L3538 to 3547)
+  Note: POST Object finalization commits with the default WriteCondition, so after the policy Deny is bypassed there is no conditional-write check to prevent the upload.
+```
+        let result = self.coordinator.finalize_authorized_stream_put(
+            &crate::coordinator::AuthorizedFinalizeStreamPutRequest {
+                session_id: ctx.session_id(),
+                crc64,
+                total_size,
+                metadata_blob: &ctx.metadata_blob,
+                system_metadata: &ctx.system_metadata,
+                write_encryption: crate::coordinator::ActiveWriteEncryptionRef::None,
+                cond: &crate::conditional::WriteCondition::default(),
+            },
+```
+
+crates/server-http/src/http/mod.rs (L5600 to 5602)
+  Note: Other PUT-style request policy contexts set object_creation_operation to true, highlighting the missing equivalent in the POST Object path.
+```
+    .with_if_match(fields.conditions.if_match)
+    .with_if_none_match(fields.conditions.if_none_match)
+    .with_object_creation_operation(true)
+```
+
+Proposed patch:
+diff --git a/crates/server-http/src/http/mod.rs b/crates/server-http/src/http/mod.rs
+index 5f4f067db5b39cf1be9bf82397a2fe6b028ffbe4..372dd78dde69d3357efed84fefdcdf52e2e3d190 100644
+--- a/crates/server-http/src/http/mod.rs
++++ b/crates/server-http/src/http/mod.rs
+@@ -3474,50 +3474,51 @@ impl HttpFrontend {
+         let managed_encryption =
+             parse_managed_encryption_form_fields(form_fields, sse_customer_request.is_some())?;
+ 
+         let requester = Self::requester_from_auth(effective_auth);
+         let acl = parse_put_object_acl(field("acl"));
+         let request_encryption = crate::coordinator::WriteEncryptionRequest::from_request_parts(
+             sse_customer_request.as_ref(),
+             managed_encryption,
+         );
+         let bucket_name = parse_bucket_name(bucket)?;
+         let prepared_put = self
+             .coordinator
+             .begin_stream_put(&AuthorizePutObjectRequest {
+                 object: ObjectRequest::new(
+                     bucket_name.clone(),
+                     key.clone(),
+                     requester.clone(),
+                     None,
+                 ),
+                 acl: acl.into(),
+                 policy_context: crate::coordinator::PutObjectPolicyContext::new(
+                     None,
+                     None,
+                     acl.policy_condition_value(),
+                 )
++                .with_object_creation_operation(true)
+                 .with_managed_encryption(managed_encryption)
+                 .with_sse_customer_algorithm(
+                     sse_customer_request.as_ref().map(|req| req.algorithm()),
+                 )
+                 .with_request_object_tags_xml(tags_xml.as_deref()),
+                 object_lock: ObjectLockState::default(),
+                 tags: tags_xml.as_deref(),
+                 encryption: request_encryption,
+             })?;
+ 
+         let success_status = field("success_action_status")
+             .and_then(|s| s.parse::<u16>().ok())
+             .unwrap_or(204);
+         let success_redirect = field("success_action_redirect")
+             .or_else(|| field("redirect"))
+             .filter(|s| !s.is_empty())
+             .map(std::string::ToString::to_string);
+         let response_location = req.header("host").map(|host| {
+             let scheme = if req.transport_security.is_secure() {
+                 "https"
+             } else {
+                 "http"
+             };
+             format!(
+                 "{scheme}://{host}/{}/{}",
+
+# Attack-path analysis
+Final: high | Decider: model_decided | Matrix severity: high | Policy adjusted: high
+## Rationale
+Kept as high. The issue is in-scope runtime authorization code and has a concrete, validated path through the HTTP POST Object upload surface. Static evidence shows the POST path omits object_creation_operation=true, policy evaluation treats the condition key as absent, Bool conditions on absent values do not match, and finalization uses an unconditional WriteCondition. This is a meaningful authorization-policy bypass with high integrity impact, especially for public-write/create-only buckets. It is not raised to critical because it does not bypass SigV4 or bucket policy authorization wholesale, does not expose private object reads, and requires a specific bucket policy that already grants PutObject to the attacker.
+## Likelihood
+high - The vulnerable path is a normal network-facing S3 POST Object operation and exploitation is low-complexity once the bucket policy precondition exists. Overall likelihood is medium because the default listen address is localhost and the issue only affects deployments that use the new conditional-write bucket policy pattern while granting PutObject to the attacker or public principal. | Remote network vector
+## Impact
+high - A successful exploit bypasses a bucket policy Deny intended to enforce conditional create-only writes and allows unconditional object creation or overwrite. This can corrupt or replace meaningful object data and can be unauthenticated for buckets that deliberately allow public PutObject but rely on conditional-write Deny rules to prevent overwrites.
+## Assumptions
+- The argmin-s3 HTTP endpoint is reachable by the attacker over a network path relevant to the deployment.
+- A bucket policy grants the attacker, or Principal="*" for anonymous users, s3:PutObject while relying on a Deny using s3:ObjectCreationOperation and s3:if-none-match to require conditional create-only writes.
+- The attacker can submit an S3 POST Object multipart/form-data upload to the target bucket.
+- reachable argmin-s3 HTTP service
+- bucket policy that allows PutObject to the attacker or anonymous public principal
+- policy uses s3:ObjectCreationOperation=true and Null s3:if-none-match=true Deny semantics to block unconditional object creation or overwrite
+- attacker uses POST Object instead of normal PUT
+## Path
+Attacker POST Object -> route PostObject -> prepare_streaming_post_object -> missing object_creation_operation=true -> Bool condition Absent/NoMatch -> Deny skipped -> WriteCondition::None -> unconditional object write
+## Path evidence
+- `crates/server-http/src/http/router.rs:546-554` - Bucket-level POST without the delete query parameter routes to S3Operation::PostObject, making this an HTTP-exposed runtime path.
+- `crates/server-http/src/http/serve.rs:1658-1666` - The streaming multipart upload path invokes prepare_streaming_post_object when the file part begins.
+- `crates/server-http/src/http/mod.rs:3318-3350` - POST Object preparation accepts SigV4 POST policy fields when present, otherwise uses anonymous auth, which is relevant to public-write bucket policies.
+- `crates/server-http/src/http/mod.rs:3438-3458` - The POST Object path builds PutObjectPolicyContext for begin_stream_put but does not call with_object_creation_operation(true).
+- `crates/server-http/src/http/mod.rs:5598-5602` - The normal PUT-style policy context does set with_object_creation_operation(true), showing the intended behavior and the POST Object omission.
+- `crates/server-core/src/coordinator/request_types.rs:96-102` - PutObjectPolicyContext defaults object_creation_operation to None unless a request path explicitly sets it.
+- `crates/server-core/src/coordinator/authz/policy.rs:389-396` - PutObject authorization forwards request.policy_context.object_creation_operation directly into the bucket policy request.
+- `crates/auth/src/bucket_policy/condition_key.rs:204-210` - s3:ObjectCreationOperation is registered as a Bool-only policy condition key for supported conditional-write actions.
+- `crates/auth/src/bucket_policy/condition_key.rs:322-330` - The resolver maps a missing object_creation_operation value to ResolvedValue::Absent.
+- `crates/auth/src/bucket_policy/condition_op.rs:152-165` - Bool condition evaluation returns NoMatch when the actual value is Absent, causing the guarded Deny not to apply.
+- `crates/server-http/src/http/mod.rs:3538-3547` - POST Object finalization passes WriteCondition::default() to finalize_authorized_stream_put.
+- `crates/server-core/src/conditional.rs:118-122` - The default WriteCondition is None, meaning the final write is unconditional after authorization succeeds.
+- `crates/argmin-s3/src/config.rs:59-69` - The service is configured by environment variables, including credentials and default listen address 127.0.0.1:9000; public exposure is deployment-dependent.
+## Narrative
+The finding is valid and reachable in the main runtime. The S3 HTTP router treats bucket-level POST without ?delete as POST Object, and the streaming server calls prepare_streaming_post_object. That function authenticates either SigV4 POST policy fields/header auth or falls back to anonymous mode for public buckets, then authorizes a stream put. Unlike the normal PUT helper, the POST Object path constructs PutObjectPolicyContext without setting object_creation_operation=true. The bucket policy layer forwards that optional field directly into PolicyRequest, and the s3:ObjectCreationOperation resolver maps None to Absent. Bool condition evaluation returns NoMatch for Absent, so an explicit Deny conditioned on Bool s3:ObjectCreationOperation=true is skipped. The POST finalizer then uses WriteCondition::default(), which is WriteCondition::None, so the write is unconditional. Impact is high integrity risk for deployments using the new conditional-write bucket policy key to permit create-only PutObject while preventing overwrites; in the public Principal="*" case, exploitation can be unauthenticated. It is not critical because it does not bypass all authentication or grant arbitrary access to private buckets; it requires a specific policy pattern that already grants PutObject to the attacker.
+## Controls
+- SigV4 request authentication
+- SigV4 POST policy authentication
+- anonymous mode only when bucket ACL/policy permits it
+- bucket policy authorization
+- object ACL parsing
+- public access controls
+- POST policy content-length-range checks
+- connection and in-flight request semaphores
+- optional TLS from configured certificate/key paths
+## Blindspots
+- No deployment manifests, container configuration, or load balancer definitions were present, so actual public exposure could not be confirmed from repository artifacts.
+- Static analysis cannot determine how many real deployments use the affected s3:ObjectCreationOperation conditional-write policy pattern.
+- The repository default listen address is localhost, but operators can configure ARGMIN_LISTEN_ADDR to a public or internal interface.
+- No cloud IAM or managed identity artifacts were found; runtime authorization is application-level S3 credentials and bucket policy.
