@@ -337,6 +337,10 @@ pub(super) const fn is_numeric_condition_kind(kind: ConditionOpKind) -> bool {
     )
 }
 
+fn string_eq_ignore_case(expected: &str, actual: &str) -> bool {
+    expected == actual || expected.to_lowercase() == actual.to_lowercase()
+}
+
 fn eval_bool(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
     match actual {
         ActualValue::Present(actual) => {
@@ -440,7 +444,7 @@ fn eval_string_equals_ignore_case(
         ActualValue::Present(actual) => {
             if operands
                 .iter()
-                .any(|expected| expected.eq_ignore_ascii_case(actual))
+                .any(|expected| string_eq_ignore_case(expected, actual))
             {
                 ConditionMatchResult::Matches
             } else {
@@ -460,7 +464,7 @@ fn eval_for_all_values_string_equals_ignore_case(
         ActualValue::Present(actual) => {
             if operands
                 .iter()
-                .any(|expected| expected.eq_ignore_ascii_case(actual))
+                .any(|expected| string_eq_ignore_case(expected, actual))
             {
                 ConditionMatchResult::Matches
             } else {
@@ -471,7 +475,7 @@ fn eval_for_all_values_string_equals_ignore_case(
             if actuals.iter().all(|actual| {
                 operands
                     .iter()
-                    .any(|expected| expected.eq_ignore_ascii_case(actual))
+                    .any(|expected| string_eq_ignore_case(expected, actual))
             }) {
                 ConditionMatchResult::Matches
             } else {
@@ -490,7 +494,7 @@ fn eval_for_any_value_string_equals_ignore_case(
         ActualValue::Present(actual) => {
             if operands
                 .iter()
-                .any(|expected| expected.eq_ignore_ascii_case(actual))
+                .any(|expected| string_eq_ignore_case(expected, actual))
             {
                 ConditionMatchResult::Matches
             } else {
@@ -501,7 +505,7 @@ fn eval_for_any_value_string_equals_ignore_case(
             if actuals.iter().any(|actual| {
                 operands
                     .iter()
-                    .any(|expected| expected.eq_ignore_ascii_case(actual))
+                    .any(|expected| string_eq_ignore_case(expected, actual))
             }) {
                 ConditionMatchResult::Matches
             } else {
@@ -546,7 +550,7 @@ fn eval_string_not_equals_ignore_case(
         ActualValue::Present(actual) => {
             if operands
                 .iter()
-                .all(|expected| !expected.eq_ignore_ascii_case(actual))
+                .all(|expected| !string_eq_ignore_case(expected, actual))
             {
                 ConditionMatchResult::Matches
             } else {
@@ -566,7 +570,7 @@ fn eval_for_all_values_string_not_equals_ignore_case(
         ActualValue::Present(actual) => {
             if operands
                 .iter()
-                .all(|expected| !expected.eq_ignore_ascii_case(actual))
+                .all(|expected| !string_eq_ignore_case(expected, actual))
             {
                 ConditionMatchResult::Matches
             } else {
@@ -577,7 +581,7 @@ fn eval_for_all_values_string_not_equals_ignore_case(
             if actuals.iter().all(|actual| {
                 operands
                     .iter()
-                    .all(|expected| !expected.eq_ignore_ascii_case(actual))
+                    .all(|expected| !string_eq_ignore_case(expected, actual))
             }) {
                 ConditionMatchResult::Matches
             } else {
@@ -596,7 +600,7 @@ fn eval_for_any_value_string_not_equals_ignore_case(
         ActualValue::Present(actual) => {
             if operands
                 .iter()
-                .all(|expected| !expected.eq_ignore_ascii_case(actual))
+                .all(|expected| !string_eq_ignore_case(expected, actual))
             {
                 ConditionMatchResult::Matches
             } else {
@@ -607,7 +611,7 @@ fn eval_for_any_value_string_not_equals_ignore_case(
             if actuals.iter().any(|actual| {
                 operands
                     .iter()
-                    .all(|expected| !expected.eq_ignore_ascii_case(actual))
+                    .all(|expected| !string_eq_ignore_case(expected, actual))
             }) {
                 ConditionMatchResult::Matches
             } else {
@@ -1151,6 +1155,16 @@ mod tests {
     }
 
     #[test]
+    fn string_equals_ignore_case_matches_non_ascii_case_variants() {
+        let op = lookup("StringEqualsIgnoreCase").unwrap();
+        let expected = operands(&["sëcret"]);
+        assert_eq!(
+            (op.evaluate)(&expected, present("SËCRET")),
+            ConditionMatchResult::Matches
+        );
+    }
+
+    #[test]
     fn string_equals_ignore_case_does_not_match_multivalue_context() {
         let op = lookup("StringEqualsIgnoreCase").unwrap();
         assert_eq!(
@@ -1337,6 +1351,20 @@ mod tests {
         );
         assert_eq!(
             (op.evaluate)(&expected, present("b")),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn string_not_equals_ignore_case_rejects_non_ascii_case_variants() {
+        let op = lookup("StringNotEqualsIgnoreCase").unwrap();
+        let expected = operands(&["sëcret"]);
+        assert_eq!(
+            (op.evaluate)(&expected, present("private")),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present("SËCRET")),
             ConditionMatchResult::NoMatch
         );
     }

@@ -7618,6 +7618,56 @@ fn test_bucket_policy_string_equals_ignore_case_request_object_tag() {
 }
 
 #[test]
+fn test_bucket_policy_string_equals_ignore_case_request_object_tag_non_ascii() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": ["s3:PutObject", "s3:PutObjectTagging"],
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEqualsIgnoreCase": {
+                                "s3:RequestObjectTag/classification": "sëcret"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObject with non-ASCII StringEqualsIgnoreCase request-object-tag condition",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("allowed-non-ascii-uppercase")
+                    .tagging("classification=S%C3%8BCRET")
+                    .body(ByteStream::from_static(b"allowed"))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &["allowed-non-ascii-uppercase"]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_string_not_equals_ignore_case_request_object_tag() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -7686,6 +7736,78 @@ fn test_bucket_policy_string_not_equals_ignore_case_request_object_tag() {
         .await;
 
         cleanup(&bucket, &["allowed-uppercase", "denied-private"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_string_not_equals_ignore_case_request_object_tag_non_ascii() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": ["s3:PutObject", "s3:PutObjectTagging"],
+                            "Resource": bucket_wildcard_resource(&bucket)
+                        },
+                        {
+                            "Effect": "Deny",
+                            "Principal": alt_policy_principal(),
+                            "Action": ["s3:PutObject", "s3:PutObjectTagging"],
+                            "Resource": bucket_wildcard_resource(&bucket),
+                            "Condition": {
+                                "StringNotEqualsIgnoreCase": {
+                                    "s3:RequestObjectTag/classification": "sëcret"
+                                }
+                            }
+                        }
+                    ],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObject exempted from non-ASCII StringNotEqualsIgnoreCase deny",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("allowed-non-ascii-uppercase")
+                    .tagging("classification=S%C3%8BCRET")
+                    .body(ByteStream::from_static(b"allowed"))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "PutObject denied by non-ASCII StringNotEqualsIgnoreCase request-object-tag condition",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("denied-private")
+                    .tagging("classification=private")
+                    .body(ByteStream::from_static(b"denied"))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &["allowed-non-ascii-uppercase", "denied-private"]).await;
     });
 }
 
