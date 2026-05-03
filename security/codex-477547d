@@ -1,0 +1,262 @@
+ListObjectVersions delimiter can scan unbounded prefixes
+Link: https://chatgpt.com/codex/cloud/security/findings/0c5d9cf47e408191871586fe2e8096c1?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 477547d
+Author: justin@specialbusservice.com
+Created: 02/05/2026, 11:04:54
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+A denial-of-service bug was introduced in the commit's ListObjectVersions delimiter implementation. The newly added delimiter handling skips common prefixes by iterating and refilling through all matching versions instead of using an indexed upper-bound seek or otherwise limiting work to the requested page size.
+When ListObjectVersions is called with a delimiter and a page boundary lands on a CommonPrefix, the response uses that CommonPrefix as the next key marker. On the next request, the new delimiter path initializes that marker as an active common prefix and calls skip_cursor_prefix. That helper advances through cursor pages until it finds a key outside the prefix, refilling from SQLite each time. Unlike the ListObjects delimiter path, this code does not seek directly to the prefix upper bound, so max-keys no longer bounds per-request work. An attacker with ListBucketVersions permission, or an anonymous caller against a bucket that permits public listing, can repeatedly request a marker such as key-marker=largeprefix/&delimiter=/&max-keys=1 and force the server to scan all versions beneath largeprefix/ before returning a tiny response.
+
+# Resolution
+Fixed in commit [7c84aa2](https://github.com/justincormack/argmin/commit/7c84aa2) (`Seek past version-list common prefixes`).
+
+The fix makes `ListObjectVersions` delimiter pagination use the same upper-bound seek strategy as `ListObjects`. `ListObjectVersionsReq` now supports an inclusive `start_at` key lower bound, and the PgStore version-listing query can seek directly to `key >= object_key_prefix_upper_bound(common_prefix)`. The storage merge loop uses that seek when an active common prefix must be skipped, avoiding repeated cursor refills through every version under that prefix. If a prefix has no representable upper bound, the existing iterative fallback remains.
+
+Regression coverage was added for the `start_at` lower bound, and existing coordinator/s3-tests version-listing delimiter and pagination coverage was rerun.
+
+Validation after the fix:
+
+- `cargo test -p storage list_object_versions -- --nocapture`
+- `cargo test -p server-core list_object_versions_delimiter -- --nocapture`
+- `cargo nextest run -p s3-tests --test versioning list_object_versions`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo nextest run -p s3-tests`
+
+# Validation
+## Rubric
+- [x] Confirm network reachability: HTTP ListObjectVersions accepts `delimiter`, `key-marker`, and `max-keys` and forwards them.
+- [x] Confirm coordinator forwards delimiter and key marker to storage ListObjectVersions implementation.
+- [x] Confirm storage initializes `active_common_prefix` from a key marker ending in the delimiter.
+- [x] Confirm `skip_cursor_prefix` skips matching keys by incrementing the cursor and refilling pages rather than seeking to a prefix upper bound.
+- [x] Dynamically demonstrate that increasing objects under the prefix increases backend page fetches while the response remains bounded by `max_keys=1`.
+## Report
+Validated the finding against commit 477547d351e9e836e1036ca0eaf9c307da4dd8b3. I first attempted a direct crash-style run of a targeted PoC test; it completed successfully rather than crashing, which is expected for an algorithmic DoS. Valgrind was attempted but unavailable in the container (`bash: command not found: valgrind`). I then used LLDB to trace/count the vulnerable storage calls.
+
+Reachability/code evidence: the HTTP ListObjectVersions handler accepts attacker-controlled `delimiter`, `key-marker`, and `max-keys` and passes them to the coordinator at `crates/server-http/src/http/mod.rs:2956-2988`. The coordinator forwards `delimiter` and `key_marker` to storage at `crates/server-core/src/coordinator/listing.rs:129-140`. In storage, `fetch_limit = max_keys + 1` is used for each cursor page and passed to `pg.list_object_versions` at `crates/storage/src/cluster/request_ops.rs:1842-1858`; `refill_cursor` repeatedly loads more pages at `request_ops.rs:1866-1874`; `skip_cursor_prefix` advances one version at a time while the key starts with the common prefix and refills as needed at `request_ops.rs:1877-1885`; a `key_marker` ending in the delimiter becomes `active_common_prefix` at `request_ops.rs:1908-1912`; and common prefix emission sets `next_key_marker` to the prefix at `request_ops.rs:1952-1958`, making the marker reachable from normal pagination.
+
+Dynamic PoC: I added a targeted unit-test patch in `crates/storage/src/cluster/local.rs` that creates a one-PG local cluster, writes N objects under `largeprefix/` plus one later key `zzzz`, and calls the actual storage API: `list_object_versions_for_bucket(bucket, None, Some("/"), Some("largeprefix/"), None, 1)`. The direct run with N=12 returned a tiny response despite the large skipped prefix: `ARGMIN_POC prefix_count=12 versions=1 common_prefixes=0 truncated=false next_key_marker=None elapsed_ms=3`.
+
+Debugger evidence: I ran LLDB with a breakpoint at `crates/storage/src/pg_store.rs:6269`, the start of `PgStore::list_object_versions`, auto-continuing and listing hit counts. With `max_keys=1`, N=12 prefix objects produced `hit count = 7`; N=40 produced `hit count = 21`, while both requests returned only one version. This matches repeated cursor refills of roughly two returned versions per page and proves per-request work grows with the number of versions under the skipped common prefix, not with `max_keys`. Therefore the suspected denial-of-service is valid.
+
+# Evidence
+crates/server-core/src/coordinator/listing.rs (L129 to 140)
+  Note: The coordinator forwards the delimiter to storage for ListObjectVersions, making the new storage delimiter path reachable from network requests.
+```
+        let list_prefix = optional_list_object_key(prefix)?;
+        let list_key_marker = optional_list_object_key(key_marker)?;
+        let listed = self
+            .storage_node
+            .list_object_versions_for_bucket(
+                bucket,
+                list_prefix.as_ref(),
+                delimiter,
+                list_key_marker.as_ref(),
+                version_id_marker,
+                max_keys,
+            )
+```
+
+crates/server-http/src/http/mod.rs (L2956 to 2988)
+  Note: The HTTP ListObjectVersions handler now accepts the attacker-controlled delimiter and passes it, along with max-keys and key-marker, into the coordinator.
+```
+            S3Operation::ListObjectVersions { bucket } => {
+                let prefix = req.query_param_lossy("prefix");
+                let delimiter = req.query_param_lossy("delimiter").filter(|d| !d.is_empty());
+                let key_marker = req.query_param_lossy("key-marker");
+                let encoding_type = req.query_param_lossy("encoding-type");
+                let version_id_marker = parse_optional_version_id(
+                    req.query_param_lossy("version-id-marker"),
+                    "version-id-marker",
+                )?;
+                if version_id_marker.is_some() && key_marker.is_none() {
+                    return Err(ServerError::InvalidArgument {
+                        reason: "A version-id marker cannot be specified without a key marker."
+                            .to_string(),
+                    });
+                }
+                let max_keys_param = req.query_param_lossy("max-keys");
+                let requested_max_keys = parse_requested_max_keys(max_keys_param.as_deref())?;
+                let policy_requested_max_keys = max_keys_param
+                    .as_deref()
+                    .map(|value| parse_requested_max_keys(Some(value)))
+                    .transpose()?;
+                let requester = Self::requester_from_auth(auth);
+
+                let result = self.coordinator.list_object_versions(
+                    &crate::coordinator::ListObjectVersionsRequest {
+                        bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
+                        prefix: prefix.as_deref(),
+                        delimiter: delimiter.as_deref(),
+                        key_marker: key_marker.as_deref(),
+                        version_id_marker,
+                        max_keys: requested_max_keys,
+                        requested_max_keys: policy_requested_max_keys,
+                    },
+```
+
+crates/storage/src/cluster/request_ops.rs (L1842 to 1874)
+  Note: The version-listing path fetches only max_keys+1 records per page, but refill_cursor will keep loading additional pages while skipping a prefix.
+```
+        let fetch_limit = max_keys.saturating_add(1);
+        let prefix = prefix.cloned();
+        let key_marker = key_marker.cloned();
+        let delimiter = delimiter.filter(|delimiter| !delimiter.is_empty());
+        let prefix_str = prefix.as_ref().map_or("", ObjectKey::as_str);
+        let fetch_versions_page = |cursor: &mut VersionCursor,
+                                   key_marker: Option<ObjectKey>,
+                                   version_id_marker: Option<VersionId>|
+         -> Result<(), ObjectPgActionError> {
+            let pg = self.metadata_pg(cursor.pg_id)?;
+            let resp = pg.list_object_versions(&ListObjectVersionsReq {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                key_marker,
+                version_id_marker,
+                max_keys: fetch_limit,
+            })?;
+            cursor.versions = resp.versions;
+            cursor.next_index = 0;
+            cursor.next_key_marker = resp.next_key_marker;
+            cursor.next_version_id_marker = resp.next_version_id_marker;
+            Ok(())
+        };
+
+        let refill_cursor = |cursor: &mut VersionCursor| -> Result<(), ObjectPgActionError> {
+            while cursor.current().is_none() {
+                let Some(next_key_marker) = cursor.next_key_marker.clone() else {
+                    break;
+                };
+                let next_version_id_marker = cursor.next_version_id_marker;
+                fetch_versions_page(cursor, Some(next_key_marker), next_version_id_marker)?;
+            }
+            Ok(())
+```
+
+crates/storage/src/cluster/request_ops.rs (L1877 to 1885)
+  Note: skip_cursor_prefix loops over every current version whose key starts with the common prefix and refills as needed, allowing work proportional to all versions under that prefix.
+```
+        let skip_cursor_prefix =
+            |cursor: &mut VersionCursor, common_prefix: &str| -> Result<(), ObjectPgActionError> {
+                while cursor
+                    .current()
+                    .is_some_and(|obj| obj.key().as_str().starts_with(common_prefix))
+                {
+                    cursor.next_index += 1;
+                    refill_cursor(cursor)?;
+                }
+```
+
+crates/storage/src/cluster/request_ops.rs (L1908 to 1930)
+  Note: A key-marker ending in the delimiter is treated as an active common prefix on the next request, causing the skip loop to run before normal pagination.
+```
+        let mut active_common_prefix = key_marker.as_ref().and_then(|marker| {
+            let delimiter = delimiter?;
+            let after_prefix = marker.as_str().strip_prefix(prefix_str)?;
+            after_prefix.ends_with(delimiter).then(|| marker.clone())
+        });
+
+        while let Some((cursor_index, current_key)) = cursors
+            .iter()
+            .enumerate()
+            .filter_map(|(cursor_index, cursor)| {
+                cursor
+                    .current()
+                    .map(|version| (cursor_index, version.key().clone()))
+            })
+            .min_by(|(left_index, left_key), (right_index, right_key)| {
+                left_key
+                    .cmp(right_key)
+                    .then_with(|| left_index.cmp(right_index))
+            })
+        {
+            if let Some(ref common_prefix) = active_common_prefix {
+                if current_key.as_str().starts_with(common_prefix.as_str()) {
+                    skip_cursor_prefix(&mut cursors[cursor_index], common_prefix.as_str())?;
+```
+
+crates/storage/src/cluster/request_ops.rs (L1940 to 1959)
+  Note: When a common prefix is emitted, the cursor is not advanced; the returned next_key_marker can be the prefix itself, setting up subsequent requests to rescan and skip the whole prefix.
+```
+            if let Some(delimiter) = delimiter {
+                if let Some(common_prefix_key) =
+                    crate::object_key_common_prefix(current.key(), prefix_str, delimiter)
+                {
+                    active_common_prefix = Some(common_prefix_key.clone());
+                    if key_marker
+                        .as_ref()
+                        .is_some_and(|marker| common_prefix_key.as_str() <= marker.as_str())
+                    {
+                        skip_cursor_prefix(&mut cursors[cursor_index], common_prefix_key.as_str())?;
+                        continue;
+                    }
+                    if versions.len() + common_prefixes.len() >= max {
+                        is_truncated = true;
+                        break;
+                    }
+                    next_key_marker = Some(common_prefix_key.clone());
+                    next_version_id_marker = None;
+                    common_prefixes.push(common_prefix_key);
+                    continue;
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Kept as medium. Static repository evidence shows an in-scope HTTP-to-storage attack path: ?versions routing reaches a handler that forwards delimiter/key-marker/max-keys, coordinator authorizes and forwards the request, and storage can repeatedly refill SQLite cursor pages while skipping an active common prefix. The validation evidence further showed PgStore::list_object_versions hit counts growing with prefix size despite max-keys=1. Impact is limited to transient availability degradation of a single service/metadata path, with no demonstrated confidentiality, integrity, auth bypass, RCE, or cross-boundary compromise. Likelihood is meaningful but moderated by deployment exposure, ListBucketVersions/public-list preconditions, and the need for many objects/versions under a prefix.
+## Likelihood
+high - The exploit parameters are simple and attacker-controlled once the listing endpoint is reachable, and public buckets can make it unauthenticated. However, default binding is localhost-only, private buckets require ListBucketVersions authorization, and the attacker needs a bucket with a large prefix to amplify the cost. | Remote network vector
+## Impact
+medium - A small request can force repeated SQLite page reads and cursor iteration proportional to the number of object versions under a prefix. This can degrade CPU/I/O availability for the argmin-s3 service, but does not directly expose data, modify data, bypass authentication, or execute code.
+## Assumptions
+- The argmin-s3 HTTP endpoint is reachable by the attacker, either because ARGMIN_LISTEN_ADDR is bound beyond localhost or because a reverse proxy exposes it.
+- The target bucket contains many keys or object versions under an attacker-selectable common prefix such as largeprefix/.
+- The attacker has s3:ListBucketVersions/ListBucketVersions-equivalent access, or the bucket policy/ACL permits anonymous public listing.
+- network reachability to argmin-s3
+- ListBucketVersions permission or a bucket that allows anonymous/public listing
+- many stored object-version rows under a common prefix
+- ability to send delimiter, key-marker, and max-keys query parameters
+## Path
+Network client
+  -> argmin-s3 HTTP listener
+  -> ?versions router/handler
+  -> coordinator authz/list_object_versions
+  -> storage active_common_prefix / skip_cursor_prefix
+  -> repeated PgStore SQLite page queries
+  -> CPU/I/O availability degradation
+## Path evidence
+- `crates/argmin-s3/src/config.rs:59-68` - Runtime credentials and listener are environment-driven; default ARGMIN_LISTEN_ADDR is 127.0.0.1:9000, so exposure depends on deployment configuration.
+- `crates/argmin-s3/src/main.rs:130-144` - The service creates an application credential record from configured access key/secret with OwnerAccountAdmin privileges.
+- `crates/argmin-s3/src/main.rs:152-205` - The main product binary binds the TCP listener and starts the plain or TLS HTTP server.
+- `crates/server-http/src/http/serve.rs:353-427` - HTTP serve layer has connection and in-flight request semaphores/timeouts, which are availability controls but not per-principal request-cost limits.
+- `crates/server-http/src/http/router.rs:528-532` - A bucket request containing ?versions is routed to the ListObjectVersions operation.
+- `crates/server-http/src/http/mod.rs:2956-2988` - The ListObjectVersions handler reads attacker-controlled prefix, delimiter, key-marker, and max-keys query parameters and passes them into coordinator.list_object_versions.
+- `crates/server-http/src/http/mod.rs:3065-3068` - Missing authentication becomes AuthContext::anonymous, making the path reachable for buckets that permit public/anonymous listing.
+- `crates/server-core/src/coordinator/authz/bucket.rs:787-821` - Authorization checks s3:ListBucketVersions with request context and then falls back to bucket read/public-read ACL behavior before allowing version listing.
+- `crates/server-core/src/coordinator/listing.rs:95-140` - Coordinator caps returned max-keys to S3_MAX_LIST_KEYS but forwards delimiter and key-marker to storage for ListObjectVersions.
+- `crates/storage/src/cluster/request_ops.rs:1842-1874` - Storage fetches max_keys+1 rows per cursor page, and refill_cursor can load additional pages while skipping.
+- `crates/storage/src/cluster/request_ops.rs:1877-1885` - skip_cursor_prefix advances one version at a time while the current key starts with the common prefix and refills as needed.
+- `crates/storage/src/cluster/request_ops.rs:1908-1931` - A key-marker ending in the delimiter is treated as an active common prefix, which triggers the skip loop before normal pagination.
+- `crates/storage/src/cluster/request_ops.rs:1940-1958` - When a delimiter-derived common prefix is emitted, next_key_marker is set to that prefix, creating a normal pagination path to the expensive marker state.
+- `crates/storage/src/pg_store.rs:6269-6327` - Each refill results in a bounded SQLite query ordered by key/write_sequence; repeated refills make total per-request work exceed the requested page size.
+## Narrative
+The finding is real and in scope. The main argmin-s3 binary exposes an HTTP S3 API on a configurable listener, defaulting to 127.0.0.1:9000. The router maps ?versions to ListObjectVersions, and the handler accepts attacker-controlled delimiter, key-marker, and max-keys query parameters. Coordinator authorization requires ListBucketVersions or falls back to bucket read/public access, then forwards those values to storage. In storage, a key-marker ending with the delimiter becomes active_common_prefix; skip_cursor_prefix then increments through every current version whose key starts with that prefix and calls refill_cursor, which issues more PgStore list_object_versions queries. The response may be limited to max-keys, but the internal scan can grow with all versions under the prefix. This is an availability issue, not a confidentiality/integrity compromise, and default exposure is localhost unless configured otherwise, so medium severity is appropriate.
+## Controls
+- SigV4 authentication for private buckets
+- Bucket policy/ACL authorization for s3:ListBucketVersions
+- Anonymous AuthContext is supported for explicitly public buckets
+- max-keys is capped for response size but does not cap internal prefix-skipping work
+- Connection and in-flight request semaphores plus HTTP timeouts
+- No repository evidence of per-client or per-bucket rate limiting for expensive list operations
+## Blindspots
+- No deployment manifests were found to prove whether ARGMIN_LISTEN_ADDR is public, internal-only, or left at the localhost default.
+- Static repository review cannot confirm real bucket policies, ACLs, object/version cardinality, or production rate limits outside the repo.
+- No cloud APIs were called; infrastructure exposure and load balancer type are unknown.
+- The validation PoC evidence was supplied by an earlier stage; this attack-path pass only rechecked repository artifacts.
