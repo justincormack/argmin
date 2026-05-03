@@ -16,7 +16,7 @@ Introduced: the new merge-read authorization path permits loading bucket tags be
 TagResource now reads the existing bucket tagging document and merges the requested tags before the s3:TagResource bucket-policy/owner authorization check is performed. The new authorize_bucket_tag_control_merge_read helper only validates that the supplied account id matches the bucket owner; it does not verify that the requester is the bucket owner or is allowed by bucket policy. Because merge validation can fail before the later authorize_put_bucket_tag_control call, an unauthorized or anonymous caller who knows the bucket name and owner account id can distinguish cases such as whether the existing tag set plus a crafted 50-tag request exceeds the tag limit. This can leak limited bucket tag metadata, such as tag count/key membership properties. Before this commit, get_bucket_tags_for_tag_resource used the stricter owner-admin authorization path before loading tags.
 
 # Resolution
-Fixed in commit [fb1678c](https://github.com/justincormack/argmin/commit/fb1678c) (`Authorize bucket tag merge reads before loading tags`).
+Fixed in commit [cf4cd36](https://github.com/justincormack/argmin/commit/cf4cd36) (`Authorize bucket tag merge reads before loading tags`).
 
 The weak `authorize_bucket_tag_control_merge_read` path was removed. TagResource and UntagResource now pass the requested tag context and concrete policy action into `get_bucket_tags_for_tag_resource`, which runs the same bucket-policy/owner authorization used by the write path before loading existing bucket tags for merge/removal. The write path still re-authorizes before storing or deleting tags.
 

@@ -10,7 +10,7 @@ case variants such as `sëcret` and `SËCRET` in request object tag values, whil
 the local evaluator previously used Rust `eq_ignore_ascii_case` and only folded
 ASCII.
 
-Fixed in commit `17ae032` (`Match S3 ignore-case Unicode policy matching`) by
+Fixed in commit `1b1d8d5` (`Match S3 ignore-case Unicode policy matching`) by
 changing the ignore-case string condition operators to compare Unicode lowercase
 forms rather than ASCII-only case folding. Added auth unit coverage and
 AWS-facing s3-tests for both positive and negative operators:
