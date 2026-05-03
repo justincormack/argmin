@@ -7,7 +7,9 @@ use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
 
 use super::ShardLocation;
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
-use crate::metadata_command::{MetadataCommandEnvelope, MetadataCommandLogIndex};
+use crate::metadata_command::{
+    MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandLogIndex,
+};
 use crate::{
     BucketName, ClusterEpoch, DataPgId, EcShape, GenerationId, ObjectKey, PgId, PgState,
     ReclaimWorkItem, ShardIndex, ShardKey, SharedStorageNode, WriteAck,
@@ -213,7 +215,6 @@ pub(crate) struct LocalClusterRuntimeState {
     reclaim_queue: (Mutex<LocalReclaimQueueState>, Condvar),
     metadata_command_indexes: Mutex<HashMap<PgId, u64>>,
     metadata_command_apply_lock: Mutex<()>,
-    applied_metadata_commands: Mutex<HashMap<(NodeId, PgId, u64), u64>>,
     pending_metadata_commands: Mutex<HashMap<(PgId, BucketName), MetadataCommandEnvelope>>,
 }
 
@@ -237,14 +238,13 @@ struct LocalReclaimQueueState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PendingMetadataCommandConflict;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MetadataCommandAcceptance {
-    Apply,
-    AlreadyApplied,
-}
-
 impl LocalClusterRuntimeState {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_metadata_command_indexes(HashMap::new())
+    }
+
+    fn with_metadata_command_indexes(metadata_command_indexes: HashMap<PgId, u64>) -> Self {
         Self {
             object_payload_leases: Mutex::new(LocalObjectPayloadLeaseState::default()),
             reclaim_queue: (
@@ -256,9 +256,8 @@ impl LocalClusterRuntimeState {
                 }),
                 Condvar::new(),
             ),
-            metadata_command_indexes: Mutex::new(HashMap::new()),
+            metadata_command_indexes: Mutex::new(metadata_command_indexes),
             metadata_command_apply_lock: Mutex::new(()),
-            applied_metadata_commands: Mutex::new(HashMap::new()),
             pending_metadata_commands: Mutex::new(HashMap::new()),
         }
     }
@@ -321,51 +320,6 @@ impl LocalClusterRuntimeState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&(pg_id, bucket.clone()));
-    }
-
-    fn metadata_command_acceptance(
-        &self,
-        target_node_id: NodeId,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<MetadataCommandAcceptance, StoreError> {
-        let command_log_index = command.id().log_index().get();
-        let applied_checksum = self
-            .applied_metadata_commands
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&(target_node_id, pg_id, command_log_index))
-            .copied();
-
-        let Some(applied_checksum) = applied_checksum else {
-            return Ok(MetadataCommandAcceptance::Apply);
-        };
-
-        if command.checksum_crc64() == applied_checksum {
-            return Ok(MetadataCommandAcceptance::AlreadyApplied);
-        }
-        Err(StoreError::MetadataCommandLogConflict {
-            node_id: target_node_id.as_u32(),
-            pg_id: pg_id.get(),
-            cluster_epoch,
-            log_index: command_log_index,
-        })
-    }
-
-    pub(crate) fn mark_metadata_command_applied(
-        &self,
-        target_node_id: NodeId,
-        pg_id: PgId,
-        command: &MetadataCommandEnvelope,
-    ) {
-        self.applied_metadata_commands
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                (target_node_id, pg_id, command.id().log_index().get()),
-                command.checksum_crc64(),
-            );
     }
 
     pub(crate) fn clear_pending_metadata_command_for_bucket(
@@ -681,13 +635,17 @@ impl LocalClusterMap {
         let metadata_primary = nodes
             .get(&metadata_primary_node_id)
             .expect("validated metadata primary should have been opened");
+        let metadata_command_indexes =
+            seed_metadata_command_indexes(&nodes, &pg_ids, ClusterEpoch::INITIAL)?;
 
         Ok(Self {
             epoch: ClusterEpoch::INITIAL,
             metadata_primary_node_id,
             pg_routes,
             placement_map,
-            runtime_state: Arc::new(LocalClusterRuntimeState::new()),
+            runtime_state: Arc::new(LocalClusterRuntimeState::with_metadata_command_indexes(
+                metadata_command_indexes,
+            )),
             process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
             nodes,
         })
@@ -888,7 +846,6 @@ impl LocalClusterMap {
                 state: route.state(),
             });
         }
-
         let primary_node_id = route.primary_node_id();
         if !route.contains_node(primary_node_id) {
             return Err(StoreError::NodeNotInActingSet {
@@ -913,20 +870,101 @@ impl LocalClusterMap {
                 cluster_epoch: self.epoch,
             });
         }
-        if !self.nodes.contains_key(&target_node_id) {
-            return Err(StoreError::NodeNotFound {
+        let target_node = self
+            .nodes
+            .get(&target_node_id)
+            .ok_or(StoreError::NodeNotFound {
+                node_id: target_node_id.as_u32(),
+                pg_id: target_pg_id.get(),
+                cluster_epoch: self.epoch,
+            })?;
+
+        let target_pg = target_node.storage_node().get_pg(target_pg_id.get())?;
+        target_pg.metadata_command_acceptance(target_node_id.as_u32(), command)
+    }
+
+    pub(crate) fn validate_metadata_command_abandon_for_replica(
+        &self,
+        origin_node_id: NodeId,
+        target_node_id: NodeId,
+        target_pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        let command_pg_id = command.id().pg_id();
+        if command_pg_id != target_pg_id {
+            return Err(StoreError::MetadataCommandWrongPg {
+                node_id: target_node_id.as_u32(),
+                command_pg_id: command_pg_id.get(),
+                target_pg_id: target_pg_id.get(),
+                cluster_epoch: self.epoch,
+            });
+        }
+
+        let command_epoch = command.id().cluster_epoch();
+        if command_epoch != self.epoch {
+            return Err(StoreError::StaleMetadataCommand {
+                node_id: target_node_id.as_u32(),
+                pg_id: target_pg_id.get(),
+                command_epoch,
+                current_epoch: self.epoch,
+            });
+        }
+
+        let route = self
+            .pg_routes
+            .get(&target_pg_id)
+            .ok_or(StoreError::ClusterPgNotFound {
+                pg_id: target_pg_id.get(),
+                cluster_epoch: self.epoch,
+            })?;
+        if route.cluster_epoch() != self.epoch {
+            return Err(StoreError::StaleMetadataRoute {
+                pg_id: target_pg_id.get(),
+                route_epoch: route.cluster_epoch(),
+                current_epoch: self.epoch,
+            });
+        }
+        if !route.is_active() {
+            return Err(StoreError::PgNotActive {
+                pg_id: target_pg_id.get(),
+                cluster_epoch: self.epoch,
+                state: route.state(),
+            });
+        }
+        let primary_node_id = route.primary_node_id();
+        if !route.contains_node(primary_node_id) {
+            return Err(StoreError::NodeNotInActingSet {
+                node_id: primary_node_id.as_u32(),
+                pg_id: target_pg_id.get(),
+                cluster_epoch: self.epoch,
+            });
+        }
+        if origin_node_id != primary_node_id {
+            return Err(StoreError::MetadataCommandFromNonPrimary {
+                node_id: target_node_id.as_u32(),
+                pg_id: target_pg_id.get(),
+                cluster_epoch: self.epoch,
+                origin_node_id: origin_node_id.as_u32(),
+                primary_node_id: primary_node_id.as_u32(),
+            });
+        }
+        if !route.contains_node(target_node_id) {
+            return Err(StoreError::NodeNotInActingSet {
                 node_id: target_node_id.as_u32(),
                 pg_id: target_pg_id.get(),
                 cluster_epoch: self.epoch,
             });
         }
-
-        self.runtime_state.metadata_command_acceptance(
-            target_node_id,
-            target_pg_id,
-            self.epoch,
-            command,
-        )
+        let target_node = self
+            .nodes
+            .get(&target_node_id)
+            .ok_or(StoreError::NodeNotFound {
+                node_id: target_node_id.as_u32(),
+                pg_id: target_pg_id.get(),
+                cluster_epoch: self.epoch,
+            })?;
+        let target_pg = target_node.storage_node().get_pg(target_pg_id.get())?;
+        target_pg.metadata_command_abandon_acceptance(target_node_id.as_u32(), command)
     }
 
     pub fn place_payload_shards(
@@ -1159,6 +1197,35 @@ fn build_static_pg_routes(
         .collect()
 }
 
+fn seed_metadata_command_indexes(
+    nodes: &BTreeMap<NodeId, LocalNodeStore>,
+    pg_ids: &[PgId],
+    cluster_epoch: ClusterEpoch,
+) -> Result<HashMap<PgId, u64>, ClusterBuildError> {
+    let mut indexes = HashMap::new();
+    for &pg_id in pg_ids {
+        let mut max_index = 0_u64;
+        for node in nodes.values() {
+            let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
+                ClusterBuildError::OpenLocalNode {
+                    node_id: node.node_id().as_u32(),
+                    source,
+                }
+            })?;
+            max_index = max_index.max(pg.max_metadata_command_log_index(cluster_epoch).map_err(
+                |source| ClusterBuildError::OpenLocalNode {
+                    node_id: node.node_id().as_u32(),
+                    source,
+                },
+            )?);
+        }
+        if max_index != 0 {
+            indexes.insert(pg_id, max_index);
+        }
+    }
+    Ok(indexes)
+}
+
 fn validate_local_pg_ids(pg_ids: &[u32]) -> Result<Vec<PgId>, ClusterBuildError> {
     if pg_ids.is_empty() {
         return Err(ClusterBuildError::EmptyPgSet);
@@ -1281,9 +1348,9 @@ fn prepare_local_node_data_dir(
 mod tests {
     use super::*;
     use crate::metadata_command::{
-        BucketPropertyMutation, BucketSubresourceMutation, CreateBucketCommand,
-        MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
-        MetadataCommandPayload,
+        metadata_command_log_hash, BucketPropertyMutation, BucketSubresourceMutation,
+        CreateBucketCommand, MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandId,
+        MetadataCommandLogIndex, MetadataCommandPayload,
     };
     use proptest::prelude::*;
     use proptest::test_runner::{TestCaseError, TestCaseResult};
@@ -1853,6 +1920,7 @@ mod tests {
                 .unwrap(),
             Some(1)
         );
+        pg.refresh_metadata_command_state_digest().unwrap();
     }
 
     fn completed_multipart_order_on_node(
@@ -2939,17 +3007,1220 @@ mod tests {
         cluster
             .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &later_command)
             .unwrap();
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let state = pg.metadata_command_replica_state().unwrap();
+            assert_eq!(state.applied_log_index, 0);
+            assert_eq!(state.applied_log_hash, 0);
+            let later = crate::PgMetadataStore::head_bucket(&*pg, &later_bucket).unwrap();
+            assert_eq!(later.name, later_bucket);
+        }
+
         cluster
             .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &earlier_command)
             .unwrap();
 
+        let first_hash = metadata_command_log_hash(
+            ClusterEpoch::INITIAL,
+            PgId::new(1),
+            MetadataCommandLogIndex::new(1).unwrap(),
+            0,
+            earlier_command.checksum_crc64(),
+        );
+        let second_hash = metadata_command_log_hash(
+            ClusterEpoch::INITIAL,
+            PgId::new(1),
+            MetadataCommandLogIndex::new(2).unwrap(),
+            first_hash,
+            later_command.checksum_crc64(),
+        );
         for node_id in node_ids {
             let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let state = pg.metadata_command_replica_state().unwrap();
+            assert_eq!(state.applied_log_index, 2);
+            assert_eq!(state.applied_log_hash, second_hash);
             let earlier = crate::PgMetadataStore::head_bucket(&*pg, &earlier_bucket).unwrap();
             assert_eq!(earlier.name, earlier_bucket);
             let later = crate::PgMetadataStore::head_bucket(&*pg, &later_bucket).unwrap();
             assert_eq!(later.name, later_bucket);
         }
+    }
+
+    #[test]
+    fn metadata_command_log_state_survives_local_cluster_reopen() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let bucket = {
+            let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+            let topology = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "durable-command-");
+            set_route_primary(&mut map, 1, NodeId::new(1));
+            let map = Arc::new(map);
+            let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            let command = create_bucket_metadata_command(PgId::new(1), 1, bucket.clone());
+            cluster
+                .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+                .unwrap();
+            bucket
+        };
+
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let command = create_bucket_metadata_command(PgId::new(1), 1, bucket.clone());
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+            .unwrap();
+
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let state = pg.metadata_command_replica_state().unwrap();
+            assert_eq!(state.applied_log_index, 1);
+            let info = crate::PgMetadataStore::head_bucket(&*pg, &bucket).unwrap();
+            assert_eq!(info.name, bucket);
+        }
+    }
+
+    #[test]
+    fn metadata_command_log_index_allocator_seeds_from_reopened_log() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let (first_bucket, second_bucket) = {
+            let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+            let topology = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let first_bucket = bucket_for_pg(topology, 1, "reopen-index-first-");
+            let second_bucket = bucket_for_pg(topology, 1, "reopen-index-second-");
+            set_route_primary(&mut map, 1, NodeId::new(1));
+            let map = Arc::new(map);
+            let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            create_test_bucket(&cluster, &first_bucket);
+            (first_bucket, second_bucket)
+        };
+
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &second_bucket);
+
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let state = pg.metadata_command_replica_state().unwrap();
+            assert_eq!(state.applied_log_index, 2);
+            let first = crate::PgMetadataStore::head_bucket(&*pg, &first_bucket).unwrap();
+            assert_eq!(first.name, first_bucket);
+            let second = crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).unwrap();
+            assert_eq!(second.name, second_bucket);
+        }
+    }
+
+    #[test]
+    fn zero_apply_command_failure_records_tombstone_for_later_hash_chain_convergence() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let first_bucket = bucket_for_pg(topology, 1, "zero-apply-first-");
+        let second_bucket = bucket_for_pg(topology, 1, "zero-apply-second-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let fail_once_hook = Arc::clone(&fail_once);
+        let first_bucket_for_hook = first_bucket.clone();
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::CreateBucket(create)
+                        if create.name == first_bucket_for_hook
+                            && node_id == NodeId::new(0)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected zero-apply create bucket failure",
+                            source: std::io::Error::other(
+                                "injected zero-apply create bucket failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let acl_grants = crate::AclGrants::default();
+        let err = cluster
+            .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+                name: first_bucket.as_str(),
+                owner_principal: "owner",
+                owner_canonical_id: &owner,
+                acl_grants: &acl_grants,
+                public_read: false,
+                public_write: false,
+                versioning: crate::BucketVersioningState::Disabled,
+                object_lock: crate::BucketObjectLockConfig::default(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Store(StoreError::Io {
+                    context: "injected zero-apply create bucket failure",
+                    ..
+                })
+            ),
+            "expected injected zero-apply failure, got {err:?}"
+        );
+        drop(hook_guard);
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(1), &first_bucket)
+            .is_none());
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let state = pg.metadata_command_replica_state().unwrap();
+            assert_eq!(state.applied_log_index, 1);
+            assert!(matches!(
+                crate::PgMetadataStore::head_bucket(&*pg, &first_bucket),
+                Err(crate::MetadataError::BucketNotFound { .. })
+            ));
+        }
+
+        create_test_bucket(&cluster, &second_bucket);
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let state = pg.metadata_command_replica_state().unwrap();
+            assert_eq!(state.applied_log_index, 2);
+            let second = crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).unwrap();
+            assert_eq!(second.name, second_bucket);
+        }
+
+        create_test_bucket(&cluster, &first_bucket);
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(1), &first_bucket)
+            .is_none());
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let state = pg.metadata_command_replica_state().unwrap();
+            assert_eq!(state.applied_log_index, 3);
+            let first = crate::PgMetadataStore::head_bucket(&*pg, &first_bucket).unwrap();
+            assert_eq!(first.name, first_bucket);
+            let second = crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).unwrap();
+            assert_eq!(second.name, second_bucket);
+        }
+    }
+
+    #[test]
+    fn partial_tombstone_recording_retries_as_idempotent_abandon() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "partial-tombstone-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let command = create_bucket_metadata_command(PgId::new(1), 1, bucket.clone());
+
+        {
+            let node_zero_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            node_zero_pg
+                .record_metadata_command_abandoned(NodeId::new(0).as_u32(), &command)
+                .unwrap();
+        }
+
+        cluster
+            .record_abandoned_metadata_command_to_acting_set(&command)
+            .unwrap();
+        cluster
+            .record_abandoned_metadata_command_to_acting_set(&command)
+            .unwrap();
+
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let state = pg.metadata_command_replica_state().unwrap();
+            assert_eq!(state.applied_log_index, 1);
+            assert!(matches!(
+                crate::PgMetadataStore::head_bucket(&*pg, &bucket),
+                Err(crate::MetadataError::BucketNotFound { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn partial_abandoned_create_bucket_retry_rebuilds_command_before_reporting_created() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "partial-create-tombstone-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let abandoned_index = map
+            .runtime_state()
+            .next_metadata_command_log_index(pg_id)
+            .get();
+        let command = create_bucket_metadata_command(pg_id, abandoned_index, bucket.clone());
+        map.runtime_state()
+            .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone())
+            .unwrap();
+        {
+            let node_zero_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            node_zero_pg
+                .record_metadata_command_abandoned(NodeId::new(0).as_u32(), &command)
+                .unwrap();
+        }
+
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let acl_grants = crate::AclGrants::default();
+        let outcome = cluster
+            .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+                name: bucket.as_str(),
+                owner_principal: "owner",
+                owner_canonical_id: &owner,
+                acl_grants: &acl_grants,
+                public_read: false,
+                public_write: false,
+                versioning: crate::BucketVersioningState::Disabled,
+                object_lock: crate::BucketObjectLockConfig::default(),
+            })
+            .unwrap();
+        let crate::BucketCreateAttemptOutcome::Created(info) = outcome else {
+            panic!("abandoned create retry must create a fresh bucket, got {outcome:?}");
+        };
+        assert_eq!(info.name, bucket);
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let state = pg.metadata_command_replica_state().unwrap();
+            assert_eq!(state.applied_log_index, abandoned_index + 1);
+            let stored = crate::PgMetadataStore::head_bucket(&*pg, &bucket).unwrap();
+            assert_eq!(stored.name, bucket);
+        }
+    }
+
+    #[test]
+    fn partial_abandoned_reservation_retry_does_not_report_skipped_command_success() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let pg_id = PgId::new(object_pg);
+        let reservation_id = crate::SessionId::try_from("58".repeat(16)).unwrap();
+        let skipped_generation_id = crate::GenerationId::MIN;
+        let command = MetadataCommandEnvelope::new(
+            crate::metadata_command::MetadataCommandId::new(
+                cluster.operation_epoch(),
+                pg_id,
+                map.runtime_state().next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::ReserveObjectGeneration(
+                crate::metadata_command::ReserveObjectGenerationCommand::new(
+                    bucket.clone(),
+                    key.clone(),
+                    reservation_id.clone(),
+                    skipped_generation_id,
+                    123,
+                ),
+            ),
+        );
+        map.runtime_state()
+            .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone())
+            .unwrap();
+        {
+            let node_zero_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            node_zero_pg
+                .record_metadata_command_abandoned(NodeId::new(0).as_u32(), &command)
+                .unwrap();
+        }
+
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        assert_eq!(generation_id, skipped_generation_id);
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(pg_id, &bucket)
+            .is_none());
+        for node_id in node_ids {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    &reservation_id
+                )
+                .unwrap(),
+                generation_id
+            );
+            let state = pg.metadata_command_replica_state().unwrap();
+            assert_eq!(state.applied_log_index, 2);
+        }
+    }
+
+    #[test]
+    fn abandoned_put_object_stream_create_releases_reserved_generation_on_drain() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let pg_id = PgId::new(object_pg);
+        let session_id = crate::SessionId::try_from("59".repeat(16)).unwrap();
+        cluster
+            .reserve_put_object_generation(&bucket, &key, &session_id)
+            .unwrap();
+        let command = MetadataCommandEnvelope::new(
+            crate::metadata_command::MetadataCommandId::new(
+                cluster.operation_epoch(),
+                pg_id,
+                map.runtime_state().next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::CreateStreamUpload(Box::new(
+                crate::metadata_command::CreateStreamUploadCommand {
+                    request: crate::CreateStreamUploadReq {
+                        session_id: session_id.clone(),
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        target: crate::StreamUploadTarget::PutObject,
+                        encryption: crate::ObjectEncryption::None,
+                    },
+                    created_at_millis: 123,
+                },
+            )),
+        );
+        map.runtime_state()
+            .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone())
+            .unwrap();
+        {
+            let node_zero_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            node_zero_pg
+                .record_metadata_command_abandoned(NodeId::new(0).as_u32(), &command)
+                .unwrap();
+        }
+
+        cluster
+            .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+            .unwrap();
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(pg_id, &bucket)
+            .is_none());
+        for node_id in node_ids {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    &session_id
+                ),
+                Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn abandoned_put_object_stream_create_release_failure_leaves_pending_retry() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let pg_id = PgId::new(object_pg);
+        let session_id = crate::SessionId::try_from("5a".repeat(16)).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &session_id)
+            .unwrap();
+        let command = MetadataCommandEnvelope::new(
+            crate::metadata_command::MetadataCommandId::new(
+                cluster.operation_epoch(),
+                pg_id,
+                map.runtime_state().next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::CreateStreamUpload(Box::new(
+                crate::metadata_command::CreateStreamUploadCommand {
+                    request: crate::CreateStreamUploadReq {
+                        session_id: session_id.clone(),
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        target: crate::StreamUploadTarget::PutObject,
+                        encryption: crate::ObjectEncryption::None,
+                    },
+                    created_at_millis: 123,
+                },
+            )),
+        );
+        map.runtime_state()
+            .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone())
+            .unwrap();
+        {
+            let node_zero_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            node_zero_pg
+                .record_metadata_command_abandoned(NodeId::new(0).as_u32(), &command)
+                .unwrap();
+        }
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let hook_session = session_id.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::ReleaseObjectGeneration(release)
+                        if release.matches_request(&hook_bucket, &hook_key, &hook_session)
+                            && node_id == NodeId::new(0)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected abandoned stream create release failure",
+                            source: std::io::Error::other(
+                                "injected abandoned stream create release failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected abandoned stream create release failure",
+                    ..
+                })
+            ),
+            "expected required release failure, got {err:?}"
+        );
+        let pending = map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(pg_id, &bucket)
+            .expect("release cleanup must remain pending after failure");
+        assert!(matches!(
+            pending.payload(),
+            MetadataCommandPayload::ReleaseObjectGeneration(release)
+                if release.matches_request(&bucket, &key, &session_id)
+        ));
+        for node_id in node_ids {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    &session_id
+                )
+                .unwrap(),
+                generation_id
+            );
+        }
+
+        drop(hook_guard);
+        cluster
+            .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+            .unwrap();
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(pg_id, &bucket)
+            .is_none());
+        for node_id in node_ids {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    &session_id
+                ),
+                Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn zero_apply_generation_reservation_records_tombstone_and_later_reserves() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let before_index = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap()
+            .metadata_command_replica_state()
+            .unwrap()
+            .applied_log_index;
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::ReserveObjectGeneration(reservation)
+                        if reservation.bucket == hook_bucket
+                            && reservation.key == hook_key
+                            && node_id == NodeId::new(0)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected zero-apply reservation failure",
+                            source: std::io::Error::other(
+                                "injected zero-apply reservation failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let reservation_id = crate::SessionId::try_from("52".repeat(16)).unwrap();
+        let err = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected zero-apply reservation failure",
+                    ..
+                })
+            ),
+            "expected injected zero-apply reservation failure, got {err:?}"
+        );
+        drop(hook_guard);
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+        for node_id in node_ids {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            let state = pg.metadata_command_replica_state().unwrap();
+            assert_eq!(state.applied_log_index, before_index + 1);
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    &reservation_id
+                ),
+                Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+            ));
+        }
+
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        assert!(generation_id.get() >= crate::GenerationId::MIN.get());
+        for node_id in node_ids {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            let state = pg.metadata_command_replica_state().unwrap();
+            assert_eq!(state.applied_log_index, before_index + 2);
+            assert_eq!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    &reservation_id
+                )
+                .unwrap(),
+                generation_id
+            );
+        }
+    }
+
+    #[test]
+    fn zero_apply_direct_put_commit_records_tombstone_and_cleans_new_payload() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let reservation_id = crate::SessionId::try_from("53".repeat(16)).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        let before_index = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap()
+            .metadata_command_replica_state()
+            .unwrap()
+            .applied_log_index;
+        let payload = b"direct put zero apply tombstone";
+        let segment_okh = [93; 16];
+        let written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                payload,
+            )
+            .unwrap();
+        let commit_req = direct_put_commit_req(
+            &bucket,
+            &key,
+            reservation_id.clone(),
+            generation_id,
+            payload,
+            segment_okh,
+            &written,
+        );
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                        if commit.object.bucket == hook_bucket
+                            && commit.object.key == hook_key
+                            && node_id == NodeId::new(0)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected zero-apply direct put commit failure",
+                            source: std::io::Error::other(
+                                "injected zero-apply direct put commit failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .commit_direct_put_object_from_payload_shards(
+                &commit_req,
+                &written.written_shards,
+                |_| Ok::<(), ()>(()),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected zero-apply direct put commit failure",
+                    ..
+                })
+            ),
+            "expected injected zero-apply direct PUT commit failure, got {err:?}"
+        );
+        drop(hook_guard);
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+
+        for node_id in node_ids {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            let state = pg.metadata_command_replica_state().unwrap();
+            assert_eq!(state.applied_log_index, before_index + 2);
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+                Err(crate::MetadataError::ObjectNotFound)
+            ));
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    &reservation_id
+                ),
+                Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn metadata_command_log_checksum_mismatch_prevents_ack() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "checksum-mismatch-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let command = create_bucket_metadata_command(PgId::new(1), 1, bucket);
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+            .unwrap();
+
+        {
+            let node_zero_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            node_zero_pg
+                .connection()
+                .execute(
+                    "UPDATE metadata_command_log SET command_checksum = ?1 WHERE log_index = 1",
+                    rusqlite::params![command.checksum_crc64().wrapping_add(1) as i64],
+                )
+                .unwrap();
+        }
+
+        let err = cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+                node_id: 0,
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn metadata_state_digest_mismatch_prevents_ack() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let first_bucket = bucket_for_pg(topology, 1, "digest-source-");
+        let second_bucket = bucket_for_pg(topology, 1, "digest-next-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let first_command = create_bucket_metadata_command(PgId::new(1), 1, first_bucket.clone());
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &first_command)
+            .unwrap();
+
+        let expected_digest = {
+            let node_zero_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            let expected_digest = node_zero_pg
+                .metadata_command_replica_state()
+                .unwrap()
+                .state_digest;
+            node_zero_pg
+                .connection()
+                .execute(
+                    "UPDATE buckets SET public_read = 1 WHERE name = ?1",
+                    rusqlite::params![&first_bucket],
+                )
+                .unwrap();
+            expected_digest
+        };
+
+        let second_command = create_bucket_metadata_command(PgId::new(1), 2, second_bucket.clone());
+        let err = cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &second_command)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::BucketSnapshotLoadError::Store(StoreError::MetadataStateDigestMismatch {
+                node_id: 0,
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                expected_digest: digest,
+                actual_digest: _,
+            }) if digest == expected_digest
+        ));
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::head_bucket(&*pg, &second_bucket),
+                Err(crate::MetadataError::BucketNotFound { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn metadata_state_digest_ignores_bucket_write_reservation_counters() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let reserved_bucket = bucket_for_pg(topology, 1, "digest-reserved-");
+        let next_bucket = bucket_for_pg(topology, 1, "digest-after-reservation-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let first_command =
+            create_bucket_metadata_command(PgId::new(1), 1, reserved_bucket.clone());
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &first_command)
+            .unwrap();
+
+        {
+            let node_zero_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            let reserved = crate::PgMetadataStore::acquire_bucket_write_reservation(
+                &*node_zero_pg,
+                &reserved_bucket,
+            )
+            .unwrap();
+            assert_eq!(reserved.active_write_reservations, 1);
+            crate::PgMetadataStore::begin_bucket_write_drain(&*node_zero_pg, &reserved_bucket)
+                .unwrap();
+            let draining =
+                crate::PgMetadataStore::head_bucket_raw(&*node_zero_pg, &reserved_bucket).unwrap();
+            assert!(draining.write_reservations_blocked);
+        }
+
+        let second_command = create_bucket_metadata_command(PgId::new(1), 2, next_bucket.clone());
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &second_command)
+            .unwrap();
+
+        {
+            let node_zero_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            crate::PgMetadataStore::release_bucket_write_reservation(
+                &*node_zero_pg,
+                &reserved_bucket,
+            )
+            .unwrap();
+            crate::PgMetadataStore::end_bucket_write_drain(&*node_zero_pg, &reserved_bucket)
+                .unwrap();
+            let info = crate::PgMetadataStore::head_bucket(&*node_zero_pg, &next_bucket).unwrap();
+            assert_eq!(info.name, next_bucket);
+        }
+    }
+
+    #[test]
+    fn metadata_state_digest_ignores_completed_multipart_order_allocator() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let allocated_bucket = bucket_for_pg(topology, 1, "digest-mpu-order-");
+        let next_bucket = bucket_for_pg(topology, 1, "digest-after-mpu-order-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let first_command =
+            create_bucket_metadata_command(PgId::new(1), 1, allocated_bucket.clone());
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &first_command)
+            .unwrap();
+
+        {
+            let node_zero_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            node_zero_pg
+                .advance_completed_multipart_upload_sequence_for_bucket(&allocated_bucket, 7)
+                .unwrap();
+            assert_eq!(
+                node_zero_pg
+                    .completed_multipart_upload_sequence_for_bucket(&allocated_bucket)
+                    .unwrap(),
+                7
+            );
+        }
+
+        let second_command = create_bucket_metadata_command(PgId::new(1), 2, next_bucket.clone());
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &second_command)
+            .unwrap();
+
+        let node_zero_pg = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        let info = crate::PgMetadataStore::head_bucket(&*node_zero_pg, &next_bucket).unwrap();
+        assert_eq!(info.name, next_bucket);
+    }
+
+    #[test]
+    fn metadata_state_digest_gate_is_bounded_for_large_local_command_streams() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let first_bucket = bucket_for_pg(topology, 1, "digest-bound-1-");
+        let final_bucket = bucket_for_pg(topology, 1, "digest-bound-final-");
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let first_command = create_bucket_metadata_command(PgId::new(1), 1, first_bucket.clone());
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &first_command)
+            .unwrap();
+
+        let node_zero_pg = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        node_zero_pg
+            .connection()
+            .execute(
+                "UPDATE metadata_command_replica_state \
+                 SET applied_log_index = 129, applied_log_hash = 0, state_digest = 0 \
+                 WHERE singleton = 0",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            node_zero_pg
+                .metadata_command_replica_state()
+                .unwrap()
+                .state_digest,
+            0
+        );
+        node_zero_pg
+            .connection()
+            .execute(
+                "UPDATE buckets SET public_read = 1 WHERE name = ?1",
+                rusqlite::params![&first_bucket],
+            )
+            .unwrap();
+
+        let final_command = create_bucket_metadata_command(PgId::new(1), 130, final_bucket.clone());
+        assert_eq!(
+            node_zero_pg
+                .metadata_command_acceptance(0, &final_command)
+                .unwrap(),
+            MetadataCommandAcceptance::Apply
+        );
     }
 
     #[test]
@@ -4084,6 +5355,10 @@ mod tests {
             ),
             "expected aborting upload to reject part finalize, got {err:?}"
         );
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
     }
 
     #[test]
@@ -4459,6 +5734,115 @@ mod tests {
             let pg = node.get_pg(object_pg).unwrap();
             crate::PgMetadataStore::get_stream_upload(&*pg, &first_session_id).unwrap();
             crate::PgMetadataStore::get_stream_upload(&*pg, &second_session_id).unwrap();
+        }
+    }
+
+    #[test]
+    fn stream_put_create_retries_after_pending_install_conflict() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let session_id = crate::SessionId::try_from("39".repeat(16)).unwrap();
+        let unrelated_session_id = crate::SessionId::try_from("3a".repeat(16)).unwrap();
+        let create = crate::CreateStreamUploadReq {
+            session_id: session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: crate::StreamUploadTarget::PutObject,
+            encryption: crate::ObjectEncryption::None,
+        };
+
+        let pg_id = PgId::new(object_pg);
+        let _serial = lock_metadata_command_apply_hook_test();
+        let injected = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let injected_for_hook = Arc::clone(&injected);
+        let map_for_hook = Arc::clone(&map);
+        let bucket_for_hook = bucket.clone();
+        let key_for_hook = key.clone();
+        let session_for_hook = unrelated_session_id.clone();
+        let command_epoch = cluster.operation_epoch();
+        let _hook_guard = cluster.test_install_before_stream_put_create_pending_install_hook(
+            Arc::new(move || {
+                if injected_for_hook.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let command = MetadataCommandEnvelope::new(
+                    crate::metadata_command::MetadataCommandId::new(
+                        command_epoch,
+                        pg_id,
+                        map_for_hook
+                            .runtime_state()
+                            .next_metadata_command_log_index(pg_id),
+                    ),
+                    MetadataCommandPayload::CreateStreamUpload(Box::new(
+                        crate::metadata_command::CreateStreamUploadCommand {
+                            request: crate::CreateStreamUploadReq {
+                                session_id: session_for_hook.clone(),
+                                bucket: bucket_for_hook.clone(),
+                                key: key_for_hook.clone(),
+                                target: crate::StreamUploadTarget::PutObject,
+                                encryption: crate::ObjectEncryption::None,
+                            },
+                            created_at_millis: 123,
+                        },
+                    )),
+                );
+                map_for_hook
+                    .runtime_state()
+                    .try_set_pending_metadata_command_for_bucket(pg_id, &bucket_for_hook, command)
+                    .expect("stream create pending-install hook should win the empty pending slot");
+            }),
+        );
+
+        let attempts_for_action = Arc::clone(&attempts);
+        let value = cluster
+            .create_put_object_stream_session(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    attempts_for_action.fetch_add(1, Ordering::SeqCst);
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>((13_u8, create.clone()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(value, 13);
+        assert!(injected.load(Ordering::SeqCst));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(pg_id, &bucket)
+            .is_none());
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            let session = crate::PgMetadataStore::get_stream_upload(&*pg, &session_id).unwrap();
+            assert_eq!(session.bucket, bucket);
+            assert_eq!(session.key, key);
+            let unrelated =
+                crate::PgMetadataStore::get_stream_upload(&*pg, &unrelated_session_id).unwrap();
+            assert_eq!(unrelated.bucket, bucket);
+            assert_eq!(unrelated.key, key);
         }
     }
 

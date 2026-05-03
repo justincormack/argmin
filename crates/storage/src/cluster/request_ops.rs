@@ -18,10 +18,10 @@ use crate::metadata_command::{
     CommitDirectPutObjectCommand, CommitMultipartObjectCommand, CommitStreamPartCommand,
     CreateBucketCommand, CreateMultipartUploadCommand, CreateStreamUploadCommand,
     DeleteObjectPayloadReclaimCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
-    InsertDeleteMarkerCommand, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
-    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
-    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
-    PutObjectMetadataMutation,
+    InsertDeleteMarkerCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
+    MetadataCommandId, MetadataCommandPayload, ObjectPayloadReclaimCommand, PutBucketAclCommand,
+    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
+    PutObjectMetadataCommand, PutObjectMetadataMutation,
 };
 use crate::*;
 
@@ -50,6 +50,9 @@ type MetadataCommandApplyTestHook =
 type AbortMultipartPendingInstallTestHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
+type StreamPutCreatePendingInstallTestHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
 static BEFORE_METADATA_COMMAND_APPLY_HOOKS: OnceLock<
     Mutex<HashMap<usize, MetadataCommandApplyTestHook>>,
 > = OnceLock::new();
@@ -57,6 +60,11 @@ static BEFORE_METADATA_COMMAND_APPLY_HOOKS: OnceLock<
 #[cfg(test)]
 static BEFORE_ABORT_MULTIPART_PENDING_INSTALL_HOOKS: OnceLock<
     Mutex<HashMap<usize, AbortMultipartPendingInstallTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static BEFORE_STREAM_PUT_CREATE_PENDING_INSTALL_HOOKS: OnceLock<
+    Mutex<HashMap<usize, StreamPutCreatePendingInstallTestHook>>,
 > = OnceLock::new();
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -71,6 +79,11 @@ pub(crate) struct MetadataCommandApplyTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct AbortMultipartPendingInstallTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct StreamPutCreatePendingInstallTestHookGuard {
     scope_id: usize,
 }
 
@@ -90,6 +103,18 @@ impl Drop for AbortMultipartPendingInstallTestHookGuard {
     fn drop(&mut self) {
         let hooks =
             BEFORE_ABORT_MULTIPART_PENDING_INSTALL_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for StreamPutCreatePendingInstallTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = BEFORE_STREAM_PUT_CREATE_PENDING_INSTALL_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -144,6 +169,19 @@ fn maybe_run_before_metadata_command_apply_hook(
 #[cfg(test)]
 fn maybe_run_before_abort_multipart_pending_install_hook(_scope_id: usize) {
     let hook = BEFORE_ABORT_MULTIPART_PENDING_INSTALL_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&_scope_id)
+        .cloned();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn maybe_run_before_stream_put_create_pending_install_hook(_scope_id: usize) {
+    let hook = BEFORE_STREAM_PUT_CREATE_PENDING_INSTALL_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -334,6 +372,7 @@ fn conflicting_pending_metadata_command(context: &'static str) -> BucketSnapshot
     .into()
 }
 
+#[derive(Debug)]
 pub(super) struct MetadataCommandApplyFailure {
     pub(super) applied_nodes: usize,
     pub(super) source: BucketSnapshotLoadError,
@@ -368,6 +407,20 @@ impl super::StorageCluster {
             .unwrap_or_else(|e| e.into_inner())
             .insert(scope_id, hook);
         AbortMultipartPendingInstallTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_before_stream_put_create_pending_install_hook(
+        &self,
+        hook: StreamPutCreatePendingInstallTestHook,
+    ) -> StreamPutCreatePendingInstallTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = BEFORE_STREAM_PUT_CREATE_PENDING_INSTALL_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        StreamPutCreatePendingInstallTestHookGuard { scope_id }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -445,98 +498,106 @@ impl super::StorageCluster {
 
         let pg_id = PgId::new(pg_id);
         let runtime_state = self.local_map.runtime_state();
-        let (command, clear_pending_on_zero_apply) = if let Some(command) =
-            runtime_state.pending_metadata_command_for_bucket(pg_id, &bucket)
-        {
-            match command.payload() {
-                MetadataCommandPayload::CreateBucket(create) if create.matches_config(config) => {
-                    (command, false)
+        loop {
+            let (command, clear_pending_on_zero_apply) = if let Some(command) =
+                runtime_state.pending_metadata_command_for_bucket(pg_id, &bucket)
+            {
+                match command.payload() {
+                    MetadataCommandPayload::CreateBucket(create)
+                        if create.matches_config(config) =>
+                    {
+                        (command, false)
+                    }
+                    MetadataCommandPayload::CreateBucket(_) => {
+                        return Err(MetadataError::BucketAlreadyExists.into());
+                    }
+                    MetadataCommandPayload::PutBucketVersioning(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending put bucket versioning command for create bucket",
+                        ));
+                    }
+                    MetadataCommandPayload::PutBucketAcl(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending put bucket acl command for create bucket",
+                        ));
+                    }
+                    MetadataCommandPayload::PutBucketProperty(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending put bucket property command for create bucket",
+                        ));
+                    }
+                    MetadataCommandPayload::PutBucketSubresource(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending put bucket subresource command for create bucket",
+                        ));
+                    }
+                    MetadataCommandPayload::ReserveObjectGeneration(_)
+                    | MetadataCommandPayload::ReleaseObjectGeneration(_)
+                    | MetadataCommandPayload::CommitDirectPutObject(_)
+                    | MetadataCommandPayload::CommitMultipartObject(_)
+                    | MetadataCommandPayload::DeleteObjectVersion(_)
+                    | MetadataCommandPayload::InsertDeleteMarker(_)
+                    | MetadataCommandPayload::PutObjectMetadata(_)
+                    | MetadataCommandPayload::CreateStreamUpload(_)
+                    | MetadataCommandPayload::AppendStreamSegment(_)
+                    | MetadataCommandPayload::AbortStreamUpload(_)
+                    | MetadataCommandPayload::CommitStreamPart(_)
+                    | MetadataCommandPayload::CreateMultipartUpload(_)
+                    | MetadataCommandPayload::AbortMultipartUpload(_)
+                    | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending object command for create bucket",
+                        ));
+                    }
                 }
-                MetadataCommandPayload::CreateBucket(_) => {
-                    return Err(MetadataError::BucketAlreadyExists.into());
-                }
-                MetadataCommandPayload::PutBucketVersioning(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending put bucket versioning command for create bucket",
-                    ));
-                }
-                MetadataCommandPayload::PutBucketAcl(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending put bucket acl command for create bucket",
-                    ));
-                }
-                MetadataCommandPayload::PutBucketProperty(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending put bucket property command for create bucket",
-                    ));
-                }
-                MetadataCommandPayload::PutBucketSubresource(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending put bucket subresource command for create bucket",
-                    ));
-                }
-                MetadataCommandPayload::ReserveObjectGeneration(_)
-                | MetadataCommandPayload::ReleaseObjectGeneration(_)
-                | MetadataCommandPayload::CommitDirectPutObject(_)
-                | MetadataCommandPayload::CommitMultipartObject(_)
-                | MetadataCommandPayload::DeleteObjectVersion(_)
-                | MetadataCommandPayload::InsertDeleteMarker(_)
-                | MetadataCommandPayload::PutObjectMetadata(_)
-                | MetadataCommandPayload::CreateStreamUpload(_)
-                | MetadataCommandPayload::AppendStreamSegment(_)
-                | MetadataCommandPayload::AbortStreamUpload(_)
-                | MetadataCommandPayload::CommitStreamPart(_)
-                | MetadataCommandPayload::CreateMultipartUpload(_)
-                | MetadataCommandPayload::AbortMultipartUpload(_)
-                | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending object command for create bucket",
-                    ));
-                }
-            }
-        } else {
-            let command_id = MetadataCommandId::new(
-                self.operation_epoch(),
-                pg_id,
-                runtime_state.next_metadata_command_log_index(pg_id),
-            );
-            let bucket_pg = primary_node.get_pg(pg_id.get())?;
-            let bucket_execution_generation = bucket_pg.reserve_bucket_execution_generation()?;
-            drop(bucket_pg);
-            let command = CreateBucketCommand::from_config(
-                config,
-                crate::clock::current_time_millis(),
-                bucket_execution_generation,
-            )
-            .map_err(|reason| MetadataError::InvalidBucketName {
-                reason: reason.to_string(),
-            })?;
-            let command = MetadataCommandEnvelope::new(
-                command_id,
-                MetadataCommandPayload::CreateBucket(command),
-            );
-            self.set_pending_metadata_command_for_bucket(
+            } else {
+                let command_id = MetadataCommandId::new(
+                    self.operation_epoch(),
+                    pg_id,
+                    runtime_state.next_metadata_command_log_index(pg_id),
+                );
+                let bucket_pg = primary_node.get_pg(pg_id.get())?;
+                let bucket_execution_generation =
+                    bucket_pg.reserve_bucket_execution_generation()?;
+                drop(bucket_pg);
+                let command = CreateBucketCommand::from_config(
+                    config,
+                    crate::clock::current_time_millis(),
+                    bucket_execution_generation,
+                )
+                .map_err(|reason| MetadataError::InvalidBucketName {
+                    reason: reason.to_string(),
+                })?;
+                let command = MetadataCommandEnvelope::new(
+                    command_id,
+                    MetadataCommandPayload::CreateBucket(command),
+                );
+                self.set_pending_metadata_command_for_bucket(
+                    pg_id,
+                    &bucket,
+                    &command,
+                    "conflicting pending command for create bucket",
+                )
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                (command, true)
+            };
+            let outcome = self.finish_pending_metadata_command_to_acting_set(
                 pg_id,
                 &bucket,
                 &command,
-                "conflicting pending command for create bucket",
-            )
-            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-            (command, true)
-        };
-        self.apply_pending_metadata_command_to_acting_set(
-            pg_id,
-            &bucket,
-            &command,
-            clear_pending_on_zero_apply,
-        )?;
+                clear_pending_on_zero_apply,
+            )?;
+            if outcome == super::PendingMetadataCommandOutcome::Abandoned {
+                continue;
+            }
 
-        let bucket_pg = primary_node.get_pg(pg_id.get())?;
-        let info = PgMetadataStore::head_bucket(&*bucket_pg, &bucket)?;
-        self.local_map
-            .runtime_state()
-            .remove_pending_metadata_command_for_bucket(pg_id, &bucket);
-        Ok(BucketCreateAttemptOutcome::Created(info))
+            let bucket_pg = primary_node.get_pg(pg_id.get())?;
+            let info = PgMetadataStore::head_bucket(&*bucket_pg, &bucket)?;
+            self.local_map
+                .runtime_state()
+                .remove_pending_metadata_command_for_bucket(pg_id, &bucket);
+            return Ok(BucketCreateAttemptOutcome::Created(info));
+        }
     }
 
     pub(super) fn apply_metadata_command_to_acting_set(
@@ -589,7 +650,7 @@ impl super::StorageCluster {
                     applied_nodes,
                     source: source.into(),
                 })?;
-            if acceptance == super::local::MetadataCommandAcceptance::AlreadyApplied {
+            if acceptance == MetadataCommandAcceptance::AlreadyApplied {
                 continue;
             }
             maybe_run_before_metadata_command_apply_hook(
@@ -628,14 +689,98 @@ impl super::StorageCluster {
                     source: source.into(),
                 }
             })?;
-            pg.apply_metadata_command(command)
+            pg.apply_metadata_command_and_record(node.node_id().as_u32(), command)
+                .map_err(|source| MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn record_abandoned_metadata_command_to_acting_set(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), MetadataCommandApplyFailure> {
+        let runtime_state = self.local_map.runtime_state();
+        let _apply_guard = runtime_state.lock_metadata_command_apply();
+        let pg_id = command.id().pg_id();
+        let primary_node_id = self
+            .local_map
+            .metadata_pg_primary_node(command.id().cluster_epoch(), pg_id)
+            .map_err(|source| MetadataCommandApplyFailure {
+                applied_nodes: 0,
+                source: source.into(),
+            })?
+            .node_id();
+        let mut nodes = self
+            .local_map
+            .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id)
+            .map_err(|source| MetadataCommandApplyFailure {
+                applied_nodes: 0,
+                source: source.into(),
+            })?;
+        nodes.sort_by_key(|node| node.node_id() == primary_node_id);
+        for (applied_nodes, node) in nodes.into_iter().enumerate() {
+            let acceptance = self
+                .local_map
+                .validate_metadata_command_abandon_for_replica(
+                    primary_node_id,
+                    node.node_id(),
+                    pg_id,
+                    command,
+                )
                 .map_err(|source| MetadataCommandApplyFailure {
                     applied_nodes,
                     source: source.into(),
                 })?;
-            runtime_state.mark_metadata_command_applied(node.node_id(), pg_id, command);
+            if acceptance == MetadataCommandAcceptance::AlreadyApplied {
+                continue;
+            }
+            let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
+                MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                }
+            })?;
+            pg.record_metadata_command_abandoned(node.node_id().as_u32(), command)
+                .map_err(|source| MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                })?;
         }
         Ok(())
+    }
+
+    pub(super) fn metadata_command_has_abandoned_log_on_acting_set(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, MetadataCommandApplyFailure> {
+        let pg_id = command.id().pg_id();
+        let nodes = self
+            .local_map
+            .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id)
+            .map_err(|source| MetadataCommandApplyFailure {
+                applied_nodes: 0,
+                source: source.into(),
+            })?;
+        for (applied_nodes, node) in nodes.into_iter().enumerate() {
+            let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
+                MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                }
+            })?;
+            if pg.metadata_command_abandoned(command).map_err(|source| {
+                MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                }
+            })? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     #[cfg(test)]
@@ -648,22 +793,39 @@ impl super::StorageCluster {
             .map_err(|error| error.source)
     }
 
-    fn apply_pending_metadata_command_to_acting_set(
+    fn finish_pending_metadata_command_to_acting_set(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
         clear_pending_on_zero_apply: bool,
-    ) -> Result<(), BucketSnapshotLoadError> {
+    ) -> Result<super::PendingMetadataCommandOutcome, BucketSnapshotLoadError> {
+        if self
+            .metadata_command_has_abandoned_log_on_acting_set(command)
+            .map_err(|error| error.source)?
+        {
+            self.record_abandoned_metadata_command_to_acting_set(command)
+                .map_err(|error| error.source)?;
+            self.local_map
+                .runtime_state()
+                .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+            return Ok(super::PendingMetadataCommandOutcome::Abandoned);
+        }
         match self.apply_metadata_command_to_acting_set(command) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(super::PendingMetadataCommandOutcome::Applied),
             Err(error) => {
-                if clear_pending_on_zero_apply && error.applied_nodes == 0 {
+                let MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source,
+                } = error;
+                if clear_pending_on_zero_apply && applied_nodes == 0 {
+                    self.record_abandoned_metadata_command_to_acting_set(command)
+                        .map_err(|error| error.source)?;
                     self.local_map
                         .runtime_state()
                         .remove_pending_metadata_command_for_bucket(pg_id, bucket);
                 }
-                Err(error.source)
+                Err(source)
             }
         }
     }
@@ -686,7 +848,9 @@ impl super::StorageCluster {
         for node in nodes {
             let pg = node.storage_node().get_pg(pg_id.get())?;
             match PgMetadataStore::delete_bucket(&*pg, bucket) {
-                Ok(()) => {}
+                Ok(()) => {
+                    pg.refresh_metadata_command_state_digest()?;
+                }
                 Err(crate::error::MetadataError::BucketNotFound { .. })
                     if node.node_id() == primary_node_id =>
                 {
@@ -983,98 +1147,104 @@ impl super::StorageCluster {
         }
 
         let runtime_state = self.local_map.runtime_state();
-        let (command, clear_pending_on_zero_apply) = if let Some(command) =
-            runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
-        {
-            match command.payload() {
-                MetadataCommandPayload::PutBucketVersioning(versioning)
-                    if versioning.matches_request(bucket, state) =>
-                {
-                    (command, false)
+        loop {
+            let (command, clear_pending_on_zero_apply) = if let Some(command) =
+                runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                match command.payload() {
+                    MetadataCommandPayload::PutBucketVersioning(versioning)
+                        if versioning.matches_request(bucket, state) =>
+                    {
+                        (command, false)
+                    }
+                    MetadataCommandPayload::PutBucketVersioning(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "conflicting pending put bucket versioning command",
+                        ));
+                    }
+                    MetadataCommandPayload::CreateBucket(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending create bucket command for versioning",
+                        ));
+                    }
+                    MetadataCommandPayload::PutBucketAcl(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending put bucket acl command for versioning",
+                        ));
+                    }
+                    MetadataCommandPayload::PutBucketProperty(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending put bucket property command for versioning",
+                        ));
+                    }
+                    MetadataCommandPayload::PutBucketSubresource(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending put bucket subresource command for versioning",
+                        ));
+                    }
+                    MetadataCommandPayload::ReserveObjectGeneration(_)
+                    | MetadataCommandPayload::ReleaseObjectGeneration(_)
+                    | MetadataCommandPayload::CommitDirectPutObject(_)
+                    | MetadataCommandPayload::CommitMultipartObject(_)
+                    | MetadataCommandPayload::DeleteObjectVersion(_)
+                    | MetadataCommandPayload::InsertDeleteMarker(_)
+                    | MetadataCommandPayload::PutObjectMetadata(_)
+                    | MetadataCommandPayload::CreateStreamUpload(_)
+                    | MetadataCommandPayload::AppendStreamSegment(_)
+                    | MetadataCommandPayload::AbortStreamUpload(_)
+                    | MetadataCommandPayload::CommitStreamPart(_)
+                    | MetadataCommandPayload::CreateMultipartUpload(_)
+                    | MetadataCommandPayload::AbortMultipartUpload(_)
+                    | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending object command for versioning",
+                        ));
+                    }
                 }
-                MetadataCommandPayload::PutBucketVersioning(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "conflicting pending put bucket versioning command",
-                    ));
-                }
-                MetadataCommandPayload::CreateBucket(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending create bucket command for versioning",
-                    ));
-                }
-                MetadataCommandPayload::PutBucketAcl(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending put bucket acl command for versioning",
-                    ));
-                }
-                MetadataCommandPayload::PutBucketProperty(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending put bucket property command for versioning",
-                    ));
-                }
-                MetadataCommandPayload::PutBucketSubresource(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending put bucket subresource command for versioning",
-                    ));
-                }
-                MetadataCommandPayload::ReserveObjectGeneration(_)
-                | MetadataCommandPayload::ReleaseObjectGeneration(_)
-                | MetadataCommandPayload::CommitDirectPutObject(_)
-                | MetadataCommandPayload::CommitMultipartObject(_)
-                | MetadataCommandPayload::DeleteObjectVersion(_)
-                | MetadataCommandPayload::InsertDeleteMarker(_)
-                | MetadataCommandPayload::PutObjectMetadata(_)
-                | MetadataCommandPayload::CreateStreamUpload(_)
-                | MetadataCommandPayload::AppendStreamSegment(_)
-                | MetadataCommandPayload::AbortStreamUpload(_)
-                | MetadataCommandPayload::CommitStreamPart(_)
-                | MetadataCommandPayload::CreateMultipartUpload(_)
-                | MetadataCommandPayload::AbortMultipartUpload(_)
-                | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending object command for versioning",
-                    ));
-                }
-            }
-        } else {
-            let command_id = MetadataCommandId::new(
-                self.operation_epoch(),
-                pg_id,
-                runtime_state.next_metadata_command_log_index(pg_id),
-            );
-            let bucket_pg = primary_node.get_pg(pg_id.get())?;
-            let bucket_execution_generation = bucket_pg.reserve_bucket_execution_generation()?;
-            drop(bucket_pg);
-            let command = MetadataCommandEnvelope::new(
-                command_id,
-                MetadataCommandPayload::PutBucketVersioning(PutBucketVersioningCommand::new(
-                    bucket.clone(),
-                    state,
-                    bucket_execution_generation,
-                )),
-            );
-            self.set_pending_metadata_command_for_bucket(
+            } else {
+                let command_id = MetadataCommandId::new(
+                    self.operation_epoch(),
+                    pg_id,
+                    runtime_state.next_metadata_command_log_index(pg_id),
+                );
+                let bucket_pg = primary_node.get_pg(pg_id.get())?;
+                let bucket_execution_generation =
+                    bucket_pg.reserve_bucket_execution_generation()?;
+                drop(bucket_pg);
+                let command = MetadataCommandEnvelope::new(
+                    command_id,
+                    MetadataCommandPayload::PutBucketVersioning(PutBucketVersioningCommand::new(
+                        bucket.clone(),
+                        state,
+                        bucket_execution_generation,
+                    )),
+                );
+                self.set_pending_metadata_command_for_bucket(
+                    pg_id,
+                    bucket,
+                    &command,
+                    "conflicting pending command for bucket versioning",
+                )
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                (command, true)
+            };
+            let outcome = self.finish_pending_metadata_command_to_acting_set(
                 pg_id,
                 bucket,
                 &command,
-                "conflicting pending command for bucket versioning",
-            )
-            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-            (command, true)
-        };
-        self.apply_pending_metadata_command_to_acting_set(
-            pg_id,
-            bucket,
-            &command,
-            clear_pending_on_zero_apply,
-        )?;
+                clear_pending_on_zero_apply,
+            )?;
+            if outcome == super::PendingMetadataCommandOutcome::Abandoned {
+                continue;
+            }
 
-        let bucket_pg = primary_node.get_pg(pg_id.get())?;
-        let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
-        self.local_map
-            .runtime_state()
-            .remove_pending_metadata_command_for_bucket(pg_id, bucket);
-        Ok(info)
+            let bucket_pg = primary_node.get_pg(pg_id.get())?;
+            let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
+            self.local_map
+                .runtime_state()
+                .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+            return Ok(info);
+        }
     }
 
     pub fn put_bucket_object_lock_and_load_info(
@@ -1168,100 +1338,106 @@ impl super::StorageCluster {
         }
 
         let runtime_state = self.local_map.runtime_state();
-        let (command, clear_pending_on_zero_apply) = if let Some(command) =
-            runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
-        {
-            match command.payload() {
-                MetadataCommandPayload::PutBucketAcl(acl)
-                    if acl.matches_request(bucket, acl_grants, public_read, public_write) =>
-                {
-                    (command, false)
+        loop {
+            let (command, clear_pending_on_zero_apply) = if let Some(command) =
+                runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                match command.payload() {
+                    MetadataCommandPayload::PutBucketAcl(acl)
+                        if acl.matches_request(bucket, acl_grants, public_read, public_write) =>
+                    {
+                        (command, false)
+                    }
+                    MetadataCommandPayload::PutBucketAcl(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "conflicting pending put bucket acl command",
+                        ));
+                    }
+                    MetadataCommandPayload::CreateBucket(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending create bucket command for bucket acl",
+                        ));
+                    }
+                    MetadataCommandPayload::PutBucketVersioning(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending put bucket versioning command for bucket acl",
+                        ));
+                    }
+                    MetadataCommandPayload::PutBucketProperty(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending put bucket property command for bucket acl",
+                        ));
+                    }
+                    MetadataCommandPayload::PutBucketSubresource(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending put bucket subresource command for bucket acl",
+                        ));
+                    }
+                    MetadataCommandPayload::ReserveObjectGeneration(_)
+                    | MetadataCommandPayload::ReleaseObjectGeneration(_)
+                    | MetadataCommandPayload::CommitDirectPutObject(_)
+                    | MetadataCommandPayload::CommitMultipartObject(_)
+                    | MetadataCommandPayload::DeleteObjectVersion(_)
+                    | MetadataCommandPayload::InsertDeleteMarker(_)
+                    | MetadataCommandPayload::PutObjectMetadata(_)
+                    | MetadataCommandPayload::CreateStreamUpload(_)
+                    | MetadataCommandPayload::AppendStreamSegment(_)
+                    | MetadataCommandPayload::AbortStreamUpload(_)
+                    | MetadataCommandPayload::CommitStreamPart(_)
+                    | MetadataCommandPayload::CreateMultipartUpload(_)
+                    | MetadataCommandPayload::AbortMultipartUpload(_)
+                    | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending object command for bucket acl",
+                        ));
+                    }
                 }
-                MetadataCommandPayload::PutBucketAcl(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "conflicting pending put bucket acl command",
-                    ));
-                }
-                MetadataCommandPayload::CreateBucket(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending create bucket command for bucket acl",
-                    ));
-                }
-                MetadataCommandPayload::PutBucketVersioning(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending put bucket versioning command for bucket acl",
-                    ));
-                }
-                MetadataCommandPayload::PutBucketProperty(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending put bucket property command for bucket acl",
-                    ));
-                }
-                MetadataCommandPayload::PutBucketSubresource(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending put bucket subresource command for bucket acl",
-                    ));
-                }
-                MetadataCommandPayload::ReserveObjectGeneration(_)
-                | MetadataCommandPayload::ReleaseObjectGeneration(_)
-                | MetadataCommandPayload::CommitDirectPutObject(_)
-                | MetadataCommandPayload::CommitMultipartObject(_)
-                | MetadataCommandPayload::DeleteObjectVersion(_)
-                | MetadataCommandPayload::InsertDeleteMarker(_)
-                | MetadataCommandPayload::PutObjectMetadata(_)
-                | MetadataCommandPayload::CreateStreamUpload(_)
-                | MetadataCommandPayload::AppendStreamSegment(_)
-                | MetadataCommandPayload::AbortStreamUpload(_)
-                | MetadataCommandPayload::CommitStreamPart(_)
-                | MetadataCommandPayload::CreateMultipartUpload(_)
-                | MetadataCommandPayload::AbortMultipartUpload(_)
-                | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending object command for bucket acl",
-                    ));
-                }
-            }
-        } else {
-            let command_id = MetadataCommandId::new(
-                self.operation_epoch(),
-                pg_id,
-                runtime_state.next_metadata_command_log_index(pg_id),
-            );
-            let bucket_pg = primary_node.get_pg(pg_id.get())?;
-            let bucket_execution_generation = bucket_pg.reserve_bucket_execution_generation()?;
-            drop(bucket_pg);
-            let command = MetadataCommandEnvelope::new(
-                command_id,
-                MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::new(
-                    bucket.clone(),
-                    acl_grants.clone(),
-                    public_read,
-                    public_write,
-                    bucket_execution_generation,
-                )),
-            );
-            self.set_pending_metadata_command_for_bucket(
+            } else {
+                let command_id = MetadataCommandId::new(
+                    self.operation_epoch(),
+                    pg_id,
+                    runtime_state.next_metadata_command_log_index(pg_id),
+                );
+                let bucket_pg = primary_node.get_pg(pg_id.get())?;
+                let bucket_execution_generation =
+                    bucket_pg.reserve_bucket_execution_generation()?;
+                drop(bucket_pg);
+                let command = MetadataCommandEnvelope::new(
+                    command_id,
+                    MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::new(
+                        bucket.clone(),
+                        acl_grants.clone(),
+                        public_read,
+                        public_write,
+                        bucket_execution_generation,
+                    )),
+                );
+                self.set_pending_metadata_command_for_bucket(
+                    pg_id,
+                    bucket,
+                    &command,
+                    "conflicting pending command for bucket ACL",
+                )
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                (command, true)
+            };
+            let outcome = self.finish_pending_metadata_command_to_acting_set(
                 pg_id,
                 bucket,
                 &command,
-                "conflicting pending command for bucket ACL",
-            )
-            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-            (command, true)
-        };
-        self.apply_pending_metadata_command_to_acting_set(
-            pg_id,
-            bucket,
-            &command,
-            clear_pending_on_zero_apply,
-        )?;
+                clear_pending_on_zero_apply,
+            )?;
+            if outcome == super::PendingMetadataCommandOutcome::Abandoned {
+                continue;
+            }
 
-        let bucket_pg = primary_node.get_pg(pg_id.get())?;
-        let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
-        self.local_map
-            .runtime_state()
-            .remove_pending_metadata_command_for_bucket(pg_id, bucket);
-        Ok(info)
+            let bucket_pg = primary_node.get_pg(pg_id.get())?;
+            let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
+            self.local_map
+                .runtime_state()
+                .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+            return Ok(info);
+        }
     }
 
     fn put_bucket_property_command_and_load_info(
@@ -1278,98 +1454,104 @@ impl super::StorageCluster {
         }
 
         let runtime_state = self.local_map.runtime_state();
-        let (command, clear_pending_on_zero_apply) = if let Some(command) =
-            runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
-        {
-            match command.payload() {
-                MetadataCommandPayload::PutBucketProperty(property)
-                    if property.matches_request(bucket, &mutation) =>
-                {
-                    (command, false)
+        loop {
+            let (command, clear_pending_on_zero_apply) = if let Some(command) =
+                runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                match command.payload() {
+                    MetadataCommandPayload::PutBucketProperty(property)
+                        if property.matches_request(bucket, &mutation) =>
+                    {
+                        (command, false)
+                    }
+                    MetadataCommandPayload::PutBucketProperty(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "conflicting pending put bucket property command",
+                        ));
+                    }
+                    MetadataCommandPayload::CreateBucket(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending create bucket command for bucket property",
+                        ));
+                    }
+                    MetadataCommandPayload::PutBucketVersioning(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending put bucket versioning command for bucket property",
+                        ));
+                    }
+                    MetadataCommandPayload::PutBucketAcl(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending put bucket acl command for bucket property",
+                        ));
+                    }
+                    MetadataCommandPayload::PutBucketSubresource(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending put bucket subresource command for bucket property",
+                        ));
+                    }
+                    MetadataCommandPayload::ReserveObjectGeneration(_)
+                    | MetadataCommandPayload::ReleaseObjectGeneration(_)
+                    | MetadataCommandPayload::CommitDirectPutObject(_)
+                    | MetadataCommandPayload::CommitMultipartObject(_)
+                    | MetadataCommandPayload::DeleteObjectVersion(_)
+                    | MetadataCommandPayload::InsertDeleteMarker(_)
+                    | MetadataCommandPayload::PutObjectMetadata(_)
+                    | MetadataCommandPayload::CreateStreamUpload(_)
+                    | MetadataCommandPayload::AppendStreamSegment(_)
+                    | MetadataCommandPayload::AbortStreamUpload(_)
+                    | MetadataCommandPayload::CommitStreamPart(_)
+                    | MetadataCommandPayload::CreateMultipartUpload(_)
+                    | MetadataCommandPayload::AbortMultipartUpload(_)
+                    | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending object command for bucket property",
+                        ));
+                    }
                 }
-                MetadataCommandPayload::PutBucketProperty(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "conflicting pending put bucket property command",
-                    ));
-                }
-                MetadataCommandPayload::CreateBucket(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending create bucket command for bucket property",
-                    ));
-                }
-                MetadataCommandPayload::PutBucketVersioning(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending put bucket versioning command for bucket property",
-                    ));
-                }
-                MetadataCommandPayload::PutBucketAcl(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending put bucket acl command for bucket property",
-                    ));
-                }
-                MetadataCommandPayload::PutBucketSubresource(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending put bucket subresource command for bucket property",
-                    ));
-                }
-                MetadataCommandPayload::ReserveObjectGeneration(_)
-                | MetadataCommandPayload::ReleaseObjectGeneration(_)
-                | MetadataCommandPayload::CommitDirectPutObject(_)
-                | MetadataCommandPayload::CommitMultipartObject(_)
-                | MetadataCommandPayload::DeleteObjectVersion(_)
-                | MetadataCommandPayload::InsertDeleteMarker(_)
-                | MetadataCommandPayload::PutObjectMetadata(_)
-                | MetadataCommandPayload::CreateStreamUpload(_)
-                | MetadataCommandPayload::AppendStreamSegment(_)
-                | MetadataCommandPayload::AbortStreamUpload(_)
-                | MetadataCommandPayload::CommitStreamPart(_)
-                | MetadataCommandPayload::CreateMultipartUpload(_)
-                | MetadataCommandPayload::AbortMultipartUpload(_)
-                | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending object command for bucket property",
-                    ));
-                }
-            }
-        } else {
-            let command_id = MetadataCommandId::new(
-                self.operation_epoch(),
-                pg_id,
-                runtime_state.next_metadata_command_log_index(pg_id),
-            );
-            let bucket_pg = primary_node.get_pg(pg_id.get())?;
-            let bucket_execution_generation = bucket_pg.reserve_bucket_execution_generation()?;
-            drop(bucket_pg);
-            let command = MetadataCommandEnvelope::new(
-                command_id,
-                MetadataCommandPayload::PutBucketProperty(PutBucketPropertyCommand::new(
-                    bucket.clone(),
-                    mutation,
-                    bucket_execution_generation,
-                )),
-            );
-            self.set_pending_metadata_command_for_bucket(
+            } else {
+                let command_id = MetadataCommandId::new(
+                    self.operation_epoch(),
+                    pg_id,
+                    runtime_state.next_metadata_command_log_index(pg_id),
+                );
+                let bucket_pg = primary_node.get_pg(pg_id.get())?;
+                let bucket_execution_generation =
+                    bucket_pg.reserve_bucket_execution_generation()?;
+                drop(bucket_pg);
+                let command = MetadataCommandEnvelope::new(
+                    command_id,
+                    MetadataCommandPayload::PutBucketProperty(PutBucketPropertyCommand::new(
+                        bucket.clone(),
+                        mutation.clone(),
+                        bucket_execution_generation,
+                    )),
+                );
+                self.set_pending_metadata_command_for_bucket(
+                    pg_id,
+                    bucket,
+                    &command,
+                    "conflicting pending command for bucket property",
+                )
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                (command, true)
+            };
+            let outcome = self.finish_pending_metadata_command_to_acting_set(
                 pg_id,
                 bucket,
                 &command,
-                "conflicting pending command for bucket property",
-            )
-            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-            (command, true)
-        };
-        self.apply_pending_metadata_command_to_acting_set(
-            pg_id,
-            bucket,
-            &command,
-            clear_pending_on_zero_apply,
-        )?;
+                clear_pending_on_zero_apply,
+            )?;
+            if outcome == super::PendingMetadataCommandOutcome::Abandoned {
+                continue;
+            }
 
-        let bucket_pg = primary_node.get_pg(pg_id.get())?;
-        let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
-        self.local_map
-            .runtime_state()
-            .remove_pending_metadata_command_for_bucket(pg_id, bucket);
-        Ok(info)
+            let bucket_pg = primary_node.get_pg(pg_id.get())?;
+            let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
+            self.local_map
+                .runtime_state()
+                .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+            return Ok(info);
+        }
     }
 
     pub fn put_bucket_subresource_and_load_info(
@@ -1411,98 +1593,104 @@ impl super::StorageCluster {
             PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
         }
         let runtime_state = self.local_map.runtime_state();
-        let (command, clear_pending_on_zero_apply) = if let Some(command) =
-            runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
-        {
-            match command.payload() {
-                MetadataCommandPayload::PutBucketSubresource(subresource)
-                    if subresource.matches_request(bucket, &mutation) =>
-                {
-                    (command, false)
+        loop {
+            let (command, clear_pending_on_zero_apply) = if let Some(command) =
+                runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                match command.payload() {
+                    MetadataCommandPayload::PutBucketSubresource(subresource)
+                        if subresource.matches_request(bucket, &mutation) =>
+                    {
+                        (command, false)
+                    }
+                    MetadataCommandPayload::PutBucketSubresource(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "conflicting pending put bucket subresource command",
+                        ));
+                    }
+                    MetadataCommandPayload::CreateBucket(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending create bucket command for bucket subresource",
+                        ));
+                    }
+                    MetadataCommandPayload::PutBucketVersioning(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending put bucket versioning command for bucket subresource",
+                        ));
+                    }
+                    MetadataCommandPayload::PutBucketAcl(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending put bucket acl command for bucket subresource",
+                        ));
+                    }
+                    MetadataCommandPayload::PutBucketProperty(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending put bucket property command for bucket subresource",
+                        ));
+                    }
+                    MetadataCommandPayload::ReserveObjectGeneration(_)
+                    | MetadataCommandPayload::ReleaseObjectGeneration(_)
+                    | MetadataCommandPayload::CommitDirectPutObject(_)
+                    | MetadataCommandPayload::CommitMultipartObject(_)
+                    | MetadataCommandPayload::DeleteObjectVersion(_)
+                    | MetadataCommandPayload::InsertDeleteMarker(_)
+                    | MetadataCommandPayload::PutObjectMetadata(_)
+                    | MetadataCommandPayload::CreateStreamUpload(_)
+                    | MetadataCommandPayload::AppendStreamSegment(_)
+                    | MetadataCommandPayload::AbortStreamUpload(_)
+                    | MetadataCommandPayload::CommitStreamPart(_)
+                    | MetadataCommandPayload::CreateMultipartUpload(_)
+                    | MetadataCommandPayload::AbortMultipartUpload(_)
+                    | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending object command for bucket subresource",
+                        ));
+                    }
                 }
-                MetadataCommandPayload::PutBucketSubresource(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "conflicting pending put bucket subresource command",
-                    ));
-                }
-                MetadataCommandPayload::CreateBucket(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending create bucket command for bucket subresource",
-                    ));
-                }
-                MetadataCommandPayload::PutBucketVersioning(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending put bucket versioning command for bucket subresource",
-                    ));
-                }
-                MetadataCommandPayload::PutBucketAcl(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending put bucket acl command for bucket subresource",
-                    ));
-                }
-                MetadataCommandPayload::PutBucketProperty(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending put bucket property command for bucket subresource",
-                    ));
-                }
-                MetadataCommandPayload::ReserveObjectGeneration(_)
-                | MetadataCommandPayload::ReleaseObjectGeneration(_)
-                | MetadataCommandPayload::CommitDirectPutObject(_)
-                | MetadataCommandPayload::CommitMultipartObject(_)
-                | MetadataCommandPayload::DeleteObjectVersion(_)
-                | MetadataCommandPayload::InsertDeleteMarker(_)
-                | MetadataCommandPayload::PutObjectMetadata(_)
-                | MetadataCommandPayload::CreateStreamUpload(_)
-                | MetadataCommandPayload::AppendStreamSegment(_)
-                | MetadataCommandPayload::AbortStreamUpload(_)
-                | MetadataCommandPayload::CommitStreamPart(_)
-                | MetadataCommandPayload::CreateMultipartUpload(_)
-                | MetadataCommandPayload::AbortMultipartUpload(_)
-                | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
-                    return Err(conflicting_pending_metadata_command(
-                        "unexpected pending object command for bucket subresource",
-                    ));
-                }
-            }
-        } else {
-            let command_id = MetadataCommandId::new(
-                self.operation_epoch(),
-                pg_id,
-                runtime_state.next_metadata_command_log_index(pg_id),
-            );
-            let bucket_pg = primary_node.get_pg(pg_id.get())?;
-            let bucket_execution_generation = bucket_pg.reserve_bucket_execution_generation()?;
-            drop(bucket_pg);
-            let command = MetadataCommandEnvelope::new(
-                command_id,
-                MetadataCommandPayload::PutBucketSubresource(PutBucketSubresourceCommand::new(
-                    bucket.clone(),
-                    mutation,
-                    bucket_execution_generation,
-                )),
-            );
-            self.set_pending_metadata_command_for_bucket(
+            } else {
+                let command_id = MetadataCommandId::new(
+                    self.operation_epoch(),
+                    pg_id,
+                    runtime_state.next_metadata_command_log_index(pg_id),
+                );
+                let bucket_pg = primary_node.get_pg(pg_id.get())?;
+                let bucket_execution_generation =
+                    bucket_pg.reserve_bucket_execution_generation()?;
+                drop(bucket_pg);
+                let command = MetadataCommandEnvelope::new(
+                    command_id,
+                    MetadataCommandPayload::PutBucketSubresource(PutBucketSubresourceCommand::new(
+                        bucket.clone(),
+                        mutation.clone(),
+                        bucket_execution_generation,
+                    )),
+                );
+                self.set_pending_metadata_command_for_bucket(
+                    pg_id,
+                    bucket,
+                    &command,
+                    "conflicting pending command for bucket subresource",
+                )
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                (command, true)
+            };
+            let outcome = self.finish_pending_metadata_command_to_acting_set(
                 pg_id,
                 bucket,
                 &command,
-                "conflicting pending command for bucket subresource",
-            )
-            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-            (command, true)
-        };
-        self.apply_pending_metadata_command_to_acting_set(
-            pg_id,
-            bucket,
-            &command,
-            clear_pending_on_zero_apply,
-        )?;
+                clear_pending_on_zero_apply,
+            )?;
+            if outcome == super::PendingMetadataCommandOutcome::Abandoned {
+                continue;
+            }
 
-        let bucket_pg = primary_node.get_pg(pg_id.get())?;
-        let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
-        self.local_map
-            .runtime_state()
-            .remove_pending_metadata_command_for_bucket(pg_id, bucket);
-        Ok(info)
+            let bucket_pg = primary_node.get_pg(pg_id.get())?;
+            let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
+            self.local_map
+                .runtime_state()
+                .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+            return Ok(info);
+        }
     }
 
     pub fn list_buckets_for_owner(
@@ -2412,13 +2600,21 @@ impl super::StorageCluster {
                 Ok(())
             }
             Err(error) => {
-                if error.applied_nodes == 0 {
+                let MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source,
+                } = error;
+                if applied_nodes == 0 {
+                    self.record_abandoned_metadata_command_to_acting_set(command)
+                        .map_err(|error| {
+                            super::bucket_snapshot_error_to_object_pg_action_error(error.source)
+                        })?;
                     self.local_map
                         .runtime_state()
                         .remove_pending_metadata_command_for_bucket(pg_id, bucket);
                 }
                 Err(super::bucket_snapshot_error_to_object_pg_action_error(
-                    error.source,
+                    source,
                 ))
             }
         }
@@ -3662,83 +3858,115 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         request: BucketSnapshotRequest,
-        action: impl FnOnce(
+        mut action: impl FnMut(
             BucketSnapshot,
             Option<StoredObject>,
         ) -> Result<(T, CreateStreamUploadReq), E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        enum Attempt<T> {
+            Complete(T),
+            Retry,
+        }
+
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
-            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-        let primary_node = self.object_metadata_primary_node(bucket, key)?;
-        primary_node.with_bucket_write_reservation_snapshot(bucket, request, |snapshot| {
-            let object_pg = primary_node.get_pg(pg_id.get())?;
-            let existing_object = match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
-                Ok(StoredObject::Live(record)) => Some(StoredObject::Live(record)),
-                Ok(StoredObject::DeleteMarker(_)) | Err(MetadataError::ObjectNotFound) => None,
-                Err(error) => return Err(error.into()),
-            };
-            drop(object_pg);
-
-            let (value, create) = match action(snapshot, existing_object) {
-                Ok(prepared) => prepared,
-                Err(error) => return Ok(Err(error)),
-            };
-            if self
-                .matching_stream_upload_exists(pg_id, &create)
-                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
-            {
-                return Ok(Ok(value));
-            }
-            self.reserve_put_object_generation(bucket, key, &create.session_id)
+        loop {
+            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
                 .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-
-            let command = MetadataCommandEnvelope::new(
-                self.next_object_metadata_command_id(pg_id),
-                MetadataCommandPayload::CreateStreamUpload(Box::new(CreateStreamUploadCommand {
-                    request: create.clone(),
-                    created_at_millis: crate::clock::current_time_millis(),
-                })),
-            );
-            if let Err(error) = self.set_pending_metadata_command_for_bucket(
-                pg_id,
+            let primary_node = self.object_metadata_primary_node(bucket, key)?;
+            let attempt = primary_node.with_bucket_write_reservation_snapshot(
                 bucket,
-                &command,
-                "conflicting pending command for stream upload creation",
-            ) {
-                let cleanup = self
-                    .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
-                    .and_then(|_| {
-                        self.release_object_generation_reservation(bucket, key, &create.session_id)
-                    });
-                if let Err(cleanup_error) = cleanup {
-                    return Err(super::object_pg_action_error_to_bucket_snapshot_error(
-                        cleanup_error,
-                    ));
-                }
-                return Err(super::object_pg_action_error_to_bucket_snapshot_error(
-                    error,
-                ));
-            }
-            if let Err(error) =
-                self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
-            {
-                if self
-                    .local_map
-                    .runtime_state()
-                    .pending_metadata_command_for_bucket(pg_id, bucket)
-                    .is_none()
-                {
-                    let _ =
-                        self.release_object_generation_reservation(bucket, key, &create.session_id);
-                }
-                return Err(super::object_pg_action_error_to_bucket_snapshot_error(
-                    error,
-                ));
-            }
+                request,
+                |snapshot| {
+                    let object_pg = primary_node.get_pg(pg_id.get())?;
+                    let existing_object =
+                        match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
+                            Ok(StoredObject::Live(record)) => Some(StoredObject::Live(record)),
+                            Ok(StoredObject::DeleteMarker(_))
+                            | Err(MetadataError::ObjectNotFound) => None,
+                            Err(error) => return Err(error.into()),
+                        };
+                    drop(object_pg);
 
-            Ok(Ok(value))
-        })
+                    let (value, create) = match action(snapshot, existing_object) {
+                        Ok(prepared) => prepared,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    if self
+                        .matching_stream_upload_exists(pg_id, &create)
+                        .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
+                    {
+                        return Ok(Ok(Attempt::Complete(value)));
+                    }
+                    self.reserve_put_object_generation(bucket, key, &create.session_id)
+                        .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+
+                    let command = MetadataCommandEnvelope::new(
+                        self.next_object_metadata_command_id(pg_id),
+                        MetadataCommandPayload::CreateStreamUpload(Box::new(
+                            CreateStreamUploadCommand {
+                                request: create.clone(),
+                                created_at_millis: crate::clock::current_time_millis(),
+                            },
+                        )),
+                    );
+                    #[cfg(test)]
+                    maybe_run_before_stream_put_create_pending_install_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                    );
+                    if self
+                        .set_pending_metadata_command_for_bucket(
+                            pg_id,
+                            bucket,
+                            &command,
+                            "conflicting pending command for stream upload creation",
+                        )
+                        .is_err()
+                    {
+                        let cleanup = self
+                            .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+                            .and_then(|_| {
+                                self.release_object_generation_reservation(
+                                    bucket,
+                                    key,
+                                    &create.session_id,
+                                )
+                            });
+                        if let Err(cleanup_error) = cleanup {
+                            return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                                cleanup_error,
+                            ));
+                        }
+                        return Ok(Ok(Attempt::Retry));
+                    }
+                    if let Err(error) =
+                        self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
+                    {
+                        if self
+                            .local_map
+                            .runtime_state()
+                            .pending_metadata_command_for_bucket(pg_id, bucket)
+                            .is_none()
+                        {
+                            let _ = self.release_object_generation_reservation(
+                                bucket,
+                                key,
+                                &create.session_id,
+                            );
+                        }
+                        return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                            error,
+                        ));
+                    }
+
+                    Ok(Ok(Attempt::Complete(value)))
+                },
+            )?;
+            match attempt {
+                Ok(Attempt::Complete(value)) => return Ok(Ok(value)),
+                Ok(Attempt::Retry) => continue,
+                Err(error) => return Ok(Err(error)),
+            }
+        }
     }
 
     pub fn finalize_put_object_stream<T, E>(
@@ -5213,7 +5441,7 @@ impl super::StorageCluster {
         version_id: VersionId,
         became_noncurrent_at: u64,
     ) -> Result<(), ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
+        self.object_metadata_primary_node(bucket, key)?
             .test_force_became_noncurrent_at(bucket, key, version_id, became_noncurrent_at)
     }
 

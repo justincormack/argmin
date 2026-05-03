@@ -17,17 +17,18 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
-use crate::error::{MetadataError, StoreError};
+use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{
-    AbortMultipartUploadCommand, AbortStreamUploadCommand, AppendStreamSegmentCommand,
-    BucketPropertyMutation, BucketSubresourceMutation, CommitDirectPutObjectCommand,
-    CommitMultipartObjectCommand, CommitStreamPartCommand, CreateBucketCommand,
-    CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteObjectPayloadReclaimCommand,
-    DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
-    MetadataCommandEnvelope, MetadataCommandPayload, ObjectPayloadReclaimCommand,
-    PutBucketAclCommand, PutBucketPropertyCommand, PutBucketSubresourceCommand,
-    PutBucketVersioningCommand, PutObjectMetadataCommand, PutObjectMetadataMutation,
-    ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
+    metadata_command_log_hash, AbortMultipartUploadCommand, AbortStreamUploadCommand,
+    AppendStreamSegmentCommand, BucketPropertyMutation, BucketSubresourceMutation,
+    CommitDirectPutObjectCommand, CommitMultipartObjectCommand, CommitStreamPartCommand,
+    CreateBucketCommand, CreateMultipartUploadCommand, CreateStreamUploadCommand,
+    DeleteObjectPayloadReclaimCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
+    InsertDeleteMarkerCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
+    MetadataCommandLogIndex, MetadataCommandPayload, MetadataCommandReplicaState,
+    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
+    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
+    PutObjectMetadataMutation, ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
 };
 use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
@@ -72,6 +73,10 @@ FROM buckets";
 /// in-progress staging rows are invisible to reads of completed objects.
 const PART_SEGMENT_STAGING_VERSION_ID: VersionId = MULTIPART_PART_SEGMENT_STAGING_VERSION_ID;
 type StreamSessionRow = (u8, u8, BucketName, ObjectKey, Option<UploadId>, Option<i64>);
+
+const METADATA_STATE_DIGEST_UNVERIFIED: u64 = 0;
+const METADATA_STATE_DIGEST_ONLINE_COMMAND_LIMIT: u64 = 128;
+const ABANDONED_METADATA_COMMAND_CHECKSUM: u64 = 0;
 
 #[derive(Debug, Clone, Copy)]
 enum BucketExecutionGeneration {
@@ -163,6 +168,15 @@ fn trusted_object_key(key: impl Into<String>) -> ObjectKey {
         .expect("pg_store must only construct ObjectKey from validated values")
 }
 
+fn digest_bytes(hasher: &mut checksum::crc64::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn quote_sql_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
 /// Per-PG store combining shard file I/O with SQLite metadata.
 pub struct PgStore {
     pg_id: u32,
@@ -218,6 +232,10 @@ impl PgStore {
             tmp_dir,
             conn,
         })
+        .and_then(|store| {
+            store.ensure_metadata_command_replica_state()?;
+            Ok(store)
+        })
     }
 
     /// Return the PG ID.
@@ -228,6 +246,725 @@ impl PgStore {
     /// Return a reference to the underlying SQLite connection.
     pub fn connection(&self) -> &Connection {
         &self.conn
+    }
+
+    fn ensure_metadata_command_replica_state(&self) -> Result<(), StoreError> {
+        let exists = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM metadata_command_replica_state WHERE singleton = 0",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|e| StoreError::Db {
+                context: "load metadata command replica state",
+                source: e,
+            })?;
+        if exists.is_some() {
+            return Ok(());
+        }
+
+        let state_digest = self.metadata_state_digest()?;
+        self.conn
+            .execute(
+                "INSERT INTO metadata_command_replica_state \
+                 (singleton, cluster_epoch, applied_log_index, applied_log_hash, state_digest) \
+                 VALUES (0, ?1, 0, 0, ?2)",
+                params![ClusterEpoch::INITIAL.get() as i64, state_digest as i64],
+            )
+            .map_err(|e| StoreError::Db {
+                context: "initialize metadata command replica state",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    pub(crate) fn metadata_command_replica_state(
+        &self,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let (cluster_epoch, applied_log_index, applied_log_hash, state_digest): (
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = self
+            .conn
+            .query_row(
+                "SELECT cluster_epoch, applied_log_index, applied_log_hash, state_digest \
+                 FROM metadata_command_replica_state WHERE singleton = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|e| StoreError::Db {
+                context: "load metadata command replica state",
+                source: e,
+            })?;
+        Ok(MetadataCommandReplicaState {
+            cluster_epoch: ClusterEpoch::new(cluster_epoch as u64)
+                .expect("metadata command replica state stores non-zero epoch"),
+            applied_log_index: applied_log_index as u64,
+            applied_log_hash: applied_log_hash as u64,
+            state_digest: state_digest as u64,
+        })
+    }
+
+    pub(crate) fn max_metadata_command_log_index(
+        &self,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<u64, StoreError> {
+        let raw = self
+            .conn
+            .query_row(
+                "SELECT max(log_index) FROM metadata_command_log \
+                 WHERE cluster_epoch = ?1 AND pg_id = ?2",
+                params![cluster_epoch.get() as i64, self.pg_id as i64],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(|e| StoreError::Db {
+                context: "load max metadata command log index",
+                source: e,
+            })?;
+        raw.unwrap_or_default()
+            .try_into()
+            .map_err(|_| StoreError::Db {
+                context: "decode max metadata command log index",
+                source: rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    Box::from("negative metadata command log index"),
+                ),
+            })
+    }
+
+    pub(crate) fn metadata_command_acceptance(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        if command.id().pg_id().get() != self.pg_id {
+            return Err(StoreError::MetadataCommandWrongPg {
+                node_id,
+                command_pg_id: command.id().pg_id().get(),
+                target_pg_id: self.pg_id,
+                cluster_epoch: command.id().cluster_epoch(),
+            });
+        }
+        if let Some((cluster_epoch, expected_digest, actual_digest)) =
+            self.metadata_state_digest_mismatch()?
+        {
+            return Err(StoreError::MetadataStateDigestMismatch {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                expected_digest,
+                actual_digest,
+            });
+        }
+
+        let command_log_entry = self
+            .conn
+            .query_row(
+                "SELECT command_checksum, abandoned FROM metadata_command_log \
+                 WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+                params![
+                    command.id().cluster_epoch().get() as i64,
+                    command.id().pg_id().get() as i64,
+                    command.id().log_index().get() as i64,
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0)),
+            )
+            .optional()
+            .map_err(|e| StoreError::Db {
+                context: "load metadata command log entry",
+                source: e,
+            })?;
+
+        let Some((command_checksum, abandoned)) = command_log_entry else {
+            return Ok(MetadataCommandAcceptance::Apply);
+        };
+        if !abandoned && command_checksum as u64 == command.checksum_crc64() {
+            return Ok(MetadataCommandAcceptance::AlreadyApplied);
+        }
+        Err(StoreError::MetadataCommandLogConflict {
+            node_id,
+            pg_id: self.pg_id,
+            cluster_epoch: command.id().cluster_epoch(),
+            log_index: command.id().log_index().get(),
+        })
+    }
+
+    pub(crate) fn metadata_command_abandon_acceptance(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        if command.id().pg_id().get() != self.pg_id {
+            return Err(StoreError::MetadataCommandWrongPg {
+                node_id,
+                command_pg_id: command.id().pg_id().get(),
+                target_pg_id: self.pg_id,
+                cluster_epoch: command.id().cluster_epoch(),
+            });
+        }
+        if let Some((cluster_epoch, expected_digest, actual_digest)) =
+            self.metadata_state_digest_mismatch()?
+        {
+            return Err(StoreError::MetadataStateDigestMismatch {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                expected_digest,
+                actual_digest,
+            });
+        }
+        let command_log_entry = self
+            .conn
+            .query_row(
+                "SELECT command_checksum, abandoned FROM metadata_command_log \
+                 WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+                params![
+                    command.id().cluster_epoch().get() as i64,
+                    command.id().pg_id().get() as i64,
+                    command.id().log_index().get() as i64,
+                ],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? != 0)),
+            )
+            .optional()
+            .map_err(|e| StoreError::Db {
+                context: "load metadata command abandon log entry",
+                source: e,
+            })?;
+
+        let Some((command_checksum, abandoned)) = command_log_entry else {
+            return Ok(MetadataCommandAcceptance::Apply);
+        };
+        if abandoned && command_checksum == ABANDONED_METADATA_COMMAND_CHECKSUM {
+            return Ok(MetadataCommandAcceptance::AlreadyApplied);
+        }
+        Err(StoreError::MetadataCommandLogConflict {
+            node_id,
+            pg_id: self.pg_id,
+            cluster_epoch: command.id().cluster_epoch(),
+            log_index: command.id().log_index().get(),
+        })
+    }
+
+    pub(crate) fn metadata_command_abandoned(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError> {
+        if command.id().pg_id().get() != self.pg_id {
+            return Ok(false);
+        }
+        let row = self
+            .conn
+            .query_row(
+                "SELECT command_checksum, abandoned FROM metadata_command_log \
+                 WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+                params![
+                    command.id().cluster_epoch().get() as i64,
+                    command.id().pg_id().get() as i64,
+                    command.id().log_index().get() as i64,
+                ],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? != 0)),
+            )
+            .optional()
+            .map_err(|e| StoreError::Db {
+                context: "load metadata command abandoned state",
+                source: e,
+            })?;
+        Ok(matches!(
+            row,
+            Some((ABANDONED_METADATA_COMMAND_CHECKSUM, true))
+        ))
+    }
+
+    pub(crate) fn record_metadata_command_applied(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        if command.id().pg_id().get() != self.pg_id {
+            return Err(StoreError::MetadataCommandWrongPg {
+                node_id,
+                command_pg_id: command.id().pg_id().get(),
+                target_pg_id: self.pg_id,
+                cluster_epoch: command.id().cluster_epoch(),
+            });
+        }
+        self.conn
+            .execute(
+                "INSERT INTO metadata_command_log \
+                 (cluster_epoch, pg_id, log_index, command_checksum, abandoned, previous_log_hash, log_hash) \
+                 VALUES (?1, ?2, ?3, ?4, 0, NULL, NULL) \
+                 ON CONFLICT(cluster_epoch, pg_id, log_index) DO NOTHING",
+                params![
+                    command.id().cluster_epoch().get() as i64,
+                    command.id().pg_id().get() as i64,
+                    command.id().log_index().get() as i64,
+                    command.checksum_crc64() as i64,
+                ],
+            )
+            .map_err(|e| StoreError::Db {
+                context: "record metadata command log entry",
+                source: e,
+            })?;
+
+        let (stored_checksum, abandoned) = self
+            .conn
+            .query_row(
+                "SELECT command_checksum, abandoned FROM metadata_command_log \
+                 WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+                params![
+                    command.id().cluster_epoch().get() as i64,
+                    command.id().pg_id().get() as i64,
+                    command.id().log_index().get() as i64,
+                ],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? != 0)),
+            )
+            .map_err(|e| StoreError::Db {
+                context: "load recorded metadata command log entry",
+                source: e,
+            })?;
+        if abandoned || stored_checksum != command.checksum_crc64() {
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch: command.id().cluster_epoch(),
+                log_index: command.id().log_index().get(),
+            });
+        }
+        self.advance_metadata_command_log_state(node_id, command.id().cluster_epoch())
+    }
+
+    pub(crate) fn record_metadata_command_abandoned(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        if command.id().pg_id().get() != self.pg_id {
+            return Err(StoreError::MetadataCommandWrongPg {
+                node_id,
+                command_pg_id: command.id().pg_id().get(),
+                target_pg_id: self.pg_id,
+                cluster_epoch: command.id().cluster_epoch(),
+            });
+        }
+        self.conn
+            .execute(
+                "INSERT INTO metadata_command_log \
+                 (cluster_epoch, pg_id, log_index, command_checksum, abandoned, previous_log_hash, log_hash) \
+                 VALUES (?1, ?2, ?3, ?4, 1, NULL, NULL) \
+                 ON CONFLICT(cluster_epoch, pg_id, log_index) DO NOTHING",
+                params![
+                    command.id().cluster_epoch().get() as i64,
+                    command.id().pg_id().get() as i64,
+                    command.id().log_index().get() as i64,
+                    ABANDONED_METADATA_COMMAND_CHECKSUM as i64,
+                ],
+            )
+            .map_err(|e| StoreError::Db {
+                context: "record abandoned metadata command log entry",
+                source: e,
+            })?;
+
+        let (stored_checksum, abandoned) = self
+            .conn
+            .query_row(
+                "SELECT command_checksum, abandoned FROM metadata_command_log \
+                 WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+                params![
+                    command.id().cluster_epoch().get() as i64,
+                    command.id().pg_id().get() as i64,
+                    command.id().log_index().get() as i64,
+                ],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? != 0)),
+            )
+            .map_err(|e| StoreError::Db {
+                context: "load abandoned metadata command log entry",
+                source: e,
+            })?;
+        if !abandoned || stored_checksum != ABANDONED_METADATA_COMMAND_CHECKSUM {
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch: command.id().cluster_epoch(),
+                log_index: command.id().log_index().get(),
+            });
+        }
+        self.advance_metadata_command_log_state(node_id, command.id().cluster_epoch())
+    }
+
+    pub(crate) fn refresh_metadata_command_state_digest(&self) -> Result<(), StoreError> {
+        let state = self.metadata_command_replica_state()?;
+        let state_digest = self.online_metadata_state_digest(state.applied_log_index)?;
+        self.conn
+            .execute(
+                "UPDATE metadata_command_replica_state SET state_digest = ?1 WHERE singleton = 0",
+                params![state_digest as i64],
+            )
+            .map_err(|e| StoreError::Db {
+                context: "refresh metadata command state digest",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn metadata_state_digest_mismatch(
+        &self,
+    ) -> Result<Option<(ClusterEpoch, u64, u64)>, StoreError> {
+        let state = self.metadata_command_replica_state()?;
+        if state.state_digest == METADATA_STATE_DIGEST_UNVERIFIED {
+            return Ok(None);
+        }
+        let actual_digest = self.metadata_state_digest()?;
+        if state.state_digest == actual_digest {
+            return Ok(None);
+        }
+        Ok(Some((
+            state.cluster_epoch,
+            state.state_digest,
+            actual_digest,
+        )))
+    }
+
+    fn advance_metadata_command_log_state(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let mut state = self.metadata_command_replica_state()?;
+        if state.cluster_epoch != cluster_epoch {
+            state = MetadataCommandReplicaState {
+                cluster_epoch,
+                applied_log_index: 0,
+                applied_log_hash: 0,
+                state_digest: self.online_metadata_state_digest(0)?,
+            };
+        }
+
+        let pg_id = PgId::new(self.pg_id);
+        let mut applied_log_index = state.applied_log_index;
+        let mut applied_log_hash = state.applied_log_hash;
+        while let Some(next_log_index) = applied_log_index.checked_add(1) {
+            let row = self
+                .conn
+                .query_row(
+                    "SELECT command_checksum, previous_log_hash, log_hash \
+                     FROM metadata_command_log \
+                     WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+                    params![
+                        cluster_epoch.get() as i64,
+                        self.pg_id as i64,
+                        next_log_index as i64,
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| StoreError::Db {
+                    context: "load next metadata command log entry",
+                    source: e,
+                })?;
+            let Some((command_checksum, previous_log_hash, log_hash)) = row else {
+                break;
+            };
+            let log_index = MetadataCommandLogIndex::new(next_log_index)
+                .expect("metadata command log index is non-zero");
+            let expected_log_hash = metadata_command_log_hash(
+                cluster_epoch,
+                pg_id,
+                log_index,
+                applied_log_hash,
+                command_checksum as u64,
+            );
+            match (previous_log_hash, log_hash) {
+                (None, None) => {
+                    self.conn
+                        .execute(
+                            "UPDATE metadata_command_log \
+                             SET previous_log_hash = ?1, log_hash = ?2 \
+                             WHERE cluster_epoch = ?3 AND pg_id = ?4 AND log_index = ?5",
+                            params![
+                                applied_log_hash as i64,
+                                expected_log_hash as i64,
+                                cluster_epoch.get() as i64,
+                                self.pg_id as i64,
+                                next_log_index as i64,
+                            ],
+                        )
+                        .map_err(|e| StoreError::Db {
+                            context: "update metadata command log hash",
+                            source: e,
+                        })?;
+                }
+                (Some(previous_log_hash), Some(log_hash))
+                    if previous_log_hash as u64 == applied_log_hash
+                        && log_hash as u64 == expected_log_hash => {}
+                (previous_log_hash, log_hash) => {
+                    return Err(StoreError::MetadataCommandLogHashMismatch {
+                        node_id,
+                        pg_id: self.pg_id,
+                        cluster_epoch,
+                        log_index: next_log_index,
+                        expected_previous_log_hash: applied_log_hash,
+                        actual_previous_log_hash: previous_log_hash.unwrap_or_default() as u64,
+                        expected_log_hash,
+                        actual_log_hash: log_hash.unwrap_or_default() as u64,
+                    });
+                }
+            }
+            applied_log_index = next_log_index;
+            applied_log_hash = expected_log_hash;
+        }
+
+        let state_digest = self.online_metadata_state_digest(applied_log_index)?;
+        self.conn
+            .execute(
+                "UPDATE metadata_command_replica_state \
+                 SET cluster_epoch = ?1, applied_log_index = ?2, applied_log_hash = ?3, state_digest = ?4 \
+                 WHERE singleton = 0",
+                params![
+                    cluster_epoch.get() as i64,
+                    applied_log_index as i64,
+                    applied_log_hash as i64,
+                    state_digest as i64,
+                ],
+            )
+            .map_err(|e| StoreError::Db {
+                context: "update metadata command replica state",
+                source: e,
+            })?;
+        self.metadata_command_replica_state()
+    }
+
+    fn metadata_state_digest(&self) -> Result<u64, StoreError> {
+        let mut hasher = checksum::crc64::Hasher::new();
+        let table_names = self.metadata_digest_table_names()?;
+        for table_name in table_names {
+            digest_bytes(&mut hasher, table_name.as_bytes());
+            let columns = Self::metadata_digest_columns(&table_name);
+            for column in &columns {
+                digest_bytes(&mut hasher, column.as_bytes());
+            }
+            let where_clause = Self::metadata_digest_where_clause(&table_name);
+            digest_bytes(&mut hasher, where_clause.as_bytes());
+            if columns.is_empty() {
+                continue;
+            }
+
+            let table_sql = quote_sql_identifier(&table_name);
+            let quoted_columns: Vec<String> = columns
+                .iter()
+                .map(|column| quote_sql_identifier(column))
+                .collect();
+            let select_values = quoted_columns
+                .iter()
+                .map(|column| format!("quote({column})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let order_by = quoted_columns.join(", ");
+            let sql = format!(
+                "SELECT {select_values} FROM {table_sql}{where_clause} ORDER BY {order_by}"
+            );
+            let mut stmt = self.conn.prepare(&sql).map_err(|e| StoreError::Db {
+                context: "prepare metadata state digest scan",
+                source: e,
+            })?;
+            let mut rows = stmt.query([]).map_err(|e| StoreError::Db {
+                context: "scan metadata state digest rows",
+                source: e,
+            })?;
+            while let Some(row) = rows.next().map_err(|e| StoreError::Db {
+                context: "scan metadata state digest row",
+                source: e,
+            })? {
+                for index in 0..columns.len() {
+                    let value = row.get::<_, String>(index).map_err(|e| StoreError::Db {
+                        context: "read metadata state digest value",
+                        source: e,
+                    })?;
+                    digest_bytes(&mut hasher, value.as_bytes());
+                }
+            }
+        }
+        Ok(hasher.finalize())
+    }
+
+    fn online_metadata_state_digest(&self, applied_log_index: u64) -> Result<u64, StoreError> {
+        // Full table scans are quadratic when run before every command in a
+        // large local trace. Keep this online corruption gate bounded; durable
+        // command-log checks remain online for every command.
+        if applied_log_index > METADATA_STATE_DIGEST_ONLINE_COMMAND_LIMIT {
+            return Ok(METADATA_STATE_DIGEST_UNVERIFIED);
+        }
+        self.metadata_state_digest()
+    }
+
+    fn metadata_digest_table_names(&self) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_schema \
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+                 ORDER BY name",
+            )
+            .map_err(|e| StoreError::Db {
+                context: "prepare metadata digest table scan",
+                source: e,
+            })?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| StoreError::Db {
+                context: "scan metadata digest tables",
+                source: e,
+            })?;
+        let mut tables = Vec::new();
+        for row in rows {
+            let table = row.map_err(|e| StoreError::Db {
+                context: "read metadata digest table",
+                source: e,
+            })?;
+            if matches!(
+                table.as_str(),
+                "buckets"
+                    | "bucket_subresources"
+                    | "objects"
+                    | "object_parts"
+                    | "object_segments"
+                    | "multipart_part_segments"
+            ) {
+                tables.push(table);
+            }
+        }
+        Ok(tables)
+    }
+
+    fn metadata_digest_columns(table_name: &str) -> Vec<String> {
+        let columns = match table_name {
+            "buckets" => &[
+                "name",
+                "owner_principal",
+                "owner_canonical_id",
+                "created_at",
+                "region",
+                "state",
+                "versioning",
+                "acl_grants",
+                "public_read",
+                "public_write",
+                "public_access_block_present",
+                "public_access_block_block_public_acls",
+                "public_access_block_ignore_public_acls",
+                "public_access_block_block_public_policy",
+                "public_access_block_restrict_public_buckets",
+                "ownership_controls_mode",
+                "bucket_policy_public",
+                "bucket_policy_generation",
+                "bucket_lifecycle_generation",
+                "bucket_execution_generation",
+                "bucket_abac_enabled",
+                "default_encryption_type",
+                "sse_c_blocked",
+                "object_lock_enabled",
+                "object_lock_default_mode",
+                "object_lock_default_days",
+                "object_lock_default_years",
+            ][..],
+            "bucket_subresources" => &["bucket_name", "kind", "body", "generation", "aux_int_1"],
+            "objects" => &[
+                "bucket",
+                "key",
+                "version_id",
+                "write_sequence",
+                "generation_id",
+                "size",
+                "etag",
+                "etag_kind",
+                "last_modified",
+                "storage_class",
+                "ec_k",
+                "ec_m",
+                "status",
+                "tags",
+                "data_layout",
+                "parts_count",
+                "metadata_blob",
+                "system_metadata_blob",
+                "encryption_type",
+                "encryption_state",
+                "owner_principal",
+                "owner_canonical_id",
+                "acl_grants",
+                "public_read",
+                "object_lock_retention_mode",
+                "object_lock_retain_until",
+                "object_lock_legal_hold",
+                "became_noncurrent_at",
+            ],
+            "object_parts" => &[
+                "bucket",
+                "key",
+                "version_id",
+                "part_number",
+                "object_offset_start",
+                "size",
+                "etag",
+                "etag_kind",
+                "part_okh",
+                "part_vid",
+                "ec_k",
+                "ec_m",
+                "data_pg_id",
+                "checksum",
+            ],
+            "object_segments" => &[
+                "bucket",
+                "key",
+                "version_id",
+                "segment_index",
+                "size",
+                "segment_crc64",
+                "segment_okh",
+                "segment_vid",
+                "data_pg_id",
+                "ec_k",
+                "ec_m",
+            ],
+            "multipart_part_segments" => &[
+                "bucket",
+                "key",
+                "upload_id",
+                "version_id",
+                "part_number",
+                "segment_index",
+                "size",
+                "segment_crc64",
+                "segment_okh",
+                "segment_vid",
+                "data_pg_id",
+                "ec_k",
+                "ec_m",
+            ],
+            _ => &[][..],
+        };
+        columns.iter().map(|column| (*column).to_string()).collect()
+    }
+
+    fn metadata_digest_where_clause(table_name: &str) -> String {
+        match table_name {
+            "multipart_part_segments" => format!(
+                " WHERE \"version_id\" != {}",
+                PART_SEGMENT_STAGING_VERSION_ID.to_u64() as i64
+            ),
+            _ => String::new(),
+        }
     }
 
     /// Resolve the file path for a shard key.
@@ -1925,6 +2662,10 @@ impl PgStore {
         commit_context: &'static str,
         body: impl FnOnce(&Self) -> Result<T, MetadataError>,
     ) -> Result<T, MetadataError> {
+        if !self.conn.is_autocommit() {
+            return body(self);
+        }
+
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|source| MetadataError::Db {
@@ -2181,6 +2922,45 @@ impl PgStore {
         }
     }
 
+    pub(crate) fn apply_metadata_command_and_record(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|source| {
+                BucketSnapshotLoadError::Metadata(MetadataError::Db {
+                    context: "apply metadata command and record (begin txn)",
+                    source,
+                })
+            })?;
+
+        let result = (|| {
+            self.apply_metadata_command(command)
+                .map_err(BucketSnapshotLoadError::Metadata)?;
+            self.record_metadata_command_applied(node_id, command)
+                .map_err(BucketSnapshotLoadError::Store)
+        })();
+
+        match result {
+            Ok(state) => {
+                if let Err(source) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(BucketSnapshotLoadError::Metadata(MetadataError::Db {
+                        context: "apply metadata command and record (commit txn)",
+                        source,
+                    }));
+                }
+                Ok(state)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
     fn apply_create_bucket_command(
         &self,
         command: &CreateBucketCommand,
@@ -2294,66 +3074,47 @@ impl PgStore {
             });
         }
 
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| MetadataError::Db {
-                context: "commit direct put command (begin txn)",
-                source: e,
-            })?;
-
-        let result: Result<(), MetadataError> = (|| {
-            self.put_object_with_segments_explicit_in_open_txn(
-                &command.object,
-                &command.segments,
-                command.write_sequence,
-                command.last_modified_millis,
-            )?;
-            self.delete_object_generation_reservation(
-                &command.object.bucket,
-                &command.object.key,
-                &command.generation_reservation_id,
-            )?;
-            if let Some(stale_payload) = &command.stale_payload {
-                self.apply_direct_put_stale_payload_in_open_txn(
+        self.with_immediate_txn(
+            "commit direct put command (begin txn)",
+            "commit direct put command (commit txn)",
+            |store| {
+                store.put_object_with_segments_explicit_in_open_txn(
+                    &command.object,
+                    &command.segments,
+                    command.write_sequence,
+                    command.last_modified_millis,
+                )?;
+                store.delete_object_generation_reservation(
                     &command.object.bucket,
                     &command.object.key,
-                    command.object.version_id,
-                    stale_payload,
+                    &command.generation_reservation_id,
                 )?;
-            }
-            self.conn
-                .execute(
-                    "DELETE FROM stream_uploads \
-                     WHERE session_id = ?1 AND bucket = ?2 AND key = ?3",
-                    params![
-                        command.generation_reservation_id.as_str(),
+                if let Some(stale_payload) = &command.stale_payload {
+                    store.apply_direct_put_stale_payload_in_open_txn(
                         &command.object.bucket,
-                        &command.object.key
-                    ],
-                )
-                .map_err(|e| MetadataError::Db {
-                    context: "commit standard object command (delete stream staging)",
-                    source: e,
-                })?;
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                if let Err(e) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    return Err(MetadataError::Db {
-                        context: "commit direct put command (commit txn)",
-                        source: e,
-                    });
+                        &command.object.key,
+                        command.object.version_id,
+                        stale_payload,
+                    )?;
                 }
+                store
+                    .conn
+                    .execute(
+                        "DELETE FROM stream_uploads \
+                     WHERE session_id = ?1 AND bucket = ?2 AND key = ?3",
+                        params![
+                            command.generation_reservation_id.as_str(),
+                            &command.object.bucket,
+                            &command.object.key
+                        ],
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "commit standard object command (delete stream staging)",
+                        source: e,
+                    })?;
                 Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+            },
+        )
     }
 
     fn direct_put_command_already_applied(
@@ -3511,131 +4272,111 @@ impl PgStore {
         let encryption_type = req.encryption.encryption_type() as u8;
         let encryption_state = req.encryption.encode_state();
         let system_metadata_blob = req.system_metadata_blob.as_slice();
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| MetadataError::Db {
-                context: "create multipart upload (begin txn)",
-                source: e,
-            })?;
-
-        let result: Result<(), MetadataError> = (|| {
-            match self.conn.execute(
-                "INSERT INTO object_generation_reservations \
-                 (reservation_id, bucket, key, generation_id, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    req.upload_id.as_str(),
-                    req.bucket,
-                    req.key,
-                    object_generation_id.get() as i64,
-                    initiated_at_millis as i64,
-                ],
-            ) {
-                Ok(_) => {}
-                Err(rusqlite::Error::SqliteFailure(_, _)) => {
-                    let existing_generation = self
-                        .conn
-                        .query_row(
-                            "SELECT generation_id FROM object_generation_reservations \
-                             WHERE reservation_id = ?1 AND bucket = ?2 AND key = ?3",
-                            params![req.upload_id.as_str(), req.bucket, req.key],
-                            |row| {
-                                let raw: i64 = row.get(0)?;
-                                Self::parse_generation_id(raw, 0, "generation_id")
-                            },
-                        )
-                        .optional()
-                        .map_err(|e| MetadataError::Db {
-                            context: "create multipart upload explicit reservation lookup",
+        self.with_immediate_txn(
+            "create multipart upload (begin txn)",
+            "create multipart upload (commit txn)",
+            |store| {
+                match store.conn.execute(
+                    "INSERT INTO object_generation_reservations \
+                     (reservation_id, bucket, key, generation_id, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        req.upload_id.as_str(),
+                        req.bucket,
+                        req.key,
+                        object_generation_id.get() as i64,
+                        initiated_at_millis as i64,
+                    ],
+                ) {
+                    Ok(_) => {}
+                    Err(rusqlite::Error::SqliteFailure(_, _)) => {
+                        let existing_generation = store
+                            .conn
+                            .query_row(
+                                "SELECT generation_id FROM object_generation_reservations \
+                                 WHERE reservation_id = ?1 AND bucket = ?2 AND key = ?3",
+                                params![req.upload_id.as_str(), req.bucket, req.key],
+                                |row| {
+                                    let raw: i64 = row.get(0)?;
+                                    Self::parse_generation_id(raw, 0, "generation_id")
+                                },
+                            )
+                            .optional()
+                            .map_err(|e| MetadataError::Db {
+                                context: "create multipart upload explicit reservation lookup",
+                                source: e,
+                            })?;
+                        if !matches!(existing_generation, Some(existing) if existing == object_generation_id)
+                        {
+                            return Err(MetadataError::Db {
+                                context: "create multipart upload explicit reservation mismatch",
+                                source: rusqlite::Error::InvalidQuery,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        return Err(MetadataError::Db {
+                            context: "create multipart upload (reserve generation)",
                             source: e,
-                        })?;
-                    if !matches!(existing_generation, Some(existing) if existing == object_generation_id)
-                    {
-                        return Err(MetadataError::Db {
-                            context: "create multipart upload explicit reservation mismatch",
-                            source: rusqlite::Error::InvalidQuery,
                         });
                     }
                 }
-                Err(e) => {
-                    return Err(MetadataError::Db {
-                        context: "create multipart upload (reserve generation)",
-                        source: e,
-                    });
-                }
-            }
-            match self.conn.execute(
-                "INSERT INTO multipart_uploads \
-                 (upload_id, bucket, key, initiated_at, state, tags, metadata_blob, system_metadata_blob, owner_principal, owner_canonical_id, \
-                  initiator_principal, initiator_canonical_id, checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_generation_id, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
-                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
-                params![
-                    req.upload_id,
-                    req.bucket,
-                    req.key,
-                    initiated_at_millis as i64,
-                    tags,
-                    req.metadata_blob.as_slice(),
-                    system_metadata_blob,
-                    req.owner.principal,
-                    req.owner.canonical_id.as_str(),
-                    req.initiator.as_ref().map(|owner| owner.principal.as_str()),
-                    req.initiator
-                        .as_ref()
-                        .map(|owner| owner.canonical_id.as_str()),
-                    algo,
-                    ctype,
-                    encryption_type,
-                    encryption_state,
-                    req.acl_grants.serialized(),
-                    i32::from(req.public_read),
-                    object_generation_id.get() as i64,
-                    object_lock_retention_mode,
-                    object_lock_retain_until,
-                    object_lock_legal_hold,
-                ],
-            ) {
-                Ok(_) => {}
-                Err(rusqlite::Error::SqliteFailure(_, _)) => {
-                    let existing = self.get_multipart_upload(&req.upload_id)?;
-                    let command = CreateMultipartUploadCommand {
-                        request: req.clone(),
-                        object_generation_id,
-                        initiated_at_millis,
-                    };
-                    if !multipart_upload_matches_create_command(&existing, &command) {
+                match store.conn.execute(
+                    "INSERT INTO multipart_uploads \
+                     (upload_id, bucket, key, initiated_at, state, tags, metadata_blob, system_metadata_blob, owner_principal, owner_canonical_id, \
+                      initiator_principal, initiator_canonical_id, checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_generation_id, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
+                     VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                    params![
+                        req.upload_id,
+                        req.bucket,
+                        req.key,
+                        initiated_at_millis as i64,
+                        tags,
+                        req.metadata_blob.as_slice(),
+                        system_metadata_blob,
+                        req.owner.principal,
+                        req.owner.canonical_id.as_str(),
+                        req.initiator.as_ref().map(|owner| owner.principal.as_str()),
+                        req.initiator
+                            .as_ref()
+                            .map(|owner| owner.canonical_id.as_str()),
+                        algo,
+                        ctype,
+                        encryption_type,
+                        encryption_state,
+                        req.acl_grants.serialized(),
+                        i32::from(req.public_read),
+                        object_generation_id.get() as i64,
+                        object_lock_retention_mode,
+                        object_lock_retain_until,
+                        object_lock_legal_hold,
+                    ],
+                ) {
+                    Ok(_) => {}
+                    Err(rusqlite::Error::SqliteFailure(_, _)) => {
+                        let existing = store.get_multipart_upload(&req.upload_id)?;
+                        let command = CreateMultipartUploadCommand {
+                            request: req.clone(),
+                            object_generation_id,
+                            initiated_at_millis,
+                        };
+                        if !multipart_upload_matches_create_command(&existing, &command) {
+                            return Err(MetadataError::Db {
+                                context: "create multipart upload explicit existing upload mismatch",
+                                source: rusqlite::Error::InvalidQuery,
+                            });
+                        }
+                    }
+                    Err(e) => {
                         return Err(MetadataError::Db {
-                            context: "create multipart upload explicit existing upload mismatch",
-                            source: rusqlite::Error::InvalidQuery,
+                            context: "create multipart upload",
+                            source: e,
                         });
                     }
-                }
-                Err(e) => {
-                    return Err(MetadataError::Db {
-                        context: "create multipart upload",
-                        source: e,
-                    });
-                }
-            }
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                if let Err(e) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    return Err(MetadataError::Db {
-                        context: "create multipart upload (commit txn)",
-                        source: e,
-                    });
                 }
                 Ok(())
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
-        }
+            },
+        )
     }
 
     pub(crate) fn prepare_abort_multipart_upload_cleanup(
@@ -10218,6 +10959,43 @@ mod tests {
         OwnerIdentity::from_principal("owner")
     }
 
+    fn create_bucket_probe_command(
+        pg_id: u32,
+        log_index: u64,
+        bucket: BucketName,
+        bucket_execution_generation: u64,
+    ) -> MetadataCommandEnvelope {
+        let owner = test_owner();
+        let config = CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            versioning: BucketVersioningState::Disabled,
+            object_lock: BucketObjectLockConfig::default(),
+        };
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(pg_id),
+                MetadataCommandLogIndex::new(log_index).unwrap(),
+            ),
+            MetadataCommandPayload::CreateBucket(
+                CreateBucketCommand::from_config(&config, 123, bucket_execution_generation)
+                    .unwrap(),
+            ),
+        )
+    }
+
+    fn assert_metadata_state_digest_mismatch(err: StoreError) {
+        assert!(
+            matches!(err, StoreError::MetadataStateDigestMismatch { .. }),
+            "expected metadata state digest mismatch, got {err:?}"
+        );
+    }
+
     // ── prefix_end ────────────────────────────────────────────────────
 
     #[test]
@@ -10255,6 +11033,187 @@ mod tests {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 42).unwrap();
         assert_eq!(store.pg_id(), 42);
+    }
+
+    #[test]
+    fn metadata_command_apply_and_record_rolls_back_metadata_on_record_conflict() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("rollback-bucket");
+        let command = create_bucket_probe_command(1, 1, bucket.clone(), 1);
+        let conflicting_checksum = command.checksum_crc64() ^ 1;
+        store
+            .conn
+            .execute(
+                "INSERT INTO metadata_command_log \
+                 (cluster_epoch, pg_id, log_index, command_checksum, previous_log_hash, log_hash) \
+                 VALUES (?1, ?2, ?3, ?4, NULL, NULL)",
+                params![
+                    ClusterEpoch::INITIAL.get() as i64,
+                    1_i64,
+                    1_i64,
+                    conflicting_checksum as i64,
+                ],
+            )
+            .unwrap();
+
+        let err = store
+            .apply_metadata_command_and_record(0, &command)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict { .. })
+            ),
+            "expected log conflict, got {err:?}"
+        );
+        assert!(
+            matches!(
+                store.head_bucket_raw(&bucket).unwrap_err(),
+                MetadataError::BucketNotFound { .. }
+            ),
+            "bucket creation must roll back when log recording fails"
+        );
+    }
+
+    #[test]
+    fn metadata_state_digest_covers_object_segments() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("digest-bucket");
+        let key = trusted_object_key("object");
+        let okh = [1_u8; 16];
+        store
+            .conn
+            .execute(
+                "INSERT INTO object_segments \
+                 (bucket, key, version_id, segment_index, size, segment_crc64, \
+                  segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    bucket.as_str(),
+                    key.as_str(),
+                    1_i64,
+                    0_i64,
+                    32_i64,
+                    99_i64,
+                    okh.as_slice(),
+                    1_i64,
+                    1_i64,
+                    4_i64,
+                    2_i64,
+                ],
+            )
+            .unwrap();
+        store.refresh_metadata_command_state_digest().unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE object_segments SET data_pg_id = ?1 \
+                 WHERE bucket = ?2 AND key = ?3 AND version_id = ?4",
+                params![2_i64, bucket.as_str(), key.as_str(), 1_i64],
+            )
+            .unwrap();
+
+        let command = create_bucket_probe_command(1, 1, trusted_bucket_name("probe"), 1);
+        let err = store.metadata_command_acceptance(0, &command).unwrap_err();
+        assert_metadata_state_digest_mismatch(err);
+    }
+
+    #[test]
+    fn metadata_state_digest_covers_multipart_part_segments() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("digest-bucket");
+        let key = trusted_object_key("object");
+        let upload_id = UploadId::new("u".repeat(UPLOAD_ID_LEN)).unwrap();
+        let okh = [2_u8; 16];
+        store
+            .conn
+            .execute(
+                "INSERT INTO multipart_part_segments \
+                 (bucket, key, upload_id, version_id, part_number, segment_index, size, \
+                  segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    bucket.as_str(),
+                    key.as_str(),
+                    upload_id.as_str(),
+                    1_i64,
+                    1_i64,
+                    0_i64,
+                    32_i64,
+                    99_i64,
+                    okh.as_slice(),
+                    1_i64,
+                    1_i64,
+                    4_i64,
+                    2_i64,
+                ],
+            )
+            .unwrap();
+        store.refresh_metadata_command_state_digest().unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE multipart_part_segments SET ec_m = ?1 \
+                 WHERE bucket = ?2 AND key = ?3 AND upload_id = ?4",
+                params![3_i64, bucket.as_str(), key.as_str(), upload_id.as_str()],
+            )
+            .unwrap();
+
+        let command = create_bucket_probe_command(1, 1, trusted_bucket_name("probe"), 1);
+        let err = store.metadata_command_acceptance(0, &command).unwrap_err();
+        assert_metadata_state_digest_mismatch(err);
+    }
+
+    #[test]
+    fn metadata_state_digest_excludes_multipart_part_staging_segments() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("digest-bucket");
+        let key = trusted_object_key("object");
+        let upload_id = UploadId::new("u".repeat(UPLOAD_ID_LEN)).unwrap();
+        let okh = [3_u8; 16];
+        store
+            .conn
+            .execute(
+                "INSERT INTO multipart_part_segments \
+                 (bucket, key, upload_id, version_id, part_number, segment_index, size, \
+                  segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    bucket.as_str(),
+                    key.as_str(),
+                    upload_id.as_str(),
+                    PART_SEGMENT_STAGING_VERSION_ID.to_u64() as i64,
+                    1_i64,
+                    0_i64,
+                    32_i64,
+                    99_i64,
+                    okh.as_slice(),
+                    1_i64,
+                    1_i64,
+                    4_i64,
+                    2_i64,
+                ],
+            )
+            .unwrap();
+        store.refresh_metadata_command_state_digest().unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE multipart_part_segments SET ec_m = ?1 \
+                 WHERE bucket = ?2 AND key = ?3 AND upload_id = ?4",
+                params![3_i64, bucket.as_str(), key.as_str(), upload_id.as_str()],
+            )
+            .unwrap();
+
+        let command = create_bucket_probe_command(1, 1, trusted_bucket_name("probe"), 1);
+        assert_eq!(
+            store.metadata_command_acceptance(0, &command).unwrap(),
+            MetadataCommandAcceptance::Apply
+        );
     }
 
     #[test]

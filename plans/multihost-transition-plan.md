@@ -1434,7 +1434,8 @@ Work items:
      - tests cover invalid origin/epoch/PG/acting-set context, accepted
        convergence, duplicate retry no-op, conflicting duplicate rejection,
        valid out-of-allocation-order application, and non-mutation on rejection
-6. Phase 6.6: log chain and state digest.
+6. Phase 6.6: log chain and state digest. Complete for the local command-owned
+   metadata surface.
    - add a durable command-log hash chain or equivalent replay state:
      epoch, PG ID, monotonically increasing log index, previous log hash, and
      command checksum
@@ -1442,6 +1443,66 @@ Work items:
      or equivalent comparison value
    - command-log checksum mismatch prevents replica acknowledgement
    - applied-state digest mismatch prevents the PG from being considered clean
+   - completed:
+     - each per-PG SQLite store now has a durable `metadata_command_log` table
+       and `metadata_command_replica_state` row
+     - command acceptance reads durable replica state, so duplicate retry and
+       checksum-conflict handling survive local cluster reopen
+     - local log-index allocation is seeded from each PG's durable command log
+       during local cluster open, so post-restart commands allocate after the
+       persisted maximum index instead of reusing index 1
+     - each replica applies the metadata mutation and records the durable
+       command-log/state advancement in one SQLite transaction; a local record
+       failure rolls back the metadata mutation instead of leaving an
+       unconvergeable digest mismatch
+     - zero-apply commands that are abandoned now record durable no-op/tombstone
+       log entries on the acting set before clearing pending state, preserving
+       the contiguous hash-chain prefix for later commands; this covers both
+       shared request-op publishers and cluster-level object publishers such as
+       generation reservation, generation release, stream append, and direct PUT
+       commit
+     - tombstone recording is idempotent across partial abandon attempts: if one
+       replica records the abandoned log row and another fails, a later pending
+       retry finishes recording matching tombstones instead of treating the
+       abandoned row as a command-log conflict
+     - pending command replay now distinguishes `Applied` from `Abandoned`;
+       matching idempotent retries do not report success for a command that was
+       deliberately skipped, and bucket/object entry points either rebuild a
+       fresh command or fail closed rather than synthesizing a result from the
+       abandoned command payload
+     - abandoned PUT-object stream creation releases its pre-reserved generation
+       when pending drain later completes the tombstone, without recursively
+       entering the public bucket-locking release path
+     - required reservation cleanup triggered by abandoned commands is no longer
+       best-effort: if the compensating release command cannot be durably
+       applied it remains pending and the drain returns an error for a later
+       retry, instead of tombstoning or dropping the release
+     - sparse out-of-allocation-order command entries remain valid: the
+       contiguous hash-chain prefix advances when missing earlier entries arrive
+     - the state digest currently covers committed command-owned metadata tables:
+       `buckets`, `bucket_subresources`, `objects`, `object_parts`,
+       `object_segments`, and committed rows in `multipart_part_segments`
+     - the `buckets` digest uses an explicit committed-metadata column allowlist;
+       transient write-drain counters such as `write_reservations_blocked` and
+       `active_write_reservations` are excluded, as is the local completed-MPU
+       order allocator column `completed_multipart_upload_sequence`
+     - transient bridge/staging/reclaim/allocator tables are intentionally
+       outside this digest until those paths are fully command-owned; examples
+       include payload shard ack rows, stream session/control rows, raw stream
+       segment staging rows, multipart upload/control rows, multipart part
+       staging rows, reclaim rows, and local allocator counters
+     - the online full-state digest gate is bounded to early/small local command
+       streams to avoid quadratic command execution on large traces; after that
+       bound, replicas still enforce durable command-log duplicate/conflict and
+       hash-prefix checks, and scalable incremental/audit digest verification is
+       follow-up work before large production PGs
+     - tests cover atomic apply-plus-record rollback, durable duplicate retry
+       after reopen, post-reopen allocation past persisted log entries,
+       zero-apply tombstone convergence, partial tombstone retry, abandoned
+       create-bucket retry, abandoned generation reservation retry, abandoned
+       stream-create reservation cleanup, failed abandoned-cleanup retry,
+       checksum conflict rejection, out-of-order sparse log convergence, and
+       committed metadata/manifest digest mismatch rejection
 7. Phase 6.7: peering placeholders and closeout.
    - add explicit peering/backfill/inconsistent placeholders needed by later
      repair work, but keep failure handling disabled initially

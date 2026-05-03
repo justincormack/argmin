@@ -416,6 +416,29 @@ CREATE TABLE IF NOT EXISTS pg_counters (
     next_bucket_execution_generation INTEGER NOT NULL DEFAULT 0 CHECK (next_bucket_execution_generation >= 0)
 )";
 
+/// Per-PG metadata command log entries accepted by this replica.
+const CREATE_METADATA_COMMAND_LOG_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS metadata_command_log (
+    cluster_epoch    INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    pg_id            INTEGER NOT NULL CHECK (pg_id >= 0),
+    log_index        INTEGER NOT NULL CHECK (log_index > 0),
+    command_checksum INTEGER NOT NULL,
+    abandoned        INTEGER NOT NULL DEFAULT 0 CHECK (abandoned IN (0, 1)),
+    previous_log_hash INTEGER,
+    log_hash         INTEGER,
+    PRIMARY KEY (cluster_epoch, pg_id, log_index)
+)";
+
+/// Per-PG durable metadata command replay state for this replica.
+const CREATE_METADATA_COMMAND_REPLICA_STATE_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS metadata_command_replica_state (
+    singleton         INTEGER PRIMARY KEY CHECK (singleton = 0),
+    cluster_epoch     INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    applied_log_index INTEGER NOT NULL DEFAULT 0 CHECK (applied_log_index >= 0),
+    applied_log_hash  INTEGER NOT NULL DEFAULT 0,
+    state_digest      INTEGER NOT NULL DEFAULT 0
+)";
+
 /// Bucket-scoped opaque subresource storage.
 const CREATE_BUCKET_SUBRESOURCES_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS bucket_subresources (
@@ -473,6 +496,8 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_BUCKETS_TABLE, [])?;
     conn.execute(CREATE_BUCKETS_OWNER_LIST_INDEX, [])?;
     conn.execute(CREATE_PG_COUNTERS_TABLE, [])?;
+    conn.execute(CREATE_METADATA_COMMAND_LOG_TABLE, [])?;
+    conn.execute(CREATE_METADATA_COMMAND_REPLICA_STATE_TABLE, [])?;
     conn.execute(
         "INSERT INTO pg_counters (singleton, next_bucket_execution_generation) \
          VALUES (0, 0) \

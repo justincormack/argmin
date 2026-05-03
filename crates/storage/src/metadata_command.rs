@@ -52,6 +52,20 @@ impl MetadataCommandLogIndex {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetadataCommandAcceptance {
+    Apply,
+    AlreadyApplied,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetadataCommandReplicaState {
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) applied_log_index: u64,
+    pub(crate) applied_log_hash: u64,
+    pub(crate) state_digest: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct MetadataCommandId {
     cluster_epoch: ClusterEpoch,
@@ -706,6 +720,23 @@ impl MetadataCommandEnvelope {
         checksum::crc64::checksum(&canonical_command_bytes(self.id, &self.payload))
             == self.checksum_crc64
     }
+}
+
+pub(crate) fn metadata_command_log_hash(
+    cluster_epoch: ClusterEpoch,
+    pg_id: PgId,
+    log_index: MetadataCommandLogIndex,
+    previous_log_hash: u64,
+    command_checksum: u64,
+) -> u64 {
+    let mut out = Vec::new();
+    put_bytes(&mut out, b"ARGMIN-METADATA-COMMAND-LOG-V1");
+    put_u64(&mut out, cluster_epoch.get());
+    put_u32(&mut out, pg_id.get());
+    put_u64(&mut out, log_index.get());
+    put_u64(&mut out, previous_log_hash);
+    put_u64(&mut out, command_checksum);
+    checksum::crc64::checksum(&out)
 }
 
 fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPayload) -> Vec<u8> {

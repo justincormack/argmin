@@ -980,6 +980,7 @@ impl SharedStorageNode {
                 context: "force became_noncurrent_at in test helper",
                 source,
             })?;
+        pg.refresh_metadata_command_state_digest()?;
         Ok(())
     }
 

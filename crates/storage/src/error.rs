@@ -132,6 +132,31 @@ pub enum StoreError {
     },
 
     #[error(
+        "metadata command log hash mismatch for local node {node_id} PG {pg_id} epoch {cluster_epoch} log index {log_index}: expected previous hash {expected_previous_log_hash:#018X} and log hash {expected_log_hash:#018X}, found previous hash {actual_previous_log_hash:#018X} and log hash {actual_log_hash:#018X}"
+    )]
+    MetadataCommandLogHashMismatch {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+        expected_previous_log_hash: u64,
+        actual_previous_log_hash: u64,
+        expected_log_hash: u64,
+        actual_log_hash: u64,
+    },
+
+    #[error(
+        "metadata state digest mismatch for local node {node_id} PG {pg_id} epoch {cluster_epoch}: expected {expected_digest:#018X}, got {actual_digest:#018X}"
+    )]
+    MetadataStateDigestMismatch {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        expected_digest: u64,
+        actual_digest: u64,
+    },
+
+    #[error(
         "shard operation for local node {node_id} PG {pg_id} has epoch {operation_epoch}, current cluster epoch is {current_epoch}"
     )]
     StaleShardOperation {

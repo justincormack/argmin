@@ -152,6 +152,7 @@ impl SharedStorageNode {
         let pg_id = self.pg_topology.bucket_pg_for(bucket);
         let bucket_pg = self.get_pg(pg_id)?;
         PgMetadataStore::mark_bucket_deleting(&*bucket_pg, bucket)?;
+        bucket_pg.refresh_metadata_command_state_digest()?;
         drop(bucket_pg);
         self.notify_bucket_coordination_change(bucket);
         Ok(())

@@ -83,6 +83,12 @@ fn conflicting_pending_object_metadata_command(context: &'static str) -> ObjectP
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PendingMetadataCommandOutcome {
+    Applied,
+    Abandoned,
+}
+
 fn object_payload_reclaim_generation(
     stale_payload: &Option<ObjectPayloadReclaimCommand>,
 ) -> Option<GenerationId> {
@@ -852,10 +858,12 @@ impl StorageCluster {
                         if reservation.matches_request(bucket, key, reservation_id) =>
                     {
                         let generation_id = reservation.generation_id;
-                        self.apply_pending_object_metadata_command_for_bucket(
+                        match self.finish_pending_object_metadata_command_for_bucket(
                             pg_id, bucket, &command,
-                        )?;
-                        return Ok(generation_id);
+                        )? {
+                            PendingMetadataCommandOutcome::Applied => return Ok(generation_id),
+                            PendingMetadataCommandOutcome::Abandoned => continue,
+                        }
                     }
                     MetadataCommandPayload::ReserveObjectGeneration(reservation) => {
                         Some((reservation.key.clone(), reservation.reservation_id.clone()))
@@ -863,14 +871,17 @@ impl StorageCluster {
                     _ => None,
                 };
 
-                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                let outcome = self
+                    .finish_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
                 if let Some((abandoned_key, abandoned_reservation_id)) = abandoned_reservation {
-                    self.release_abandoned_object_generation_reservation(
-                        pg_id,
-                        bucket,
-                        &abandoned_key,
-                        &abandoned_reservation_id,
-                    )?;
+                    if outcome == PendingMetadataCommandOutcome::Applied {
+                        self.release_abandoned_object_generation_reservation(
+                            pg_id,
+                            bucket,
+                            &abandoned_key,
+                            &abandoned_reservation_id,
+                        )?;
+                    }
                 }
                 continue;
             }
@@ -915,6 +926,10 @@ impl StorageCluster {
                 }
                 Err(error) => {
                     if error.applied_nodes == 0 {
+                        self.record_abandoned_metadata_command_to_acting_set(&command)
+                            .map_err(|error| {
+                                bucket_snapshot_error_to_object_pg_action_error(error.source)
+                            })?;
                         self.local_map
                             .runtime_state()
                             .remove_pending_metadata_command_for_bucket(pg_id, bucket);
@@ -933,12 +948,134 @@ impl StorageCluster {
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), ObjectPgActionError> {
+        match self.finish_pending_object_metadata_command_for_bucket(pg_id, bucket, command)? {
+            PendingMetadataCommandOutcome::Applied => Ok(()),
+            PendingMetadataCommandOutcome::Abandoned => {
+                Err(conflicting_pending_object_metadata_command(
+                    "abandoned pending object metadata command",
+                ))
+            }
+        }
+    }
+
+    fn finish_pending_object_metadata_command_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        if self
+            .metadata_command_has_abandoned_log_on_acting_set(command)
+            .map_err(|error| bucket_snapshot_error_to_object_pg_action_error(error.source))?
+        {
+            self.record_abandoned_metadata_command_to_acting_set(command)
+                .map_err(|error| bucket_snapshot_error_to_object_pg_action_error(error.source))?;
+            self.local_map
+                .runtime_state()
+                .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+            self.after_object_metadata_command_abandoned(command)?;
+            return Ok(PendingMetadataCommandOutcome::Abandoned);
+        }
         match self.apply_metadata_command_to_acting_set(command) {
             Ok(()) => {
                 self.local_map
                     .runtime_state()
                     .remove_pending_metadata_command_for_bucket(pg_id, bucket);
                 self.after_object_metadata_command_applied(command);
+                Ok(PendingMetadataCommandOutcome::Applied)
+            }
+            Err(error) => Err(bucket_snapshot_error_to_object_pg_action_error(
+                error.source,
+            )),
+        }
+    }
+
+    fn after_object_metadata_command_abandoned(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), ObjectPgActionError> {
+        match command.payload() {
+            MetadataCommandPayload::CommitDirectPutObject(commit) => {
+                let release_result = self.release_object_generation_reservation_command_required(
+                    command.id().pg_id(),
+                    &commit.object.bucket,
+                    &commit.object.key,
+                    &commit.generation_reservation_id,
+                );
+                for segment in &commit.segments {
+                    self.delete_payload_shard_set_best_effort(
+                        segment.data_pg_id,
+                        EcShape {
+                            k: segment.ec_k,
+                            m: segment.ec_m,
+                        },
+                        &segment.segment_okh,
+                        segment.segment_vid,
+                    );
+                }
+                release_result?;
+            }
+            MetadataCommandPayload::AppendStreamSegment(append) => {
+                self.delete_payload_shard_set_best_effort(
+                    append.segment.data_pg_id,
+                    EcShape {
+                        k: append.segment.ec_k,
+                        m: append.segment.ec_m,
+                    },
+                    &append.segment.segment_okh,
+                    append.segment.segment_vid,
+                );
+            }
+            MetadataCommandPayload::CreateStreamUpload(create)
+                if create.request.target == StreamUploadTarget::PutObject =>
+            {
+                self.release_object_generation_reservation_command_required(
+                    command.id().pg_id(),
+                    &create.request.bucket,
+                    &create.request.key,
+                    &create.request.session_id,
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn release_object_generation_reservation_command_required(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> Result<(), ObjectPgActionError> {
+        let runtime_state = self.local_map.runtime_state();
+        let command = MetadataCommandEnvelope::new(
+            self.next_object_metadata_command_id(pg_id),
+            MetadataCommandPayload::ReleaseObjectGeneration(ReleaseObjectGenerationCommand::new(
+                bucket.clone(),
+                key.clone(),
+                reservation_id.clone(),
+            )),
+        );
+        if runtime_state
+            .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
+            .is_err()
+        {
+            return Err(conflicting_pending_object_metadata_command(
+                "conflicting pending command for abandoned object generation reservation release",
+            ));
+        }
+        if self
+            .metadata_command_has_abandoned_log_on_acting_set(&command)
+            .map_err(|error| bucket_snapshot_error_to_object_pg_action_error(error.source))?
+        {
+            return Err(conflicting_pending_object_metadata_command(
+                "abandoned pending command for required object generation reservation release",
+            ));
+        }
+        match self.apply_metadata_command_to_acting_set(&command) {
+            Ok(()) => {
+                runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
                 Ok(())
             }
             Err(error) => Err(bucket_snapshot_error_to_object_pg_action_error(
@@ -957,7 +1094,7 @@ impl StorageCluster {
             .runtime_state()
             .pending_metadata_command_for_bucket(pg_id, bucket)
         {
-            self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            self.finish_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
         }
         Ok(())
     }
@@ -1044,6 +1181,10 @@ impl StorageCluster {
             }
             Err(error) => {
                 if error.applied_nodes == 0 {
+                    self.record_abandoned_metadata_command_to_acting_set(command)
+                        .map_err(|error| {
+                            bucket_snapshot_error_to_object_pg_action_error(error.source)
+                        })?;
                     self.local_map
                         .runtime_state()
                         .remove_pending_metadata_command_for_bucket(pg_id, bucket);
@@ -1198,6 +1339,19 @@ impl StorageCluster {
         let (command, clear_pending_on_zero_apply) = if let Some(command) =
             runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
         {
+            if self
+                .metadata_command_has_abandoned_log_on_acting_set(&command)
+                .map_err(|error| bucket_snapshot_error_to_object_pg_action_error(error.source))?
+            {
+                self.record_abandoned_metadata_command_to_acting_set(&command)
+                    .map_err(|error| {
+                        bucket_snapshot_error_to_object_pg_action_error(error.source)
+                    })?;
+                runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                return Err(conflicting_pending_object_metadata_command(
+                    "abandoned pending command for object generation reservation release",
+                ));
+            }
             match command.payload() {
                 MetadataCommandPayload::ReleaseObjectGeneration(reservation)
                     if reservation.matches_request(bucket, key, reservation_id) =>
@@ -1243,6 +1397,10 @@ impl StorageCluster {
             }
             Err(error) => {
                 if clear_pending_on_zero_apply && error.applied_nodes == 0 {
+                    self.record_abandoned_metadata_command_to_acting_set(&command)
+                        .map_err(|error| {
+                            bucket_snapshot_error_to_object_pg_action_error(error.source)
+                        })?;
                     self.local_map
                         .runtime_state()
                         .remove_pending_metadata_command_for_bucket(pg_id, bucket);
@@ -1284,6 +1442,33 @@ impl StorageCluster {
         let (command, new_pending_command) = if let Some(command) =
             runtime_state.pending_metadata_command_for_bucket(pg_id, &req.bucket)
         {
+            if self
+                .metadata_command_has_abandoned_log_on_acting_set(&command)
+                .map_err(|error| bucket_snapshot_error_to_object_pg_action_error(error.source))?
+            {
+                self.record_abandoned_metadata_command_to_acting_set(&command)
+                    .map_err(|error| {
+                        bucket_snapshot_error_to_object_pg_action_error(error.source)
+                    })?;
+                runtime_state.remove_pending_metadata_command_for_bucket(pg_id, &req.bucket);
+                drop(_bucket_guard);
+                self.release_object_generation_reservation_after_pending_drain_best_effort(
+                    pg_id,
+                    &req.bucket,
+                    &req.key,
+                    &req.generation_reservation_id,
+                );
+                self.delete_direct_put_segment_payload_shards(
+                    req.data_pg_id,
+                    req.ec,
+                    &req.segment_okh,
+                    req.segment_vid,
+                    written_shards,
+                );
+                return Err(conflicting_pending_object_metadata_command(
+                    "abandoned pending command for direct put commit",
+                ));
+            }
             match command.payload() {
                 MetadataCommandPayload::CommitDirectPutObject(commit)
                     if commit.matches_request(
@@ -1394,6 +1579,10 @@ impl StorageCluster {
 
         if let Err(error) = self.apply_metadata_command_to_acting_set(&command) {
             if new_pending_command && error.applied_nodes == 0 {
+                self.record_abandoned_metadata_command_to_acting_set(&command)
+                    .map_err(|error| {
+                        bucket_snapshot_error_to_object_pg_action_error(error.source)
+                    })?;
                 self.local_map
                     .runtime_state()
                     .remove_pending_metadata_command_for_bucket(pg_id, &req.bucket);
