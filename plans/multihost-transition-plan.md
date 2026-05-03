@@ -1544,6 +1544,13 @@ Work items:
    - enter inconsistent or peering state when no safe authoritative source exists
 5. decide whether record-level checksums are needed for high-value rows, or
    whether command-log plus state-digest verification is sufficient initially
+6. define metadata command-log retention and compaction policy:
+   - compact only after a durable checkpoint, state digest, or equivalent
+     replica comparison point has been established
+   - preserve enough log history for pending command retry, replica restart,
+     peering, and targeted repair
+   - define how compacted replicas prove equivalence and still reject stale,
+     divergent, or conflicting commands
 
 Exit criteria:
 
@@ -1554,6 +1561,8 @@ Exit criteria:
    digest mismatch repair
 5. the system never resolves divergent metadata by silently choosing an arbitrary
    replica
+6. command-log compaction cannot remove entries still needed for pending retry,
+   peering, restart recovery, or repair validation
 
 ## Phase 6b: Temporary Failure Write Policy
 
@@ -1665,7 +1674,9 @@ Work items:
 5. define read and write availability rules for peering and degraded PGs
 6. implement shard repair for missing or corrupt shards
 7. implement PG backfill and migration for changed acting sets
-8. add cluster-map history retention and pruning
+8. implement metadata command-log retention and compaction using the Phase 6a
+   policy
+9. add cluster-map history retention and pruning
 
 Exit criteria:
 
@@ -1673,7 +1684,9 @@ Exit criteria:
 2. PGs enter peering before serving unsafe requests
 3. repair restores missing shards from available EC data
 4. migration can move a PG acting set without per-object metadata rewrites
-5. failure-injection tests cover primary loss, replica loss, restart, and repair
+5. command-log retention bounds long-running disk growth without breaking
+   restart, peering, or repair correctness
+6. failure-injection tests cover primary loss, replica loss, restart, and repair
 
 ## Phase 10: Replicated Control Plane
 
