@@ -3473,6 +3473,7 @@ impl HttpFrontend {
             parse_sse_customer_form_fields(req.transport_security, form_fields)?;
         let managed_encryption =
             parse_managed_encryption_form_fields(form_fields, sse_customer_request.is_some())?;
+        let cond = write_condition_from_headers(req)?;
 
         let requester = Self::requester_from_auth(effective_auth);
         let acl = parse_put_object_acl(field("acl"));
@@ -3496,6 +3497,8 @@ impl HttpFrontend {
                     None,
                     acl.policy_condition_value(),
                 )
+                .with_if_match(cond.if_match_policy_value())
+                .with_if_none_match(cond.if_none_match_policy_value())
                 .with_managed_encryption(managed_encryption)
                 .with_sse_customer_algorithm(
                     sse_customer_request.as_ref().map(|req| req.algorithm()),
@@ -9226,6 +9229,113 @@ mod tests {
             0,
             "policy-denied POST should not create a stream session"
         );
+    }
+
+    #[test]
+    fn prepare_streaming_post_object_does_not_set_object_creation_operation_policy_condition() {
+        let tmp = test_util::tempdir();
+        let mut fe = setup_frontend(tmp.path());
+        fe.credentials.add(
+            TEST_SIGV4_ACCESS_KEY.to_string(),
+            SecretKey::new(TEST_SIGV4_SECRET.to_string()),
+        );
+        create_sigv4_test_bucket(&fe.coordinator, "mybucket", false);
+        fe.coordinator
+            .put_bucket_policy(&crate::coordinator::PutBucketPolicyRequest {
+                bucket: crate::coordinator::BucketRequest::new(
+                    test_bucket_name("mybucket"),
+                    crate::coordinator::test_helpers::requester(TEST_SIGV4_ACCESS_KEY),
+                    None,
+                ),
+                config: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::mybucket/*","Condition":{"Bool":{"s3:ObjectCreationOperation":"true"},"Null":{"s3:if-none-match":"true"}}}]}"#,
+                confirm_remove_self_bucket_access: false,
+            })
+            .unwrap();
+
+        let req = new_req(
+            http::Method::POST,
+            "/mybucket",
+            "",
+            vec![(
+                "host".to_string(),
+                "examplebucket.s3.amazonaws.com".to_string(),
+            )],
+            vec![],
+        );
+        let fields = signed_post_policy_fields("mybucket", "mykey", &[], &[]);
+
+        let ctx = fe
+            .prepare_streaming_post_object(&req, "mybucket", &fields, Some("upload.txt"))
+            .unwrap();
+        fe.abort_streaming_post_object(&ctx);
+
+        assert_eq!(
+            fe.coordinator.scavenge_stale_sessions(0),
+            0,
+            "aborted POST should not leave a stream session"
+        );
+    }
+
+    #[test]
+    fn prepare_streaming_post_object_passes_if_none_match_to_bucket_policy() {
+        let tmp = test_util::tempdir();
+        let mut fe = setup_frontend(tmp.path());
+        fe.credentials.add(
+            TEST_SIGV4_ACCESS_KEY.to_string(),
+            SecretKey::new(TEST_SIGV4_SECRET.to_string()),
+        );
+        create_sigv4_test_bucket(&fe.coordinator, "mybucket", false);
+        fe.coordinator
+            .put_bucket_policy(&crate::coordinator::PutBucketPolicyRequest {
+                bucket: crate::coordinator::BucketRequest::new(
+                    test_bucket_name("mybucket"),
+                    crate::coordinator::test_helpers::requester(TEST_SIGV4_ACCESS_KEY),
+                    None,
+                ),
+                config: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::mybucket/*","Condition":{"Null":{"s3:if-none-match":"true"}}}]}"#,
+                confirm_remove_self_bucket_access: false,
+            })
+            .unwrap();
+
+        let missing_header_req = new_req(
+            http::Method::POST,
+            "/mybucket",
+            "",
+            vec![(
+                "host".to_string(),
+                "examplebucket.s3.amazonaws.com".to_string(),
+            )],
+            vec![],
+        );
+        let fields = signed_post_policy_fields("mybucket", "mykey", &[], &[]);
+        match fe.prepare_streaming_post_object(
+            &missing_header_req,
+            "mybucket",
+            &fields,
+            Some("upload.txt"),
+        ) {
+            Err(ServerError::AccessDenied) => {}
+            Err(err) => panic!("expected AccessDenied, got {err:?}"),
+            Ok(_) => panic!("expected AccessDenied, got Ok"),
+        }
+
+        let header_req = new_req(
+            http::Method::POST,
+            "/mybucket",
+            "",
+            vec![
+                (
+                    "host".to_string(),
+                    "examplebucket.s3.amazonaws.com".to_string(),
+                ),
+                ("if-none-match".to_string(), "*".to_string()),
+            ],
+            vec![],
+        );
+        let ctx = fe
+            .prepare_streaming_post_object(&header_req, "mybucket", &fields, Some("upload.txt"))
+            .unwrap();
+        fe.abort_streaming_post_object(&ctx);
     }
 
     #[test]

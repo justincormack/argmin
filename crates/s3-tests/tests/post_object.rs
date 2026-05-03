@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aws_sdk_s3::types::ServerSideEncryption;
+use aws_sdk_s3::{primitives::ByteStream, types::ServerSideEncryption};
 use ring::hmac;
 use s3_tests::{
     assert_s3_err_code, err_status, post_object_raw_to_test_endpoint_with_headers,
@@ -344,6 +344,31 @@ fn assert_error_code(body: &str, code: &str) {
         body.contains(&expected),
         "expected {expected} in body: {body}"
     );
+}
+
+async fn wait_for_put_object_access_denied(client: &aws_sdk_s3::Client, bucket: &str, key: &str) {
+    for attempt in 0..20 {
+        let result = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"policy-convergence"))
+            .send()
+            .await;
+        if result
+            .as_ref()
+            .err()
+            .and_then(|err| err.raw_response().map(|r| r.status().as_u16()))
+            == Some(403)
+        {
+            return;
+        }
+        if attempt + 1 < 20 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    panic!("PutObject policy denial did not converge");
 }
 
 // ── Basic upload ────────────────────────────────────────────────────────
@@ -812,6 +837,448 @@ fn test_post_object_sse_s3_bucket_policy_requires_explicit_header() {
             .delete_object()
             .bucket(&bucket)
             .key(key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_post_object_bucket_policy_object_creation_operation_condition_is_absent() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let post_key = "post-object-conditional-write-object-creation";
+        let put_allowed_key = "post-object-conditional-write-put-allowed";
+        let convergence_key = "post-object-conditional-write-convergence";
+        let file_data = b"POST Object does not set ObjectCreationOperation";
+
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:PutObject",
+                "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                "Condition": {
+                    "Bool": {
+                        "s3:ObjectCreationOperation": "true"
+                    },
+                    "Null": {
+                        "s3:if-none-match": "true"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+        wait_for_put_object_access_denied(client, &bucket, convergence_key).await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(put_allowed_key)
+            .if_none_match("*")
+            .body(ByteStream::from_static(b"PUT with If-None-Match"))
+            .send()
+            .await
+            .unwrap();
+
+        let fields = sigv4_fields(&bucket, post_key, &[]);
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let (status, body) = post_object(&bucket, &field_refs, file_data, "test.txt");
+        assert_eq!(status, 204, "expected 204, got {status} body={body}");
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(post_key)
+            .send()
+            .await
+            .unwrap();
+        let data = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], file_data);
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(post_key)
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(put_allowed_key)
+            .send()
+            .await
+            .unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(convergence_key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_post_object_bucket_policy_if_none_match_header_is_policy_only() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let missing_key = "post-object-if-none-match-missing";
+        let header_key = "post-object-if-none-match-header";
+        let convergence_key = "post-object-if-none-match-convergence";
+        let file_data = b"POST Object with If-None-Match";
+
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:PutObject",
+                "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                "Condition": {
+                    "Null": {
+                        "s3:if-none-match": "true"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+        wait_for_put_object_access_denied(client, &bucket, convergence_key).await;
+
+        let fields = sigv4_fields(&bucket, missing_key, &[]);
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let (status, body) = post_object(&bucket, &field_refs, file_data, "test.txt");
+        assert_eq!(status, 403, "expected 403, got {status} body={body}");
+        assert_error_code(&body, "AccessDenied");
+
+        let fields = sigv4_fields(&bucket, header_key, &[]);
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let (status, body) = post_object_with_headers(
+            &bucket,
+            &field_refs,
+            file_data,
+            "test.txt",
+            &[("If-None-Match", "*")],
+        );
+        assert_eq!(status, 204, "expected 204, got {status} body={body}");
+
+        let repeat = post_object_with_headers(
+            &bucket,
+            &field_refs,
+            b"overwrite",
+            "test.txt",
+            &[("If-None-Match", "*")],
+        );
+        assert_eq!(
+            repeat.0, 204,
+            "expected 204, got {} body={}",
+            repeat.0, repeat.1
+        );
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(header_key)
+            .send()
+            .await
+            .unwrap();
+        let data = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"overwrite");
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(header_key)
+            .send()
+            .await
+            .unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(convergence_key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_post_object_bucket_policy_if_none_match_string_equals() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let missing_key = "post-object-if-none-match-equals-missing";
+        let header_key = "post-object-if-none-match-equals-header";
+        let convergence_key = "post-object-if-none-match-equals-convergence";
+        let file_data = b"POST Object with exact If-None-Match policy";
+
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": "s3:PutObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                    "Condition": {
+                        "Null": {
+                            "s3:if-none-match": "true"
+                        }
+                    }
+                },
+                {
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": "s3:PutObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                    "Condition": {
+                        "StringNotEquals": {
+                            "s3:if-none-match": "*"
+                        }
+                    }
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+        wait_for_put_object_access_denied(client, &bucket, convergence_key).await;
+
+        let fields = sigv4_fields(&bucket, missing_key, &[]);
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let (status, body) = post_object(&bucket, &field_refs, file_data, "test.txt");
+        assert_eq!(status, 403, "expected 403, got {status} body={body}");
+        assert_error_code(&body, "AccessDenied");
+
+        let fields = sigv4_fields(&bucket, header_key, &[]);
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let (status, body) = post_object_with_headers(
+            &bucket,
+            &field_refs,
+            file_data,
+            "test.txt",
+            &[("If-None-Match", "*")],
+        );
+        assert_eq!(status, 204, "expected 204, got {status} body={body}");
+
+        let repeat = post_object_with_headers(
+            &bucket,
+            &field_refs,
+            b"overwrite",
+            "test.txt",
+            &[("If-None-Match", "*")],
+        );
+        assert_eq!(
+            repeat.0, 204,
+            "expected 204, got {} body={}",
+            repeat.0, repeat.1
+        );
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(header_key)
+            .send()
+            .await
+            .unwrap();
+        let data = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"overwrite");
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(header_key)
+            .send()
+            .await
+            .unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(convergence_key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_post_object_bucket_policy_if_match_string_equals_is_policy_only() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let missing_key = "post-object-if-match-equals-missing";
+        let wrong_key = "post-object-if-match-equals-wrong";
+        let header_key = "post-object-if-match-equals-header";
+        let convergence_key = "post-object-if-match-equals-convergence";
+        let expected_if_match = "\"post-policy-etag\"";
+        let file_data = b"POST Object with exact If-Match policy";
+
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": "s3:PutObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                    "Condition": {
+                        "Null": {
+                            "s3:if-match": "true"
+                        }
+                    }
+                },
+                {
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": "s3:PutObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                    "Condition": {
+                        "StringNotEquals": {
+                            "s3:if-match": expected_if_match
+                        }
+                    }
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let convergence_fields = sigv4_fields(&bucket, convergence_key, &[]);
+        let convergence_field_refs: Vec<(&str, &str)> = convergence_fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        for attempt in 0..20 {
+            let (status, _) = post_object_with_headers(
+                &bucket,
+                &convergence_field_refs,
+                b"policy-convergence",
+                "test.txt",
+                &[("If-Match", "\"wrong\"")],
+            );
+            if status == 403 {
+                break;
+            }
+            if attempt + 1 == 20 {
+                panic!("PutObject policy denial did not converge");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        let fields = sigv4_fields(&bucket, missing_key, &[]);
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let (status, body) = post_object(&bucket, &field_refs, file_data, "test.txt");
+        assert_eq!(status, 403, "expected 403, got {status} body={body}");
+        assert_error_code(&body, "AccessDenied");
+
+        let fields = sigv4_fields(&bucket, wrong_key, &[]);
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let (status, body) = post_object_with_headers(
+            &bucket,
+            &field_refs,
+            file_data,
+            "test.txt",
+            &[("If-Match", "\"wrong\"")],
+        );
+        assert_eq!(status, 403, "expected 403, got {status} body={body}");
+        assert_error_code(&body, "AccessDenied");
+
+        let fields = sigv4_fields(&bucket, header_key, &[]);
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let (status, body) = post_object_with_headers(
+            &bucket,
+            &field_refs,
+            file_data,
+            "test.txt",
+            &[("If-Match", expected_if_match)],
+        );
+        assert_eq!(status, 204, "expected 204, got {status} body={body}");
+
+        let repeat = post_object_with_headers(
+            &bucket,
+            &field_refs,
+            b"overwrite",
+            "test.txt",
+            &[("If-Match", expected_if_match)],
+        );
+        assert_eq!(
+            repeat.0, 204,
+            "expected 204, got {} body={}",
+            repeat.0, repeat.1
+        );
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(header_key)
+            .send()
+            .await
+            .unwrap();
+        let data = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"overwrite");
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(header_key)
             .send()
             .await
             .unwrap();
