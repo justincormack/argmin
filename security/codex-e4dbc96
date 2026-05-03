@@ -1,0 +1,368 @@
+Unbounded metadata command cache enables memory DoS
+Link: https://chatgpt.com/codex/cloud/security/findings/cf13c24300f88191bffa1907eef1693b?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium (attack path: medium)
+Status: resolved
+
+# Resolution
+This finding was valid for commit `e4dbc96`.
+
+It was resolved in commit `410d5ff` (`storage: harden metadata command log
+recovery`). That change removed the process-lifetime
+`LocalClusterRuntimeState.applied_metadata_commands` cache and the
+`mark_metadata_command_applied` insertion path that caused heap growth once per
+metadata command per acting node.
+
+Replica idempotence and conflict detection now read from each PG's durable
+SQLite `metadata_command_log` and `metadata_command_replica_state` instead of
+an unbounded in-memory `HashMap`. Metadata command application and durable log
+recording are performed in one SQLite transaction through
+`PgStore::apply_metadata_command_and_record`, so successful command application
+does not retain per-command process heap state for later duplicate detection.
+
+Follow-up: the fix changes the risk from unbounded process heap growth to
+normal durable command-log growth on disk. Metadata command-log retention and
+compaction are tracked in `plans/multihost-transition-plan.md`: Phase 6a now
+defines the compaction policy and Phase 9 implements retention/compaction once
+peering and repair semantics are in place. That plan update was recorded in
+commit `9389766` (`Track metadata command log compaction`).
+
+# Metadata
+Repo: justincormack/argmin
+Commit: e4dbc96
+Author: justin@specialbusservice.com
+Created: 02/05/2026, 16:25:09
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: the commit adds applied_metadata_commands as an unbounded runtime cache and inserts into it after every successful command application. Existing HTTP-accessible metadata mutation paths can generate arbitrarily many metadata commands, so the new cache creates attacker-amplified process memory growth.
+The new replica-acceptance hardening records every applied metadata command in LocalClusterRuntimeState.applied_metadata_commands, keyed by target node, PG, and monotonically increasing log index. Each successful metadata command application calls mark_metadata_command_applied(), which inserts a new entry, but there is no eviction, compaction, per-PG high-water mark, or durable replay window limiting this map. A client that can perform metadata-mutating S3 operations can repeatedly issue low-payload requests, such as PutObjectTagging on the same object, causing this HashMap to grow for the lifetime of the process even when persistent object metadata stays bounded. This creates an introduced remote denial-of-service vector via heap exhaustion. The cache should be bounded, replaced with compact per-replica log progress plus a limited retry window, or pruned after commands can no longer be retried.
+
+# Validation
+## Rubric
+- [x] Confirm the commit introduced/contains a runtime HashMap cache keyed by node, PG, and monotonically increasing metadata command log index.
+- [x] Confirm successful metadata command application inserts into that cache and inspected changed code does not provide eviction/compaction/high-water pruning.
+- [x] Confirm an HTTP-accessible S3 metadata mutation, specifically PutObjectTagging, reaches the path that creates fresh metadata commands.
+- [x] Dynamically show repeated tag updates on the same object create fresh cache entries linearly with request count and acting-node count.
+- [x] Attempt crash, valgrind/ASan, and debugger validation before relying on code understanding: crash reproduced under ulimit; valgrind unavailable; lldb traces captured.
+## Report
+Validated the finding. Key code evidence: LocalClusterRuntimeState contains applied_metadata_commands as HashMap<(NodeId, PgId, u64), u64> at crates/storage/src/cluster/local.rs:211-217. mark_metadata_command_applied inserts by target node, PG, and log index at local.rs:356-368 with no eviction in the inspected changed code. Every successful command application calls it at crates/storage/src/cluster/request_ops.rs:631-636. PutObjectTagging is HTTP exposed at crates/server-http/src/http/mod.rs:2283-2300, flows through coordinator put_object_tags at crates/server-core/src/coordinator/object_metadata.rs:269-327, then StorageCluster::put_object_tags_if at crates/storage/src/cluster/request_ops.rs:2261-2276. The metadata update path allocates a fresh log index at request_ops.rs:2146-2151 and applies the new command at request_ops.rs:2247-2256. I added targeted validation tests. The real put-object-tags path on the same object showed exact linear cache growth: with ARGMIN_VALIDATION_TAG_UPDATES=100, output was `VALIDATION_CACHE_GROWTH baseline=6 after=306 growth=300 expected_growth=300 pg_id=1`, i.e. 100 requests * 3 acting nodes. A larger run with 5000 updates produced `growth=15000`. This confirms attacker-controllable repeated low-payload metadata mutations grow the process-local cache for each command/node even after pending commands clear. Direct heap-exhaustion was reproduced against the actual vulnerable cache by running the synthetic cache test under a 32MB virtual-memory limit: `memory allocation of 13107216 bytes failed`, exit code 6. Valgrind was attempted but unavailable (`bash: valgrind: command not found`). Debugger validation used lldb: breakpoint at request_ops.rs:2151 showed the chain `put_object_tags_if -> put_object_metadata_if -> new_put_object_metadata_command -> next_metadata_command_log_index`; breakpoint at local.rs:364 showed `mark_metadata_command_applied -> apply_metadata_command_to_acting_set_from_origin` at request_ops.rs:636.
+
+# Evidence
+crates/server-http/src/http/mod.rs (L2283 to 2300)
+  Note: PutObjectTagging is an HTTP-exposed operation that reaches the object metadata update path, providing a low-payload way to generate repeated metadata commands.
+```
+            S3Operation::PutObjectTagging { bucket, key } => {
+                validate_request_checksum_headers(req, true, false)?;
+                let vid = parse_version_id(req)?;
+                let tags = xml::TagSet::parse_tagging_xml(&req.body, 10)?;
+                let tags_xml = tags.to_xml();
+                let requester = Self::requester_from_auth(auth);
+                self.coordinator
+                    .put_object_tags(&crate::coordinator::PutObjectTagsRequest {
+                        object: object_version_request(
+                            &bucket,
+                            &key,
+                            vid,
+                            requester,
+                            expected_bucket_owner,
+                        )?,
+                        tags: &tags_xml,
+                    })?;
+                Ok(S3Response::put_object_tagging())
+```
+
+crates/storage/src/cluster/local.rs (L211 to 217)
+  Note: The commit adds applied_metadata_commands to process runtime state; it is a HashMap with no visible bound or eviction policy.
+```
+pub(crate) struct LocalClusterRuntimeState {
+    object_payload_leases: Mutex<LocalObjectPayloadLeaseState>,
+    reclaim_queue: (Mutex<LocalReclaimQueueState>, Condvar),
+    metadata_command_indexes: Mutex<HashMap<PgId, u64>>,
+    metadata_command_apply_lock: Mutex<()>,
+    applied_metadata_commands: Mutex<HashMap<(NodeId, PgId, u64), u64>>,
+    pending_metadata_commands: Mutex<HashMap<(PgId, BucketName), MetadataCommandEnvelope>>,
+```
+
+crates/storage/src/cluster/local.rs (L326 to 369)
+  Note: Replica acceptance consults the applied-command map and mark_metadata_command_applied inserts a new entry keyed by node, PG, and log index; there is no pruning when log indexes advance.
+```
+    fn metadata_command_acceptance(
+        &self,
+        target_node_id: NodeId,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        let command_log_index = command.id().log_index().get();
+        let applied_checksum = self
+            .applied_metadata_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(target_node_id, pg_id, command_log_index))
+            .copied();
+
+        let Some(applied_checksum) = applied_checksum else {
+            return Ok(MetadataCommandAcceptance::Apply);
+        };
+
+        if command.checksum_crc64() == applied_checksum {
+            return Ok(MetadataCommandAcceptance::AlreadyApplied);
+        }
+        Err(StoreError::MetadataCommandLogConflict {
+            node_id: target_node_id.as_u32(),
+            pg_id: pg_id.get(),
+            cluster_epoch,
+            log_index: command_log_index,
+        })
+    }
+
+    pub(crate) fn mark_metadata_command_applied(
+        &self,
+        target_node_id: NodeId,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) {
+        self.applied_metadata_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                (target_node_id, pg_id, command.id().log_index().get()),
+                command.checksum_crc64(),
+            );
+    }
+```
+
+crates/storage/src/cluster/request_ops.rs (L2138 to 2257)
+  Note: Object metadata updates allocate a fresh metadata command log index and apply the command; repeated updates on the same object can therefore create unbounded cache entries.
+```
+    fn new_put_object_metadata_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        mutation: PutObjectMetadataMutation,
+    ) -> MetadataCommandEnvelope {
+        let command_id = MetadataCommandId::new(
+            self.operation_epoch(),
+            pg_id,
+            self.local_map
+                .runtime_state()
+                .next_metadata_command_log_index(pg_id),
+        );
+        MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id,
+                mutation,
+            })),
+        )
+    }
+
+    fn put_object_metadata_if<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        requested_version_id: Option<VersionId>,
+        action: impl FnOnce(&StoredObject) -> Result<(T, VersionId, PutObjectMetadataMutation), E>,
+    ) -> Result<Result<T, E>, ObjectPgActionError> {
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let runtime_state = self.local_map.runtime_state();
+        let mut action = Some(action);
+
+        loop {
+            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                if let MetadataCommandPayload::PutObjectMetadata(update) = command.payload() {
+                    if update.bucket == *bucket && update.key == *key {
+                        let object_pg = primary_node.get_pg(pg_id.get())?;
+                        let stored = match requested_version_id {
+                            Some(version_id) => {
+                                if version_id != update.version_id {
+                                    drop(object_pg);
+                                    self.apply_pending_object_metadata_command_for_bucket(
+                                        pg_id, bucket, &command,
+                                    )?;
+                                    continue;
+                                }
+                                PgMetadataStore::get_object_version(
+                                    &*object_pg,
+                                    bucket,
+                                    key,
+                                    version_id,
+                                )?
+                            }
+                            None => {
+                                let stored =
+                                    PgMetadataStore::get_object_meta(&*object_pg, bucket, key)?;
+                                if stored.version_id() != update.version_id {
+                                    drop(object_pg);
+                                    self.apply_pending_object_metadata_command_for_bucket(
+                                        pg_id, bucket, &command,
+                                    )?;
+                                    continue;
+                                }
+                                stored
+                            }
+                        };
+                        let (value, version_id, mutation) =
+                            match action.take().expect("object metadata action used once")(&stored)
+                            {
+                                Ok(command) => command,
+                                Err(error) => return Ok(Err(error)),
+                            };
+                        if !update.matches_request(bucket, key, version_id, &mutation) {
+                            return Err(super::conflicting_pending_object_metadata_command(
+                                "conflicting pending command for object metadata update",
+                            ));
+                        }
+                        drop(object_pg);
+                        self.apply_pending_object_metadata_command_for_bucket(
+                            pg_id, bucket, &command,
+                        )?;
+                        return Ok(Ok(value));
+                    }
+                }
+
+                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                continue;
+            }
+
+            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let stored = match requested_version_id {
+                Some(version_id) => {
+                    PgMetadataStore::get_object_version(&*object_pg, bucket, key, version_id)?
+                }
+                None => PgMetadataStore::get_object_meta(&*object_pg, bucket, key)?,
+            };
+            let (value, version_id, mutation) =
+                match action.take().expect("object metadata action used once")(&stored) {
+                    Ok(command) => command,
+                    Err(error) => return Ok(Err(error)),
+                };
+            let command =
+                self.new_put_object_metadata_command(pg_id, bucket, key, version_id, mutation);
+            drop(object_pg);
+            self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                bucket,
+                &command,
+                "conflicting pending command for object metadata mutation",
+            )?;
+            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            return Ok(Ok(value));
+```
+
+crates/storage/src/cluster/request_ops.rs (L579 to 636)
+  Note: Every non-duplicate metadata command applied to each acting node calls mark_metadata_command_applied, so the map grows once per command per node.
+```
+        for (applied_nodes, node) in nodes.into_iter().enumerate() {
+            let acceptance = self
+                .local_map
+                .validate_metadata_command_for_replica(
+                    origin_node_id,
+                    node.node_id(),
+                    pg_id,
+                    command,
+                )
+                .map_err(|source| MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                })?;
+            if acceptance == super::local::MetadataCommandAcceptance::AlreadyApplied {
+                continue;
+            }
+            maybe_run_before_metadata_command_apply_hook(
+                self.metadata_command_apply_test_hook_scope_id(),
+                node.node_id(),
+                command,
+            )
+            .map_err(|source| MetadataCommandApplyFailure {
+                applied_nodes,
+                source: source.into(),
+            })?;
+            if let MetadataCommandPayload::CommitMultipartObject(commit) = command.payload() {
+                let bucket_pg_id = node
+                    .storage_node()
+                    .pg_topology()
+                    .bucket_pg_for(&commit.object.bucket);
+                let bucket_pg = node.storage_node().get_pg(bucket_pg_id).map_err(|source| {
+                    MetadataCommandApplyFailure {
+                        applied_nodes,
+                        source: source.into(),
+                    }
+                })?;
+                bucket_pg
+                    .advance_completed_multipart_upload_sequence_for_bucket(
+                        &commit.object.bucket,
+                        commit.completion_order,
+                    )
+                    .map_err(|source| MetadataCommandApplyFailure {
+                        applied_nodes,
+                        source: source.into(),
+                    })?;
+            }
+            let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
+                MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                }
+            })?;
+            pg.apply_metadata_command(command)
+                .map_err(|source| MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                })?;
+            runtime_state.mark_metadata_command_applied(node.node_id(), pg_id, command);
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Keeping medium. The finding is validated and reachable in the main runtime: HTTP PutObjectTagging routes through authentication/authorization to storage metadata mutation, where each successful command inserts into an unbounded process-lifetime HashMap. This supports a credible authenticated remote memory DoS. It should not be raised to high/critical because the demonstrated impact is availability only, exploitation requires authorized metadata mutation or permissive policy, no data exposure or privilege escalation is shown, and default repository configuration listens on 127.0.0.1:9000 with concurrency/timeouts that reduce but do not eliminate abuse.
+## Likelihood
+high - For any deployment where an attacker has S3 tag/write permission or permissive bucket policy access, exploitation is low complexity and uses repeated small normal HTTP requests. Likelihood is moderated by the need for authorization and by the repository default binding to localhost rather than public exposure. | Remote network vector
+## Impact
+medium - The impact is availability loss or degradation of the single argmin-s3 process through heap growth. Validation evidence showed linear cache growth via the real PutObjectTagging path and allocation failure under a memory limit. There is no direct confidentiality, integrity, code execution, credential, or cross-tenant compromise shown.
+## Assumptions
+- The attacker can reach the argmin-s3 HTTP endpoint as deployed and can issue an S3 metadata-mutating operation such as PutObjectTagging on an existing object.
+- The attacker has valid S3 credentials or a bucket policy/public configuration that permits the relevant tagging/write action.
+- Process memory is finite and the in-memory LocalClusterRuntimeState lives for the lifetime of the service process; restart clears this specific cache.
+- Network access to the S3-compatible HTTP listener
+- Authorization to perform PutObjectTagging or equivalent object metadata mutation
+- Repeated successful metadata mutation requests
+## Path
+S3 client -> HTTP PUT ?tagging -> PutObjectTagging -> Coordinator authz -> put_object_metadata_if -> mark_metadata_command_applied -> unbounded HashMap -> memory DoS
+## Path evidence
+- `crates/storage/src/cluster/local.rs:211-217` - Main runtime state contains applied_metadata_commands as a HashMap keyed by NodeId, PgId, and log index, with no capacity bound in the type or initialization.
+- `crates/storage/src/cluster/local.rs:326-369` - Replica acceptance reads from applied_metadata_commands and mark_metadata_command_applied inserts a new entry by monotonically increasing command log index; no pruning is performed here.
+- `crates/storage/src/cluster/request_ops.rs:631-636` - Every successful metadata command application calls mark_metadata_command_applied for the acting node.
+- `crates/storage/src/cluster/request_ops.rs:2144-2153` - Object metadata mutations allocate a fresh metadata command id using next_metadata_command_log_index.
+- `crates/storage/src/cluster/request_ops.rs:2247-2256` - The new metadata command is set pending and then applied, driving the insertion path.
+- `crates/storage/src/cluster/request_ops.rs:2261-2276` - put_object_tags_if uses the generic object metadata mutation path with PutTags, so repeated tag updates generate repeated metadata commands.
+- `crates/server-http/src/http/router.rs:558-564` - HTTP PUT with the tagging query parameter is routed to S3Operation::PutObjectTagging.
+- `crates/server-http/src/http/mod.rs:826-870` - The normal HTTP request handler routes and authenticates non-OPTIONS S3 requests before dispatch.
+- `crates/server-http/src/http/mod.rs:2283-2300` - PutObjectTagging parses a small XML tag body and calls coordinator.put_object_tags, providing the remote entrypoint into the vulnerable mutation path.
+- `crates/server-core/src/coordinator/object_metadata.rs:269-327` - Coordinator.put_object_tags checks object-tag authorization and then invokes storage_node.put_object_tags_if.
+- `crates/argmin-s3/src/config.rs:31-46` - The product binary is configured by environment; default listener is 127.0.0.1:9000, with connection and inflight limits but no per-operation cache bound.
+- `crates/argmin-s3/src/main.rs:130-144` - Configured S3 credentials are loaded into an in-process CredentialStore as OwnerAccountAdmin, confirming the operation is part of the main authenticated S3 service.
+- `crates/argmin-s3/src/main.rs:152-156` - The argmin-s3 binary binds the configured TCP listener for the HTTP service.
+## Narrative
+This is a real, in-scope availability vulnerability. The main HTTP request path authenticates and dispatches S3 operations, including PUT object tagging. PutObjectTagging reaches coordinator authorization and then storage metadata mutation. The storage layer allocates a fresh metadata command log index for each mutation and records each successful application in LocalClusterRuntimeState.applied_metadata_commands. That map is keyed by target node, PG, and log index; repository search shows only initialization, lookup, and insertion, with no eviction or compaction. Validation evidence also showed linear growth through the real PutObjectTagging path and a memory-allocation failure under a constrained heap. Severity remains medium: exploitation is straightforward for a client with tag/write permission and affects whole-service availability, but it requires authorized access or permissive bucket policy, does not compromise confidentiality or integrity, and is cleared by process restart.
+## Controls
+- SigV4 authentication and presigned URL authentication for non-OPTIONS requests
+- Coordinator bucket/object authorization and bucket policy checks before PutObjectTagging mutates metadata
+- Default ARGMIN_LISTEN_ADDR is 127.0.0.1:9000
+- Optional TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- Configurable max_connections and max_inflight_requests
+- HTTP header/body idle timeouts
+- Buffered control-plane body size cap
+## Blindspots
+- No deployment manifests, Kubernetes ingress, load balancer, or Terraform artifacts were found in the inspected repository scope, so actual public exposure cannot be confirmed statically.
+- Static analysis cannot determine production memory limits, process supervision/restart behavior, or operational rate limiting outside the repository.
+- The exact bytes of heap growth per command depend on Rust HashMap allocation behavior and cluster acting-set size at runtime.
