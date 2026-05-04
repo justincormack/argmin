@@ -383,6 +383,8 @@ pub struct UploadPartResult {
 pub struct UploadPartCopyResult {
     pub etag: String,
     pub last_modified: u64,
+    /// Computed checksum for this copied part (if the multipart upload has one).
+    pub checksum: Option<RawChecksum>,
     pub managed_encryption: Option<ManagedEncryptionAlgorithm>,
     pub sse_customer: Option<SseCustomerResponseHeaders>,
 }

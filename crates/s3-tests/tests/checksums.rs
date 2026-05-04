@@ -985,6 +985,89 @@ fn test_upload_part_uses_multipart_checksum_algorithm_without_part_checksum_head
     });
 }
 
+#[test]
+fn test_upload_part_copy_uses_multipart_checksum_algorithm() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let src_key = "mpu-copy-checksum-source";
+        let dst_key = "mpu-copy-checksum-destination";
+        let source_body = vec![b'C'; PART_SIZE];
+        let expected_checksum = checksum_crc32(&source_body);
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .body(ByteStream::from(source_body))
+            .send()
+            .await
+            .unwrap();
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .checksum_type(ChecksumType::FullObject)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        let copy = client
+            .upload_part_copy()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .copy_source(format!("{bucket}/{src_key}"))
+            .send()
+            .await
+            .unwrap();
+        let copied_part = copy.copy_part_result().expect("expected CopyPartResult");
+        let copied_checksum = copied_part
+            .checksum_crc32()
+            .expect("expected UploadPartCopy CRC32 checksum");
+        assert_eq!(copied_checksum, expected_checksum);
+
+        let complete = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(copied_part.e_tag().unwrap())
+                            .part_number(1)
+                            .checksum_crc32(copied_checksum)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(complete.checksum_crc32(), Some(expected_checksum.as_str()));
+        assert_eq!(complete.checksum_type(), Some(&ChecksumType::FullObject));
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(dst_key)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.checksum_crc32(), Some(expected_checksum.as_str()));
+        assert_eq!(head.checksum_type(), Some(&ChecksumType::FullObject));
+
+        cleanup(&bucket, &[src_key, dst_key]).await;
+    });
+}
+
 // ── test_multipart_checksum_sha256 ───────────────────────────────────
 
 /// Tests bad checksum rejection and missing part checksum rejection on

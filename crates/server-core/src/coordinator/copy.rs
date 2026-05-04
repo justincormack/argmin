@@ -574,6 +574,7 @@ impl Coordinator {
         Ok(UploadPartCopyResult {
             etag: inner.etag,
             last_modified: inner.last_modified,
+            checksum: inner.checksum,
             managed_encryption: inner.managed_encryption,
             sse_customer: sse_customer_headers,
         })

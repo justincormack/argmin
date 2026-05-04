@@ -2770,6 +2770,7 @@ impl HttpFrontend {
                 Ok(S3Response::upload_part_copy(
                     &result.etag,
                     result.last_modified,
+                    result.checksum.as_ref(),
                     result.managed_encryption,
                     result.sse_customer.as_ref(),
                 ))

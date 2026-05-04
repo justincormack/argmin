@@ -1740,10 +1740,11 @@ impl S3Response {
     pub fn upload_part_copy(
         etag: &str,
         last_modified: u64,
+        checksum: Option<&RawChecksum>,
         managed_encryption: Option<ManagedEncryptionAlgorithm>,
         sse_customer: Option<&SseCustomerResponseHeaders>,
     ) -> Self {
-        let body = xml::copy_part_result_xml(etag, last_modified);
+        let body = xml::copy_part_result_xml(etag, last_modified, checksum);
         Self::new(200)
             .xml_body(body)
             .apply_managed_encryption_headers(managed_encryption)

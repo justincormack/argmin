@@ -5,7 +5,7 @@ use crate::coordinator::{
     ListPartsResult, ObjectPartsInfo,
 };
 use crate::error::ServerError;
-use checksum::{ChecksumAlgorithm, ChecksumType};
+use checksum::{ChecksumAlgorithm, ChecksumType, RawChecksum};
 use quick_xml::{escape::unescape, events::Event, Reader};
 #[cfg(test)]
 use s3_types::VersionId;
@@ -3137,15 +3137,36 @@ pub fn copy_object_result_xml(
 
 /// Format a `CopyPartResult` XML response.
 #[must_use]
-pub fn copy_part_result_xml(etag: &str, last_modified: u64) -> String {
+pub fn copy_part_result_xml(
+    etag: &str,
+    last_modified: u64,
+    checksum: Option<&RawChecksum>,
+) -> String {
+    let mut checksum_xml = String::new();
+    if let Some(checksum) = checksum {
+        use base64::Engine;
+
+        if let Some(tag) = checksum_header_to_xml_tag(checksum.algorithm().header_name()) {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(checksum.bytes());
+            checksum_xml.push('<');
+            checksum_xml.push_str(tag);
+            checksum_xml.push('>');
+            checksum_xml.push_str(&xml_escape(&b64));
+            checksum_xml.push_str("</");
+            checksum_xml.push_str(tag);
+            checksum_xml.push('>');
+        }
+    }
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <CopyPartResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
          <LastModified>{}</LastModified>\
          <ETag>{}</ETag>\
+         {}\
          </CopyPartResult>",
         format_timestamp(last_modified),
         etag,
+        checksum_xml,
     )
 }
 
