@@ -1503,12 +1503,38 @@ Work items:
        stream-create reservation cleanup, failed abandoned-cleanup retry,
        checksum conflict rejection, out-of-order sparse log convergence, and
        committed metadata/manifest digest mismatch rejection
+   - remaining slices: none; Phase 6.6 is complete.
 7. Phase 6.7: peering placeholders and closeout.
    - add explicit peering/backfill/inconsistent placeholders needed by later
      repair work, but keep failure handling disabled initially
    - keep strict writes as the only acknowledged write mode
    - close out with boundary checks proving active metadata paths route through
      cluster-owned PG routing
+   - proposed slices:
+     1. add the missing `PgState::Inconsistent` placeholder and make every
+        existing PG-route path treat all non-`Active` states as fail-closed
+        route/control-plane errors with typed state context
+     2. pin the non-active PG behavior matrix for metadata primary lookup,
+        acting-set fanout, command apply/abandon, payload placement, shard
+        read/write/delete, and placed segment recovery; Phase 6.7 must not add
+        real peering, repair, or degraded availability behavior
+     3. reassert strict writes: successful writes still require every required
+        metadata replica and every required payload shard; no quorum
+        acknowledgement, degraded writes, or missing-shard writes are accepted
+     4. close the production boundary: remaining metadata-primary bridge access
+        is test-hook-only, active production metadata paths cannot reach
+        `StorageCluster::single_node`, and direct shard IO / metadata-primary
+        payload paths cannot reappear
+     5. update the invariant guide, public `StorageCluster` method matrix,
+        boundary-check script, and local-cluster trace/model tests so the final
+        Phase 6 routing boundary is executable rather than review-only
+   - explicitly out of scope for Phase 6.7:
+     - heartbeat or failure detection
+     - cluster-epoch changes for membership or acting-set updates
+     - primary election or promotion
+     - real peering/backfill/repair/migration
+     - degraded read/write availability policy implementation
+     - metadata command-log retention/compaction implementation
 
 Exit criteria:
 
