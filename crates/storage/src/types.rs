@@ -195,6 +195,7 @@ pub enum PgState {
     Peering,
     Degraded,
     Backfilling,
+    Inconsistent,
 }
 
 impl std::fmt::Display for PgState {
@@ -204,6 +205,7 @@ impl std::fmt::Display for PgState {
             Self::Peering => f.write_str("peering"),
             Self::Degraded => f.write_str("degraded"),
             Self::Backfilling => f.write_str("backfilling"),
+            Self::Inconsistent => f.write_str("inconsistent"),
         }
     }
 }

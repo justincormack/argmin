@@ -24,6 +24,11 @@ Every public `StorageCluster` operation must fit one of these classes:
 
 - Single-PG metadata reads and writes must route through the cluster map PG
   primary. They must not fall back to the process-wide metadata-primary node.
+- `PgState::Active` is the only serving PG state in the local Phase 6
+  implementation. `Peering`, `Degraded`, `Backfilling`, and `Inconsistent` are
+  placeholders for later failure/repair work and must fail closed with typed
+  route/control-plane errors before metadata or payload state is read or
+  mutated.
 - The remaining metadata-primary bridge is temporary, epoch-fenced, and allowed
   only for current-handle test hooks. Production metadata paths must route by
   PG primary or use explicit local-cluster runtime state for in-memory

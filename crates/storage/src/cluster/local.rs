@@ -2155,6 +2155,7 @@ mod tests {
             Just(PgState::Peering),
             Just(PgState::Degraded),
             Just(PgState::Backfilling),
+            Just(PgState::Inconsistent),
         ]
     }
 
@@ -2804,6 +2805,89 @@ mod tests {
                 cluster_epoch,
             } if cluster_epoch == ClusterEpoch::INITIAL
         ));
+    }
+
+    #[test]
+    fn metadata_routes_reject_all_non_active_pg_states() {
+        let non_active_states = [
+            PgState::Peering,
+            PgState::Degraded,
+            PgState::Backfilling,
+            PgState::Inconsistent,
+        ];
+
+        for state in non_active_states {
+            let tmp = test_util::tempdir();
+            let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+            let ec_shape = EcShape { k: 2, m: 1 };
+            let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+            let topology = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "non-active-route-");
+            let command = create_bucket_metadata_command(PgId::new(1), 1, bucket);
+            map.pg_routes.get_mut(&PgId::new(1)).unwrap().state = state;
+
+            let err = map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(1))
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                StoreError::PgNotActive {
+                    pg_id: 1,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    state: err_state,
+                } if err_state == state
+            ));
+
+            let err = map
+                .metadata_pg_acting_nodes(ClusterEpoch::INITIAL, PgId::new(1))
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                StoreError::PgNotActive {
+                    pg_id: 1,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    state: err_state,
+                } if err_state == state
+            ));
+
+            let err = map
+                .validate_metadata_command_for_replica(
+                    NodeId::new(0),
+                    NodeId::new(1),
+                    PgId::new(1),
+                    &command,
+                )
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                StoreError::PgNotActive {
+                    pg_id: 1,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    state: err_state,
+                } if err_state == state
+            ));
+
+            let err = map
+                .validate_metadata_command_abandon_for_replica(
+                    NodeId::new(0),
+                    NodeId::new(1),
+                    PgId::new(1),
+                    &command,
+                )
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                StoreError::PgNotActive {
+                    pg_id: 1,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    state: err_state,
+                } if err_state == state
+            ));
+        }
     }
 
     #[test]
@@ -11689,62 +11773,177 @@ mod tests {
     }
 
     #[test]
-    fn placed_segment_recovery_propagates_non_active_pg_route() {
-        let tmp = test_util::tempdir();
-        let node_ids = [
-            NodeId::new(0),
-            NodeId::new(1),
-            NodeId::new(2),
-            NodeId::new(3),
-            NodeId::new(4),
-            NodeId::new(5),
+    fn payload_placement_and_shard_io_reject_all_non_active_pg_states() {
+        let non_active_states = [
+            PgState::Peering,
+            PgState::Degraded,
+            PgState::Backfilling,
+            PgState::Inconsistent,
         ];
-        let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
-        let mut map =
-            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
-        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
-        let segment = write_committed_direct_segment(&cluster, b"phase-five-route-read");
-        let data_pg_id = DataPgId::new(PgId::new(segment.written.data_pg_id));
-        drop(cluster);
 
-        Arc::get_mut(&mut map)
-            .unwrap()
-            .pg_routes
-            .get_mut(&data_pg_id.pg_id())
-            .unwrap()
-            .state = PgState::Peering;
-        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
-        let shard_size = segment
-            .payload
-            .len()
-            .div_ceil(usize::from(segment.written.ec.k));
-        let mut all_shards = vec![None; usize::from(segment.written.ec.k + segment.written.ec.m)];
-        let mut present_count = 0;
+        for state in non_active_states {
+            let tmp = test_util::tempdir();
+            let node_ids = [
+                NodeId::new(0),
+                NodeId::new(1),
+                NodeId::new(2),
+                NodeId::new(3),
+                NodeId::new(4),
+                NodeId::new(5),
+            ];
+            let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+            let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
+            map.pg_routes.get_mut(&PgId::new(0)).unwrap().state = state;
+            let location = ShardLocation::new(
+                ClusterEpoch::INITIAL,
+                DataPgId::new(PgId::new(0)),
+                ShardIndex::new(0),
+                NodeId::new(0),
+            );
+            let key = ShardKey::new(&[47; 16], 1, 0);
 
-        let err = cluster
-            .try_load_placed_segment_shard(
-                segment.written.data_pg_id,
-                &segment.segment_okh,
-                segment.generation_id,
-                &segment.locations,
-                0,
-                shard_size,
-                &mut all_shards,
-                &mut present_count,
-            )
-            .unwrap_err();
+            let err = map
+                .place_payload_shards(
+                    ClusterEpoch::INITIAL,
+                    DataPgId::new(PgId::new(0)),
+                    ec_shape,
+                    b"non-active-placement",
+                )
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                ClusterBuildError::PgNotActive {
+                    pg_id: 0,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    state: err_state,
+                } if err_state == state
+            ));
 
-        assert!(matches!(
-            err,
-            StoreError::PgNotActive {
-                pg_id,
-                cluster_epoch,
-                state: PgState::Peering,
-            } if pg_id == data_pg_id.get()
-                && cluster_epoch == ClusterEpoch::INITIAL
-        ));
-        assert_eq!(present_count, 0);
-        assert!(all_shards.iter().all(Option::is_none));
+            let err = map
+                .write_payload_shard(ClusterEpoch::INITIAL, location, &key, b"non-active")
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                ShardIoError::PgNotActive {
+                    node_id: 0,
+                    pg_id: 0,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    state: err_state,
+                } if err_state == state
+            ));
+
+            let err = map
+                .read_payload_shard(
+                    ClusterEpoch::INITIAL,
+                    location,
+                    &key,
+                    WriteAck {
+                        crc64: 0,
+                        stored_size: 1,
+                    },
+                )
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                ShardIoError::PgNotActive {
+                    node_id: 0,
+                    pg_id: 0,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    state: err_state,
+                } if err_state == state
+            ));
+
+            let err = map
+                .delete_payload_shard(ClusterEpoch::INITIAL, location, &key)
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                ShardIoError::PgNotActive {
+                    node_id: 0,
+                    pg_id: 0,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    state: err_state,
+                } if err_state == state
+            ));
+
+            assert!(matches!(
+                map.node(NodeId::new(0))
+                    .unwrap()
+                    .storage_node()
+                    .read_shard_file(0, &key),
+                Err(StoreError::NotFound)
+            ));
+        }
+    }
+
+    #[test]
+    fn placed_segment_recovery_propagates_non_active_pg_route() {
+        let non_active_states = [
+            PgState::Peering,
+            PgState::Degraded,
+            PgState::Backfilling,
+            PgState::Inconsistent,
+        ];
+
+        for state in non_active_states {
+            let tmp = test_util::tempdir();
+            let node_ids = [
+                NodeId::new(0),
+                NodeId::new(1),
+                NodeId::new(2),
+                NodeId::new(3),
+                NodeId::new(4),
+                NodeId::new(5),
+            ];
+            let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+            let mut map =
+                Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
+            let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            let segment = write_committed_direct_segment(&cluster, b"phase-six-seven-route-read");
+            let data_pg_id = DataPgId::new(PgId::new(segment.written.data_pg_id));
+            drop(cluster);
+
+            Arc::get_mut(&mut map)
+                .unwrap()
+                .pg_routes
+                .get_mut(&data_pg_id.pg_id())
+                .unwrap()
+                .state = state;
+            let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            let shard_size = segment
+                .payload
+                .len()
+                .div_ceil(usize::from(segment.written.ec.k));
+            let mut all_shards =
+                vec![None; usize::from(segment.written.ec.k + segment.written.ec.m)];
+            let mut present_count = 0;
+
+            let err = cluster
+                .try_load_placed_segment_shard(
+                    segment.written.data_pg_id,
+                    &segment.segment_okh,
+                    segment.generation_id,
+                    &segment.locations,
+                    0,
+                    shard_size,
+                    &mut all_shards,
+                    &mut present_count,
+                )
+                .unwrap_err();
+
+            assert!(matches!(
+                err,
+                StoreError::PgNotActive {
+                    pg_id,
+                    cluster_epoch,
+                    state: err_state,
+                } if pg_id == data_pg_id.get()
+                    && cluster_epoch == ClusterEpoch::INITIAL
+                    && err_state == state
+            ));
+            assert_eq!(present_count, 0);
+            assert!(all_shards.iter().all(Option::is_none));
+        }
     }
 
     #[test]

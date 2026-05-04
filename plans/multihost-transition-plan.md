@@ -831,6 +831,7 @@ Work items:
    - peering
    - degraded
    - backfilling
+   - inconsistent
 6. make logs and errors include node, PG, and epoch information
 
 Exit criteria:
@@ -847,8 +848,8 @@ Phase 5 implementation notes:
      primary node, an acting set, and `PgState::Active`
    - the initial local acting set is all configured local nodes, with the
      existing metadata-primary node as the static primary
-   - `PgState` includes `active`, `peering`, `degraded`, and `backfilling` even
-     though only active routes are constructed initially
+   - `PgState` includes `active`, `peering`, `degraded`, `backfilling`, and
+     `inconsistent` even though only active routes are constructed initially
    - placed shard placement and IO now reject unknown or non-active PGs through
      the route table before touching a node store
    - local cluster startup rejects empty and duplicate PG sets before preparing
@@ -948,9 +949,9 @@ Phase 5 implementation notes:
       - add a small proptest trace model around local cluster handles and PG
         routes, not full S3 semantics
       - model: create a handle at epoch N, advance the map epoch, change PG
-        state between active/peering/degraded/backfilling, place/write/read/delete
-        payload shards, call metadata bridge methods, acquire/release payload
-        leases, and run best-effort cleanup
+        state between active/peering/degraded/backfilling/inconsistent,
+        place/write/read/delete payload shards, call metadata bridge methods,
+        acquire/release payload leases, and run best-effort cleanup
       - invariants: stale handles never start new metadata or payload work,
         stale payload reads fail before returning data including zero-size
         payloads, active lease tokens release after epoch change, route and
@@ -1023,10 +1024,10 @@ Phase 5 implementation notes:
      verification so the check is part of the documented full-suite gate
    - `prop_local_cluster_trace_preserves_epoch_route_and_cleanup_invariants`
      now runs randomized local-cluster traces covering map epoch changes, PG
-     active/peering/degraded/backfilling transitions, current and stale placed
-     shard IO, stale metadata bridge calls, zero-size stale payload reads,
-     best-effort reclaim queue suppression, lease release after epoch changes,
-     and EC recovery after physical shard loss
+     active/peering/degraded/backfilling/inconsistent transitions, current and
+     stale placed shard IO, stale metadata bridge calls, zero-size stale payload
+     reads, best-effort reclaim queue suppression, lease release after epoch
+     changes, and EC recovery after physical shard loss
    - payload cleanup fault-injection hooks now cover placed shard delete,
      metadata-primary ack delete, and typed best-effort cleanup error
      observation under request trace context
@@ -1528,6 +1529,15 @@ Work items:
      5. update the invariant guide, public `StorageCluster` method matrix,
         boundary-check script, and local-cluster trace/model tests so the final
         Phase 6 routing boundary is executable rather than review-only
+   - completed:
+     - `PgState::Inconsistent` is now part of the local PG state model; metadata
+       primary lookup, acting-set fanout, command apply/abandon validation,
+       payload placement, shard IO, and placed segment recovery all reject
+       every non-`Active` state before reading or mutating metadata/payload
+       state
+     - the local-cluster trace strategy now includes `Inconsistent`, so the
+       existing randomized route/epoch/cleanup model exercises it alongside
+       peering, degraded, and backfilling states
    - explicitly out of scope for Phase 6.7:
      - heartbeat or failure detection
      - cluster-epoch changes for membership or acting-set updates
