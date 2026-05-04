@@ -92,6 +92,41 @@ practical. Exact transport timing, and whether an unread-body rejection is
 reported as a normal S3 error or an early connection close, can still differ
 slightly from AWS in these edge cases.
 
+### Terminal multipart upload IDs are not retained for hidden-resource denial
+
+AWS retains or can validate some terminal multipart upload identity after an
+upload has completed or been aborted. In AWS-backed tests, a same-account caller
+without multipart-management permission can receive `403 AccessDenied` for a
+real completed or aborted `(key, upload-id)` pair, while receiving
+`404 NoSuchUpload` for a mutated upload ID, a never-existing upload ID, or the
+same real upload ID under a different key.
+
+Argmin intentionally does not preserve this hidden terminal-upload identity as
+unbounded metadata. Multipart upload identity can be very high churn because
+clients commonly use multipart upload for most object writes. Retaining every
+completed or aborted upload ID for its bucket lifetime would create unbounded
+storage growth for an obscure error-precedence distinction.
+
+The Argmin compatibility target is therefore:
+
+- active uploads preserve the AWS-compatible `403 AccessDenied` versus
+  `404 NoSuchUpload` authorization behavior
+- completed and aborted uploads match AWS operation-visible behavior for
+  authorized callers
+- a raced `UploadPart` must not surface `500 InternalError`; if abort wins the
+  race, return `404 NoSuchUpload`
+- terminal completed or aborted upload IDs may return `404 NoSuchUpload` where
+  AWS would return `403 AccessDenied` to an unauthorized caller
+
+Returning `404 NoSuchUpload` for terminal uploads is less revealing than AWS's
+observed `403 AccessDenied` response, so this difference does not expose hidden
+state. A possible future compatibility tightening would be to encode key-bound
+validation material into newly generated upload IDs, for example with an HMAC
+over the bucket/key plus randomness. That could make it possible to recognize
+whether an upload ID was issued for a specific key without retaining unbounded
+terminal upload tombstones. Until such a design exists, Argmin prefers bounded
+storage over matching AWS's terminal hidden-ID denial exactly.
+
 ## AWS documentation divergences
 
 This section records cases where AWS's public S3 documentation and live AWS

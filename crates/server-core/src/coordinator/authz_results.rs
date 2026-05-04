@@ -243,6 +243,12 @@ pub(super) enum AuthorizedAbortMultipartUpload {
 }
 
 #[derive(Debug)]
+pub(super) struct AuthorizedListParts {
+    pub(super) bucket_info: BucketSummary,
+    pub(super) upload: MultipartUploadRecord,
+}
+
+#[derive(Debug)]
 pub(super) struct AuthorizedListObjectsV2 {
     pub(super) bucket_info: BucketSummary,
 }

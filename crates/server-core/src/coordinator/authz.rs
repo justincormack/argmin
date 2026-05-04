@@ -33,18 +33,16 @@ use super::authz_results::{
     AuthorizedGetBucketPolicyStatus, AuthorizedGetBucketPublicAccessBlock,
     AuthorizedGetBucketVersioning, AuthorizedHeadBucket, AuthorizedListBuckets,
     AuthorizedListMultipartUploads, AuthorizedListObjectVersions, AuthorizedListObjectsV2,
-    AuthorizedMultipartPartWrite, AuthorizedObjectRead, AuthorizedPutBucketAbac,
-    AuthorizedPutBucketAcl, AuthorizedPutBucketEncryption, AuthorizedPutBucketLifecycle,
-    AuthorizedPutBucketObjectLockConfiguration, AuthorizedPutBucketOwnershipControls,
-    AuthorizedPutBucketPolicy, AuthorizedPutBucketPublicAccessBlock, AuthorizedPutBucketVersioning,
-    AuthorizedUploadPartCopy,
+    AuthorizedListParts, AuthorizedMultipartPartWrite, AuthorizedObjectRead,
+    AuthorizedPutBucketAbac, AuthorizedPutBucketAcl, AuthorizedPutBucketEncryption,
+    AuthorizedPutBucketLifecycle, AuthorizedPutBucketObjectLockConfiguration,
+    AuthorizedPutBucketOwnershipControls, AuthorizedPutBucketPolicy,
+    AuthorizedPutBucketPublicAccessBlock, AuthorizedPutBucketVersioning, AuthorizedUploadPartCopy,
 };
 use super::authz_types::{AuthorizedPutObjectWrite, AuthorizedPutObjectWriteAcl, ValidatedBucket};
 use super::bucket_handles::{
     BucketHandleLoader, BucketHandleRequest, LoadedBucketHandle, LoadedBucketValue,
 };
-#[cfg(test)]
-use super::request_types::ListPartsRequest;
 use super::request_types::{
     authorization_policy_context_for_put_object_write_acl, AuthorizePutObjectRequest,
     BeginStreamPartRequest, BucketAcl, BucketRequest, BucketScopedAuthorizationRequest,
@@ -52,12 +50,13 @@ use super::request_types::{
     CopyObjectRequest, CreateBucketAcl, CreateBucketRequest, CreateMultipartUploadRequest,
     DeleteEntry, DeleteObjectRequest, DeleteObjectsRequest, ExpectedBucketOwnerRequest,
     GetObjectAttributesRequest, GetObjectRequest, ListBucketsRequest, ListMultipartUploadsRequest,
-    ListObjectVersionsRequest, ListObjectsV2Request, MultipartObjectRequest, ObjectRequest,
-    ObjectVersionRequest, PutBucketAbacRequest, PutBucketAclInput, PutBucketAclRequest,
-    PutBucketConfigRequest, PutBucketEncryptionRequest, PutBucketObjectLockConfigurationRequest,
-    PutBucketOwnershipControlsRequest, PutBucketPolicyRequest, PutBucketPublicAccessBlockRequest,
-    PutBucketTagControlRequest, PutBucketTagsForUntagResourceRequest, PutBucketVersioningRequest,
-    PutObjectAcl, PutObjectPolicyContext, PutObjectWriteAcl, Requester, TaggingDirective,
+    ListObjectVersionsRequest, ListObjectsV2Request, ListPartsRequest, MultipartObjectRequest,
+    ObjectRequest, ObjectVersionRequest, PutBucketAbacRequest, PutBucketAclInput,
+    PutBucketAclRequest, PutBucketConfigRequest, PutBucketEncryptionRequest,
+    PutBucketObjectLockConfigurationRequest, PutBucketOwnershipControlsRequest,
+    PutBucketPolicyRequest, PutBucketPublicAccessBlockRequest, PutBucketTagControlRequest,
+    PutBucketTagsForUntagResourceRequest, PutBucketVersioningRequest, PutObjectAcl,
+    PutObjectPolicyContext, PutObjectWriteAcl, Requester, TaggingDirective,
     UntagBucketTagControlRequest, UploadPartCopyRequest,
 };
 use super::response_types::{BucketSummary, GetBucketAclResult, ModernBucketSummary};

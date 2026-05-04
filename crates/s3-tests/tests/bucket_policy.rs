@@ -10380,6 +10380,174 @@ fn test_bucket_policy_management_paths_deny_same_account_non_initiator_with_put_
 }
 
 #[test]
+fn test_bucket_policy_management_paths_deny_same_account_non_initiator_missing_upload_with_put_object(
+) {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let second_client = CTX.require_second_client();
+        let same_account_principal = same_account_exact_principal().await;
+
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let key = "same-account-non-initiator-missing-upload";
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(multipart_put_object_policy_for_alt_and_same_account(
+                &bucket,
+                &same_account_principal,
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let upload = eventually_ok_with_retry(
+            "CreateMultipartUpload with PutObject only",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .create_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .send()
+            },
+        )
+        .await;
+        let upload_id = upload.upload_id().unwrap().to_string();
+        let mut mutated_upload_id = upload_id.clone().into_bytes();
+        let last = mutated_upload_id
+            .last_mut()
+            .expect("AWS upload IDs are non-empty");
+        *last = if *last == b'A' { b'B' } else { b'A' };
+        let mutated_upload_id = String::from_utf8(mutated_upload_id).unwrap();
+
+        alt_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_result_matches(
+            "ListParts by upload initiator should observe the aborted upload as missing",
+            20,
+            std::time::Duration::from_millis(200),
+            || {
+                alt_client
+                    .list_parts()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .send()
+            },
+            |result| {
+                result
+                    .as_ref()
+                    .err()
+                    .and_then(|err| err.raw_response().map(|r| r.status().as_u16()))
+                    == Some(404)
+            },
+        )
+        .await;
+
+        let list_denied = second_client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await;
+        match err_status(&list_denied) {
+            403 => assert_s3_err_code(&list_denied, "AccessDenied"),
+            404 => assert_s3_err_code(&list_denied, "NoSuchUpload"),
+            status => panic!("unexpected ListParts status for terminal hidden upload: {status}"),
+        }
+
+        let abort_denied = second_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await;
+        match err_status(&abort_denied) {
+            403 => assert_s3_err_code(&abort_denied, "AccessDenied"),
+            404 => assert_s3_err_code(&abort_denied, "NoSuchUpload"),
+            status => {
+                panic!(
+                    "unexpected AbortMultipartUpload status for terminal hidden upload: {status}"
+                )
+            }
+        }
+
+        let wrong_key_list_missing = second_client
+            .list_parts()
+            .bucket(&bucket)
+            .key("same-account-non-initiator-missing-upload-wrong-key")
+            .upload_id(&upload_id)
+            .send()
+            .await;
+        assert_eq!(err_status(&wrong_key_list_missing), 404);
+        assert_s3_err_code(&wrong_key_list_missing, "NoSuchUpload");
+
+        let mutated_list_missing = second_client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&mutated_upload_id)
+            .send()
+            .await;
+        assert_eq!(err_status(&mutated_list_missing), 404);
+        assert_s3_err_code(&mutated_list_missing, "NoSuchUpload");
+
+        let arbitrary_list_missing = second_client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id("missing-upload-id")
+            .send()
+            .await;
+        assert_eq!(err_status(&arbitrary_list_missing), 404);
+        assert_s3_err_code(&arbitrary_list_missing, "NoSuchUpload");
+
+        let wrong_key_abort_missing = second_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("same-account-non-initiator-missing-upload-wrong-key")
+            .upload_id(&upload_id)
+            .send()
+            .await;
+        assert_eq!(err_status(&wrong_key_abort_missing), 404);
+        assert_s3_err_code(&wrong_key_abort_missing, "NoSuchUpload");
+
+        let mutated_abort_missing = second_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&mutated_upload_id)
+            .send()
+            .await;
+        assert_eq!(err_status(&mutated_abort_missing), 404);
+        assert_s3_err_code(&mutated_abort_missing, "NoSuchUpload");
+
+        let arbitrary_abort_missing = second_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id("missing-upload-id")
+            .send()
+            .await;
+        assert_eq!(err_status(&arbitrary_abort_missing), 404);
+        assert_s3_err_code(&arbitrary_abort_missing, "NoSuchUpload");
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_boe_management_paths_deny_same_account_non_initiator_with_put_object() {
     s3_tests::run(async {
         let client = CTX.client();

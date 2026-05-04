@@ -2,6 +2,37 @@
 
 Status: in progress
 
+Current slice:
+
+- added AWS-pinned coverage for multipart management visibility after abort
+- AWS behavior confirmed:
+  - the upload initiator sees a just-aborted upload as `NoSuchUpload`
+  - a same-account non-initiator with only `s3:PutObject` sees that same
+    just-aborted real upload ID as `AccessDenied`
+  - an arbitrary never-existing upload ID still returns `NoSuchUpload`
+- decision: do not retain unbounded completed/aborted hidden-upload identity
+  just to match AWS's terminal `403` versus `404` distinction; document this as
+  an explicit AWS compatibility difference
+- ListParts now receives an `AuthorizedListParts` capability from authz instead
+  of performing the protected upload-management lookup in the operation path
+- added AWS-pinned multipart abort lifecycle tests:
+  - aborting an upload with completed parts makes `ListParts` return
+    `NoSuchUpload`
+  - abort racing a slow already-started `UploadPart` returns AWS-compatible
+    `NoSuchUpload` or success, but must not surface a server `InternalError`
+  - the same race after one completed part has already established the upload
+    also returned `NoSuchUpload` in the observed AWS run
+  - in both slow-upload races, `ListParts` immediately after abort returns
+    `NoSuchUpload`, before waiting for the raced `UploadPart` result
+- AWS probing found aborted upload hidden identity is not just upload ID syntax
+  validation: same-length mutated IDs and real IDs under the wrong key return
+  `NoSuchUpload`, while the real aborted ID under the original key keeps
+  returning `AccessDenied` to an unauthorized same-account caller for at least
+  two minutes
+- possible future tightening: encode key-bound validation material into upload
+  IDs so terminal hidden-ID checks can be recognized without retaining
+  unbounded tombstones
+
 ## Goal
 
 Make auth ordering bugs hard to write by requiring typed authorization
@@ -64,8 +95,8 @@ Audit and refactor:
 - `UploadPart`
 - `UploadPartCopy`
 - `CompleteMultipartUpload`
-- `AbortMultipartUpload`
-- `ListParts`
+- `AbortMultipartUpload` (first pass complete for active-upload visibility)
+- `ListParts` (first pass complete for active-upload visibility)
 
 Questions to lock down against AWS:
 
@@ -75,6 +106,55 @@ Questions to lock down against AWS:
   the same as for a real hidden upload?
 - do SSE-C, checksum, completed-upload, or invalid-part validation errors ever
   take priority over the hidden-upload denial?
+
+### Multipart Abort And In-Flight Parts
+
+This was found while tightening multipart management authz, but it is a
+separate conformance issue from protected-state visibility.
+
+AWS documents a looser lifecycle: after abort, in-flight part uploads might
+still succeed, and callers may need to abort repeatedly and use `ListParts` to
+verify that all part storage has gone. The AWS behavior we pinned for slow
+UploadPart races returned `NoSuchUpload` once abort won, and `ListParts`
+immediately after abort also returned `NoSuchUpload`.
+
+The compatibility target is therefore narrower than retaining every terminal
+upload ID:
+
+- active uploads preserve AWS-compatible `403` versus `404` auth behavior
+- completed and aborted uploads match operation-visible behavior for authorized
+  callers
+- raced `UploadPart` must never surface `500 InternalError`; return
+  `NoSuchUpload` if abort won
+- terminal hidden upload IDs may return `NoSuchUpload` rather than AWS's
+  `AccessDenied`, because `404` is less revealing and avoids unbounded
+  terminal-ID retention
+
+Refactor target:
+
+- reject new UploadPart/UploadPartCopy stream sessions once an upload is
+  aborting
+- make already-started part commits that lose the abort race return
+  `NoSuchUpload` rather than leaking storage/internal errors
+- keep the active-upload auth path explicit enough to preserve `403` versus
+  `404` for uploads that are still in progress
+- avoid unbounded completed/aborted hidden-ID tombstones
+- use durable reclaim-style metadata for any physical part shard deletion that
+  cannot be completed synchronously
+
+AWS-facing tests should pin:
+
+- abort with no parts
+- abort with completed parts and `ListParts` immediately after (covered)
+- abort racing an already-started part upload (covered for a slow streaming
+  body; AWS returned `NoSuchUpload` in the observed run; `ListParts` immediately
+  after abort also returns `NoSuchUpload`)
+- abort racing an already-started second part after one part has completed
+  (covered; AWS returned `NoSuchUpload` in the observed run; `ListParts`
+  immediately after abort also returns `NoSuchUpload`)
+- repeated abort after a raced part finishes
+- authorization/error precedence for hidden aborting uploads versus missing
+  uploads
 
 ### Object Read Snapshots
 

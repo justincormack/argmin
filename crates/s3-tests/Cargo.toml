@@ -30,6 +30,8 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", 
 aws-credential-types = "1"
 aws-smithy-runtime-api = "1"
 aws-smithy-types = { version = "1", features = ["http-body-1-x"] }
+bytes = "1"
+http-body-1x = { package = "http-body", version = "1" }
 
 # Async runtime (required by AWS SDK)
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }

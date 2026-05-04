@@ -142,13 +142,7 @@ impl Coordinator {
         let session = self
             .storage_node
             .load_stream_upload_session(bucket, key, session_id)
-            .map_err(|error| match error {
-                storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
-                storage::ObjectPgActionError::InvalidRequest { reason } => {
-                    ServerError::InvalidRequest { reason }
-                }
-                storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
-            })?;
+            .map_err(Self::map_object_pg_action_error)?;
         self.resume_write_encryption(
             &session.encryption,
             sse_customer,
@@ -168,13 +162,7 @@ impl Coordinator {
         let session = self
             .storage_node
             .load_stream_upload_session(bucket, key, session_id)
-            .map_err(|error| match error {
-                storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
-                storage::ObjectPgActionError::InvalidRequest { reason } => {
-                    ServerError::InvalidRequest { reason }
-                }
-                storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
-            })?;
+            .map_err(Self::map_object_pg_action_error)?;
         self.resume_write_encryption(
             &session.encryption,
             sse_customer,
@@ -194,13 +182,7 @@ impl Coordinator {
         let target = self
             .storage_node
             .load_stream_upload_session(bucket, key, session_id)
-            .map_err(|error| match error {
-                storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
-                storage::ObjectPgActionError::InvalidRequest { reason } => {
-                    ServerError::InvalidRequest { reason }
-                }
-                storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
-            })?
+            .map_err(Self::map_object_pg_action_error)?
             .target;
         match target {
             StreamUploadTarget::PutObject => {
@@ -443,13 +425,7 @@ impl Coordinator {
             match self
                 .storage_node
                 .load_stream_upload_session(bucket, key, session_id)
-                .map_err(|error| match error {
-                    storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
-                    storage::ObjectPgActionError::InvalidRequest { reason } => {
-                        ServerError::InvalidRequest { reason }
-                    }
-                    storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
-                })?
+                .map_err(Self::map_object_pg_action_error)?
                 .encryption
             {
                 ObjectEncryption::None => data.len() as u64,
@@ -479,13 +455,7 @@ impl Coordinator {
                     segment_okh,
                 },
             )
-            .map_err(|error| match error {
-                storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
-                storage::ObjectPgActionError::InvalidRequest { reason } => {
-                    ServerError::InvalidRequest { reason }
-                }
-                storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
-            })?;
+            .map_err(Self::map_object_pg_action_error)?;
 
         Self::emit_stream_segment_layout(
             &target,
@@ -517,13 +487,7 @@ impl Coordinator {
                 &segment_record,
                 &shard_batch,
             )
-            .map_err(|error| match error {
-                storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
-                storage::ObjectPgActionError::InvalidRequest { reason } => {
-                    ServerError::InvalidRequest { reason }
-                }
-                storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
-            })
+            .map_err(Self::map_object_pg_action_error)
     }
 
     #[cfg(test)]
@@ -552,13 +516,7 @@ impl Coordinator {
     ) -> Result<(), ServerError> {
         self.storage_node
             .abort_stream_upload_session(bucket, key, session_id)
-            .map_err(|error| match error {
-                storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
-                storage::ObjectPgActionError::InvalidRequest { reason } => {
-                    ServerError::InvalidRequest { reason }
-                }
-                storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
-            })
+            .map_err(Self::map_object_pg_action_error)
     }
 
     #[cfg(test)]

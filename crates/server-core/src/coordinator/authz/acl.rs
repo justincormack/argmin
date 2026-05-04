@@ -739,16 +739,11 @@ impl Coordinator {
             self.checked_active_bucket_summary_for(bucket, req.expected_bucket_owner())?;
         let authorized = match self
             .storage_node
-            .lookup_abort_multipart_upload(bucket, key, upload_id)
+            .lookup_multipart_upload_management(bucket, key, upload_id)
             .map_err(Self::map_object_pg_action_error)?
         {
-            storage::AbortMultipartUploadLookup::InProgress(upload) => {
+            storage::MultipartUploadManagementLookup::InProgress(upload) => {
                 let upload = *upload;
-                if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
-                    return Err(ServerError::NoSuchUpload {
-                        upload_id: upload_id.to_string(),
-                    });
-                }
                 if !Self::requester_can_manage_multipart_upload(
                     req.object.requester(),
                     &bucket_info,
@@ -762,12 +757,19 @@ impl Coordinator {
                     upload_id: upload_id.clone(),
                 }
             }
-            storage::AbortMultipartUploadLookup::Completed(completed) => {
-                if completed.bucket != bucket.as_str() || completed.key != key.as_str() {
-                    return Err(ServerError::NoSuchUpload {
-                        upload_id: upload_id.to_string(),
-                    });
+            storage::MultipartUploadManagementLookup::NonInProgress(upload) => {
+                if !Self::requester_can_manage_multipart_upload(
+                    req.object.requester(),
+                    &bucket_info,
+                    &upload,
+                ) {
+                    return Err(ServerError::AccessDenied);
                 }
+                return Err(ServerError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
+            storage::MultipartUploadManagementLookup::Completed(completed) => {
                 if !Self::requester_can_manage_completed_multipart_upload(
                     req.object.requester(),
                     &bucket_info,
@@ -777,33 +779,70 @@ impl Coordinator {
                 }
                 AuthorizedAbortMultipartUpload::Completed
             }
+            storage::MultipartUploadManagementLookup::Missing => {
+                return Err(ServerError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
         };
         Ok(authorized)
     }
 
-    #[cfg(test)]
     pub(in crate::coordinator) fn authorize_list_parts(
         &self,
         req: &ListPartsRequest<'_>,
-    ) -> Result<(), ServerError> {
+    ) -> Result<AuthorizedListParts, ServerError> {
         let bucket = req.upload.bucket_name_typed();
         let key = req.upload.key_typed();
         let upload_id = req.upload.upload_id_typed();
         let bucket_info =
             self.checked_active_bucket_summary_for(bucket, req.expected_bucket_owner())?;
-        let upload = self
+        match self
             .storage_node
-            .load_in_progress_multipart_upload_for_listing(bucket, key, upload_id)
-            .map_err(Self::map_object_pg_action_error)?;
-        if !Self::requester_can_manage_multipart_upload(
-            req.upload.requester(),
-            &bucket_info,
-            &upload,
-        ) {
-            return Err(ServerError::AccessDenied);
+            .lookup_multipart_upload_management(bucket, key, upload_id)
+            .map_err(Self::map_object_pg_action_error)?
+        {
+            storage::MultipartUploadManagementLookup::InProgress(upload) => {
+                if !Self::requester_can_manage_multipart_upload(
+                    req.upload.requester(),
+                    &bucket_info,
+                    &upload,
+                ) {
+                    return Err(ServerError::AccessDenied);
+                }
+                Ok(AuthorizedListParts {
+                    bucket_info: bucket_info.into_inner(),
+                    upload: *upload,
+                })
+            }
+            storage::MultipartUploadManagementLookup::NonInProgress(upload) => {
+                if !Self::requester_can_manage_multipart_upload(
+                    req.upload.requester(),
+                    &bucket_info,
+                    &upload,
+                ) {
+                    return Err(ServerError::AccessDenied);
+                }
+                Err(ServerError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                })
+            }
+            storage::MultipartUploadManagementLookup::Completed(upload) => {
+                if !Self::requester_can_manage_completed_multipart_upload(
+                    req.upload.requester(),
+                    &bucket_info,
+                    &upload,
+                ) {
+                    return Err(ServerError::AccessDenied);
+                }
+                Err(ServerError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                })
+            }
+            storage::MultipartUploadManagementLookup::Missing => Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            }),
         }
-
-        Ok(())
     }
 
     pub(super) fn authorize_object_read_snapshot_non_boe(

@@ -9,7 +9,7 @@ use storage::{
 
 use super::authz_results::{
     AuthorizedAbortMultipartUpload, AuthorizedCompleteMultipartUpload,
-    AuthorizedCreateMultipartUpload, AuthorizedListMultipartUploads,
+    AuthorizedCreateMultipartUpload, AuthorizedListMultipartUploads, AuthorizedListParts,
 };
 use super::bucket_handles::{BucketHandleLoader, BucketHandleRequest};
 #[cfg(test)]
@@ -720,32 +720,18 @@ impl Coordinator {
             req.upload.upload_id(),
             req.max_parts
         );
-        let bucket = req.upload.bucket_name_typed();
-        let key = req.upload.key_typed();
-        let upload_id = req.upload.upload_id_typed();
-        let bucket_info =
-            self.checked_active_bucket_summary_for(bucket, req.expected_bucket_owner())?;
+        let AuthorizedListParts {
+            bucket_info,
+            upload: authorized_upload,
+        } = self.authorize_list_parts(req)?;
         let listed = self
             .storage_node
-            .list_multipart_parts_for_upload(
-                bucket,
-                key,
-                upload_id,
+            .list_multipart_parts_for_authorized_upload(
+                &authorized_upload,
                 req.part_number_marker,
                 req.max_parts,
-                |upload| {
-                    if !Self::requester_can_manage_multipart_upload(
-                        req.upload.requester(),
-                        &bucket_info,
-                        upload,
-                    ) {
-                        return Err(ServerError::AccessDenied);
-                    }
-                    Ok(())
-                },
             )
-            .map_err(Self::map_object_pg_action_error)??;
-        let bucket_info = bucket_info.into_inner();
+            .map_err(Self::map_object_pg_action_error)?;
         let upload = listed.upload;
         let resp = listed.response;
         let upload_initiated_at = upload.initiated_at;
@@ -780,7 +766,7 @@ impl Coordinator {
             checksum_type,
             lifecycle_abort: self.multipart_lifecycle_abort_headers(
                 &bucket_info,
-                key.as_str(),
+                upload.key.as_str(),
                 upload_initiated_at,
             )?,
         })

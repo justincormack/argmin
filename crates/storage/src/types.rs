@@ -2791,9 +2791,11 @@ pub struct CompletedMultipartUploadRecord {
 }
 
 #[derive(Debug, Clone)]
-pub enum AbortMultipartUploadLookup {
+pub enum MultipartUploadManagementLookup {
     InProgress(Box<MultipartUploadRecord>),
+    NonInProgress(Box<MultipartUploadRecord>),
     Completed(CompletedMultipartUploadRecord),
+    Missing,
 }
 
 /// In-progress multipart part record.

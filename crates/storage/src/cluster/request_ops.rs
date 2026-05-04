@@ -5086,37 +5086,28 @@ impl super::StorageCluster {
         })
     }
 
-    pub fn list_multipart_parts_for_upload<E, F>(
+    pub fn list_multipart_parts_for_authorized_upload(
         &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
+        authorized_upload: &MultipartUploadRecord,
         part_number_marker: Option<u32>,
         max_parts: u32,
-        authorize: F,
-    ) -> Result<Result<ListedMultipartParts, E>, ObjectPgActionError>
-    where
-        F: FnOnce(&MultipartUploadRecord) -> Result<(), E>,
-    {
-        self.object_metadata_primary_node(bucket, key)?
-            .list_multipart_parts_for_upload(
-                bucket,
-                key,
-                upload_id,
+    ) -> Result<ListedMultipartParts, ObjectPgActionError> {
+        self.object_metadata_primary_node(&authorized_upload.bucket, &authorized_upload.key)?
+            .list_multipart_parts_for_authorized_upload(
+                authorized_upload,
                 part_number_marker,
                 max_parts,
-                authorize,
             )
     }
 
-    pub fn lookup_abort_multipart_upload(
+    pub fn lookup_multipart_upload_management(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
-    ) -> Result<AbortMultipartUploadLookup, ObjectPgActionError> {
+    ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError> {
         self.object_metadata_primary_node(bucket, key)?
-            .lookup_abort_multipart_upload(bucket, key, upload_id)
+            .lookup_multipart_upload_management(bucket, key, upload_id)
     }
 
     pub fn abort_multipart_upload(

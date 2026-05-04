@@ -4,8 +4,19 @@
 //! CreateMultipartUpload, UploadPart, CompleteMultipartUpload,
 //! AbortMultipartUpload, ListMultipartUploads, ListParts.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+use aws_sdk_s3::error::BoxError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, EncodingType};
+use aws_smithy_types::body::SdkBody;
+use bytes::Bytes;
+use http_body_1x::{Body, Frame, SizeHint};
 use s3_tests::{
     assert_s3_err_code, copy_source_with_version, err_status, object_url, send_signed_request,
     send_signed_request_with_credentials, unique_bucket, RawResponse, SignedRequestCredentials,
@@ -13,9 +24,87 @@ use s3_tests::{
 };
 
 const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
+const SLOW_PART_SIZE: usize = 8 * 1024 * 1024;
+const SLOW_PART_CHUNK_SIZE: usize = 64 * 1024;
 
 fn external_test_mode() -> bool {
     std::env::var_os("S3_TEST_ENDPOINT").is_some()
+}
+
+struct SlowUploadPartBody {
+    remaining: usize,
+    first_frame_sent: Arc<AtomicBool>,
+    delay: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl SlowUploadPartBody {
+    fn new(first_frame_sent: Arc<AtomicBool>) -> Self {
+        Self {
+            remaining: SLOW_PART_SIZE,
+            first_frame_sent,
+            delay: None,
+        }
+    }
+}
+
+impl Body for SlowUploadPartBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if let Some(delay) = &mut self.delay {
+            if delay.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            self.delay = None;
+        }
+
+        if self.remaining == 0 {
+            return Poll::Ready(None);
+        }
+
+        let len = self.remaining.min(SLOW_PART_CHUNK_SIZE);
+        self.remaining -= len;
+        self.first_frame_sent.store(true, Ordering::SeqCst);
+        if self.remaining != 0 {
+            self.delay = Some(Box::pin(tokio::time::sleep(Duration::from_millis(20))));
+        }
+        Poll::Ready(Some(Ok(Frame::data(Bytes::from(vec![b'x'; len])))))
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.remaining as u64)
+    }
+}
+
+async fn wait_for_slow_body_to_start(first_frame_sent: &AtomicBool) {
+    for _ in 0..100 {
+        if first_frame_sent.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("slow UploadPart body did not start sending");
+}
+
+async fn assert_list_parts_no_such_upload(bucket: &str, key: &str, upload_id: &str) {
+    let result = CTX
+        .client()
+        .list_parts()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .send()
+        .await;
+    assert_eq!(
+        err_status(&result),
+        404,
+        "unexpected ListParts result: {result:?}"
+    );
+    assert_s3_err_code(&result, "NoSuchUpload");
 }
 
 fn primary_credentials() -> SignedRequestCredentials<'static> {
@@ -248,6 +337,275 @@ async fn complete_single_part_multipart_upload(bucket: &str, key: &str, body: &[
         .unwrap();
 
     upload_id
+}
+
+#[test]
+fn test_abort_multipart_upload_with_completed_part_hides_upload_for_list_parts() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "abort-completed-part";
+        let upload_id = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap()
+            .upload_id()
+            .unwrap()
+            .to_string();
+
+        client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(vec![b'a'; PART_SIZE]))
+            .send()
+            .await
+            .unwrap();
+
+        let before_abort = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(before_abort.parts().len(), 1);
+        assert_eq!(before_abort.parts()[0].part_number(), Some(1));
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_abort_multipart_upload_racing_started_upload_part_returns_success_or_no_such_upload() {
+    s3_tests::run(async {
+        let client = CTX.client().clone();
+        let bucket = setup_bucket().await;
+        let key = "abort-races-started-part";
+        let upload_id = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap()
+            .upload_id()
+            .unwrap()
+            .to_string();
+
+        let first_frame_sent = Arc::new(AtomicBool::new(false));
+        let body = ByteStream::new(SdkBody::from_body_1_x(SlowUploadPartBody::new(Arc::clone(
+            &first_frame_sent,
+        ))));
+        let upload_bucket = bucket.clone();
+        let upload_id_for_task = upload_id.clone();
+        let upload_task = tokio::spawn(async move {
+            client
+                .upload_part()
+                .bucket(upload_bucket)
+                .key(key)
+                .upload_id(upload_id_for_task)
+                .part_number(1)
+                .body(body)
+                .send()
+                .await
+        });
+
+        wait_for_slow_body_to_start(&first_frame_sent).await;
+
+        CTX.client()
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
+
+        let upload_part = upload_task
+            .await
+            .expect("slow UploadPart task should not panic");
+        let uploaded_part = match &upload_part {
+            Ok(output) => Some(output),
+            Err(err) => {
+                assert_eq!(
+                    err_status(&upload_part),
+                    404,
+                    "unexpected raced UploadPart error: {err:?}"
+                );
+                assert_s3_err_code(&upload_part, "NoSuchUpload");
+                None
+            }
+        };
+        if let Some(uploaded_part) = uploaded_part {
+            assert!(
+                uploaded_part.e_tag().is_some(),
+                "successful UploadPart should return an ETag"
+            );
+        }
+
+        let list_after_race = CTX
+            .client()
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await;
+        if let Ok(parts) = list_after_race {
+            assert_eq!(parts.parts().len(), 1);
+            assert_eq!(parts.parts()[0].part_number(), Some(1));
+            CTX.client()
+                .abort_multipart_upload()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .send()
+                .await
+                .unwrap();
+        }
+
+        assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_abort_multipart_upload_racing_started_second_part_returns_success_or_no_such_upload() {
+    s3_tests::run(async {
+        let client = CTX.client().clone();
+        let bucket = setup_bucket().await;
+        let key = "abort-races-started-second-part";
+        let upload_id = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap()
+            .upload_id()
+            .unwrap()
+            .to_string();
+
+        client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(vec![b'a'; PART_SIZE]))
+            .send()
+            .await
+            .unwrap();
+
+        let before_race = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(before_race.parts().len(), 1);
+        assert_eq!(before_race.parts()[0].part_number(), Some(1));
+
+        let first_frame_sent = Arc::new(AtomicBool::new(false));
+        let body = ByteStream::new(SdkBody::from_body_1_x(SlowUploadPartBody::new(Arc::clone(
+            &first_frame_sent,
+        ))));
+        let upload_bucket = bucket.clone();
+        let upload_id_for_task = upload_id.clone();
+        let upload_task = tokio::spawn(async move {
+            client
+                .upload_part()
+                .bucket(upload_bucket)
+                .key(key)
+                .upload_id(upload_id_for_task)
+                .part_number(2)
+                .body(body)
+                .send()
+                .await
+        });
+
+        wait_for_slow_body_to_start(&first_frame_sent).await;
+
+        CTX.client()
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
+
+        let upload_part = upload_task
+            .await
+            .expect("slow UploadPart task should not panic");
+        let uploaded_part = match &upload_part {
+            Ok(output) => Some(output),
+            Err(err) => {
+                assert_eq!(
+                    err_status(&upload_part),
+                    404,
+                    "unexpected raced UploadPart error after established part: {err:?}"
+                );
+                assert_s3_err_code(&upload_part, "NoSuchUpload");
+                None
+            }
+        };
+        if let Some(uploaded_part) = uploaded_part {
+            assert!(
+                uploaded_part.e_tag().is_some(),
+                "successful UploadPart should return an ETag"
+            );
+        }
+
+        let list_after_race = CTX
+            .client()
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await;
+        if let Ok(parts) = list_after_race {
+            assert!(
+                !parts.parts().is_empty(),
+                "remaining parts should be visible before the repeated abort"
+            );
+            CTX.client()
+                .abort_multipart_upload()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .send()
+                .await
+                .unwrap();
+        }
+
+        assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
+        cleanup(&bucket, &[]).await;
+    });
 }
 
 #[test]
