@@ -545,6 +545,13 @@ Status:
     are exposed from the central resolver table
   - existing-object-tag, request-tag, and bucket-tag preload decisions now use
     the central table instead of local key-prefix checks
+- second cleanup slice complete:
+  - request object tags now use an explicit available/unavailable request
+    input state
+  - missing request tags on an available request remain distinct from an auth
+    path that did not provide request-tag data
+  - `s3:RequestObjectTag/*`, `aws:RequestTag/*`,
+    `s3:RequestObjectTagKeys`, and `aws:TagKeys` share that distinction
 
 Implementation goal:
 

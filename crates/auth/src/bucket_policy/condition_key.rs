@@ -13,7 +13,7 @@
 use super::condition_op::{self, ActualValue};
 use super::{
     BucketTagValue, ConditionMatchResult, ExistingObjectTagValue, PolicyAction,
-    PolicyConditionClause, PolicyRequest,
+    PolicyConditionClause, PolicyRequest, RequestObjectTagKeysValue, RequestObjectTagValue,
 };
 
 /// Resolved value for a condition key in a given request.
@@ -348,15 +348,18 @@ fn resolve_existing_object_tag<'a>(request: &PolicyRequest<'a>, param: &str) -> 
 }
 
 fn resolve_request_object_tag<'a>(request: &PolicyRequest<'a>, param: &str) -> ResolvedValue<'a> {
-    option_to_resolved(request.request_object_tag_value(param))
+    match request.request_object_tag_value(param) {
+        RequestObjectTagValue::Unavailable => ResolvedValue::Unavailable,
+        RequestObjectTagValue::Available(Some(value)) => ResolvedValue::Present(value),
+        RequestObjectTagValue::Available(None) => ResolvedValue::Absent,
+    }
 }
 
 fn resolve_request_tag_keys<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
-    let keys = request.request_tag_keys();
-    if keys.is_empty() {
-        ResolvedValue::Absent
-    } else {
-        ResolvedValue::PresentValues(keys)
+    match request.request_tag_keys() {
+        RequestObjectTagKeysValue::Unavailable => ResolvedValue::Unavailable,
+        RequestObjectTagKeysValue::Available(keys) if keys.is_empty() => ResolvedValue::Absent,
+        RequestObjectTagKeysValue::Available(keys) => ResolvedValue::PresentValues(keys),
     }
 }
 

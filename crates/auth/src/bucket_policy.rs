@@ -276,6 +276,12 @@ pub enum BucketTags<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestObjectTags<'a> {
+    Unavailable,
+    Available(&'a [PolicyTag<'a>]),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PolicyRequest<'a> {
     action: PolicyAction,
     bucket: &'a str,
@@ -285,7 +291,7 @@ pub struct PolicyRequest<'a> {
     requester_canonical_user_id: Option<&'a CanonicalUserId>,
     bucket_tags: BucketTags<'a>,
     existing_object_tags: ExistingObjectTags<'a>,
-    request_object_tags: &'a [PolicyTag<'a>],
+    request_object_tags: RequestObjectTags<'a>,
     copy_source: Option<&'a str>,
     metadata_directive: Option<&'a str>,
     canned_acl: Option<&'a str>,
@@ -325,7 +331,7 @@ impl<'a> PolicyRequest<'a> {
             requester_canonical_user_id,
             bucket_tags: BucketTags::Unavailable,
             existing_object_tags,
-            request_object_tags: &[],
+            request_object_tags: RequestObjectTags::Unavailable,
             copy_source: None,
             metadata_directive: None,
             canned_acl: None,
@@ -364,7 +370,7 @@ impl<'a> PolicyRequest<'a> {
             requester_canonical_user_id,
             bucket_tags,
             existing_object_tags: ExistingObjectTags::Unavailable,
-            request_object_tags: &[],
+            request_object_tags: RequestObjectTags::Unavailable,
             copy_source: None,
             metadata_directive: None,
             canned_acl: None,
@@ -436,13 +442,18 @@ impl<'a> PolicyRequest<'a> {
     }
 
     #[must_use]
-    fn request_tag_keys(&self) -> Vec<&'a str> {
-        self.request_object_tags.iter().map(|tag| tag.key).collect()
+    fn request_tag_keys(&self) -> RequestObjectTagKeysValue<'a> {
+        match self.request_object_tags {
+            RequestObjectTags::Unavailable => RequestObjectTagKeysValue::Unavailable,
+            RequestObjectTags::Available(tags) => {
+                RequestObjectTagKeysValue::Available(tags.iter().map(|tag| tag.key).collect())
+            }
+        }
     }
 
     #[must_use]
     pub fn with_request_object_tags(mut self, request_object_tags: &'a [PolicyTag<'a>]) -> Self {
-        self.request_object_tags = request_object_tags;
+        self.request_object_tags = RequestObjectTags::Available(request_object_tags);
         self
     }
 
@@ -589,11 +600,13 @@ impl<'a> PolicyRequest<'a> {
     }
 
     #[must_use]
-    fn request_object_tag_value(&self, key: &str) -> Option<&'a str> {
-        self.request_object_tags
-            .iter()
-            .find(|tag| tag.key == key)
-            .map(|tag| tag.value)
+    fn request_object_tag_value(&self, key: &str) -> RequestObjectTagValue<'a> {
+        match self.request_object_tags {
+            RequestObjectTags::Unavailable => RequestObjectTagValue::Unavailable,
+            RequestObjectTags::Available(tags) => RequestObjectTagValue::Available(
+                tags.iter().find(|tag| tag.key == key).map(|tag| tag.value),
+            ),
+        }
     }
 
     #[must_use]
@@ -884,6 +897,18 @@ enum ExistingObjectTagValue<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BucketTagValue<'a> {
+    Unavailable,
+    Available(Option<&'a str>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RequestObjectTagKeysValue<'a> {
+    Unavailable,
+    Available(Vec<&'a str>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestObjectTagValue<'a> {
     Unavailable,
     Available(Option<&'a str>),
 }
@@ -2333,6 +2358,7 @@ mod tests {
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"s3:RequestObjectTag/security":"true"}}}]}"#,
         )
         .unwrap();
+        let no_request_tags: [PolicyTag<'_>; 0] = [];
         let request = PolicyRequest::for_object(
             PolicyAction::PutObject,
             "bucket",
@@ -2340,9 +2366,53 @@ mod tests {
             Some("caller"),
             None,
             ExistingObjectTags::Unavailable,
-        );
+        )
+        .with_request_object_tags(&no_request_tags);
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
+    }
+
+    #[test]
+    fn request_object_tag_unavailable_input_is_distinct_from_empty_request() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"s3:RequestObjectTag/security":"true"}}},{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"s3:RequestObjectTagKeys":"true"}}}]}"#,
+        )
+        .unwrap();
+        let unavailable_request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        );
+        let no_request_tags: [PolicyTag<'_>; 0] = [];
+        let empty_request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_request_object_tags(&no_request_tags);
+
+        assert_eq!(
+            policy.statements[0].condition_match_result(&unavailable_request),
+            ConditionMatchResult::InputUnavailable
+        );
+        assert_eq!(
+            policy.statements[1].condition_match_result(&unavailable_request),
+            ConditionMatchResult::InputUnavailable
+        );
+        assert_eq!(
+            policy.statements[0].condition_match_result(&empty_request),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            policy.statements[1].condition_match_result(&empty_request),
+            ConditionMatchResult::Matches
+        );
     }
 
     #[test]
