@@ -562,6 +562,11 @@ Status:
   - context-less bucket auth paths now explicitly provide available-but-absent
     request-header context for currently supported bucket-policy header
     conditions
+- fourth cleanup slice completed:
+  - `authz/policy.rs` now centralizes object and bucket `PolicyRequest`
+    construction through local builders
+  - repeated manual request-construction chains in the main legacy/object and
+    bucket policy helpers now share the same availability baseline
 
 Implementation goal:
 
