@@ -29,6 +29,10 @@ Every public `StorageCluster` operation must fit one of these classes:
   placeholders for later failure/repair work and must fail closed with typed
   route/control-plane errors before metadata or payload state is read or
   mutated.
+- Phase 6 writes are strict. A successful write must apply to every required
+  metadata acting-set replica and write every required payload shard. The local
+  implementation must not acknowledge quorum writes, degraded writes, or
+  missing-shard writes.
 - The remaining metadata-primary bridge is temporary, epoch-fenced, and allowed
   only for current-handle test hooks. Production metadata paths must route by
   PG primary or use explicit local-cluster runtime state for in-memory

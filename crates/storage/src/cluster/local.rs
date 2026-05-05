@@ -2891,6 +2891,88 @@ mod tests {
     }
 
     #[test]
+    fn metadata_write_fails_closed_when_required_replica_is_missing() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "strict-metadata-replica-");
+        {
+            let route = map.pg_routes.get_mut(&PgId::new(1)).unwrap();
+            route.primary_node_id = NodeId::new(1);
+            route.acting_set = Arc::from([NodeId::new(0), NodeId::new(99), NodeId::new(1)]);
+        }
+
+        let mut map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let acl_grants = crate::AclGrants::default();
+        let config = crate::CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: "owner",
+            owner_canonical_id: &owner,
+            acl_grants: &acl_grants,
+            public_read: false,
+            public_write: false,
+            versioning: crate::BucketVersioningState::Disabled,
+            object_lock: crate::BucketObjectLockConfig::default(),
+        };
+
+        let err = cluster
+            .create_bucket_with_config_and_load_info(&config)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::BucketSnapshotLoadError::Store(StoreError::NodeNotFound {
+                node_id: 99,
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+            })
+        ));
+        assert!(
+            map.runtime_state()
+                .pending_metadata_command_for_bucket(PgId::new(1), &bucket)
+                .is_some(),
+            "failed strict write should keep the command pending for replica recovery"
+        );
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::head_bucket(&*pg, &bucket),
+                Err(crate::MetadataError::BucketNotFound { .. })
+            ));
+        }
+
+        drop(cluster);
+        {
+            let route = Arc::get_mut(&mut map)
+                .unwrap()
+                .pg_routes
+                .get_mut(&PgId::new(1))
+                .unwrap();
+            route.acting_set = Arc::from(node_ids);
+        }
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        cluster
+            .create_bucket_with_config_and_load_info(&config)
+            .unwrap();
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(1), &bucket)
+            .is_none());
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket(&*pg, &bucket).unwrap();
+            assert_eq!(info.name, bucket);
+        }
+    }
+
+    #[test]
     fn metadata_command_replica_acceptance_rejects_invalid_route_context() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -12247,6 +12329,106 @@ mod tests {
                     .read_shard_file(0, &key),
                 Err(StoreError::NotFound)
             ));
+        }
+    }
+
+    #[test]
+    fn direct_put_payload_write_fails_closed_when_required_shard_node_leaves_acting_set() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, _object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+
+        let mut map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let reservation_id = crate::SessionId::try_from("56".repeat(16)).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        let segment_okh = [96; 16];
+        let placement_key =
+            super::super::segment_payload_placement_key(&segment_okh, generation_id);
+        let locations = cluster
+            .place_payload_shards(DataPgId::new(PgId::new(data_pg)), ec_shape, &placement_key)
+            .unwrap();
+        let (removed_shard_index, removed_node) = locations
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(index, location)| (index, location.node_id()))
+            .find(|(_, node_id)| *node_id != NodeId::new(0))
+            .expect("test placement should use a non-primary shard node");
+        assert!(
+            removed_shard_index > 0,
+            "test must fail after at least one earlier shard write"
+        );
+        drop(cluster);
+
+        {
+            let route = Arc::get_mut(&mut map)
+                .unwrap()
+                .pg_routes
+                .get_mut(&PgId::new(data_pg))
+                .unwrap();
+            let acting_set: Vec<NodeId> = node_ids
+                .into_iter()
+                .filter(|node_id| *node_id != removed_node)
+                .collect();
+            if route.primary_node_id == removed_node {
+                route.primary_node_id = acting_set[0];
+            }
+            route.acting_set = Arc::from(acting_set);
+        }
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+        let err = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                b"strict payload write requires every placed shard",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::NodeNotInActingSet {
+                node_id,
+                pg_id,
+                cluster_epoch: ClusterEpoch::INITIAL,
+            } if node_id == removed_node.as_u32() && pg_id == data_pg
+        ));
+        for shard_index in 0..ec_shape.k + ec_shape.m {
+            assert!(
+                !cluster
+                    .test_payload_shard_file_exists(
+                        data_pg,
+                        ec_shape,
+                        &segment_okh,
+                        generation_id,
+                        shard_index,
+                    )
+                    .unwrap(),
+                "failed strict payload write must not leave shard {shard_index}"
+            );
         }
     }
 

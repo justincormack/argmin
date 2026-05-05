@@ -1538,6 +1538,15 @@ Work items:
      - the local-cluster trace strategy now includes `Inconsistent`, so the
        existing randomized route/epoch/cleanup model exercises it alongside
        peering, degraded, and backfilling states
+     - strict-write behavior is pinned with deterministic tests: a metadata
+       write with a missing required acting-set replica fails closed without
+       publishing bucket metadata and keeps the command pending for retry, and a
+       direct PUT payload write fails if any placed shard target is outside the
+       active data-PG acting set while cleaning up any shards written before the
+       failure
+     - the invariant guide now explicitly states that Phase 6 writes require
+       every metadata replica and every required payload shard; quorum,
+       degraded, and missing-shard writes remain out of scope
    - explicitly out of scope for Phase 6.7:
      - heartbeat or failure detection
      - cluster-epoch changes for membership or acting-set updates
