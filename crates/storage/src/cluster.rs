@@ -1,6 +1,6 @@
-use std::sync::{Arc, Weak};
 #[cfg(any(test, feature = "test-hooks"))]
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
+use std::sync::{Arc, Weak};
 
 use ec::{EcConfig, ErasureCodec};
 use placement::NodeId;
@@ -194,25 +194,18 @@ pub type PayloadShardCleanupTestHook =
 pub type PayloadCleanupErrorTestHook = Arc<dyn Fn(&'static str, &StoreError) + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
-static BEFORE_STREAM_ABORT_STORAGE_HOOK: OnceLock<Mutex<Option<StreamAbortHook>>> = OnceLock::new();
+#[derive(Default)]
+struct StorageClusterTestHooks {
+    before_stream_abort_storage: Option<StreamAbortHook>,
+    before_placed_payload_shard_delete: Option<PayloadShardCleanupTestHook>,
+    before_metadata_primary_payload_ack_delete: Option<PayloadShardCleanupTestHook>,
+    best_effort_payload_cleanup_error: Option<PayloadCleanupErrorTestHook>,
+}
 
 #[cfg(any(test, feature = "test-hooks"))]
-static BEFORE_PLACED_PAYLOAD_SHARD_DELETE_HOOK: OnceLock<
-    Mutex<Option<PayloadShardCleanupTestHook>>,
-> = OnceLock::new();
-
-#[cfg(any(test, feature = "test-hooks"))]
-static BEFORE_METADATA_PRIMARY_PAYLOAD_ACK_DELETE_HOOK: OnceLock<
-    Mutex<Option<PayloadShardCleanupTestHook>>,
-> = OnceLock::new();
-
-#[cfg(any(test, feature = "test-hooks"))]
-static BEST_EFFORT_PAYLOAD_CLEANUP_ERROR_HOOK: OnceLock<
-    Mutex<Option<PayloadCleanupErrorTestHook>>,
-> = OnceLock::new();
-
-#[cfg(any(test, feature = "test-hooks"))]
-pub struct StreamAbortTestHookGuard;
+pub struct StreamAbortTestHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
 
 #[cfg(any(test, feature = "test-hooks"))]
 enum PayloadCleanupTestHookKind {
@@ -223,108 +216,34 @@ enum PayloadCleanupTestHookKind {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct PayloadCleanupTestHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
     kind: PayloadCleanupTestHookKind,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
 impl Drop for StreamAbortTestHookGuard {
     fn drop(&mut self) {
-        let hook = BEFORE_STREAM_ABORT_STORAGE_HOOK.get_or_init(|| Mutex::new(None));
-        *hook.lock().unwrap() = None;
+        self.hooks.lock().unwrap().before_stream_abort_storage = None;
     }
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
 impl Drop for PayloadCleanupTestHookGuard {
     fn drop(&mut self) {
+        let mut hooks = self.hooks.lock().unwrap();
         match self.kind {
             PayloadCleanupTestHookKind::PlacedShardDelete => {
-                let hook = BEFORE_PLACED_PAYLOAD_SHARD_DELETE_HOOK.get_or_init(|| Mutex::new(None));
-                *hook.lock().unwrap() = None;
+                hooks.before_placed_payload_shard_delete = None;
             }
             PayloadCleanupTestHookKind::MetadataPrimaryAckDelete => {
-                let hook = BEFORE_METADATA_PRIMARY_PAYLOAD_ACK_DELETE_HOOK
-                    .get_or_init(|| Mutex::new(None));
-                *hook.lock().unwrap() = None;
+                hooks.before_metadata_primary_payload_ack_delete = None;
             }
             PayloadCleanupTestHookKind::BestEffortError => {
-                let hook = BEST_EFFORT_PAYLOAD_CLEANUP_ERROR_HOOK.get_or_init(|| Mutex::new(None));
-                *hook.lock().unwrap() = None;
+                hooks.best_effort_payload_cleanup_error = None;
             }
         }
     }
 }
-
-#[cfg(any(test, feature = "test-hooks"))]
-fn maybe_run_before_stream_abort_storage_hook() {
-    let hook = BEFORE_STREAM_ABORT_STORAGE_HOOK
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap()
-        .clone();
-    if let Some(hook) = hook {
-        hook();
-    }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-fn maybe_run_before_placed_payload_shard_delete_hook(
-    shard_key: &ShardKey,
-) -> Result<(), StoreError> {
-    let hook = BEFORE_PLACED_PAYLOAD_SHARD_DELETE_HOOK
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap()
-        .clone();
-    if let Some(hook) = hook {
-        hook(shard_key)?;
-    }
-    Ok(())
-}
-
-#[cfg(not(any(test, feature = "test-hooks")))]
-fn maybe_run_before_placed_payload_shard_delete_hook(
-    _shard_key: &ShardKey,
-) -> Result<(), StoreError> {
-    Ok(())
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-fn maybe_run_before_metadata_primary_payload_ack_delete_hook(
-    shard_key: &ShardKey,
-) -> Result<(), StoreError> {
-    let hook = BEFORE_METADATA_PRIMARY_PAYLOAD_ACK_DELETE_HOOK
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap()
-        .clone();
-    if let Some(hook) = hook {
-        hook(shard_key)?;
-    }
-    Ok(())
-}
-
-#[cfg(not(any(test, feature = "test-hooks")))]
-fn maybe_run_before_metadata_primary_payload_ack_delete_hook(
-    _shard_key: &ShardKey,
-) -> Result<(), StoreError> {
-    Ok(())
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-fn maybe_observe_best_effort_payload_cleanup_error(operation: &'static str, error: &StoreError) {
-    let hook = BEST_EFFORT_PAYLOAD_CLEANUP_ERROR_HOOK
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap()
-        .clone();
-    if let Some(hook) = hook {
-        hook(operation, error);
-    }
-}
-
-#[cfg(not(any(test, feature = "test-hooks")))]
-fn maybe_observe_best_effort_payload_cleanup_error(_operation: &'static str, _error: &StoreError) {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardLocation {
@@ -463,9 +382,99 @@ pub struct StorageCluster {
     single_node: Arc<SharedStorageNode>,
     local_map: Arc<LocalClusterMap>,
     operation_epoch: ClusterEpoch,
+    #[cfg(any(test, feature = "test-hooks"))]
+    test_hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
 impl StorageCluster {
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn maybe_run_before_stream_abort_storage_hook(&self) {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .before_stream_abort_storage
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn maybe_run_before_placed_payload_shard_delete_hook(
+        &self,
+        shard_key: &ShardKey,
+    ) -> Result<(), StoreError> {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .before_placed_payload_shard_delete
+            .clone();
+        if let Some(hook) = hook {
+            hook(shard_key)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    fn maybe_run_before_placed_payload_shard_delete_hook(
+        &self,
+        _shard_key: &ShardKey,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn maybe_run_before_metadata_primary_payload_ack_delete_hook(
+        &self,
+        shard_key: &ShardKey,
+    ) -> Result<(), StoreError> {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .before_metadata_primary_payload_ack_delete
+            .clone();
+        if let Some(hook) = hook {
+            hook(shard_key)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    fn maybe_run_before_metadata_primary_payload_ack_delete_hook(
+        &self,
+        _shard_key: &ShardKey,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn maybe_observe_best_effort_payload_cleanup_error(
+        &self,
+        operation: &'static str,
+        error: &StoreError,
+    ) {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .best_effort_payload_cleanup_error
+            .clone();
+        if let Some(hook) = hook {
+            hook(operation, error);
+        }
+    }
+
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    fn maybe_observe_best_effort_payload_cleanup_error(
+        &self,
+        _operation: &'static str,
+        _error: &StoreError,
+    ) {
+    }
+
     pub fn open_local_nodes(
         data_dir: &std::path::Path,
         node_ids: &[NodeId],
@@ -502,6 +511,8 @@ impl StorageCluster {
             single_node,
             local_map,
             operation_epoch,
+            #[cfg(any(test, feature = "test-hooks"))]
+            test_hooks: Arc::new(Mutex::new(StorageClusterTestHooks::default())),
         }))
     }
 
@@ -642,9 +653,10 @@ impl StorageCluster {
         &self,
         hook: Arc<dyn Fn() + Send + Sync>,
     ) -> StreamAbortTestHookGuard {
-        let slot = BEFORE_STREAM_ABORT_STORAGE_HOOK.get_or_init(|| Mutex::new(None));
-        *slot.lock().unwrap() = Some(hook);
-        StreamAbortTestHookGuard
+        self.test_hooks.lock().unwrap().before_stream_abort_storage = Some(hook);
+        StreamAbortTestHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -652,9 +664,12 @@ impl StorageCluster {
         &self,
         hook: PayloadShardCleanupTestHook,
     ) -> PayloadCleanupTestHookGuard {
-        let slot = BEFORE_PLACED_PAYLOAD_SHARD_DELETE_HOOK.get_or_init(|| Mutex::new(None));
-        *slot.lock().unwrap() = Some(hook);
+        self.test_hooks
+            .lock()
+            .unwrap()
+            .before_placed_payload_shard_delete = Some(hook);
         PayloadCleanupTestHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
             kind: PayloadCleanupTestHookKind::PlacedShardDelete,
         }
     }
@@ -664,9 +679,12 @@ impl StorageCluster {
         &self,
         hook: PayloadShardCleanupTestHook,
     ) -> PayloadCleanupTestHookGuard {
-        let slot = BEFORE_METADATA_PRIMARY_PAYLOAD_ACK_DELETE_HOOK.get_or_init(|| Mutex::new(None));
-        *slot.lock().unwrap() = Some(hook);
+        self.test_hooks
+            .lock()
+            .unwrap()
+            .before_metadata_primary_payload_ack_delete = Some(hook);
         PayloadCleanupTestHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
             kind: PayloadCleanupTestHookKind::MetadataPrimaryAckDelete,
         }
     }
@@ -676,9 +694,12 @@ impl StorageCluster {
         &self,
         hook: PayloadCleanupErrorTestHook,
     ) -> PayloadCleanupTestHookGuard {
-        let slot = BEST_EFFORT_PAYLOAD_CLEANUP_ERROR_HOOK.get_or_init(|| Mutex::new(None));
-        *slot.lock().unwrap() = Some(hook);
+        self.test_hooks
+            .lock()
+            .unwrap()
+            .best_effort_payload_cleanup_error = Some(hook);
         PayloadCleanupTestHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
             kind: PayloadCleanupTestHookKind::BestEffortError,
         }
     }
@@ -1439,18 +1460,164 @@ impl StorageCluster {
 
         let _bucket_guard = object_node.lock_bucket(&req.bucket);
         let runtime_state = self.local_map.runtime_state();
-        let (command, new_pending_command) = if let Some(command) =
-            runtime_state.pending_metadata_command_for_bucket(pg_id, &req.bucket)
-        {
-            if self
-                .metadata_command_has_abandoned_log_on_acting_set(&command)
-                .map_err(|error| bucket_snapshot_error_to_object_pg_action_error(error.source))?
+        let (command, new_pending_command) = loop {
+            let Some(command) =
+                runtime_state.pending_metadata_command_for_bucket(pg_id, &req.bucket)
+            else {
+                let object_pg = object_node.get_pg(pg_id.get())?;
+                let command = match self
+                    .prepare_commit_direct_put_object_command(pg_id, &object_pg, req, action)
+                {
+                    Ok(Ok(command)) => command,
+                    Ok(Err(error)) => {
+                        drop(object_pg);
+                        drop(_bucket_guard);
+                        self.release_object_generation_reservation_after_pending_drain_best_effort(
+                            pg_id,
+                            &req.bucket,
+                            &req.key,
+                            &req.generation_reservation_id,
+                        );
+                        self.delete_direct_put_segment_payload_shards(
+                            req.data_pg_id,
+                            req.ec,
+                            &req.segment_okh,
+                            req.segment_vid,
+                            written_shards,
+                        );
+                        return Ok(Err(error));
+                    }
+                    Err(error) => {
+                        drop(object_pg);
+                        drop(_bucket_guard);
+                        self.release_object_generation_reservation_after_pending_drain_best_effort(
+                            pg_id,
+                            &req.bucket,
+                            &req.key,
+                            &req.generation_reservation_id,
+                        );
+                        self.delete_direct_put_segment_payload_shards(
+                            req.data_pg_id,
+                            req.ec,
+                            &req.segment_okh,
+                            req.segment_vid,
+                            written_shards,
+                        );
+                        return Err(error);
+                    }
+                };
+                drop(object_pg);
+                break (command, true);
+            };
+
+            let is_matching_direct_put = matches!(
+                command.payload(),
+                MetadataCommandPayload::CommitDirectPutObject(commit)
+                    if commit.matches_request(
+                        &req.bucket,
+                        &req.key,
+                        &req.generation_reservation_id,
+                        req.generation_id,
+                    )
+            );
+            let has_abandoned_log =
+                match self.metadata_command_has_abandoned_log_on_acting_set(&command) {
+                    Ok(has_abandoned_log) => has_abandoned_log,
+                    Err(error) => {
+                        let error = bucket_snapshot_error_to_object_pg_action_error(error.source);
+                        drop(_bucket_guard);
+                        self.release_object_generation_reservation_after_pending_drain_best_effort(
+                            pg_id,
+                            &req.bucket,
+                            &req.key,
+                            &req.generation_reservation_id,
+                        );
+                        self.delete_direct_put_segment_payload_shards(
+                            req.data_pg_id,
+                            req.ec,
+                            &req.segment_okh,
+                            req.segment_vid,
+                            written_shards,
+                        );
+                        return Err(error);
+                    }
+                };
+            if has_abandoned_log {
+                if is_matching_direct_put {
+                    if let Err(error) =
+                        self.record_abandoned_metadata_command_to_acting_set(&command)
+                    {
+                        let error = bucket_snapshot_error_to_object_pg_action_error(error.source);
+                        drop(_bucket_guard);
+                        self.release_object_generation_reservation_after_pending_drain_best_effort(
+                            pg_id,
+                            &req.bucket,
+                            &req.key,
+                            &req.generation_reservation_id,
+                        );
+                        self.delete_direct_put_segment_payload_shards(
+                            req.data_pg_id,
+                            req.ec,
+                            &req.segment_okh,
+                            req.segment_vid,
+                            written_shards,
+                        );
+                        return Err(error);
+                    }
+                    runtime_state.remove_pending_metadata_command_for_bucket(pg_id, &req.bucket);
+                    drop(_bucket_guard);
+                    self.release_object_generation_reservation_after_pending_drain_best_effort(
+                        pg_id,
+                        &req.bucket,
+                        &req.key,
+                        &req.generation_reservation_id,
+                    );
+                    self.delete_direct_put_segment_payload_shards(
+                        req.data_pg_id,
+                        req.ec,
+                        &req.segment_okh,
+                        req.segment_vid,
+                        written_shards,
+                    );
+                    return Err(conflicting_pending_object_metadata_command(
+                        "abandoned pending command for direct put commit",
+                    ));
+                }
+                match self.finish_pending_object_metadata_command_for_bucket(
+                    pg_id,
+                    &req.bucket,
+                    &command,
+                ) {
+                    Ok(PendingMetadataCommandOutcome::Applied) => {
+                        unreachable!("already-classified abandoned metadata command was applied")
+                    }
+                    Ok(PendingMetadataCommandOutcome::Abandoned) => {}
+                    Err(error) => {
+                        drop(_bucket_guard);
+                        self.release_object_generation_reservation_after_pending_drain_best_effort(
+                            pg_id,
+                            &req.bucket,
+                            &req.key,
+                            &req.generation_reservation_id,
+                        );
+                        self.delete_direct_put_segment_payload_shards(
+                            req.data_pg_id,
+                            req.ec,
+                            &req.segment_okh,
+                            req.segment_vid,
+                            written_shards,
+                        );
+                        return Err(error);
+                    }
+                }
+                continue;
+            }
+            if is_matching_direct_put {
+                break (command, false);
+            }
+            if let Err(error) =
+                self.apply_pending_object_metadata_command_for_bucket(pg_id, &req.bucket, &command)
             {
-                self.record_abandoned_metadata_command_to_acting_set(&command)
-                    .map_err(|error| {
-                        bucket_snapshot_error_to_object_pg_action_error(error.source)
-                    })?;
-                runtime_state.remove_pending_metadata_command_for_bucket(pg_id, &req.bucket);
                 drop(_bucket_guard);
                 self.release_object_generation_reservation_after_pending_drain_best_effort(
                     pg_id,
@@ -1465,72 +1632,8 @@ impl StorageCluster {
                     req.segment_vid,
                     written_shards,
                 );
-                return Err(conflicting_pending_object_metadata_command(
-                    "abandoned pending command for direct put commit",
-                ));
+                return Err(error);
             }
-            match command.payload() {
-                MetadataCommandPayload::CommitDirectPutObject(commit)
-                    if commit.matches_request(
-                        &req.bucket,
-                        &req.key,
-                        &req.generation_reservation_id,
-                        req.generation_id,
-                    ) =>
-                {
-                    (command, false)
-                }
-                _ => {
-                    return Err(conflicting_pending_object_metadata_command(
-                        "conflicting pending command for direct put commit",
-                    ));
-                }
-            }
-        } else {
-            let object_pg = object_node.get_pg(pg_id.get())?;
-            let command = match self
-                .prepare_commit_direct_put_object_command(pg_id, &object_pg, req, action)
-            {
-                Ok(Ok(command)) => command,
-                Ok(Err(error)) => {
-                    drop(object_pg);
-                    drop(_bucket_guard);
-                    self.release_object_generation_reservation_after_pending_drain_best_effort(
-                        pg_id,
-                        &req.bucket,
-                        &req.key,
-                        &req.generation_reservation_id,
-                    );
-                    self.delete_direct_put_segment_payload_shards(
-                        req.data_pg_id,
-                        req.ec,
-                        &req.segment_okh,
-                        req.segment_vid,
-                        written_shards,
-                    );
-                    return Ok(Err(error));
-                }
-                Err(error) => {
-                    drop(object_pg);
-                    drop(_bucket_guard);
-                    self.release_object_generation_reservation_after_pending_drain_best_effort(
-                        pg_id,
-                        &req.bucket,
-                        &req.key,
-                        &req.generation_reservation_id,
-                    );
-                    self.delete_direct_put_segment_payload_shards(
-                        req.data_pg_id,
-                        req.ec,
-                        &req.segment_okh,
-                        req.segment_vid,
-                        written_shards,
-                    );
-                    return Err(error);
-                }
-            };
-            drop(object_pg);
-            (command, true)
         };
 
         if let Err(error) = self.register_payload_shard_acks(req.data_pg_id, &shard_batch) {
@@ -2204,7 +2307,7 @@ impl StorageCluster {
         }
 
         #[cfg(any(test, feature = "test-hooks"))]
-        maybe_run_before_stream_abort_storage_hook();
+        self.maybe_run_before_stream_abort_storage_hook();
 
         let _bucket_guard = node.lock_bucket(bucket);
         pending_completed_session =
@@ -2570,7 +2673,7 @@ impl StorageCluster {
         for shard_key in shard_keys {
             let location = Self::placed_payload_shard_location(&locations, shard_key)
                 .map_err(ObjectPgActionError::Store)?;
-            maybe_run_before_placed_payload_shard_delete_hook(shard_key)
+            self.maybe_run_before_placed_payload_shard_delete_hook(shard_key)
                 .map_err(ObjectPgActionError::Store)?;
             self.delete_payload_shard(location, shard_key)
                 .map_err(|error| ObjectPgActionError::Store(shard_io_error_to_store(error)))?;
@@ -2591,7 +2694,7 @@ impl StorageCluster {
             Ok(locations) => locations,
             Err(error) => {
                 let error = cluster_build_error_to_store(error);
-                emit_best_effort_payload_cleanup_error("place payload shards", &error);
+                self.emit_best_effort_payload_cleanup_error("place payload shards", &error);
                 return;
             }
         };
@@ -2599,9 +2702,10 @@ impl StorageCluster {
         for shard_key in shard_keys {
             match Self::placed_payload_shard_location(&locations, shard_key) {
                 Ok(location) => {
-                    if let Err(error) = maybe_run_before_placed_payload_shard_delete_hook(shard_key)
+                    if let Err(error) =
+                        self.maybe_run_before_placed_payload_shard_delete_hook(shard_key)
                     {
-                        emit_best_effort_payload_cleanup_error(
+                        self.emit_best_effort_payload_cleanup_error(
                             "delete placed payload shard",
                             &error,
                         );
@@ -2609,14 +2713,17 @@ impl StorageCluster {
                     }
                     if let Err(error) = self.delete_payload_shard(location, shard_key) {
                         let error = shard_io_error_to_store(error);
-                        emit_best_effort_payload_cleanup_error(
+                        self.emit_best_effort_payload_cleanup_error(
                             "delete placed payload shard",
                             &error,
                         );
                     }
                 }
                 Err(error) => {
-                    emit_best_effort_payload_cleanup_error("resolve placed payload shard", &error);
+                    self.emit_best_effort_payload_cleanup_error(
+                        "resolve placed payload shard",
+                        &error,
+                    );
                 }
             }
         }
@@ -2631,7 +2738,7 @@ impl StorageCluster {
             .metadata_pg_primary_node(data_pg_id)?
             .get_pg(data_pg_id)?;
         for shard_key in shard_keys {
-            maybe_run_before_metadata_primary_payload_ack_delete_hook(shard_key)
+            self.maybe_run_before_metadata_primary_payload_ack_delete_hook(shard_key)
                 .map_err(ObjectPgActionError::Store)?;
             data_pg.delete_shard_record(shard_key)?;
         }
@@ -2646,7 +2753,7 @@ impl StorageCluster {
         let node = match self.metadata_pg_primary_node(data_pg_id) {
             Ok(node) => node,
             Err(error) => {
-                emit_best_effort_payload_cleanup_error(
+                self.emit_best_effort_payload_cleanup_error(
                     "resolve payload ack metadata PG primary",
                     &error,
                 );
@@ -2656,18 +2763,19 @@ impl StorageCluster {
         let data_pg = match node.get_pg(data_pg_id) {
             Ok(data_pg) => data_pg,
             Err(error) => {
-                emit_best_effort_payload_cleanup_error("resolve payload ack PG", &error);
+                self.emit_best_effort_payload_cleanup_error("resolve payload ack PG", &error);
                 return;
             }
         };
         for shard_key in shard_keys {
-            if let Err(error) = maybe_run_before_metadata_primary_payload_ack_delete_hook(shard_key)
+            if let Err(error) =
+                self.maybe_run_before_metadata_primary_payload_ack_delete_hook(shard_key)
             {
-                emit_best_effort_payload_cleanup_error("delete payload ack", &error);
+                self.emit_best_effort_payload_cleanup_error("delete payload ack", &error);
                 continue;
             }
             if let Err(error) = data_pg.delete_shard_record(shard_key) {
-                emit_best_effort_payload_cleanup_error("delete payload ack", &error);
+                self.emit_best_effort_payload_cleanup_error("delete payload ack", &error);
             }
         }
     }
@@ -2771,6 +2879,19 @@ impl StorageCluster {
         Ok(self
             .test_payload_shard_file_path(data_pg_id, ec, segment_okh, segment_vid, shard_index)?
             .exists())
+    }
+
+    fn emit_best_effort_payload_cleanup_error(&self, operation: &'static str, error: &StoreError) {
+        let Some(trace) = observability::current_context() else {
+            return;
+        };
+        self.maybe_observe_best_effort_payload_cleanup_error(operation, error);
+        let _ = observability::event_in_context(
+            &trace,
+            TRACE_TARGET,
+            "payload_cleanup_best_effort_error",
+            Some(format_args!("operation={operation:?} error={error}")),
+        );
     }
 }
 
@@ -2944,17 +3065,4 @@ fn is_recoverable_physical_shard_io_error(context: &'static str, kind: std::io::
             std::io::ErrorKind::InvalidData
         ) | ("read shard file", std::io::ErrorKind::UnexpectedEof)
     )
-}
-
-fn emit_best_effort_payload_cleanup_error(operation: &'static str, error: &StoreError) {
-    let Some(trace) = observability::current_context() else {
-        return;
-    };
-    maybe_observe_best_effort_payload_cleanup_error(operation, error);
-    let _ = observability::event_in_context(
-        &trace,
-        TRACE_TARGET,
-        "payload_cleanup_best_effort_error",
-        Some(format_args!("operation={operation:?} error={error}")),
-    );
 }
