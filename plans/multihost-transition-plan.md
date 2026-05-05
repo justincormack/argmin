@@ -1505,7 +1505,7 @@ Work items:
        checksum conflict rejection, out-of-order sparse log convergence, and
        committed metadata/manifest digest mismatch rejection
    - remaining slices: none; Phase 6.6 is complete.
-7. Phase 6.7: peering placeholders and closeout.
+7. Phase 6.7: peering placeholders and closeout. Complete.
    - add explicit peering/backfill/inconsistent placeholders needed by later
      repair work, but keep failure handling disabled initially
    - keep strict writes as the only acknowledged write mode
@@ -1554,6 +1554,13 @@ Work items:
        placed-shard and legacy metadata-primary payload checks
      - the public `StorageCluster` method matrix has been refreshed with the
        metadata-command test hooks added during Phase 6
+     - exit criteria are satisfied by the Phase 6.2-6.7 command-path,
+       convergence, checksum/digest, strict-write, non-active route, and
+       boundary-check coverage; Phase 6.7 closeout verification used
+       `cargo nextest run`, `cargo clippy --all-targets --all-features --
+       -D warnings`, `./scripts/check-storage-cluster-boundaries`, and
+       `git diff --check`
+   - remaining slices: none; Phase 6.7 is complete.
    - explicitly out of scope for Phase 6.7:
      - heartbeat or failure detection
      - cluster-epoch changes for membership or acting-set updates
