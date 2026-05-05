@@ -1150,23 +1150,25 @@ fn abort_wins_over_complete_after_snapshot_without_leaking_multipart_state() {
     let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let completer = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let aborter = setup_coordinator_with_storage_cluster(storage_cluster);
+    let bucket = "race-complete-bucket";
+    let key = "race-complete-key";
     let invariant =
         "if abort wins after complete has snapshotted multipart state, the upload is removed without exposing a committed object or leaking multipart state";
     let state = InvariantHarness::new(&admin);
 
     admin
-        .create_bucket_for_owner("default-owner", "bucket", false)
+        .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
-    let (upload_id, parts) = create_upload_with_parts(&admin, "bucket", "key", &[(1, b"part")]);
+    let (upload_id, parts) = create_upload_with_parts(&admin, bucket, key, &[(1, b"part")]);
 
-    let sync = install_multipart_complete_pre_commit_race_hooks("bucket", "key");
+    let sync = install_multipart_complete_pre_commit_race_hooks(bucket, key);
     let upload_id_for_complete = upload_id.clone();
     let parts_for_complete = parts.clone();
     let t_complete = std::thread::spawn(move || {
         completer.complete_multipart_upload(&CompleteMultipartUploadRequest {
             upload: multipart_object_request(
-                "bucket",
-                "key",
+                bucket,
+                key,
                 &upload_id_for_complete,
                 test_requester(),
             ),
@@ -1182,8 +1184,8 @@ fn abort_wins_over_complete_after_snapshot_without_leaking_multipart_state() {
 
     aborter
         .abort_multipart_upload(&multipart_object_request(
-            "bucket",
-            "key",
+            bucket,
+            key,
             &upload_id,
             test_requester(),
         ))
@@ -1199,7 +1201,7 @@ fn abort_wins_over_complete_after_snapshot_without_leaking_multipart_state() {
     let err = admin
         .head_object(&GetObjectRequest {
             sse_customer: None,
-            object: object_version_request("bucket", "key", None, test_requester()),
+            object: object_version_request(bucket, key, None, test_requester()),
             cond: NO_READ,
         })
         .unwrap_err();
@@ -1210,7 +1212,7 @@ fn abort_wins_over_complete_after_snapshot_without_leaking_multipart_state() {
 
     let err = admin
         .list_parts(&ListPartsRequest {
-            upload: multipart_object_request("bucket", "key", &upload_id, test_requester()),
+            upload: multipart_object_request(bucket, key, &upload_id, test_requester()),
             part_number_marker: None,
             max_parts: 100,
         })
@@ -1220,11 +1222,11 @@ fn abort_wins_over_complete_after_snapshot_without_leaking_multipart_state() {
         "{invariant}: multipart upload should be gone after abort wins, got {err:?}"
     );
 
-    state.assert_no_pending_multipart_uploads_for("bucket", "key", invariant);
-    state.assert_no_pending_reclaim_roots_for("bucket", "key", invariant);
+    state.assert_no_pending_multipart_uploads_for(bucket, key, invariant);
+    state.assert_no_pending_reclaim_roots_for(bucket, key, invariant);
     assert!(
         state
-            .multipart_part_segments("bucket", "key", &upload_id)
+            .multipart_part_segments(bucket, key, &upload_id)
             .is_empty(),
         "{invariant}: abort winner should leave no committed multipart segment rows"
     );
