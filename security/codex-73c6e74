@@ -1,0 +1,234 @@
+HeadBucket can ignore ListBucket list-parameter Deny conditions
+Link: https://chatgpt.com/codex/cloud/security/findings/2d2d74d3f5508191945270328ed6e13c?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 73c6e74
+Author: justin@specialbusservice.com
+Created: 05/05/2026, 14:24:08
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Fixed in commit `a60bb22` (`Fix HeadBucket list condition policy context`).
+
+The fix adds `PolicyRequest::with_absent_list_parameters()` and applies it when building bucket policy requests through the shared `bucket_policy_request(...)` helper. Contextless bucket authorization paths such as `HeadBucket` now mark `s3:prefix`, `s3:delimiter`, and `s3:max-keys` as available-but-absent instead of unavailable, so `Null` and `IfExists` semantics evaluate normally and explicit Deny statements are not skipped before ACL/public-read fallback.
+
+The regression test `head_bucket_list_policy_deny_on_absent_list_parameters_overrides_public_read_acl` covers the reported attack path with a public-read bucket and explicit `s3:ListBucket` Deny conditions for all three list parameter keys.
+
+Verification for the fix:
+- `cargo test -p server-core head_bucket_list_policy_deny_on_absent_list_parameters_overrides_public_read_acl -- --nocapture`
+- `cargo test -p auth`
+- `cargo test -p server-core --lib`
+- `cargo clippy -p auth -p server-core --all-targets -- -D warnings`
+
+# Summary
+Introduced bug: scalar list-condition inputs are left unavailable for a contextless ListBucket authorization path. Because InputUnavailable is treated as no policy effect, explicit Deny conditions on absent list parameters can be bypassed for HeadBucket when fallback authorization permits the request.
+This change distinguishes unavailable scalar policy inputs from available-but-absent values. That is generally sound, but bucket_policy_decision_for_loaded_handle constructs contextless bucket PolicyRequest values by calling with_absent_request_headers only. For HeadBucket, the code evaluates a ListBucket policy decision through this contextless path. Since for_bucket now leaves prefix, delimiter, and max_keys as RequestField::Unavailable, and the resolver turns that into InputUnavailable, condition_match_result causes both Allow and Deny statements to be ignored. A policy such as an explicit Deny on s3:ListBucket with Null:{"s3:prefix":"true"} or StringNotEquals on s3:prefix previously matched the missing prefix; after this commit it is skipped for HeadBucket. If the bucket's ACL/public-read fallback otherwise allows bucket read, a remote requester can get HeadBucket success despite the explicit bucket policy Deny. Ordinary ListObjects paths provide prefix/delimiter/max-keys context, so the regression is specific to contextless ListBucket authorization such as HeadBucket.
+
+# Validation
+## Rubric
+- [x] Confirm PolicyRequest::for_bucket initializes scalar list-condition inputs prefix/delimiter/max_keys as Unavailable, while the contextless helper with_absent_request_headers does not mark them available-but-absent.
+- [x] Confirm s3:prefix/s3:delimiter/s3:max-keys are supported ListBucket condition keys and resolve via request_field_to_resolved, where Unavailable is distinct from Absent.
+- [x] Confirm unavailable condition input returns ConditionMatchResult::InputUnavailable and PolicyStatement::request_effect treats InputUnavailable as no statement effect, including explicit Deny.
+- [x] Confirm HeadBucket evaluates an s3:ListBucket bucket-policy decision via the contextless helper and bucket_policy_allows_with_fallback allows NoMatch to fall back to ACL/public-read behavior.
+- [x] Demonstrate dynamically that an explicit Deny Null:{"s3:prefix":"true"} is bypassed by the contextless request but enforced when list parameters are marked absent.
+## Report
+Validated the finding. I created a minimal Rust Cargo example at crates/auth/examples/head_bucket_bypass.rs that constructs an explicit Deny bucket policy for s3:ListBucket with Condition Null:{"s3:prefix":"true"}. It evaluates two requests: (1) the contextless HeadBucket-like request built as PolicyRequest::for_bucket(...).with_absent_request_headers(), and (2) a control request that additionally marks list parameters absent with with_prefix(None), with_delimiter(None), and with_max_keys(None). The PoC output was: contextless_decision=NoMatch; fixed_absent_list_context_decision=ExplicitDeny; contextless_head_bucket_allowed_with_public_read_fallback=true; fixed_head_bucket_allowed_with_public_read_fallback=false. This demonstrates that the explicit Deny is skipped only for the contextless path and that a public-read/ACL fallback would allow the HeadBucket-style authorization. Code evidence: PolicyRequest::for_bucket leaves prefix/delimiter/max_keys as RequestField::Unavailable at crates/auth/src/bucket_policy.rs:399-401; with_absent_request_headers only marks request headers absent and does not touch list parameters at crates/auth/src/bucket_policy.rs:551-564. s3:prefix, s3:delimiter, and s3:max-keys are supported ListBucket condition keys at crates/auth/src/bucket_policy/condition_key.rs:280-303 and list_condition_supported_for_action includes PolicyAction::ListBucket at lines 603-607. Those keys resolve through request_field_to_resolved at lines 441-450, where RequestField::Unavailable becomes ResolvedValue::Unavailable at lines 468-473. evaluate_clause returns ConditionMatchResult::InputUnavailable for that case at lines 719-723, and PolicyStatement::request_effect maps InputUnavailable to None even for Deny at crates/auth/src/bucket_policy.rs:786-790. The HeadBucket authorization path evaluates ListBucket through bucket_policy_decision_for_loaded_handle at crates/server-core/src/coordinator/authz/bucket.rs:58-75; that helper builds the contextless request with only with_absent_request_headers at crates/server-core/src/coordinator/authz/policy.rs:268-280. bucket_policy_allows_with_fallback sends NoMatch to fallback at crates/server-core/src/coordinator/authz/policy.rs:474-482. Dynamic/debugger evidence: cargo run -p auth --example head_bucket_bypass reproduced the bypass. I attempted crash-style validation; the issue is a logic bug and did not crash. Valgrind was not installed, and ASan could not be used because -Z sanitizer=address requires nightly Rust. I then ran lldb non-interactively and hit condition_key.rs:723 followed by bucket_policy.rs:790; the backtrace showed the call chain condition_key::evaluate_clause -> PolicyStatement::condition_match_result -> PolicyStatement::request_effect -> BucketPolicy::evaluate -> head_bucket_bypass.rs:51, confirming the unavailable prefix becomes InputUnavailable and is then treated as no policy effect.
+
+# Evidence
+crates/auth/src/bucket_policy.rs (L395 to 403)
+  Note: for_bucket now defaults object_creation_operation, prefix, delimiter, max_keys, object_ownership, and version_id to Unavailable instead of absent.
+```
+            grant_full_control: RequestField::Unavailable,
+            if_match: RequestField::Unavailable,
+            if_none_match: RequestField::Unavailable,
+            object_creation_operation: RequestBool::Unavailable,
+            prefix: RequestField::Unavailable,
+            delimiter: RequestField::Unavailable,
+            max_keys: RequestField::Unavailable,
+            object_ownership: RequestField::Unavailable,
+            version_id: RequestField::Unavailable,
+```
+
+crates/auth/src/bucket_policy.rs (L550 to 564)
+  Note: The helper used for contextless bucket requests only marks request headers as available-but-absent; it does not mark list parameters such as prefix, delimiter, or max_keys as absent.
+```
+    #[must_use]
+    pub fn with_absent_request_headers(mut self) -> Self {
+        self.copy_source = RequestField::Available(None);
+        self.metadata_directive = RequestField::Available(None);
+        self.canned_acl = RequestField::Available(None);
+        self.server_side_encryption = RequestField::Available(None);
+        self.sse_customer_algorithm = RequestField::Available(None);
+        self.grant_read = RequestField::Available(None);
+        self.grant_write = RequestField::Available(None);
+        self.grant_read_acp = RequestField::Available(None);
+        self.grant_write_acp = RequestField::Available(None);
+        self.grant_full_control = RequestField::Available(None);
+        self.if_match = RequestField::Available(None);
+        self.if_none_match = RequestField::Available(None);
+        self
+```
+
+crates/auth/src/bucket_policy.rs (L786 to 792)
+  Note: InputUnavailable is treated as no statement effect, so even explicit Deny statements are skipped.
+```
+        match self.condition_match_result(request) {
+            ConditionMatchResult::Matches => Some(self.effect),
+            ConditionMatchResult::NoMatch => None,
+            ConditionMatchResult::AcceptedButNotEvaluable => None,
+            ConditionMatchResult::InputUnavailable => None,
+            ConditionMatchResult::Unsupported => {
+                (self.effect == PolicyEffect::Deny).then_some(PolicyEffect::Deny)
+```
+
+crates/auth/src/bucket_policy/condition_key.rs (L280 to 302)
+  Note: s3:prefix, s3:delimiter, and s3:max-keys are supported condition keys for ListBucket/ListBucketVersions policies.
+```
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:prefix"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
+        resolve: resolve_prefix,
+        evaluable_for_action: None,
+        supported_for_action: Some(list_condition_supported_for_action),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:delimiter"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
+        resolve: resolve_delimiter,
+        evaluable_for_action: None,
+        supported_for_action: Some(list_condition_supported_for_action),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:max-keys"),
+        operator_support: OperatorSupport::StringOrNumeric,
+        input: None,
+        resolve: resolve_max_keys,
+        evaluable_for_action: None,
+        supported_for_action: Some(list_condition_supported_for_action),
+```
+
+crates/auth/src/bucket_policy/condition_key.rs (L441 to 450)
+  Note: List condition keys resolve through request_field_to_resolved, so an unavailable field is not treated as an absent request parameter.
+```
+fn resolve_prefix<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    request_field_to_resolved(request.prefix())
+}
+
+fn resolve_delimiter<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    request_field_to_resolved(request.delimiter())
+}
+
+fn resolve_max_keys<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    request_field_to_resolved(request.max_keys())
+```
+
+crates/auth/src/bucket_policy/condition_key.rs (L468 to 473)
+  Note: Unavailable request fields now resolve to ResolvedValue::Unavailable, while only Available(None) resolves to Absent.
+```
+fn request_field_to_resolved(value: RequestField<'_>) -> ResolvedValue<'_> {
+    match value {
+        RequestField::Unavailable => ResolvedValue::Unavailable,
+        RequestField::Available(Some(value)) => ResolvedValue::Present(value),
+        RequestField::Available(None) => ResolvedValue::Absent,
+    }
+```
+
+crates/auth/src/bucket_policy/condition_key.rs (L719 to 724)
+  Note: Unavailable resolved values return ConditionMatchResult::InputUnavailable instead of evaluating Null/StringNotEquals absent-value semantics.
+```
+    let actual = match (resolver.resolve)(request, param) {
+        ResolvedValue::Present(value) => ActualValue::Present(value),
+        ResolvedValue::PresentValues(values) => ActualValue::PresentValues(values),
+        ResolvedValue::Absent => ActualValue::Absent,
+        ResolvedValue::Unavailable => return ConditionMatchResult::InputUnavailable,
+    };
+```
+
+crates/server-core/src/coordinator/authz/bucket.rs (L58 to 63)
+  Note: HeadBucket evaluates a ListBucket bucket-policy decision through the contextless bucket-policy path, so ListBucket list-parameter conditions are left unavailable.
+```
+        let list_decision = self.bucket_policy_decision_for_loaded_handle(
+            req.requester(),
+            &bucket,
+            auth::PolicyAction::ListBucket,
+            bucket_policy.as_deref(),
+        )?;
+```
+
+crates/server-core/src/coordinator/authz/policy.rs (L268 to 280)
+  Note: Contextless bucket policy requests call with_absent_request_headers but do not provide absent list-parameter context.
+```
+    let request = auth::PolicyRequest::for_bucket(
+        action,
+        bucket.name.as_str(),
+        requester.principal_opt(),
+        requester.canonical_user_id(),
+        if bucket_tags_available {
+            auth::bucket_policy::BucketTags::Available(&bucket_tags)
+        } else {
+            auth::bucket_policy::BucketTags::Unavailable
+        },
+    )
+    .with_absent_request_headers();
+    Ok(policy.evaluate(&request))
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Severity is kept at medium. Evidence shows a real runtime authorization bug reachable through the HTTP S3 API: HeadBucket uses a contextless ListBucket policy request, supported list-condition keys resolve to InputUnavailable, Deny is skipped, and NoMatch falls back to ACL/public-read. The probability is moderate because it requires public/effective read fallback and a particular Deny-condition policy, but no credentials may be needed when those conditions hold. The impact is also moderate rather than high/critical because the demonstrated consequence is HeadBucket success and bucket metadata/existence disclosure, not private object data exposure, object listing, modification, deletion, RCE, or credential compromise.
+## Likelihood
+high - The attack is low-complexity once the HTTP endpoint is reachable: send HEAD /bucket, potentially without credentials. However, exploitation requires a specific but plausible configuration: effective bucket-read/public-read fallback plus an explicit ListBucket Deny policy conditioned on absent list parameters. | Remote network vector
+## Impact
+medium - The bypass can defeat an explicit bucket policy Deny for HeadBucket and disclose bucket existence/location/metadata to a requester who should have been denied by policy. The impact is limited because the validated path is contextless HeadBucket; ordinary ListObjects paths provide prefix/delimiter/max-keys context and object data read/write/delete is not demonstrated.
+## Assumptions
+- An operator exposes the argmin-s3 HTTP endpoint beyond localhost, or the attacker can reach the internal S3-compatible service.
+- A bucket is effectively readable through ACL/public-read fallback for the attacker, including anonymous requesters.
+- The bucket has an explicit Deny policy for s3:ListBucket that depends on absent list parameters such as s3:prefix, s3:delimiter, or s3:max-keys.
+- Public Access Block settings do not ignore the public ACL fallback for the affected bucket.
+- reachable argmin-s3 HTTP endpoint
+- existing bucket
+- bucket read fallback allows the requester, commonly through public-read ACL
+- explicit s3:ListBucket Deny policy conditioned on absent s3:prefix, s3:delimiter, or s3:max-keys
+- the request is HeadBucket or another contextless bucket authorization path
+## Path
+attacker -> HEAD /bucket -> anonymous AuthContext -> HeadBucket authz -> contextless ListBucket policy -> s3:prefix unavailable -> Deny skipped/NoMatch -> ACL public-read fallback -> HeadBucket 200
+## Path evidence
+- `crates/argmin-s3/src/config.rs:31-68` - Runtime configuration loads credentials from env and defaults ARGMIN_LISTEN_ADDR to 127.0.0.1:9000; exposure is deployment-dependent.
+- `crates/argmin-s3/src/main.rs:136-143` - The configured credential is registered as OwnerAccountAdmin for the standalone service.
+- `crates/argmin-s3/src/main.rs:152-159` - Main runtime binds a TCP listener on the configured listen address.
+- `crates/server-http/src/http/router.rs:443-445` - HEAD on a bucket path is an HTTP-reachable HeadBucket operation.
+- `crates/server-http/src/http/mod.rs:3074-3076` - Missing authentication is converted to anonymous AuthContext, making public-bucket scenarios attacker-reachable without credentials.
+- `crates/server-core/src/coordinator/authz/bucket.rs:43-83` - HeadBucket authorization evaluates ListBucket and GetBucketLocation policy decisions and then falls back to bucket read authorization.
+- `crates/server-core/src/coordinator/authz/policy.rs:268-280` - The contextless bucket policy request uses with_absent_request_headers only and does not mark list parameters absent.
+- `crates/auth/src/bucket_policy.rs:395-403` - PolicyRequest::for_bucket leaves prefix, delimiter, and max_keys as RequestField::Unavailable.
+- `crates/auth/src/bucket_policy.rs:550-564` - with_absent_request_headers sets only request header fields to Available(None), not s3 list parameters.
+- `crates/auth/src/bucket_policy/condition_key.rs:280-303` - s3:prefix, s3:delimiter, and s3:max-keys are supported condition keys.
+- `crates/auth/src/bucket_policy/condition_key.rs:603-607` - The list condition keys are supported for PolicyAction::ListBucket, which HeadBucket uses for its list decision.
+- `crates/auth/src/bucket_policy/condition_key.rs:441-473` - List condition keys resolve through request_field_to_resolved; RequestField::Unavailable becomes ResolvedValue::Unavailable rather than Absent.
+- `crates/auth/src/bucket_policy/condition_key.rs:719-724` - Unavailable resolved values short-circuit to ConditionMatchResult::InputUnavailable.
+- `crates/auth/src/bucket_policy.rs:786-792` - InputUnavailable produces no statement effect, so explicit Deny is skipped.
+- `crates/server-core/src/coordinator/authz/policy.rs:474-482` - A NoMatch policy decision falls back to ACL/read authorization.
+- `crates/server-core/src/coordinator/authz.rs:454-469` - requester_can_read_bucket authorizes based on owner, ACL read grant, or public_read.
+- `crates/server-core/src/coordinator/authz.rs:789-791` - effective_public_read permits public-read fallback unless public ACLs are ignored.
+## Narrative
+The finding is real and reachable in the main runtime path. HEAD /{bucket} is routed to HeadBucket, unauthenticated requests can become anonymous, and authorize_head_bucket evaluates a ListBucket policy decision through a contextless helper. That helper only marks request headers absent; for_bucket leaves prefix, delimiter, and max_keys unavailable. The condition-key resolver treats unavailable values as InputUnavailable, and PolicyStatement::request_effect maps InputUnavailable to no effect even for explicit Deny. The resulting NoMatch then falls back to requester_can_read_bucket, which can allow public-read buckets. The validated PoC demonstrated contextless_decision=NoMatch while the same request with absent list parameters produced ExplicitDeny. Severity remains medium because exploitation is network-reachable and can be unauthenticated under plausible public bucket settings, but impact is narrow: HeadBucket metadata/existence disclosure and policy-intent bypass, not object data read/write/delete or full ListObjects access.
+## Controls
+- SigV4 authentication
+- anonymous AuthContext for missing auth
+- bucket policy explicit Deny/Allow evaluation
+- bucket ACL public-read fallback
+- Public Access Block IgnorePublicAcls can disable public ACL fallback
+- optional TLS via ARGMIN_TLS_CERT_PATH/ARGMIN_TLS_KEY_PATH
+- connection and in-flight request semaphores
+## Blindspots
+- Static review only; no live deployment, ingress, reverse proxy, or actual public exposure artifacts were present in the repository.
+- The validated PoC was an executable Rust/library-level reproduction rather than a full end-to-end HTTP deployment test, though HTTP reachability is supported by routing and dispatch code.
+- Repository does not contain real bucket policies or ACL state, so the exact prevalence of the required public-read plus explicit Deny configuration is unknown.
+- External controls such as network firewalls, reverse proxies, or operator-managed Public Access Block settings cannot be verified from the checkout.
