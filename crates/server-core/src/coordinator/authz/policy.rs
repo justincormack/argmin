@@ -140,7 +140,8 @@ fn bucket_policy_request<'a>(input: BucketPolicyRequestInput<'a>) -> auth::Polic
         input.requester.canonical_user_id(),
         input.bucket_tags,
     )
-    .with_absent_request_headers();
+    .with_absent_request_headers()
+    .with_absent_list_parameters();
 
     if let Some(request_tags) = input.request_tags {
         request = request.with_request_object_tags(request_tags);

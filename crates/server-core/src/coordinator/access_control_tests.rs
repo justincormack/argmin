@@ -7221,6 +7221,41 @@ fn head_bucket_allows_public_read_for_anonymous() {
 }
 
 #[test]
+fn head_bucket_list_policy_deny_on_absent_list_parameters_overrides_public_read_acl() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("owner-a", "bucket", true)
+        .unwrap();
+
+    for condition_key in ["s3:prefix", "s3:delimiter", "s3:max-keys"] {
+        let policy = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{{"Null":{{"{condition_key}":"true"}}}}}}]}}"#
+        );
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            &policy,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+
+        let err = coord
+            .head_bucket(&BucketRequest {
+                name: trusted_bucket_name("bucket"),
+                requester: Requester::anonymous(),
+                expected_bucket_owner: None,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::AccessDenied),
+            "HeadBucket should honor absent {condition_key} Deny before ACL fallback"
+        );
+    }
+}
+
+#[test]
 fn list_objects_rejects_non_owner_requester() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());

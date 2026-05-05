@@ -565,6 +565,14 @@ impl<'a> PolicyRequest<'a> {
     }
 
     #[must_use]
+    pub fn with_absent_list_parameters(mut self) -> Self {
+        self.prefix = RequestField::Available(None);
+        self.delimiter = RequestField::Available(None);
+        self.max_keys = RequestField::Available(None);
+        self
+    }
+
+    #[must_use]
     pub fn with_object_creation_operation(
         mut self,
         object_creation_operation: Option<bool>,
