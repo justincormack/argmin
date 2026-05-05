@@ -503,14 +503,35 @@ Acceptance criteria:
 Map request-tag condition evaluability for actions that may or may not carry
 request tags.
 
-Priority targets:
+AWS-pinned results so far:
 
 - `PutObject`
+  - evaluable and matching when inline object tags are supplied
+- `CreateMultipartUpload`
+  - same shape as `PutObject` for inline object tags
 - `PutObjectTagging`
+  - policy accepted
+  - evaluable and matching against the submitted tag set
+  - a nonmatching submitted tag value is denied
 - `PutObjectVersionTagging`
+  - same shape as `PutObjectTagging`
+  - evaluable and matching against the submitted tag set for the requested
+    version
 - `PutObjectAcl`
+  - policy rejected at `PutBucketPolicy` with `MalformedPolicy`
 - `PutObjectRetention`
+  - policy rejected at `PutBucketPolicy` with `MalformedPolicy`
 - `PutObjectLegalHold`
+  - policy rejected at `PutBucketPolicy` with `MalformedPolicy`
+
+Priority targets:
+
+- `PutObject` (covered)
+- `PutObjectTagging` (covered)
+- `PutObjectVersionTagging` (covered)
+- `PutObjectAcl` (covered)
+- `PutObjectRetention` (covered)
+- `PutObjectLegalHold` (covered)
 
 Acceptance criteria:
 

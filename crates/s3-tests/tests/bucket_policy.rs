@@ -7705,6 +7705,234 @@ fn test_bucket_policy_put_obj_request_object_tag() {
 }
 
 #[test]
+fn test_bucket_policy_put_object_tagging_request_object_tag() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        let key = "request-tag-put-object-tagging";
+
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"body"))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:PutObjectTagging",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:RequestObjectTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok_with_retry(
+            "PutObjectTagging with RequestObjectTag bucket policy",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .tagging(simple_bucket_tagging("security", "public"))
+                    .send()
+            },
+        )
+        .await;
+
+        let tags = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            tags.tag_set()
+                .iter()
+                .map(|tag| (tag.key(), tag.value()))
+                .collect::<Vec<_>>(),
+            vec![("security", "public")]
+        );
+
+        eventually_access_denied(
+            "PutObjectTagging denied by nonmatching RequestObjectTag bucket policy",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .tagging(simple_bucket_tagging("security", "private"))
+                    .send()
+            },
+        )
+        .await;
+
+        let tags = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            tags.tag_set()
+                .iter()
+                .map(|tag| (tag.key(), tag.value()))
+                .collect::<Vec<_>>(),
+            vec![("security", "public")]
+        );
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_object_version_tagging_request_object_tag() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        let key = "request-tag-put-object-version-tagging";
+
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        let version_id = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"body"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected VersionId for versioned object")
+            .to_string();
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:PutObjectVersionTagging",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:RequestObjectTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok_with_retry(
+            "PutObjectVersionTagging with RequestObjectTag bucket policy",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .version_id(&version_id)
+                    .tagging(simple_bucket_tagging("security", "public"))
+                    .send()
+            },
+        )
+        .await;
+
+        let tags = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            tags.tag_set()
+                .iter()
+                .map(|tag| (tag.key(), tag.value()))
+                .collect::<Vec<_>>(),
+            vec![("security", "public")]
+        );
+
+        eventually_access_denied(
+            "PutObjectVersionTagging denied by nonmatching RequestObjectTag bucket policy",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .version_id(&version_id)
+                    .tagging(simple_bucket_tagging("security", "private"))
+                    .send()
+            },
+        )
+        .await;
+
+        let tags = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            tags.tag_set()
+                .iter()
+                .map(|tag| (tag.key(), tag.value()))
+                .collect::<Vec<_>>(),
+            vec![("security", "public")]
+        );
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_string_equals_ignore_case_request_object_tag() {
     s3_tests::run(async {
         let client = CTX.client();
