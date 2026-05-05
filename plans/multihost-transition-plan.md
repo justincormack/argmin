@@ -1547,6 +1547,13 @@ Work items:
      - the invariant guide now explicitly states that Phase 6 writes require
        every metadata replica and every required payload shard; quorum,
        degraded, and missing-shard writes remain out of scope
+     - `scripts/check-storage-cluster-boundaries` now fails if
+       `self.single_node` is used outside the two approved
+       metadata-primary helper methods or if `metadata_primary_bridge_node()`
+       is called outside a cfg-gated test hook, in addition to the existing
+       placed-shard and legacy metadata-primary payload checks
+     - the public `StorageCluster` method matrix has been refreshed with the
+       metadata-command test hooks added during Phase 6
    - explicitly out of scope for Phase 6.7:
      - heartbeat or failure detection
      - cluster-epoch changes for membership or acting-set updates

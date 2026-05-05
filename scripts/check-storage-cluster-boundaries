@@ -26,21 +26,77 @@ fail_with_matches() {
 
 echo "Storage cluster boundary checks"
 
-single_node_matches=$(
-    rg -n --color=never 'self\.single_node' \
-        crates/storage/src/cluster.rs \
-        crates/storage/src/cluster/request_ops.rs \
-        crates/server-core/src \
-        || true
-)
 unexpected_single_node=$(
-    printf '%s\n' "$single_node_matches" \
-        | rg -v 'Ok\(self\.single_node\.as_ref\(\)\)|Ok\(Arc::clone\(&self\.single_node\)\)|self\.single_node\.as_ref\(\)' \
-        || true
+    awk '
+    function update_function_context() {
+        if ($0 ~ /^    #\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ || $0 ~ /^    #\[cfg\(test\)\]/) {
+            pending_test_hook_cfg = 1
+            return
+        }
+        if ($0 ~ /^    #\[/) {
+            return
+        }
+        if ($0 ~ /^    (pub(\([^)]*\))? )?fn [A-Za-z0-9_]+/) {
+            current_fn = $0
+            sub(/^.*fn /, "", current_fn)
+            sub(/\(.*/, "", current_fn)
+            in_test_hook = pending_test_hook_cfg
+            pending_test_hook_cfg = 0
+            return
+        }
+        if ($0 !~ /^[[:space:]]*$/) {
+            pending_test_hook_cfg = 0
+        }
+    }
+    {
+        update_function_context()
+        if ($0 ~ /self\.single_node/ \
+            && current_fn != "metadata_primary_bridge_node" \
+            && current_fn != "metadata_primary_topology_node") {
+            print FILENAME ":" FNR ":" $0
+        }
+    }
+    ' crates/storage/src/cluster.rs crates/storage/src/cluster/request_ops.rs
 )
 fail_with_matches \
     "Unexpected direct self.single_node access outside approved StorageCluster helpers" \
     "$unexpected_single_node"
+
+unexpected_metadata_bridge=$(
+    awk '
+    function update_function_context() {
+        if ($0 ~ /^    #\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ || $0 ~ /^    #\[cfg\(test\)\]/) {
+            pending_test_hook_cfg = 1
+            return
+        }
+        if ($0 ~ /^    #\[/) {
+            return
+        }
+        if ($0 ~ /^    (pub(\([^)]*\))? )?fn [A-Za-z0-9_]+/) {
+            current_fn = $0
+            sub(/^.*fn /, "", current_fn)
+            sub(/\(.*/, "", current_fn)
+            in_test_hook = pending_test_hook_cfg
+            pending_test_hook_cfg = 0
+            return
+        }
+        if ($0 !~ /^[[:space:]]*$/) {
+            pending_test_hook_cfg = 0
+        }
+    }
+    {
+        update_function_context()
+        if ($0 ~ /metadata_primary_bridge_node\(/ \
+            && current_fn != "metadata_primary_bridge_node" \
+            && !in_test_hook) {
+            print FILENAME ":" FNR ":" $0
+        }
+    }
+    ' crates/storage/src/cluster.rs crates/storage/src/cluster/request_ops.rs
+)
+fail_with_matches \
+    "metadata_primary_bridge_node used outside cfg-gated test hooks" \
+    "$unexpected_metadata_bridge"
 
 direct_shard_matches=$(
     rg -n --color=never '\.(write_shard|read_shard|delete_shard|write_shard_file|read_shard_file|read_shard_file_into|delete_shard_file)\(' \
