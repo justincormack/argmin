@@ -567,6 +567,10 @@ Status:
     construction through local builders
   - repeated manual request-construction chains in the main legacy/object and
     bucket policy helpers now share the same availability baseline
+- fifth cleanup slice complete:
+  - the BOE modern write path now uses the shared object `PolicyRequest`
+    builder so scalar and tag availability behavior cannot diverge from the
+    legacy/object path
 
 Implementation goal:
 

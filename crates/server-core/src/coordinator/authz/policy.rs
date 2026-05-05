@@ -9,18 +9,18 @@ pub(super) struct ObjectPolicyEvaluationContext<'a> {
     pub(super) policy: &'a auth::BucketPolicy,
 }
 
-struct ObjectPolicyRequestInput<'a> {
-    requester: &'a Requester,
-    bucket_name: &'a str,
-    bucket_abac_enabled: bool,
-    key: &'a str,
-    action: auth::PolicyAction,
-    policy_context: PutObjectPolicyContext<'a>,
-    policy: &'a auth::BucketPolicy,
-    existing_object_tags: auth::bucket_policy::ExistingObjectTags<'a>,
-    bucket_tags: &'a [auth::PolicyTag<'a>],
-    request_object_tags: &'a [auth::PolicyTag<'a>],
-    version_id: Option<&'a str>,
+pub(super) struct ObjectPolicyRequestInput<'a> {
+    pub(super) requester: &'a Requester,
+    pub(super) bucket_name: &'a str,
+    pub(super) bucket_abac_enabled: bool,
+    pub(super) key: &'a str,
+    pub(super) action: auth::PolicyAction,
+    pub(super) policy_context: PutObjectPolicyContext<'a>,
+    pub(super) policy: &'a auth::BucketPolicy,
+    pub(super) existing_object_tags: auth::bucket_policy::ExistingObjectTags<'a>,
+    pub(super) bucket_tags: &'a [auth::PolicyTag<'a>],
+    pub(super) request_object_tags: &'a [auth::PolicyTag<'a>],
+    pub(super) version_id: Option<&'a str>,
 }
 
 struct BucketPolicyRequestInput<'a> {
@@ -74,7 +74,7 @@ pub(super) fn load_bucket_tags_for_policy_action(
     }
 }
 
-fn policy_tags_from_pairs(tags: &[(String, String)]) -> Vec<auth::PolicyTag<'_>> {
+pub(super) fn policy_tags_from_pairs(tags: &[(String, String)]) -> Vec<auth::PolicyTag<'_>> {
     tags.iter()
         .map(|(key, value)| auth::PolicyTag::new(key, value))
         .collect()
@@ -93,7 +93,9 @@ fn bucket_tag_input_for_policy_action<'a>(
     }
 }
 
-fn object_policy_request<'a>(input: ObjectPolicyRequestInput<'a>) -> auth::PolicyRequest<'a> {
+pub(super) fn object_policy_request<'a>(
+    input: ObjectPolicyRequestInput<'a>,
+) -> auth::PolicyRequest<'a> {
     auth::PolicyRequest::for_object(
         input.action,
         input.bucket_name,

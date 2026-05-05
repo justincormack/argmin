@@ -1,3 +1,4 @@
+use super::policy::{object_policy_request, policy_tags_from_pairs, ObjectPolicyRequestInput};
 use super::*;
 use std::ops::Deref;
 
@@ -858,53 +859,25 @@ fn bucket_policy_decision_for_put_object_action_modern(
     } else {
         Vec::new()
     };
-    let request_object_tags: Vec<auth::PolicyTag<'_>> = request_object_tags
-        .iter()
-        .map(|(tag_key, value)| auth::PolicyTag::new(tag_key, value))
-        .collect();
+    let request_object_tags = policy_tags_from_pairs(&request_object_tags);
     let bucket_tags = bucket_tags.for_policy_action(bucket, action, Some(policy))?;
-    let bucket_tags: Vec<auth::PolicyTag<'_>> = bucket_tags
-        .into_iter()
-        .flat_map(|tags| tags.iter())
-        .map(|(key, value)| auth::PolicyTag::new(key, value))
-        .collect();
+    let bucket_tags = bucket_tags.map_or_else(Vec::new, policy_tags_from_pairs);
     let version_id = policy_context
         .version_id
         .map(|version_id| version_id.to_string());
-    let policy_request = auth::PolicyRequest::for_object(
-        action,
-        bucket.name.as_str(),
+    let policy_request = object_policy_request(ObjectPolicyRequestInput {
+        requester,
+        bucket_name: bucket.name.as_str(),
+        bucket_abac_enabled: bucket.bucket_abac_enabled,
         key,
-        requester.principal_opt(),
-        requester.canonical_user_id(),
-        auth::bucket_policy::ExistingObjectTags::Unavailable,
-    )
-    .with_bucket_tags(
-        if bucket.bucket_abac_enabled && policy.requires_bucket_tags_for_action(action) {
-            auth::bucket_policy::BucketTags::Available(&bucket_tags)
-        } else {
-            auth::bucket_policy::BucketTags::Unavailable
-        },
-    )
-    .with_request_object_tags(&request_object_tags)
-    .with_copy_source(policy_context.copy_source)
-    .with_metadata_directive(policy_context.metadata_directive)
-    .with_canned_acl(policy_context.canned_acl)
-    .with_server_side_encryption(
-        policy_context
-            .managed_encryption
-            .map(ManagedEncryptionAlgorithm::as_str),
-    )
-    .with_sse_customer_algorithm(policy_context.sse_customer_algorithm)
-    .with_grant_read(policy_context.grant_read)
-    .with_grant_write(policy_context.grant_write)
-    .with_grant_read_acp(policy_context.grant_read_acp)
-    .with_grant_write_acp(policy_context.grant_write_acp)
-    .with_grant_full_control(policy_context.grant_full_control)
-    .with_if_match(policy_context.if_match)
-    .with_if_none_match(policy_context.if_none_match)
-    .with_object_creation_operation(policy_context.object_creation_operation)
-    .with_version_id(version_id.as_deref());
+        action,
+        policy_context: *policy_context,
+        policy,
+        existing_object_tags: auth::bucket_policy::ExistingObjectTags::Unavailable,
+        bucket_tags: &bucket_tags,
+        request_object_tags: &request_object_tags,
+        version_id: version_id.as_deref(),
+    });
     Ok(policy.evaluate(&policy_request))
 }
 
