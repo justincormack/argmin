@@ -97,6 +97,15 @@ The first `s3:ExistingObjectTag/*` row is now AWS-pinned:
 - `GetObjectLegalHold`
   - same shape as `GetObjectRetention`
   - policy rejected at `PutBucketPolicy` with `MalformedPolicy`
+- `DeleteObjectTagging`
+  - policy accepted
+  - evaluable and matching
+  - `s3:ExistingObjectTag/*` can authorize deletion of the current object's
+    tag set
+- `DeleteObjectVersionTagging`
+  - same shape as `DeleteObjectTagging`
+  - policy accepted
+  - evaluable and matching for the requested version's existing tags
 
 That means `ExistingObjectTag` is not a single “supported or unsupported”
 family. Its behavior is action-specific in at least three ways:
@@ -480,7 +489,8 @@ Primary pairs:
 - `HeadObjectVersion` vs `HeadObjectVersion` with separate tag-read permission
 - `GetObjectAttributes` vs `GetObjectVersionAttributes`
 - `DeleteObject` vs `DeleteObjectVersion`
-- `DeleteObjectTagging` vs `DeleteObjectVersionTagging`
+- `DeleteObjectTagging` vs `DeleteObjectVersionTagging` (covered; both are
+  evaluable and matching)
 
 Acceptance criteria:
 
