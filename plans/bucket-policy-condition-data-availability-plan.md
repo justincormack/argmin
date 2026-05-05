@@ -400,13 +400,13 @@ encryption family:
   inherit customer-provided encryption headers just because initiation used
   SSE-C
 
-One more regression shape also needs to be pinned directly:
+The mixed invalid/valid action rejection shape is now also pinned:
 
 - mixed-action statements that combine one policy-invalid action with one valid
   action, for example:
   - `["s3:DeleteObject", "s3:DeleteObjectTagging"]`
   - with `s3:ExistingObjectTag/*`
-- these should be rejected at `PutBucketPolicy` if any matched action in the
+- these are rejected at `PutBucketPolicy` if any matched action in the
   statement makes the condition/action combination invalid
 
 ## Scope
@@ -535,6 +535,16 @@ Status:
 
 Once the AWS-backed matrix is mapped, refactor auth support to encode
 evaluability centrally rather than via per-action ad hoc checks.
+
+Status:
+
+- first cleanup slice complete:
+  - condition-key rows now identify the runtime input family they require
+    when evaluable
+  - policy validity, accepted-but-not-evaluable, and evaluable action states
+    are exposed from the central resolver table
+  - existing-object-tag, request-tag, and bucket-tag preload decisions now use
+    the central table instead of local key-prefix checks
 
 Implementation goal:
 

@@ -34,28 +34,31 @@ impl BucketPolicy {
 
     #[must_use]
     pub fn requires_existing_object_tags_for_action(&self, action: PolicyAction) -> bool {
-        if !condition_key::key_is_evaluable_for_action("s3:ExistingObjectTag/", action) {
-            return false;
-        }
-        let action = action.as_str();
-        self.statements.iter().any(|statement| {
-            statement.matches_action(action) && statement.references_existing_object_tag_condition()
-        })
+        self.requires_condition_input_for_action(
+            action,
+            condition_key::ConditionInput::ExistingObject,
+        )
     }
 
     #[must_use]
     pub fn requires_request_object_tags_for_action(&self, action: PolicyAction) -> bool {
-        let action = action.as_str();
-        self.statements.iter().any(|statement| {
-            statement.matches_action(action) && statement.references_request_object_tag_condition()
-        })
+        self.requires_condition_input_for_action(action, condition_key::ConditionInput::Request)
     }
 
     #[must_use]
     pub fn requires_bucket_tags_for_action(&self, action: PolicyAction) -> bool {
-        let action = action.as_str();
+        self.requires_condition_input_for_action(action, condition_key::ConditionInput::Bucket)
+    }
+
+    fn requires_condition_input_for_action(
+        &self,
+        action: PolicyAction,
+        input: condition_key::ConditionInput,
+    ) -> bool {
+        let action_str = action.as_str();
         self.statements.iter().any(|statement| {
-            statement.matches_action(action) && statement.references_bucket_tag_condition()
+            statement.matches_action(action_str)
+                && statement.references_condition_input_for_action(action, input)
         })
     }
 
@@ -765,24 +768,20 @@ impl PolicyStatement {
             .any(|pattern| wildcard_matches(pattern, resource))
     }
 
-    fn references_existing_object_tag_condition(&self) -> bool {
-        self.conditions
-            .iter()
-            .any(|clause| clause.key.starts_with("s3:ExistingObjectTag/"))
-    }
-
-    fn references_request_object_tag_condition(&self) -> bool {
-        self.conditions.iter().any(|clause| {
-            clause.key.starts_with("s3:RequestObjectTag/")
-                || clause.key.starts_with("aws:RequestTag/")
-                || clause.key == "s3:RequestObjectTagKeys"
-        })
-    }
-
     fn references_bucket_tag_condition(&self) -> bool {
         self.conditions.iter().any(|clause| {
-            clause.key.starts_with("s3:BucketTag/") || clause.key.starts_with("aws:ResourceTag/")
+            condition_key::clause_input(clause) == Some(condition_key::ConditionInput::Bucket)
         })
+    }
+
+    fn references_condition_input_for_action(
+        &self,
+        action: PolicyAction,
+        input: condition_key::ConditionInput,
+    ) -> bool {
+        self.conditions
+            .iter()
+            .any(|clause| condition_key::clause_requires_input_for_action(clause, action, input))
     }
 
     fn conditions_supported_for_policy_actions(&self) -> bool {

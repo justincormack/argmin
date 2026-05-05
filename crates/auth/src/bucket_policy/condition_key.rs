@@ -68,6 +68,22 @@ impl KeyMatch {
 /// keys.
 pub(super) type ResolveFn = for<'a> fn(&PolicyRequest<'a>, &str) -> ResolvedValue<'a>;
 
+/// Runtime input family a condition key needs when it is actually evaluable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConditionInput {
+    ExistingObject,
+    Request,
+    Bucket,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConditionActionStatus {
+    Evaluable,
+    AcceptedButNotEvaluable,
+    PolicyInvalid,
+    Unsupported,
+}
+
 /// One row of the condition-key resolver table.
 ///
 /// `evaluable_for_action`: if set, the evaluator returns
@@ -85,6 +101,7 @@ pub(super) type ResolveFn = for<'a> fn(&PolicyRequest<'a>, &str) -> ResolvedValu
 pub(super) struct ConditionKeyResolver {
     pub(super) key: KeyMatch,
     pub(super) operator_support: OperatorSupport,
+    pub(super) input: Option<ConditionInput>,
     pub(super) resolve: ResolveFn,
     pub(super) evaluable_for_action: Option<fn(PolicyAction) -> bool>,
     pub(super) supported_for_action: Option<fn(PolicyAction) -> bool>,
@@ -98,6 +115,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Prefix("s3:ExistingObjectTag/"),
         operator_support: OperatorSupport::StringEqualsOnly,
+        input: Some(ConditionInput::ExistingObject),
         resolve: resolve_existing_object_tag,
         evaluable_for_action: Some(existing_object_tag_evaluable_for_action),
         supported_for_action: Some(existing_object_tag_supported_for_action),
@@ -105,6 +123,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Prefix("s3:BucketTag/"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: Some(ConditionInput::Bucket),
         resolve: resolve_bucket_tag,
         evaluable_for_action: None,
         supported_for_action: Some(bucket_tag_supported_for_action),
@@ -112,6 +131,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Prefix("aws:ResourceTag/"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: Some(ConditionInput::Bucket),
         resolve: resolve_bucket_tag,
         evaluable_for_action: None,
         supported_for_action: Some(bucket_tag_supported_for_action),
@@ -119,6 +139,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Prefix("s3:RequestObjectTag/"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: Some(ConditionInput::Request),
         resolve: resolve_request_object_tag,
         evaluable_for_action: None,
         supported_for_action: Some(request_object_tag_supported_for_action),
@@ -126,6 +147,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Prefix("aws:RequestTag/"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: Some(ConditionInput::Request),
         resolve: resolve_request_object_tag,
         evaluable_for_action: None,
         supported_for_action: Some(request_tag_supported_for_action),
@@ -133,6 +155,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:RequestObjectTagKeys"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: Some(ConditionInput::Request),
         resolve: resolve_request_tag_keys,
         evaluable_for_action: None,
         supported_for_action: Some(request_object_tag_supported_for_action),
@@ -140,6 +163,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Exact("aws:TagKeys"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: Some(ConditionInput::Request),
         resolve: resolve_request_tag_keys,
         evaluable_for_action: None,
         supported_for_action: Some(tag_keys_supported_for_action),
@@ -147,6 +171,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:x-amz-copy-source"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
         resolve: resolve_copy_source,
         evaluable_for_action: None,
         supported_for_action: Some(request_header_supported_for_action_non_get),
@@ -154,6 +179,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:x-amz-metadata-directive"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
         resolve: resolve_metadata_directive,
         evaluable_for_action: None,
         supported_for_action: Some(request_header_supported_for_action_non_get),
@@ -161,6 +187,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:x-amz-acl"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
         resolve: resolve_canned_acl,
         evaluable_for_action: None,
         supported_for_action: Some(canned_acl_supported_for_action),
@@ -168,6 +195,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:x-amz-server-side-encryption"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
         resolve: resolve_server_side_encryption,
         evaluable_for_action: None,
         supported_for_action: Some(server_side_encryption_supported_for_action),
@@ -175,6 +203,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:x-amz-server-side-encryption-customer-algorithm"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
         resolve: resolve_sse_customer_algorithm,
         evaluable_for_action: None,
         supported_for_action: Some(request_header_supported_for_action_non_get),
@@ -182,6 +211,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:x-amz-grant-read"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
         resolve: resolve_grant_read,
         evaluable_for_action: None,
         supported_for_action: Some(request_header_supported_for_action_non_get),
@@ -189,6 +219,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:x-amz-grant-write"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
         resolve: resolve_grant_write,
         evaluable_for_action: None,
         // grant-write and grant-write-acp are intentionally supported for
@@ -200,6 +231,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:x-amz-grant-read-acp"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
         resolve: resolve_grant_read_acp,
         evaluable_for_action: None,
         supported_for_action: Some(request_header_supported_for_action_non_get),
@@ -207,6 +239,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:x-amz-grant-write-acp"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
         resolve: resolve_grant_write_acp,
         evaluable_for_action: None,
         supported_for_action: None,
@@ -214,6 +247,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:x-amz-grant-full-control"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
         resolve: resolve_grant_full_control,
         evaluable_for_action: None,
         supported_for_action: Some(request_header_supported_for_action_non_get),
@@ -221,6 +255,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:if-match"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
         resolve: resolve_if_match,
         evaluable_for_action: None,
         supported_for_action: Some(conditional_write_supported_for_action),
@@ -228,6 +263,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:if-none-match"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
         resolve: resolve_if_none_match,
         evaluable_for_action: None,
         supported_for_action: Some(conditional_write_supported_for_action),
@@ -235,6 +271,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:ObjectCreationOperation"),
         operator_support: OperatorSupport::BoolOnly,
+        input: None,
         resolve: resolve_object_creation_operation,
         evaluable_for_action: None,
         supported_for_action: Some(conditional_write_supported_for_action),
@@ -242,6 +279,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:prefix"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
         resolve: resolve_prefix,
         evaluable_for_action: None,
         supported_for_action: Some(list_condition_supported_for_action),
@@ -249,6 +287,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:delimiter"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
         resolve: resolve_delimiter,
         evaluable_for_action: None,
         supported_for_action: Some(list_condition_supported_for_action),
@@ -256,6 +295,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:max-keys"),
         operator_support: OperatorSupport::StringOrNumeric,
+        input: None,
         resolve: resolve_max_keys,
         evaluable_for_action: None,
         supported_for_action: Some(list_condition_supported_for_action),
@@ -263,6 +303,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:locationconstraint"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
         resolve: resolve_location_constraint,
         evaluable_for_action: None,
         supported_for_action: Some(location_constraint_supported_for_action),
@@ -270,6 +311,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:x-amz-object-ownership"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
         resolve: resolve_object_ownership,
         evaluable_for_action: None,
         supported_for_action: Some(object_ownership_supported_for_action),
@@ -277,6 +319,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
     ConditionKeyResolver {
         key: KeyMatch::Exact("s3:versionid"),
         operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
         resolve: resolve_version_id,
         evaluable_for_action: None,
         supported_for_action: Some(version_id_supported_for_action),
@@ -580,41 +623,68 @@ fn version_id_supported_for_action(action: PolicyAction) -> bool {
     )
 }
 
+pub(super) fn clause_action_status(
+    clause: &PolicyConditionClause,
+    action: PolicyAction,
+) -> ConditionActionStatus {
+    let Some((resolver, _param)) = lookup(clause.key.as_str()) else {
+        return ConditionActionStatus::Unsupported;
+    };
+    let operator = clause.operator.as_str();
+    let operator_ok = operator_supported_for_key(operator, resolver.operator_support);
+    if !operator_ok {
+        return ConditionActionStatus::Unsupported;
+    }
+    if resolver
+        .supported_for_action
+        .is_some_and(|predicate| !predicate(action))
+    {
+        return ConditionActionStatus::PolicyInvalid;
+    }
+    if resolver
+        .evaluable_for_action
+        .is_some_and(|predicate| !predicate(action))
+    {
+        return ConditionActionStatus::AcceptedButNotEvaluable;
+    }
+    ConditionActionStatus::Evaluable
+}
+
 /// Whether a condition clause is supported on a given action at
 /// statement-validation time.
 ///
 /// A clause is supported when its key has a resolver row, the operator is
 /// compatible with the row's `operator_support`, and the row's
-/// `supported_for_action` predicate (if any) admits the action.
+/// `supported_for_action` predicate (if any) admits the action. A clause can
+/// still be supported even when AWS accepts it but does not evaluate it for
+/// this action.
 pub(super) fn supports_clause_for_action(
     clause: &PolicyConditionClause,
     action: PolicyAction,
 ) -> bool {
+    matches!(
+        clause_action_status(clause, action),
+        ConditionActionStatus::Evaluable | ConditionActionStatus::AcceptedButNotEvaluable
+    )
+}
+
+pub(super) fn clause_requires_input_for_action(
+    clause: &PolicyConditionClause,
+    action: PolicyAction,
+    input: ConditionInput,
+) -> bool {
     let Some((resolver, _param)) = lookup(clause.key.as_str()) else {
         return false;
     };
-    let operator = clause.operator.as_str();
-    let operator_ok = operator_supported_for_key(operator, resolver.operator_support);
-    if !operator_ok {
-        return false;
-    }
-    resolver
-        .supported_for_action
-        .is_none_or(|predicate| predicate(action))
+    resolver.input == Some(input)
+        && matches!(
+            clause_action_status(clause, action),
+            ConditionActionStatus::Evaluable
+        )
 }
 
-/// Whether a resolver key is evaluable for an action at evaluator time.
-///
-/// Returns `true` by default when the resolver does not constrain
-/// evaluability, or when the key is not in the table (the caller typically
-/// treats unknown keys as not requiring this gate).
-pub(super) fn key_is_evaluable_for_action(key: &str, action: PolicyAction) -> bool {
-    let Some((resolver, _)) = lookup(key) else {
-        return true;
-    };
-    resolver
-        .evaluable_for_action
-        .is_none_or(|predicate| predicate(action))
+pub(super) fn clause_input(clause: &PolicyConditionClause) -> Option<ConditionInput> {
+    lookup(clause.key.as_str()).and_then(|(resolver, _param)| resolver.input)
 }
 
 /// Evaluate a condition clause against a request.
@@ -851,6 +921,86 @@ mod tests {
         assert!(!predicate(PolicyAction::GetObjectAttributes));
         assert!(!predicate(PolicyAction::GetObjectVersionAttributes));
         assert!(predicate(PolicyAction::GetObject));
+    }
+
+    #[test]
+    fn condition_action_status_distinguishes_validation_and_evaluability() {
+        let clause = PolicyConditionClause {
+            operator: "StringEquals".to_string(),
+            key: "s3:ExistingObjectTag/security".to_string(),
+            values: vec!["public".to_string()],
+        };
+
+        assert_eq!(
+            clause_action_status(&clause, PolicyAction::GetObject),
+            ConditionActionStatus::Evaluable
+        );
+        assert_eq!(
+            clause_action_status(&clause, PolicyAction::GetObjectAttributes),
+            ConditionActionStatus::AcceptedButNotEvaluable
+        );
+        assert_eq!(
+            clause_action_status(&clause, PolicyAction::PutObject),
+            ConditionActionStatus::PolicyInvalid
+        );
+    }
+
+    #[test]
+    fn condition_input_requirements_only_apply_to_evaluable_actions() {
+        let clause = PolicyConditionClause {
+            operator: "StringEquals".to_string(),
+            key: "s3:ExistingObjectTag/security".to_string(),
+            values: vec!["public".to_string()],
+        };
+
+        assert!(clause_requires_input_for_action(
+            &clause,
+            PolicyAction::GetObject,
+            ConditionInput::ExistingObject
+        ));
+        assert!(!clause_requires_input_for_action(
+            &clause,
+            PolicyAction::GetObjectAttributes,
+            ConditionInput::ExistingObject
+        ));
+        assert!(!clause_requires_input_for_action(
+            &clause,
+            PolicyAction::PutObject,
+            ConditionInput::ExistingObject
+        ));
+    }
+
+    #[test]
+    fn resolver_table_classifies_condition_inputs() {
+        for key in [
+            "s3:RequestObjectTag/security",
+            "aws:RequestTag/security",
+            "s3:RequestObjectTagKeys",
+            "aws:TagKeys",
+        ] {
+            let clause = PolicyConditionClause {
+                operator: "StringEquals".to_string(),
+                key: key.to_string(),
+                values: vec!["allow".to_string()],
+            };
+            assert_eq!(clause_input(&clause), Some(ConditionInput::Request));
+        }
+
+        for key in ["s3:BucketTag/security", "aws:ResourceTag/security"] {
+            let clause = PolicyConditionClause {
+                operator: "StringEquals".to_string(),
+                key: key.to_string(),
+                values: vec!["allow".to_string()],
+            };
+            assert_eq!(clause_input(&clause), Some(ConditionInput::Bucket));
+        }
+
+        let header_clause = PolicyConditionClause {
+            operator: "StringEquals".to_string(),
+            key: "s3:x-amz-copy-source".to_string(),
+            values: vec!["src/*".to_string()],
+        };
+        assert_eq!(clause_input(&header_clause), None);
     }
 
     #[test]
