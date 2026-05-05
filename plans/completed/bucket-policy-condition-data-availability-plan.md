@@ -1,6 +1,6 @@
 ## Bucket Policy Condition Data Availability Plan
 
-Status: in progress
+Status: complete
 
 ## Goal
 
@@ -447,18 +447,24 @@ CRUD or parser validation.
 Add AWS-facing `s3-tests` that probe `s3:ExistingObjectTag/*` across adjacent
 object actions.
 
+Status:
+
+- complete
+- all priority targets are AWS-pinned and represented in the central
+  condition-key support/evaluability table
+
 Start with the highest-value candidates:
 
-- `PutObject`
-- `GetObjectVersionAttributes`
-- `GetObjectRetention`
-- `GetObjectLegalHold`
-- `PutObjectRetention`
-- `BypassGovernanceRetention`
-- `DeleteObject`
-- `DeleteObjectVersion`
-- `DeleteObjectTagging`
-- `DeleteObjectVersionTagging`
+- `PutObject` (covered; policy-invalid)
+- `GetObjectVersionAttributes` (covered; accepted but non-evaluable)
+- `GetObjectRetention` (covered; policy-invalid)
+- `GetObjectLegalHold` (covered; policy-invalid)
+- `PutObjectRetention` (covered; policy-invalid)
+- `BypassGovernanceRetention` (covered; policy-invalid)
+- `DeleteObject` (covered; policy-invalid)
+- `DeleteObjectVersion` (covered; policy-invalid)
+- `DeleteObjectTagging` (covered; evaluable and matching)
+- `DeleteObjectVersionTagging` (covered; evaluable and matching)
 
 Test shape:
 
@@ -482,13 +488,22 @@ Acceptance criteria:
 Check whether current-version and version-specific actions differ in condition
 evaluability.
 
+Status:
+
+- complete
+- versioned/current-version pairs that differ are now pinned by AWS-facing
+  tests instead of inferred from adjacent actions
+
 Primary pairs:
 
-- `GetObject` vs `GetObjectVersion`
-- `HeadObject` vs `HeadObject` with separate tag-read permission
+- `GetObject` vs `GetObjectVersion` (covered; both evaluable and matching)
+- `HeadObject` vs `HeadObject` with separate tag-read permission (covered;
+  both evaluable and matching)
 - `HeadObjectVersion` vs `HeadObjectVersion` with separate tag-read permission
-- `GetObjectAttributes` vs `GetObjectVersionAttributes`
-- `DeleteObject` vs `DeleteObjectVersion`
+  (covered; both evaluable and matching)
+- `GetObjectAttributes` vs `GetObjectVersionAttributes` (covered; both
+  accepted but non-evaluable)
+- `DeleteObject` vs `DeleteObjectVersion` (covered; both policy-invalid)
 - `DeleteObjectTagging` vs `DeleteObjectVersionTagging` (covered; both are
   evaluable and matching)
 
@@ -569,6 +584,7 @@ evaluability centrally rather than via per-action ad hoc checks.
 
 Status:
 
+- complete
 - first cleanup slice complete:
   - condition-key rows now identify the runtime input family they require
     when evaluable
