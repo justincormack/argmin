@@ -2,6 +2,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use storage::SessionId;
 
+use super::Coordinator;
+
 #[derive(Default, Clone)]
 pub(super) struct ReclamationTestHooks {
     pub(super) target: Option<(String, String)>,
@@ -52,8 +54,6 @@ pub(super) struct StreamAppendTestHooks {
     pub(super) after_prepare: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
-pub(super) static STREAM_APPEND_TEST_HOOKS: OnceLock<Mutex<StreamAppendTestHooks>> =
-    OnceLock::new();
 pub(super) static STREAM_APPEND_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(super) struct ReclamationTestHookGuard;
@@ -66,7 +66,9 @@ impl Drop for ReclamationTestHookGuard {
     }
 }
 
-pub(super) struct StreamAppendTestHookGuard;
+pub(super) struct StreamAppendTestHookGuard {
+    hooks: Arc<Mutex<StreamAppendTestHooks>>,
+}
 
 pub(super) struct BucketPolicyLoadTestHookGuard;
 
@@ -74,9 +76,7 @@ pub(super) struct BucketWriteHandleTestHookGuard;
 
 impl Drop for StreamAppendTestHookGuard {
     fn drop(&mut self) {
-        let hooks =
-            STREAM_APPEND_TEST_HOOKS.get_or_init(|| Mutex::new(StreamAppendTestHooks::default()));
-        *hooks.lock().unwrap() = StreamAppendTestHooks::default();
+        *self.hooks.lock().unwrap() = StreamAppendTestHooks::default();
     }
 }
 
@@ -104,13 +104,16 @@ pub(super) fn install_reclamation_test_hooks(
     ReclamationTestHookGuard
 }
 
-pub(super) fn install_stream_append_test_hooks(
-    hooks: StreamAppendTestHooks,
-) -> StreamAppendTestHookGuard {
-    let slot =
-        STREAM_APPEND_TEST_HOOKS.get_or_init(|| Mutex::new(StreamAppendTestHooks::default()));
-    *slot.lock().unwrap() = hooks;
-    StreamAppendTestHookGuard
+impl Coordinator {
+    pub(super) fn install_stream_append_test_hooks(
+        &self,
+        hooks: StreamAppendTestHooks,
+    ) -> StreamAppendTestHookGuard {
+        *self.shared_caches.stream_append_test_hooks.lock().unwrap() = hooks;
+        StreamAppendTestHookGuard {
+            hooks: Arc::clone(&self.shared_caches.stream_append_test_hooks),
+        }
+    }
 }
 
 pub(super) fn install_bucket_policy_load_test_hooks(
@@ -182,19 +185,26 @@ pub(super) fn maybe_run_multipart_complete_pre_commit_hook(bucket: &str, key: &s
     }
 }
 
-pub(super) fn maybe_run_stream_append_prepare_hook(session_id: &SessionId, segment_index: u32) {
-    let hooks = STREAM_APPEND_TEST_HOOKS
-        .get_or_init(|| Mutex::new(StreamAppendTestHooks::default()))
-        .lock()
-        .unwrap()
-        .clone();
-    if hooks
-        .target
-        .as_ref()
-        .is_some_and(|(session, index)| session == session_id && *index == segment_index)
-    {
-        if let Some(hook) = hooks.after_prepare {
-            hook();
+impl Coordinator {
+    pub(super) fn maybe_run_stream_append_prepare_hook(
+        &self,
+        session_id: &SessionId,
+        segment_index: u32,
+    ) {
+        let hooks = self
+            .shared_caches
+            .stream_append_test_hooks
+            .lock()
+            .unwrap()
+            .clone();
+        if hooks
+            .target
+            .as_ref()
+            .is_some_and(|(session, index)| session == session_id && *index == segment_index)
+        {
+            if let Some(hook) = hooks.after_prepare {
+                hook();
+            }
         }
     }
 }

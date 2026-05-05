@@ -6,7 +6,7 @@ use storage::{
 #[cfg(feature = "deep-tracing")]
 use super::INTERNAL_SEGMENT_SIZE;
 #[cfg(test)]
-use super::{maybe_run_stream_append_prepare_hook, trusted_bucket_name, trusted_object_key};
+use super::{trusted_bucket_name, trusted_object_key};
 use super::{
     ActiveWriteEncryption, BucketSummary, Coordinator, WriteEncryptionRequest, TRACE_TARGET,
 };
@@ -467,7 +467,7 @@ impl Coordinator {
         );
 
         #[cfg(test)]
-        maybe_run_stream_append_prepare_hook(session_id, segment_index);
+        self.maybe_run_stream_append_prepare_hook(session_id, segment_index);
 
         let written_shards = self
             .storage_node

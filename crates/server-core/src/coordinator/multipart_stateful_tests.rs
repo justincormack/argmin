@@ -453,6 +453,7 @@ struct StreamAppendRaceSync {
 }
 
 fn install_stream_append_race_hooks(
+    coord: &Coordinator,
     session_id: &SessionId,
     segment_index: u32,
 ) -> StreamAppendRaceSync {
@@ -462,7 +463,7 @@ fn install_stream_append_race_hooks(
         .unwrap();
     let prepared_barrier = Arc::new(Barrier::new(3));
     let prepared_barrier_hook = Arc::clone(&prepared_barrier);
-    let guard = install_stream_append_test_hooks(StreamAppendTestHooks {
+    let guard = coord.install_stream_append_test_hooks(StreamAppendTestHooks {
         target: Some((session_id.as_str().to_owned(), segment_index)),
         after_prepare: Some(Arc::new(move || {
             prepared_barrier_hook.wait();
@@ -560,7 +561,7 @@ fn run_stream_duplicate_segment_race_invariant_test(pg_count: u32, require_cross
         );
     }
 
-    let sync = install_stream_append_race_hooks(&session_id, 0);
+    let sync = install_stream_append_race_hooks(&admin, &session_id, 0);
     let data_a = b"first-segment".to_vec();
     let data_b = b"second-segment".to_vec();
     let key_a = key.clone();

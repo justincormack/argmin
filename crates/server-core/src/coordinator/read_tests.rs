@@ -207,7 +207,7 @@ fn failed_stream_put_append_commit_cleans_placed_shards() {
     let hook_bucket = bucket.clone();
     let hook_key = key.clone();
     let hook_session_id = session_id.clone();
-    let _guard = install_stream_append_test_hooks(StreamAppendTestHooks {
+    let _guard = coord.install_stream_append_test_hooks(StreamAppendTestHooks {
         target: Some((session_id.as_str().to_owned(), 0)),
         after_prepare: Some(Arc::new(move || {
             hook_storage
@@ -306,7 +306,7 @@ fn failed_stream_put_append_cleanup_failure_traces_allowed_orphan() {
     let hook_bucket = bucket.clone();
     let hook_key = key.clone();
     let hook_session_id = session_id.clone();
-    let _stream_guard = install_stream_append_test_hooks(StreamAppendTestHooks {
+    let _stream_guard = coord.install_stream_append_test_hooks(StreamAppendTestHooks {
         target: Some((session_id.as_str().to_owned(), 0)),
         after_prepare: Some(Arc::new(move || {
             hook_storage

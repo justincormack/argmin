@@ -338,6 +338,8 @@ impl BucketFastPathCache {
 #[derive(Default)]
 pub(super) struct CoordinatorSharedCaches {
     bucket_fast_path: RwLock<BucketFastPathCache>,
+    #[cfg(test)]
+    stream_append_test_hooks: Arc<Mutex<test_hooks::StreamAppendTestHooks>>,
 }
 
 fn shared_caches_for_storage_cluster(
