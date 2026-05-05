@@ -275,7 +275,8 @@ pub(super) fn bucket_policy_decision_for_bucket_loaded_with_tags(
         } else {
             auth::bucket_policy::BucketTags::Unavailable
         },
-    );
+    )
+    .with_absent_request_headers();
     Ok(policy.evaluate(&request))
 }
 
@@ -337,6 +338,7 @@ pub(super) fn bucket_policy_decision_for_loaded_handle_with_context(
             auth::bucket_policy::BucketTags::Unavailable
         },
     )
+    .with_absent_request_headers()
     .with_request_object_tags(&request_tags)
     .with_canned_acl(policy_context.canned_acl)
     .with_grant_read(policy_context.grant_read)

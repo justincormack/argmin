@@ -552,6 +552,16 @@ Status:
     path that did not provide request-tag data
   - `s3:RequestObjectTag/*`, `aws:RequestTag/*`,
     `s3:RequestObjectTagKeys`, and `aws:TagKeys` share that distinction
+- third cleanup slice complete:
+  - scalar request fields now use an explicit available/unavailable state
+  - request-header, list-parameter, object-ownership, and version-ID
+    conditions can distinguish an available-but-absent value from an auth path
+    that did not provide that request field
+  - `s3:ObjectCreationOperation` now uses the same explicit availability
+    distinction
+  - context-less bucket auth paths now explicitly provide available-but-absent
+    request-header context for currently supported bucket-policy header
+    conditions
 
 Implementation goal:
 

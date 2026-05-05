@@ -275,6 +275,32 @@ fn get_bucket_acl_bucket_policy_allow_applies() {
 }
 
 #[test]
+fn get_bucket_acl_bucket_policy_null_request_header_condition_matches_absent_header() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("111122223333", "bucket", false)
+        .unwrap();
+    put_bucket_policy_test(
+        &coord,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetBucketAcl","Resource":"arn:aws:s3:::bucket","Condition":{"Null":{"s3:x-amz-grant-write":"true"}}}]}"#,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+
+    let acl = get_bucket_acl_test(
+        &coord,
+        "bucket",
+        test_helpers::requester("444455556666"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(acl.owner_principal, "111122223333");
+}
+
+#[test]
 fn put_bucket_acl_bucket_policy_allow_applies() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
@@ -415,6 +441,38 @@ fn put_bucket_acl_bucket_policy_grant_read_condition_applies() {
     assert!(acl
         .acl_grants
         .allows_canonical_user(&alt_canonical_id, AclPermission::Read));
+}
+
+#[test]
+fn tag_resource_bucket_policy_null_request_header_condition_matches_absent_header() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("111122223333", "bucket", true)
+        .unwrap();
+    put_bucket_policy_test(
+        &coord,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:TagResource","Resource":"arn:aws:s3:::bucket","Condition":{"Null":{"s3:x-amz-server-side-encryption":"true"}}}]}"#,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+
+    coord
+        .put_bucket_tags_for_tag_resource(&PutBucketTagControlRequest {
+            control: BucketTagControlRequest {
+                bucket: bucket_request_with_expected_owner(
+                    "bucket",
+                    test_helpers::requester("444455556666"),
+                    None,
+                ),
+                account_id: "111122223333",
+            },
+            config: "<Tagging><TagSet><Tag><Key>security</Key><Value>allow</Value></Tag></TagSet></Tagging>",
+            request_tags: &[("security".to_string(), "allow".to_string())],
+        })
+        .unwrap();
 }
 
 #[test]

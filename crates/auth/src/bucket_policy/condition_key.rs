@@ -13,7 +13,8 @@
 use super::condition_op::{self, ActualValue};
 use super::{
     BucketTagValue, ConditionMatchResult, ExistingObjectTagValue, PolicyAction,
-    PolicyConditionClause, PolicyRequest, RequestObjectTagKeysValue, RequestObjectTagValue,
+    PolicyConditionClause, PolicyRequest, RequestBool, RequestField, RequestObjectTagKeysValue,
+    RequestObjectTagValue,
 };
 
 /// Resolved value for a condition key in a given request.
@@ -372,57 +373,57 @@ fn resolve_bucket_tag<'a>(request: &PolicyRequest<'a>, param: &str) -> ResolvedV
 }
 
 fn resolve_copy_source<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
-    option_to_resolved(request.copy_source())
+    request_field_to_resolved(request.copy_source())
 }
 
 fn resolve_metadata_directive<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
-    option_to_resolved(request.metadata_directive())
+    request_field_to_resolved(request.metadata_directive())
 }
 
 fn resolve_canned_acl<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
-    option_to_resolved(request.canned_acl())
+    request_field_to_resolved(request.canned_acl())
 }
 
 fn resolve_server_side_encryption<'a>(
     request: &PolicyRequest<'a>,
     _param: &str,
 ) -> ResolvedValue<'a> {
-    option_to_resolved(request.server_side_encryption())
+    request_field_to_resolved(request.server_side_encryption())
 }
 
 fn resolve_sse_customer_algorithm<'a>(
     request: &PolicyRequest<'a>,
     _param: &str,
 ) -> ResolvedValue<'a> {
-    option_to_resolved(request.sse_customer_algorithm())
+    request_field_to_resolved(request.sse_customer_algorithm())
 }
 
 fn resolve_grant_read<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
-    option_to_resolved(request.grant_read())
+    request_field_to_resolved(request.grant_read())
 }
 
 fn resolve_grant_write<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
-    option_to_resolved(request.grant_write())
+    request_field_to_resolved(request.grant_write())
 }
 
 fn resolve_grant_read_acp<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
-    option_to_resolved(request.grant_read_acp())
+    request_field_to_resolved(request.grant_read_acp())
 }
 
 fn resolve_grant_write_acp<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
-    option_to_resolved(request.grant_write_acp())
+    request_field_to_resolved(request.grant_write_acp())
 }
 
 fn resolve_grant_full_control<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
-    option_to_resolved(request.grant_full_control())
+    request_field_to_resolved(request.grant_full_control())
 }
 
 fn resolve_if_match<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
-    option_to_resolved(request.if_match())
+    request_field_to_resolved(request.if_match())
 }
 
 fn resolve_if_none_match<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
-    option_to_resolved(request.if_none_match())
+    request_field_to_resolved(request.if_none_match())
 }
 
 fn resolve_object_creation_operation<'a>(
@@ -430,22 +431,23 @@ fn resolve_object_creation_operation<'a>(
     _param: &str,
 ) -> ResolvedValue<'a> {
     match request.object_creation_operation() {
-        Some(true) => ResolvedValue::Present("true"),
-        Some(false) => ResolvedValue::Present("false"),
-        None => ResolvedValue::Absent,
+        RequestBool::Unavailable => ResolvedValue::Unavailable,
+        RequestBool::Available(Some(true)) => ResolvedValue::Present("true"),
+        RequestBool::Available(Some(false)) => ResolvedValue::Present("false"),
+        RequestBool::Available(None) => ResolvedValue::Absent,
     }
 }
 
 fn resolve_prefix<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
-    option_to_resolved(request.prefix())
+    request_field_to_resolved(request.prefix())
 }
 
 fn resolve_delimiter<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
-    option_to_resolved(request.delimiter())
+    request_field_to_resolved(request.delimiter())
 }
 
 fn resolve_max_keys<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
-    option_to_resolved(request.max_keys())
+    request_field_to_resolved(request.max_keys())
 }
 
 fn resolve_location_constraint<'a>(
@@ -456,17 +458,18 @@ fn resolve_location_constraint<'a>(
 }
 
 fn resolve_object_ownership<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
-    option_to_resolved(request.object_ownership())
+    request_field_to_resolved(request.object_ownership())
 }
 
 fn resolve_version_id<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
-    option_to_resolved(request.version_id())
+    request_field_to_resolved(request.version_id())
 }
 
-fn option_to_resolved(value: Option<&str>) -> ResolvedValue<'_> {
+fn request_field_to_resolved(value: RequestField<'_>) -> ResolvedValue<'_> {
     match value {
-        Some(value) => ResolvedValue::Present(value),
-        None => ResolvedValue::Absent,
+        RequestField::Unavailable => ResolvedValue::Unavailable,
+        RequestField::Available(Some(value)) => ResolvedValue::Present(value),
+        RequestField::Available(None) => ResolvedValue::Absent,
     }
 }
 

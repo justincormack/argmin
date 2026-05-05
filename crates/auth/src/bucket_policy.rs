@@ -282,6 +282,18 @@ pub enum RequestObjectTags<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestField<'a> {
+    Unavailable,
+    Available(Option<&'a str>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestBool {
+    Unavailable,
+    Available(Option<bool>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PolicyRequest<'a> {
     action: PolicyAction,
     bucket: &'a str,
@@ -292,24 +304,24 @@ pub struct PolicyRequest<'a> {
     bucket_tags: BucketTags<'a>,
     existing_object_tags: ExistingObjectTags<'a>,
     request_object_tags: RequestObjectTags<'a>,
-    copy_source: Option<&'a str>,
-    metadata_directive: Option<&'a str>,
-    canned_acl: Option<&'a str>,
-    server_side_encryption: Option<&'a str>,
-    sse_customer_algorithm: Option<&'a str>,
-    grant_read: Option<&'a str>,
-    grant_write: Option<&'a str>,
-    grant_read_acp: Option<&'a str>,
-    grant_write_acp: Option<&'a str>,
-    grant_full_control: Option<&'a str>,
-    if_match: Option<&'a str>,
-    if_none_match: Option<&'a str>,
-    object_creation_operation: Option<bool>,
-    prefix: Option<&'a str>,
-    delimiter: Option<&'a str>,
-    max_keys: Option<&'a str>,
-    object_ownership: Option<&'a str>,
-    version_id: Option<&'a str>,
+    copy_source: RequestField<'a>,
+    metadata_directive: RequestField<'a>,
+    canned_acl: RequestField<'a>,
+    server_side_encryption: RequestField<'a>,
+    sse_customer_algorithm: RequestField<'a>,
+    grant_read: RequestField<'a>,
+    grant_write: RequestField<'a>,
+    grant_read_acp: RequestField<'a>,
+    grant_write_acp: RequestField<'a>,
+    grant_full_control: RequestField<'a>,
+    if_match: RequestField<'a>,
+    if_none_match: RequestField<'a>,
+    object_creation_operation: RequestBool,
+    prefix: RequestField<'a>,
+    delimiter: RequestField<'a>,
+    max_keys: RequestField<'a>,
+    object_ownership: RequestField<'a>,
+    version_id: RequestField<'a>,
 }
 
 impl<'a> PolicyRequest<'a> {
@@ -332,24 +344,24 @@ impl<'a> PolicyRequest<'a> {
             bucket_tags: BucketTags::Unavailable,
             existing_object_tags,
             request_object_tags: RequestObjectTags::Unavailable,
-            copy_source: None,
-            metadata_directive: None,
-            canned_acl: None,
-            server_side_encryption: None,
-            sse_customer_algorithm: None,
-            grant_read: None,
-            grant_write: None,
-            grant_read_acp: None,
-            grant_write_acp: None,
-            grant_full_control: None,
-            if_match: None,
-            if_none_match: None,
-            object_creation_operation: None,
-            prefix: None,
-            delimiter: None,
-            max_keys: None,
-            object_ownership: None,
-            version_id: None,
+            copy_source: RequestField::Unavailable,
+            metadata_directive: RequestField::Unavailable,
+            canned_acl: RequestField::Unavailable,
+            server_side_encryption: RequestField::Unavailable,
+            sse_customer_algorithm: RequestField::Unavailable,
+            grant_read: RequestField::Unavailable,
+            grant_write: RequestField::Unavailable,
+            grant_read_acp: RequestField::Unavailable,
+            grant_write_acp: RequestField::Unavailable,
+            grant_full_control: RequestField::Unavailable,
+            if_match: RequestField::Unavailable,
+            if_none_match: RequestField::Unavailable,
+            object_creation_operation: RequestBool::Unavailable,
+            prefix: RequestField::Unavailable,
+            delimiter: RequestField::Unavailable,
+            max_keys: RequestField::Unavailable,
+            object_ownership: RequestField::Unavailable,
+            version_id: RequestField::Unavailable,
         }
     }
 
@@ -371,24 +383,24 @@ impl<'a> PolicyRequest<'a> {
             bucket_tags,
             existing_object_tags: ExistingObjectTags::Unavailable,
             request_object_tags: RequestObjectTags::Unavailable,
-            copy_source: None,
-            metadata_directive: None,
-            canned_acl: None,
-            server_side_encryption: None,
-            sse_customer_algorithm: None,
-            grant_read: None,
-            grant_write: None,
-            grant_read_acp: None,
-            grant_write_acp: None,
-            grant_full_control: None,
-            if_match: None,
-            if_none_match: None,
-            object_creation_operation: None,
-            prefix: None,
-            delimiter: None,
-            max_keys: None,
-            object_ownership: None,
-            version_id: None,
+            copy_source: RequestField::Unavailable,
+            metadata_directive: RequestField::Unavailable,
+            canned_acl: RequestField::Unavailable,
+            server_side_encryption: RequestField::Unavailable,
+            sse_customer_algorithm: RequestField::Unavailable,
+            grant_read: RequestField::Unavailable,
+            grant_write: RequestField::Unavailable,
+            grant_read_acp: RequestField::Unavailable,
+            grant_write_acp: RequestField::Unavailable,
+            grant_full_control: RequestField::Unavailable,
+            if_match: RequestField::Unavailable,
+            if_none_match: RequestField::Unavailable,
+            object_creation_operation: RequestBool::Unavailable,
+            prefix: RequestField::Unavailable,
+            delimiter: RequestField::Unavailable,
+            max_keys: RequestField::Unavailable,
+            object_ownership: RequestField::Unavailable,
+            version_id: RequestField::Unavailable,
         }
     }
 
@@ -465,73 +477,90 @@ impl<'a> PolicyRequest<'a> {
 
     #[must_use]
     pub fn with_copy_source(mut self, copy_source: Option<&'a str>) -> Self {
-        self.copy_source = copy_source;
+        self.copy_source = RequestField::Available(copy_source);
         self
     }
 
     #[must_use]
     pub fn with_metadata_directive(mut self, metadata_directive: Option<&'a str>) -> Self {
-        self.metadata_directive = metadata_directive;
+        self.metadata_directive = RequestField::Available(metadata_directive);
         self
     }
 
     #[must_use]
     pub fn with_canned_acl(mut self, canned_acl: Option<&'a str>) -> Self {
-        self.canned_acl = canned_acl;
+        self.canned_acl = RequestField::Available(canned_acl);
         self
     }
 
     #[must_use]
     pub fn with_server_side_encryption(mut self, server_side_encryption: Option<&'a str>) -> Self {
-        self.server_side_encryption = server_side_encryption;
+        self.server_side_encryption = RequestField::Available(server_side_encryption);
         self
     }
 
     #[must_use]
     pub fn with_sse_customer_algorithm(mut self, sse_customer_algorithm: Option<&'a str>) -> Self {
-        self.sse_customer_algorithm = sse_customer_algorithm;
+        self.sse_customer_algorithm = RequestField::Available(sse_customer_algorithm);
         self
     }
 
     #[must_use]
     pub fn with_grant_read(mut self, grant_read: Option<&'a str>) -> Self {
-        self.grant_read = grant_read;
+        self.grant_read = RequestField::Available(grant_read);
         self
     }
 
     #[must_use]
     pub fn with_grant_write(mut self, grant_write: Option<&'a str>) -> Self {
-        self.grant_write = grant_write;
+        self.grant_write = RequestField::Available(grant_write);
         self
     }
 
     #[must_use]
     pub fn with_grant_read_acp(mut self, grant_read_acp: Option<&'a str>) -> Self {
-        self.grant_read_acp = grant_read_acp;
+        self.grant_read_acp = RequestField::Available(grant_read_acp);
         self
     }
 
     #[must_use]
     pub fn with_grant_write_acp(mut self, grant_write_acp: Option<&'a str>) -> Self {
-        self.grant_write_acp = grant_write_acp;
+        self.grant_write_acp = RequestField::Available(grant_write_acp);
         self
     }
 
     #[must_use]
     pub fn with_grant_full_control(mut self, grant_full_control: Option<&'a str>) -> Self {
-        self.grant_full_control = grant_full_control;
+        self.grant_full_control = RequestField::Available(grant_full_control);
         self
     }
 
     #[must_use]
     pub fn with_if_match(mut self, if_match: Option<&'a str>) -> Self {
-        self.if_match = if_match;
+        self.if_match = RequestField::Available(if_match);
         self
     }
 
     #[must_use]
     pub fn with_if_none_match(mut self, if_none_match: Option<&'a str>) -> Self {
-        self.if_none_match = if_none_match;
+        self.if_none_match = RequestField::Available(if_none_match);
+        self
+    }
+
+    #[must_use]
+    pub fn with_absent_request_headers(mut self) -> Self {
+        self.copy_source = RequestField::Available(None);
+        self.metadata_directive = RequestField::Available(None);
+        self.canned_acl = RequestField::Available(None);
+        self.server_side_encryption = RequestField::Available(None);
+        self.sse_customer_algorithm = RequestField::Available(None);
+        self.grant_read = RequestField::Available(None);
+        self.grant_write = RequestField::Available(None);
+        self.grant_read_acp = RequestField::Available(None);
+        self.grant_write_acp = RequestField::Available(None);
+        self.grant_full_control = RequestField::Available(None);
+        self.if_match = RequestField::Available(None);
+        self.if_none_match = RequestField::Available(None);
         self
     }
 
@@ -540,62 +569,62 @@ impl<'a> PolicyRequest<'a> {
         mut self,
         object_creation_operation: Option<bool>,
     ) -> Self {
-        self.object_creation_operation = object_creation_operation;
+        self.object_creation_operation = RequestBool::Available(object_creation_operation);
         self
     }
 
     #[must_use]
     pub fn with_prefix(mut self, prefix: Option<&'a str>) -> Self {
-        self.prefix = prefix;
+        self.prefix = RequestField::Available(prefix);
         self
     }
 
     #[must_use]
     pub fn with_delimiter(mut self, delimiter: Option<&'a str>) -> Self {
-        self.delimiter = delimiter;
+        self.delimiter = RequestField::Available(delimiter);
         self
     }
 
     #[must_use]
     pub fn with_max_keys(mut self, max_keys: Option<&'a str>) -> Self {
-        self.max_keys = max_keys;
+        self.max_keys = RequestField::Available(max_keys);
         self
     }
 
     #[must_use]
     pub fn with_object_ownership(mut self, object_ownership: Option<&'a str>) -> Self {
-        self.object_ownership = object_ownership;
+        self.object_ownership = RequestField::Available(object_ownership);
         self
     }
 
     #[must_use]
     pub fn with_version_id(mut self, version_id: Option<&'a str>) -> Self {
-        self.version_id = version_id;
+        self.version_id = RequestField::Available(version_id);
         self
     }
 
     #[must_use]
-    fn copy_source(&self) -> Option<&'a str> {
+    fn copy_source(&self) -> RequestField<'a> {
         self.copy_source
     }
 
     #[must_use]
-    fn metadata_directive(&self) -> Option<&'a str> {
+    fn metadata_directive(&self) -> RequestField<'a> {
         self.metadata_directive
     }
 
     #[must_use]
-    fn canned_acl(&self) -> Option<&'a str> {
+    fn canned_acl(&self) -> RequestField<'a> {
         self.canned_acl
     }
 
     #[must_use]
-    fn server_side_encryption(&self) -> Option<&'a str> {
+    fn server_side_encryption(&self) -> RequestField<'a> {
         self.server_side_encryption
     }
 
     #[must_use]
-    fn sse_customer_algorithm(&self) -> Option<&'a str> {
+    fn sse_customer_algorithm(&self) -> RequestField<'a> {
         self.sse_customer_algorithm
     }
 
@@ -610,67 +639,67 @@ impl<'a> PolicyRequest<'a> {
     }
 
     #[must_use]
-    fn grant_read(&self) -> Option<&'a str> {
+    fn grant_read(&self) -> RequestField<'a> {
         self.grant_read
     }
 
     #[must_use]
-    fn grant_write(&self) -> Option<&'a str> {
+    fn grant_write(&self) -> RequestField<'a> {
         self.grant_write
     }
 
     #[must_use]
-    fn grant_read_acp(&self) -> Option<&'a str> {
+    fn grant_read_acp(&self) -> RequestField<'a> {
         self.grant_read_acp
     }
 
     #[must_use]
-    fn grant_write_acp(&self) -> Option<&'a str> {
+    fn grant_write_acp(&self) -> RequestField<'a> {
         self.grant_write_acp
     }
 
     #[must_use]
-    fn grant_full_control(&self) -> Option<&'a str> {
+    fn grant_full_control(&self) -> RequestField<'a> {
         self.grant_full_control
     }
 
     #[must_use]
-    fn if_match(&self) -> Option<&'a str> {
+    fn if_match(&self) -> RequestField<'a> {
         self.if_match
     }
 
     #[must_use]
-    fn if_none_match(&self) -> Option<&'a str> {
+    fn if_none_match(&self) -> RequestField<'a> {
         self.if_none_match
     }
 
     #[must_use]
-    fn object_creation_operation(&self) -> Option<bool> {
+    fn object_creation_operation(&self) -> RequestBool {
         self.object_creation_operation
     }
 
     #[must_use]
-    fn prefix(&self) -> Option<&'a str> {
+    fn prefix(&self) -> RequestField<'a> {
         self.prefix
     }
 
     #[must_use]
-    fn delimiter(&self) -> Option<&'a str> {
+    fn delimiter(&self) -> RequestField<'a> {
         self.delimiter
     }
 
     #[must_use]
-    fn max_keys(&self) -> Option<&'a str> {
+    fn max_keys(&self) -> RequestField<'a> {
         self.max_keys
     }
 
     #[must_use]
-    fn object_ownership(&self) -> Option<&'a str> {
+    fn object_ownership(&self) -> RequestField<'a> {
         self.object_ownership
     }
 
     #[must_use]
-    fn version_id(&self) -> Option<&'a str> {
+    fn version_id(&self) -> RequestField<'a> {
         self.version_id
     }
 }
@@ -2752,7 +2781,8 @@ mod tests {
             Some("caller"),
             None,
             ExistingObjectTags::Unavailable,
-        );
+        )
+        .with_grant_full_control(None);
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
     }
@@ -2808,7 +2838,8 @@ mod tests {
             Some("caller"),
             None,
             ExistingObjectTags::Unavailable,
-        );
+        )
+        .with_sse_customer_algorithm(None);
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
     }
@@ -2864,9 +2895,78 @@ mod tests {
             Some("caller"),
             None,
             ExistingObjectTags::Unavailable,
-        );
+        )
+        .with_server_side_encryption(None);
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
+    }
+
+    #[test]
+    fn request_field_unavailable_input_is_distinct_from_missing_header() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"s3:x-amz-server-side-encryption":"true"}}}]}"#,
+        )
+        .unwrap();
+        let unavailable_request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        );
+        let missing_header_request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_server_side_encryption(None);
+
+        assert_eq!(
+            policy.statements[0].condition_match_result(&unavailable_request),
+            ConditionMatchResult::InputUnavailable
+        );
+        assert_eq!(
+            policy.statements[0].condition_match_result(&missing_header_request),
+            ConditionMatchResult::Matches
+        );
+    }
+
+    #[test]
+    fn object_creation_operation_unavailable_input_is_distinct_from_absent_value() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"Bool":{"s3:ObjectCreationOperation":"true"}}}]}"#,
+        )
+        .unwrap();
+        let unavailable_request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        );
+        let absent_request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_object_creation_operation(None);
+
+        assert_eq!(
+            policy.statements[0].condition_match_result(&unavailable_request),
+            ConditionMatchResult::InputUnavailable
+        );
+        assert_eq!(
+            policy.statements[0].condition_match_result(&absent_request),
+            ConditionMatchResult::NoMatch
+        );
     }
 
     #[test]
@@ -2997,7 +3097,8 @@ mod tests {
             Some("caller"),
             None,
             ExistingObjectTags::Unavailable,
-        );
+        )
+        .with_copy_source(None);
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
         assert_eq!(policy.validate_evaluable_object_conditions(), Ok(()));
