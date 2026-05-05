@@ -1544,34 +1544,24 @@ impl StorageCluster {
                 };
             if has_abandoned_log {
                 if is_matching_direct_put {
-                    if let Err(error) =
-                        self.record_abandoned_metadata_command_to_acting_set(&command)
-                    {
-                        let error = bucket_snapshot_error_to_object_pg_action_error(error.source);
-                        drop(_bucket_guard);
-                        self.release_object_generation_reservation_after_pending_drain_best_effort(
-                            pg_id,
-                            &req.bucket,
-                            &req.key,
-                            &req.generation_reservation_id,
-                        );
-                        self.delete_direct_put_segment_payload_shards(
-                            req.data_pg_id,
-                            req.ec,
-                            &req.segment_okh,
-                            req.segment_vid,
-                            written_shards,
-                        );
-                        return Err(error);
-                    }
-                    runtime_state.remove_pending_metadata_command_for_bucket(pg_id, &req.bucket);
-                    drop(_bucket_guard);
-                    self.release_object_generation_reservation_after_pending_drain_best_effort(
+                    let error = match self.finish_pending_object_metadata_command_for_bucket(
                         pg_id,
                         &req.bucket,
-                        &req.key,
-                        &req.generation_reservation_id,
-                    );
+                        &command,
+                    ) {
+                        Ok(PendingMetadataCommandOutcome::Applied) => {
+                            unreachable!(
+                                "already-classified abandoned metadata command was applied"
+                            )
+                        }
+                        Ok(PendingMetadataCommandOutcome::Abandoned) => {
+                            conflicting_pending_object_metadata_command(
+                                "abandoned pending command for direct put commit",
+                            )
+                        }
+                        Err(error) => error,
+                    };
+                    drop(_bucket_guard);
                     self.delete_direct_put_segment_payload_shards(
                         req.data_pg_id,
                         req.ec,
@@ -1579,9 +1569,7 @@ impl StorageCluster {
                         req.segment_vid,
                         written_shards,
                     );
-                    return Err(conflicting_pending_object_metadata_command(
-                        "abandoned pending command for direct put commit",
-                    ));
+                    return Err(error);
                 }
                 match self.finish_pending_object_metadata_command_for_bucket(
                     pg_id,
