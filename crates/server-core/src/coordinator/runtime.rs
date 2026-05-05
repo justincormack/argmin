@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use s3_types::BucketLifecycleConfiguration;
 use storage::{
-    BucketInfo, BucketName, EcShape, GenerationId, ObjectEncryption, ObjectKey,
-    SegmentStoredBytesRequest, StorageCluster, UploadId, UploadState, VersionId,
+    AuthorizedMultipartUploadRecord, BucketInfo, BucketName, EcShape, GenerationId,
+    ObjectEncryption, ObjectKey, SegmentStoredBytesRequest, StorageCluster, UploadId, UploadState,
+    VersionId,
 };
 
 use super::payload::SharedPayloadBuffer;
@@ -624,6 +625,15 @@ impl ReadRuntime {
     ) -> Result<bool, ServerError> {
         self.storage_node
             .abort_multipart_upload(bucket, key, upload_id)
+            .map_err(Coordinator::map_object_pg_action_error)
+    }
+
+    pub(super) fn abort_authorized_multipart_upload_internal(
+        &self,
+        upload: &AuthorizedMultipartUploadRecord,
+    ) -> Result<bool, ServerError> {
+        self.storage_node
+            .abort_authorized_multipart_upload(upload)
             .map_err(Coordinator::map_object_pg_action_error)
     }
 

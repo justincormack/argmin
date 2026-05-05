@@ -2779,6 +2779,34 @@ pub struct MultipartUploadRecord {
     pub encryption: ObjectEncryption,
 }
 
+/// Multipart upload record that has already passed caller authorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedMultipartUploadRecord {
+    upload: MultipartUploadRecord,
+}
+
+impl AuthorizedMultipartUploadRecord {
+    pub fn assume_authorized(upload: MultipartUploadRecord) -> Self {
+        Self { upload }
+    }
+
+    pub fn record(&self) -> &MultipartUploadRecord {
+        &self.upload
+    }
+
+    pub fn into_record(self) -> MultipartUploadRecord {
+        self.upload
+    }
+}
+
+impl std::ops::Deref for AuthorizedMultipartUploadRecord {
+    type Target = MultipartUploadRecord;
+
+    fn deref(&self) -> &Self::Target {
+        &self.upload
+    }
+}
+
 /// Completed multipart upload record retained for AbortMultipartUpload semantics.
 #[derive(Debug, Clone)]
 pub struct CompletedMultipartUploadRecord {

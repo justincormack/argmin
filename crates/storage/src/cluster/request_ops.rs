@@ -4316,7 +4316,7 @@ impl super::StorageCluster {
         upload_id: &UploadId,
         part_number: u32,
         session_id: &SessionId,
-        action: impl FnOnce(&MultipartUploadRecord) -> Result<T, E>,
+        action: impl FnOnce(&MultipartUploadRecord) -> Result<(AuthorizedMultipartUploadRecord, T), E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
@@ -4332,9 +4332,16 @@ impl super::StorageCluster {
                 },
             ));
         }
-        let result = action(&upload);
-        if result.is_err() {
-            return Ok(result);
+        let (authorized_upload, result) = match action(&upload) {
+            Ok((authorized_upload, result)) => (authorized_upload, result),
+            Err(error) => return Ok(Err(error)),
+        };
+        if authorized_upload.record() != &upload {
+            return Err(BucketSnapshotLoadError::Metadata(
+                MetadataError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                },
+            ));
         }
         let create = CreateStreamUploadReq {
             session_id: session_id.clone(),
@@ -4351,7 +4358,7 @@ impl super::StorageCluster {
             .matching_stream_upload_exists(pg_id, &create)
             .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
         {
-            return Ok(result);
+            return Ok(Ok(result));
         }
         let command = MetadataCommandEnvelope::new(
             self.next_object_metadata_command_id(pg_id),
@@ -4369,27 +4376,25 @@ impl super::StorageCluster {
         .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
         self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
             .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-        Ok(result)
+        Ok(Ok(result))
     }
 
     pub fn create_upload_part_stream_session(
         &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
         part_number: u32,
         session_id: &SessionId,
     ) -> Result<SessionId, ObjectPgActionError> {
+        let bucket = &authorized_upload.record().bucket;
+        let key = &authorized_upload.record().key;
+        let upload_id = &authorized_upload.record().upload_id;
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         loop {
             self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
             let primary_node = self.object_metadata_primary_node(bucket, key)?;
             let object_pg = primary_node.get_pg(pg_id.get())?;
             let upload = PgMetadataStore::get_multipart_upload(&*object_pg, upload_id)?;
-            if upload.bucket != *bucket
-                || upload.key != *key
-                || upload.state != UploadState::InProgress
-            {
+            if upload != *authorized_upload.record() || upload.state != UploadState::InProgress {
                 return Err(MetadataError::NoSuchUpload {
                     upload_id: upload_id.to_string(),
                 }
@@ -4466,23 +4471,25 @@ impl super::StorageCluster {
 
     pub fn load_multipart_completion_snapshot(
         &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
         requested_part_numbers: &[u32],
     ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .load_multipart_completion_snapshot(bucket, key, upload_id, requested_part_numbers)
+        self.object_metadata_primary_node(
+            &authorized_upload.record().bucket,
+            &authorized_upload.record().key,
+        )?
+        .load_multipart_completion_snapshot(authorized_upload, requested_part_numbers)
     }
 
     pub fn load_multipart_completion_preflight(
         &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
     ) -> Result<MultipartCompletionPreflight, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .load_multipart_completion_preflight(bucket, key, upload_id)
+        self.object_metadata_primary_node(
+            &authorized_upload.record().bucket,
+            &authorized_upload.record().key,
+        )?
+        .load_multipart_completion_preflight(authorized_upload)
     }
 
     fn complete_multipart_outcome_from_command(
@@ -5088,16 +5095,19 @@ impl super::StorageCluster {
 
     pub fn list_multipart_parts_for_authorized_upload(
         &self,
-        authorized_upload: &MultipartUploadRecord,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
         part_number_marker: Option<u32>,
         max_parts: u32,
     ) -> Result<ListedMultipartParts, ObjectPgActionError> {
-        self.object_metadata_primary_node(&authorized_upload.bucket, &authorized_upload.key)?
-            .list_multipart_parts_for_authorized_upload(
-                authorized_upload,
-                part_number_marker,
-                max_parts,
-            )
+        self.object_metadata_primary_node(
+            &authorized_upload.record().bucket,
+            &authorized_upload.record().key,
+        )?
+        .list_multipart_parts_for_authorized_upload(
+            authorized_upload,
+            part_number_marker,
+            max_parts,
+        )
     }
 
     pub fn lookup_multipart_upload_management(
@@ -5158,6 +5168,55 @@ impl super::StorageCluster {
         }
     }
 
+    pub fn abort_authorized_multipart_upload(
+        &self,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+    ) -> Result<bool, ObjectPgActionError> {
+        let bucket = &authorized_upload.record().bucket;
+        let key = &authorized_upload.record().key;
+        let upload_id = &authorized_upload.record().upload_id;
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let runtime_state = self.local_map.runtime_state();
+        'retry_after_pending_conflict: loop {
+            while let Some(command) =
+                runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                let matching_abort = matches!(
+                    command.payload(),
+                    MetadataCommandPayload::AbortMultipartUpload(abort)
+                        if abort.bucket == *bucket
+                            && abort.key == *key
+                            && abort.upload_id == *upload_id
+                );
+                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                if matching_abort {
+                    return Ok(true);
+                }
+            }
+
+            let Some(command) =
+                self.prepare_authorized_abort_multipart_upload_command(pg_id, authorized_upload)?
+            else {
+                return Ok(false);
+            };
+            let MetadataCommandPayload::AbortMultipartUpload(_) = command.payload() else {
+                unreachable!("prepared abort multipart command changed payload kind");
+            };
+            #[cfg(test)]
+            maybe_run_before_abort_multipart_pending_install_hook(
+                self.metadata_command_apply_test_hook_scope_id(),
+            );
+            if runtime_state
+                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
+                .is_err()
+            {
+                continue 'retry_after_pending_conflict;
+            }
+            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            return Ok(true);
+        }
+    }
+
     fn prepare_abort_multipart_upload_command(
         &self,
         pg_id: PgId,
@@ -5181,6 +5240,35 @@ impl super::StorageCluster {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 upload_id: upload_id.clone(),
+                cleanup,
+            })),
+        )))
+    }
+
+    fn prepare_authorized_abort_multipart_upload_command(
+        &self,
+        pg_id: PgId,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        let primary_node = self.object_metadata_primary_node(
+            &authorized_upload.record().bucket,
+            &authorized_upload.record().key,
+        )?;
+        let cleanup = {
+            let object_pg = primary_node.get_pg(pg_id.get())?;
+            object_pg.prepare_authorized_abort_multipart_upload_cleanup(authorized_upload)?
+        };
+        let cleanup = match cleanup {
+            Some(cleanup) => cleanup,
+            None => return Ok(None),
+        };
+
+        Ok(Some(MetadataCommandEnvelope::new(
+            self.next_object_metadata_command_id(pg_id),
+            MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
+                bucket: authorized_upload.record().bucket.clone(),
+                key: authorized_upload.record().key.clone(),
+                upload_id: authorized_upload.record().upload_id.clone(),
                 cleanup,
             })),
         )))

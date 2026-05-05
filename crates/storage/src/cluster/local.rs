@@ -5366,8 +5366,15 @@ mod tests {
             .unwrap();
 
         let session_id = crate::SessionId::try_from("0123456789abcdef0123456789abcdef").unwrap();
+        let upload = cluster
+            .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
+            .unwrap();
         cluster
-            .create_upload_part_stream_session(&bucket, &key, &upload_id, 1, &session_id)
+            .create_upload_part_stream_session(
+                &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+                1,
+                &session_id,
+            )
             .unwrap();
 
         let _serial = lock_metadata_command_apply_hook_test();
@@ -6752,8 +6759,15 @@ mod tests {
             .unwrap();
 
         let session_id = crate::SessionId::try_from("43".repeat(16)).unwrap();
+        let upload = cluster
+            .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
+            .unwrap();
         cluster
-            .create_upload_part_stream_session(&bucket, &key, &upload_id, 1, &session_id)
+            .create_upload_part_stream_session(
+                &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+                1,
+                &session_id,
+            )
             .unwrap();
 
         let payload = b"streamed multipart command part";
@@ -6964,8 +6978,15 @@ mod tests {
         ));
 
         let session_id = crate::SessionId::try_from("44".repeat(16)).unwrap();
+        let upload = cluster
+            .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
+            .unwrap();
         let err = cluster
-            .create_upload_part_stream_session(&bucket, &key, &upload_id, 1, &session_id)
+            .create_upload_part_stream_session(
+                &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+                1,
+                &session_id,
+            )
             .unwrap_err();
         drop(hook_guard);
 

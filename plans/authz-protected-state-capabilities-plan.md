@@ -15,6 +15,21 @@ Current slice:
   an explicit AWS compatibility difference
 - ListParts now receives an `AuthorizedListParts` capability from authz instead
   of performing the protected upload-management lookup in the operation path
+- AbortMultipartUpload now receives an `AuthorizedAbortMultipartUpload`
+  capability carrying the authorized in-progress upload snapshot; the storage
+  abort helper consumes that snapshot and rejects if the upload changed before
+  abort is prepared
+- UploadPart stream-session creation now requires authz to return an
+  `AuthorizedMultipartUploadRecord`; storage revalidates that token before
+  installing the stream session
+- UploadPartCopy stream-session creation now consumes the authorized
+  multipart-upload snapshot instead of raw bucket/key/upload ID fields
+- CompleteMultipartUpload preflight and part snapshots now consume the
+  authorized multipart-upload snapshot instead of raw bucket/key/upload ID
+  fields
+- protected multipart storage helpers now require the nominal
+  `AuthorizedMultipartUploadRecord` wrapper rather than accepting a plain
+  `MultipartUploadRecord`
 - added AWS-pinned multipart abort lifecycle tests:
   - aborting an upload with completed parts makes `ListParts` return
     `NoSuchUpload`
@@ -92,11 +107,14 @@ upload state before deciding whether the caller may see that upload at all.
 
 Audit and refactor:
 
-- `UploadPart`
-- `UploadPartCopy`
-- `CompleteMultipartUpload`
-- `AbortMultipartUpload` (first pass complete for active-upload visibility)
-- `ListParts` (first pass complete for active-upload visibility)
+- `UploadPart` (first pass complete for authorized-upload session creation)
+- `UploadPartCopy` (first pass complete for authorized-upload session creation)
+- `CompleteMultipartUpload` (first pass complete for preflight and part
+  snapshots)
+- `AbortMultipartUpload` (first pass complete for active-upload visibility and
+  authorized-upload abort)
+- `ListParts` (first pass complete for active-upload visibility and
+  authorized-upload listing)
 
 Questions to lock down against AWS:
 

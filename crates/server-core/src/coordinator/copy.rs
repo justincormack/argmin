@@ -490,7 +490,7 @@ impl Coordinator {
         let session_id = Self::random_session_id("failed to generate session ID")?;
         let session_id = self
             .storage_node
-            .create_upload_part_stream_session(&bucket, &key, &upload_id, part_number, &session_id)
+            .create_upload_part_stream_session(&upload, part_number, &session_id)
             .map_err(Self::map_object_pg_action_error)?;
         let session = BeginStreamPartResult {
             session_id,

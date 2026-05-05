@@ -580,7 +580,7 @@ impl Coordinator {
                 key: req.upload.key_typed().clone(),
                 upload_id: dst_upload.upload_id.clone(),
                 part_number,
-                upload: dst_upload,
+                upload: storage::AuthorizedMultipartUploadRecord::assume_authorized(dst_upload),
                 sse_customer,
             },
         })
@@ -636,7 +636,7 @@ impl Coordinator {
             key: key.clone(),
             upload_id: upload.upload_id.clone(),
             part_number,
-            upload: upload.clone(),
+            upload: storage::AuthorizedMultipartUploadRecord::assume_authorized(upload.clone()),
             sse_customer,
         })
     }
@@ -723,7 +723,7 @@ impl Coordinator {
             bucket: req.upload.bucket_name_typed().clone(),
             key: req.upload.key_typed().clone(),
             upload_id: upload.upload_id.clone(),
-            upload,
+            upload: storage::AuthorizedMultipartUploadRecord::assume_authorized(upload),
             multipart_write_encryption,
         })
     }
@@ -752,9 +752,9 @@ impl Coordinator {
                     return Err(ServerError::AccessDenied);
                 }
                 AuthorizedAbortMultipartUpload::InProgress {
-                    bucket: req.bucket_name_typed().clone(),
-                    key: req.key_typed().clone(),
-                    upload_id: upload_id.clone(),
+                    upload: Box::new(storage::AuthorizedMultipartUploadRecord::assume_authorized(
+                        upload,
+                    )),
                 }
             }
             storage::MultipartUploadManagementLookup::NonInProgress(upload) => {
@@ -812,7 +812,7 @@ impl Coordinator {
                 }
                 Ok(AuthorizedListParts {
                     bucket_info: bucket_info.into_inner(),
-                    upload: *upload,
+                    upload: storage::AuthorizedMultipartUploadRecord::assume_authorized(*upload),
                 })
             }
             storage::MultipartUploadManagementLookup::NonInProgress(upload) => {

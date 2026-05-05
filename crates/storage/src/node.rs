@@ -23,13 +23,13 @@ use crate::pg_store::PgStore;
 use crate::pg_topology::PgTopology;
 use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 use crate::types::{
-    BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
-    BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind, EcShape, GenerationId,
-    ListMultipartUploadsReq, ListObjectVersionsReq, ListPartsReq, ListedMultipartParts,
-    LoadedBucketSubresource, MultipartCompletionPreflight, MultipartCompletionSnapshot,
-    MultipartUploadManagementLookup, MultipartUploadRecord, ObjectKey, ObjectReadSnapshot,
-    ObjectReadSnapshotOutcome, SessionId, ShardKey, StoredObject, StreamUploadState,
-    StreamUploadTarget, UploadId, UploadState, WriteAck,
+    AuthorizedMultipartUploadRecord, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
+    BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind, EcShape,
+    GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq, ListPartsReq,
+    ListedMultipartParts, LoadedBucketSubresource, MultipartCompletionPreflight,
+    MultipartCompletionSnapshot, MultipartUploadManagementLookup, MultipartUploadRecord, ObjectKey,
+    ObjectReadSnapshot, ObjectReadSnapshotOutcome, SessionId, ShardKey, StoredObject,
+    StreamUploadState, StreamUploadTarget, UploadId, UploadState, WriteAck,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::types::{

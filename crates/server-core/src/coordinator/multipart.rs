@@ -146,14 +146,19 @@ impl Coordinator {
                                     &bucket_handle,
                                     upload,
                                 )?;
-                                Ok::<_, ServerError>(BeginStreamPartResult {
+                                let checksum_algorithm = authorized
+                                    .upload
+                                    .checksum
+                                    .map(MultipartChecksumConfig::algorithm);
+                                let authorized_upload = authorized.upload;
+                                Ok::<_, ServerError>((
+                                    authorized_upload,
+                                    BeginStreamPartResult {
                                     session_id: session_id.clone(),
-                                    checksum_algorithm: authorized
-                                        .upload
-                                        .checksum
-                                        .map(MultipartChecksumConfig::algorithm),
+                                    checksum_algorithm,
                                     sse_customer: authorized.sse_customer,
-                                })
+                                    },
+                                ))
                             },
                         )
                         .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
@@ -302,7 +307,7 @@ impl Coordinator {
         let expected_object_size = req.expected_object_size;
         let completion_preflight = self
             .storage_node
-            .load_multipart_completion_preflight(&bucket, &key, &upload_id)
+            .load_multipart_completion_preflight(&upload)
             .map_err(Coordinator::map_object_pg_action_error)?;
 
         if !req.cond.is_empty() {
@@ -335,16 +340,15 @@ impl Coordinator {
         }
 
         let requested_part_numbers: Vec<u32> = parts.iter().map(|part| part.part_number).collect();
-        let completion_snapshot = self
-            .storage_node
-            .load_multipart_completion_snapshot(&bucket, &key, &upload_id, &requested_part_numbers)
-            .map_err(|error| match error {
-                storage::ObjectPgActionError::Metadata(storage::MetadataError::PartNotFound {
-                    part_number,
-                    ..
-                }) => ServerError::InvalidPart { part_number },
-                other => Coordinator::map_object_pg_action_error(other),
-            })?;
+        let completion_snapshot =
+            self.storage_node
+                .load_multipart_completion_snapshot(&upload, &requested_part_numbers)
+                .map_err(|error| match error {
+                    storage::ObjectPgActionError::Metadata(
+                        storage::MetadataError::PartNotFound { part_number, .. },
+                    ) => ServerError::InvalidPart { part_number },
+                    other => Coordinator::map_object_pg_action_error(other),
+                })?;
 
         let checksum_algo = upload.checksum.map(MultipartChecksumConfig::algorithm);
         let checksum_type = upload.checksum.map(MultipartChecksumConfig::checksum_type);
@@ -690,19 +694,15 @@ impl Coordinator {
         );
         match self.authorize_abort_multipart_upload(req)? {
             AuthorizedAbortMultipartUpload::Completed => Ok(()),
-            AuthorizedAbortMultipartUpload::InProgress {
-                bucket,
-                key,
-                upload_id,
-            } => {
+            AuthorizedAbortMultipartUpload::InProgress { upload } => {
                 if self
                     .read_runtime()
-                    .abort_multipart_upload_internal_for(&bucket, &key, &upload_id)?
+                    .abort_authorized_multipart_upload_internal(&upload)?
                 {
                     Ok(())
                 } else {
                     Err(ServerError::NoSuchUpload {
-                        upload_id: upload_id.to_string(),
+                        upload_id: upload.upload_id.to_string(),
                     })
                 }
             }

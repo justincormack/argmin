@@ -12,8 +12,8 @@ use crate::sse::SseCustomerWriteContext;
 use s3_types::{AclGrants, BucketVersioningState, CanonicalUserId, VersionId};
 use storage::BucketObjectOwnership;
 use storage::{
-    BucketEncryptionConfig, BucketName, BucketObjectLockConfig, BucketOwnershipControls,
-    EffectiveBucketEncryptionConfig, MultipartUploadRecord, ObjectKey, ObjectLockState,
+    AuthorizedMultipartUploadRecord, BucketEncryptionConfig, BucketName, BucketObjectLockConfig,
+    BucketOwnershipControls, EffectiveBucketEncryptionConfig, ObjectKey, ObjectLockState,
     ObjectReadSnapshot, OwnerIdentity, PublicAccessBlockConfig, UploadId,
 };
 
@@ -203,7 +203,7 @@ pub(super) struct AuthorizedBeginStreamPart {
     pub(super) key: ObjectKey,
     pub(super) upload_id: UploadId,
     pub(super) part_number: u32,
-    pub(super) upload: MultipartUploadRecord,
+    pub(super) upload: AuthorizedMultipartUploadRecord,
     pub(super) sse_customer: Option<SseCustomerWriteContext>,
 }
 
@@ -213,7 +213,7 @@ pub(super) struct AuthorizedMultipartPartWrite {
     pub(super) key: ObjectKey,
     pub(super) upload_id: UploadId,
     pub(super) part_number: u32,
-    pub(super) upload: MultipartUploadRecord,
+    pub(super) upload: AuthorizedMultipartUploadRecord,
     pub(super) sse_customer: Option<SseCustomerWriteContext>,
 }
 
@@ -228,16 +228,14 @@ pub(super) struct AuthorizedCompleteMultipartUpload {
     pub(super) bucket: BucketName,
     pub(super) key: ObjectKey,
     pub(super) upload_id: UploadId,
-    pub(super) upload: MultipartUploadRecord,
+    pub(super) upload: AuthorizedMultipartUploadRecord,
     pub(super) multipart_write_encryption: ActiveWriteEncryption,
 }
 
 #[derive(Debug)]
 pub(super) enum AuthorizedAbortMultipartUpload {
     InProgress {
-        bucket: BucketName,
-        key: ObjectKey,
-        upload_id: UploadId,
+        upload: Box<AuthorizedMultipartUploadRecord>,
     },
     Completed,
 }
@@ -245,7 +243,7 @@ pub(super) enum AuthorizedAbortMultipartUpload {
 #[derive(Debug)]
 pub(super) struct AuthorizedListParts {
     pub(super) bucket_info: BucketSummary,
-    pub(super) upload: MultipartUploadRecord,
+    pub(super) upload: AuthorizedMultipartUploadRecord,
 }
 
 #[derive(Debug)]

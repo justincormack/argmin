@@ -4430,6 +4430,52 @@ impl PgStore {
         )
     }
 
+    pub(crate) fn prepare_authorized_abort_multipart_upload_cleanup(
+        &self,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+    ) -> Result<Option<AbortMultipartUploadCleanup>, MetadataError> {
+        self.with_immediate_txn(
+            "prepare authorized abort multipart upload cleanup (begin txn)",
+            "prepare authorized abort multipart upload cleanup (commit txn)",
+            |store| {
+                let mut upload =
+                    match store.get_multipart_upload(&authorized_upload.record().upload_id) {
+                        Ok(upload) => upload,
+                        Err(MetadataError::NoSuchUpload { .. }) => return Ok(None),
+                        Err(error) => return Err(error),
+                    };
+                if upload != *authorized_upload.record() {
+                    return Ok(None);
+                }
+
+                match upload.state {
+                    UploadState::InProgress => {
+                        store.set_upload_state(&upload.upload_id, UploadState::Aborting)?;
+                        upload.state = UploadState::Aborting;
+                    }
+                    UploadState::Aborting => {}
+                    UploadState::Completing => return Ok(None),
+                }
+
+                let parts = store
+                    .list_multipart_parts(&ListPartsReq {
+                        upload_id: upload.upload_id.clone(),
+                        part_number_marker: None,
+                        max_parts: u32::MAX,
+                    })?
+                    .parts;
+                let streaming_segments =
+                    store.get_all_multipart_part_segments_for_upload(&upload.upload_id)?;
+
+                Ok(Some(AbortMultipartUploadCleanup {
+                    upload,
+                    parts,
+                    streaming_segments,
+                }))
+            },
+        )
+    }
+
     fn apply_abort_multipart_upload_command(
         &self,
         command: &AbortMultipartUploadCommand,
