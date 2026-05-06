@@ -1350,7 +1350,8 @@ mod tests {
     use crate::metadata_command::{
         metadata_command_log_hash, BucketPropertyMutation, BucketSubresourceMutation,
         CreateBucketCommand, MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandId,
-        MetadataCommandLogIndex, MetadataCommandPayload, PutObjectMetadataCommand,
+        MetadataCommandLogIndex, MetadataCommandPayload, PutBucketAclCommand,
+        PutObjectMetadataCommand,
     };
     use proptest::prelude::*;
     use proptest::test_runner::{TestCaseError, TestCaseResult};
@@ -1567,24 +1568,26 @@ mod tests {
         bucket: crate::BucketName,
     ) -> MetadataCommandEnvelope {
         let owner = crate::CanonicalUserId::from_principal("owner");
+        let acl_grants = crate::AclGrants::default();
+        let config = crate::CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: "owner",
+            owner_canonical_id: &owner,
+            acl_grants: &acl_grants,
+            public_read: false,
+            public_write: false,
+            versioning: crate::BucketVersioningState::Disabled,
+            object_lock: crate::BucketObjectLockConfig::default(),
+        };
         MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 ClusterEpoch::INITIAL,
                 pg_id,
                 MetadataCommandLogIndex::new(log_index).unwrap(),
             ),
-            MetadataCommandPayload::CreateBucket(CreateBucketCommand {
-                name: bucket,
-                owner_principal: "owner".to_string(),
-                owner_canonical_id: owner,
-                acl_grants: crate::AclGrants::default(),
-                public_read: false,
-                public_write: false,
-                versioning: crate::BucketVersioningState::Disabled,
-                object_lock: crate::BucketObjectLockConfig::default(),
-                created_at_millis: 1_234,
-                bucket_execution_generation: log_index,
-            }),
+            MetadataCommandPayload::CreateBucket(
+                CreateBucketCommand::from_config(&config, 1_234, log_index).unwrap(),
+            ),
         )
     }
 
@@ -3316,7 +3319,7 @@ mod tests {
             move |node_id, command| {
                 match command.payload() {
                     MetadataCommandPayload::CreateBucket(create)
-                        if create.name == first_bucket_for_hook
+                        if create.bucket.name == first_bucket_for_hook
                             && node_id == NodeId::new(0)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
@@ -9686,7 +9689,7 @@ mod tests {
             move |node_id, command| {
                 match command.payload() {
                     MetadataCommandPayload::CreateBucket(create)
-                        if create.name == hook_bucket
+                        if create.bucket.name == hook_bucket
                             && node_id == NodeId::new(2)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
@@ -9846,7 +9849,7 @@ mod tests {
             move |node_id, command| {
                 match command.payload() {
                     MetadataCommandPayload::PutBucketVersioning(versioning)
-                        if versioning.name == hook_bucket
+                        if versioning.bucket.name == hook_bucket
                             && node_id == NodeId::new(2)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
@@ -9948,7 +9951,7 @@ mod tests {
             move |node_id, command| {
                 match command.payload() {
                     MetadataCommandPayload::PutBucketVersioning(versioning)
-                        if versioning.name == hook_bucket
+                        if versioning.bucket.name == hook_bucket
                             && node_id == NodeId::new(2)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
@@ -9988,8 +9991,8 @@ mod tests {
         assert!(matches!(
             pending.payload(),
             MetadataCommandPayload::PutBucketVersioning(versioning)
-                if versioning.name == bucket
-                    && versioning.state == crate::BucketVersioningState::Enabled
+                if versioning.bucket.name == bucket
+                    && versioning.bucket.versioning == crate::BucketVersioningState::Enabled
         ));
         let partial_info = {
             let applied_replica = map.node(NodeId::new(0)).unwrap().storage_node();
@@ -10137,7 +10140,7 @@ mod tests {
             move |node_id, command| {
                 match command.payload() {
                     MetadataCommandPayload::PutBucketAcl(acl)
-                        if acl.name == hook_bucket
+                        if acl.bucket.name == hook_bucket
                             && node_id == NodeId::new(2)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
@@ -10240,7 +10243,7 @@ mod tests {
             move |node_id, command| {
                 match command.payload() {
                     MetadataCommandPayload::PutBucketAcl(acl)
-                        if acl.name == hook_bucket
+                        if acl.bucket.name == hook_bucket
                             && node_id == NodeId::new(2)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
@@ -10279,7 +10282,7 @@ mod tests {
         assert!(matches!(
             pending_before.payload(),
             MetadataCommandPayload::PutBucketAcl(acl)
-                if acl.name == bucket && acl.public_read && !acl.public_write
+                if acl.bucket.name == bucket && acl.bucket.public_read && !acl.bucket.public_write
         ));
         let partial_info = {
             let applied_replica = map.node(NodeId::new(0)).unwrap().storage_node();
@@ -10345,6 +10348,68 @@ mod tests {
                 partial_info.bucket_execution_generation
             );
         }
+    }
+
+    #[test]
+    fn bucket_acl_retry_rejects_same_acl_with_mismatched_post_image() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "acl-post-image-conflict-")
+        };
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let acl_grants = crate::AclGrants::default();
+        let current = {
+            let node = map.node(NodeId::new(0)).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            crate::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket).unwrap()
+        };
+        let mut update = PutBucketAclCommand::from_bucket(
+            current.with_execution_generation(77),
+            acl_grants.clone(),
+            true,
+            false,
+        );
+        update.bucket.bucket_policy_public = true;
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                cluster.operation_epoch(),
+                PgId::new(1),
+                MetadataCommandLogIndex::new(77).unwrap(),
+            ),
+            MetadataCommandPayload::PutBucketAcl(update),
+        );
+        map.runtime_state()
+            .try_set_pending_metadata_command_for_bucket(PgId::new(1), &bucket, command)
+            .unwrap();
+
+        let err = cluster
+            .put_bucket_acl_and_load_info(&bucket, &acl_grants, true, false)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Store(StoreError::Io {
+                    context: "conflicting pending put bucket acl command",
+                    ..
+                })
+            ),
+            "expected conflicting pending ACL command, got {err:?}"
+        );
+        let info = cluster.head_bucket_info(&bucket).unwrap();
+        assert!(!info.public_read);
+        assert!(!info.bucket_policy_public);
     }
 
     #[test]
@@ -10530,8 +10595,9 @@ mod tests {
             move |node_id, command| {
                 match command.payload() {
                     MetadataCommandPayload::PutBucketProperty(property)
-                        if property.name == hook_bucket
-                            && property.mutation == expected_mutation
+                        if property.bucket.name == hook_bucket
+                            && property.effect == expected_mutation.effect()
+                            && property.bucket.public_access_block == Some(public_access_block)
                             && node_id == NodeId::new(2)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
@@ -11170,7 +11236,7 @@ mod tests {
             move |node_id, command| {
                 match command.payload() {
                     MetadataCommandPayload::PutBucketVersioning(versioning)
-                        if versioning.name == hook_bucket
+                        if versioning.bucket.name == hook_bucket
                             && node_id == NodeId::new(2)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {

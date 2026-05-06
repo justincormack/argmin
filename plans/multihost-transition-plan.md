@@ -1777,6 +1777,23 @@ Completed:
   - tightened pending-command retry so a same AWS mutation is accepted only when
     the pending command's post-image exactly matches the row the retry would
     produce
+- Phase 7.2 bucket-command closeout:
+  - converted `CreateBucketCommand` to carry the exact bucket-table row image
+    rather than reconstructing a row from `CreateBucketConfig` during replay
+  - converted `PutBucketVersioningCommand`, `PutBucketAclCommand`, and
+    `PutBucketPropertyCommand` to carry bucket-table post-images; bucket
+    property commands retain only a storage property-effect discriminator so
+    replay can validate the intended field group changed
+  - added an explicit bucket-row command type with raw storage columns,
+    including raw encryption settings, so same-effective but different-stored
+    rows do not compare equal
+  - tightened bucket pending-command retry so retries compare the row image
+    produced by the current request against the pending command post-image, not
+    just the original AWS request fields
+  - updated canonical command encoding coverage and retry regressions for
+    bucket row-image matching
+  - Phase 7.2 is complete: all current metadata command payloads are classified
+    as storage-shaped before Phase 7.3 canonical binary state encoding
 
 Exit criteria:
 

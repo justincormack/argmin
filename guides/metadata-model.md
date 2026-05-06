@@ -100,10 +100,10 @@ encodings.
 
 | Command | Shape | Canonical Reads | Canonical Writes | Retry Rule |
 | --- | --- | --- | --- | --- |
-| `CreateBucket` | Mixed | bucket absence / matching existing bucket | bucket row | identical bucket row converges |
-| `PutBucketVersioning` | Mixed | bucket row generation | bucket versioning, execution generation | matching target state converges |
-| `PutBucketAcl` | Mixed | bucket row generation | bucket ACL/public flags, execution generation | matching ACL effect converges |
-| `PutBucketProperty` | Mixed | bucket row generation | bucket property columns, execution generation | matching property effect converges |
+| `CreateBucket` | Storage-shaped | bucket absence / matching existing bucket row | exact bucket row | identical bucket row converges |
+| `PutBucketVersioning` | Storage-shaped | exact bucket row, versioning transition rule | post-mutation bucket row | matching bucket row post-image converges |
+| `PutBucketAcl` | Storage-shaped | exact bucket row | post-mutation bucket row | matching bucket row post-image converges |
+| `PutBucketProperty` | Storage-shaped | exact bucket row | post-mutation bucket row plus property effect group | matching bucket row post-image converges |
 | `PutBucketSubresource` | Storage-shaped | bucket row generation | bucket subresource row, generation mirrors | matching subresource effect converges |
 | `ReserveObjectGeneration` | Storage-shaped | object generation allocators and live/reclaim/reservation rows | generation reservation row | matching reservation id converges |
 | `ReleaseObjectGeneration` | Storage-shaped | generation reservation row | removes reservation row | missing matching reservation is idempotent |
@@ -125,6 +125,15 @@ published by the command. Matching only the original request fields is not
 enough, because row fields such as timestamps, generation ids, and allocator
 state are part of the command checksum and replay effect. For stream upload
 session creation this includes the initial `next_segment_vid` allocator value.
+For bucket creation this includes the bucket creation timestamp, raw encryption
+columns, execution generation, and other bucket-table storage columns.
+
+Bucket metadata commands keep the AWS-facing operation split at the storage API
+boundary, but the durable command carries the bucket-table post-image. Bucket
+property commands also carry the storage property group being changed so replay
+can validate that only the intended bucket-row columns changed. Raw bucket
+encryption columns are part of the row image; matching only the effective
+encryption behavior is not exact enough.
 
 `PutObjectMetadata` keeps the AWS-facing "put tags", "delete tags", "put ACL",
 "put retention", and "put legal hold" distinctions at the coordinator/storage

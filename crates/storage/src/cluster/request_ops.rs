@@ -14,7 +14,7 @@ use super::{
     MetadataCommandApplyTestContext, MetadataCommandApplyTestKind,
 };
 use crate::metadata_command::{
-    AbortMultipartUploadCommand, BucketPropertyMutation, BucketSubresourceMutation,
+    AbortMultipartUploadCommand, BucketPropertyMutation, BucketRecord, BucketSubresourceMutation,
     CommitDirectPutObjectCommand, CommitMultipartObjectCommand, CommitStreamPartCommand,
     CreateBucketCommand, CreateMultipartUploadCommand, CreateStreamUploadCommand,
     DeleteObjectPayloadReclaimCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
@@ -200,22 +200,22 @@ fn metadata_command_apply_test_context(
     let (kind, bucket, key) = match command.payload() {
         MetadataCommandPayload::CreateBucket(command) => (
             MetadataCommandApplyTestKind::CreateBucket,
-            Some(command.name.clone()),
+            Some(command.bucket.name.clone()),
             None,
         ),
         MetadataCommandPayload::PutBucketVersioning(command) => (
             MetadataCommandApplyTestKind::PutBucketVersioning,
-            Some(command.name.clone()),
+            Some(command.bucket.name.clone()),
             None,
         ),
         MetadataCommandPayload::PutBucketAcl(command) => (
             MetadataCommandApplyTestKind::PutBucketAcl,
-            Some(command.name.clone()),
+            Some(command.bucket.name.clone()),
             None,
         ),
         MetadataCommandPayload::PutBucketProperty(command) => (
             MetadataCommandApplyTestKind::PutBucketProperty,
-            Some(command.name.clone()),
+            Some(command.bucket.name.clone()),
             None,
         ),
         MetadataCommandPayload::PutBucketSubresource(command) => (
@@ -512,7 +512,7 @@ impl super::StorageCluster {
             {
                 match command.payload() {
                     MetadataCommandPayload::CreateBucket(create)
-                        if create.matches_config(config) =>
+                        if create.matches_create_config(config) =>
                     {
                         (command, false)
                     }
@@ -1133,6 +1133,20 @@ impl super::StorageCluster {
             .get_bucket_subresource(bucket, kind)
     }
 
+    fn pending_bucket_command_matches_current(
+        current: BucketRecord,
+        target: &BucketRecord,
+        build_expected: impl FnOnce(BucketRecord) -> Result<BucketRecord, BucketSnapshotLoadError>,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        if current.bucket_execution_generation == target.bucket_execution_generation {
+            return Ok(current == *target);
+        }
+        if current.bucket_execution_generation > target.bucket_execution_generation {
+            return Ok(false);
+        }
+        Ok(build_expected(current)? == *target)
+    }
+
     pub fn put_bucket_versioning_and_load_info(
         &self,
         bucket: &BucketName,
@@ -1162,8 +1176,36 @@ impl super::StorageCluster {
             {
                 match command.payload() {
                     MetadataCommandPayload::PutBucketVersioning(versioning)
-                        if versioning.matches_request(bucket, state) =>
+                        if versioning.bucket_name() == bucket =>
                     {
+                        let bucket_pg = primary_node.get_pg(pg_id.get())?;
+                        let current = bucket_pg.head_bucket_record_raw(bucket)?;
+                        if !Self::pending_bucket_command_matches_current(
+                            current,
+                            &versioning.bucket,
+                            |record| {
+                                if state == BucketVersioningState::Disabled
+                                    && record.versioning != BucketVersioningState::Disabled
+                                {
+                                    return Err(MetadataError::InvalidVersioningTransition {
+                                        from: record.versioning,
+                                        to: state,
+                                    }
+                                    .into());
+                                }
+                                Ok(PutBucketVersioningCommand::from_bucket(
+                                    record.with_execution_generation(
+                                        versioning.bucket.bucket_execution_generation,
+                                    ),
+                                    state,
+                                )
+                                .bucket)
+                            },
+                        )? {
+                            return Err(conflicting_pending_metadata_command(
+                                "conflicting pending put bucket versioning command",
+                            ));
+                        }
                         (command, false)
                     }
                     MetadataCommandPayload::PutBucketVersioning(_) => {
@@ -1217,17 +1259,19 @@ impl super::StorageCluster {
                     runtime_state.next_metadata_command_log_index(pg_id),
                 );
                 let bucket_pg = primary_node.get_pg(pg_id.get())?;
+                let current = bucket_pg.head_bucket_record_raw(bucket)?;
                 let bucket_execution_generation =
                     bucket_pg.reserve_bucket_execution_generation()?;
-                drop(bucket_pg);
                 let command = MetadataCommandEnvelope::new(
                     command_id,
-                    MetadataCommandPayload::PutBucketVersioning(PutBucketVersioningCommand::new(
-                        bucket.clone(),
-                        state,
-                        bucket_execution_generation,
-                    )),
+                    MetadataCommandPayload::PutBucketVersioning(
+                        PutBucketVersioningCommand::from_bucket(
+                            current.with_execution_generation(bucket_execution_generation),
+                            state,
+                        ),
+                    ),
                 );
+                drop(bucket_pg);
                 self.set_pending_metadata_command_for_bucket(
                     pg_id,
                     bucket,
@@ -1352,9 +1396,28 @@ impl super::StorageCluster {
                 runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
             {
                 match command.payload() {
-                    MetadataCommandPayload::PutBucketAcl(acl)
-                        if acl.matches_request(bucket, acl_grants, public_read, public_write) =>
-                    {
+                    MetadataCommandPayload::PutBucketAcl(acl) if acl.bucket_name() == bucket => {
+                        let bucket_pg = primary_node.get_pg(pg_id.get())?;
+                        let current = bucket_pg.head_bucket_record_raw(bucket)?;
+                        if !Self::pending_bucket_command_matches_current(
+                            current,
+                            &acl.bucket,
+                            |record| {
+                                Ok(PutBucketAclCommand::from_bucket(
+                                    record.with_execution_generation(
+                                        acl.bucket.bucket_execution_generation,
+                                    ),
+                                    acl_grants.clone(),
+                                    public_read,
+                                    public_write,
+                                )
+                                .bucket)
+                            },
+                        )? {
+                            return Err(conflicting_pending_metadata_command(
+                                "conflicting pending put bucket acl command",
+                            ));
+                        }
                         (command, false)
                     }
                     MetadataCommandPayload::PutBucketAcl(_) => {
@@ -1408,19 +1471,19 @@ impl super::StorageCluster {
                     runtime_state.next_metadata_command_log_index(pg_id),
                 );
                 let bucket_pg = primary_node.get_pg(pg_id.get())?;
+                let current = bucket_pg.head_bucket_record_raw(bucket)?;
                 let bucket_execution_generation =
                     bucket_pg.reserve_bucket_execution_generation()?;
-                drop(bucket_pg);
                 let command = MetadataCommandEnvelope::new(
                     command_id,
-                    MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::new(
-                        bucket.clone(),
+                    MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
+                        current.with_execution_generation(bucket_execution_generation),
                         acl_grants.clone(),
                         public_read,
                         public_write,
-                        bucket_execution_generation,
                     )),
                 );
+                drop(bucket_pg);
                 self.set_pending_metadata_command_for_bucket(
                     pg_id,
                     bucket,
@@ -1469,8 +1532,28 @@ impl super::StorageCluster {
             {
                 match command.payload() {
                     MetadataCommandPayload::PutBucketProperty(property)
-                        if property.matches_request(bucket, &mutation) =>
+                        if property.bucket_name() == bucket
+                            && property.effect == mutation.effect() =>
                     {
+                        let bucket_pg = primary_node.get_pg(pg_id.get())?;
+                        let current = bucket_pg.head_bucket_record_raw(bucket)?;
+                        if !Self::pending_bucket_command_matches_current(
+                            current,
+                            &property.bucket,
+                            |record| {
+                                Ok(PutBucketPropertyCommand::from_bucket_and_mutation(
+                                    record.with_execution_generation(
+                                        property.bucket.bucket_execution_generation,
+                                    ),
+                                    mutation.clone(),
+                                )
+                                .bucket)
+                            },
+                        )? {
+                            return Err(conflicting_pending_metadata_command(
+                                "conflicting pending put bucket property command",
+                            ));
+                        }
                         (command, false)
                     }
                     MetadataCommandPayload::PutBucketProperty(_) => {
@@ -1524,17 +1607,19 @@ impl super::StorageCluster {
                     runtime_state.next_metadata_command_log_index(pg_id),
                 );
                 let bucket_pg = primary_node.get_pg(pg_id.get())?;
+                let current = bucket_pg.head_bucket_record_raw(bucket)?;
                 let bucket_execution_generation =
                     bucket_pg.reserve_bucket_execution_generation()?;
-                drop(bucket_pg);
                 let command = MetadataCommandEnvelope::new(
                     command_id,
-                    MetadataCommandPayload::PutBucketProperty(PutBucketPropertyCommand::new(
-                        bucket.clone(),
-                        mutation.clone(),
-                        bucket_execution_generation,
-                    )),
+                    MetadataCommandPayload::PutBucketProperty(
+                        PutBucketPropertyCommand::from_bucket_and_mutation(
+                            current.with_execution_generation(bucket_execution_generation),
+                            mutation.clone(),
+                        ),
+                    ),
                 );
+                drop(bucket_pg);
                 self.set_pending_metadata_command_for_bucket(
                     pg_id,
                     bucket,
@@ -1608,7 +1693,7 @@ impl super::StorageCluster {
             {
                 match command.payload() {
                     MetadataCommandPayload::PutBucketSubresource(subresource)
-                        if subresource.matches_request(bucket, &mutation) =>
+                        if subresource.matches_mutation(bucket, &mutation) =>
                     {
                         (command, false)
                     }

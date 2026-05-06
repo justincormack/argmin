@@ -20,15 +20,15 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{
     metadata_command_log_hash, AbortMultipartUploadCommand, AbortStreamUploadCommand,
-    AppendStreamSegmentCommand, BucketPropertyMutation, BucketSubresourceMutation,
-    CommitDirectPutObjectCommand, CommitMultipartObjectCommand, CommitStreamPartCommand,
-    CreateBucketCommand, CreateMultipartUploadCommand, CreateStreamUploadCommand,
-    DeleteObjectPayloadReclaimCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
-    InsertDeleteMarkerCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
-    MetadataCommandLogIndex, MetadataCommandPayload, MetadataCommandReplicaState,
-    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
-    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
-    ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
+    AppendStreamSegmentCommand, BucketPropertyEffect, BucketPropertyMutation, BucketRecord,
+    BucketSubresourceMutation, CommitDirectPutObjectCommand, CommitMultipartObjectCommand,
+    CommitStreamPartCommand, CreateBucketCommand, CreateMultipartUploadCommand,
+    CreateStreamUploadCommand, DeleteObjectPayloadReclaimCommand, DeleteObjectVersionCommand,
+    DeleteObjectVersionTarget, InsertDeleteMarkerCommand, MetadataCommandAcceptance,
+    MetadataCommandEnvelope, MetadataCommandLogIndex, MetadataCommandPayload,
+    MetadataCommandReplicaState, ObjectPayloadReclaimCommand, PutBucketAclCommand,
+    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
+    PutObjectMetadataCommand, ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
 };
 use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
@@ -44,6 +44,13 @@ SELECT name, owner_principal, owner_canonical_id, created_at, region, state, ver
        bucket_policy_public, bucket_policy_generation, \
        EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 5 AND body IS NOT NULL) AS bucket_lifecycle_present, \
        bucket_lifecycle_generation, bucket_execution_generation, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
+FROM buckets";
+
+const BUCKET_RECORD_SELECT: &str = "\
+SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, \
+       public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls_mode, \
+       bucket_policy_public, bucket_policy_generation, bucket_lifecycle_generation, bucket_execution_generation, completed_multipart_upload_sequence, bucket_abac_enabled, default_encryption_type, sse_c_blocked, \
+       object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
 FROM buckets";
 
 /// Part segment rows use a sentinel version_id during staging (pre-CompleteMultipartUpload).
@@ -206,47 +213,34 @@ enum BucketExecutionGeneration {
     Explicit(u64),
 }
 
-fn bucket_matches_create_command(info: &BucketInfo, command: &CreateBucketCommand) -> bool {
-    info.name == command.name
-        && info.owner_principal == command.owner_principal
-        && info.owner_canonical_id == command.owner_canonical_id
-        && info.created_at == command.created_at_millis
-        && info.state == BucketState::Active
-        && info.versioning == command.versioning
-        && info.object_lock == command.object_lock
-        && info.acl_grants == command.acl_grants
-        && info.public_read == command.public_read
-        && info.public_write == command.public_write
-        && !info.write_reservations_blocked
-        && info.active_write_reservations == 0
-        && info.bucket_execution_generation == command.bucket_execution_generation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BucketRecordUpdateEffect {
+    Versioning,
+    Acl,
+    Property(BucketPropertyEffect),
 }
 
-fn bucket_property_stale_context(mutation: &BucketPropertyMutation) -> &'static str {
-    match mutation {
-        BucketPropertyMutation::ObjectLock(_) => "apply stale bucket object lock command",
-        BucketPropertyMutation::Encryption(_) => "apply stale bucket encryption command",
-        BucketPropertyMutation::PublicAccessBlock(_) => {
-            "apply stale bucket public access block command"
-        }
-        BucketPropertyMutation::OwnershipControls(_) => {
-            "apply stale bucket ownership controls command"
-        }
-        BucketPropertyMutation::AbacEnabled(_) => "apply stale bucket abac command",
+fn bucket_property_stale_context(effect: BucketPropertyEffect) -> &'static str {
+    match effect {
+        BucketPropertyEffect::ObjectLock => "apply stale bucket object lock command",
+        BucketPropertyEffect::Encryption => "apply stale bucket encryption command",
+        BucketPropertyEffect::PublicAccessBlock => "apply stale bucket public access block command",
+        BucketPropertyEffect::OwnershipControls => "apply stale bucket ownership controls command",
+        BucketPropertyEffect::AbacEnabled => "apply stale bucket abac command",
     }
 }
 
-fn bucket_property_conflict_context(mutation: &BucketPropertyMutation) -> &'static str {
-    match mutation {
-        BucketPropertyMutation::ObjectLock(_) => "apply conflicting bucket object lock command",
-        BucketPropertyMutation::Encryption(_) => "apply conflicting bucket encryption command",
-        BucketPropertyMutation::PublicAccessBlock(_) => {
+fn bucket_property_conflict_context(effect: BucketPropertyEffect) -> &'static str {
+    match effect {
+        BucketPropertyEffect::ObjectLock => "apply conflicting bucket object lock command",
+        BucketPropertyEffect::Encryption => "apply conflicting bucket encryption command",
+        BucketPropertyEffect::PublicAccessBlock => {
             "apply conflicting bucket public access block command"
         }
-        BucketPropertyMutation::OwnershipControls(_) => {
+        BucketPropertyEffect::OwnershipControls => {
             "apply conflicting bucket ownership controls command"
         }
-        BucketPropertyMutation::AbacEnabled(_) => "apply conflicting bucket abac command",
+        BucketPropertyEffect::AbacEnabled => "apply conflicting bucket abac command",
     }
 }
 
@@ -1783,6 +1777,80 @@ impl PgStore {
         })
     }
 
+    fn row_to_bucket_record(row: &rusqlite::Row<'_>) -> Result<BucketRecord, rusqlite::Error> {
+        let owner_canonical_id_raw: String = row.get(2)?;
+        let owner_canonical_id =
+            Self::parse_canonical_user_id(owner_canonical_id_raw, 2, "owner_canonical_id")?;
+        let public_access_block = Self::parse_public_access_block(
+            (
+                row.get::<_, i64>(12)?,
+                row.get::<_, i64>(13)?,
+                row.get::<_, i64>(14)?,
+                row.get::<_, i64>(15)?,
+                row.get::<_, i64>(16)?,
+            ),
+            [12, 13, 14, 15, 16],
+        )?;
+        let ownership_controls = Self::parse_ownership_controls(row.get(17)?, 17)?;
+        let object_lock = Self::parse_bucket_object_lock(
+            (
+                row.get::<_, i64>(26)?,
+                row.get::<_, Option<u8>>(27)?,
+                row.get::<_, Option<i64>>(28)?,
+                row.get::<_, Option<i64>>(29)?,
+            ),
+            [26, 27, 28, 29],
+        )?;
+        let acl_grants = Self::parse_acl_grants(row.get::<_, String>(7)?, 7, "acl_grants")?;
+        Ok(BucketRecord {
+            name: row.get(0)?,
+            owner_principal: row.get(1)?,
+            owner_canonical_id,
+            created_at: row.get::<_, i64>(3)? as u64,
+            region: row.get::<_, i64>(4)? as u16,
+            state: Self::parse_enum(row.get::<_, u8>(5)?, 5, "state", BucketState::from_u8)?,
+            versioning: Self::parse_enum(
+                row.get::<_, u8>(6)?,
+                6,
+                "versioning",
+                BucketVersioningState::from_u8,
+            )?,
+            object_lock,
+            acl_grants,
+            public_read: row.get::<_, i64>(8)? != 0,
+            public_write: row.get::<_, i64>(9)? != 0,
+            write_reservations_blocked: row.get::<_, i64>(10)? != 0,
+            active_write_reservations: Self::parse_u32(
+                row.get::<_, i64>(11)?,
+                11,
+                "active_write_reservations",
+            )?,
+            public_access_block,
+            ownership_controls,
+            bucket_policy_public: row.get::<_, i64>(18)? != 0,
+            bucket_policy_generation: row.get::<_, i64>(19)? as u64,
+            bucket_lifecycle_generation: row.get::<_, i64>(20)? as u64,
+            bucket_execution_generation: row.get::<_, i64>(21)? as u64,
+            completed_multipart_upload_sequence: row.get::<_, i64>(22)? as u64,
+            bucket_abac_enabled: row.get::<_, i64>(23)? != 0,
+            encryption: BucketEncryptionConfig {
+                default_encryption: row
+                    .get::<_, Option<u8>>(24)?
+                    .map(|value| {
+                        ManagedEncryptionAlgorithm::from_u8(value).ok_or_else(|| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                24,
+                                rusqlite::types::Type::Integer,
+                                Box::from(format!("invalid default_encryption_type: {value}")),
+                            )
+                        })
+                    })
+                    .transpose()?,
+                sse_c_blocked: row.get::<_, i64>(25)? != 0,
+            },
+        })
+    }
+
     fn ensure_bucket_exists(&self, name: &str, context: &'static str) -> Result<(), MetadataError> {
         self.conn
             .query_row(
@@ -2802,7 +2870,7 @@ impl PgStore {
                 ) {
                     Ok(_) => Ok(()),
                     Err(rusqlite::Error::SqliteFailure(err, _))
-                        if err.code == rusqlite::ffi::ErrorCode::ConstraintViolation =>
+                        if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY =>
                     {
                         Err(MetadataError::BucketAlreadyExists)
                     }
@@ -2813,6 +2881,346 @@ impl PgStore {
                 }
             },
         )
+    }
+
+    fn insert_bucket_record_explicit(&self, bucket: &BucketRecord) -> Result<(), MetadataError> {
+        let created_at = i64::try_from(bucket.created_at).map_err(|_| MetadataError::Db {
+            context: "create bucket record (encode created_at)",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+                "bucket created_at exceeds i64",
+            )),
+        })?;
+        let (
+            object_lock_enabled,
+            object_lock_default_mode,
+            object_lock_default_days,
+            object_lock_default_years,
+        ) = Self::bucket_object_lock_sql_values(bucket.object_lock).map_err(|e| {
+            MetadataError::Db {
+                context: "create bucket record (encode object lock)",
+                source: e,
+            }
+        })?;
+        let (
+            public_access_block_present,
+            public_access_block_block_public_acls,
+            public_access_block_ignore_public_acls,
+            public_access_block_block_public_policy,
+            public_access_block_restrict_public_buckets,
+        ) = Self::public_access_block_sql_values(bucket.public_access_block);
+
+        self.with_immediate_txn(
+            "create bucket record (begin txn)",
+            "create bucket record (commit txn)",
+            |store| {
+                store.advance_bucket_execution_generation_in_txn(
+                    bucket.bucket_execution_generation,
+                    "create bucket record (advance execution generation)",
+                )?;
+                match store.conn.execute(
+                    "INSERT INTO buckets \
+                     (name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls_mode, bucket_policy_public, bucket_policy_generation, bucket_lifecycle_generation, bucket_execution_generation, completed_multipart_upload_sequence, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
+                    params![
+                        bucket.name.as_str(),
+                        &bucket.owner_principal,
+                        bucket.owner_canonical_id.as_str(),
+                        created_at,
+                        bucket.region as i64,
+                        bucket.state as u8 as i64,
+                        bucket.versioning as u8 as i64,
+                        bucket.acl_grants.serialized(),
+                        i32::from(bucket.public_read),
+                        i32::from(bucket.public_write),
+                        i32::from(bucket.write_reservations_blocked),
+                        bucket.active_write_reservations as i64,
+                        public_access_block_present,
+                        public_access_block_block_public_acls,
+                        public_access_block_ignore_public_acls,
+                        public_access_block_block_public_policy,
+                        public_access_block_restrict_public_buckets,
+                        Self::ownership_controls_sql_value(bucket.ownership_controls),
+                        i32::from(bucket.bucket_policy_public),
+                        bucket.bucket_policy_generation as i64,
+                        bucket.bucket_lifecycle_generation as i64,
+                        bucket.bucket_execution_generation as i64,
+                        bucket.completed_multipart_upload_sequence as i64,
+                        i32::from(bucket.bucket_abac_enabled),
+                        bucket.encryption.default_encryption.map(|value| value as u8),
+                        i32::from(bucket.encryption.sse_c_blocked),
+                        object_lock_enabled,
+                        object_lock_default_mode,
+                        object_lock_default_days,
+                        object_lock_default_years,
+                    ],
+                ) {
+                    Ok(_) => Ok(()),
+                    Err(rusqlite::Error::SqliteFailure(err, _))
+                        if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY =>
+                    {
+                        Err(MetadataError::BucketAlreadyExists)
+                    }
+                    Err(source) => Err(MetadataError::Db {
+                        context: "create bucket record",
+                        source,
+                    }),
+                }
+            },
+        )
+    }
+
+    fn put_bucket_record_update_inner(
+        &self,
+        target: &BucketRecord,
+        effect: BucketRecordUpdateEffect,
+        stale_context: &'static str,
+        conflict_context: &'static str,
+    ) -> Result<(), MetadataError> {
+        let current = self.head_bucket_record_raw(&target.name)?;
+        if current == *target {
+            return Ok(());
+        }
+        if current.bucket_execution_generation == target.bucket_execution_generation {
+            return Err(MetadataError::Db {
+                context: conflict_context,
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        if current.bucket_execution_generation > target.bucket_execution_generation {
+            return Err(MetadataError::Db {
+                context: stale_context,
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        if !Self::bucket_record_preimage_matches_update(&current, target, effect) {
+            return Err(MetadataError::Db {
+                context: conflict_context,
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        if matches!(effect, BucketRecordUpdateEffect::Versioning)
+            && target.versioning == BucketVersioningState::Disabled
+            && current.versioning != BucketVersioningState::Disabled
+        {
+            return Err(MetadataError::InvalidVersioningTransition {
+                from: current.versioning,
+                to: target.versioning,
+            });
+        }
+
+        self.with_immediate_txn(
+            "put bucket record update (begin txn)",
+            "put bucket record update (commit txn)",
+            |store| {
+                store.advance_bucket_execution_generation_in_txn(
+                    target.bucket_execution_generation,
+                    "put bucket record update (advance execution generation)",
+                )?;
+                let updated = match effect {
+                    BucketRecordUpdateEffect::Versioning => store
+                        .conn
+                        .execute(
+                            "UPDATE buckets \
+                             SET versioning = ?1, \
+                                 bucket_execution_generation = ?2 \
+                             WHERE name = ?3",
+                            params![
+                                target.versioning as u8 as i64,
+                                target.bucket_execution_generation as i64,
+                                target.name.as_str(),
+                            ],
+                        )
+                        .map_err(|source| MetadataError::Db {
+                            context: "put bucket versioning",
+                            source,
+                        })?,
+                    BucketRecordUpdateEffect::Acl => store
+                        .conn
+                        .execute(
+                            "UPDATE buckets \
+                             SET acl_grants = ?1, \
+                                 public_read = ?2, \
+                                 public_write = ?3, \
+                                 bucket_execution_generation = ?4 \
+                             WHERE name = ?5",
+                            params![
+                                target.acl_grants.serialized(),
+                                i32::from(target.public_read),
+                                i32::from(target.public_write),
+                                target.bucket_execution_generation as i64,
+                                target.name.as_str(),
+                            ],
+                        )
+                        .map_err(|source| MetadataError::Db {
+                            context: "put bucket acl",
+                            source,
+                        })?,
+                    BucketRecordUpdateEffect::Property(BucketPropertyEffect::ObjectLock) => {
+                        let (enabled, default_mode, default_days, default_years) =
+                            Self::bucket_object_lock_sql_values(target.object_lock).map_err(
+                                |e| MetadataError::Db {
+                                    context: "put bucket object lock (encode)",
+                                    source: e,
+                                },
+                            )?;
+                        store
+                            .conn
+                            .execute(
+                                "UPDATE buckets \
+                                 SET object_lock_enabled = ?1, \
+                                     object_lock_default_mode = ?2, \
+                                     object_lock_default_days = ?3, \
+                                     object_lock_default_years = ?4, \
+                                     bucket_execution_generation = ?5 \
+                                 WHERE name = ?6",
+                                params![
+                                    enabled,
+                                    default_mode,
+                                    default_days,
+                                    default_years,
+                                    target.bucket_execution_generation as i64,
+                                    target.name.as_str(),
+                                ],
+                            )
+                            .map_err(|source| MetadataError::Db {
+                                context: "put bucket object lock",
+                                source,
+                            })?
+                    }
+                    BucketRecordUpdateEffect::Property(BucketPropertyEffect::Encryption) => store
+                        .conn
+                        .execute(
+                            "UPDATE buckets \
+                             SET default_encryption_type = ?1, \
+                                 sse_c_blocked = ?2, \
+                                 bucket_execution_generation = ?3 \
+                             WHERE name = ?4",
+                            params![
+                                target
+                                    .encryption
+                                    .default_encryption
+                                    .map(|value| value as u8),
+                                i32::from(target.encryption.sse_c_blocked),
+                                target.bucket_execution_generation as i64,
+                                target.name.as_str(),
+                            ],
+                        )
+                        .map_err(|source| MetadataError::Db {
+                            context: "put bucket encryption",
+                            source,
+                        })?,
+                    BucketRecordUpdateEffect::Property(BucketPropertyEffect::PublicAccessBlock) => {
+                        let (
+                            present,
+                            block_public_acls,
+                            ignore_public_acls,
+                            block_public_policy,
+                            restrict_public_buckets,
+                        ) = Self::public_access_block_sql_values(target.public_access_block);
+                        store
+                            .conn
+                            .execute(
+                                "UPDATE buckets SET \
+                                     public_access_block_present = ?1, \
+                                     public_access_block_block_public_acls = ?2, \
+                                     public_access_block_ignore_public_acls = ?3, \
+                                     public_access_block_block_public_policy = ?4, \
+                                     public_access_block_restrict_public_buckets = ?5, \
+                                     bucket_execution_generation = ?6 \
+                                 WHERE name = ?7",
+                                params![
+                                    present,
+                                    block_public_acls,
+                                    ignore_public_acls,
+                                    block_public_policy,
+                                    restrict_public_buckets,
+                                    target.bucket_execution_generation as i64,
+                                    target.name.as_str(),
+                                ],
+                            )
+                            .map_err(|source| MetadataError::Db {
+                                context: "put bucket public access block",
+                                source,
+                            })?
+                    }
+                    BucketRecordUpdateEffect::Property(BucketPropertyEffect::OwnershipControls) => {
+                        store
+                            .conn
+                            .execute(
+                                "UPDATE buckets \
+                                 SET ownership_controls_mode = ?1, \
+                                     bucket_execution_generation = ?2 \
+                                 WHERE name = ?3",
+                                params![
+                                    Self::ownership_controls_sql_value(target.ownership_controls),
+                                    target.bucket_execution_generation as i64,
+                                    target.name.as_str(),
+                                ],
+                            )
+                            .map_err(|source| MetadataError::Db {
+                                context: "put bucket ownership controls",
+                                source,
+                            })?
+                    }
+                    BucketRecordUpdateEffect::Property(BucketPropertyEffect::AbacEnabled) => store
+                        .conn
+                        .execute(
+                            "UPDATE buckets \
+                             SET bucket_abac_enabled = ?1, \
+                                 bucket_execution_generation = ?2 \
+                             WHERE name = ?3",
+                            params![
+                                i32::from(target.bucket_abac_enabled),
+                                target.bucket_execution_generation as i64,
+                                target.name.as_str(),
+                            ],
+                        )
+                        .map_err(|source| MetadataError::Db {
+                            context: "put bucket abac enabled",
+                            source,
+                        })?,
+                };
+                if updated == 0 {
+                    return Err(bucket_not_found(target.name.as_str()));
+                }
+                Ok(())
+            },
+        )
+    }
+
+    fn bucket_record_preimage_matches_update(
+        current: &BucketRecord,
+        target: &BucketRecord,
+        effect: BucketRecordUpdateEffect,
+    ) -> bool {
+        let mut expected = current.clone();
+        expected.bucket_execution_generation = target.bucket_execution_generation;
+        match effect {
+            BucketRecordUpdateEffect::Versioning => {
+                expected.versioning = target.versioning;
+            }
+            BucketRecordUpdateEffect::Acl => {
+                expected.acl_grants = target.acl_grants.clone();
+                expected.public_read = target.public_read;
+                expected.public_write = target.public_write;
+            }
+            BucketRecordUpdateEffect::Property(BucketPropertyEffect::ObjectLock) => {
+                expected.object_lock = target.object_lock;
+            }
+            BucketRecordUpdateEffect::Property(BucketPropertyEffect::Encryption) => {
+                expected.encryption = target.encryption;
+            }
+            BucketRecordUpdateEffect::Property(BucketPropertyEffect::PublicAccessBlock) => {
+                expected.public_access_block = target.public_access_block;
+            }
+            BucketRecordUpdateEffect::Property(BucketPropertyEffect::OwnershipControls) => {
+                expected.ownership_controls = target.ownership_controls;
+            }
+            BucketRecordUpdateEffect::Property(BucketPropertyEffect::AbacEnabled) => {
+                expected.bucket_abac_enabled = target.bucket_abac_enabled;
+            }
+        }
+        expected == *target
     }
 
     pub(crate) fn apply_metadata_command(
@@ -2933,16 +3341,11 @@ impl PgStore {
         &self,
         command: &CreateBucketCommand,
     ) -> Result<(), MetadataError> {
-        let config = command.config();
-        match self.create_bucket_with_config_inner(
-            &config,
-            command.created_at_millis,
-            BucketExecutionGeneration::Explicit(command.bucket_execution_generation),
-        ) {
+        match self.insert_bucket_record_explicit(&command.bucket) {
             Ok(()) => Ok(()),
             Err(MetadataError::BucketAlreadyExists) => {
-                let existing = self.head_bucket_raw(&command.name)?;
-                if bucket_matches_create_command(&existing, command) {
+                let existing = self.head_bucket_record_raw(&command.bucket.name)?;
+                if existing == command.bucket {
                     Ok(())
                 } else {
                     Err(MetadataError::BucketAlreadyExists)
@@ -2956,10 +3359,11 @@ impl PgStore {
         &self,
         command: &PutBucketVersioningCommand,
     ) -> Result<(), MetadataError> {
-        self.put_bucket_versioning_inner(
-            &command.name,
-            command.state,
-            BucketExecutionGeneration::Explicit(command.bucket_execution_generation),
+        self.put_bucket_record_update_inner(
+            &command.bucket,
+            BucketRecordUpdateEffect::Versioning,
+            "apply stale bucket versioning command",
+            "apply conflicting bucket versioning command",
         )
     }
 
@@ -2967,12 +3371,11 @@ impl PgStore {
         &self,
         command: &PutBucketAclCommand,
     ) -> Result<(), MetadataError> {
-        self.put_bucket_acl_inner(
-            &command.name,
-            &command.acl_grants,
-            command.public_read,
-            command.public_write,
-            BucketExecutionGeneration::Explicit(command.bucket_execution_generation),
+        self.put_bucket_record_update_inner(
+            &command.bucket,
+            BucketRecordUpdateEffect::Acl,
+            "apply stale bucket acl command",
+            "apply conflicting bucket acl command",
         )
     }
 
@@ -2980,10 +3383,11 @@ impl PgStore {
         &self,
         command: &PutBucketPropertyCommand,
     ) -> Result<(), MetadataError> {
-        self.put_bucket_property_inner(
-            &command.name,
-            &command.mutation,
-            BucketExecutionGeneration::Explicit(command.bucket_execution_generation),
+        self.put_bucket_record_update_inner(
+            &command.bucket,
+            BucketRecordUpdateEffect::Property(command.effect),
+            bucket_property_stale_context(command.effect),
+            bucket_property_conflict_context(command.effect),
         )
     }
 
@@ -4923,13 +5327,13 @@ impl PgStore {
                     return Ok(());
                 }
                 return Err(MetadataError::Db {
-                    context: bucket_property_conflict_context(mutation),
+                    context: bucket_property_conflict_context(mutation.effect()),
                     source: rusqlite::Error::InvalidQuery,
                 });
             }
             if info.bucket_execution_generation > explicit {
                 return Err(MetadataError::Db {
-                    context: bucket_property_stale_context(mutation),
+                    context: bucket_property_stale_context(mutation.effect()),
                     source: rusqlite::Error::InvalidQuery,
                 });
             }
@@ -6083,6 +6487,21 @@ impl PgMetadataStore for PgStore {
             .optional()
             .map_err(|e| MetadataError::Db {
                 context: "head bucket raw",
+                source: e,
+            })?
+            .ok_or_else(|| bucket_not_found(name.as_str()))
+    }
+
+    fn head_bucket_record_raw(&self, name: &BucketName) -> Result<BucketRecord, MetadataError> {
+        self.conn
+            .query_row(
+                &format!("{BUCKET_RECORD_SELECT} WHERE name = ?1"),
+                params![name.as_str()],
+                Self::row_to_bucket_record,
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "head bucket record raw",
                 source: e,
             })?
             .ok_or_else(|| bucket_not_found(name.as_str()))
@@ -11318,10 +11737,12 @@ mod tests {
                 PgId::new(1),
                 MetadataCommandLogIndex::new(2).unwrap(),
             ),
-            MetadataCommandPayload::PutBucketVersioning(PutBucketVersioningCommand::new(
-                bucket.clone(),
+            MetadataCommandPayload::PutBucketVersioning(PutBucketVersioningCommand::from_bucket(
+                store
+                    .head_bucket_record_raw(&bucket)
+                    .unwrap()
+                    .with_execution_generation(12),
                 BucketVersioningState::Enabled,
-                12,
             )),
         );
         store.apply_metadata_command(&newer).unwrap();
@@ -11332,10 +11753,12 @@ mod tests {
                 PgId::new(1),
                 MetadataCommandLogIndex::new(1).unwrap(),
             ),
-            MetadataCommandPayload::PutBucketVersioning(PutBucketVersioningCommand::new(
-                bucket.clone(),
+            MetadataCommandPayload::PutBucketVersioning(PutBucketVersioningCommand::from_bucket(
+                store
+                    .head_bucket_record_raw(&bucket)
+                    .unwrap()
+                    .with_execution_generation(11),
                 BucketVersioningState::Enabled,
-                11,
             )),
         );
         let err = store.apply_metadata_command(&stale).unwrap_err();
@@ -11356,10 +11779,12 @@ mod tests {
                 PgId::new(1),
                 MetadataCommandLogIndex::new(3).unwrap(),
             ),
-            MetadataCommandPayload::PutBucketVersioning(PutBucketVersioningCommand::new(
-                bucket.clone(),
+            MetadataCommandPayload::PutBucketVersioning(PutBucketVersioningCommand::from_bucket(
+                store
+                    .head_bucket_record_raw(&bucket)
+                    .unwrap()
+                    .with_execution_generation(12),
                 BucketVersioningState::Suspended,
-                12,
             )),
         );
         let err = store.apply_metadata_command(&conflicting).unwrap_err();
@@ -11405,12 +11830,14 @@ mod tests {
                 PgId::new(1),
                 MetadataCommandLogIndex::new(2).unwrap(),
             ),
-            MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::new(
-                bucket.clone(),
+            MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
+                store
+                    .head_bucket_record_raw(&bucket)
+                    .unwrap()
+                    .with_execution_generation(12),
                 acl_grants.clone(),
                 true,
                 false,
-                12,
             )),
         );
         store.apply_metadata_command(&newer).unwrap();
@@ -11421,12 +11848,14 @@ mod tests {
                 PgId::new(1),
                 MetadataCommandLogIndex::new(1).unwrap(),
             ),
-            MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::new(
-                bucket.clone(),
+            MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
+                store
+                    .head_bucket_record_raw(&bucket)
+                    .unwrap()
+                    .with_execution_generation(11),
                 acl_grants.clone(),
                 true,
                 false,
-                11,
             )),
         );
         let err = store.apply_metadata_command(&stale).unwrap_err();
@@ -11447,12 +11876,14 @@ mod tests {
                 PgId::new(1),
                 MetadataCommandLogIndex::new(3).unwrap(),
             ),
-            MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::new(
-                bucket.clone(),
+            MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
+                store
+                    .head_bucket_record_raw(&bucket)
+                    .unwrap()
+                    .with_execution_generation(12),
                 acl_grants.clone(),
                 false,
                 true,
-                12,
             )),
         );
         let err = store.apply_metadata_command(&conflicting).unwrap_err();
@@ -11504,11 +11935,15 @@ mod tests {
                 PgId::new(1),
                 MetadataCommandLogIndex::new(2).unwrap(),
             ),
-            MetadataCommandPayload::PutBucketProperty(PutBucketPropertyCommand::new(
-                bucket.clone(),
-                BucketPropertyMutation::Encryption(newer_config),
-                12,
-            )),
+            MetadataCommandPayload::PutBucketProperty(
+                PutBucketPropertyCommand::from_bucket_and_mutation(
+                    store
+                        .head_bucket_record_raw(&bucket)
+                        .unwrap()
+                        .with_execution_generation(12),
+                    BucketPropertyMutation::Encryption(newer_config),
+                ),
+            ),
         );
         store.apply_metadata_command(&newer).unwrap();
 
@@ -11518,11 +11953,15 @@ mod tests {
                 PgId::new(1),
                 MetadataCommandLogIndex::new(1).unwrap(),
             ),
-            MetadataCommandPayload::PutBucketProperty(PutBucketPropertyCommand::new(
-                bucket.clone(),
-                BucketPropertyMutation::Encryption(newer_config),
-                11,
-            )),
+            MetadataCommandPayload::PutBucketProperty(
+                PutBucketPropertyCommand::from_bucket_and_mutation(
+                    store
+                        .head_bucket_record_raw(&bucket)
+                        .unwrap()
+                        .with_execution_generation(11),
+                    BucketPropertyMutation::Encryption(newer_config),
+                ),
+            ),
         );
         let err = store.apply_metadata_command(&stale).unwrap_err();
         assert!(
@@ -11550,11 +11989,15 @@ mod tests {
                 PgId::new(1),
                 MetadataCommandLogIndex::new(3).unwrap(),
             ),
-            MetadataCommandPayload::PutBucketProperty(PutBucketPropertyCommand::new(
-                bucket.clone(),
-                BucketPropertyMutation::Encryption(same_effective_but_different_stored_config),
-                12,
-            )),
+            MetadataCommandPayload::PutBucketProperty(
+                PutBucketPropertyCommand::from_bucket_and_mutation(
+                    store
+                        .head_bucket_record_raw(&bucket)
+                        .unwrap()
+                        .with_execution_generation(12),
+                    BucketPropertyMutation::Encryption(same_effective_but_different_stored_config),
+                ),
+            ),
         );
         let err = store.apply_metadata_command(&conflicting).unwrap_err();
         assert!(

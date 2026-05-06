@@ -8,14 +8,14 @@ use s3_types::{
 
 use crate::types::{
     AbortMultipartUploadCleanup, BucketEncryptionConfig, BucketName, BucketObjectOwnership,
-    BucketOwnershipControls, BucketSubresourceAux, BucketSubresourceKind, ClusterEpoch,
-    CreateBucketConfig, CreateMultipartUploadReq, CreateStreamUploadReq, GenerationId,
-    LiveObjectRecord, ManagedEncryptionAlgorithm, MultipartPartRecord, MultipartPartSegmentRecord,
-    MultipartReclaimPartRecord, MultipartReclaimRecord, MultipartUploadRecord, ObjectEncryption,
-    ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord,
-    ObjectSegmentsReclaimRecord, OwnerIdentity, PgId, PublicAccessBlockConfig, PutLiveObjectReq,
-    SerializedTagSet, SessionId, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
-    StreamUploadTarget, UploadId, VersionId,
+    BucketOwnershipControls, BucketState, BucketSubresourceAux, BucketSubresourceKind,
+    ClusterEpoch, CreateBucketConfig, CreateMultipartUploadReq, CreateStreamUploadReq,
+    GenerationId, LiveObjectRecord, ManagedEncryptionAlgorithm, MultipartPartRecord,
+    MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimRecord,
+    MultipartUploadRecord, ObjectEncryption, ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord,
+    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, OwnerIdentity, PgId, PublicAccessBlockConfig,
+    PutLiveObjectReq, SerializedTagSet, SessionId, StreamUploadRecord, StreamUploadSegmentRecord,
+    StreamUploadState, StreamUploadTarget, UploadId, VersionId,
 };
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
@@ -101,21 +101,33 @@ impl MetadataCommandId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CreateBucketCommand {
+pub struct BucketRecord {
     pub(crate) name: BucketName,
     pub(crate) owner_principal: String,
     pub(crate) owner_canonical_id: CanonicalUserId,
+    pub(crate) created_at: u64,
+    pub(crate) region: u16,
+    pub(crate) state: BucketState,
+    pub(crate) versioning: BucketVersioningState,
+    pub(crate) object_lock: BucketObjectLockConfig,
     pub(crate) acl_grants: AclGrants,
     pub(crate) public_read: bool,
     pub(crate) public_write: bool,
-    pub(crate) versioning: BucketVersioningState,
-    pub(crate) object_lock: BucketObjectLockConfig,
-    pub(crate) created_at_millis: u64,
+    pub(crate) write_reservations_blocked: bool,
+    pub(crate) active_write_reservations: u32,
+    pub(crate) public_access_block: Option<PublicAccessBlockConfig>,
+    pub(crate) ownership_controls: Option<BucketOwnershipControls>,
+    pub(crate) bucket_policy_public: bool,
+    pub(crate) bucket_policy_generation: u64,
+    pub(crate) bucket_lifecycle_generation: u64,
     pub(crate) bucket_execution_generation: u64,
+    pub(crate) completed_multipart_upload_sequence: u64,
+    pub(crate) bucket_abac_enabled: bool,
+    pub(crate) encryption: BucketEncryptionConfig,
 }
 
-impl CreateBucketCommand {
-    pub(crate) fn from_config(
+impl BucketRecord {
+    pub(crate) fn from_create_config(
         config: &CreateBucketConfig<'_>,
         created_at_millis: u64,
         bucket_execution_generation: u64,
@@ -126,41 +138,64 @@ impl CreateBucketCommand {
             name,
             owner_principal: config.owner_principal.to_string(),
             owner_canonical_id: config.owner_canonical_id.clone(),
+            created_at: created_at_millis,
+            region: 0,
+            state: BucketState::Active,
+            versioning: config.versioning,
+            object_lock: config.object_lock,
             acl_grants: config.acl_grants.clone(),
             public_read: config.public_read,
             public_write: config.public_write,
-            versioning: config.versioning,
-            object_lock: config.object_lock,
-            created_at_millis,
+            write_reservations_blocked: false,
+            active_write_reservations: 0,
+            public_access_block: None,
+            ownership_controls: None,
+            bucket_policy_public: false,
+            bucket_policy_generation: 0,
+            bucket_lifecycle_generation: 0,
             bucket_execution_generation,
+            completed_multipart_upload_sequence: 0,
+            bucket_abac_enabled: false,
+            encryption: BucketEncryptionConfig {
+                default_encryption: None,
+                sse_c_blocked: true,
+            },
         })
     }
 
-    pub(crate) fn config(&self) -> CreateBucketConfig<'_> {
-        CreateBucketConfig {
-            name: self.name.as_str(),
-            owner_principal: &self.owner_principal,
-            owner_canonical_id: &self.owner_canonical_id,
-            acl_grants: &self.acl_grants,
-            public_read: self.public_read,
-            public_write: self.public_write,
-            versioning: self.versioning,
-            object_lock: self.object_lock,
-        }
+    pub(crate) fn matches_create_config(&self, config: &CreateBucketConfig<'_>) -> bool {
+        Self::from_create_config(config, self.created_at, self.bucket_execution_generation)
+            .is_ok_and(|expected| expected == *self)
     }
 
-    pub(crate) fn matches_config(&self, config: &CreateBucketConfig<'_>) -> bool {
-        let Ok(name) = BucketName::try_from(config.name.to_string()) else {
-            return false;
-        };
-        self.name == name
-            && self.owner_principal == config.owner_principal
-            && &self.owner_canonical_id == config.owner_canonical_id
-            && &self.acl_grants == config.acl_grants
-            && self.public_read == config.public_read
-            && self.public_write == config.public_write
-            && self.versioning == config.versioning
-            && self.object_lock == config.object_lock
+    pub(crate) fn with_execution_generation(mut self, generation: u64) -> Self {
+        self.bucket_execution_generation = generation;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CreateBucketCommand {
+    pub(crate) bucket: BucketRecord,
+}
+
+impl CreateBucketCommand {
+    pub(crate) fn from_config(
+        config: &CreateBucketConfig<'_>,
+        created_at_millis: u64,
+        bucket_execution_generation: u64,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            bucket: BucketRecord::from_create_config(
+                config,
+                created_at_millis,
+                bucket_execution_generation,
+            )?,
+        })
+    }
+
+    pub(crate) fn matches_create_config(&self, config: &CreateBucketConfig<'_>) -> bool {
+        self.bucket.matches_create_config(config)
     }
 }
 
@@ -215,99 +250,61 @@ impl MetadataCommandPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PutBucketVersioningCommand {
-    pub(crate) name: BucketName,
-    pub(crate) state: BucketVersioningState,
-    pub(crate) bucket_execution_generation: u64,
+    pub(crate) bucket: BucketRecord,
 }
 
 impl PutBucketVersioningCommand {
-    pub(crate) fn new(
-        name: BucketName,
-        state: BucketVersioningState,
-        bucket_execution_generation: u64,
-    ) -> Self {
-        Self {
-            name,
-            state,
-            bucket_execution_generation,
-        }
+    pub(crate) fn from_bucket(mut bucket: BucketRecord, state: BucketVersioningState) -> Self {
+        bucket.versioning = state;
+        Self { bucket }
     }
 
-    pub(crate) fn matches_request(
-        &self,
-        bucket: &BucketName,
-        state: BucketVersioningState,
-    ) -> bool {
-        self.name == *bucket && self.state == state
+    pub(crate) fn bucket_name(&self) -> &BucketName {
+        &self.bucket.name
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PutBucketAclCommand {
-    pub(crate) name: BucketName,
-    pub(crate) acl_grants: AclGrants,
-    pub(crate) public_read: bool,
-    pub(crate) public_write: bool,
-    pub(crate) bucket_execution_generation: u64,
+    pub(crate) bucket: BucketRecord,
 }
 
 impl PutBucketAclCommand {
-    pub(crate) fn new(
-        name: BucketName,
+    pub(crate) fn from_bucket(
+        mut bucket: BucketRecord,
         acl_grants: AclGrants,
         public_read: bool,
         public_write: bool,
-        bucket_execution_generation: u64,
     ) -> Self {
-        Self {
-            name,
-            acl_grants,
-            public_read,
-            public_write,
-            bucket_execution_generation,
-        }
+        bucket.acl_grants = acl_grants;
+        bucket.public_read = public_read;
+        bucket.public_write = public_write;
+        Self { bucket }
     }
 
-    pub(crate) fn matches_request(
-        &self,
-        bucket: &BucketName,
-        acl_grants: &AclGrants,
-        public_read: bool,
-        public_write: bool,
-    ) -> bool {
-        self.name == *bucket
-            && self.acl_grants == *acl_grants
-            && self.public_read == public_read
-            && self.public_write == public_write
+    pub(crate) fn bucket_name(&self) -> &BucketName {
+        &self.bucket.name
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PutBucketPropertyCommand {
-    pub(crate) name: BucketName,
-    pub(crate) mutation: BucketPropertyMutation,
-    pub(crate) bucket_execution_generation: u64,
+    pub(crate) bucket: BucketRecord,
+    pub(crate) effect: BucketPropertyEffect,
 }
 
 impl PutBucketPropertyCommand {
-    pub(crate) fn new(
-        name: BucketName,
+    pub(crate) fn from_bucket_and_mutation(
+        mut bucket: BucketRecord,
         mutation: BucketPropertyMutation,
-        bucket_execution_generation: u64,
     ) -> Self {
-        Self {
-            name,
-            mutation,
-            bucket_execution_generation,
-        }
+        let effect = mutation.effect();
+        mutation.apply_to_bucket(&mut bucket);
+        Self { bucket, effect }
     }
 
-    pub(crate) fn matches_request(
-        &self,
-        bucket: &BucketName,
-        mutation: &BucketPropertyMutation,
-    ) -> bool {
-        self.name == *bucket && self.mutation == *mutation
+    pub(crate) fn bucket_name(&self) -> &BucketName {
+        &self.bucket.name
     }
 }
 
@@ -318,6 +315,48 @@ pub(crate) enum BucketPropertyMutation {
     PublicAccessBlock(Option<PublicAccessBlockConfig>),
     OwnershipControls(Option<BucketOwnershipControls>),
     AbacEnabled(bool),
+}
+
+impl BucketPropertyMutation {
+    pub(crate) fn effect(&self) -> BucketPropertyEffect {
+        match self {
+            Self::ObjectLock(_) => BucketPropertyEffect::ObjectLock,
+            Self::Encryption(_) => BucketPropertyEffect::Encryption,
+            Self::PublicAccessBlock(_) => BucketPropertyEffect::PublicAccessBlock,
+            Self::OwnershipControls(_) => BucketPropertyEffect::OwnershipControls,
+            Self::AbacEnabled(_) => BucketPropertyEffect::AbacEnabled,
+        }
+    }
+
+    pub(crate) fn apply_to_bucket(self, bucket: &mut BucketRecord) {
+        match self {
+            Self::ObjectLock(config) => {
+                bucket.object_lock = config;
+            }
+            Self::Encryption(config) => {
+                bucket.encryption = config;
+            }
+            Self::PublicAccessBlock(config) => {
+                bucket.public_access_block = config;
+            }
+            Self::OwnershipControls(config) => {
+                bucket.ownership_controls = config;
+            }
+            Self::AbacEnabled(enabled) => {
+                bucket.bucket_abac_enabled = enabled;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum BucketPropertyEffect {
+    ObjectLock = 0,
+    Encryption = 1,
+    PublicAccessBlock = 2,
+    OwnershipControls = 3,
+    AbacEnabled = 4,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,7 +379,7 @@ impl PutBucketSubresourceCommand {
         }
     }
 
-    pub(crate) fn matches_request(
+    pub(crate) fn matches_mutation(
         &self,
         bucket: &BucketName,
         mutation: &BucketSubresourceMutation,
@@ -868,36 +907,20 @@ fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPaylo
 }
 
 fn encode_create_bucket(out: &mut Vec<u8>, command: &CreateBucketCommand) {
-    put_str(out, command.name.as_str());
-    put_str(out, &command.owner_principal);
-    put_str(out, command.owner_canonical_id.as_str());
-    put_str(out, &command.acl_grants.serialized());
-    put_bool(out, command.public_read);
-    put_bool(out, command.public_write);
-    put_u8(out, command.versioning as u8);
-    encode_object_lock(out, command.object_lock);
-    put_u64(out, command.created_at_millis);
-    put_u64(out, command.bucket_execution_generation);
+    encode_bucket_record(out, &command.bucket);
 }
 
 fn encode_put_bucket_versioning(out: &mut Vec<u8>, command: &PutBucketVersioningCommand) {
-    put_str(out, command.name.as_str());
-    put_u8(out, command.state as u8);
-    put_u64(out, command.bucket_execution_generation);
+    encode_bucket_record(out, &command.bucket);
 }
 
 fn encode_put_bucket_acl(out: &mut Vec<u8>, command: &PutBucketAclCommand) {
-    put_str(out, command.name.as_str());
-    put_str(out, &command.acl_grants.serialized());
-    put_bool(out, command.public_read);
-    put_bool(out, command.public_write);
-    put_u64(out, command.bucket_execution_generation);
+    encode_bucket_record(out, &command.bucket);
 }
 
 fn encode_put_bucket_property(out: &mut Vec<u8>, command: &PutBucketPropertyCommand) {
-    put_str(out, command.name.as_str());
-    encode_bucket_property_mutation(out, &command.mutation);
-    put_u64(out, command.bucket_execution_generation);
+    encode_bucket_record(out, &command.bucket);
+    put_u8(out, command.effect as u8);
 }
 
 fn encode_put_bucket_subresource(out: &mut Vec<u8>, command: &PutBucketSubresourceCommand) {
@@ -1216,6 +1239,31 @@ fn encode_live_object_record(out: &mut Vec<u8>, object: &LiveObjectRecord) {
     encode_object_encryption(out, &object.encryption);
 }
 
+fn encode_bucket_record(out: &mut Vec<u8>, bucket: &BucketRecord) {
+    put_str(out, bucket.name.as_str());
+    put_str(out, &bucket.owner_principal);
+    put_str(out, bucket.owner_canonical_id.as_str());
+    put_u64(out, bucket.created_at);
+    put_u16(out, bucket.region);
+    put_u8(out, bucket.state as u8);
+    put_u8(out, bucket.versioning as u8);
+    encode_object_lock(out, bucket.object_lock);
+    put_str(out, &bucket.acl_grants.serialized());
+    put_bool(out, bucket.public_read);
+    put_bool(out, bucket.public_write);
+    put_bool(out, bucket.write_reservations_blocked);
+    put_u32(out, bucket.active_write_reservations);
+    encode_public_access_block(out, bucket.public_access_block);
+    encode_ownership_controls(out, bucket.ownership_controls);
+    put_bool(out, bucket.bucket_policy_public);
+    put_u64(out, bucket.bucket_policy_generation);
+    put_u64(out, bucket.bucket_lifecycle_generation);
+    put_u64(out, bucket.bucket_execution_generation);
+    put_u64(out, bucket.completed_multipart_upload_sequence);
+    put_bool(out, bucket.bucket_abac_enabled);
+    encode_bucket_encryption(out, bucket.encryption);
+}
+
 fn encode_object_segment(out: &mut Vec<u8>, segment: &ObjectSegmentRecord) {
     put_str(out, segment.bucket.as_str());
     put_str(out, segment.key.as_str());
@@ -1508,31 +1556,6 @@ fn encode_bucket_subresource_aux(out: &mut Vec<u8>, aux: BucketSubresourceAux) {
     }
 }
 
-fn encode_bucket_property_mutation(out: &mut Vec<u8>, mutation: &BucketPropertyMutation) {
-    match mutation {
-        BucketPropertyMutation::ObjectLock(config) => {
-            put_u8(out, 1);
-            encode_object_lock(out, *config);
-        }
-        BucketPropertyMutation::Encryption(config) => {
-            put_u8(out, 2);
-            encode_bucket_encryption(out, *config);
-        }
-        BucketPropertyMutation::PublicAccessBlock(config) => {
-            put_u8(out, 3);
-            encode_public_access_block(out, *config);
-        }
-        BucketPropertyMutation::OwnershipControls(config) => {
-            put_u8(out, 4);
-            encode_ownership_controls(out, *config);
-        }
-        BucketPropertyMutation::AbacEnabled(enabled) => {
-            put_u8(out, 5);
-            put_bool(out, *enabled);
-        }
-    }
-}
-
 fn encode_bucket_encryption(out: &mut Vec<u8>, config: BucketEncryptionConfig) {
     match config.default_encryption {
         None => put_u8(out, 0),
@@ -1638,6 +1661,26 @@ mod tests {
         OwnerIdentity, SerializedMetadataBlob, SerializedSystemMetadataBlob, StorageClass,
     };
 
+    fn test_bucket_record(name: &str, generation: u64) -> BucketRecord {
+        let owner = CanonicalUserId::from_principal("owner");
+        let acl_grants = AclGrants::default();
+        BucketRecord::from_create_config(
+            &CreateBucketConfig {
+                name,
+                owner_principal: "owner",
+                owner_canonical_id: &owner,
+                acl_grants: &acl_grants,
+                public_read: false,
+                public_write: true,
+                versioning: BucketVersioningState::Enabled,
+                object_lock: BucketObjectLockConfig::default(),
+            },
+            123,
+            generation,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn metadata_command_canonical_encoding_is_stable() {
         let owner = CanonicalUserId::from_principal("owner");
@@ -1670,15 +1713,14 @@ mod tests {
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
         assert!(envelope.verify_checksum());
-        assert_eq!(envelope.checksum_crc64(), 0xa1bf3d54b1685454);
+        assert_eq!(envelope.checksum_crc64(), 0xf863c7b45c9b2576);
     }
 
     #[test]
     fn metadata_command_versioning_encoding_is_stable() {
-        let command = PutBucketVersioningCommand::new(
-            BucketName::try_from("bucket").unwrap(),
+        let command = PutBucketVersioningCommand::from_bucket(
+            test_bucket_record("bucket", 11),
             BucketVersioningState::Enabled,
-            11,
         );
         let id = MetadataCommandId::new(
             ClusterEpoch::INITIAL,
@@ -1694,18 +1736,17 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0xa7a53964fbc32e58);
+        assert_eq!(envelope.checksum_crc64(), 0x025a3a3a3a06e265);
         assert!(envelope.verify_checksum());
     }
 
     #[test]
     fn metadata_command_bucket_acl_encoding_is_stable() {
-        let command = PutBucketAclCommand::new(
-            BucketName::try_from("bucket").unwrap(),
+        let command = PutBucketAclCommand::from_bucket(
+            test_bucket_record("bucket", 12),
             AclGrants::default(),
             true,
             false,
-            12,
         );
         let id = MetadataCommandId::new(
             ClusterEpoch::INITIAL,
@@ -1719,13 +1760,12 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x3947184ebe5f3b3b);
+        assert_eq!(envelope.checksum_crc64(), 0x2a8ea7a65e10535f);
         assert!(envelope.verify_checksum());
     }
 
     #[test]
     fn metadata_command_bucket_property_encoding_is_stable() {
-        let bucket = BucketName::try_from("bucket").unwrap();
         let id = MetadataCommandId::new(
             ClusterEpoch::INITIAL,
             PgId::new(3),
@@ -1771,8 +1811,10 @@ mod tests {
 
         let mut checksums = Vec::new();
         for (offset, (mutation, _expected_checksum)) in mutations.into_iter().enumerate() {
-            let command =
-                PutBucketPropertyCommand::new(bucket.clone(), mutation.clone(), 20 + offset as u64);
+            let command = PutBucketPropertyCommand::from_bucket_and_mutation(
+                test_bucket_record("bucket", 20 + offset as u64),
+                mutation.clone(),
+            );
             let id = MetadataCommandId::new(
                 id.cluster_epoch(),
                 id.pg_id(),
@@ -1795,13 +1837,13 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0x239f63ca5e298fa1,
-                0xb5c042bf2bf79c2d,
-                0x01ff273102f24631,
-                0x703c1fc321a3a801,
-                0xbc2d9efb84c3ed11,
-                0xd8eb45a268b77749,
-                0xcc7e17ba9b256211,
+                0xa719319c74b1f0cb,
+                0xd1075afe8d161071,
+                0xcb081a9b10eaa110,
+                0xc08ab093cf1861e5,
+                0x85ddf064e854992e,
+                0x0d0bf92d0ebb50bc,
+                0x6f37b9d0b95a6e38,
             ]
         );
     }

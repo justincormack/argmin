@@ -1,5 +1,6 @@
 /// Trait definitions for the storage layer.
 use crate::error::{MetadataError, StoreError};
+use crate::metadata_command::BucketRecord;
 use crate::types::*;
 
 /// Per-PG shard store. One instance per PG directory.
@@ -57,6 +58,9 @@ pub trait PgMetadataStore {
 
     /// Get bucket metadata including non-active lifecycle states.
     fn head_bucket_raw(&self, name: &BucketName) -> Result<BucketInfo, MetadataError>;
+
+    /// Get the exact bucket table row including raw storage-only columns.
+    fn head_bucket_record_raw(&self, name: &BucketName) -> Result<BucketRecord, MetadataError>;
 
     /// List all buckets owned by the given owner within this PG.
     fn list_buckets(&self, owner_canonical_id: &str) -> Result<Vec<BucketInfo>, MetadataError>;
