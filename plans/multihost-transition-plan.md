@@ -566,7 +566,7 @@ Phase 3 completion notes:
 
 1. all Phase 3 exit criteria are met for the current local PG model
 2. physical EC shard placement across nodes starts in Phase 4
-3. crash-durable cleanup of unreferenced shard files remains Phase 7 scavenger
+3. crash-durable cleanup of unreferenced shard files remains Phase 9 scavenger
    work, not Phase 3 data placement work
 
 ## Phase 4: Node-Aware Shard Placement
@@ -1580,50 +1580,133 @@ Exit criteria:
 7. no active cluster metadata path mutates or reads PG state by bypassing
    cluster PG routing through `StorageCluster::single_node`
 
-## Phase 6a: Metadata Integrity And Divergence Policy
+## Phase 7: Metadata Model, Integrity, And Divergence Policy
 
-Define how metadata corruption and replica disagreement are detected and handled.
+Define the metadata model before adding repair, degraded availability, or
+multi-process coordination.
 
-This phase should not rely only on SQLite page or constraint checks. Those are
-useful local signals, but replicated correctness needs PG-level integrity.
+Phase 6 created a working replicated command path, but it deliberately followed
+the existing request-shaped code. That leaves some foundations too implicit:
+
+- the command log and SQLite tables currently duplicate much of the same state
+  until the materialized tables overwrite or delete old rows
+- the system has a command-to-database apply path, but not a clearly documented
+  command/state/checkpoint model
+- many command payloads still mirror exact S3 operations rather than a smaller
+  storage-level mutation language
+- compaction and repair cannot be made safe until the relationship between log
+  history, materialized state, and checkpoints is explicit
+
+The intended model is:
+
+- the metadata command log is the ordered mutation history for a PG
+- SQLite metadata tables are the materialized serving view of that history
+- a checkpoint or snapshot is a compact proof of materialized state at a log
+  index
+- replay is `checkpoint + retained log tail -> materialized state`
+- deterministic apply is `canonical command + prior canonical state -> next
+  canonical state`
+- scrub and repair compare canonical state, not accidental SQLite row layout
+- the system must never resolve disagreement by silently choosing whichever
+  replica answered first
+
+This phase is intentionally early. If the command representation, state digest,
+checkpoint shape, or replay model needs rework, doing it now is cheaper and
+safer than after temporary availability policy, real peering, or multi-process
+RPC add more states.
 
 Work items:
 
-1. use the Phase 6 command-log hash chain and replica state table as the
-   baseline integrity source for every replicated metadata PG
-2. define canonical encodings for metadata rows or table ranges where scrub or
-   targeted repair needs row-level comparison beyond the command log
-3. decide how periodic metadata scrub compares replicas:
-   - full PG digest for small PGs
-   - table or key-range digests for larger PGs
-   - targeted row comparison after a digest mismatch
-4. define the resolution rules:
+1. document the source-of-truth split:
+   - command log as mutation history
+   - SQLite tables as materialized serving view
+   - checkpoints/snapshots as compact equivalence points
+   - pending commands as unclosed log intents, not independent state
+2. define canonical metadata state independent of SQLite layout:
+   - bucket records and subresources
+   - object versions and delete markers
+   - segment manifests and object parts
+   - multipart uploads, uploaded parts, and streamed part segments
+   - reclaim rows, write sequences, bucket execution generations, and other
+     allocators/counters
+3. define canonical row, table-range, and full-PG encodings for digest and
+   repair comparison:
+   - stable field ordering and integer/string encoding
+   - explicit handling of optional fields and deleted/missing rows
+   - table/range boundaries that can scale beyond small test PGs
+4. decide whether to keep request-shaped commands or refactor toward
+   storage-shaped commands before moving on:
+   - current examples are AWS-shaped commands like put tags, put ACL, complete
+     multipart upload, and lifecycle expiry
+   - possible storage-shaped commands include `PutBucketRecord`,
+     `PutBucketSubresource`, `PutObjectVersion`, `DeleteObjectVersion`,
+     `PutSegmentManifest`, `PutMultipartUpload`, `PutMultipartPart`,
+     `DeleteMultipartUpload`, and `DeleteReclaimRecord`
+   - S3 semantics should ideally produce storage mutations; replication,
+     replay, digest, and repair should reason about storage mutations
+5. define the command/state mapping:
+   - every command has deterministic preconditions over canonical state
+   - every accepted command produces deterministic canonical state changes
+   - replay does not require reconstructing an AWS request from current
+     database state
+   - reverse mapping is not required after overwrites/deletes, but replay and
+     checkpoint validation must be unambiguous
+6. define integrity and scrub policy:
+   - use the Phase 6 command-log hash chain and replica state table as the
+     baseline integrity source for every replicated metadata PG
+   - every persisted binary command-log entry must carry a per-entry checksum
+     in addition to the hash-chain link, so disk bitrot or torn writes are
+     detected before replay, compaction, peering, or repair trusts that entry
+   - every persisted checkpoint, snapshot, canonical row block, or table-range
+     block introduced by this phase must also carry a checksum over its
+     canonical binary encoding
+   - use canonical row/range/full-PG digests where scrub or targeted repair
+     needs comparison beyond the log
+   - SQLite page and constraint checks are useful diagnostics, but they are not
+     the integrity boundary for replicated metadata
+7. define divergence resolution rules:
    - replay from a valid command log when possible
    - rebuild a bad replica from a clean peer or snapshot when needed
-   - enter inconsistent or peering state when no safe authoritative source exists
-5. decide whether record-level checksums are needed for high-value rows, or
-   whether command-log plus state-digest verification is sufficient initially
-6. define metadata command-log retention and compaction policy:
+   - enter inconsistent or peering state when no safe authoritative source
+     exists
+8. define metadata command-log retention and compaction policy:
    - compact only after a durable checkpoint, state digest, or equivalent
      replica comparison point has been established
    - preserve enough log history for pending command retry, replica restart,
      peering, and targeted repair
    - define how compacted replicas prove equivalence and still reject stale,
      divergent, or conflicting commands
+9. implement the chosen immediate rework before Phase 8 if it affects command
+   payloads, canonical encodings, digest/checkpoint shape, or repair semantics
+10. add model and corruption tests:
+   - deterministic command apply over canonical state
+   - replay from checkpoint plus log tail
+   - row corruption detected by canonical digest
+   - missing, reordered, modified, or conflicting log entries detected
+   - divergent replicas excluded from clean PG state until repaired
 
 Exit criteria:
 
-1. a corrupted metadata row can be detected by scrub or read validation
-2. a replica with a missing, reordered, or modified command is detected
-3. a divergent replica is excluded from clean PG state until repaired
-4. tests cover primary corruption, replica corruption, stale replica restart, and
-   digest mismatch repair
-5. the system never resolves divergent metadata by silently choosing an arbitrary
-   replica
-6. command-log compaction cannot remove entries still needed for pending retry,
+1. the log/materialized-view/checkpoint relationship is documented and encoded
+   in tests
+2. every command-owned metadata table has a canonical state representation
+3. the project has either committed to request-shaped commands for now with
+   explicit limits, or refactored the core command payloads toward
+   storage-shaped mutations
+4. a corrupted metadata row can be detected by scrub or read validation
+5. a replica with a missing, reordered, or modified command is detected
+6. every persisted binary command-log entry and every persisted
+   checkpoint/snapshot/range block introduced by this phase has a checksum over
+   its canonical encoding
+7. a divergent replica is excluded from clean PG state until repaired
+8. tests cover primary corruption, replica corruption, stale replica restart,
+   digest mismatch repair, checksum failure, and checkpoint/log-tail replay
+9. command-log compaction cannot remove entries still needed for pending retry,
    peering, restart recovery, or repair validation
+10. the system never resolves divergent metadata by silently choosing an
+   arbitrary replica
 
-## Phase 6b: Temporary Failure Write Policy
+## Phase 8: Temporary Failure Write Policy
 
 Decide the policy for writes while one or more target nodes are temporarily
 unavailable.
@@ -1667,7 +1750,7 @@ Exit criteria:
 5. tests cover a second failure before repair for any policy that acknowledges
    writes below full redundancy
 
-## Phase 7: Replace Process-Local Coordination
+## Phase 9: Replace Process-Local Coordination
 
 Remove process-local mechanisms from logical correctness.
 
@@ -1697,7 +1780,7 @@ Exit criteria:
 5. unreferenced shard files left by best-effort cleanup failures are eventually
    detected and removed without consulting process-local state
 
-## Phase 8: Local Multi-Process RPC
+## Phase 10: Local Multi-Process RPC
 
 Move from in-process multi-node to local multi-process nodes.
 
@@ -1720,7 +1803,7 @@ Exit criteria:
 3. killing a non-critical process fails closed with clear errors
 4. restarting a process preserves its local shard and metadata state
 
-## Phase 9: Failure, Peering, Repair, And Migration
+## Phase 11: Failure, Peering, Repair, And Migration
 
 Add real distributed behavior after the normal path is already shaped correctly.
 
@@ -1733,7 +1816,7 @@ Work items:
 5. define read and write availability rules for peering and degraded PGs
 6. implement shard repair for missing or corrupt shards
 7. implement PG backfill and migration for changed acting sets
-8. implement metadata command-log retention and compaction using the Phase 6a
+8. implement metadata command-log retention and compaction using the Phase 7
    policy
 9. add cluster-map history retention and pruning
 
@@ -1747,7 +1830,7 @@ Exit criteria:
    restart, peering, or repair correctness
 6. failure-injection tests cover primary loss, replica loss, restart, and repair
 
-## Phase 10: Replicated Control Plane
+## Phase 12: Replicated Control Plane
 
 Replace the static in-memory control plane with a real replicated control plane.
 
