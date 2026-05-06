@@ -1690,6 +1690,50 @@ Work items:
    - missing, reordered, modified, or conflicting log entries detected
    - divergent replicas excluded from clean PG state until repaired
 
+Proposed slices:
+
+1. Phase 7.1: model and current digest inventory.
+   - add a guide that defines the command-log/materialized-view/checkpoint
+     relationship, payload-byte boundary, canonical-state target, command
+     mapping rules, and divergence policy
+   - make the current committed-serving-view digest inventory explicit in code,
+     so included tables and intentional Phase 7 gaps are reviewable without
+     relying on SQLite schema discovery
+   - keep the existing SQL-row digest as an interim online gate; this slice does
+     not yet introduce the final binary canonical row/range/checkpoint encoding
+2. Phase 7.2: storage-shaped command decision and command mapping.
+   - decide which existing S3-shaped command payloads should be retained for
+     now and which should be converted to storage-shaped mutations before Phase
+     8
+   - define deterministic preconditions and state transitions for the retained
+     command set over canonical metadata state
+3. Phase 7.3: canonical binary state encoding.
+   - define row, table-range, and full-PG encodings that do not depend on
+     SQLite row formatting
+   - include payload descriptors and payload CRC64 values, but not object
+     payload bytes
+4. Phase 7.4: log/checkpoint checksum and replay tests.
+   - add or update persisted binary formats so every log entry and every new
+     checkpoint/range block has a checksum over its canonical encoding
+   - add corruption, replay, checkpoint/log-tail, and divergence tests against
+     the canonical encodings
+5. Phase 7.5: retention and compaction policy.
+   - implement or fully specify command-log retention around pending retry,
+     restart, peering, repair, and checkpoint equivalence
+
+Completed:
+
+- Phase 7.1:
+  - added [metadata-model.md](../guides/metadata-model.md) with the
+    source-of-truth split, payload-byte boundary, target canonical state,
+    command-mapping direction, integrity requirements, and divergence rules
+  - replaced SQLite schema discovery in the online metadata state digest with an
+    explicit committed-serving-view table descriptor list:
+    `bucket_subresources`, `buckets`, committed `multipart_part_segments`,
+    `object_parts`, `object_segments`, and `objects`
+  - pinned that interim digest inventory in a unit test; the missing tables
+    remain visible Phase 7 gaps rather than hidden schema-scan exclusions
+
 Exit criteria:
 
 1. the log/materialized-view/checkpoint relationship is documented and encoded

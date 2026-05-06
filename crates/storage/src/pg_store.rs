@@ -78,6 +78,150 @@ const METADATA_STATE_DIGEST_UNVERIFIED: u64 = 0;
 const METADATA_STATE_DIGEST_ONLINE_COMMAND_LIMIT: u64 = 128;
 const ABANDONED_METADATA_COMMAND_CHECKSUM: u64 = 0;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataDigestFilter {
+    AllRows,
+    CommittedMultipartPartSegments,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MetadataDigestTable {
+    name: &'static str,
+    columns: &'static [&'static str],
+    filter: MetadataDigestFilter,
+}
+
+const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
+    MetadataDigestTable {
+        name: "bucket_subresources",
+        columns: &["bucket_name", "kind", "body", "generation", "aux_int_1"],
+        filter: MetadataDigestFilter::AllRows,
+    },
+    MetadataDigestTable {
+        name: "buckets",
+        columns: &[
+            "name",
+            "owner_principal",
+            "owner_canonical_id",
+            "created_at",
+            "region",
+            "state",
+            "versioning",
+            "acl_grants",
+            "public_read",
+            "public_write",
+            "public_access_block_present",
+            "public_access_block_block_public_acls",
+            "public_access_block_ignore_public_acls",
+            "public_access_block_block_public_policy",
+            "public_access_block_restrict_public_buckets",
+            "ownership_controls_mode",
+            "bucket_policy_public",
+            "bucket_policy_generation",
+            "bucket_lifecycle_generation",
+            "bucket_execution_generation",
+            "bucket_abac_enabled",
+            "default_encryption_type",
+            "sse_c_blocked",
+            "object_lock_enabled",
+            "object_lock_default_mode",
+            "object_lock_default_days",
+            "object_lock_default_years",
+        ],
+        filter: MetadataDigestFilter::AllRows,
+    },
+    MetadataDigestTable {
+        name: "multipart_part_segments",
+        columns: &[
+            "bucket",
+            "key",
+            "upload_id",
+            "version_id",
+            "part_number",
+            "segment_index",
+            "size",
+            "segment_crc64",
+            "segment_okh",
+            "segment_vid",
+            "data_pg_id",
+            "ec_k",
+            "ec_m",
+        ],
+        filter: MetadataDigestFilter::CommittedMultipartPartSegments,
+    },
+    MetadataDigestTable {
+        name: "object_parts",
+        columns: &[
+            "bucket",
+            "key",
+            "version_id",
+            "part_number",
+            "object_offset_start",
+            "size",
+            "etag",
+            "etag_kind",
+            "part_okh",
+            "part_vid",
+            "ec_k",
+            "ec_m",
+            "data_pg_id",
+            "checksum",
+        ],
+        filter: MetadataDigestFilter::AllRows,
+    },
+    MetadataDigestTable {
+        name: "object_segments",
+        columns: &[
+            "bucket",
+            "key",
+            "version_id",
+            "segment_index",
+            "size",
+            "segment_crc64",
+            "segment_okh",
+            "segment_vid",
+            "data_pg_id",
+            "ec_k",
+            "ec_m",
+        ],
+        filter: MetadataDigestFilter::AllRows,
+    },
+    MetadataDigestTable {
+        name: "objects",
+        columns: &[
+            "bucket",
+            "key",
+            "version_id",
+            "write_sequence",
+            "generation_id",
+            "size",
+            "etag",
+            "etag_kind",
+            "last_modified",
+            "storage_class",
+            "ec_k",
+            "ec_m",
+            "status",
+            "tags",
+            "data_layout",
+            "parts_count",
+            "metadata_blob",
+            "system_metadata_blob",
+            "encryption_type",
+            "encryption_state",
+            "owner_principal",
+            "owner_canonical_id",
+            "acl_grants",
+            "public_read",
+            "object_lock_retention_mode",
+            "object_lock_retain_until",
+            "object_lock_legal_hold",
+            "became_noncurrent_at",
+        ],
+        filter: MetadataDigestFilter::AllRows,
+    },
+];
+
 #[derive(Debug, Clone, Copy)]
 enum BucketExecutionGeneration {
     Allocate,
@@ -746,21 +890,17 @@ impl PgStore {
 
     fn metadata_state_digest(&self) -> Result<u64, StoreError> {
         let mut hasher = checksum::crc64::Hasher::new();
-        let table_names = self.metadata_digest_table_names()?;
-        for table_name in table_names {
-            digest_bytes(&mut hasher, table_name.as_bytes());
-            let columns = Self::metadata_digest_columns(&table_name);
-            for column in &columns {
+        for table in METADATA_DIGEST_TABLES {
+            digest_bytes(&mut hasher, table.name.as_bytes());
+            for column in table.columns {
                 digest_bytes(&mut hasher, column.as_bytes());
             }
-            let where_clause = Self::metadata_digest_where_clause(&table_name);
+            let where_clause = Self::metadata_digest_where_clause(table.filter);
             digest_bytes(&mut hasher, where_clause.as_bytes());
-            if columns.is_empty() {
-                continue;
-            }
 
-            let table_sql = quote_sql_identifier(&table_name);
-            let quoted_columns: Vec<String> = columns
+            let table_sql = quote_sql_identifier(table.name);
+            let quoted_columns: Vec<String> = table
+                .columns
                 .iter()
                 .map(|column| quote_sql_identifier(column))
                 .collect();
@@ -785,7 +925,7 @@ impl PgStore {
                 context: "scan metadata state digest row",
                 source: e,
             })? {
-                for index in 0..columns.len() {
+                for index in 0..table.columns.len() {
                     let value = row.get::<_, String>(index).map_err(|e| StoreError::Db {
                         context: "read metadata state digest value",
                         source: e,
@@ -807,163 +947,13 @@ impl PgStore {
         self.metadata_state_digest()
     }
 
-    fn metadata_digest_table_names(&self) -> Result<Vec<String>, StoreError> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT name FROM sqlite_schema \
-                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
-                 ORDER BY name",
-            )
-            .map_err(|e| StoreError::Db {
-                context: "prepare metadata digest table scan",
-                source: e,
-            })?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| StoreError::Db {
-                context: "scan metadata digest tables",
-                source: e,
-            })?;
-        let mut tables = Vec::new();
-        for row in rows {
-            let table = row.map_err(|e| StoreError::Db {
-                context: "read metadata digest table",
-                source: e,
-            })?;
-            if matches!(
-                table.as_str(),
-                "buckets"
-                    | "bucket_subresources"
-                    | "objects"
-                    | "object_parts"
-                    | "object_segments"
-                    | "multipart_part_segments"
-            ) {
-                tables.push(table);
-            }
-        }
-        Ok(tables)
-    }
-
-    fn metadata_digest_columns(table_name: &str) -> Vec<String> {
-        let columns = match table_name {
-            "buckets" => &[
-                "name",
-                "owner_principal",
-                "owner_canonical_id",
-                "created_at",
-                "region",
-                "state",
-                "versioning",
-                "acl_grants",
-                "public_read",
-                "public_write",
-                "public_access_block_present",
-                "public_access_block_block_public_acls",
-                "public_access_block_ignore_public_acls",
-                "public_access_block_block_public_policy",
-                "public_access_block_restrict_public_buckets",
-                "ownership_controls_mode",
-                "bucket_policy_public",
-                "bucket_policy_generation",
-                "bucket_lifecycle_generation",
-                "bucket_execution_generation",
-                "bucket_abac_enabled",
-                "default_encryption_type",
-                "sse_c_blocked",
-                "object_lock_enabled",
-                "object_lock_default_mode",
-                "object_lock_default_days",
-                "object_lock_default_years",
-            ][..],
-            "bucket_subresources" => &["bucket_name", "kind", "body", "generation", "aux_int_1"],
-            "objects" => &[
-                "bucket",
-                "key",
-                "version_id",
-                "write_sequence",
-                "generation_id",
-                "size",
-                "etag",
-                "etag_kind",
-                "last_modified",
-                "storage_class",
-                "ec_k",
-                "ec_m",
-                "status",
-                "tags",
-                "data_layout",
-                "parts_count",
-                "metadata_blob",
-                "system_metadata_blob",
-                "encryption_type",
-                "encryption_state",
-                "owner_principal",
-                "owner_canonical_id",
-                "acl_grants",
-                "public_read",
-                "object_lock_retention_mode",
-                "object_lock_retain_until",
-                "object_lock_legal_hold",
-                "became_noncurrent_at",
-            ],
-            "object_parts" => &[
-                "bucket",
-                "key",
-                "version_id",
-                "part_number",
-                "object_offset_start",
-                "size",
-                "etag",
-                "etag_kind",
-                "part_okh",
-                "part_vid",
-                "ec_k",
-                "ec_m",
-                "data_pg_id",
-                "checksum",
-            ],
-            "object_segments" => &[
-                "bucket",
-                "key",
-                "version_id",
-                "segment_index",
-                "size",
-                "segment_crc64",
-                "segment_okh",
-                "segment_vid",
-                "data_pg_id",
-                "ec_k",
-                "ec_m",
-            ],
-            "multipart_part_segments" => &[
-                "bucket",
-                "key",
-                "upload_id",
-                "version_id",
-                "part_number",
-                "segment_index",
-                "size",
-                "segment_crc64",
-                "segment_okh",
-                "segment_vid",
-                "data_pg_id",
-                "ec_k",
-                "ec_m",
-            ],
-            _ => &[][..],
-        };
-        columns.iter().map(|column| (*column).to_string()).collect()
-    }
-
-    fn metadata_digest_where_clause(table_name: &str) -> String {
-        match table_name {
-            "multipart_part_segments" => format!(
+    fn metadata_digest_where_clause(filter: MetadataDigestFilter) -> String {
+        match filter {
+            MetadataDigestFilter::AllRows => String::new(),
+            MetadataDigestFilter::CommittedMultipartPartSegments => format!(
                 " WHERE \"version_id\" != {}",
                 PART_SEGMENT_STAGING_VERSION_ID.to_u64() as i64
             ),
-            _ => String::new(),
         }
     }
 
@@ -11044,6 +11034,36 @@ mod tests {
             matches!(err, StoreError::MetadataStateDigestMismatch { .. }),
             "expected metadata state digest mismatch, got {err:?}"
         );
+    }
+
+    #[test]
+    fn metadata_state_digest_table_inventory_is_explicit() {
+        let tables: Vec<_> = METADATA_DIGEST_TABLES
+            .iter()
+            .map(|table| (table.name, table.filter))
+            .collect();
+        assert_eq!(
+            tables,
+            vec![
+                ("bucket_subresources", MetadataDigestFilter::AllRows),
+                ("buckets", MetadataDigestFilter::AllRows),
+                (
+                    "multipart_part_segments",
+                    MetadataDigestFilter::CommittedMultipartPartSegments,
+                ),
+                ("object_parts", MetadataDigestFilter::AllRows),
+                ("object_segments", MetadataDigestFilter::AllRows),
+                ("objects", MetadataDigestFilter::AllRows),
+            ]
+        );
+
+        for table in METADATA_DIGEST_TABLES {
+            assert!(
+                !table.columns.is_empty(),
+                "{} must have explicit digest columns",
+                table.name
+            );
+        }
     }
 
     // ── prefix_end ────────────────────────────────────────────────────
