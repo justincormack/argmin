@@ -1726,6 +1726,10 @@ Proposed slices:
      SQLite row formatting
    - include payload descriptors and payload CRC64 values, but not object
      payload bytes
+   - first convert the online committed-serving-view digest from SQLite
+     `quote(...)` text to typed canonical binary table-range encoding, then
+     expand the inventory to the remaining command-owned in-progress,
+     allocator, and reclaim tables
 4. Phase 7.4: log/checkpoint checksum and replay tests.
    - add or update persisted binary formats so every log entry and every new
      checkpoint/range block has a checksum over its canonical encoding
@@ -1794,6 +1798,20 @@ Completed:
     bucket row-image matching
   - Phase 7.2 is complete: all current metadata command payloads are classified
     as storage-shaped before Phase 7.3 canonical binary state encoding
+- Phase 7.3 first slice:
+  - replaced the online committed-serving-view digest's SQLite `quote(...)`
+    row text with a canonical binary full-PG encoding over the explicit Phase
+    7 inventory
+  - the full-PG encoding now starts with a stable domain/version header; each
+    encoded table range includes table name, filter identity, ordered column
+    list, row boundaries, and typed SQL values
+  - canonical value encoding distinguishes `NULL`, integers, text, blobs, and
+    real values before hashing, so metadata bitrot checks no longer depend on
+    SQLite text formatting
+  - the committed-serving-view inventory is still intentionally incomplete:
+    in-progress upload state, reclaim rows, durable reservation rows, and
+    allocator tables still need canonical representations before Phase 7.3 is
+    complete
 
 Exit criteria:
 

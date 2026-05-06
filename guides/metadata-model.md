@@ -59,9 +59,9 @@ The target canonical state includes:
   completed multipart pruning order
 
 The current
-[multihost transition Phase 7.1](../plans/multihost-transition-plan.md#phase-7-metadata-model-integrity-and-divergence-policy)
-implementation has an explicit interim digest inventory for the command-owned
-committed serving view:
+[multihost transition Phase 7](../plans/multihost-transition-plan.md#phase-7-metadata-model-integrity-and-divergence-policy)
+implementation has an explicit canonical binary digest inventory for the
+command-owned committed serving view:
 
 - `bucket_subresources`
 - `buckets`
@@ -70,8 +70,12 @@ committed serving view:
 - `object_segments`
 - `objects`
 
-This list is deliberately explicit in code. Tables that are not yet included are
-Phase 7 gaps, not hidden exclusions.
+The full-PG encoding starts with a stable domain/version header. Each included
+table range then encodes explicit table and column names, filter identity, row
+boundaries, and typed SQL values. `NULL`, integers, text, and blobs are separate
+binary value kinds; the digest does not use SQLite `quote(...)` output or SQL
+row text as its integrity boundary. This list remains deliberately explicit in
+code. Tables that are not yet included are Phase 7 gaps, not hidden exclusions.
 
 ## Commands
 

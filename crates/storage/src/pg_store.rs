@@ -15,6 +15,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use rusqlite::types::ValueRef;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
@@ -62,6 +63,8 @@ type StreamSessionRow = (u8, u8, BucketName, ObjectKey, Option<UploadId>, Option
 const METADATA_STATE_DIGEST_UNVERIFIED: u64 = 0;
 const METADATA_STATE_DIGEST_ONLINE_COMMAND_LIMIT: u64 = 128;
 const ABANDONED_METADATA_COMMAND_CHECKSUM: u64 = 0;
+const METADATA_CANONICAL_STATE_ENCODING_VERSION: u8 = 1;
+const METADATA_CANONICAL_PG_STATE_DOMAIN: &[u8] = b"argmin.metadata.pg-state";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetadataDigestFilter {
@@ -74,6 +77,17 @@ struct MetadataDigestTable {
     name: &'static str,
     columns: &'static [&'static str],
     filter: MetadataDigestFilter,
+}
+
+impl MetadataDigestFilter {
+    fn canonical_name(self) -> &'static str {
+        match self {
+            MetadataDigestFilter::AllRows => "all-rows",
+            MetadataDigestFilter::CommittedMultipartPartSegments => {
+                "committed-multipart-part-segments"
+            }
+        }
+    }
 }
 
 const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
@@ -284,9 +298,26 @@ fn trusted_object_key(key: impl Into<String>) -> ObjectKey {
         .expect("pg_store must only construct ObjectKey from validated values")
 }
 
-fn digest_bytes(hasher: &mut checksum::crc64::Hasher, bytes: &[u8]) {
+/// Feed a variable-length byte field into a canonical digest.
+///
+/// The length prefix is part of the canonical state encoding. Without it,
+/// adjacent text/blob fields could be split differently while producing the
+/// same byte stream.
+fn digest_len_prefixed_bytes(hasher: &mut checksum::crc64::Hasher, bytes: &[u8]) {
     hasher.update(&(bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);
+}
+
+fn digest_u8(hasher: &mut checksum::crc64::Hasher, value: u8) {
+    hasher.update(&[value]);
+}
+
+fn digest_i64(hasher: &mut checksum::crc64::Hasher, value: i64) {
+    hasher.update(&value.to_be_bytes());
+}
+
+fn digest_u64(hasher: &mut checksum::crc64::Hasher, value: u64) {
+    hasher.update(&value.to_be_bytes());
 }
 
 fn quote_sql_identifier(identifier: &str) -> String {
@@ -862,51 +893,91 @@ impl PgStore {
 
     fn metadata_state_digest(&self) -> Result<u64, StoreError> {
         let mut hasher = checksum::crc64::Hasher::new();
+        Self::digest_canonical_pg_state_header(&mut hasher);
         for table in METADATA_DIGEST_TABLES {
-            digest_bytes(&mut hasher, table.name.as_bytes());
-            for column in table.columns {
-                digest_bytes(&mut hasher, column.as_bytes());
-            }
-            let where_clause = Self::metadata_digest_where_clause(table.filter);
-            digest_bytes(&mut hasher, where_clause.as_bytes());
-
-            let table_sql = quote_sql_identifier(table.name);
-            let quoted_columns: Vec<String> = table
-                .columns
-                .iter()
-                .map(|column| quote_sql_identifier(column))
-                .collect();
-            let select_values = quoted_columns
-                .iter()
-                .map(|column| format!("quote({column})"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let order_by = quoted_columns.join(", ");
-            let sql = format!(
-                "SELECT {select_values} FROM {table_sql}{where_clause} ORDER BY {order_by}"
-            );
-            let mut stmt = self.conn.prepare(&sql).map_err(|e| StoreError::Db {
-                context: "prepare metadata state digest scan",
-                source: e,
-            })?;
-            let mut rows = stmt.query([]).map_err(|e| StoreError::Db {
-                context: "scan metadata state digest rows",
-                source: e,
-            })?;
-            while let Some(row) = rows.next().map_err(|e| StoreError::Db {
-                context: "scan metadata state digest row",
-                source: e,
-            })? {
-                for index in 0..table.columns.len() {
-                    let value = row.get::<_, String>(index).map_err(|e| StoreError::Db {
-                        context: "read metadata state digest value",
-                        source: e,
-                    })?;
-                    digest_bytes(&mut hasher, value.as_bytes());
-                }
-            }
+            self.digest_canonical_metadata_table_range(&mut hasher, table)?;
         }
         Ok(hasher.finalize())
+    }
+
+    fn digest_canonical_pg_state_header(hasher: &mut checksum::crc64::Hasher) {
+        digest_len_prefixed_bytes(hasher, METADATA_CANONICAL_PG_STATE_DOMAIN);
+        digest_u8(hasher, METADATA_CANONICAL_STATE_ENCODING_VERSION);
+        digest_u64(hasher, METADATA_DIGEST_TABLES.len() as u64);
+    }
+
+    fn digest_canonical_metadata_table_range(
+        &self,
+        hasher: &mut checksum::crc64::Hasher,
+        table: &MetadataDigestTable,
+    ) -> Result<(), StoreError> {
+        digest_u8(hasher, 0x10);
+        digest_len_prefixed_bytes(hasher, table.name.as_bytes());
+        digest_len_prefixed_bytes(hasher, table.filter.canonical_name().as_bytes());
+        digest_u64(hasher, table.columns.len() as u64);
+        for column in table.columns {
+            digest_len_prefixed_bytes(hasher, column.as_bytes());
+        }
+
+        let where_clause = Self::metadata_digest_where_clause(table.filter);
+        let table_sql = quote_sql_identifier(table.name);
+        let quoted_columns: Vec<String> = table
+            .columns
+            .iter()
+            .map(|column| quote_sql_identifier(column))
+            .collect();
+        let select_values = quoted_columns.join(", ");
+        let order_by = quoted_columns.join(", ");
+        let sql =
+            format!("SELECT {select_values} FROM {table_sql}{where_clause} ORDER BY {order_by}");
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| StoreError::Db {
+            context: "prepare canonical metadata table range scan",
+            source: e,
+        })?;
+        let mut rows = stmt.query([]).map_err(|e| StoreError::Db {
+            context: "scan canonical metadata table range rows",
+            source: e,
+        })?;
+        while let Some(row) = rows.next().map_err(|e| StoreError::Db {
+            context: "scan canonical metadata table range row",
+            source: e,
+        })? {
+            digest_u8(hasher, 0x20);
+            digest_u64(hasher, table.columns.len() as u64);
+            for index in 0..table.columns.len() {
+                let value = row.get_ref(index).map_err(|e| StoreError::Db {
+                    context: "read canonical metadata table range value",
+                    source: e,
+                })?;
+                Self::digest_canonical_sql_value(hasher, value);
+            }
+        }
+        digest_u8(hasher, 0x11);
+        Ok(())
+    }
+
+    fn digest_canonical_sql_value(hasher: &mut checksum::crc64::Hasher, value: ValueRef<'_>) {
+        match value {
+            ValueRef::Null => {
+                digest_u8(hasher, 0x00);
+            }
+            ValueRef::Integer(value) => {
+                digest_u8(hasher, 0x01);
+                digest_i64(hasher, value);
+            }
+            ValueRef::Real(value) => {
+                digest_u8(hasher, 0x02);
+                digest_u64(hasher, value.to_bits());
+            }
+            ValueRef::Text(value) => {
+                digest_u8(hasher, 0x03);
+                digest_len_prefixed_bytes(hasher, value);
+            }
+            ValueRef::Blob(value) => {
+                digest_u8(hasher, 0x04);
+                digest_len_prefixed_bytes(hasher, value);
+            }
+        }
     }
 
     fn online_metadata_state_digest(&self, applied_log_index: u64) -> Result<u64, StoreError> {
@@ -11489,6 +11560,61 @@ mod tests {
                 table.name
             );
         }
+    }
+
+    #[test]
+    fn canonical_metadata_value_encoding_is_typed() {
+        fn digest_for(value: ValueRef<'_>) -> u64 {
+            let mut hasher = checksum::crc64::Hasher::new();
+            PgStore::digest_canonical_sql_value(&mut hasher, value);
+            hasher.finalize()
+        }
+
+        assert_ne!(digest_for(ValueRef::Null), digest_for(ValueRef::Text(b"")));
+        assert_ne!(
+            digest_for(ValueRef::Integer(12)),
+            digest_for(ValueRef::Text(b"12"))
+        );
+        assert_ne!(
+            digest_for(ValueRef::Text(b"bytes")),
+            digest_for(ValueRef::Blob(b"bytes"))
+        );
+        assert_ne!(
+            digest_for(ValueRef::Integer(-1)),
+            digest_for(ValueRef::Integer(1))
+        );
+    }
+
+    #[test]
+    fn canonical_metadata_variable_length_encoding_is_prefix_free() {
+        fn digest_values(values: &[ValueRef<'_>]) -> u64 {
+            let mut hasher = checksum::crc64::Hasher::new();
+            for value in values {
+                PgStore::digest_canonical_sql_value(&mut hasher, *value);
+            }
+            hasher.finalize()
+        }
+
+        fn digest_names(names: &[&[u8]]) -> u64 {
+            let mut hasher = checksum::crc64::Hasher::new();
+            for name in names {
+                digest_len_prefixed_bytes(&mut hasher, name);
+            }
+            hasher.finalize()
+        }
+
+        assert_ne!(
+            digest_values(&[ValueRef::Blob(b"\x04"), ValueRef::Blob(b"")]),
+            digest_values(&[ValueRef::Blob(b""), ValueRef::Blob(b"\x04")])
+        );
+        assert_ne!(
+            digest_values(&[ValueRef::Text(b"a"), ValueRef::Text(b"bc")]),
+            digest_values(&[ValueRef::Text(b"ab"), ValueRef::Text(b"c")])
+        );
+        assert_ne!(
+            digest_names(&[b"table", b"_range"]),
+            digest_names(&[b"table_", b"range"])
+        );
     }
 
     // ── prefix_end ────────────────────────────────────────────────────
