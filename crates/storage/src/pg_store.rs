@@ -28,7 +28,7 @@ use crate::metadata_command::{
     MetadataCommandLogIndex, MetadataCommandPayload, MetadataCommandReplicaState,
     ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
     PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
-    PutObjectMetadataMutation, ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
+    ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
 };
 use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
@@ -3665,36 +3665,111 @@ impl PgStore {
         &self,
         command: &PutObjectMetadataCommand,
     ) -> Result<(), MetadataError> {
-        match &command.mutation {
-            PutObjectMetadataMutation::PutTags(tags) => {
-                self.put_object_tags(&command.bucket, &command.key, command.version_id, tags)
-            }
-            PutObjectMetadataMutation::DeleteTags => {
-                self.delete_object_tags(&command.bucket, &command.key, command.version_id)
-            }
-            PutObjectMetadataMutation::PutRetention(retention) => self.put_object_retention(
-                &command.bucket,
-                &command.key,
-                command.version_id,
-                *retention,
-            ),
-            PutObjectMetadataMutation::PutLegalHold(legal_hold) => self.put_object_legal_hold(
-                &command.bucket,
-                &command.key,
-                command.version_id,
-                *legal_hold,
-            ),
-            PutObjectMetadataMutation::PutAcl {
-                acl_grants,
-                public_read,
-            } => self.put_object_acl(
-                &command.bucket,
-                &command.key,
-                command.version_id,
-                acl_grants,
-                *public_read,
-            ),
+        if self.put_object_metadata_command_already_applied(command)? {
+            return Ok(());
         }
+        self.with_immediate_txn(
+            "put object metadata command (begin txn)",
+            "put object metadata command (commit txn)",
+            |store| store.put_object_metadata_explicit_in_open_txn(&command.object),
+        )
+    }
+
+    fn put_object_metadata_command_already_applied(
+        &self,
+        command: &PutObjectMetadataCommand,
+    ) -> Result<bool, MetadataError> {
+        let stored = match self.get_object_version(
+            &command.object.bucket,
+            &command.object.key,
+            command.object.version_id,
+        ) {
+            Ok(StoredObject::Live(record)) => record,
+            Ok(StoredObject::DeleteMarker(_)) | Err(MetadataError::ObjectNotFound) => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(command.matches_object(&stored))
+    }
+
+    fn put_object_metadata_explicit_in_open_txn(
+        &self,
+        object: &LiveObjectRecord,
+    ) -> Result<(), MetadataError> {
+        let stored = match self.get_object_version(&object.bucket, &object.key, object.version_id) {
+            Ok(StoredObject::Live(record)) => record,
+            Ok(StoredObject::DeleteMarker(_)) => {
+                return Err(MetadataError::MethodNotAllowedOnDeleteMarker);
+            }
+            Err(error) => return Err(error),
+        };
+        if stored == *object {
+            return Ok(());
+        }
+        if !Self::put_object_metadata_preimage_matches(&stored, object) {
+            return Err(MetadataError::Db {
+                context: "put object metadata command preimage mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+
+        let tags = object.tags.as_ref().map(SerializedTagSet::as_str);
+        let (object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) =
+            Self::object_lock_sql_values(object.object_lock).map_err(|e| MetadataError::Db {
+                context: "put object metadata command (encode object lock)",
+                source: e,
+            })?;
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE objects \
+                 SET tags = ?1, acl_grants = ?2, public_read = ?3, \
+                     object_lock_retention_mode = ?4, object_lock_retain_until = ?5, \
+                     object_lock_legal_hold = ?6 \
+                 WHERE bucket = ?7 AND key = ?8 AND version_id = ?9 AND status = ?10",
+                params![
+                    tags,
+                    object.acl_grants.serialized(),
+                    i32::from(object.public_read),
+                    object_lock_retention_mode,
+                    object_lock_retain_until,
+                    object_lock_legal_hold,
+                    &object.bucket,
+                    &object.key,
+                    object.version_id.to_u64() as i64,
+                    ObjectState::Live as u8,
+                ],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put object metadata command",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::ObjectNotFound);
+        }
+        Ok(())
+    }
+
+    fn put_object_metadata_preimage_matches(
+        stored: &LiveObjectRecord,
+        object: &LiveObjectRecord,
+    ) -> bool {
+        stored.bucket == object.bucket
+            && stored.key == object.key
+            && stored.version_id == object.version_id
+            && stored.owner == object.owner
+            && stored.generation_id == object.generation_id
+            && stored.size == object.size
+            && stored.etag == object.etag
+            && stored.last_modified == object.last_modified
+            && stored.became_noncurrent_at == object.became_noncurrent_at
+            && stored.storage_class == object.storage_class
+            && stored.ec == object.ec
+            && stored.layout == object.layout
+            && stored.metadata_blob == object.metadata_blob
+            && stored.system_metadata_blob == object.system_metadata_blob
+            && stored.encryption == object.encryption
     }
 
     fn create_stream_upload_explicit(

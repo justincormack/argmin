@@ -1764,8 +1764,19 @@ Completed:
   - included stream session `next_segment_vid` allocator state in
     `StreamUploadRecord` and `CreateStreamUploadCommand` checksums so stream
     create row matching covers the full storage row
-  - `PutObjectMetadata` remains the main request-shaped object command to
-    address before Phase 7.3
+- Phase 7.2 `PutObjectMetadata` slice:
+  - converted the durable `PutObjectMetadataCommand` from request-shaped
+    "put tags/delete tags/put ACL/put retention/put legal hold" mutations to a
+    storage-shaped post-mutation `LiveObjectRecord`
+  - kept the mutation enum as an internal constructor detail at the storage API
+    boundary, where coordinator-approved AWS semantics are turned into a
+    concrete metadata row image
+  - changed command encoding so object metadata updates checksum the live object
+    post-image, including ACL/public-read, tags, object-lock state, payload
+    identity, timestamps, layout, metadata blobs, and encryption state
+  - tightened pending-command retry so a same AWS mutation is accepted only when
+    the pending command's post-image exactly matches the row the retry would
+    produce
 
 Exit criteria:
 

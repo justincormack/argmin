@@ -1350,7 +1350,7 @@ mod tests {
     use crate::metadata_command::{
         metadata_command_log_hash, BucketPropertyMutation, BucketSubresourceMutation,
         CreateBucketCommand, MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandId,
-        MetadataCommandLogIndex, MetadataCommandPayload,
+        MetadataCommandLogIndex, MetadataCommandPayload, PutObjectMetadataCommand,
     };
     use proptest::prelude::*;
     use proptest::test_runner::{TestCaseError, TestCaseResult};
@@ -4338,8 +4338,8 @@ mod tests {
             move |node_id, command| {
                 match command.payload() {
                     MetadataCommandPayload::PutObjectMetadata(update)
-                        if update.bucket == hook_bucket
-                            && update.key == hook_key
+                        if update.object.bucket == hook_bucket
+                            && update.object.key == hook_key
                             && node_id == NodeId::new(1)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
@@ -8294,8 +8294,8 @@ mod tests {
             move |node_id, command| {
                 match command.payload() {
                     MetadataCommandPayload::PutObjectMetadata(update)
-                        if update.bucket == hook_bucket
-                            && update.key == hook_key
+                        if update.object.bucket == hook_bucket
+                            && update.object.key == hook_key
                             && node_id == NodeId::new(1)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
@@ -8385,6 +8385,146 @@ mod tests {
                 .as_deref(),
                 Some(tags)
             );
+        }
+    }
+
+    #[test]
+    fn object_metadata_retry_rejects_same_mutation_with_mismatched_post_image() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        write_committed_direct_segment_for(&cluster, &bucket, &key, b"metadata mismatch");
+        let tags =
+            "<Tagging><TagSet><Tag><Key>retry</Key><Value>no</Value></Tag></TagSet></Tagging>";
+
+        let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+        let pg = primary.get_pg(object_pg).unwrap();
+        let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key)
+            .unwrap()
+            .into_live()
+            .unwrap();
+        drop(pg);
+        let mut mismatched_post_image = stored.clone();
+        mismatched_post_image.tags = Some(crate::SerializedTagSet::new(tags.to_string()));
+        mismatched_post_image.public_read = !stored.public_read;
+        let pg_id = PgId::new(object_pg);
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                map.runtime_state().next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
+                object: mismatched_post_image,
+            })),
+        );
+        map.runtime_state()
+            .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command)
+            .unwrap();
+
+        let err = cluster
+            .put_object_tags_if(&bucket, &key, None, tags, |stored| {
+                Ok::<_, ()>(stored.version_id())
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "conflicting pending command for object metadata update",
+                    ..
+                })
+            ),
+            "expected conflicting post-image error, got {err:?}"
+        );
+        let pg = primary.get_pg(object_pg).unwrap();
+        let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+        assert_eq!(stored.as_live().unwrap().tags, None);
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(pg_id, &bucket)
+            .is_some());
+    }
+
+    #[test]
+    fn object_metadata_command_rejects_non_metadata_post_image_mismatch() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        write_committed_direct_segment_for(&cluster, &bucket, &key, b"metadata apply mismatch");
+        let tags =
+            "<Tagging><TagSet><Tag><Key>apply</Key><Value>no</Value></Tag></TagSet></Tagging>";
+        let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+        let pg = primary.get_pg(object_pg).unwrap();
+        let mut post_image = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key)
+            .unwrap()
+            .into_live()
+            .unwrap();
+        drop(pg);
+        post_image.tags = Some(crate::SerializedTagSet::new(tags.to_string()));
+        post_image.size += 1;
+
+        let pg_id = PgId::new(object_pg);
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                map.runtime_state().next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
+                object: post_image,
+            })),
+        );
+        let err = cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::Db {
+                    context: "put object metadata command preimage mismatch",
+                    ..
+                })
+            ),
+            "expected preimage mismatch, got {err:?}"
+        );
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+            assert_eq!(stored.as_live().unwrap().tags, None);
         }
     }
 

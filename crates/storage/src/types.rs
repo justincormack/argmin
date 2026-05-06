@@ -1632,7 +1632,7 @@ impl ObjectLayout {
 // ── Variant-based object model ────────────────────────────────────
 
 /// An object record read from storage — either a live object or a delete marker.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 // Boxing the live variant would add heap traffic on the hot metadata path.
 #[allow(clippy::large_enum_variant)]
 pub enum StoredObject {
@@ -1762,7 +1762,7 @@ impl OwnerIdentity {
 }
 
 /// A live object record (not a delete marker).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveObjectRecord {
     pub bucket: BucketName,
     pub key: ObjectKey,
@@ -1792,7 +1792,7 @@ pub struct LiveObjectRecord {
 }
 
 /// A delete marker record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteMarkerRecord {
     pub bucket: BucketName,
     pub key: ObjectKey,

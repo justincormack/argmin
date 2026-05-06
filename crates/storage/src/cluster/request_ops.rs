@@ -255,8 +255,8 @@ fn metadata_command_apply_test_context(
         ),
         MetadataCommandPayload::PutObjectMetadata(command) => (
             MetadataCommandApplyTestKind::PutObjectMetadata,
-            Some(command.bucket.clone()),
-            Some(command.key.clone()),
+            Some(command.object.bucket.clone()),
+            Some(command.object.key.clone()),
         ),
         MetadataCommandPayload::CreateStreamUpload(command) => (
             MetadataCommandApplyTestKind::CreateStreamUpload,
@@ -2380,10 +2380,7 @@ impl super::StorageCluster {
     fn new_put_object_metadata_command(
         &self,
         pg_id: PgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: VersionId,
-        mutation: PutObjectMetadataMutation,
+        object: LiveObjectRecord,
     ) -> MetadataCommandEnvelope {
         let command_id = MetadataCommandId::new(
             self.operation_epoch(),
@@ -2395,12 +2392,32 @@ impl super::StorageCluster {
         MetadataCommandEnvelope::new(
             command_id,
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                version_id,
-                mutation,
+                object,
             })),
         )
+    }
+
+    fn put_object_metadata_command_from_stored(
+        stored: &StoredObject,
+        version_id: VersionId,
+        mutation: PutObjectMetadataMutation,
+    ) -> Result<PutObjectMetadataCommand, ObjectPgActionError> {
+        if stored.version_id() != version_id {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: format!(
+                    "object metadata action returned version {:?} for stored version {:?}",
+                    version_id,
+                    stored.version_id()
+                ),
+            });
+        }
+        let live = stored
+            .as_live()
+            .ok_or(MetadataError::MethodNotAllowedOnDeleteMarker)?;
+        Ok(PutObjectMetadataCommand::from_live_object_and_mutation(
+            live.clone(),
+            mutation,
+        ))
     }
 
     fn put_object_metadata_if<T, E>(
@@ -2420,11 +2437,11 @@ impl super::StorageCluster {
             if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
             {
                 if let MetadataCommandPayload::PutObjectMetadata(update) = command.payload() {
-                    if update.bucket == *bucket && update.key == *key {
+                    if update.object.bucket == *bucket && update.object.key == *key {
                         let object_pg = primary_node.get_pg(pg_id.get())?;
                         let stored = match requested_version_id {
                             Some(version_id) => {
-                                if version_id != update.version_id {
+                                if version_id != update.object.version_id {
                                     drop(object_pg);
                                     self.apply_pending_object_metadata_command_for_bucket(
                                         pg_id, bucket, &command,
@@ -2441,7 +2458,7 @@ impl super::StorageCluster {
                             None => {
                                 let stored =
                                     PgMetadataStore::get_object_meta(&*object_pg, bucket, key)?;
-                                if stored.version_id() != update.version_id {
+                                if stored.version_id() != update.object.version_id {
                                     drop(object_pg);
                                     self.apply_pending_object_metadata_command_for_bucket(
                                         pg_id, bucket, &command,
@@ -2457,7 +2474,10 @@ impl super::StorageCluster {
                                 Ok(command) => command,
                                 Err(error) => return Ok(Err(error)),
                             };
-                        if !update.matches_request(bucket, key, version_id, &mutation) {
+                        let expected = Self::put_object_metadata_command_from_stored(
+                            &stored, version_id, mutation,
+                        )?;
+                        if update.as_ref() != &expected {
                             return Err(super::conflicting_pending_object_metadata_command(
                                 "conflicting pending command for object metadata update",
                             ));
@@ -2486,8 +2506,9 @@ impl super::StorageCluster {
                     Ok(command) => command,
                     Err(error) => return Ok(Err(error)),
                 };
-            let command =
-                self.new_put_object_metadata_command(pg_id, bucket, key, version_id, mutation);
+            let update =
+                Self::put_object_metadata_command_from_stored(&stored, version_id, mutation)?;
+            let command = self.new_put_object_metadata_command(pg_id, update.object);
             drop(object_pg);
             self.set_pending_metadata_command_for_bucket(
                 pg_id,

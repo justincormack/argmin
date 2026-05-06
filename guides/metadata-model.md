@@ -111,7 +111,7 @@ encodings.
 | `CommitMultipartObject` | Storage-shaped | MPU rows, part rows, completed-MPU order, object state | object row, part manifest, selected segment rows, completed-MPU row, stale reclaim rows | matching upload completion converges |
 | `DeleteObjectVersion` | Storage-shaped | exact object version row | removes version, writes reclaim metadata for live payload | matching version/generation converges |
 | `InsertDeleteMarker` | Storage-shaped | object version/write-sequence state | delete marker row, optional stale reclaim metadata | matching bucket/key marker insertion converges |
-| `PutObjectMetadata` | Request-shaped | exact object version row | tags, retention, legal hold, or ACL fields | matching mutation converges |
+| `PutObjectMetadata` | Storage-shaped | exact object version row | post-mutation live object metadata row | matching live object post-image converges |
 | `CreateStreamUpload` | Storage-shaped | target object/upload row for validation | stream session row | matching session row converges |
 | `AppendStreamSegment` | Storage-shaped | stream session row and segment allocator | stream segment row, session segment allocator | matching segment row converges |
 | `AbortStreamUpload` | Storage-shaped | stream session and staged segments | removes stream session/segments | matching session abort converges |
@@ -126,11 +126,11 @@ enough, because row fields such as timestamps, generation ids, and allocator
 state are part of the command checksum and replay effect. For stream upload
 session creation this includes the initial `next_segment_vid` allocator value.
 
-`PutObjectMetadata` is the main remaining request-shaped object command. It
-still records "put tags", "delete tags", "put ACL", "put retention", and "put
-legal hold" mutations rather than an explicit post-image object metadata row.
-That should be converted before Phase 7.3 if the binary canonical command
-format is going to commit object metadata command payloads long term.
+`PutObjectMetadata` keeps the AWS-facing "put tags", "delete tags", "put ACL",
+"put retention", and "put legal hold" distinctions at the coordinator/storage
+API boundary, but the durable command carries the post-mutation live object row.
+Retry matching compares that row image rather than reconstructing AWS request
+semantics from materialized state.
 
 ## Integrity And Divergence
 

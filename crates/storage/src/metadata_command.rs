@@ -10,11 +10,11 @@ use crate::types::{
     AbortMultipartUploadCleanup, BucketEncryptionConfig, BucketName, BucketObjectOwnership,
     BucketOwnershipControls, BucketSubresourceAux, BucketSubresourceKind, ClusterEpoch,
     CreateBucketConfig, CreateMultipartUploadReq, CreateStreamUploadReq, GenerationId,
-    ManagedEncryptionAlgorithm, MultipartPartRecord, MultipartPartSegmentRecord,
+    LiveObjectRecord, ManagedEncryptionAlgorithm, MultipartPartRecord, MultipartPartSegmentRecord,
     MultipartReclaimPartRecord, MultipartReclaimRecord, MultipartUploadRecord, ObjectEncryption,
     ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord,
     ObjectSegmentsReclaimRecord, OwnerIdentity, PgId, PublicAccessBlockConfig, PutLiveObjectReq,
-    SessionId, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
+    SerializedTagSet, SessionId, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
     StreamUploadTarget, UploadId, VersionId,
 };
 
@@ -595,24 +595,40 @@ pub(crate) enum PutObjectMetadataMutation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PutObjectMetadataCommand {
-    pub(crate) bucket: BucketName,
-    pub(crate) key: ObjectKey,
-    pub(crate) version_id: VersionId,
-    pub(crate) mutation: PutObjectMetadataMutation,
+    pub(crate) object: LiveObjectRecord,
 }
 
 impl PutObjectMetadataCommand {
-    pub(crate) fn matches_request(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: VersionId,
-        mutation: &PutObjectMetadataMutation,
-    ) -> bool {
-        self.bucket == *bucket
-            && self.key == *key
-            && self.version_id == version_id
-            && self.mutation == *mutation
+    pub(crate) fn from_live_object_and_mutation(
+        mut object: LiveObjectRecord,
+        mutation: PutObjectMetadataMutation,
+    ) -> Self {
+        match mutation {
+            PutObjectMetadataMutation::PutTags(tags) => {
+                object.tags = Some(SerializedTagSet::new(tags));
+            }
+            PutObjectMetadataMutation::DeleteTags => {
+                object.tags = None;
+            }
+            PutObjectMetadataMutation::PutRetention(retention) => {
+                object.object_lock.retention = Some(retention);
+            }
+            PutObjectMetadataMutation::PutLegalHold(legal_hold) => {
+                object.object_lock.legal_hold = legal_hold;
+            }
+            PutObjectMetadataMutation::PutAcl {
+                acl_grants,
+                public_read,
+            } => {
+                object.acl_grants = acl_grants;
+                object.public_read = public_read;
+            }
+        }
+        Self { object }
+    }
+
+    pub(crate) fn matches_object(&self, object: &LiveObjectRecord) -> bool {
+        self.object == *object
     }
 }
 
@@ -1020,35 +1036,7 @@ fn encode_insert_delete_marker(out: &mut Vec<u8>, command: &InsertDeleteMarkerCo
 }
 
 fn encode_put_object_metadata(out: &mut Vec<u8>, command: &PutObjectMetadataCommand) {
-    put_str(out, command.bucket.as_str());
-    put_str(out, command.key.as_str());
-    encode_version_id(out, command.version_id);
-    match &command.mutation {
-        PutObjectMetadataMutation::PutTags(tags) => {
-            put_u8(out, 1);
-            put_str(out, tags);
-        }
-        PutObjectMetadataMutation::DeleteTags => {
-            put_u8(out, 2);
-        }
-        PutObjectMetadataMutation::PutRetention(retention) => {
-            put_u8(out, 3);
-            put_u8(out, retention.mode as u8);
-            put_u64(out, retention.retain_until_unix_seconds);
-        }
-        PutObjectMetadataMutation::PutLegalHold(legal_hold) => {
-            put_u8(out, 4);
-            put_u8(out, *legal_hold as u8);
-        }
-        PutObjectMetadataMutation::PutAcl {
-            acl_grants,
-            public_read,
-        } => {
-            put_u8(out, 5);
-            put_str(out, &acl_grants.serialized());
-            put_bool(out, *public_read);
-        }
-    }
+    encode_live_object_record(out, &command.object);
 }
 
 fn encode_create_stream_upload(out: &mut Vec<u8>, command: &CreateStreamUploadCommand) {
@@ -1177,6 +1165,38 @@ fn encode_put_live_object(out: &mut Vec<u8>, object: &PutLiveObjectReq) {
     put_u64(out, object.generation_id.get());
     put_u64(out, object.size);
     encode_object_etag(out, object.etag);
+    put_u8(out, object.ec.k);
+    put_u8(out, object.ec.m);
+    encode_object_layout(out, object.layout);
+    encode_optional_str(out, object.tags.as_deref());
+    encode_optional_bytes(
+        out,
+        object.metadata_blob.as_ref().map(|blob| blob.as_slice()),
+    );
+    encode_optional_bytes(
+        out,
+        object
+            .system_metadata_blob
+            .as_ref()
+            .map(|blob| blob.as_slice()),
+    );
+    encode_object_lock_state(out, object.object_lock);
+    encode_object_encryption(out, &object.encryption);
+}
+
+fn encode_live_object_record(out: &mut Vec<u8>, object: &LiveObjectRecord) {
+    put_str(out, object.bucket.as_str());
+    put_str(out, object.key.as_str());
+    encode_version_id(out, object.version_id);
+    encode_owner_identity(out, &object.owner);
+    put_str(out, &object.acl_grants.serialized());
+    put_bool(out, object.public_read);
+    put_u64(out, object.generation_id.get());
+    put_u64(out, object.size);
+    encode_object_etag(out, object.etag);
+    put_u64(out, object.last_modified);
+    encode_optional_u64(out, object.became_noncurrent_at);
+    put_u8(out, object.storage_class as u8);
     put_u8(out, object.ec.k);
     put_u8(out, object.ec.m);
     encode_object_layout(out, object.layout);
@@ -1615,7 +1635,7 @@ mod tests {
     use super::*;
     use crate::types::{
         EcShape, MultipartReclaimPartSegmentRecord, ObjectSegmentsReclaimSegmentRecord,
-        OwnerIdentity, SerializedMetadataBlob, SerializedSystemMetadataBlob,
+        OwnerIdentity, SerializedMetadataBlob, SerializedSystemMetadataBlob, StorageClass,
     };
 
     #[test]
@@ -1916,6 +1936,27 @@ mod tests {
             etag: ObjectEtag::multipart([3; 8], 1),
             ..object.clone()
         };
+        let metadata_object = LiveObjectRecord {
+            bucket: object.bucket.clone(),
+            key: object.key.clone(),
+            version_id: object.version_id,
+            owner: object.owner.clone(),
+            acl_grants: object.acl_grants.clone(),
+            public_read: object.public_read,
+            generation_id: object.generation_id,
+            size: object.size,
+            etag: object.etag,
+            last_modified: 555,
+            became_noncurrent_at: None,
+            storage_class: StorageClass::Standard,
+            ec: object.ec,
+            layout: object.layout,
+            tags: object.tags.clone(),
+            metadata_blob: object.metadata_blob.clone(),
+            system_metadata_blob: object.system_metadata_blob.clone(),
+            object_lock: object.object_lock,
+            encryption: object.encryption.clone(),
+        };
         let part = ObjectPartRecord {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -2115,31 +2156,41 @@ mod tests {
                 stale_payload: Some(multipart_reclaim.clone()),
             }),
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                version_id: VersionId::from_u64(8),
-                mutation: PutObjectMetadataMutation::PutTags("<Tagging/>".to_string()),
+                object: LiveObjectRecord {
+                    version_id: VersionId::from_u64(8),
+                    tags: Some(SerializedTagSet::new("<Tagging/>".to_string())),
+                    ..metadata_object.clone()
+                },
             })),
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                version_id: VersionId::from_u64(8),
-                mutation: PutObjectMetadataMutation::DeleteTags,
+                object: LiveObjectRecord {
+                    version_id: VersionId::from_u64(8),
+                    tags: None,
+                    ..metadata_object.clone()
+                },
             })),
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                version_id: VersionId::from_u64(8),
-                mutation: PutObjectMetadataMutation::PutRetention(ObjectRetention {
-                    mode: ObjectLockMode::Governance,
-                    retain_until_unix_seconds: 999,
-                }),
+                object: LiveObjectRecord {
+                    version_id: VersionId::from_u64(8),
+                    object_lock: ObjectLockState {
+                        retention: Some(ObjectRetention {
+                            mode: ObjectLockMode::Governance,
+                            retain_until_unix_seconds: 999,
+                        }),
+                        ..ObjectLockState::default()
+                    },
+                    ..metadata_object.clone()
+                },
             })),
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                version_id: VersionId::from_u64(8),
-                mutation: PutObjectMetadataMutation::PutLegalHold(StoredLegalHoldStatus::On),
+                object: LiveObjectRecord {
+                    version_id: VersionId::from_u64(8),
+                    object_lock: ObjectLockState {
+                        legal_hold: StoredLegalHoldStatus::On,
+                        ..ObjectLockState::default()
+                    },
+                    ..metadata_object.clone()
+                },
             })),
             MetadataCommandPayload::CreateMultipartUpload(Box::new(
                 CreateMultipartUploadCommand::from_request(
@@ -2222,12 +2273,13 @@ mod tests {
                 ),
             )),
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
-                bucket,
-                key,
-                version_id: VersionId::from_u64(8),
-                mutation: PutObjectMetadataMutation::PutAcl {
+                object: LiveObjectRecord {
+                    bucket,
+                    key,
+                    version_id: VersionId::from_u64(8),
                     acl_grants: AclGrants::default(),
                     public_read: true,
+                    ..metadata_object
                 },
             })),
         ];
@@ -2260,10 +2312,10 @@ mod tests {
                 0xfce4f84779e4e364,
                 0xa1b20e6eb91852f7,
                 0x4a877a8134817636,
-                0x1f4a02b6464a538c,
-                0x01cd87bdfd723201,
-                0x12751ef35639efd3,
-                0x22fd0e282e38997a,
+                0x6c3bf60387ba55f3,
+                0x488205d249e6ecb4,
+                0x2a86200ef59abfce,
+                0xbedac82e848dc420,
                 0x73de85dc53ef998c,
                 0x2c69c1feb283495d,
                 0x35664b4295eb2b3b,
@@ -2272,7 +2324,7 @@ mod tests {
                 0x505fc17b646186f2,
                 0xff13404730caba1e,
                 0x98ce7d1649b15c26,
-                0xf7b9ce5080e08d99,
+                0xa04e109e74c16cc7,
             ]
         );
     }
