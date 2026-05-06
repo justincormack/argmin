@@ -69,7 +69,6 @@ const METADATA_CANONICAL_PG_STATE_DOMAIN: &[u8] = b"argmin.metadata.pg-state";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetadataDigestFilter {
     AllRows,
-    CommittedMultipartPartSegments,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -83,9 +82,6 @@ impl MetadataDigestFilter {
     fn canonical_name(self) -> &'static str {
         match self {
             MetadataDigestFilter::AllRows => "all-rows",
-            MetadataDigestFilter::CommittedMultipartPartSegments => {
-                "committed-multipart-part-segments"
-            }
         }
     }
 }
@@ -130,6 +126,21 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
+        name: "completed_multipart_uploads",
+        columns: &[
+            "upload_id",
+            "bucket",
+            "key",
+            "completion_order",
+            "completed_at",
+            "owner_principal",
+            "owner_canonical_id",
+            "initiator_principal",
+            "initiator_canonical_id",
+        ],
+        filter: MetadataDigestFilter::AllRows,
+    },
+    MetadataDigestTable {
         name: "multipart_part_segments",
         columns: &[
             "bucket",
@@ -146,7 +157,100 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "ec_k",
             "ec_m",
         ],
-        filter: MetadataDigestFilter::CommittedMultipartPartSegments,
+        filter: MetadataDigestFilter::AllRows,
+    },
+    MetadataDigestTable {
+        name: "multipart_parts",
+        columns: &[
+            "upload_id",
+            "part_number",
+            "generation",
+            "size",
+            "etag",
+            "etag_kind",
+            "part_okh",
+            "part_vid",
+            "ec_k",
+            "ec_m",
+            "last_modified",
+            "checksum",
+        ],
+        filter: MetadataDigestFilter::AllRows,
+    },
+    MetadataDigestTable {
+        name: "multipart_reclaim_part_segments",
+        columns: &[
+            "bucket",
+            "key",
+            "generation_id",
+            "part_number",
+            "segment_index",
+            "segment_okh",
+            "segment_vid",
+            "data_pg_id",
+            "ec_k",
+            "ec_m",
+        ],
+        filter: MetadataDigestFilter::AllRows,
+    },
+    MetadataDigestTable {
+        name: "multipart_reclaim_parts",
+        columns: &[
+            "bucket",
+            "key",
+            "generation_id",
+            "part_number",
+            "storage_kind",
+            "part_okh",
+            "part_vid",
+            "data_pg_id",
+            "ec_k",
+            "ec_m",
+        ],
+        filter: MetadataDigestFilter::AllRows,
+    },
+    MetadataDigestTable {
+        name: "multipart_reclaims",
+        columns: &["bucket", "key", "generation_id", "created_at"],
+        filter: MetadataDigestFilter::AllRows,
+    },
+    MetadataDigestTable {
+        name: "multipart_uploads",
+        columns: &[
+            "upload_id",
+            "bucket",
+            "key",
+            "initiated_at",
+            "tags",
+            "metadata_blob",
+            "system_metadata_blob",
+            "owner_principal",
+            "owner_canonical_id",
+            "initiator_principal",
+            "initiator_canonical_id",
+            "checksum_algorithm",
+            "checksum_type",
+            "encryption_type",
+            "encryption_state",
+            "acl_grants",
+            "public_read",
+            "object_generation_id",
+            "object_lock_retention_mode",
+            "object_lock_retain_until",
+            "object_lock_legal_hold",
+        ],
+        filter: MetadataDigestFilter::AllRows,
+    },
+    MetadataDigestTable {
+        name: "object_generation_reservations",
+        columns: &[
+            "reservation_id",
+            "bucket",
+            "key",
+            "generation_id",
+            "created_at",
+        ],
+        filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
         name: "object_parts",
@@ -169,6 +273,21 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
+        name: "object_segment_reclaim_segments",
+        columns: &[
+            "bucket",
+            "key",
+            "generation_id",
+            "segment_index",
+            "segment_okh",
+            "segment_vid",
+            "data_pg_id",
+            "ec_k",
+            "ec_m",
+        ],
+        filter: MetadataDigestFilter::AllRows,
+    },
+    MetadataDigestTable {
         name: "object_segments",
         columns: &[
             "bucket",
@@ -183,6 +302,11 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "ec_k",
             "ec_m",
         ],
+        filter: MetadataDigestFilter::AllRows,
+    },
+    MetadataDigestTable {
+        name: "object_segments_reclaims",
+        columns: &["bucket", "key", "generation_id", "created_at"],
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
@@ -216,6 +340,37 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "object_lock_retain_until",
             "object_lock_legal_hold",
             "became_noncurrent_at",
+        ],
+        filter: MetadataDigestFilter::AllRows,
+    },
+    MetadataDigestTable {
+        name: "stream_upload_segments",
+        columns: &[
+            "session_id",
+            "segment_index",
+            "size",
+            "segment_crc64",
+            "segment_okh",
+            "segment_vid",
+            "data_pg_id",
+            "ec_k",
+            "ec_m",
+        ],
+        filter: MetadataDigestFilter::AllRows,
+    },
+    MetadataDigestTable {
+        name: "stream_uploads",
+        columns: &[
+            "session_id",
+            "bucket",
+            "key",
+            "op_kind",
+            "upload_id",
+            "part_number",
+            "state",
+            "created_at",
+            "encryption_type",
+            "encryption_state",
         ],
         filter: MetadataDigestFilter::AllRows,
     },
@@ -993,10 +1148,6 @@ impl PgStore {
     fn metadata_digest_where_clause(filter: MetadataDigestFilter) -> String {
         match filter {
             MetadataDigestFilter::AllRows => String::new(),
-            MetadataDigestFilter::CommittedMultipartPartSegments => format!(
-                " WHERE \"version_id\" != {}",
-                PART_SEGMENT_STAGING_VERSION_ID.to_u64() as i64
-            ),
         }
     }
 
@@ -11532,6 +11683,63 @@ mod tests {
         );
     }
 
+    fn assert_metadata_state_digest_covers_mutation(
+        setup: impl FnOnce(&PgStore),
+        mutate: impl FnOnce(&PgStore),
+    ) {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        setup(&store);
+        store.refresh_metadata_command_state_digest().unwrap();
+        mutate(&store);
+
+        let command = create_bucket_probe_command(1, 1, trusted_bucket_name("probe"), 1);
+        let err = store.metadata_command_acceptance(0, &command).unwrap_err();
+        assert_metadata_state_digest_mismatch(err);
+    }
+
+    fn insert_digest_multipart_upload(store: &PgStore, upload_id: &UploadId) {
+        let owner = test_owner();
+        let bucket = trusted_bucket_name("digest-bucket");
+        let key = trusted_object_key("object");
+        store
+            .conn
+            .execute(
+                "INSERT INTO multipart_uploads \
+                 (upload_id, bucket, key, initiated_at, state, tags, metadata_blob, \
+                  system_metadata_blob, owner_principal, owner_canonical_id, \
+                  initiator_principal, initiator_canonical_id, checksum_algorithm, checksum_type, \
+                  encryption_type, encryption_state, acl_grants, public_read, object_generation_id, \
+                  object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                params![
+                    upload_id.as_str(),
+                    bucket.as_str(),
+                    key.as_str(),
+                    101_i64,
+                    UploadState::InProgress as u8,
+                    Option::<&str>::None,
+                    b"meta".as_slice(),
+                    b"system".as_slice(),
+                    owner.principal.as_str(),
+                    owner.canonical_id.as_str(),
+                    Option::<&str>::None,
+                    Option::<&str>::None,
+                    Option::<u8>::None,
+                    Option::<u8>::None,
+                    ObjectEncryption::None.encryption_type() as u8,
+                    Option::<&[u8]>::None,
+                    "",
+                    0_i64,
+                    1_i64,
+                    Option::<i64>::None,
+                    Option::<i64>::None,
+                    StoredLegalHoldStatus::NotSet as u8,
+                ],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn metadata_state_digest_table_inventory_is_explicit() {
         let tables: Vec<_> = METADATA_DIGEST_TABLES
@@ -11543,13 +11751,30 @@ mod tests {
             vec![
                 ("bucket_subresources", MetadataDigestFilter::AllRows),
                 ("buckets", MetadataDigestFilter::AllRows),
+                ("completed_multipart_uploads", MetadataDigestFilter::AllRows),
+                ("multipart_part_segments", MetadataDigestFilter::AllRows),
+                ("multipart_parts", MetadataDigestFilter::AllRows),
                 (
-                    "multipart_part_segments",
-                    MetadataDigestFilter::CommittedMultipartPartSegments,
+                    "multipart_reclaim_part_segments",
+                    MetadataDigestFilter::AllRows
+                ),
+                ("multipart_reclaim_parts", MetadataDigestFilter::AllRows),
+                ("multipart_reclaims", MetadataDigestFilter::AllRows),
+                ("multipart_uploads", MetadataDigestFilter::AllRows),
+                (
+                    "object_generation_reservations",
+                    MetadataDigestFilter::AllRows
                 ),
                 ("object_parts", MetadataDigestFilter::AllRows),
+                (
+                    "object_segment_reclaim_segments",
+                    MetadataDigestFilter::AllRows
+                ),
                 ("object_segments", MetadataDigestFilter::AllRows),
+                ("object_segments_reclaims", MetadataDigestFilter::AllRows),
                 ("objects", MetadataDigestFilter::AllRows),
+                ("stream_upload_segments", MetadataDigestFilter::AllRows),
+                ("stream_uploads", MetadataDigestFilter::AllRows),
             ]
         );
 
@@ -11789,7 +12014,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_state_digest_excludes_multipart_part_staging_segments() {
+    fn metadata_state_digest_covers_multipart_part_staging_segments() {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
         let bucket = trusted_bucket_name("digest-bucket");
@@ -11831,9 +12056,459 @@ mod tests {
             .unwrap();
 
         let command = create_bucket_probe_command(1, 1, trusted_bucket_name("probe"), 1);
-        assert_eq!(
-            store.metadata_command_acceptance(0, &command).unwrap(),
-            MetadataCommandAcceptance::Apply
+        let err = store.metadata_command_acceptance(0, &command).unwrap_err();
+        assert_metadata_state_digest_mismatch(err);
+    }
+
+    #[test]
+    fn metadata_state_digest_covers_multipart_upload_and_part_state() {
+        assert_metadata_state_digest_covers_mutation(
+            |store| {
+                let upload_id = UploadId::new("u".repeat(UPLOAD_ID_LEN)).unwrap();
+                insert_digest_multipart_upload(store, &upload_id);
+            },
+            |store| {
+                let upload_id = UploadId::new("u".repeat(UPLOAD_ID_LEN)).unwrap();
+                store
+                    .conn
+                    .execute(
+                        "UPDATE multipart_uploads SET metadata_blob = ?1 WHERE upload_id = ?2",
+                        params![b"changed".as_slice(), upload_id.as_str()],
+                    )
+                    .unwrap();
+            },
+        );
+
+        assert_metadata_state_digest_covers_mutation(
+            |store| {
+                let upload_id = UploadId::new("p".repeat(UPLOAD_ID_LEN)).unwrap();
+                let okh = [4_u8; 16];
+                insert_digest_multipart_upload(store, &upload_id);
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO multipart_parts \
+                         (upload_id, part_number, generation, size, etag, etag_kind, part_okh, \
+                          part_vid, ec_k, ec_m, last_modified, checksum) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                        params![
+                            upload_id.as_str(),
+                            1_i64,
+                            1_i64,
+                            64_i64,
+                            b"etag".as_slice(),
+                            EtagKind::Crc64 as u8,
+                            okh.as_slice(),
+                            1_i64,
+                            4_i64,
+                            2_i64,
+                            102_i64,
+                            Option::<&[u8]>::None,
+                        ],
+                    )
+                    .unwrap();
+            },
+            |store| {
+                let upload_id = UploadId::new("p".repeat(UPLOAD_ID_LEN)).unwrap();
+                store
+                    .conn
+                    .execute(
+                        "UPDATE multipart_parts SET checksum = ?1 WHERE upload_id = ?2",
+                        params![b"checksum".as_slice(), upload_id.as_str()],
+                    )
+                    .unwrap();
+            },
+        );
+    }
+
+    #[test]
+    fn metadata_state_digest_covers_completed_multipart_uploads() {
+        assert_metadata_state_digest_covers_mutation(
+            |store| {
+                let owner = test_owner();
+                let upload_id = UploadId::new("c".repeat(UPLOAD_ID_LEN)).unwrap();
+                let bucket = trusted_bucket_name("digest-bucket");
+                let key = trusted_object_key("object");
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO completed_multipart_uploads \
+                         (upload_id, bucket, key, completion_order, completed_at, \
+                          owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        params![
+                            upload_id.as_str(),
+                            bucket.as_str(),
+                            key.as_str(),
+                            1_i64,
+                            103_i64,
+                            owner.principal.as_str(),
+                            owner.canonical_id.as_str(),
+                            Option::<&str>::None,
+                            Option::<&str>::None,
+                        ],
+                    )
+                    .unwrap();
+            },
+            |store| {
+                let upload_id = UploadId::new("c".repeat(UPLOAD_ID_LEN)).unwrap();
+                store
+                    .conn
+                    .execute(
+                        "UPDATE completed_multipart_uploads SET completion_order = ?1 WHERE upload_id = ?2",
+                        params![2_i64, upload_id.as_str()],
+                    )
+                    .unwrap();
+            },
+        );
+    }
+
+    #[test]
+    fn metadata_state_digest_covers_stream_upload_state() {
+        assert_metadata_state_digest_covers_mutation(
+            |store| {
+                let bucket = trusted_bucket_name("digest-bucket");
+                let key = trusted_object_key("object");
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO stream_uploads \
+                         (session_id, bucket, key, op_kind, upload_id, part_number, state, \
+                          created_at, next_segment_vid, encryption_type, encryption_state) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                        params![
+                            "session",
+                            bucket.as_str(),
+                            key.as_str(),
+                            StreamUploadKind::PutObject as u8,
+                            Option::<&str>::None,
+                            Option::<i64>::None,
+                            StreamUploadState::InProgress as u8,
+                            104_i64,
+                            1_i64,
+                            ObjectEncryption::None.encryption_type() as u8,
+                            Option::<&[u8]>::None,
+                        ],
+                    )
+                    .unwrap();
+            },
+            |store| {
+                store
+                    .conn
+                    .execute(
+                        "UPDATE stream_uploads SET state = ?1 WHERE session_id = ?2",
+                        params![StreamUploadState::Completing as u8, "session"],
+                    )
+                    .unwrap();
+            },
+        );
+
+        assert_metadata_state_digest_covers_mutation(
+            |store| {
+                let bucket = trusted_bucket_name("digest-bucket");
+                let key = trusted_object_key("object");
+                let okh = [5_u8; 16];
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO stream_uploads \
+                         (session_id, bucket, key, op_kind, upload_id, part_number, state, \
+                          created_at, next_segment_vid, encryption_type, encryption_state) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                        params![
+                            "seg-session",
+                            bucket.as_str(),
+                            key.as_str(),
+                            StreamUploadKind::PutObject as u8,
+                            Option::<&str>::None,
+                            Option::<i64>::None,
+                            StreamUploadState::InProgress as u8,
+                            105_i64,
+                            2_i64,
+                            ObjectEncryption::None.encryption_type() as u8,
+                            Option::<&[u8]>::None,
+                        ],
+                    )
+                    .unwrap();
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO stream_upload_segments \
+                         (session_id, segment_index, size, segment_crc64, segment_okh, \
+                          segment_vid, data_pg_id, ec_k, ec_m) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        params![
+                            "seg-session",
+                            0_i64,
+                            64_i64,
+                            99_i64,
+                            okh.as_slice(),
+                            1_i64,
+                            1_i64,
+                            4_i64,
+                            2_i64,
+                        ],
+                    )
+                    .unwrap();
+            },
+            |store| {
+                store
+                    .conn
+                    .execute(
+                        "UPDATE stream_upload_segments SET data_pg_id = ?1 WHERE session_id = ?2",
+                        params![2_i64, "seg-session"],
+                    )
+                    .unwrap();
+            },
+        );
+    }
+
+    #[test]
+    fn metadata_state_digest_covers_reclaim_and_reservation_state() {
+        assert_metadata_state_digest_covers_mutation(
+            |store| {
+                let bucket = trusted_bucket_name("digest-bucket");
+                let key = trusted_object_key("object");
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO object_generation_reservations \
+                         (reservation_id, bucket, key, generation_id, created_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params!["reservation", bucket.as_str(), key.as_str(), 1_i64, 106_i64],
+                    )
+                    .unwrap();
+            },
+            |store| {
+                store
+                    .conn
+                    .execute(
+                        "UPDATE object_generation_reservations SET created_at = ?1 WHERE reservation_id = ?2",
+                        params![107_i64, "reservation"],
+                    )
+                    .unwrap();
+            },
+        );
+
+        assert_metadata_state_digest_covers_mutation(
+            |store| {
+                let bucket = trusted_bucket_name("digest-bucket");
+                let key = trusted_object_key("object");
+                let okh = [6_u8; 16];
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO object_segments_reclaims \
+                         (bucket, key, generation_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+                        params![bucket.as_str(), key.as_str(), 1_i64, 108_i64],
+                    )
+                    .unwrap();
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO object_segment_reclaim_segments \
+                         (bucket, key, generation_id, segment_index, segment_okh, segment_vid, \
+                          data_pg_id, ec_k, ec_m) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        params![
+                            bucket.as_str(),
+                            key.as_str(),
+                            1_i64,
+                            0_i64,
+                            okh.as_slice(),
+                            1_i64,
+                            1_i64,
+                            4_i64,
+                            2_i64,
+                        ],
+                    )
+                    .unwrap();
+            },
+            |store| {
+                let bucket = trusted_bucket_name("digest-bucket");
+                let key = trusted_object_key("object");
+                store
+                    .conn
+                    .execute(
+                        "UPDATE object_segment_reclaim_segments SET ec_m = ?1 \
+                         WHERE bucket = ?2 AND key = ?3 AND generation_id = ?4",
+                        params![3_i64, bucket.as_str(), key.as_str(), 1_i64],
+                    )
+                    .unwrap();
+            },
+        );
+
+        assert_metadata_state_digest_covers_mutation(
+            |store| {
+                let bucket = trusted_bucket_name("digest-bucket");
+                let key = trusted_object_key("object");
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO object_segments_reclaims \
+                         (bucket, key, generation_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+                        params![bucket.as_str(), key.as_str(), 2_i64, 110_i64],
+                    )
+                    .unwrap();
+            },
+            |store| {
+                let bucket = trusted_bucket_name("digest-bucket");
+                let key = trusted_object_key("object");
+                store
+                    .conn
+                    .execute(
+                        "UPDATE object_segments_reclaims SET created_at = ?1 \
+                         WHERE bucket = ?2 AND key = ?3 AND generation_id = ?4",
+                        params![111_i64, bucket.as_str(), key.as_str(), 2_i64],
+                    )
+                    .unwrap();
+            },
+        );
+
+        assert_metadata_state_digest_covers_mutation(
+            |store| {
+                let bucket = trusted_bucket_name("digest-bucket");
+                let key = trusted_object_key("object");
+                let okh = [7_u8; 16];
+                let segment_okh = [8_u8; 16];
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO multipart_reclaims \
+                         (bucket, key, generation_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+                        params![bucket.as_str(), key.as_str(), 1_i64, 109_i64],
+                    )
+                    .unwrap();
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO multipart_reclaim_parts \
+                         (bucket, key, generation_id, part_number, storage_kind, part_okh, \
+                          part_vid, data_pg_id, ec_k, ec_m) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        params![
+                            bucket.as_str(),
+                            key.as_str(),
+                            1_i64,
+                            1_i64,
+                            0_i64,
+                            okh.as_slice(),
+                            1_i64,
+                            1_i64,
+                            4_i64,
+                            2_i64,
+                        ],
+                    )
+                    .unwrap();
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO multipart_reclaim_part_segments \
+                         (bucket, key, generation_id, part_number, segment_index, segment_okh, \
+                          segment_vid, data_pg_id, ec_k, ec_m) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        params![
+                            bucket.as_str(),
+                            key.as_str(),
+                            1_i64,
+                            1_i64,
+                            0_i64,
+                            segment_okh.as_slice(),
+                            1_i64,
+                            1_i64,
+                            4_i64,
+                            2_i64,
+                        ],
+                    )
+                    .unwrap();
+            },
+            |store| {
+                let bucket = trusted_bucket_name("digest-bucket");
+                let key = trusted_object_key("object");
+                store
+                    .conn
+                    .execute(
+                        "UPDATE multipart_reclaim_part_segments SET data_pg_id = ?1 \
+                         WHERE bucket = ?2 AND key = ?3 AND generation_id = ?4",
+                        params![2_i64, bucket.as_str(), key.as_str(), 1_i64],
+                    )
+                    .unwrap();
+            },
+        );
+
+        assert_metadata_state_digest_covers_mutation(
+            |store| {
+                let bucket = trusted_bucket_name("digest-bucket");
+                let key = trusted_object_key("object");
+                let okh = [9_u8; 16];
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO multipart_reclaims \
+                         (bucket, key, generation_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+                        params![bucket.as_str(), key.as_str(), 2_i64, 112_i64],
+                    )
+                    .unwrap();
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO multipart_reclaim_parts \
+                         (bucket, key, generation_id, part_number, storage_kind, part_okh, \
+                          part_vid, data_pg_id, ec_k, ec_m) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        params![
+                            bucket.as_str(),
+                            key.as_str(),
+                            2_i64,
+                            1_i64,
+                            0_i64,
+                            okh.as_slice(),
+                            1_i64,
+                            1_i64,
+                            4_i64,
+                            2_i64,
+                        ],
+                    )
+                    .unwrap();
+            },
+            |store| {
+                let bucket = trusted_bucket_name("digest-bucket");
+                let key = trusted_object_key("object");
+                store
+                    .conn
+                    .execute(
+                        "UPDATE multipart_reclaim_parts SET ec_m = ?1 \
+                         WHERE bucket = ?2 AND key = ?3 AND generation_id = ?4",
+                        params![3_i64, bucket.as_str(), key.as_str(), 2_i64],
+                    )
+                    .unwrap();
+            },
+        );
+
+        assert_metadata_state_digest_covers_mutation(
+            |store| {
+                let bucket = trusted_bucket_name("digest-bucket");
+                let key = trusted_object_key("object");
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO multipart_reclaims \
+                         (bucket, key, generation_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+                        params![bucket.as_str(), key.as_str(), 3_i64, 113_i64],
+                    )
+                    .unwrap();
+            },
+            |store| {
+                let bucket = trusted_bucket_name("digest-bucket");
+                let key = trusted_object_key("object");
+                store
+                    .conn
+                    .execute(
+                        "UPDATE multipart_reclaims SET created_at = ?1 \
+                         WHERE bucket = ?2 AND key = ?3 AND generation_id = ?4",
+                        params![114_i64, bucket.as_str(), key.as_str(), 3_i64],
+                    )
+                    .unwrap();
+            },
         );
     }
 

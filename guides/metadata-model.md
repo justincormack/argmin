@@ -61,14 +61,32 @@ The target canonical state includes:
 The current
 [multihost transition Phase 7](../plans/multihost-transition-plan.md#phase-7-metadata-model-integrity-and-divergence-policy)
 implementation has an explicit canonical binary digest inventory for the
-command-owned committed serving view:
+command-owned durable serving, in-progress, and cleanup metadata:
 
 - `bucket_subresources`
 - `buckets`
-- committed rows in `multipart_part_segments`
+- `completed_multipart_uploads`
+- `multipart_part_segments`, including staging rows
+- `multipart_parts`
+- `multipart_reclaim_part_segments`
+- `multipart_reclaim_parts`
+- `multipart_reclaims`
+- `multipart_uploads`
+- `object_generation_reservations`
 - `object_parts`
+- `object_segment_reclaim_segments`
 - `object_segments`
+- `object_segments_reclaims`
 - `objects`
+- `stream_upload_segments`
+- `stream_uploads`
+
+The current inventory still excludes state that is local-only or not yet
+owned by its own canonical command stream: bucket write-drain counters,
+`pg_counters`, `object_version_counters`, `multipart_uploads.state`,
+`stream_uploads.next_segment_vid`, and
+`buckets.completed_multipart_upload_sequence`. Those are Phase 7.3 gaps, not
+implicit exemptions from metadata integrity.
 
 The full-PG encoding starts with a stable domain/version header. Each included
 table range then encodes explicit table and column names, filter identity, row

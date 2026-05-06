@@ -5661,8 +5661,18 @@ impl super::StorageCluster {
         key: &ObjectKey,
         reclaim: &ObjectSegmentsReclaimRecord,
     ) -> Result<(), ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
-            .test_put_object_segments_reclaim(bucket, key, reclaim)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let runtime_state = self.local_map.runtime_state();
+        let _apply_guard = runtime_state.lock_metadata_command_apply();
+        for node in self
+            .local_map
+            .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
+        {
+            let pg = node.storage_node().get_pg(pg_id.get())?;
+            pg.put_object_segments_reclaim(reclaim)?;
+            pg.refresh_metadata_command_state_digest()?;
+        }
+        Ok(())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -5672,8 +5682,18 @@ impl super::StorageCluster {
         key: &ObjectKey,
         reclaim: &MultipartReclaimRecord,
     ) -> Result<(), ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
-            .test_put_multipart_reclaim(bucket, key, reclaim)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let runtime_state = self.local_map.runtime_state();
+        let _apply_guard = runtime_state.lock_metadata_command_apply();
+        for node in self
+            .local_map
+            .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
+        {
+            let pg = node.storage_node().get_pg(pg_id.get())?;
+            pg.put_multipart_reclaim(reclaim)?;
+            pg.refresh_metadata_command_state_digest()?;
+        }
+        Ok(())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -5779,8 +5799,19 @@ impl super::StorageCluster {
         session_id: &SessionId,
         created_at: u64,
     ) -> Result<(), ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
-            .test_force_stream_upload_created_at(bucket, key, session_id, created_at)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let runtime_state = self.local_map.runtime_state();
+        let _apply_guard = runtime_state.lock_metadata_command_apply();
+        for node in self
+            .local_map
+            .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
+        {
+            node.storage_node()
+                .test_force_stream_upload_created_at(bucket, key, session_id, created_at)?;
+            let pg = node.storage_node().get_pg(pg_id.get())?;
+            pg.refresh_metadata_command_state_digest()?;
+        }
+        Ok(())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

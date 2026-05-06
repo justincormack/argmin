@@ -1480,9 +1480,11 @@ Work items:
        retry, instead of tombstoning or dropping the release
      - sparse out-of-allocation-order command entries remain valid: the
        contiguous hash-chain prefix advances when missing earlier entries arrive
-     - the state digest currently covers committed command-owned metadata tables:
-       `buckets`, `bucket_subresources`, `objects`, `object_parts`,
-       `object_segments`, and committed rows in `multipart_part_segments`
+     - the Phase 6.6 state digest initially covered committed command-owned
+       metadata tables: `buckets`, `bucket_subresources`, `objects`,
+       `object_parts`, `object_segments`, and committed rows in
+       `multipart_part_segments`; Phase 7.3 expands this into the broader
+       canonical binary inventory
      - the `buckets` digest uses an explicit committed-metadata column allowlist;
        transient write-drain counters such as `write_reservations_blocked` and
        `active_write_reservations` are excluded, as is the local completed-MPU
@@ -1798,7 +1800,7 @@ Completed:
     bucket row-image matching
   - Phase 7.2 is complete: all current metadata command payloads are classified
     as storage-shaped before Phase 7.3 canonical binary state encoding
-- Phase 7.3 first slice:
+- Phase 7.3 first slices:
   - replaced the online committed-serving-view digest's SQLite `quote(...)`
     row text with a canonical binary full-PG encoding over the explicit Phase
     7 inventory
@@ -1808,10 +1810,25 @@ Completed:
   - canonical value encoding distinguishes `NULL`, integers, text, blobs, and
     real values before hashing, so metadata bitrot checks no longer depend on
     SQLite text formatting
-  - the committed-serving-view inventory is still intentionally incomplete:
-    in-progress upload state, reclaim rows, durable reservation rows, and
-    allocator tables still need canonical representations before Phase 7.3 is
-    complete
+  - expanded the online digest inventory to command-owned durable upload,
+    stream, reclaim, and reservation rows:
+    `multipart_uploads`, `multipart_parts`, all `multipart_part_segments`
+    including staging rows, `completed_multipart_uploads`, `stream_uploads`,
+    `stream_upload_segments`, `object_generation_reservations`,
+    `object_segments_reclaims`, `object_segment_reclaim_segments`,
+    `multipart_reclaims`, `multipart_reclaim_parts`, and
+    `multipart_reclaim_part_segments`
+  - changed digest-covered test setup hooks, including reclaim-row seeding and
+    stream-session timestamp forcing, to update every object-PG acting node and
+    refresh each replica's state digest, so test-only setup does not hide real
+    digest divergence
+  - retained explicit exclusions for state that is still local-only or still
+    mutates outside its own command stream: bucket write-drain counters,
+    `pg_counters`, `object_version_counters`, `multipart_uploads.state`,
+    `stream_uploads.next_segment_vid`, and
+    `buckets.completed_multipart_upload_sequence`
+  - remaining Phase 7.3 work is to move those allocator/counter rows behind
+    canonical command/checkpoint ownership, then include them in the digest
 
 Exit criteria:
 
