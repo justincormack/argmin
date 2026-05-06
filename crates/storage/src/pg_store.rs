@@ -4419,8 +4419,8 @@ impl PgStore {
         self.conn
             .execute(
                 "INSERT INTO stream_uploads \
-                 (session_id, bucket, key, op_kind, upload_id, part_number, state, created_at, next_segment_vid, encryption_type, encryption_state) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 (session_id, bucket, key, op_kind, upload_id, part_number, state, created_at, encryption_type, encryption_state) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     session.session_id,
                     session.bucket,
@@ -4430,44 +4430,12 @@ impl PgStore {
                     part_number,
                     session.state as u8,
                     session.created_at as i64,
-                    session.next_segment_vid.get() as i64,
                     encryption_type,
                     encryption_state,
                 ],
             )
             .map_err(|e| MetadataError::Db {
                 context: "create stream upload explicit",
-                source: e,
-            })?;
-        Ok(())
-    }
-
-    fn advance_stream_segment_vid_at_least(
-        &self,
-        segment: &StreamUploadSegmentRecord,
-    ) -> Result<(), MetadataError> {
-        let next_segment_vid =
-            segment
-                .segment_vid
-                .get()
-                .checked_add(1)
-                .ok_or_else(|| MetadataError::Db {
-                    context: "stream segment command vid overflow",
-                    source: rusqlite::Error::FromSqlConversionFailure(
-                        1,
-                        rusqlite::types::Type::Integer,
-                        Box::from("next_segment_vid overflow"),
-                    ),
-                })? as i64;
-        self.conn
-            .execute(
-                "UPDATE stream_uploads \
-                 SET next_segment_vid = CASE WHEN next_segment_vid < ?1 THEN ?1 ELSE next_segment_vid END \
-                 WHERE session_id = ?2",
-                params![next_segment_vid, segment.session_id.as_str()],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "advance stream segment command vid",
                 source: e,
             })?;
         Ok(())
@@ -4560,18 +4528,12 @@ impl PgStore {
                     .into_iter()
                     .find(|segment| segment.segment_index == command.segment.segment_index);
                 match existing {
-                    Some(existing) if existing == command.segment => {
-                        store.advance_stream_segment_vid_at_least(&command.segment)?;
-                        Ok(())
-                    }
+                    Some(existing) if existing == command.segment => Ok(()),
                     Some(_) => Err(MetadataError::Db {
                         context: "append stream segment command existing segment mismatch",
                         source: rusqlite::Error::InvalidQuery,
                     }),
-                    None => {
-                        store.append_stream_segment(&command.segment)?;
-                        store.advance_stream_segment_vid_at_least(&command.segment)
-                    }
+                    None => store.append_stream_segment(&command.segment),
                 }
             },
         )
@@ -10355,7 +10317,7 @@ impl PgMetadataStore for PgStore {
         self.conn
             .query_row(
                 "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
-                 created_at, next_segment_vid, encryption_type, encryption_state FROM stream_uploads WHERE session_id = ?1",
+                 created_at, encryption_type, encryption_state FROM stream_uploads WHERE session_id = ?1",
                 params![session_id.as_str()],
                 |row| {
                     let op_kind_raw: u8 = row.get(3)?;
@@ -10380,16 +10342,11 @@ impl PgMetadataStore for PgStore {
                             )
                         })?,
                         created_at: row.get::<_, i64>(7)? as u64,
-                        next_segment_vid: Self::parse_generation_id(
-                            row.get::<_, i64>(8)?,
-                            8,
-                            "next_segment_vid",
-                        )?,
                         encryption: Self::parse_object_encryption(
-                            row.get::<_, u8>(9)?,
-                            row.get::<_, Option<Vec<u8>>>(10)?,
+                            row.get::<_, u8>(8)?,
+                            row.get::<_, Option<Vec<u8>>>(9)?,
+                            8,
                             9,
-                            10,
                         )?,
                     })
                 },
@@ -10468,7 +10425,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare(
                 "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
-                 created_at, next_segment_vid, encryption_type, encryption_state FROM stream_uploads",
+                 created_at, encryption_type, encryption_state FROM stream_uploads",
             )
             .map_err(|e| MetadataError::Db {
                 context: "list all stream uploads (prepare)",
@@ -10493,16 +10450,11 @@ impl PgMetadataStore for PgStore {
                         )
                     })?,
                     created_at: row.get::<_, i64>(7)? as u64,
-                    next_segment_vid: Self::parse_generation_id(
-                        row.get::<_, i64>(8)?,
-                        8,
-                        "next_segment_vid",
-                    )?,
                     encryption: Self::parse_object_encryption(
-                        row.get::<_, u8>(9)?,
-                        row.get::<_, Option<Vec<u8>>>(10)?,
+                        row.get::<_, u8>(8)?,
+                        row.get::<_, Option<Vec<u8>>>(9)?,
+                        8,
                         9,
-                        10,
                     )?,
                 })
             })
@@ -10515,60 +10467,6 @@ impl PgMetadataStore for PgStore {
                 context: "list all stream uploads (collect)",
                 source: e,
             })
-    }
-
-    fn allocate_stream_segment_vid(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<GenerationId, MetadataError> {
-        let (state, next_segment_vid): (u8, i64) = self
-            .conn
-            .query_row(
-                "SELECT state, next_segment_vid FROM stream_uploads WHERE session_id = ?1",
-                params![session_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "get next stream segment vid",
-                source: e,
-            })?
-            .ok_or_else(|| MetadataError::StreamSessionNotFound {
-                session_id: session_id.as_str().to_owned(),
-            })?;
-
-        if state != StreamUploadState::InProgress as u8 {
-            return Err(MetadataError::StreamSessionNotInProgress { state });
-        }
-
-        let segment_vid = Self::parse_generation_id(next_segment_vid, 1, "next_segment_vid")
-            .map_err(|e| MetadataError::Db {
-                context: "parse next stream segment vid",
-                source: e,
-            })?;
-        let next_segment_vid =
-            next_segment_vid
-                .checked_add(1)
-                .ok_or_else(|| MetadataError::Db {
-                    context: "stream segment vid overflow",
-                    source: rusqlite::Error::FromSqlConversionFailure(
-                        1,
-                        rusqlite::types::Type::Integer,
-                        Box::from("next_segment_vid overflow"),
-                    ),
-                })?;
-
-        self.conn
-            .execute(
-                "UPDATE stream_uploads SET next_segment_vid = ?1 WHERE session_id = ?2",
-                params![next_segment_vid, session_id.as_str()],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "advance next stream segment vid",
-                source: e,
-            })?;
-
-        Ok(segment_vid)
     }
 
     fn append_stream_segment(
@@ -12174,8 +12072,8 @@ mod tests {
                     .execute(
                         "INSERT INTO stream_uploads \
                          (session_id, bucket, key, op_kind, upload_id, part_number, state, \
-                          created_at, next_segment_vid, encryption_type, encryption_state) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                          created_at, encryption_type, encryption_state) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                         params![
                             "session",
                             bucket.as_str(),
@@ -12185,7 +12083,6 @@ mod tests {
                             Option::<i64>::None,
                             StreamUploadState::InProgress as u8,
                             104_i64,
-                            1_i64,
                             ObjectEncryption::None.encryption_type() as u8,
                             Option::<&[u8]>::None,
                         ],
@@ -12213,8 +12110,8 @@ mod tests {
                     .execute(
                         "INSERT INTO stream_uploads \
                          (session_id, bucket, key, op_kind, upload_id, part_number, state, \
-                          created_at, next_segment_vid, encryption_type, encryption_state) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                          created_at, encryption_type, encryption_state) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                         params![
                             "seg-session",
                             bucket.as_str(),
@@ -12224,7 +12121,6 @@ mod tests {
                             Option::<i64>::None,
                             StreamUploadState::InProgress as u8,
                             105_i64,
-                            2_i64,
                             ObjectEncryption::None.encryption_type() as u8,
                             Option::<&[u8]>::None,
                         ],

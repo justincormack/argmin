@@ -1767,7 +1767,7 @@ Completed:
   - tightened stream/MPU creation retry matching so an existing row is accepted
     only when it exactly matches the row from an applied pending command; same
     request fields with different row-only fields now fail closed
-  - included stream session `next_segment_vid` allocator state in
+  - included all then-durable stream session row fields in
     `StreamUploadRecord` and `CreateStreamUploadCommand` checksums so stream
     create row matching covers the full storage row
 - Phase 7.2 `PutObjectMetadata` slice:
@@ -1822,10 +1822,14 @@ Completed:
     stream-session timestamp forcing, to update every object-PG acting node and
     refresh each replica's state digest, so test-only setup does not hide real
     digest divergence
+  - removed durable `stream_uploads.next_segment_vid`; stream segment payload
+    generation allocation is now local runtime state used only to keep
+    concurrent uncommitted appends on distinct placed shard keys, while the
+    command-owned `stream_upload_segments.segment_vid` value remains in the
+    canonical digest
   - retained explicit exclusions for state that is still local-only or still
     mutates outside its own command stream: bucket write-drain counters,
-    `pg_counters`, `object_version_counters`, `multipart_uploads.state`,
-    `stream_uploads.next_segment_vid`, and
+    `pg_counters`, `object_version_counters`, `multipart_uploads.state`, and
     `buckets.completed_multipart_upload_sequence`
   - remaining Phase 7.3 work is to move those allocator/counter rows behind
     canonical command/checkpoint ownership, then include them in the digest

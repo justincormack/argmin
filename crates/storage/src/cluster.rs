@@ -1307,6 +1307,9 @@ impl StorageCluster {
                         stale_generation_id,
                     );
                 }
+                self.local_map
+                    .runtime_state()
+                    .clear_stream_segment_vid_allocator(&commit.generation_reservation_id);
             }
             MetadataCommandPayload::CommitMultipartObject(commit) => {
                 if let Some(stale_generation_id) =
@@ -1345,6 +1348,9 @@ impl StorageCluster {
                 self.delete_staged_stream_segment_payload_shards_best_effort(
                     &abort.staged_segments,
                 );
+                self.local_map
+                    .runtime_state()
+                    .clear_stream_segment_vid_allocator(&abort.session_id);
             }
             MetadataCommandPayload::CommitStreamPart(commit) => {
                 self.delete_finalize_upload_part_cleanup_best_effort(
@@ -1354,6 +1360,9 @@ impl StorageCluster {
                         displaced_segments: commit.displaced_segments.clone(),
                     },
                 );
+                self.local_map
+                    .runtime_state()
+                    .clear_stream_segment_vid_allocator(&commit.session_id);
             }
             MetadataCommandPayload::AbortMultipartUpload(abort) => {
                 self.delete_abort_multipart_cleanup_best_effort(&abort.cleanup);
@@ -2151,8 +2160,11 @@ impl StorageCluster {
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+        let runtime_state = self.local_map.runtime_state();
         self.object_metadata_primary_node(bucket, key)?
-            .prepare_stream_segment_append(bucket, key, request)
+            .prepare_stream_segment_append(bucket, key, request, || {
+                runtime_state.allocate_stream_segment_vid(&request.session_id)
+            })
     }
 
     pub fn write_stream_segment_payload_shards(
@@ -2400,7 +2412,8 @@ impl StorageCluster {
             &command,
             "conflicting pending command for stream upload abort",
         )?;
-        self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
+        self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+        Ok(())
     }
 
     pub fn list_stream_upload_sessions_best_effort(&self) -> Vec<StreamUploadRecord> {

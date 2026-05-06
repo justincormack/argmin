@@ -83,8 +83,7 @@ command-owned durable serving, in-progress, and cleanup metadata:
 
 The current inventory still excludes state that is local-only or not yet
 owned by its own canonical command stream: bucket write-drain counters,
-`pg_counters`, `object_version_counters`, `multipart_uploads.state`,
-`stream_uploads.next_segment_vid`, and
+`pg_counters`, `object_version_counters`, `multipart_uploads.state`, and
 `buckets.completed_multipart_upload_sequence`. Those are Phase 7.3 gaps, not
 implicit exemptions from metadata integrity.
 
@@ -135,7 +134,7 @@ encodings.
 | `InsertDeleteMarker` | Storage-shaped | object version/write-sequence state | delete marker row, optional stale reclaim metadata | matching bucket/key marker insertion converges |
 | `PutObjectMetadata` | Storage-shaped | exact object version row | post-mutation live object metadata row | matching live object post-image converges |
 | `CreateStreamUpload` | Storage-shaped | target object/upload row for validation | stream session row | matching session row converges |
-| `AppendStreamSegment` | Storage-shaped | stream session row and segment allocator | stream segment row, session segment allocator | matching segment row converges |
+| `AppendStreamSegment` | Storage-shaped | stream session row and existing segment rows | stream segment row | matching segment row converges |
 | `AbortStreamUpload` | Storage-shaped | stream session and staged segments | removes stream session/segments | matching session abort converges |
 | `CommitStreamPart` | Storage-shaped | stream session, upload row, staged segments, existing part | multipart part row and staged segment rows | matching session/upload/part converges |
 | `CreateMultipartUpload` | Storage-shaped | object generation allocators and reservation rows | multipart upload row and generation reservation row | matching upload row converges |
@@ -144,11 +143,16 @@ encodings.
 
 For row-shaped create commands, retry matching is exact over the stored row
 published by the command. Matching only the original request fields is not
-enough, because row fields such as timestamps, generation ids, and allocator
-state are part of the command checksum and replay effect. For stream upload
-session creation this includes the initial `next_segment_vid` allocator value.
-For bucket creation this includes the bucket creation timestamp, raw encryption
-columns, execution generation, and other bucket-table storage columns.
+enough, because row fields such as timestamps and generation ids are part of
+the command checksum and replay effect. For bucket creation this includes the
+bucket creation timestamp, raw encryption columns, execution generation, and
+other bucket-table storage columns.
+
+Stream segment payload generation allocation is local runtime state, not a
+durable SQLite row. It only gives concurrent uncommitted stream appends distinct
+placed payload shard keys. The durable command records the concrete
+`stream_upload_segments.segment_vid` value that was used, and that segment row
+is included in the canonical metadata digest.
 
 Bucket metadata commands keep the AWS-facing operation split at the storage API
 boundary, but the durable command carries the bucket-table post-image. Bucket

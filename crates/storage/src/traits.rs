@@ -554,12 +554,6 @@ pub trait PgMetadataStore {
     /// Used by the startup scavenger to find abandoned sessions.
     fn list_all_stream_uploads(&self) -> Result<Vec<StreamUploadRecord>, MetadataError>;
 
-    /// Allocate the next unique staged segment payload generation for a session.
-    fn allocate_stream_segment_vid(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<GenerationId, MetadataError>;
-
     /// Append a staging segment record to an in-progress streaming session.
     fn append_stream_segment(
         &self,

@@ -3094,7 +3094,6 @@ pub struct StreamUploadRecord {
     pub target: StreamUploadTarget,
     pub state: StreamUploadState,
     pub created_at: u64,
-    pub next_segment_vid: GenerationId,
     pub encryption: ObjectEncryption,
 }
 

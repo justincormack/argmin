@@ -686,7 +686,6 @@ impl CreateStreamUploadCommand {
                 target: request.target,
                 state: StreamUploadState::InProgress,
                 created_at: created_at_millis,
-                next_segment_vid: GenerationId::MIN,
                 encryption: request.encryption,
             },
         }
@@ -1069,7 +1068,6 @@ fn encode_create_stream_upload(out: &mut Vec<u8>, command: &CreateStreamUploadCo
     encode_stream_upload_target(out, &command.session.target);
     put_u8(out, command.session.state as u8);
     put_u64(out, command.session.created_at);
-    put_u64(out, command.session.next_segment_vid.get());
     encode_object_encryption(out, &command.session.encryption);
 }
 
@@ -2360,7 +2358,7 @@ mod tests {
                 0xbedac82e848dc420,
                 0x73de85dc53ef998c,
                 0x2c69c1feb283495d,
-                0x35664b4295eb2b3b,
+                0x9e020e0cc8c2f954,
                 0xf1b058002ad6040e,
                 0x7555192579a20442,
                 0x505fc17b646186f2,

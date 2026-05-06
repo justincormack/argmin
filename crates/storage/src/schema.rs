@@ -190,7 +190,6 @@ CREATE TABLE IF NOT EXISTS stream_uploads (
     part_number   INTEGER,
     state         INTEGER NOT NULL DEFAULT 0,
     created_at    INTEGER NOT NULL,
-    next_segment_vid INTEGER NOT NULL DEFAULT 1 CHECK (next_segment_vid > 0),
     encryption_type INTEGER NOT NULL DEFAULT 0 CHECK (encryption_type IN (0, 1, 2)),
     encryption_state BLOB,
     CHECK (op_kind IN (0, 1)),
@@ -515,7 +514,6 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_object_write_sequence_columns(conn)?;
     migrate_object_became_noncurrent_columns(conn)?;
     migrate_multipart_upload_tag_columns(conn)?;
-    migrate_stream_upload_segment_vid_columns(conn)?;
     migrate_multipart_upload_object_generation_columns(conn)?;
     create_object_lock_triggers(conn)?;
     Ok(())
@@ -665,15 +663,6 @@ fn migrate_multipart_upload_tag_columns(conn: &Connection) -> Result<(), rusqlit
         Err(e) => return Err(e),
     }
     Ok(())
-}
-
-fn migrate_stream_upload_segment_vid_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
-    add_column_if_missing(
-        conn,
-        "stream_uploads",
-        "next_segment_vid",
-        "ALTER TABLE stream_uploads ADD COLUMN next_segment_vid INTEGER NOT NULL DEFAULT 1 CHECK (next_segment_vid > 0)",
-    )
 }
 
 fn migrate_multipart_upload_object_generation_columns(
