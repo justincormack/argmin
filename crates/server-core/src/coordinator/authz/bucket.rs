@@ -104,15 +104,14 @@ impl Coordinator {
     pub(in crate::coordinator) fn authorize_put_bucket_cors(
         &self,
         req: &PutBucketConfigRequest<'_>,
-    ) -> Result<AuthorizedBucketSubresourcePut, ServerError> {
+    ) -> Result<AuthorizedPutBucketCors, ServerError> {
         let _bucket = self.authorize_loaded_bucket_write_action_for(
             &req.bucket,
             auth::PolicyAction::PutBucketCors,
             Self::requester_can_bucket_owner_account_admin,
         )?;
-        Ok(AuthorizedBucketSubresourcePut {
+        Ok(AuthorizedPutBucketCors {
             bucket: req.bucket.name_typed().clone(),
-            kind: storage::BucketSubresourceKind::Cors,
             body: req.config.to_string(),
         })
     }
@@ -120,7 +119,7 @@ impl Coordinator {
     pub(in crate::coordinator) fn authorize_get_bucket_cors(
         &self,
         req: &BucketRequest<'_>,
-    ) -> Result<AuthorizedBucketSubresourceBodyGet, ServerError> {
+    ) -> Result<AuthorizedGetBucketCors, ServerError> {
         let bucket = self.load_bucket_handle_for_bucket_read(
             req,
             BucketHandleRequest::new().requiring_cors_view(),
@@ -137,7 +136,7 @@ impl Coordinator {
         if !allowed {
             return Err(ServerError::AccessDenied);
         }
-        Ok(AuthorizedBucketSubresourceBodyGet {
+        Ok(AuthorizedGetBucketCors {
             body: Self::loaded_bucket_subresource_body(bucket.cors())?,
         })
     }
@@ -145,7 +144,7 @@ impl Coordinator {
     pub(in crate::coordinator) fn authorize_get_bucket_tagging(
         &self,
         req: &BucketRequest<'_>,
-    ) -> Result<AuthorizedBucketSubresourceBodyGet, ServerError> {
+    ) -> Result<AuthorizedGetBucketTagging, ServerError> {
         let bucket = self.load_bucket_handle_for_bucket_read(
             req,
             BucketHandleRequest::new().requiring_bucket_tags(),
@@ -165,7 +164,7 @@ impl Coordinator {
         ) {
             return Err(ServerError::AccessDenied);
         }
-        Ok(AuthorizedBucketSubresourceBodyGet {
+        Ok(AuthorizedGetBucketTagging {
             body: Self::loaded_bucket_subresource_body(bucket.tags())?,
         })
     }
@@ -179,32 +178,30 @@ impl Coordinator {
     pub(in crate::coordinator) fn authorize_load_bucket_cors_config_for(
         &self,
         name: &BucketName,
-    ) -> AuthorizedBucketSubresourceGet {
-        AuthorizedBucketSubresourceGet {
+    ) -> AuthorizedLoadBucketCorsConfig {
+        AuthorizedLoadBucketCorsConfig {
             bucket: name.clone(),
-            kind: storage::BucketSubresourceKind::Cors,
         }
     }
 
     pub(in crate::coordinator) fn authorize_delete_bucket_cors(
         &self,
         req: &BucketRequest<'_>,
-    ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
+    ) -> Result<AuthorizedDeleteBucketCors, ServerError> {
         let _bucket = self.authorize_loaded_bucket_write_action_for(
             req,
             auth::PolicyAction::PutBucketCors,
             Self::requester_can_bucket_owner_account_admin,
         )?;
-        Ok(AuthorizedBucketSubresourceDelete {
+        Ok(AuthorizedDeleteBucketCors {
             bucket: req.name_typed().clone(),
-            kind: storage::BucketSubresourceKind::Cors,
         })
     }
 
     pub(in crate::coordinator) fn authorize_put_bucket_tagging(
         &self,
         req: &PutBucketConfigRequest<'_>,
-    ) -> Result<AuthorizedBucketSubresourcePut, ServerError> {
+    ) -> Result<AuthorizedPutBucketTagging, ServerError> {
         let bucket = self.authorize_loaded_bucket_write_action_for(
             &req.bucket,
             auth::PolicyAction::PutBucketTagging,
@@ -215,9 +212,8 @@ impl Coordinator {
                 reason: "This S3 general purpose bucket has attribute-based access control (ABAC) enabled. To add tags to this bucket, initiate a TagResource request. To delete tags from this bucket, initiate an UntagResource request.".to_string(),
             });
         }
-        Ok(AuthorizedBucketSubresourcePut {
+        Ok(AuthorizedPutBucketTagging {
             bucket: req.bucket.name_typed().clone(),
-            kind: storage::BucketSubresourceKind::Tagging,
             body: req.config.to_string(),
         })
     }
@@ -225,7 +221,7 @@ impl Coordinator {
     pub(in crate::coordinator) fn authorize_delete_bucket_tagging(
         &self,
         req: &BucketRequest<'_>,
-    ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
+    ) -> Result<AuthorizedDeleteBucketTagging, ServerError> {
         let bucket = self.authorize_loaded_bucket_write_action_for(
             req,
             auth::PolicyAction::PutBucketTagging,
@@ -236,9 +232,8 @@ impl Coordinator {
                 reason: "This S3 general purpose bucket has attribute-based access control (ABAC) enabled. To delete tags from this bucket, initiate an UntagResource request.".to_string(),
             });
         }
-        Ok(AuthorizedBucketSubresourceDelete {
+        Ok(AuthorizedDeleteBucketTagging {
             bucket: req.name_typed().clone(),
-            kind: storage::BucketSubresourceKind::Tagging,
         })
     }
 
@@ -412,13 +407,13 @@ impl Coordinator {
     pub(in crate::coordinator) fn authorize_get_bucket_policy(
         &self,
         req: &BucketRequest<'_>,
-    ) -> Result<AuthorizedBucketSubresourceBodyGet, ServerError> {
+    ) -> Result<AuthorizedGetBucketPolicy, ServerError> {
         let bucket = self.authorize_loaded_bucket_policy_action_for(
             req,
             auth::PolicyAction::GetBucketPolicy,
             Self::requester_can_bucket_owner_account_admin,
         )?;
-        Ok(AuthorizedBucketSubresourceBodyGet {
+        Ok(AuthorizedGetBucketPolicy {
             body: Self::loaded_bucket_subresource_body(bucket.policy())?,
         })
     }
@@ -426,15 +421,14 @@ impl Coordinator {
     pub(in crate::coordinator) fn authorize_delete_bucket_policy(
         &self,
         req: &BucketRequest<'_>,
-    ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
+    ) -> Result<AuthorizedDeleteBucketPolicy, ServerError> {
         let _bucket = self.authorize_loaded_bucket_write_policy_action_for(
             req,
             auth::PolicyAction::DeleteBucketPolicy,
             Self::requester_can_bucket_owner_account_admin,
         )?;
-        Ok(AuthorizedBucketSubresourceDelete {
+        Ok(AuthorizedDeleteBucketPolicy {
             bucket: req.name_typed().clone(),
-            kind: storage::BucketSubresourceKind::Policy,
         })
     }
 
@@ -592,7 +586,7 @@ impl Coordinator {
     pub(in crate::coordinator) fn authorize_get_bucket_lifecycle(
         &self,
         req: &BucketRequest<'_>,
-    ) -> Result<AuthorizedBucketSubresourceBodyGet, ServerError> {
+    ) -> Result<AuthorizedGetBucketLifecycle, ServerError> {
         let bucket = self.load_bucket_handle_for_bucket_read(
             req,
             BucketHandleRequest::new().requiring_lifecycle_view(),
@@ -609,7 +603,7 @@ impl Coordinator {
         if !allowed {
             return Err(ServerError::AccessDenied);
         }
-        Ok(AuthorizedBucketSubresourceBodyGet {
+        Ok(AuthorizedGetBucketLifecycle {
             body: Self::loaded_bucket_subresource_body(bucket.lifecycle())?,
         })
     }
@@ -622,25 +616,23 @@ impl Coordinator {
     pub(in crate::coordinator) fn authorize_load_bucket_lifecycle_for(
         &self,
         name: &BucketName,
-    ) -> AuthorizedBucketSubresourceGet {
-        AuthorizedBucketSubresourceGet {
+    ) -> AuthorizedLoadBucketLifecycleConfig {
+        AuthorizedLoadBucketLifecycleConfig {
             bucket: name.clone(),
-            kind: storage::BucketSubresourceKind::Lifecycle,
         }
     }
 
     pub(in crate::coordinator) fn authorize_delete_bucket_lifecycle(
         &self,
         req: &BucketRequest<'_>,
-    ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
+    ) -> Result<AuthorizedDeleteBucketLifecycle, ServerError> {
         let _bucket = self.authorize_loaded_bucket_write_action_for(
             req,
             auth::PolicyAction::PutLifecycleConfiguration,
             Self::requester_can_bucket_owner_account_admin,
         )?;
-        Ok(AuthorizedBucketSubresourceDelete {
+        Ok(AuthorizedDeleteBucketLifecycle {
             bucket: req.name_typed().clone(),
-            kind: storage::BucketSubresourceKind::Lifecycle,
         })
     }
 

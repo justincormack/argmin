@@ -34,7 +34,13 @@ impl Coordinator {
         }
 
         let authorized = self.authorize_load_bucket_lifecycle_for(&bucket.name);
-        let raw_config = self.load_authorized_bucket_subresource(&authorized)?;
+        let raw_config = self
+            .storage_node
+            .get_bucket_subresource(
+                &authorized.bucket,
+                storage::BucketSubresourceKind::Lifecycle,
+            )
+            .map_err(Self::map_bucket_snapshot_load_error)?;
         match raw_config {
             Some(config_xml) => s3_types::parse_lifecycle_configuration_xml(config_xml.as_bytes())
                 .map(Some)

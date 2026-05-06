@@ -23,21 +23,24 @@ use self::modern::BoeLoadedBucketHandle;
 pub(super) use self::modern::ModernReadAction;
 use super::authz_results::{
     AuthorizedAbortMultipartUpload, AuthorizedBeginStreamPart, AuthorizedBucketConfigAccess,
-    AuthorizedBucketSubresourceBodyGet, AuthorizedBucketSubresourceDelete,
-    AuthorizedBucketSubresourceGet, AuthorizedBucketSubresourcePut,
     AuthorizedCompleteMultipartUpload, AuthorizedCopyObject, AuthorizedCreateBucket,
-    AuthorizedCreateMultipartUpload, AuthorizedDeleteBucket, AuthorizedDeleteBucketEncryption,
-    AuthorizedDeleteObject, AuthorizedGetBucketAbac, AuthorizedGetBucketAcl,
-    AuthorizedGetBucketEncryption, AuthorizedGetBucketLocation,
+    AuthorizedCreateMultipartUpload, AuthorizedDeleteBucket, AuthorizedDeleteBucketCors,
+    AuthorizedDeleteBucketEncryption, AuthorizedDeleteBucketLifecycle,
+    AuthorizedDeleteBucketPolicy, AuthorizedDeleteBucketTagging, AuthorizedDeleteObject,
+    AuthorizedGetBucketAbac, AuthorizedGetBucketAcl, AuthorizedGetBucketCors,
+    AuthorizedGetBucketEncryption, AuthorizedGetBucketLifecycle, AuthorizedGetBucketLocation,
     AuthorizedGetBucketObjectLockConfiguration, AuthorizedGetBucketOwnershipControls,
-    AuthorizedGetBucketPolicyStatus, AuthorizedGetBucketPublicAccessBlock,
+    AuthorizedGetBucketPolicy, AuthorizedGetBucketPolicyStatus,
+    AuthorizedGetBucketPublicAccessBlock, AuthorizedGetBucketTagging,
     AuthorizedGetBucketVersioning, AuthorizedHeadBucket, AuthorizedListBuckets,
     AuthorizedListMultipartUploads, AuthorizedListObjectVersions, AuthorizedListObjectsV2,
-    AuthorizedListParts, AuthorizedMultipartPartWrite, AuthorizedObjectRead,
-    AuthorizedPutBucketAbac, AuthorizedPutBucketAcl, AuthorizedPutBucketEncryption,
+    AuthorizedListParts, AuthorizedLoadBucketCorsConfig, AuthorizedLoadBucketLifecycleConfig,
+    AuthorizedMultipartPartWrite, AuthorizedObjectRead, AuthorizedPutBucketAbac,
+    AuthorizedPutBucketAcl, AuthorizedPutBucketCors, AuthorizedPutBucketEncryption,
     AuthorizedPutBucketLifecycle, AuthorizedPutBucketObjectLockConfiguration,
     AuthorizedPutBucketOwnershipControls, AuthorizedPutBucketPolicy,
-    AuthorizedPutBucketPublicAccessBlock, AuthorizedPutBucketVersioning, AuthorizedUploadPartCopy,
+    AuthorizedPutBucketPublicAccessBlock, AuthorizedPutBucketTagging,
+    AuthorizedPutBucketVersioning, AuthorizedUploadPartCopy,
 };
 use super::authz_types::{AuthorizedPutObjectWrite, AuthorizedPutObjectWriteAcl, ValidatedBucket};
 use super::bucket_handles::{

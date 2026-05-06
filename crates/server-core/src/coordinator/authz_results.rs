@@ -18,27 +18,65 @@ use storage::{
 };
 
 #[derive(Debug)]
-pub(super) struct AuthorizedBucketSubresourcePut {
+pub(super) struct AuthorizedPutBucketCors {
     pub(super) bucket: BucketName,
-    pub(super) kind: storage::BucketSubresourceKind,
     pub(super) body: String,
 }
 
 #[derive(Debug)]
-pub(super) struct AuthorizedBucketSubresourceGet {
-    pub(super) bucket: BucketName,
-    pub(super) kind: storage::BucketSubresourceKind,
-}
-
-#[derive(Debug)]
-pub(super) struct AuthorizedBucketSubresourceBodyGet {
+pub(super) struct AuthorizedGetBucketCors {
     pub(super) body: Option<String>,
 }
 
 #[derive(Debug)]
-pub(super) struct AuthorizedBucketSubresourceDelete {
+pub(super) struct AuthorizedLoadBucketCorsConfig {
     pub(super) bucket: BucketName,
-    pub(super) kind: storage::BucketSubresourceKind,
+}
+
+#[derive(Debug)]
+pub(super) struct AuthorizedDeleteBucketCors {
+    pub(super) bucket: BucketName,
+}
+
+#[derive(Debug)]
+pub(super) struct AuthorizedPutBucketTagging {
+    pub(super) bucket: BucketName,
+    pub(super) body: String,
+}
+
+#[derive(Debug)]
+pub(super) struct AuthorizedGetBucketTagging {
+    pub(super) body: Option<String>,
+}
+
+#[derive(Debug)]
+pub(super) struct AuthorizedDeleteBucketTagging {
+    pub(super) bucket: BucketName,
+}
+
+#[derive(Debug)]
+pub(super) struct AuthorizedGetBucketPolicy {
+    pub(super) body: Option<String>,
+}
+
+#[derive(Debug)]
+pub(super) struct AuthorizedDeleteBucketPolicy {
+    pub(super) bucket: BucketName,
+}
+
+#[derive(Debug)]
+pub(super) struct AuthorizedGetBucketLifecycle {
+    pub(super) body: Option<String>,
+}
+
+#[derive(Debug)]
+pub(super) struct AuthorizedLoadBucketLifecycleConfig {
+    pub(super) bucket: BucketName,
+}
+
+#[derive(Debug)]
+pub(super) struct AuthorizedDeleteBucketLifecycle {
+    pub(super) bucket: BucketName,
 }
 
 #[derive(Debug)]
