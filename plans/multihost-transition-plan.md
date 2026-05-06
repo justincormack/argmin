@@ -1603,6 +1603,10 @@ The intended model is:
 - SQLite metadata tables are the materialized serving view of that history
 - a checkpoint or snapshot is a compact proof of materialized state at a log
   index
+- object payload bytes are not part of the metadata command log, canonical
+  metadata state, checkpoint, or scrub digest; the metadata records only payload
+  descriptors such as size, segment/part layout, placement references, and the
+  payload CRC64 values needed to verify object data
 - replay is `checkpoint + retained log tail -> materialized state`
 - deterministic apply is `canonical command + prior canonical state -> next
   canonical state`
@@ -1625,7 +1629,8 @@ Work items:
 2. define canonical metadata state independent of SQLite layout:
    - bucket records and subresources
    - object versions and delete markers
-   - segment manifests and object parts
+   - segment manifests and object parts, including payload sizes and CRC64
+     values, but not object payload bytes
    - multipart uploads, uploaded parts, and streamed part segments
    - reclaim rows, write sequences, bucket execution generations, and other
      allocators/counters
