@@ -3086,7 +3086,7 @@ impl StreamUploadState {
 }
 
 /// In-progress streaming upload session record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamUploadRecord {
     pub session_id: SessionId,
     pub bucket: BucketName,
@@ -3094,6 +3094,7 @@ pub struct StreamUploadRecord {
     pub target: StreamUploadTarget,
     pub state: StreamUploadState,
     pub created_at: u64,
+    pub next_segment_vid: GenerationId,
     pub encryption: ObjectEncryption,
 }
 

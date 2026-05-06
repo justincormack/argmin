@@ -91,6 +91,47 @@ Reverse mapping from materialized state back to the original AWS request is not
 required after overwrites or deletes. Replay and checkpoint validation must be
 unambiguous.
 
+### Command Mapping Inventory
+
+Phase 7.2 classifies each current metadata command by the state it mutates. New
+commands should be storage-shaped by default. Existing mixed commands should be
+converted before their payload shape is frozen into canonical binary row/range
+encodings.
+
+| Command | Shape | Canonical Reads | Canonical Writes | Retry Rule |
+| --- | --- | --- | --- | --- |
+| `CreateBucket` | Mixed | bucket absence / matching existing bucket | bucket row | identical bucket row converges |
+| `PutBucketVersioning` | Mixed | bucket row generation | bucket versioning, execution generation | matching target state converges |
+| `PutBucketAcl` | Mixed | bucket row generation | bucket ACL/public flags, execution generation | matching ACL effect converges |
+| `PutBucketProperty` | Mixed | bucket row generation | bucket property columns, execution generation | matching property effect converges |
+| `PutBucketSubresource` | Storage-shaped | bucket row generation | bucket subresource row, generation mirrors | matching subresource effect converges |
+| `ReserveObjectGeneration` | Storage-shaped | object generation allocators and live/reclaim/reservation rows | generation reservation row | matching reservation id converges |
+| `ReleaseObjectGeneration` | Storage-shaped | generation reservation row | removes reservation row | missing matching reservation is idempotent |
+| `CommitDirectPutObject` | Storage-shaped | object row, version/write-sequence state, reservation row | object row, segment manifest, stale reclaim rows | matching object generation/reservation converges |
+| `CommitMultipartObject` | Storage-shaped | MPU rows, part rows, completed-MPU order, object state | object row, part manifest, selected segment rows, completed-MPU row, stale reclaim rows | matching upload completion converges |
+| `DeleteObjectVersion` | Storage-shaped | exact object version row | removes version, writes reclaim metadata for live payload | matching version/generation converges |
+| `InsertDeleteMarker` | Storage-shaped | object version/write-sequence state | delete marker row, optional stale reclaim metadata | matching bucket/key marker insertion converges |
+| `PutObjectMetadata` | Request-shaped | exact object version row | tags, retention, legal hold, or ACL fields | matching mutation converges |
+| `CreateStreamUpload` | Storage-shaped | target object/upload row for validation | stream session row | matching session row converges |
+| `AppendStreamSegment` | Storage-shaped | stream session row and segment allocator | stream segment row, session segment allocator | matching segment row converges |
+| `AbortStreamUpload` | Storage-shaped | stream session and staged segments | removes stream session/segments | matching session abort converges |
+| `CommitStreamPart` | Storage-shaped | stream session, upload row, staged segments, existing part | multipart part row and staged segment rows | matching session/upload/part converges |
+| `CreateMultipartUpload` | Storage-shaped | object generation allocators and reservation rows | multipart upload row and generation reservation row | matching upload row converges |
+| `AbortMultipartUpload` | Storage-shaped | upload row, part rows, staged part segments | upload/part metadata cleanup rows | matching upload abort converges |
+| `DeleteObjectPayloadReclaim` | Storage-shaped | reclaim root and manifest rows | removes reclaim metadata | matching reclaim root converges |
+
+For row-shaped create commands, retry matching is exact over the stored row
+published by the command. Matching only the original request fields is not
+enough, because row fields such as timestamps, generation ids, and allocator
+state are part of the command checksum and replay effect. For stream upload
+session creation this includes the initial `next_segment_vid` allocator value.
+
+`PutObjectMetadata` is the main remaining request-shaped object command. It
+still records "put tags", "delete tags", "put ACL", "put retention", and "put
+legal hold" mutations rather than an explicit post-image object metadata row.
+That should be converted before Phase 7.3 if the binary canonical command
+format is going to commit object metadata command payloads long term.
+
 ## Integrity And Divergence
 
 Every persisted binary command-log entry must carry a checksum over its

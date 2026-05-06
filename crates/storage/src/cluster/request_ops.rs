@@ -260,8 +260,8 @@ fn metadata_command_apply_test_context(
         ),
         MetadataCommandPayload::CreateStreamUpload(command) => (
             MetadataCommandApplyTestKind::CreateStreamUpload,
-            Some(command.request.bucket.clone()),
-            Some(command.request.key.clone()),
+            Some(command.session.bucket.clone()),
+            Some(command.session.key.clone()),
         ),
         MetadataCommandPayload::AppendStreamSegment(command) => (
             MetadataCommandApplyTestKind::AppendStreamSegment,
@@ -280,8 +280,8 @@ fn metadata_command_apply_test_context(
         ),
         MetadataCommandPayload::CreateMultipartUpload(command) => (
             MetadataCommandApplyTestKind::CreateMultipartUpload,
-            Some(command.request.bucket.clone()),
-            Some(command.request.key.clone()),
+            Some(command.upload.bucket.clone()),
+            Some(command.upload.key.clone()),
         ),
         MetadataCommandPayload::AbortMultipartUpload(command) => (
             MetadataCommandApplyTestKind::AbortMultipartUpload,
@@ -3924,7 +3924,8 @@ impl super::StorageCluster {
 
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         loop {
-            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+            let applied_commands = self
+                .drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)
                 .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
             let primary_node = self.object_metadata_primary_node(bucket, key)?;
             let attempt = primary_node.with_bucket_write_reservation_snapshot(
@@ -3946,7 +3947,11 @@ impl super::StorageCluster {
                         Err(error) => return Ok(Err(error)),
                     };
                     if self
-                        .matching_stream_upload_exists(pg_id, &create)
+                        .matching_stream_upload_exists(
+                            pg_id,
+                            &create,
+                            super::applied_stream_create_command(&applied_commands, &create),
+                        )
                         .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
                     {
                         return Ok(Ok(Attempt::Complete(value)));
@@ -3957,10 +3962,10 @@ impl super::StorageCluster {
                     let command = MetadataCommandEnvelope::new(
                         self.next_object_metadata_command_id(pg_id),
                         MetadataCommandPayload::CreateStreamUpload(Box::new(
-                            CreateStreamUploadCommand {
-                                request: create.clone(),
-                                created_at_millis: crate::clock::current_time_millis(),
-                            },
+                            CreateStreamUploadCommand::from_request(
+                                create.clone(),
+                                crate::clock::current_time_millis(),
+                            ),
                         )),
                     );
                     #[cfg(test)]
@@ -4233,7 +4238,8 @@ impl super::StorageCluster {
         ) -> Result<(T, CreateMultipartUploadReq), E>,
     ) -> Result<Result<CreateMultipartUploadOutcome<T>, E>, BucketSnapshotLoadError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+        let applied_commands = self
+            .drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)
             .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
         primary_node.with_bucket_write_reservation_snapshot(bucket, request, |snapshot| {
@@ -4250,7 +4256,11 @@ impl super::StorageCluster {
                 Err(error) => return Ok(Err(error)),
             };
             if let Some(initiated_at) = self
-                .matching_multipart_upload_initiated_at(pg_id, &create)
+                .matching_multipart_upload_initiated_at(
+                    pg_id,
+                    &create,
+                    super::applied_multipart_create_command(&applied_commands, &create),
+                )
                 .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
             {
                 return Ok(Ok(CreateMultipartUploadOutcome {
@@ -4266,11 +4276,11 @@ impl super::StorageCluster {
             let command = MetadataCommandEnvelope::new(
                 self.next_object_metadata_command_id(pg_id),
                 MetadataCommandPayload::CreateMultipartUpload(Box::new(
-                    CreateMultipartUploadCommand {
-                        request: create.clone(),
+                    CreateMultipartUploadCommand::from_request(
+                        create.clone(),
                         object_generation_id,
-                        initiated_at_millis: crate::clock::current_time_millis(),
-                    },
+                        crate::clock::current_time_millis(),
+                    ),
                 )),
             );
             self.set_pending_metadata_command_for_bucket(
@@ -4319,7 +4329,8 @@ impl super::StorageCluster {
         action: impl FnOnce(&MultipartUploadRecord) -> Result<(AuthorizedMultipartUploadRecord, T), E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+        let applied_commands = self
+            .drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)
             .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let object_pg = primary_node.get_pg(pg_id.get())?;
@@ -4355,17 +4366,23 @@ impl super::StorageCluster {
         };
         drop(object_pg);
         if self
-            .matching_stream_upload_exists(pg_id, &create)
+            .matching_stream_upload_exists(
+                pg_id,
+                &create,
+                super::applied_stream_create_command(&applied_commands, &create),
+            )
             .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
         {
             return Ok(Ok(result));
         }
         let command = MetadataCommandEnvelope::new(
             self.next_object_metadata_command_id(pg_id),
-            MetadataCommandPayload::CreateStreamUpload(Box::new(CreateStreamUploadCommand {
-                request: create,
-                created_at_millis: crate::clock::current_time_millis(),
-            })),
+            MetadataCommandPayload::CreateStreamUpload(Box::new(
+                CreateStreamUploadCommand::from_request(
+                    create,
+                    crate::clock::current_time_millis(),
+                ),
+            )),
         );
         self.set_pending_metadata_command_for_bucket(
             pg_id,
@@ -4390,7 +4407,8 @@ impl super::StorageCluster {
         let upload_id = &authorized_upload.record().upload_id;
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         loop {
-            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+            let applied_commands =
+                self.drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)?;
             let primary_node = self.object_metadata_primary_node(bucket, key)?;
             let object_pg = primary_node.get_pg(pg_id.get())?;
             let upload = PgMetadataStore::get_multipart_upload(&*object_pg, upload_id)?;
@@ -4411,15 +4429,21 @@ impl super::StorageCluster {
                 encryption: upload.encryption,
             };
             drop(object_pg);
-            if self.matching_stream_upload_exists(pg_id, &create)? {
+            if self.matching_stream_upload_exists(
+                pg_id,
+                &create,
+                super::applied_stream_create_command(&applied_commands, &create),
+            )? {
                 return Ok(session_id.clone());
             }
             let command = MetadataCommandEnvelope::new(
                 self.next_object_metadata_command_id(pg_id),
-                MetadataCommandPayload::CreateStreamUpload(Box::new(CreateStreamUploadCommand {
-                    request: create,
-                    created_at_millis: crate::clock::current_time_millis(),
-                })),
+                MetadataCommandPayload::CreateStreamUpload(Box::new(
+                    CreateStreamUploadCommand::from_request(
+                        create,
+                        crate::clock::current_time_millis(),
+                    ),
+                )),
             );
             if self
                 .set_pending_metadata_command_for_bucket(

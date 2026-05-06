@@ -3625,16 +3625,16 @@ mod tests {
                 map.runtime_state().next_metadata_command_log_index(pg_id),
             ),
             MetadataCommandPayload::CreateStreamUpload(Box::new(
-                crate::metadata_command::CreateStreamUploadCommand {
-                    request: crate::CreateStreamUploadReq {
+                crate::metadata_command::CreateStreamUploadCommand::from_request(
+                    crate::CreateStreamUploadReq {
                         session_id: session_id.clone(),
                         bucket: bucket.clone(),
                         key: key.clone(),
                         target: crate::StreamUploadTarget::PutObject,
                         encryption: crate::ObjectEncryption::None,
                     },
-                    created_at_millis: 123,
-                },
+                    123,
+                ),
             )),
         );
         map.runtime_state()
@@ -3711,16 +3711,16 @@ mod tests {
                 map.runtime_state().next_metadata_command_log_index(pg_id),
             ),
             MetadataCommandPayload::CreateStreamUpload(Box::new(
-                crate::metadata_command::CreateStreamUploadCommand {
-                    request: crate::CreateStreamUploadReq {
+                crate::metadata_command::CreateStreamUploadCommand::from_request(
+                    crate::CreateStreamUploadReq {
                         session_id: session_id.clone(),
                         bucket: bucket.clone(),
                         key: key.clone(),
                         target: crate::StreamUploadTarget::PutObject,
                         encryption: crate::ObjectEncryption::None,
                     },
-                    created_at_millis: 123,
-                },
+                    123,
+                ),
             )),
         );
         map.runtime_state()
@@ -5246,7 +5246,7 @@ mod tests {
             move |node_id, command| {
                 match command.payload() {
                     MetadataCommandPayload::CreateMultipartUpload(create)
-                        if create.request.upload_id == hook_upload_id
+                        if create.upload.upload_id == hook_upload_id
                             && node_id == NodeId::new(1)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
@@ -5337,6 +5337,91 @@ mod tests {
                 replica_upload.object_generation_id
             );
         }
+    }
+
+    #[test]
+    fn multipart_create_retry_rejects_same_request_with_mismatched_generation() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let upload_id = upload_id_from_label("mpurowmismatch");
+        let create = crate::CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
+
+        cluster
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), create.clone()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+        {
+            let primary = map.node(NodeId::new(0)).unwrap().storage_node();
+            let pg = primary.get_pg(object_pg).unwrap();
+            let upload = crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap();
+            let mismatched_generation =
+                crate::GenerationId::new(upload.object_generation_id.get() + 1).unwrap();
+            pg.connection()
+                .execute(
+                    "UPDATE multipart_uploads SET object_generation_id = ?1 WHERE upload_id = ?2",
+                    rusqlite::params![mismatched_generation.get() as i64, upload_id.as_str()],
+                )
+                .unwrap();
+        }
+
+        let err = cluster
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), create.clone()))
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::Db {
+                    context: "create multipart upload existing upload mismatch",
+                    ..
+                })
+            ),
+            "expected exact multipart upload row mismatch, got {err:?}"
+        );
     }
 
     #[test]
@@ -5705,16 +5790,16 @@ mod tests {
                             .next_metadata_command_log_index(pg_id),
                     ),
                     MetadataCommandPayload::CreateStreamUpload(Box::new(
-                        crate::metadata_command::CreateStreamUploadCommand {
-                            request: crate::CreateStreamUploadReq {
+                        crate::metadata_command::CreateStreamUploadCommand::from_request(
+                            crate::CreateStreamUploadReq {
                                 session_id: session_for_hook.clone(),
                                 bucket: bucket_for_hook.clone(),
                                 key: key_for_hook.clone(),
                                 target: crate::StreamUploadTarget::PutObject,
                                 encryption: crate::ObjectEncryption::None,
                             },
-                            created_at_millis: 123,
-                        },
+                            123,
+                        ),
                     )),
                 );
                 map_for_hook
@@ -6050,7 +6135,7 @@ mod tests {
             move |node_id, command| {
                 match command.payload() {
                     MetadataCommandPayload::CreateStreamUpload(create)
-                        if create.request.session_id == hook_session_id
+                        if create.session.session_id == hook_session_id
                             && node_id == NodeId::new(1)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
@@ -6155,6 +6240,161 @@ mod tests {
     }
 
     #[test]
+    fn stream_put_create_retry_rejects_same_request_with_mismatched_created_at() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let session_id = crate::SessionId::try_from("7a".repeat(16)).unwrap();
+        let create = crate::CreateStreamUploadReq {
+            session_id: session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: crate::StreamUploadTarget::PutObject,
+            encryption: crate::ObjectEncryption::None,
+        };
+
+        cluster
+            .create_put_object_stream_session(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), create.clone()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+        {
+            let primary = map.node(NodeId::new(0)).unwrap().storage_node();
+            let pg = primary.get_pg(object_pg).unwrap();
+            let session = crate::PgMetadataStore::get_stream_upload(&*pg, &session_id).unwrap();
+            pg.connection()
+                .execute(
+                    "UPDATE stream_uploads SET created_at = ?1 WHERE session_id = ?2",
+                    rusqlite::params![
+                        session.created_at.saturating_add(1) as i64,
+                        session_id.as_str()
+                    ],
+                )
+                .unwrap();
+        }
+
+        let err = cluster
+            .create_put_object_stream_session(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), create.clone()))
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::Db {
+                    context: "create stream upload existing session mismatch",
+                    ..
+                })
+            ),
+            "expected exact stream session row mismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn stream_create_row_match_rejects_mismatched_next_segment_vid() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let session_id = crate::SessionId::try_from("7b".repeat(16)).unwrap();
+        let create = crate::CreateStreamUploadReq {
+            session_id: session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: crate::StreamUploadTarget::PutObject,
+            encryption: crate::ObjectEncryption::None,
+        };
+
+        cluster
+            .create_put_object_stream_session(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), create.clone()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        let expected_command = {
+            let primary = map.node(NodeId::new(0)).unwrap().storage_node();
+            let pg = primary.get_pg(object_pg).unwrap();
+            let session = crate::PgMetadataStore::get_stream_upload(&*pg, &session_id).unwrap();
+            let expected = crate::metadata_command::CreateStreamUploadCommand::from_request(
+                create.clone(),
+                session.created_at,
+            );
+            assert_eq!(session, expected.session);
+            pg.connection()
+                .execute(
+                    "UPDATE stream_uploads SET next_segment_vid = ?1 WHERE session_id = ?2",
+                    rusqlite::params![
+                        session.next_segment_vid.get().saturating_add(1) as i64,
+                        session_id.as_str()
+                    ],
+                )
+                .unwrap();
+            expected
+        };
+
+        let err = cluster
+            .matching_stream_upload_exists(PgId::new(object_pg), &create, Some(&expected_command))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Metadata(crate::MetadataError::Db {
+                    context: "create stream upload existing session mismatch",
+                    ..
+                })
+            ),
+            "expected exact stream session allocator mismatch, got {err:?}"
+        );
+    }
+
+    #[test]
     fn stream_put_create_drains_unrelated_pending_create_before_new_session() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -6200,7 +6440,7 @@ mod tests {
             move |node_id, command| {
                 match command.payload() {
                     MetadataCommandPayload::CreateStreamUpload(create)
-                        if create.request.session_id == hook_session_id
+                        if create.session.session_id == hook_session_id
                             && node_id == NodeId::new(1)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
@@ -6318,16 +6558,16 @@ mod tests {
                             .next_metadata_command_log_index(pg_id),
                     ),
                     MetadataCommandPayload::CreateStreamUpload(Box::new(
-                        crate::metadata_command::CreateStreamUploadCommand {
-                            request: crate::CreateStreamUploadReq {
+                        crate::metadata_command::CreateStreamUploadCommand::from_request(
+                            crate::CreateStreamUploadReq {
                                 session_id: session_for_hook.clone(),
                                 bucket: bucket_for_hook.clone(),
                                 key: key_for_hook.clone(),
                                 target: crate::StreamUploadTarget::PutObject,
                                 encryption: crate::ObjectEncryption::None,
                             },
-                            created_at_millis: 123,
-                        },
+                            123,
+                        ),
                     )),
                 );
                 map_for_hook
@@ -6401,16 +6641,16 @@ mod tests {
                 map.runtime_state().next_metadata_command_log_index(pg_id),
             ),
             MetadataCommandPayload::CreateStreamUpload(Box::new(
-                crate::metadata_command::CreateStreamUploadCommand {
-                    request: crate::CreateStreamUploadReq {
+                crate::metadata_command::CreateStreamUploadCommand::from_request(
+                    crate::CreateStreamUploadReq {
                         session_id: unrelated_session_id.clone(),
                         bucket: bucket.clone(),
                         key: key.clone(),
                         target: crate::StreamUploadTarget::PutObject,
                         encryption: crate::ObjectEncryption::None,
                     },
-                    created_at_millis: 123,
-                },
+                    123,
+                ),
             )),
         );
         map.runtime_state()
@@ -7387,12 +7627,12 @@ mod tests {
             move |_node_id, command| {
                 if let MetadataCommandPayload::CreateStreamUpload(create) = command.payload() {
                     let is_target_upload = matches!(
-                        &create.request.target,
+                        &create.session.target,
                         crate::StreamUploadTarget::UploadPart { upload_id, .. }
                             if upload_id == &hook_upload_id
                     );
-                    if create.request.bucket == hook_bucket
-                        && create.request.key == hook_key
+                    if create.session.bucket == hook_bucket
+                        && create.session.key == hook_key
                         && is_target_upload
                         && !hook_did_flip.swap(true, Ordering::SeqCst)
                     {

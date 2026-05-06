@@ -1707,6 +1707,20 @@ Proposed slices:
      8
    - define deterministic preconditions and state transitions for the retained
      command set over canonical metadata state
+   - add a command mapping matrix to
+     [metadata-model.md](../guides/metadata-model.md) covering current command
+     shape, canonical state read/write sets, deterministic preconditions, and
+     retry/idempotence behavior
+   - make the rule explicit for future commands: coordinator/auth code handles
+     AWS request semantics, while storage commands carry post-validation storage
+     effects that replay can apply without reconstructing an AWS request
+   - convert the clearest request-shaped payloads first:
+     `CreateMultipartUploadCommand` should carry the exact multipart upload row,
+     and `CreateStreamUploadCommand` should carry the exact stream session row
+     and target storage state, rather than embedding the request structs
+   - rename or replace request-oriented retry comparison helpers where touched,
+     so storage pending-command retry compares command intent/effect rather than
+     AWS request semantics
 3. Phase 7.3: canonical binary state encoding.
    - define row, table-range, and full-PG encodings that do not depend on
      SQLite row formatting
@@ -1733,6 +1747,25 @@ Completed:
     `object_parts`, `object_segments`, and `objects`
   - pinned that interim digest inventory in a unit test; the missing tables
     remain visible Phase 7 gaps rather than hidden schema-scan exclusions
+- Phase 7.2 first slice:
+  - added the command mapping inventory to
+    [metadata-model.md](../guides/metadata-model.md), including current command
+    shape, canonical read/write sets, and retry behavior
+  - converted `CreateStreamUploadCommand` from an embedded
+    `CreateStreamUploadReq` to a storage-shaped stream session row
+  - converted `CreateMultipartUploadCommand` from an embedded
+    `CreateMultipartUploadReq` plus separate timestamps/generation fields to a
+    storage-shaped multipart upload row
+  - updated canonical command encoding coverage so stream/MPU creation command
+    checksums cover the storage row state
+  - tightened stream/MPU creation retry matching so an existing row is accepted
+    only when it exactly matches the row from an applied pending command; same
+    request fields with different row-only fields now fail closed
+  - included stream session `next_segment_vid` allocator state in
+    `StreamUploadRecord` and `CreateStreamUploadCommand` checksums so stream
+    create row matching covers the full storage row
+  - `PutObjectMetadata` remains the main request-shaped object command to
+    address before Phase 7.3
 
 Exit criteria:
 

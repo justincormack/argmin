@@ -14,7 +14,8 @@ use crate::types::{
     MultipartReclaimPartRecord, MultipartReclaimRecord, MultipartUploadRecord, ObjectEncryption,
     ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord,
     ObjectSegmentsReclaimRecord, OwnerIdentity, PgId, PublicAccessBlockConfig, PutLiveObjectReq,
-    SessionId, StreamUploadSegmentRecord, StreamUploadTarget, UploadId, VersionId,
+    SessionId, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
+    StreamUploadTarget, UploadId, VersionId,
 };
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
@@ -617,8 +618,24 @@ impl PutObjectMetadataCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CreateStreamUploadCommand {
-    pub(crate) request: CreateStreamUploadReq,
-    pub(crate) created_at_millis: u64,
+    pub(crate) session: StreamUploadRecord,
+}
+
+impl CreateStreamUploadCommand {
+    pub(crate) fn from_request(request: CreateStreamUploadReq, created_at_millis: u64) -> Self {
+        Self {
+            session: StreamUploadRecord {
+                session_id: request.session_id,
+                bucket: request.bucket,
+                key: request.key,
+                target: request.target,
+                state: StreamUploadState::InProgress,
+                created_at: created_at_millis,
+                next_segment_vid: GenerationId::MIN,
+                encryption: request.encryption,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -667,9 +684,36 @@ impl CommitStreamPartCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CreateMultipartUploadCommand {
-    pub(crate) request: CreateMultipartUploadReq,
-    pub(crate) object_generation_id: GenerationId,
-    pub(crate) initiated_at_millis: u64,
+    pub(crate) upload: MultipartUploadRecord,
+}
+
+impl CreateMultipartUploadCommand {
+    pub(crate) fn from_request(
+        request: CreateMultipartUploadReq,
+        object_generation_id: GenerationId,
+        initiated_at_millis: u64,
+    ) -> Self {
+        Self {
+            upload: MultipartUploadRecord {
+                upload_id: request.upload_id,
+                bucket: request.bucket,
+                key: request.key,
+                initiated_at: initiated_at_millis,
+                state: crate::UploadState::InProgress,
+                tags: request.tags,
+                metadata_blob: request.metadata_blob,
+                system_metadata_blob: request.system_metadata_blob,
+                initiator: request.initiator,
+                owner: request.owner,
+                acl_grants: request.acl_grants,
+                public_read: request.public_read,
+                object_generation_id,
+                object_lock: request.object_lock,
+                checksum: request.checksum,
+                encryption: request.encryption,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1008,12 +1052,14 @@ fn encode_put_object_metadata(out: &mut Vec<u8>, command: &PutObjectMetadataComm
 }
 
 fn encode_create_stream_upload(out: &mut Vec<u8>, command: &CreateStreamUploadCommand) {
-    put_str(out, command.request.session_id.as_str());
-    put_str(out, command.request.bucket.as_str());
-    put_str(out, command.request.key.as_str());
-    encode_stream_upload_target(out, &command.request.target);
-    encode_object_encryption(out, &command.request.encryption);
-    put_u64(out, command.created_at_millis);
+    put_str(out, command.session.session_id.as_str());
+    put_str(out, command.session.bucket.as_str());
+    put_str(out, command.session.key.as_str());
+    encode_stream_upload_target(out, &command.session.target);
+    put_u8(out, command.session.state as u8);
+    put_u64(out, command.session.created_at);
+    put_u64(out, command.session.next_segment_vid.get());
+    encode_object_encryption(out, &command.session.encryption);
 }
 
 fn encode_append_stream_segment(out: &mut Vec<u8>, command: &AppendStreamSegmentCommand) {
@@ -1056,22 +1102,7 @@ fn encode_commit_stream_part(out: &mut Vec<u8>, command: &CommitStreamPartComman
 }
 
 fn encode_create_multipart_upload(out: &mut Vec<u8>, command: &CreateMultipartUploadCommand) {
-    let request = &command.request;
-    put_str(out, request.upload_id.as_str());
-    put_str(out, request.bucket.as_str());
-    put_str(out, request.key.as_str());
-    encode_optional_str(out, request.tags.as_ref().map(|tags| tags.as_str()));
-    put_bytes(out, request.metadata_blob.as_slice());
-    put_bytes(out, request.system_metadata_blob.as_slice());
-    encode_optional_owner_identity(out, request.initiator.as_ref());
-    encode_owner_identity(out, &request.owner);
-    put_str(out, &request.acl_grants.serialized());
-    put_bool(out, request.public_read);
-    encode_object_lock_state(out, request.object_lock);
-    encode_optional_multipart_checksum_config(out, request.checksum);
-    encode_object_encryption(out, &request.encryption);
-    put_u64(out, command.object_generation_id.get());
-    put_u64(out, command.initiated_at_millis);
+    encode_multipart_upload(out, &command.upload);
 }
 
 fn encode_abort_multipart_upload(out: &mut Vec<u8>, command: &AbortMultipartUploadCommand) {
@@ -2110,25 +2141,27 @@ mod tests {
                 version_id: VersionId::from_u64(8),
                 mutation: PutObjectMetadataMutation::PutLegalHold(StoredLegalHoldStatus::On),
             })),
-            MetadataCommandPayload::CreateMultipartUpload(Box::new(CreateMultipartUploadCommand {
-                request: CreateMultipartUploadReq {
-                    upload_id: upload_id.clone(),
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    tags: Some(crate::SerializedTagSet::new("<Tagging/>".to_string())),
-                    metadata_blob: SerializedMetadataBlob::new(vec![1, 2, 3]),
-                    system_metadata_blob: SerializedSystemMetadataBlob::new(vec![4, 5, 6]),
-                    initiator: Some(OwnerIdentity::from_principal("initiator")),
-                    owner: OwnerIdentity::from_principal("owner"),
-                    acl_grants: AclGrants::default(),
-                    public_read: true,
-                    object_lock: ObjectLockState::default(),
-                    checksum: None,
-                    encryption: ObjectEncryption::None,
-                },
-                object_generation_id: generation_id,
-                initiated_at_millis: 560,
-            })),
+            MetadataCommandPayload::CreateMultipartUpload(Box::new(
+                CreateMultipartUploadCommand::from_request(
+                    CreateMultipartUploadReq {
+                        upload_id: upload_id.clone(),
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        tags: Some(crate::SerializedTagSet::new("<Tagging/>".to_string())),
+                        metadata_blob: SerializedMetadataBlob::new(vec![1, 2, 3]),
+                        system_metadata_blob: SerializedSystemMetadataBlob::new(vec![4, 5, 6]),
+                        initiator: Some(OwnerIdentity::from_principal("initiator")),
+                        owner: OwnerIdentity::from_principal("owner"),
+                        acl_grants: AclGrants::default(),
+                        public_read: true,
+                        object_lock: ObjectLockState::default(),
+                        checksum: None,
+                        encryption: ObjectEncryption::None,
+                    },
+                    generation_id,
+                    560,
+                ),
+            )),
             MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
                 bucket: bucket.clone(),
                 key: key.clone(),
@@ -2139,16 +2172,18 @@ mod tests {
                     streaming_segments: vec![omitted_streaming_segment.clone()],
                 },
             })),
-            MetadataCommandPayload::CreateStreamUpload(Box::new(CreateStreamUploadCommand {
-                request: CreateStreamUploadReq {
-                    session_id: stream_session_id.clone(),
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    target: StreamUploadTarget::PutObject,
-                    encryption: ObjectEncryption::None,
-                },
-                created_at_millis: 561,
-            })),
+            MetadataCommandPayload::CreateStreamUpload(Box::new(
+                CreateStreamUploadCommand::from_request(
+                    CreateStreamUploadReq {
+                        session_id: stream_session_id.clone(),
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        target: StreamUploadTarget::PutObject,
+                        encryption: ObjectEncryption::None,
+                    },
+                    561,
+                ),
+            )),
             MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
                 bucket: bucket.clone(),
                 key: key.clone(),
@@ -2229,9 +2264,9 @@ mod tests {
                 0x01cd87bdfd723201,
                 0x12751ef35639efd3,
                 0x22fd0e282e38997a,
-                0x1c7aebe9c981fa68,
+                0x73de85dc53ef998c,
                 0x2c69c1feb283495d,
-                0xb67d60bbbb74f9d1,
+                0x35664b4295eb2b3b,
                 0xf1b058002ad6040e,
                 0x7555192579a20442,
                 0x505fc17b646186f2,

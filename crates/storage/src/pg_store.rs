@@ -36,28 +36,6 @@ use crate::types::*;
 
 const TRACE_TARGET: &str = "storage";
 
-fn multipart_upload_matches_create_command(
-    existing: &MultipartUploadRecord,
-    command: &CreateMultipartUploadCommand,
-) -> bool {
-    let request = &command.request;
-    existing.upload_id == request.upload_id
-        && existing.bucket == request.bucket
-        && existing.key == request.key
-        && existing.initiated_at == command.initiated_at_millis
-        && existing.state == UploadState::InProgress
-        && existing.tags == request.tags
-        && existing.metadata_blob == request.metadata_blob
-        && existing.system_metadata_blob == request.system_metadata_blob
-        && existing.initiator == request.initiator
-        && existing.owner == request.owner
-        && existing.acl_grants == request.acl_grants
-        && existing.public_read == request.public_read
-        && existing.object_generation_id == command.object_generation_id
-        && existing.object_lock == request.object_lock
-        && existing.checksum == request.checksum
-        && existing.encryption == request.encryption
-}
 const LIFECYCLE_SUBRESOURCE_KIND_SQL: i64 = BucketSubresourceKind::Lifecycle as u8 as i64;
 const BUCKET_INFO_SELECT: &str = "\
 SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, \
@@ -3721,36 +3699,37 @@ impl PgStore {
 
     fn create_stream_upload_explicit(
         &self,
-        req: &CreateStreamUploadReq,
-        created_at_millis: u64,
+        session: &StreamUploadRecord,
     ) -> Result<(), MetadataError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::create_stream_upload_explicit",
             "pg_id={} session_id={:?} bucket={:?} key={:?}",
             self.pg_id,
-            req.session_id.as_str(),
-            req.bucket.as_str(),
-            req.key.as_str()
+            session.session_id.as_str(),
+            session.bucket.as_str(),
+            session.key.as_str()
         );
-        let op_kind = req.target.op_kind() as u8;
-        let upload_id = req.target.upload_id();
-        let part_number = req.target.part_number().map(|n| n as i64);
-        let encryption_type = req.encryption.encryption_type() as u8;
-        let encryption_state = req.encryption.encode_state();
+        let op_kind = session.target.op_kind() as u8;
+        let upload_id = session.target.upload_id();
+        let part_number = session.target.part_number().map(|n| n as i64);
+        let encryption_type = session.encryption.encryption_type() as u8;
+        let encryption_state = session.encryption.encode_state();
         self.conn
             .execute(
                 "INSERT INTO stream_uploads \
-                 (session_id, bucket, key, op_kind, upload_id, part_number, state, created_at, encryption_type, encryption_state) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9)",
+                 (session_id, bucket, key, op_kind, upload_id, part_number, state, created_at, next_segment_vid, encryption_type, encryption_state) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
-                    req.session_id,
-                    req.bucket,
-                    req.key,
+                    session.session_id,
+                    session.bucket,
+                    session.key,
                     op_kind,
                     upload_id,
                     part_number,
-                    created_at_millis as i64,
+                    session.state as u8,
+                    session.created_at as i64,
+                    session.next_segment_vid.get() as i64,
                     encryption_type,
                     encryption_state,
                 ],
@@ -3798,23 +3777,14 @@ impl PgStore {
         command: &CreateStreamUploadCommand,
     ) -> Result<(), MetadataError> {
         self.validate_create_stream_upload_command_target(command)?;
-        match self.get_stream_upload(&command.request.session_id) {
-            Ok(existing)
-                if existing.bucket == command.request.bucket
-                    && existing.key == command.request.key
-                    && existing.target == command.request.target
-                    && existing.state == StreamUploadState::InProgress
-                    && existing.created_at == command.created_at_millis
-                    && existing.encryption == command.request.encryption =>
-            {
-                Ok(())
-            }
+        match self.get_stream_upload(&command.session.session_id) {
+            Ok(existing) if existing == command.session => Ok(()),
             Ok(_) => Err(MetadataError::Db {
                 context: "create stream upload command existing session mismatch",
                 source: rusqlite::Error::InvalidQuery,
             }),
             Err(MetadataError::StreamSessionNotFound { .. }) => {
-                self.create_stream_upload_explicit(&command.request, command.created_at_millis)
+                self.create_stream_upload_explicit(&command.session)
             }
             Err(error) => Err(error),
         }
@@ -3824,25 +3794,41 @@ impl PgStore {
         &self,
         command: &CreateStreamUploadCommand,
     ) -> Result<(), MetadataError> {
-        match &command.request.target {
-            StreamUploadTarget::PutObject => Ok(()),
+        match &command.session.target {
+            StreamUploadTarget::PutObject => {
+                if command.session.state == StreamUploadState::InProgress {
+                    Ok(())
+                } else {
+                    Err(MetadataError::Db {
+                        context: "create stream upload command state mismatch",
+                        source: rusqlite::Error::InvalidQuery,
+                    })
+                }
+            }
             StreamUploadTarget::UploadPart { upload_id, .. } => {
                 let upload = self.get_multipart_upload(upload_id)?;
-                if upload.bucket != command.request.bucket
-                    || upload.key != command.request.key
+                if upload.bucket != command.session.bucket
+                    || upload.key != command.session.key
                     || upload.state != UploadState::InProgress
                 {
                     return Err(MetadataError::NoSuchUpload {
                         upload_id: upload_id.to_string(),
                     });
                 }
-                if upload.encryption != command.request.encryption {
+                if upload.encryption != command.session.encryption {
                     return Err(MetadataError::Db {
                         context: "create stream upload command upload encryption mismatch",
                         source: rusqlite::Error::InvalidQuery,
                     });
                 }
-                Ok(())
+                if command.session.state == StreamUploadState::InProgress {
+                    Ok(())
+                } else {
+                    Err(MetadataError::Db {
+                        context: "create stream upload command state mismatch",
+                        source: rusqlite::Error::InvalidQuery,
+                    })
+                }
             }
         }
     }
@@ -4229,39 +4215,39 @@ impl PgStore {
         &self,
         command: &CreateMultipartUploadCommand,
     ) -> Result<(), MetadataError> {
-        self.create_multipart_upload_explicit(
-            &command.request,
-            command.object_generation_id,
-            command.initiated_at_millis,
-        )
+        if command.upload.state != UploadState::InProgress {
+            return Err(MetadataError::Db {
+                context: "create multipart upload command state mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        self.create_multipart_upload_explicit(&command.upload)
     }
 
     fn create_multipart_upload_explicit(
         &self,
-        req: &CreateMultipartUploadReq,
-        object_generation_id: GenerationId,
-        initiated_at_millis: u64,
+        upload: &MultipartUploadRecord,
     ) -> Result<(), MetadataError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::create_multipart_upload_explicit",
             "pg_id={} upload_id={:?} bucket={:?} key={:?}",
             self.pg_id,
-            req.upload_id.as_str(),
-            req.bucket.as_str(),
-            req.key.as_str()
+            upload.upload_id.as_str(),
+            upload.bucket.as_str(),
+            upload.key.as_str()
         );
-        let algo = req.checksum.map(|c| c.algorithm() as u8);
-        let ctype = req.checksum.map(|c| c.checksum_type() as u8);
-        let tags = req.tags.as_ref().map(SerializedTagSet::as_str);
+        let algo = upload.checksum.map(|c| c.algorithm() as u8);
+        let ctype = upload.checksum.map(|c| c.checksum_type() as u8);
+        let tags = upload.tags.as_ref().map(SerializedTagSet::as_str);
         let (object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) =
-            Self::object_lock_sql_values(req.object_lock).map_err(|e| MetadataError::Db {
+            Self::object_lock_sql_values(upload.object_lock).map_err(|e| MetadataError::Db {
                 context: "create multipart upload (encode object lock)",
                 source: e,
             })?;
-        let encryption_type = req.encryption.encryption_type() as u8;
-        let encryption_state = req.encryption.encode_state();
-        let system_metadata_blob = req.system_metadata_blob.as_slice();
+        let encryption_type = upload.encryption.encryption_type() as u8;
+        let encryption_state = upload.encryption.encode_state();
+        let system_metadata_blob = upload.system_metadata_blob.as_slice();
         self.with_immediate_txn(
             "create multipart upload (begin txn)",
             "create multipart upload (commit txn)",
@@ -4271,11 +4257,11 @@ impl PgStore {
                      (reservation_id, bucket, key, generation_id, created_at) \
                      VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
-                        req.upload_id.as_str(),
-                        req.bucket,
-                        req.key,
-                        object_generation_id.get() as i64,
-                        initiated_at_millis as i64,
+                        upload.upload_id.as_str(),
+                        upload.bucket,
+                        upload.key,
+                        upload.object_generation_id.get() as i64,
+                        upload.initiated_at as i64,
                     ],
                 ) {
                     Ok(_) => {}
@@ -4285,7 +4271,7 @@ impl PgStore {
                             .query_row(
                                 "SELECT generation_id FROM object_generation_reservations \
                                  WHERE reservation_id = ?1 AND bucket = ?2 AND key = ?3",
-                                params![req.upload_id.as_str(), req.bucket, req.key],
+                                params![upload.upload_id.as_str(), upload.bucket, upload.key],
                                 |row| {
                                     let raw: i64 = row.get(0)?;
                                     Self::parse_generation_id(raw, 0, "generation_id")
@@ -4296,7 +4282,7 @@ impl PgStore {
                                 context: "create multipart upload explicit reservation lookup",
                                 source: e,
                             })?;
-                        if !matches!(existing_generation, Some(existing) if existing == object_generation_id)
+                        if !matches!(existing_generation, Some(existing) if existing == upload.object_generation_id)
                         {
                             return Err(MetadataError::Db {
                                 context: "create multipart upload explicit reservation mismatch",
@@ -4315,28 +4301,29 @@ impl PgStore {
                     "INSERT INTO multipart_uploads \
                      (upload_id, bucket, key, initiated_at, state, tags, metadata_blob, system_metadata_blob, owner_principal, owner_canonical_id, \
                       initiator_principal, initiator_canonical_id, checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_generation_id, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
-                     VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
                     params![
-                        req.upload_id,
-                        req.bucket,
-                        req.key,
-                        initiated_at_millis as i64,
+                        upload.upload_id,
+                        upload.bucket,
+                        upload.key,
+                        upload.initiated_at as i64,
+                        upload.state as u8,
                         tags,
-                        req.metadata_blob.as_slice(),
+                        upload.metadata_blob.as_slice(),
                         system_metadata_blob,
-                        req.owner.principal,
-                        req.owner.canonical_id.as_str(),
-                        req.initiator.as_ref().map(|owner| owner.principal.as_str()),
-                        req.initiator
+                        upload.owner.principal,
+                        upload.owner.canonical_id.as_str(),
+                        upload.initiator.as_ref().map(|owner| owner.principal.as_str()),
+                        upload.initiator
                             .as_ref()
                             .map(|owner| owner.canonical_id.as_str()),
                         algo,
                         ctype,
                         encryption_type,
                         encryption_state,
-                        req.acl_grants.serialized(),
-                        i32::from(req.public_read),
-                        object_generation_id.get() as i64,
+                        upload.acl_grants.serialized(),
+                        i32::from(upload.public_read),
+                        upload.object_generation_id.get() as i64,
                         object_lock_retention_mode,
                         object_lock_retain_until,
                         object_lock_legal_hold,
@@ -4344,13 +4331,8 @@ impl PgStore {
                 ) {
                     Ok(_) => {}
                     Err(rusqlite::Error::SqliteFailure(_, _)) => {
-                        let existing = store.get_multipart_upload(&req.upload_id)?;
-                        let command = CreateMultipartUploadCommand {
-                            request: req.clone(),
-                            object_generation_id,
-                            initiated_at_millis,
-                        };
-                        if !multipart_upload_matches_create_command(&existing, &command) {
+                        let existing = store.get_multipart_upload(&upload.upload_id)?;
+                        if existing != *upload {
                             return Err(MetadataError::Db {
                                 context: "create multipart upload explicit existing upload mismatch",
                                 source: rusqlite::Error::InvalidQuery,
@@ -8162,7 +8144,12 @@ impl PgMetadataStore for PgStore {
 
     fn create_multipart_upload(&self, req: &CreateMultipartUploadReq) -> Result<(), MetadataError> {
         let object_generation_id = self.next_generation_id(&req.bucket, &req.key)?;
-        self.create_multipart_upload_explicit(req, object_generation_id, PgStore::now_millis())
+        let command = CreateMultipartUploadCommand::from_request(
+            req.clone(),
+            object_generation_id,
+            PgStore::now_millis(),
+        );
+        self.create_multipart_upload_explicit(&command.upload)
     }
 
     fn get_multipart_upload(
@@ -9641,34 +9628,8 @@ impl PgMetadataStore for PgStore {
             req.bucket.as_str(),
             req.key.as_str()
         );
-        let now = PgStore::now_millis();
-        let op_kind = req.target.op_kind() as u8;
-        let upload_id = req.target.upload_id();
-        let part_number = req.target.part_number().map(|n| n as i64);
-        let encryption_type = req.encryption.encryption_type() as u8;
-        let encryption_state = req.encryption.encode_state();
-        self.conn
-            .execute(
-                "INSERT INTO stream_uploads \
-                 (session_id, bucket, key, op_kind, upload_id, part_number, state, created_at, encryption_type, encryption_state) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9)",
-                params![
-                    req.session_id,
-                    req.bucket,
-                    req.key,
-                    op_kind,
-                    upload_id,
-                    part_number,
-                    now as i64,
-                    encryption_type,
-                    encryption_state,
-                ],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "create stream upload",
-                source: e,
-            })?;
-        Ok(())
+        let command = CreateStreamUploadCommand::from_request(req.clone(), PgStore::now_millis());
+        self.create_stream_upload_explicit(&command.session)
     }
 
     fn get_stream_upload(
@@ -9678,7 +9639,7 @@ impl PgMetadataStore for PgStore {
         self.conn
             .query_row(
                 "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
-                 created_at, encryption_type, encryption_state FROM stream_uploads WHERE session_id = ?1",
+                 created_at, next_segment_vid, encryption_type, encryption_state FROM stream_uploads WHERE session_id = ?1",
                 params![session_id.as_str()],
                 |row| {
                     let op_kind_raw: u8 = row.get(3)?;
@@ -9703,11 +9664,16 @@ impl PgMetadataStore for PgStore {
                             )
                         })?,
                         created_at: row.get::<_, i64>(7)? as u64,
-                        encryption: Self::parse_object_encryption(
-                            row.get::<_, u8>(8)?,
-                            row.get::<_, Option<Vec<u8>>>(9)?,
+                        next_segment_vid: Self::parse_generation_id(
+                            row.get::<_, i64>(8)?,
                             8,
+                            "next_segment_vid",
+                        )?,
+                        encryption: Self::parse_object_encryption(
+                            row.get::<_, u8>(9)?,
+                            row.get::<_, Option<Vec<u8>>>(10)?,
                             9,
+                            10,
                         )?,
                     })
                 },
@@ -9786,7 +9752,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare(
                 "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
-                 created_at, encryption_type, encryption_state FROM stream_uploads",
+                 created_at, next_segment_vid, encryption_type, encryption_state FROM stream_uploads",
             )
             .map_err(|e| MetadataError::Db {
                 context: "list all stream uploads (prepare)",
@@ -9811,11 +9777,16 @@ impl PgMetadataStore for PgStore {
                         )
                     })?,
                     created_at: row.get::<_, i64>(7)? as u64,
-                    encryption: Self::parse_object_encryption(
-                        row.get::<_, u8>(8)?,
-                        row.get::<_, Option<Vec<u8>>>(9)?,
+                    next_segment_vid: Self::parse_generation_id(
+                        row.get::<_, i64>(8)?,
                         8,
+                        "next_segment_vid",
+                    )?,
+                    encryption: Self::parse_object_encryption(
+                        row.get::<_, u8>(9)?,
+                        row.get::<_, Option<Vec<u8>>>(10)?,
                         9,
+                        10,
                     )?,
                 })
             })
@@ -10430,47 +10401,7 @@ impl PgMetadataStore for PgStore {
         let result: Result<Vec<MultipartPartSegmentRecord>, MetadataError> = (|| {
             // 1. Verify session exists, is InProgress, is UploadPart kind, and matches
             //    the target bucket/key/upload_id/part_number. Then transition to Completing.
-            let sess_row =
-                self.conn
-                    .query_row(
-                        "SELECT session_id, state, op_kind, bucket, key, upload_id, part_number \
-                     FROM stream_uploads WHERE session_id = ?1",
-                        params![session_id.as_str()],
-                        |row| {
-                            let op_kind_raw: u8 = row.get(2)?;
-                            let upload_id: Option<UploadId> = row.get(5)?;
-                            let part_number: Option<i64> = row.get(6)?;
-                            Ok(StreamUploadRecord {
-                                session_id: row.get(0)?,
-                                state: StreamUploadState::from_u8(row.get::<_, u8>(1)?)
-                                    .ok_or_else(|| {
-                                        rusqlite::Error::FromSqlConversionFailure(
-                                            1,
-                                            rusqlite::types::Type::Integer,
-                                            Box::from("invalid stream state"),
-                                        )
-                                    })?,
-                                target: PgStore::parse_stream_target(
-                                    op_kind_raw,
-                                    upload_id,
-                                    part_number,
-                                    1,
-                                )?,
-                                bucket: row.get(3)?,
-                                key: row.get(4)?,
-                                created_at: 0,
-                                encryption: ObjectEncryption::None,
-                            })
-                        },
-                    )
-                    .optional()
-                    .map_err(|e| MetadataError::Db {
-                        context: "commit stream part (lookup session)",
-                        source: e,
-                    })?
-                    .ok_or_else(|| MetadataError::StreamSessionNotFound {
-                        session_id: session_id.as_str().to_owned(),
-                    })?;
+            let sess_row = self.get_stream_upload(session_id)?;
 
             if sess_row.state != StreamUploadState::InProgress {
                 return Err(MetadataError::StreamSessionNotInProgress {

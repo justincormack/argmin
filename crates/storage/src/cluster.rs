@@ -11,9 +11,9 @@ pub use local::{LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRo
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 use crate::metadata_command::{
     AbortStreamUploadCommand, AppendStreamSegmentCommand, CommitDirectPutObjectCommand,
-    CreateStreamUploadCommand, DeleteObjectVersionTarget, MetadataCommandEnvelope,
-    MetadataCommandId, MetadataCommandPayload, ObjectPayloadReclaimCommand,
-    ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
+    CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteObjectVersionTarget,
+    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
+    ObjectPayloadReclaimCommand, ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
 };
 use crate::node::SharedStorageNode;
 use crate::traits::{PgMetadataStore, ShardStore};
@@ -21,11 +21,12 @@ use crate::types::{
     BucketName, ClusterEpoch, CommitDirectPutObjectReq, CreateStreamUploadReq, DataPgId,
     DirectPutCommitSnapshot, DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome,
     GenerationId, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
-    MultipartReclaimRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectPartRecord,
-    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, PgId,
-    PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SegmentStoredBytesRequest, SessionId,
-    ShardIndex, ShardKey, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
-    StreamUploadTarget, VersionId, WriteAck, WrittenShardAck,
+    MultipartReclaimRecord, MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout,
+    ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
+    ObjectSegmentsReclaimSegmentRecord, PgId, PrepareStreamUploadSegmentAppendReq,
+    PutLiveObjectReq, SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey,
+    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
+    VersionId, WriteAck, WrittenShardAck,
 };
 use crate::{BucketSnapshotLoadError, MetadataError, ObjectEtag, ObjectPgActionError};
 
@@ -132,35 +133,77 @@ fn object_pg_action_error_to_bucket_snapshot_error(
     }
 }
 
-fn stream_upload_matches_create(
-    existing: &StreamUploadRecord,
+fn stream_create_request_matches_session(
+    session: &StreamUploadRecord,
     create: &CreateStreamUploadReq,
 ) -> bool {
-    existing.bucket == create.bucket
-        && existing.key == create.key
-        && existing.target == create.target
-        && existing.state == StreamUploadState::InProgress
-        && existing.encryption == create.encryption
+    session.session_id == create.session_id
+        && session.bucket == create.bucket
+        && session.key == create.key
+        && session.target == create.target
+        && session.state == StreamUploadState::InProgress
+        && session.encryption == create.encryption
 }
 
-fn multipart_upload_matches_create(
-    existing: &crate::MultipartUploadRecord,
+fn stream_upload_matches_command(
+    existing: &StreamUploadRecord,
+    create: &CreateStreamUploadCommand,
+) -> bool {
+    *existing == create.session
+}
+
+fn applied_stream_create_command<'a>(
+    applied_commands: &'a [MetadataCommandEnvelope],
+    create: &CreateStreamUploadReq,
+) -> Option<&'a CreateStreamUploadCommand> {
+    applied_commands.iter().rev().find_map(|command| {
+        let MetadataCommandPayload::CreateStreamUpload(create_command) = command.payload() else {
+            return None;
+        };
+        stream_create_request_matches_session(&create_command.session, create)
+            .then_some(create_command.as_ref())
+    })
+}
+
+fn multipart_create_request_matches_upload(
+    upload: &MultipartUploadRecord,
     create: &crate::CreateMultipartUploadReq,
 ) -> bool {
-    existing.upload_id == create.upload_id
-        && existing.bucket == create.bucket
-        && existing.key == create.key
-        && existing.state == crate::UploadState::InProgress
-        && existing.tags == create.tags
-        && existing.metadata_blob == create.metadata_blob
-        && existing.system_metadata_blob == create.system_metadata_blob
-        && existing.initiator == create.initiator
-        && existing.owner == create.owner
-        && existing.acl_grants == create.acl_grants
-        && existing.public_read == create.public_read
-        && existing.object_lock == create.object_lock
-        && existing.checksum == create.checksum
-        && existing.encryption == create.encryption
+    upload.upload_id == create.upload_id
+        && upload.bucket == create.bucket
+        && upload.key == create.key
+        && upload.state == crate::UploadState::InProgress
+        && upload.tags == create.tags
+        && upload.metadata_blob == create.metadata_blob
+        && upload.system_metadata_blob == create.system_metadata_blob
+        && upload.initiator == create.initiator
+        && upload.owner == create.owner
+        && upload.acl_grants == create.acl_grants
+        && upload.public_read == create.public_read
+        && upload.object_lock == create.object_lock
+        && upload.checksum == create.checksum
+        && upload.encryption == create.encryption
+}
+
+fn multipart_upload_matches_command(
+    existing: &MultipartUploadRecord,
+    create: &CreateMultipartUploadCommand,
+) -> bool {
+    *existing == create.upload
+}
+
+fn applied_multipart_create_command<'a>(
+    applied_commands: &'a [MetadataCommandEnvelope],
+    create: &crate::CreateMultipartUploadReq,
+) -> Option<&'a CreateMultipartUploadCommand> {
+    applied_commands.iter().rev().find_map(|command| {
+        let MetadataCommandPayload::CreateMultipartUpload(create_command) = command.payload()
+        else {
+            return None;
+        };
+        multipart_create_request_matches_upload(&create_command.upload, create)
+            .then_some(create_command.as_ref())
+    })
 }
 
 fn pending_command_completes_stream_session(
@@ -1048,13 +1091,13 @@ impl StorageCluster {
                 );
             }
             MetadataCommandPayload::CreateStreamUpload(create)
-                if create.request.target == StreamUploadTarget::PutObject =>
+                if create.session.target == StreamUploadTarget::PutObject =>
             {
                 self.release_object_generation_reservation_command_required(
                     command.id().pg_id(),
-                    &create.request.bucket,
-                    &create.request.key,
-                    &create.request.session_id,
+                    &create.session.bucket,
+                    &create.session.key,
+                    &create.session.session_id,
                 )?;
             }
             _ => {}
@@ -1110,14 +1153,28 @@ impl StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<(), ObjectPgActionError> {
+        self.drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)
+            .map(|_| ())
+    }
+
+    fn drain_pending_object_metadata_commands_for_bucket_collect(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Vec<MetadataCommandEnvelope>, ObjectPgActionError> {
+        let mut applied = Vec::new();
         while let Some(command) = self
             .local_map
             .runtime_state()
             .pending_metadata_command_for_bucket(pg_id, bucket)
         {
-            self.finish_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            let outcome =
+                self.finish_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            if outcome == PendingMetadataCommandOutcome::Applied {
+                applied.push(command);
+            }
         }
-        Ok(())
+        Ok(applied)
     }
 
     fn pending_command_completes_stream_session(
@@ -1149,11 +1206,17 @@ impl StorageCluster {
         &self,
         pg_id: PgId,
         create: &CreateStreamUploadReq,
+        expected_command: Option<&CreateStreamUploadCommand>,
     ) -> Result<bool, ObjectPgActionError> {
         let object_node = self.object_metadata_primary_node(&create.bucket, &create.key)?;
         let object_pg = object_node.get_pg(pg_id.get())?;
         match object_pg.get_stream_upload(&create.session_id) {
-            Ok(existing) if stream_upload_matches_create(&existing, create) => Ok(true),
+            Ok(existing)
+                if expected_command
+                    .is_some_and(|command| stream_upload_matches_command(&existing, command)) =>
+            {
+                Ok(true)
+            }
             Ok(_) => Err(MetadataError::Db {
                 context: "create stream upload existing session mismatch",
                 source: rusqlite::Error::InvalidQuery,
@@ -1168,11 +1231,16 @@ impl StorageCluster {
         &self,
         pg_id: PgId,
         create: &crate::CreateMultipartUploadReq,
+        expected_command: Option<&CreateMultipartUploadCommand>,
     ) -> Result<Option<u64>, ObjectPgActionError> {
         let object_node = self.object_metadata_primary_node(&create.bucket, &create.key)?;
         let object_pg = object_node.get_pg(pg_id.get())?;
         match object_pg.get_multipart_upload(&create.upload_id) {
-            Ok(existing) if multipart_upload_matches_create(&existing, create) => {
+            Ok(existing)
+                if expected_command.is_some_and(|command| {
+                    multipart_upload_matches_command(&existing, command)
+                }) =>
+            {
                 Ok(Some(existing.initiated_at))
             }
             Ok(_) => Err(MetadataError::Db {
@@ -2015,17 +2083,21 @@ impl StorageCluster {
             encryption,
         };
         loop {
-            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
-            if self.matching_stream_upload_exists(pg_id, &request)? {
+            let applied_commands =
+                self.drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)?;
+            let expected_command = applied_stream_create_command(&applied_commands, &request);
+            if self.matching_stream_upload_exists(pg_id, &request, expected_command)? {
                 return Ok(());
             }
             self.reserve_put_object_generation(bucket, key, session_id)?;
             let command = MetadataCommandEnvelope::new(
                 self.next_object_metadata_command_id(pg_id),
-                MetadataCommandPayload::CreateStreamUpload(Box::new(CreateStreamUploadCommand {
-                    request: request.clone(),
-                    created_at_millis: crate::clock::current_time_millis(),
-                })),
+                MetadataCommandPayload::CreateStreamUpload(Box::new(
+                    CreateStreamUploadCommand::from_request(
+                        request.clone(),
+                        crate::clock::current_time_millis(),
+                    ),
+                )),
             );
             if self
                 .set_pending_metadata_command_for_bucket(
