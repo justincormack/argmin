@@ -1,0 +1,301 @@
+Partial version reservations can make versioned keys unwritable
+Link: https://chatgpt.com/codex/cloud/security/findings/de37aa8096d08191bc2495b79b1a2a9d?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: a22ce27
+Author: justin@specialbusservice.com
+Created: 07/05/2026, 16:12:27
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Fixed in `6443410` (`Recover partial object version reservations`).
+
+The fix keeps `ReserveObjectVersion` command-owned but makes recovery from a
+lost in-memory pending reservation monotonic. New reservations now choose the
+maximum next-version candidate across the object-PG acting set instead of only
+the current primary. Replica apply still rejects a command below the replica's
+local counter, but lower replicas are allowed to advance forward under the
+command. This may leave gaps in opaque version IDs after partial apply plus
+restart, but it prevents divergent counters from making a versioning-enabled key
+persistently unwritable.
+
+Regression coverage added:
+
+- `reserve_object_version_partial_apply_after_reopen_uses_max_counter`
+  reproduces partial `ReserveObjectVersion` apply, drops the in-memory pending
+  command through local-cluster reopen, then proves later reservations converge
+  all acting replicas and continue to advance.
+- `reserve_object_version_command_advances_lower_counter_forward` proves a
+  replica with a lower local counter accepts and advances to a higher
+  command-owned reservation.
+
+Verification before the fix commit:
+
+- `cargo nextest run -p storage reserve_object_version -- --nocapture`
+- `cargo check -p storage -p server-core`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo nextest run --status-level fail` (`4503 passed`)
+
+# Summary
+Introduced: routing object version allocation through a separate metadata command adds a new failure mode where a partially applied ReserveObjectVersion command is unrecoverable after coordinator restart because only command indexes, not pending commands, are reconstructed. The strict per-replica equality check then turns the inconsistent counters into persistent write failures for versioned operations on the affected object key.
+Version allocation is now split into a separate metadata command. The coordinator records the command only in the process-local pending_metadata_commands map, applies it to replicas, and removes it on success. If a process crash or restart happens after the ReserveObjectVersion command has been applied to some, but not all, acting-set nodes, that pending command is not recovered. On restart the command index is seeded from the maximum durable log index, but the lost command is not replayed or drained. A subsequent reservation computes the next version_id from the current primary only. Replicas that did apply the lost reservation will have a higher next_version_id, while replicas that did not will have a lower one. The new reserve_object_version_explicit implementation requires exact equality with each replica's local next_version_id and rejects mismatches as stale, so the new reservation fails. Repeated retries can continue to pick a version_id that at least one replica rejects, leaving versioning-enabled writes and delete-marker insertions for that key unavailable until manual metadata repair.
+
+# Validation
+## Rubric
+- [x] Confirm version allocation is split into a standalone `ReserveObjectVersion` command stored only in process-local pending state before apply.
+- [x] Confirm metadata command application can durably affect only a subset of acting-set replicas before returning an error.
+- [x] Confirm restart/open reconstructs command indexes but not pending metadata commands.
+- [x] Reproduce divergent object version counters after partial apply plus reopen.
+- [x] Demonstrate subsequent reservations repeatedly fail with `reserve object version command stale version` rather than repairing divergence.
+## Report
+Validated the finding with a focused Rust unit-test PoC plus LLDB trace. I added a targeted test in `crates/storage/src/cluster/local.rs` that: (1) creates a 3-node local cluster with primary node 1, (2) injects a `ReserveObjectVersion` apply failure on the primary after non-primary replicas have already applied, (3) confirms the same-process in-memory pending command exists and counters diverge, (4) drops and reopens the cluster to simulate restart, (5) confirms `pending_metadata_commands` is gone while durable counters remain split, and (6) retries reservation twice and gets persistent stale-version errors.
+
+Relevant code evidence: `crates/storage/src/cluster.rs:1022-1059` stores a new `ReserveObjectVersion` only in process-local pending state and then applies it; `crates/storage/src/cluster/request_ops.rs:679-711` applies metadata commands sequentially to acting-set nodes, allowing partial durable apply before a later failure; `crates/storage/src/cluster/local.rs:248-263` initializes `pending_metadata_commands` to an empty `HashMap` on runtime construction; `crates/storage/src/cluster/local.rs:1236-1262` seeds only max command indexes on open; `crates/storage/src/pg_store.rs:5881-5884` rejects explicit reservation when local `expected != version_id` with `reserve object version command stale version`.
+
+Focused command: `cargo test -p storage reserve_object_version_partial_apply_lost_after_reopen_causes_stale_retry -- --nocapture`. Output showed: `initial partial apply error: Store(Io { context: "injected lost reserve object version apply failure", ... })`, then after reopen: `post-reopen attempt 1 error: Metadata(Db { context: "reserve object version command stale version", source: InvalidQuery })` and `post-reopen attempt 2 error: Metadata(Db { context: "reserve object version command stale version", source: InvalidQuery })`, with the test passing. This confirms the post-restart state is unrepaired and repeated retries fail.
+
+Debugger validation: `gdb` was not installed, so I used LLDB. Breakpoint at `crates/storage/src/pg_store.rs:5883` hit exactly at the stale-version return. Backtrace showed the chain `PgStore::reserve_object_version_explicit` -> `apply_reserve_object_version_command` -> `apply_metadata_command_and_record` -> `StorageCluster::apply_metadata_command_to_acting_set_from_origin` -> `apply_new_object_metadata_command_for_bucket` -> `StorageCluster::reserve_next_object_version` -> the PoC test. This demonstrates the new reservation after restart reaches a replica with a mismatched local counter and is rejected.
+
+Crash/Valgrind attempts: a direct process crash is not expected because this is a persistent logic/availability bug, not memory corruption; the focused test reproduced the logical failure instead of crashing. `valgrind --version` returned exit 127 (`command not found`).
+
+# Evidence
+crates/storage/src/cluster.rs (L1022 to 1059)
+  Note: reserve_next_object_version creates a standalone ReserveObjectVersion command, stores it only as a pending command, applies it, and returns the reserved version. If the process dies after partial apply, this pending command is lost.
+```
+            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                if let MetadataCommandPayload::ReserveObjectVersion(reservation) = command.payload()
+                {
+                    let reserved_version_id = reservation.version_id;
+                    let matches_request = reservation.matches_request(bucket, key);
+                    match self.finish_pending_object_metadata_command_for_bucket(
+                        pg_id, bucket, &command,
+                    )? {
+                        PendingMetadataCommandOutcome::Applied if matches_request => {
+                            return Ok(reserved_version_id);
+                        }
+                        PendingMetadataCommandOutcome::Applied
+                        | PendingMetadataCommandOutcome::Abandoned => continue,
+                    }
+                }
+                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                continue;
+            }
+
+            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let version_id = PgMetadataStore::next_version_id(&*object_pg, bucket, key)?;
+            drop(object_pg);
+            let command = MetadataCommandEnvelope::new(
+                self.next_object_metadata_command_id(pg_id),
+                MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+                    bucket.clone(),
+                    key.clone(),
+                    version_id,
+                )),
+            );
+            if runtime_state
+                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
+                .is_err()
+            {
+                continue;
+            }
+            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+```
+
+crates/storage/src/cluster/local.rs (L1236 to 1262)
+  Note: Startup seeds only the maximum metadata command log index from durable replicas; it does not replay or restore the lost pending ReserveObjectVersion command.
+```
+fn seed_metadata_command_indexes(
+    nodes: &BTreeMap<NodeId, LocalNodeStore>,
+    pg_ids: &[PgId],
+    cluster_epoch: ClusterEpoch,
+) -> Result<HashMap<PgId, u64>, ClusterBuildError> {
+    let mut indexes = HashMap::new();
+    for &pg_id in pg_ids {
+        let mut max_index = 0_u64;
+        for node in nodes.values() {
+            let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
+                ClusterBuildError::OpenLocalNode {
+                    node_id: node.node_id().as_u32(),
+                    source,
+                }
+            })?;
+            max_index = max_index.max(pg.max_metadata_command_log_index(cluster_epoch).map_err(
+                |source| ClusterBuildError::OpenLocalNode {
+                    node_id: node.node_id().as_u32(),
+                    source,
+                },
+            )?);
+        }
+        if max_index != 0 {
+            indexes.insert(pg_id, max_index);
+        }
+    }
+    Ok(indexes)
+```
+
+crates/storage/src/cluster/local.rs (L248 to 263)
+  Note: LocalClusterRuntimeState reconstructs command indexes but initializes pending_metadata_commands as an empty in-memory HashMap, so partially applied pending commands are not recovered after restart.
+```
+    fn with_metadata_command_indexes(metadata_command_indexes: HashMap<PgId, u64>) -> Self {
+        Self {
+            object_payload_leases: Mutex::new(LocalObjectPayloadLeaseState::default()),
+            reclaim_queue: (
+                Mutex::new(LocalReclaimQueueState {
+                    object_queue: VecDeque::new(),
+                    queued_objects: HashSet::new(),
+                    bucket_delete_queue: VecDeque::new(),
+                    queued_bucket_deletes: HashSet::new(),
+                }),
+                Condvar::new(),
+            ),
+            metadata_command_indexes: Mutex::new(metadata_command_indexes),
+            metadata_command_apply_lock: Mutex::new(()),
+            pending_metadata_commands: Mutex::new(HashMap::new()),
+            stream_segment_vids: Mutex::new(HashMap::new()),
+```
+
+crates/storage/src/cluster/request_ops.rs (L663 to 715)
+  Note: Metadata commands are applied sequentially across acting-set nodes and can fail after only some replicas have applied and recorded the command, creating the partial-apply state.
+```
+    ) -> Result<(), MetadataCommandApplyFailure> {
+        let runtime_state = self.local_map.runtime_state();
+        let _apply_guard = runtime_state.lock_metadata_command_apply();
+        let pg_id = command.id().pg_id();
+        let mut nodes = self
+            .local_map
+            .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id)
+            .map_err(|source| MetadataCommandApplyFailure {
+                applied_nodes: 0,
+                source: source.into(),
+            })?;
+        let primary_node_id = self
+            .local_map
+            .pg_route(pg_id)
+            .expect("validated metadata PG command route must exist")
+            .primary_node_id();
+        nodes.sort_by_key(|node| node.node_id() == primary_node_id);
+        for (applied_nodes, node) in nodes.into_iter().enumerate() {
+            let acceptance = self
+                .local_map
+                .validate_metadata_command_for_replica(
+                    origin_node_id,
+                    node.node_id(),
+                    pg_id,
+                    command,
+                )
+                .map_err(|source| MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                })?;
+            if acceptance == MetadataCommandAcceptance::AlreadyApplied {
+                continue;
+            }
+            maybe_run_before_metadata_command_apply_hook(
+                self.metadata_command_apply_test_hook_scope_id(),
+                node.node_id(),
+                command,
+            )
+            .map_err(|source| MetadataCommandApplyFailure {
+                applied_nodes,
+                source: source.into(),
+            })?;
+            let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
+                MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                }
+            })?;
+            pg.apply_metadata_command_and_record(node.node_id().as_u32(), command)
+                .map_err(|source| MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source,
+                })?;
+```
+
+crates/storage/src/pg_store.rs (L5874 to 5889)
+  Note: The new ReserveObjectVersion apply path rejects any replica whose local next_version_id differs from the command's version_id, so counters diverged by a lost partial reservation cause subsequent reservations to fail.
+```
+    ) -> Result<(), MetadataError> {
+        if version_id.is_null() {
+            return Err(MetadataError::Db {
+                context: "reserve object version command null version",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        let expected = self.next_version_id(bucket, key)?;
+        if expected != version_id {
+            return Err(MetadataError::Db {
+                context: "reserve object version command stale version",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        self.advance_object_version_counter_in_open_txn(bucket, key, version_id)
+    }
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Kept at medium. Repository evidence confirms this is not a false positive: production S3 PutObject/DeleteObject/multipart paths call reserve_next_object_version for enabled-versioning buckets; that function stores ReserveObjectVersion only in an in-memory pending map; metadata command apply is sequential and can be partially durable; restart reconstructs only indexes and an empty pending map; and pg_store rejects later reservations when replica counters disagree. The issue is in-scope because it affects the argmin-s3 runtime storage path and the threat model includes versioning metadata and availability. It is not high/critical because it requires write/delete capability plus a crash/I/O-failure timing window, and the impact is persistent availability loss for affected key operations rather than auth bypass, data exfiltration, RCE, or broad cross-tenant compromise.
+## Likelihood
+low - The normal API path is reachable to permitted S3 writers, but exploitation requires a versioning-enabled bucket and a narrow operational-fault window where ReserveObjectVersion is durably applied to only part of the acting set before process restart. The remote client controls the write/delete operation but not necessarily the crash or I/O failure, so exploitation is high complexity.
+## Impact
+medium - A successful trigger can persistently prevent versioned writes and delete-marker insertion for the affected object key until metadata repair. It does not expose secrets, bypass authentication, execute code, or directly corrupt arbitrary objects, and the demonstrated impact is availability rather than confidentiality or broad integrity compromise.
+## Assumptions
+- The production service is the argmin-s3 binary described by README and guides/threat_model.md.
+- An attacker is a client who can reach the S3-compatible HTTP endpoint and has write/delete capability for a versioning-enabled bucket, either through SigV4 credentials, bucket policy, or public-write ACL configuration.
+- The attacker cannot directly call internal storage APIs; the partial-apply window requires an operational fault such as process crash/restart, node/storage I/O error, or similar failure during metadata command application.
+- No deployment manifests or load balancer configuration were present in the repository checkout, so public exposure is inferred only from application defaults and configurable listen address.
+- argmin-s3 runtime is serving the S3 HTTP API
+- target bucket has versioning enabled
+- attacker can issue PutObject, CopyObject, multipart completion, or DeleteObject that allocates an object version for the target key
+- ReserveObjectVersion applies to only some acting-set nodes
+- process crashes or restarts before the in-memory pending metadata command is recovered or drained
+- later version allocation for the same key encounters divergent replica next_version_id counters
+## Path
+Client -> HTTP S3 API -> Coordinator/storage versioned write
+       -> ReserveObjectVersion pending in RAM
+       -> partial replica apply + crash/restart
+       -> pending map empty, counters split
+       -> stale-version rejection -> key-level write/delete-marker DoS
+## Path evidence
+- `README.md:1-5` - Identifies argmin as an S3-compatible object storage server with per-PG SQLite metadata and SigV4 authentication.
+- `guides/threat_model.md:8-21` - Defines argmin-s3 HTTP S3 APIs, storage metadata, versioning state, and local/internal deployments as in-scope runtime surface.
+- `crates/argmin-s3/src/config.rs:31-70` - Environment-driven service mapping: required credentials/secrets, default listen address 127.0.0.1:9000, optional TLS, and data directory.
+- `crates/argmin-s3/src/main.rs:130-144` - The service creates a CredentialStore entry from environment credentials and grants it OwnerAccountAdmin authorization.
+- `crates/argmin-s3/src/main.rs:152-212` - The production binary binds the configured TCP listener and starts the HTTP/TLS server with connection and in-flight request limits.
+- `crates/server-http/src/http/mod.rs:3048-3076` - HTTP requests are authenticated with SigV4 credentials, with missing auth mapped to anonymous for ACL/policy-controlled paths.
+- `crates/server-http/src/http/mod.rs:1522-1568` - Normal PutObject requests are parsed at the HTTP boundary and dispatched to coordinator.put_object, reaching storage through normal product use.
+- `crates/server-http/src/http/mod.rs:1757-1780` - DeleteObject requests are exposed through the same HTTP frontend and dispatched to coordinator.delete_object.
+- `crates/server-http/src/http/mod.rs:1995-2005` - PutBucketVersioning is a normal HTTP S3 API operation, establishing the versioning-enabled precondition.
+- `crates/storage/src/cluster.rs:1641-1648` - Direct PutObject commits reserve a new object version when bucket versioning is Enabled.
+- `crates/storage/src/cluster/request_ops.rs:3538-3542` - Enabled-versioning DeleteObject inserts a delete marker by calling reserve_next_object_version.
+- `crates/storage/src/cluster/request_ops.rs:4409-4414` - Multipart completion for enabled-versioning objects also calls reserve_next_object_version.
+- `crates/storage/src/cluster.rs:1022-1059` - reserve_next_object_version creates a ReserveObjectVersion command, stores it in process-local pending state, applies it, and returns the reserved version.
+- `crates/storage/src/cluster/request_ops.rs:663-715` - Metadata commands are applied sequentially across acting-set nodes and can fail after some nodes have already recorded the command.
+- `crates/storage/src/cluster/local.rs:248-263` - LocalClusterRuntimeState reconstructs runtime state with pending_metadata_commands initialized as an empty in-memory HashMap.
+- `crates/storage/src/cluster/local.rs:671-683` - Cluster open seeds metadata command indexes and constructs runtime state, but does not restore pending command payloads.
+- `crates/storage/src/cluster/local.rs:1236-1262` - Startup seed_metadata_command_indexes scans only maximum durable log indexes, not lost pending ReserveObjectVersion command payloads.
+- `crates/storage/src/pg_store.rs:5881-5888` - reserve_object_version_explicit rejects a reservation when the replica's expected next_version_id differs from the command version_id, causing stale-version failures after counters diverge.
+## Narrative
+The finding is real and in scope: production HTTP S3 operations can reach version allocation for enabled-versioning buckets, and the storage layer records a ReserveObjectVersion command only in process-local pending state before applying it to replicas. The apply loop can persist the command to some nodes before failing. On reopen, local runtime state initializes pending_metadata_commands to an empty HashMap and startup seeds only max command indexes, so the partially applied command is not replayed. Later reservations use the primary's next_version_id and PgStore rejects replicas whose local expected version differs, producing persistent stale-version failures. Severity remains medium, not high or critical, because impact is availability-only and appears limited to the affected key/bucket operations, while exploitation requires write/delete authorization plus a high-complexity crash/I/O-failure timing window that the remote client does not fully control.
+## Controls
+- SigV4 authentication for signed requests
+- Anonymous access only for ACL/policy-permitted public paths
+- server-core bucket/object authorization
+- OwnerAccountAdmin credential loaded from environment
+- Default listener is 127.0.0.1:9000
+- Optional direct TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- max_connections and max_inflight_requests admission control
+- Per-PG and metadata command apply locking
+## Blindspots
+- No Kubernetes, Terraform, Docker, or load balancer manifests were present, so actual internet exposure cannot be established from repository artifacts.
+- This static pass did not rerun the validation PoC; it relies on the provided validation evidence plus repository code review.
+- The repository shows normal API reachability, but does not prove a remote client alone can force the required partial-apply crash/I/O failure without an external operational fault.
+- The exact blast radius depends on bucket policy/ACL configuration and whether untrusted users have write/delete permissions to versioning-enabled buckets.
+- Local-node behavior was reviewed; future multihost deployment details may change failure probability or exposure.
