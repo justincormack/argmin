@@ -1,0 +1,313 @@
+MPU sequence drain can skip object cleanup hooks
+Link: https://chatgpt.com/codex/cloud/security/findings/81055e54f96081919e5860a059ca711f?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium
+Status: fixed
+
+# Resolution
+Fixed in commit `4a090db` (`Run object cleanup when MPU order drains pending commands`).
+
+The finding was valid. `reserve_completed_multipart_upload_order` could observe
+a pending object metadata command in the same `(pg_id, bucket)` runtime slot
+when the bucket PG and object PG were the same. It then drained that command
+through `finish_pending_metadata_command_to_acting_set`, which applies/removes
+the metadata command but does not run object-command apply/abandon cleanup hooks.
+
+The fix adds an MPU-order-specific pending-command finisher. Bucket commands,
+completed-MPU tombstone commands, and `AdvanceCompletedMultipartUploadSequence`
+still use the generic bucket metadata finisher. Object metadata commands are
+now dispatched through `finish_pending_object_metadata_command_for_bucket`, so
+the existing cleanup hooks run when a same-PG pending object command is
+converged or abandoned by MPU order allocation.
+
+Regression coverage was added with a same-PG `DeleteObjectVersion` pending
+command. The test forces a partial delete apply failure, calls the MPU order
+reservation helper, and asserts that the object command converges, payload
+reclaim is enqueued, reclaim metadata exists on all acting nodes, and the
+completed MPU sequence advances.
+
+The StorageCluster invariant matrix was also updated to list the new
+test-only `test_reserve_completed_multipart_upload_order` helper.
+
+Verification before the fix commit:
+- `cargo test -p storage completed_multipart_order_drains_same_pg_object_command_with_cleanup_hooks -- --nocapture`
+- `cargo nextest run -p storage`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo nextest run`
+- `git diff --check`
+
+# Metadata
+Repo: justincormack/argmin
+Commit: ad5f27b
+Author: justin@specialbusservice.com
+Created: 07/05/2026, 14:15:44
+Assignee: Unassigned
+Signals: Security
+
+# Summary
+Introduced: the new MPU sequence reservation logic drains non-sequence pending commands with the generic bucket metadata finish path instead of dispatching object metadata commands through their cleanup-aware pending-command path.
+The commit adds reserve_completed_multipart_upload_order(), which checks for any pending command keyed by the bucket metadata PG and bucket. It correctly handles AdvanceCompletedMultipartUploadSequence, but for all other pending commands it calls finish_pending_metadata_command_to_acting_set() directly and removes the pending entry. Pending commands are keyed only by (pg_id, bucket), so when an object's metadata PG is the same as the bucket metadata PG, object metadata commands can also appear under this key. Applying those object commands through finish_pending_metadata_command_to_acting_set() bypasses finish_pending_object_metadata_command_for_bucket(), which is the path that calls after_object_metadata_command_applied() and after_object_metadata_command_abandoned(). Those hooks enqueue stale object payload reclaim, delete staged shards, clear stream upload allocators, and run abort cleanup. In normal races the original requester may still run the hook, but orphaned or retried pending object commands after partial failures can be drained by MPU order reservation without cleanup, causing unreclaimed data and potential disk-space denial of service.
+
+# Evidence
+crates/storage/src/cluster.rs (L1011 to 1051)
+  Note: The object metadata pending-command path calls after_object_metadata_command_abandoned() or after_object_metadata_command_applied(), which the new generic drain bypasses.
+```
+    fn apply_pending_object_metadata_command_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), ObjectPgActionError> {
+        match self.finish_pending_object_metadata_command_for_bucket(pg_id, bucket, command)? {
+            PendingMetadataCommandOutcome::Applied => Ok(()),
+            PendingMetadataCommandOutcome::Abandoned => {
+                Err(conflicting_pending_object_metadata_command(
+                    "abandoned pending object metadata command",
+                ))
+            }
+        }
+    }
+
+    fn finish_pending_object_metadata_command_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        if self
+            .metadata_command_has_abandoned_log_on_acting_set(command)
+            .map_err(|error| bucket_snapshot_error_to_object_pg_action_error(error.source))?
+        {
+            self.record_abandoned_metadata_command_to_acting_set(command)
+                .map_err(|error| bucket_snapshot_error_to_object_pg_action_error(error.source))?;
+            self.local_map
+                .runtime_state()
+                .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+            self.after_object_metadata_command_abandoned(command)?;
+            return Ok(PendingMetadataCommandOutcome::Abandoned);
+        }
+        match self.apply_metadata_command_to_acting_set(command) {
+            Ok(()) => {
+                self.local_map
+                    .runtime_state()
+                    .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                self.after_object_metadata_command_applied(command);
+                Ok(PendingMetadataCommandOutcome::Applied)
+```
+
+crates/storage/src/cluster.rs (L1059 to 1107)
+  Note: Abandon cleanup releases reservations and deletes staged payload shards for object commands; this cleanup is skipped if such a command is drained through the new bucket path.
+```
+    fn after_object_metadata_command_abandoned(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), ObjectPgActionError> {
+        match command.payload() {
+            MetadataCommandPayload::CommitDirectPutObject(commit) => {
+                let release_result = self.release_object_generation_reservation_command_required(
+                    command.id().pg_id(),
+                    &commit.object.bucket,
+                    &commit.object.key,
+                    &commit.generation_reservation_id,
+                );
+                for segment in &commit.segments {
+                    self.delete_payload_shard_set_best_effort(
+                        segment.data_pg_id,
+                        EcShape {
+                            k: segment.ec_k,
+                            m: segment.ec_m,
+                        },
+                        &segment.segment_okh,
+                        segment.segment_vid,
+                    );
+                }
+                release_result?;
+            }
+            MetadataCommandPayload::AppendStreamSegment(append) => {
+                self.delete_payload_shard_set_best_effort(
+                    append.segment.data_pg_id,
+                    EcShape {
+                        k: append.segment.ec_k,
+                        m: append.segment.ec_m,
+                    },
+                    &append.segment.segment_okh,
+                    append.segment.segment_vid,
+                );
+            }
+            MetadataCommandPayload::CreateStreamUpload(create)
+                if create.session.target == StreamUploadTarget::PutObject =>
+            {
+                self.release_object_generation_reservation_command_required(
+                    command.id().pg_id(),
+                    &create.session.bucket,
+                    &create.session.key,
+                    &create.session.session_id,
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+```
+
+crates/storage/src/cluster.rs (L1300 to 1376)
+  Note: Post-apply cleanup enqueues stale payload reclaim, clears stream allocators, deletes staged multipart cleanup, and finalizes bucket delete reclaim; these side effects are skipped by the new drain path.
+```
+    fn after_object_metadata_command_applied(&self, command: &MetadataCommandEnvelope) {
+        match command.payload() {
+            MetadataCommandPayload::CommitDirectPutObject(commit) => {
+                if let Some(stale_generation_id) =
+                    object_payload_reclaim_generation(&commit.stale_payload)
+                {
+                    self.enqueue_object_payload_reclaim(
+                        &commit.object.bucket,
+                        &commit.object.key,
+                        stale_generation_id,
+                    );
+                }
+                self.local_map
+                    .runtime_state()
+                    .clear_stream_segment_vid_allocator(&commit.generation_reservation_id);
+            }
+            MetadataCommandPayload::CommitMultipartObject(commit) => {
+                if let Some(stale_generation_id) =
+                    object_payload_reclaim_generation(&commit.stale_payload)
+                {
+                    self.enqueue_object_payload_reclaim(
+                        &commit.object.bucket,
+                        &commit.object.key,
+                        stale_generation_id,
+                    );
+                }
+            }
+            MetadataCommandPayload::DeleteObjectVersion(delete) => {
+                if let Some(reclaim_generation_id) =
+                    delete_object_version_reclaim_generation(&delete.target)
+                {
+                    self.enqueue_object_payload_reclaim(
+                        &delete.bucket,
+                        &delete.key,
+                        reclaim_generation_id,
+                    );
+                }
+            }
+            MetadataCommandPayload::InsertDeleteMarker(marker) => {
+                if let Some(stale_generation_id) =
+                    object_payload_reclaim_generation(&marker.stale_payload)
+                {
+                    self.enqueue_object_payload_reclaim(
+                        &marker.bucket,
+                        &marker.key,
+                        stale_generation_id,
+                    );
+                }
+            }
+            MetadataCommandPayload::AbortStreamUpload(abort) => {
+                self.delete_staged_stream_segment_payload_shards_best_effort(
+                    &abort.staged_segments,
+                );
+                self.local_map
+                    .runtime_state()
+                    .clear_stream_segment_vid_allocator(&abort.session_id);
+            }
+            MetadataCommandPayload::CommitStreamPart(commit) => {
+                self.delete_finalize_upload_part_cleanup_best_effort(
+                    &crate::FinalizeStreamPartCleanup {
+                        upload: commit.upload.clone(),
+                        existing_part: commit.existing_part.clone(),
+                        displaced_segments: commit.displaced_segments.clone(),
+                    },
+                );
+                self.local_map
+                    .runtime_state()
+                    .clear_stream_segment_vid_allocator(&commit.session_id);
+            }
+            MetadataCommandPayload::AbortMultipartUpload(abort) => {
+                self.delete_abort_multipart_cleanup_best_effort(&abort.cleanup);
+            }
+            MetadataCommandPayload::DeleteObjectPayloadReclaim(delete) => {
+                self.enqueue_bucket_delete_finalize(&delete.bucket);
+            }
+            _ => {}
+        }
+```
+
+crates/storage/src/cluster/request_ops.rs (L4932 to 4968)
+  Note: New MPU order reservation drains any non-Advance pending command via finish_pending_metadata_command_to_acting_set(), without distinguishing bucket commands from object metadata commands.
+```
+    fn reserve_completed_multipart_upload_order(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<u64, ObjectPgActionError> {
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        let primary_node = self.bucket_metadata_primary_node(bucket)?;
+        let runtime_state = self.local_map.runtime_state();
+        loop {
+            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                if let MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(advance) =
+                    command.payload()
+                {
+                    let completion_order = advance.completion_order;
+                    match self
+                        .finish_pending_metadata_command_to_acting_set(
+                            pg_id, bucket, &command, false,
+                        )
+                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
+                    {
+                        super::PendingMetadataCommandOutcome::Applied => {
+                            runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                            return Ok(completion_order);
+                        }
+                        super::PendingMetadataCommandOutcome::Abandoned => continue,
+                    }
+                }
+                match self
+                    .finish_pending_metadata_command_to_acting_set(pg_id, bucket, &command, false)
+                    .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
+                {
+                    super::PendingMetadataCommandOutcome::Applied => {
+                        runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                        continue;
+                    }
+                    super::PendingMetadataCommandOutcome::Abandoned => continue,
+                }
+```
+
+crates/storage/src/cluster/request_ops.rs (L809 to 843)
+  Note: The generic finish path only applies or abandons the command; it does not run object metadata post-apply or abandon cleanup hooks.
+```
+    fn finish_pending_metadata_command_to_acting_set(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        clear_pending_on_zero_apply: bool,
+    ) -> Result<super::PendingMetadataCommandOutcome, BucketSnapshotLoadError> {
+        if self
+            .metadata_command_has_abandoned_log_on_acting_set(command)
+            .map_err(|error| error.source)?
+        {
+            self.record_abandoned_metadata_command_to_acting_set(command)
+                .map_err(|error| error.source)?;
+            self.local_map
+                .runtime_state()
+                .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+            return Ok(super::PendingMetadataCommandOutcome::Abandoned);
+        }
+        match self.apply_metadata_command_to_acting_set(command) {
+            Ok(()) => Ok(super::PendingMetadataCommandOutcome::Applied),
+            Err(error) => {
+                let MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source,
+                } = error;
+                if clear_pending_on_zero_apply && applied_nodes == 0 {
+                    self.record_abandoned_metadata_command_to_acting_set(command)
+                        .map_err(|error| error.source)?;
+                    self.local_map
+                        .runtime_state()
+                        .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                }
+                Err(source)
+            }
+        }
+```
