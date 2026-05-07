@@ -1,0 +1,327 @@
+Non-reserving version IDs can race object commits
+Link: https://chatgpt.com/codex/cloud/security/findings/542ccfa2f8b48191bbc8f2c60bc125db?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Resolution
+Fixed in commit `a22ce27` (`Route object version allocation through metadata commands`).
+
+The fix makes object version allocation command-owned. `next_version_id` remains
+a read-only candidate helper inside a PG, but versioned publish paths no longer
+consume that candidate directly. Instead they first publish a
+`ReserveObjectVersion` metadata command on the object PG command stream, then
+use the reserved `VersionId` in the later object publish/delete-marker command.
+
+This closes the reported race because concurrent versioned writers for the same
+bucket/key now serialize through the pending metadata-command stream before a
+version ID is consumed. The retry path also reuses matching pending
+`ReserveObjectVersion` commands after partial replica apply, so transient apply
+failures converge instead of generating a duplicate candidate.
+
+The direct PUT path now performs fallible conditional/action validation before
+reserving an object version, so rejected writes do not advance
+`object_version_counters`. Stream PUT finalization, multipart completion, and
+lifecycle current expiry all reserve their version IDs through the same command
+stream.
+
+Regression coverage added in the fix:
+- partial-apply retry for `ReserveObjectVersion`;
+- direct PUT action failure does not reserve or advance an object version;
+- versioned direct PUT and multipart completion allocate ordered versions via
+  the command stream;
+- versioned stream PUT finalization reserves through the command stream;
+- lifecycle current expiry reserves the delete-marker version through the
+  command stream.
+
+Verification before the fix commit:
+- `cargo nextest run -p storage`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo nextest run`
+- `git diff --check`
+
+# Metadata
+Repo: justincormack/argmin
+Commit: a8379c1
+Author: justin@specialbusservice.com
+Created: 07/05/2026, 12:55:06
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced a race by changing next_version_id from a reserving allocator into a read-only candidate allocator without ensuring all versioned object commit paths publish a pending command before choosing the candidate version ID.
+Before this commit, next_version_id reserved a version by updating object_version_counters in an immediate SQLite transaction. The new implementation only reads the maximum existing object version and stored counter, and the counter is advanced later during metadata command application. Some commit paths compute the candidate version ID before registering their metadata command as pending. In particular, direct PUT computes the version in prepare_commit_direct_put_object_command and only later sets the pending command after payload ack registration, while multipart completion computes its version and only much later attempts to set the pending command. Since direct PUT and multipart completion use different bucket-scoped locks, two concurrent commits to the same versioned key can both observe the same read-only candidate. If one command applies and removes the pending entry before the other registers its command, the stale command may proceed with a duplicate version_id and fail during object insertion due the objects primary key. This is primarily an availability/integrity-of-operation issue: an authenticated writer, or an anonymous writer to a public-write bucket, can race commits to make concurrent writes fail after payload work has already been performed. The primary key prevents silent overwrite, limiting the impact.
+
+# Validation
+## Rubric
+- [x] Confirm `next_version_id` no longer reserves/advances `object_version_counters` before returning.
+- [x] Confirm at least one real commit path computes a version before publishing its pending metadata command.
+- [x] Confirm direct PUT and multipart completion can interleave because they do not share the same bucket-scoped serialization lock.
+- [x] Dynamically demonstrate two pre-publication readers can obtain the same non-null version id for the same bucket/key.
+- [x] Dynamically demonstrate that after one command applies, a stale duplicate-version command fails on the `objects(bucket,key,version_id)` primary key, causing a write-operation failure rather than silent overwrite.
+## Report
+Validated the suspected race/failure mode with a targeted debug unit-test PoC plus LLDB trace. Code review showed `PgMetadataStore::next_version_id` is now a candidate reader: it queries `MAX(version_id)` from `objects` and `next_version_id` from `object_version_counters`, but performs no reserving write before returning (`crates/storage/src/pg_store.rs:7909-7982`; trait comment also says "candidate version_id ... without reserving it" at `crates/storage/src/traits.rs:291-298`). The durable counter is advanced later inside object metadata application (`crates/storage/src/pg_store.rs:5792-5825`). The direct PUT path prepares the command and chooses the version before pending command publication (`crates/storage/src/cluster.rs:1848-1855`), and then registers payload shard acks before `set_pending_metadata_command_for_bucket` (`crates/storage/src/cluster.rs:1705-1730`). Multipart completion uses a separate multipart-completion bucket lock (`crates/storage/src/cluster/request_ops.rs:4916-4928`), chooses `next_version_id` at `request_ops.rs:4988-4990`, and only later publishes pending at `request_ops.rs:5138-5144`. I added `poc_non_reserving_next_version_id_allows_duplicate_stale_commit_failure`, which models two commit paths reading the candidate before either is applied/published. The test output proves both reads return version 1, the first commit advances the next candidate to 2, and the stale second command fails at object insertion with SQLite primary-key/unique-constraint failure: `UNIQUE constraint failed: objects.bucket, objects.key, objects.version_id`. I attempted crash-style validation with a debug cargo test; there is no process crash because the vulnerability manifests as an application-level write failure. Valgrind was unavailable in the container; ASan was attempted but stable Rust rejected `-Z sanitizer=address`. LLDB was available and stopped immediately after the stale `apply_metadata_command(&second).unwrap_err()` returned, confirming the failure path under a debugger.
+
+# Evidence
+crates/storage/src/cluster.rs (L1705 to 1730)
+  Note: Direct PUT registers payload acknowledgements before publishing the newly prepared metadata command as pending, leaving a window after version selection where another commit can apply.
+```
+        if let Err(error) = self.register_payload_shard_acks(req.data_pg_id, &shard_batch) {
+            if new_pending_command {
+                drop(_bucket_guard);
+                self.release_object_generation_reservation_after_pending_drain_best_effort(
+                    pg_id,
+                    &req.bucket,
+                    &req.key,
+                    &req.generation_reservation_id,
+                );
+                self.delete_direct_put_segment_payload_shards(
+                    req.data_pg_id,
+                    req.ec,
+                    &req.segment_okh,
+                    req.segment_vid,
+                    written_shards,
+                );
+            }
+            return Err(error);
+        }
+        if new_pending_command {
+            if let Err(error) = self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                &req.bucket,
+                &command,
+                "conflicting pending command for direct PUT object commit",
+            ) {
+```
+
+crates/storage/src/cluster.rs (L1848 to 1855)
+  Note: Direct PUT chooses the version_id using the now non-reserving next_version_id before pending command publication.
+```
+        let version_id = if req.versioning == crate::BucketVersioningState::Enabled {
+            PgMetadataStore::next_version_id(object_pg, &req.bucket, &req.key)?
+        } else {
+            VersionId::Null
+        };
+        let last_modified_millis = crate::clock::current_time_millis();
+        let write_sequence =
+            object_pg.next_object_write_sequence(req.bucket.as_str(), req.key.as_str())?;
+```
+
+crates/storage/src/cluster/request_ops.rs (L4916 to 4928)
+  Note: Multipart completion uses a separate multipart completion lock rather than the direct PUT bucket lock, so it can interleave with direct PUT for the same key.
+```
+    pub fn complete_multipart_upload_commit_serialized(
+        &self,
+        req: CompleteMultipartCommitRequest,
+        keep_completed_uploads: usize,
+    ) -> Result<CompleteMultipartCommitOutcome, ObjectPgActionError> {
+        let bucket = req.bucket.clone();
+        let key = req.key.clone();
+        let upload_id = req.upload_id.clone();
+        let generation_id = req.generation_id;
+        let pg_id = PgId::new(self.object_metadata_pg_id(&bucket, &key));
+        let bucket_primary_node = self.bucket_metadata_primary_node(&bucket)?;
+        let _completion_guard = bucket_primary_node.lock_multipart_completion_bucket(&bucket);
+        let primary_node = self.object_metadata_primary_node(&bucket, &key)?;
+```
+
+crates/storage/src/cluster/request_ops.rs (L4988 to 4990)
+  Note: Multipart completion also chooses its version_id using the non-reserving next_version_id.
+```
+            let version_id = if req.versioning == BucketVersioningState::Enabled {
+                PgMetadataStore::next_version_id(&*object_pg, &bucket, &key)?
+            } else {
+```
+
+crates/storage/src/cluster/request_ops.rs (L5138 to 5144)
+  Note: The multipart completion pending command is registered only after the version candidate has been selected and the command has been built.
+```
+            if runtime_state
+                .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone())
+                .is_err()
+            {
+                continue 'retry_after_pending_conflict;
+            }
+            self.apply_multipart_completion_command(pg_id, &bucket, &command)?;
+```
+
+crates/storage/src/pg_store.rs (L5792 to 5825)
+  Note: The durable object_version_counters row is advanced only later, when an object metadata command is applied.
+```
+    fn advance_object_version_counter_in_open_txn(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<(), MetadataError> {
+        if version_id.is_null() {
+            return Ok(());
+        }
+        let following = version_id
+            .to_u64()
+            .checked_add(1)
+            .ok_or_else(|| MetadataError::Db {
+                context: "advance object version counter",
+                source: rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    Box::from("version_id overflow"),
+                ),
+            })?;
+        let following = i64::try_from(following).map_err(|_| MetadataError::Db {
+            context: "advance object version counter",
+            source: rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Integer,
+                Box::from("version_id exceeds SQLite integer range"),
+            ),
+        })?;
+        self.conn
+            .execute(
+                "INSERT INTO object_version_counters (bucket, key, next_version_id) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(bucket, key) DO UPDATE SET \
+                     next_version_id = max(object_version_counters.next_version_id, excluded.next_version_id)",
+```
+
+crates/storage/src/pg_store.rs (L7909 to 7982)
+  Note: next_version_id now only reads existing rows and object_version_counters and returns a candidate; it no longer reserves or advances the counter before returning.
+```
+    fn next_version_id(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<VersionId, MetadataError> {
+        let max_existing: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT MAX(version_id) FROM objects WHERE bucket = ?1 AND key = ?2",
+                params![bucket, key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "next version id (max existing)",
+                source: e,
+            })?
+            .flatten();
+        let next_from_rows = match max_existing {
+            None => 1,
+            Some(v) => {
+                let current = u64::try_from(v).map_err(|_| MetadataError::Db {
+                    context: "negative version_id in database",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::from(format!("negative MAX(version_id): {v}")),
+                    ),
+                })?;
+                current.checked_add(1).ok_or_else(|| MetadataError::Db {
+                    context: "version_id overflow",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::from("MAX(version_id) overflow"),
+                    ),
+                })?
+            }
+        };
+
+        let stored_next: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT next_version_id FROM object_version_counters \
+                 WHERE bucket = ?1 AND key = ?2",
+                params![bucket, key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "next version id (load counter)",
+                source: e,
+            })?;
+        let next_from_counter = match stored_next {
+            None => 1,
+            Some(v) => u64::try_from(v).map_err(|_| MetadataError::Db {
+                context: "negative next_version_id in database",
+                source: rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    Box::from(format!("negative next_version_id: {v}")),
+                ),
+            })?,
+        };
+        let next = next_from_rows.max(next_from_counter);
+        next.checked_add(1).ok_or_else(|| MetadataError::Db {
+            context: "version_id overflow",
+            source: rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Integer,
+                Box::from("next_version_id overflow"),
+            ),
+        })?;
+        Ok(VersionId::from_u64(next))
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Medium is appropriate. The bug is real and production-reachable: next_version_id is explicitly non-reserving, direct PUT and multipart completion can compute a version before pending command publication, and the two paths use different locks. A validation PoC showed duplicate candidate version IDs and a stale commit failing with a UNIQUE constraint on objects(bucket,key,version_id). However, impact is limited to availability/integrity-of-operation for writes the attacker is already allowed to perform or for public-write buckets; SQLite constraints prevent silent overwrite, and no data disclosure, authorization bypass, or code execution is evidenced. These constraints rule out high/critical while still supporting a medium availability finding.
+## Likelihood
+high - The vulnerable paths are reachable through normal S3 HTTP write APIs, but exploitation requires write permission or a public-write bucket, bucket versioning, and a concurrency race between direct PUT and multipart completion for the same key. | Remote network vector
+## Impact
+medium - The demonstrated effect is targeted write failure/availability degradation for a versioned key after payload work has already occurred. The primary key prevents silent overwrite, and there is no shown confidentiality loss, privilege escalation, auth bypass, or permanent data corruption.
+## Assumptions
+- The argmin-s3 binary is deployed as the S3-compatible HTTP service.
+- The target bucket has object versioning enabled; non-versioned writes use VersionId::Null and do not exercise the duplicate numeric version_id path.
+- The attacker can issue writes to the same bucket/key, either with valid SigV4 credentials that authorize PutObject/multipart completion or via an intentionally public-write bucket.
+- The attacker can create a timing overlap between a direct PUT commit path and a multipart completion commit path for the same versioned key.
+- argmin-s3 HTTP service reachable over TCP
+- bucket versioning enabled
+- attacker has write authorization for the bucket/key or the bucket is public-write
+- concurrent direct PUT and CompleteMultipartUpload for the same key
+## Path
+Attacker S3 client
+  | concurrent PUT + CompleteMultipartUpload
+  v
+argmin-s3 HTTP listener -> SigV4/authz or public-write ACL
+  |                                      |
+  v                                      v
+Direct PUT commit                  Multipart completion
+  | next_version_id()              | next_version_id()
+  +--------------- same candidate version_id ---------------+
+                                  v
+                    objects(bucket,key,version_id) PK
+                                  v
+                    stale commit fails / write availability loss
+## Path evidence
+- `crates/argmin-s3/src/main.rs:153-206` - Production argmin-s3 binds a TCP listener and starts the HTTP server; TLS is optional, so the S3 API is a runtime network surface.
+- `crates/argmin-s3/src/config.rs:35-70` - Runtime configuration uses ARGMIN_LISTEN_ADDR, defaulting to 127.0.0.1:9000, and loads access credentials from environment variables.
+- `crates/server-http/src/http/mod.rs:1398-1405` - HTTP dispatcher routes S3 PutObject requests into the write handling path.
+- `crates/server-http/src/http/mod.rs:1561-1587` - Normal PutObject calls coordinator.put_object with attacker-controlled bucket, key, body, metadata, conditions, ACL, and encryption parameters after parsing/authz.
+- `crates/server-http/src/http/mod.rs:2778-2825` - HTTP dispatcher routes CompleteMultipartUpload requests to coordinator.complete_multipart_upload with attacker-controlled uploadId, XML parts list, and key.
+- `crates/server-core/src/coordinator/authz.rs:440-456` - Object write authorization permits bucket owner/admin, ACL write grantees, or effective public_write.
+- `crates/server-core/src/coordinator/authz.rs:796-800` - Public-write is effective only when bucket public ACLs are not ignored by public access block settings.
+- `crates/storage/src/traits.rs:291-298` - The storage trait documents next_version_id as returning a candidate without reserving it.
+- `crates/storage/src/pg_store.rs:7909-7982` - next_version_id reads MAX(version_id) and object_version_counters, then returns a candidate without performing a reserving write.
+- `crates/storage/src/pg_store.rs:5792-5825` - The durable object_version_counters row is advanced later during metadata command application.
+- `crates/storage/src/cluster.rs:1848-1855` - Direct PUT chooses version_id via next_version_id before the pending command is published.
+- `crates/storage/src/cluster.rs:1705-1730` - Direct PUT registers payload shard acknowledgements before set_pending_metadata_command_for_bucket, leaving a post-version-selection window.
+- `crates/storage/src/cluster/request_ops.rs:4916-4928` - Multipart completion uses lock_multipart_completion_bucket rather than the direct PUT bucket lock, allowing interleaving with direct PUT for the same key.
+- `crates/storage/src/cluster/request_ops.rs:4988-4990` - Multipart completion also chooses its version_id using next_version_id.
+- `crates/storage/src/cluster/request_ops.rs:5138-5144` - Multipart completion publishes the pending metadata command only after selecting/building the command.
+- `crates/storage/src/schema.rs:52-68` - The objects table primary key is (bucket, key, version_id), which prevents silent overwrite but turns duplicate version_id races into failed commits.
+## Narrative
+The finding is real and in scope. The production HTTP server dispatches PutObject and CompleteMultipartUpload to coordinator/storage commit paths. In the introduced code, next_version_id only reads existing object rows and object_version_counters and does not reserve the returned value; the durable counter is advanced later during metadata command application. Direct PUT computes its version before publishing a pending metadata command and only publishes after payload shard ack registration. Multipart completion computes its version under a separate multipart-completion bucket lock and also publishes pending later. Therefore, a writer who can race direct PUT and multipart completion for the same versioned key can cause both paths to select the same version_id. The SQLite primary key prevents silent overwrite, so the proven impact is a failed stale commit/write availability degradation rather than data disclosure, auth bypass, or persistent corruption. This supports medium severity, not high or critical.
+## Controls
+- SigV4 authentication for non-anonymous requests
+- Bucket/object authorization and ACL checks
+- Public access block can disable effective public-write ACLs
+- Bucket versioning gate; non-versioned writes use VersionId::Null
+- SQLite primary key on objects(bucket,key,version_id) prevents silent overwrite
+- HTTP max_connections and max_inflight_requests backpressure
+- HTTP header/body idle timeouts
+## Blindspots
+- Static review did not run an end-to-end HTTP race against a live argmin-s3 process in this stage.
+- No deployment manifests or load balancer configuration were present, so public internet exposure cannot be confirmed from repository artifacts.
+- Exact exploit reliability depends on runtime timing, object size, storage latency, and whether operators enable bucket versioning and public-write ACLs.
+- The validation PoC was storage-level rather than a complete remote exploit, although the repository code maps the affected paths to normal HTTP S3 operations.
