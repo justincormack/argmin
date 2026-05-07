@@ -3106,6 +3106,7 @@ impl PgStore {
     }
 
     fn insert_bucket_record_explicit(&self, bucket: &BucketRecord) -> Result<(), MetadataError> {
+        let bucket = bucket.clone().command_metadata_projection();
         let created_at = i64::try_from(bucket.created_at).map_err(|_| MetadataError::Db {
             context: "create bucket record (encode created_at)",
             source: rusqlite::Error::ToSqlConversionFailure(Box::from(
@@ -3154,8 +3155,8 @@ impl PgStore {
                         bucket.acl_grants.serialized(),
                         i32::from(bucket.public_read),
                         i32::from(bucket.public_write),
-                        i32::from(bucket.write_reservations_blocked),
-                        bucket.active_write_reservations as i64,
+                        0_i32,
+                        0_i64,
                         public_access_block_present,
                         public_access_block_block_public_acls,
                         public_access_block_ignore_public_acls,
@@ -3166,7 +3167,7 @@ impl PgStore {
                         bucket.bucket_policy_generation as i64,
                         bucket.bucket_lifecycle_generation as i64,
                         bucket.bucket_execution_generation as i64,
-                        bucket.completed_multipart_upload_sequence as i64,
+                        0_i64,
                         i32::from(bucket.bucket_abac_enabled),
                         bucket.encryption.default_encryption.map(|value| value as u8),
                         i32::from(bucket.encryption.sse_c_blocked),
@@ -3199,7 +3200,7 @@ impl PgStore {
         conflict_context: &'static str,
     ) -> Result<(), MetadataError> {
         let current = self.head_bucket_record_raw(&target.name)?;
-        if current == *target {
+        if current.command_metadata_eq(target) {
             return Ok(());
         }
         if current.bucket_execution_generation == target.bucket_execution_generation {
@@ -3442,7 +3443,7 @@ impl PgStore {
                 expected.bucket_abac_enabled = target.bucket_abac_enabled;
             }
         }
-        expected == *target
+        expected.command_metadata_eq(target)
     }
 
     pub(crate) fn apply_metadata_command(
@@ -3567,7 +3568,7 @@ impl PgStore {
             Ok(()) => Ok(()),
             Err(MetadataError::BucketAlreadyExists) => {
                 let existing = self.head_bucket_record_raw(&command.bucket.name)?;
-                if existing == command.bucket {
+                if existing.command_metadata_eq(&command.bucket) {
                     Ok(())
                 } else {
                     Err(MetadataError::BucketAlreadyExists)

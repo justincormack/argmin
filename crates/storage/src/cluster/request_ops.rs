@@ -1139,12 +1139,12 @@ impl super::StorageCluster {
         build_expected: impl FnOnce(BucketRecord) -> Result<BucketRecord, BucketSnapshotLoadError>,
     ) -> Result<bool, BucketSnapshotLoadError> {
         if current.bucket_execution_generation == target.bucket_execution_generation {
-            return Ok(current == *target);
+            return Ok(current.command_metadata_eq(target));
         }
         if current.bucket_execution_generation > target.bucket_execution_generation {
             return Ok(false);
         }
-        Ok(build_expected(current)? == *target)
+        Ok(build_expected(current)?.command_metadata_eq(target))
     }
 
     pub fn put_bucket_versioning_and_load_info(

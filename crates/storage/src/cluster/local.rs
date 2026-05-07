@@ -4757,6 +4757,78 @@ mod tests {
     }
 
     #[test]
+    fn bucket_metadata_commands_ignore_primary_local_write_reservation_state() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "bucket-command-reserved-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        {
+            let primary_pg = map
+                .node(NodeId::new(1))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            let reserved =
+                crate::PgMetadataStore::acquire_bucket_write_reservation(&*primary_pg, &bucket)
+                    .unwrap();
+            assert_eq!(reserved.active_write_reservations, 1);
+        }
+
+        let acl_grants = crate::AclGrants::default();
+        cluster
+            .put_bucket_acl_and_load_info(&bucket, &acl_grants, true, false)
+            .unwrap();
+        cluster
+            .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+            .unwrap();
+        let public_access_block = crate::PublicAccessBlockConfig {
+            block_public_acls: true,
+            ignore_public_acls: true,
+            block_public_policy: true,
+            restrict_public_buckets: true,
+        };
+        cluster
+            .put_bucket_public_access_block_and_load_info(&bucket, public_access_block)
+            .unwrap();
+
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.acl_grants, acl_grants);
+            assert!(info.public_read);
+            assert!(!info.public_write);
+            assert_eq!(info.versioning, crate::BucketVersioningState::Enabled);
+            assert_eq!(info.public_access_block, Some(public_access_block));
+            if node_id == NodeId::new(1) {
+                assert_eq!(info.active_write_reservations, 1);
+            } else {
+                assert_eq!(info.active_write_reservations, 0);
+            }
+        }
+
+        let primary_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        crate::PgMetadataStore::release_bucket_write_reservation(&*primary_pg, &bucket).unwrap();
+    }
+
+    #[test]
     fn metadata_state_digest_ignores_completed_multipart_order_allocator() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

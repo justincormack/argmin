@@ -165,12 +165,23 @@ impl BucketRecord {
 
     pub(crate) fn matches_create_config(&self, config: &CreateBucketConfig<'_>) -> bool {
         Self::from_create_config(config, self.created_at, self.bucket_execution_generation)
-            .is_ok_and(|expected| expected == *self)
+            .is_ok_and(|expected| expected.command_metadata_eq(self))
     }
 
     pub(crate) fn with_execution_generation(mut self, generation: u64) -> Self {
         self.bucket_execution_generation = generation;
         self
+    }
+
+    pub(crate) fn command_metadata_projection(mut self) -> Self {
+        self.write_reservations_blocked = false;
+        self.active_write_reservations = 0;
+        self.completed_multipart_upload_sequence = 0;
+        self
+    }
+
+    pub(crate) fn command_metadata_eq(&self, other: &Self) -> bool {
+        self.clone().command_metadata_projection() == other.clone().command_metadata_projection()
     }
 }
 
@@ -256,6 +267,7 @@ pub(crate) struct PutBucketVersioningCommand {
 impl PutBucketVersioningCommand {
     pub(crate) fn from_bucket(mut bucket: BucketRecord, state: BucketVersioningState) -> Self {
         bucket.versioning = state;
+        bucket = bucket.command_metadata_projection();
         Self { bucket }
     }
 
@@ -279,6 +291,7 @@ impl PutBucketAclCommand {
         bucket.acl_grants = acl_grants;
         bucket.public_read = public_read;
         bucket.public_write = public_write;
+        bucket = bucket.command_metadata_projection();
         Self { bucket }
     }
 
@@ -300,6 +313,7 @@ impl PutBucketPropertyCommand {
     ) -> Self {
         let effect = mutation.effect();
         mutation.apply_to_bucket(&mut bucket);
+        bucket = bucket.command_metadata_projection();
         Self { bucket, effect }
     }
 
@@ -1249,15 +1263,12 @@ fn encode_bucket_record(out: &mut Vec<u8>, bucket: &BucketRecord) {
     put_str(out, &bucket.acl_grants.serialized());
     put_bool(out, bucket.public_read);
     put_bool(out, bucket.public_write);
-    put_bool(out, bucket.write_reservations_blocked);
-    put_u32(out, bucket.active_write_reservations);
     encode_public_access_block(out, bucket.public_access_block);
     encode_ownership_controls(out, bucket.ownership_controls);
     put_bool(out, bucket.bucket_policy_public);
     put_u64(out, bucket.bucket_policy_generation);
     put_u64(out, bucket.bucket_lifecycle_generation);
     put_u64(out, bucket.bucket_execution_generation);
-    put_u64(out, bucket.completed_multipart_upload_sequence);
     put_bool(out, bucket.bucket_abac_enabled);
     encode_bucket_encryption(out, bucket.encryption);
 }
@@ -1711,7 +1722,7 @@ mod tests {
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
         assert!(envelope.verify_checksum());
-        assert_eq!(envelope.checksum_crc64(), 0xf863c7b45c9b2576);
+        assert_eq!(envelope.checksum_crc64(), 0x66809b9080b3d0ce);
     }
 
     #[test]
@@ -1734,7 +1745,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x025a3a3a3a06e265);
+        assert_eq!(envelope.checksum_crc64(), 0x5b70f24232e19e41);
         assert!(envelope.verify_checksum());
     }
 
@@ -1758,7 +1769,41 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x2a8ea7a65e10535f);
+        assert_eq!(envelope.checksum_crc64(), 0xef5303af8c76b99e);
+        assert!(envelope.verify_checksum());
+    }
+
+    #[test]
+    fn bucket_command_encoding_ignores_local_runtime_state() {
+        let mut current = test_bucket_record("bucket", 13);
+        current.write_reservations_blocked = true;
+        current.active_write_reservations = 7;
+        current.completed_multipart_upload_sequence = 11;
+
+        let command = PutBucketAclCommand::from_bucket(current, AclGrants::default(), true, false);
+        assert!(!command.bucket.write_reservations_blocked);
+        assert_eq!(command.bucket.active_write_reservations, 0);
+        assert_eq!(command.bucket.completed_multipart_upload_sequence, 0);
+
+        let id = MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(3),
+            MetadataCommandLogIndex::new(13).unwrap(),
+        );
+        let envelope =
+            MetadataCommandEnvelope::new(id, MetadataCommandPayload::PutBucketAcl(command));
+        let duplicate = MetadataCommandEnvelope::new(
+            id,
+            MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
+                test_bucket_record("bucket", 13),
+                AclGrants::default(),
+                true,
+                false,
+            )),
+        );
+
+        assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
+        assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
         assert!(envelope.verify_checksum());
     }
 
@@ -1835,13 +1880,13 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0xa719319c74b1f0cb,
-                0xd1075afe8d161071,
-                0xcb081a9b10eaa110,
-                0xc08ab093cf1861e5,
-                0x85ddf064e854992e,
-                0x0d0bf92d0ebb50bc,
-                0x6f37b9d0b95a6e38,
+                0xf27692e29e21bb1f,
+                0x80d40aaea5acf124,
+                0x1072c4f57d813743,
+                0x277b3c42b8d9d442,
+                0x00dc5a4ce204ff47,
+                0x316cb12d15f693df,
+                0xb3eb4da7c314e661,
             ]
         );
     }
