@@ -27,11 +27,11 @@ use crate::metadata_command::{
     CreateBucketCommand, CreateMultipartUploadCommand, CreateStreamUploadCommand,
     DeleteCompletedMultipartUploadCommand, DeleteObjectPayloadReclaimCommand,
     DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
-    MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandLogIndex,
-    MetadataCommandPayload, MetadataCommandReplicaState, ObjectPayloadReclaimCommand,
-    PutBucketAclCommand, PutBucketPropertyCommand, PutBucketSubresourceCommand,
-    PutBucketVersioningCommand, PutObjectMetadataCommand, ReleaseObjectGenerationCommand,
-    ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
+    MarkBucketDeletingCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
+    MetadataCommandLogIndex, MetadataCommandPayload, MetadataCommandReplicaState,
+    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
+    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
+    ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
 };
 use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
@@ -352,6 +352,11 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
+        name: "pg_counters",
+        columns: &["singleton", "next_bucket_execution_generation"],
+        filter: MetadataDigestFilter::AllRows,
+    },
+    MetadataDigestTable {
         name: "stream_upload_segments",
         columns: &[
             "session_id",
@@ -392,6 +397,7 @@ enum BucketExecutionGeneration {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BucketRecordUpdateEffect {
+    State,
     Versioning,
     Acl,
     Property(BucketPropertyEffect),
@@ -2982,14 +2988,34 @@ impl PgStore {
             })
     }
 
-    pub(crate) fn reserve_bucket_execution_generation(&self) -> Result<u64, MetadataError> {
-        self.with_immediate_txn(
-            "reserve bucket execution generation (begin txn)",
-            "reserve bucket execution generation (commit txn)",
-            |store| {
-                store.next_bucket_execution_generation_in_txn("reserve bucket execution generation")
-            },
-        )
+    pub(crate) fn next_bucket_execution_generation_candidate(&self) -> Result<u64, MetadataError> {
+        let current: u64 = self
+            .conn
+            .query_row(
+                "SELECT next_bucket_execution_generation FROM pg_counters WHERE singleton = 0",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|source| MetadataError::Db {
+                context: "read next bucket execution generation candidate",
+                source,
+            })
+            .and_then(|raw| {
+                raw.try_into().map_err(|_| MetadataError::Db {
+                    context: "decode next bucket execution generation candidate",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::from("negative next_bucket_execution_generation"),
+                    ),
+                })
+            })?;
+        current.checked_add(1).ok_or_else(|| MetadataError::Db {
+            context: "increment next bucket execution generation candidate",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+                "bucket execution generation exceeds u64",
+            )),
+        })
     }
 
     fn advance_bucket_execution_generation_in_txn(
@@ -3257,6 +3283,23 @@ impl PgStore {
                     "put bucket record update (advance execution generation)",
                 )?;
                 let updated = match effect {
+                    BucketRecordUpdateEffect::State => store
+                        .conn
+                        .execute(
+                            "UPDATE buckets \
+                             SET state = ?1, \
+                                 bucket_execution_generation = ?2 \
+                             WHERE name = ?3",
+                            params![
+                                target.state as u8 as i64,
+                                target.bucket_execution_generation as i64,
+                                target.name.as_str(),
+                            ],
+                        )
+                        .map_err(|source| MetadataError::Db {
+                            context: "put bucket state",
+                            source,
+                        })?,
                     BucketRecordUpdateEffect::Versioning => store
                         .conn
                         .execute(
@@ -3436,6 +3479,9 @@ impl PgStore {
         let mut expected = current.clone();
         expected.bucket_execution_generation = target.bucket_execution_generation;
         match effect {
+            BucketRecordUpdateEffect::State => {
+                expected.state = target.state;
+            }
             BucketRecordUpdateEffect::Versioning => {
                 expected.versioning = target.versioning;
             }
@@ -3492,6 +3538,9 @@ impl PgStore {
             }
             MetadataCommandPayload::PutBucketSubresource(subresource) => {
                 self.apply_put_bucket_subresource_command(subresource)
+            }
+            MetadataCommandPayload::MarkBucketDeleting(mark) => {
+                self.apply_mark_bucket_deleting_command(mark)
             }
             MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(command) => {
                 self.apply_advance_completed_multipart_upload_sequence_command(command)
@@ -3625,6 +3674,18 @@ impl PgStore {
             BucketRecordUpdateEffect::Acl,
             "apply stale bucket acl command",
             "apply conflicting bucket acl command",
+        )
+    }
+
+    fn apply_mark_bucket_deleting_command(
+        &self,
+        command: &MarkBucketDeletingCommand,
+    ) -> Result<(), MetadataError> {
+        self.put_bucket_record_update_inner(
+            &command.bucket,
+            BucketRecordUpdateEffect::State,
+            "apply stale mark bucket deleting command",
+            "apply conflicting mark bucket deleting command",
         )
     }
 
@@ -11705,6 +11766,7 @@ mod tests {
                 ("object_segments", MetadataDigestFilter::AllRows),
                 ("object_segments_reclaims", MetadataDigestFilter::AllRows),
                 ("objects", MetadataDigestFilter::AllRows),
+                ("pg_counters", MetadataDigestFilter::AllRows),
                 ("stream_upload_segments", MetadataDigestFilter::AllRows),
                 ("stream_uploads", MetadataDigestFilter::AllRows),
             ]
@@ -12469,6 +12531,45 @@ mod tests {
                     )
                     .unwrap();
             },
+        );
+    }
+
+    #[test]
+    fn metadata_state_digest_covers_pg_counters() {
+        assert_metadata_state_digest_covers_mutation(
+            |_| {},
+            |store| {
+                store
+                    .conn
+                    .execute(
+                        "UPDATE pg_counters SET next_bucket_execution_generation = ?1 \
+                         WHERE singleton = 0",
+                        params![3_i64],
+                    )
+                    .unwrap();
+            },
+        );
+    }
+
+    #[test]
+    fn bucket_execution_generation_candidate_advances_only_on_command_apply() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("bucket");
+
+        let first = store.next_bucket_execution_generation_candidate().unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(
+            store.next_bucket_execution_generation_candidate().unwrap(),
+            first
+        );
+
+        let command = create_bucket_probe_command(1, 1, bucket, first);
+        store.apply_metadata_command(&command).unwrap();
+
+        assert_eq!(
+            store.next_bucket_execution_generation_candidate().unwrap(),
+            first + 1
         );
     }
 

@@ -1780,6 +1780,31 @@ mod tests {
         }
     }
 
+    fn assert_bucket_execution_counter_on_acting_nodes(
+        map: &LocalClusterMap,
+        node_ids: &[NodeId],
+        bucket_pg: u32,
+        expected_current_generation: u64,
+    ) {
+        for node_id in node_ids {
+            let node = map.node(*node_id).unwrap().storage_node();
+            let pg = node.get_pg(bucket_pg).unwrap();
+            let next_generation: i64 = pg
+                .connection()
+                .query_row(
+                    "SELECT next_bucket_execution_generation \
+                     FROM pg_counters WHERE singleton = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                next_generation as u64, expected_current_generation,
+                "unexpected bucket execution counter on node {node_id:?}"
+            );
+        }
+    }
+
     fn seed_streamed_multipart_completion(
         cluster: &crate::StorageCluster,
         bucket: &crate::BucketName,
@@ -11059,6 +11084,12 @@ mod tests {
                 created.bucket_execution_generation
             );
         }
+        assert_bucket_execution_counter_on_acting_nodes(
+            &map,
+            &node_ids,
+            1,
+            created.bucket_execution_generation,
+        );
 
         let exists = cluster
             .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
@@ -12886,6 +12917,23 @@ mod tests {
         assert!(pre_delete_generation > created_generation);
 
         cluster.begin_bucket_delete(&bucket).unwrap();
+        let deleting_generation = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .test_head_bucket_raw(&bucket)
+            .unwrap()
+            .bucket_execution_generation;
+        assert!(deleting_generation > pre_delete_generation);
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.state, crate::BucketState::Deleting);
+            assert_eq!(info.bucket_execution_generation, deleting_generation);
+        }
+        assert_bucket_execution_counter_on_acting_nodes(&map, &node_ids, 1, deleting_generation);
+
         assert_eq!(
             cluster.try_finalize_bucket_delete(&bucket).unwrap(),
             crate::BucketDeleteFinalizeOutcome::Finalized

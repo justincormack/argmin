@@ -79,13 +79,14 @@ command-owned durable serving, in-progress, and cleanup metadata:
 - `object_segments_reclaims`
 - `object_version_counters`
 - `objects`
+- `pg_counters`
 - `stream_upload_segments`
 - `stream_uploads`
 
 The current inventory still excludes state that is local-only or not yet
-owned by its own canonical command stream: bucket write-drain counters,
-`pg_counters`, and `multipart_uploads.state`. Those are Phase 7.3 gaps, not
-implicit exemptions from metadata integrity.
+owned by its own canonical command stream: bucket write-drain counters and
+`multipart_uploads.state`. Those are Phase 7.3 gaps, not implicit exemptions
+from metadata integrity.
 
 The full-PG encoding starts with a stable domain/version header. Each included
 table range then encodes explicit table and column names, filter identity, row
@@ -126,6 +127,7 @@ encodings.
 | `PutBucketAcl` | Storage-shaped | command-owned bucket row | post-mutation command-owned bucket row | matching command-owned bucket row post-image converges |
 | `PutBucketProperty` | Storage-shaped | command-owned bucket row | post-mutation command-owned bucket row plus property effect group | matching command-owned bucket row post-image converges |
 | `PutBucketSubresource` | Storage-shaped | bucket row generation | bucket subresource row, generation mirrors | matching subresource effect converges |
+| `MarkBucketDeleting` | Storage-shaped | drained command-owned bucket row | post-mutation deleting bucket row | matching deleting bucket row post-image converges |
 | `AdvanceCompletedMultipartUploadSequence` | Storage-shaped | bucket completed-MPU sequence | advances bucket completed-MPU sequence to the command order | matching bucket/order converges |
 | `ReserveObjectGeneration` | Storage-shaped | object generation allocators and live/reclaim/reservation rows | generation reservation row | matching reservation id converges |
 | `ReleaseObjectGeneration` | Storage-shaped | generation reservation row | removes reservation row | missing matching reservation is idempotent |
@@ -169,6 +171,14 @@ group being changed so replay can validate that only the intended bucket-row
 columns changed. Raw bucket encryption columns are part of the row image;
 matching only the effective encryption behavior is not exact
 enough.
+
+The bucket execution-generation counter in `pg_counters` is part of the
+canonical digest. Bucket command construction reads a candidate generation from
+that counter, but does not mutate it; command apply advances the counter in the
+same transaction as the bucket row mutation. DeleteBucket begin uses the same
+command stream: after the write-drain fence and emptiness check, it publishes a
+`MarkBucketDeleting` bucket-row post-image rather than mutating the bucket state
+or `pg_counters` directly.
 
 `PutObjectMetadata` keeps the AWS-facing "put tags", "delete tags", "put ACL",
 "put retention", and "put legal hold" distinctions at the coordinator/storage

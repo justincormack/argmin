@@ -1852,11 +1852,37 @@ Completed:
   - included `buckets.completed_multipart_upload_sequence` in the canonical
     bucket-row digest and stopped treating it as local runtime state in bucket
     command row projections
+  - moved `pg_counters.next_bucket_execution_generation` under bucket metadata
+    command ownership: command construction now reads a candidate execution
+    generation without mutating the durable counter, and command apply advances
+    `pg_counters` in the same transaction as the bucket row/subresource
+    mutation
+  - moved DeleteBucket begin onto a row-shaped `MarkBucketDeleting` bucket
+    metadata command, so the Active-to-Deleting state transition and execution
+    generation advance are replicated through the command stream rather than
+    written through the old metadata-primary bucket path
+  - narrowed old `SharedStorageNode` direct bucket mutation helpers to
+    `cfg(test)`, leaving production bucket state/subresource/counter mutation
+    behind `StorageCluster` command APIs
+  - included `pg_counters` in the canonical full-PG digest so counter
+    corruption or off-command allocator mutation is detected before later
+    command apply
   - retained explicit exclusions for state that is still local-only or still
-    mutates outside its own command stream: bucket write-drain counters,
-    `pg_counters`, and `multipart_uploads.state`
-  - remaining Phase 7.3 work is to move those allocator/counter rows behind
-    canonical command/checkpoint ownership, then include them in the digest
+    mutates outside its own command stream:
+    - bucket write-drain counters (`write_reservations_blocked` and
+      `active_write_reservations`) are bucket-delete/read-write fencing state,
+      not canonical S3 metadata; they remain outside the metadata digest until
+      the Phase 9 lease/fence model decides whether this state should stay
+      process-local or become a replicated fence
+    - `multipart_uploads.state` is still excluded from the canonical
+      multipart-upload table range even though the rest of
+      `multipart_uploads` is digest-covered; Phase 7.3 needs to either make
+      upload state command-owned and digest-covered, or explicitly reclassify
+      it as non-canonical state
+  - remaining Phase 7.3 work is:
+    - resolve the `multipart_uploads.state` classification and digest coverage
+    - keep bucket write-drain counters documented as a Phase 9 fence/lease
+      concern unless that phase moves them into canonical replicated metadata
 
 Exit criteria:
 

@@ -19,10 +19,11 @@ use crate::metadata_command::{
     CommitMultipartObjectCommand, CommitStreamPartCommand, CreateBucketCommand,
     CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteCompletedMultipartUploadCommand,
     DeleteObjectPayloadReclaimCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
-    InsertDeleteMarkerCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
-    MetadataCommandId, MetadataCommandPayload, ObjectPayloadReclaimCommand, PutBucketAclCommand,
-    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
-    PutObjectMetadataCommand, PutObjectMetadataMutation,
+    InsertDeleteMarkerCommand, MarkBucketDeletingCommand, MetadataCommandAcceptance,
+    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
+    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
+    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
+    PutObjectMetadataMutation,
 };
 use crate::*;
 
@@ -222,6 +223,11 @@ fn metadata_command_apply_test_context(
         MetadataCommandPayload::PutBucketSubresource(command) => (
             MetadataCommandApplyTestKind::PutBucketSubresource,
             Some(command.name.clone()),
+            None,
+        ),
+        MetadataCommandPayload::MarkBucketDeleting(command) => (
+            MetadataCommandApplyTestKind::MarkBucketDeleting,
+            Some(command.bucket.name.clone()),
             None,
         ),
         MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(command) => (
@@ -564,6 +570,11 @@ impl super::StorageCluster {
                             "unexpected pending put bucket subresource command for create bucket",
                         ));
                     }
+                    MetadataCommandPayload::MarkBucketDeleting(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending mark bucket deleting command for create bucket",
+                        ));
+                    }
                     MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
                         self.drain_pending_completed_multipart_sequence_command(
                             pg_id, &bucket, &command,
@@ -599,7 +610,7 @@ impl super::StorageCluster {
                 );
                 let bucket_pg = primary_node.get_pg(pg_id.get())?;
                 let bucket_execution_generation =
-                    bucket_pg.reserve_bucket_execution_generation()?;
+                    bucket_pg.next_bucket_execution_generation_candidate()?;
                 drop(bucket_pg);
                 let command = CreateBucketCommand::from_config(
                     config,
@@ -894,6 +905,7 @@ impl super::StorageCluster {
             | MetadataCommandPayload::PutBucketAcl(_)
             | MetadataCommandPayload::PutBucketProperty(_)
             | MetadataCommandPayload::PutBucketSubresource(_)
+            | MetadataCommandPayload::MarkBucketDeleting(_)
             | MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
             | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => self
                 .finish_pending_metadata_command_to_acting_set(pg_id, bucket, command, false)
@@ -1046,17 +1058,155 @@ impl super::StorageCluster {
     }
 
     pub fn begin_bucket_delete(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let node = self.bucket_metadata_primary_node(bucket)?;
         let drain = node.begin_bucket_write_drain(bucket)?;
         crate::node::maybe_run_after_begin_bucket_delete_drain_hook(bucket);
 
-        if self.bucket_has_visible_data(bucket, true)? {
-            return Err(crate::error::MetadataError::BucketNotEmpty.into());
-        }
+        let runtime_state = self.local_map.runtime_state();
+        loop {
+            let (command, clear_pending_on_zero_apply) = if let Some(command) =
+                runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                match command.payload() {
+                    MetadataCommandPayload::MarkBucketDeleting(mark)
+                        if mark.bucket_name() == bucket =>
+                    {
+                        let bucket_pg = node.get_pg(pg_id.get())?;
+                        let current = bucket_pg.head_bucket_record_raw(bucket)?;
+                        if !Self::pending_bucket_command_matches_current(
+                            current,
+                            &mark.bucket,
+                            |record| {
+                                Ok(MarkBucketDeletingCommand::from_bucket(
+                                    record.with_execution_generation(
+                                        mark.bucket.bucket_execution_generation,
+                                    ),
+                                )
+                                .bucket)
+                            },
+                        )
+                        .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
+                        {
+                            return Err(bucket_snapshot_error_to_bucket_write_drain_error(
+                                conflicting_pending_metadata_command(
+                                    "conflicting pending mark bucket deleting command",
+                                ),
+                            ));
+                        }
+                        (command, false)
+                    }
+                    MetadataCommandPayload::MarkBucketDeleting(_) => {
+                        return Err(bucket_snapshot_error_to_bucket_write_drain_error(
+                            conflicting_pending_metadata_command(
+                                "conflicting pending mark bucket deleting command",
+                            ),
+                        ));
+                    }
+                    MetadataCommandPayload::CreateBucket(_)
+                    | MetadataCommandPayload::PutBucketVersioning(_)
+                    | MetadataCommandPayload::PutBucketAcl(_)
+                    | MetadataCommandPayload::PutBucketProperty(_)
+                    | MetadataCommandPayload::PutBucketSubresource(_)
+                    | MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
+                    | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
+                        let outcome = self
+                            .finish_pending_metadata_command_to_acting_set(
+                                pg_id, bucket, &command, false,
+                            )
+                            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                        if outcome == super::PendingMetadataCommandOutcome::Applied {
+                            runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                        }
+                        continue;
+                    }
+                    MetadataCommandPayload::ReserveObjectGeneration(_)
+                    | MetadataCommandPayload::ReleaseObjectGeneration(_)
+                    | MetadataCommandPayload::ReserveObjectVersion(_)
+                    | MetadataCommandPayload::CommitDirectPutObject(_)
+                    | MetadataCommandPayload::CommitMultipartObject(_)
+                    | MetadataCommandPayload::DeleteObjectVersion(_)
+                    | MetadataCommandPayload::InsertDeleteMarker(_)
+                    | MetadataCommandPayload::PutObjectMetadata(_)
+                    | MetadataCommandPayload::CreateStreamUpload(_)
+                    | MetadataCommandPayload::AppendStreamSegment(_)
+                    | MetadataCommandPayload::AbortStreamUpload(_)
+                    | MetadataCommandPayload::CommitStreamPart(_)
+                    | MetadataCommandPayload::CreateMultipartUpload(_)
+                    | MetadataCommandPayload::AbortMultipartUpload(_)
+                    | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
+                        for raw_pg_id in self.metadata_pg_ids() {
+                            self.drain_pending_object_metadata_commands_for_bucket(
+                                PgId::new(raw_pg_id),
+                                bucket,
+                            )
+                            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
+                            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                for raw_pg_id in self.metadata_pg_ids() {
+                    self.drain_pending_object_metadata_commands_for_bucket(
+                        PgId::new(raw_pg_id),
+                        bucket,
+                    )
+                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
+                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                }
+                if runtime_state
+                    .pending_metadata_command_for_bucket(pg_id, bucket)
+                    .is_some()
+                {
+                    continue;
+                }
+                if self.bucket_has_visible_data(bucket, true)? {
+                    return Err(crate::error::MetadataError::BucketNotEmpty.into());
+                }
+                let command_id = MetadataCommandId::new(
+                    self.operation_epoch(),
+                    pg_id,
+                    runtime_state.next_metadata_command_log_index(pg_id),
+                );
+                let bucket_pg = node.get_pg(pg_id.get())?;
+                let current = bucket_pg.head_bucket_record_raw(bucket)?;
+                let bucket_execution_generation =
+                    bucket_pg.next_bucket_execution_generation_candidate()?;
+                drop(bucket_pg);
+                let command = MetadataCommandEnvelope::new(
+                    command_id,
+                    MetadataCommandPayload::MarkBucketDeleting(
+                        MarkBucketDeletingCommand::from_bucket(
+                            current.with_execution_generation(bucket_execution_generation),
+                        ),
+                    ),
+                );
+                if runtime_state
+                    .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
+                    .is_err()
+                {
+                    continue;
+                }
+                (command, true)
+            };
+            let outcome = self
+                .finish_pending_metadata_command_to_acting_set(
+                    pg_id,
+                    bucket,
+                    &command,
+                    clear_pending_on_zero_apply,
+                )
+                .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+            if outcome == super::PendingMetadataCommandOutcome::Abandoned {
+                continue;
+            }
 
-        node.mark_bucket_deleting(bucket)?;
-        drain.persist();
-        Ok(())
+            runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
+            node.notify_bucket_coordination_change(bucket);
+            drain.persist();
+            return Ok(());
+        }
     }
 
     pub fn try_finalize_bucket_delete(
@@ -1425,6 +1575,11 @@ impl super::StorageCluster {
                             "unexpected pending put bucket subresource command for versioning",
                         ));
                     }
+                    MetadataCommandPayload::MarkBucketDeleting(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending mark bucket deleting command for versioning",
+                        ));
+                    }
                     MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
                         self.drain_pending_completed_multipart_sequence_command(
                             pg_id, bucket, &command,
@@ -1461,7 +1616,7 @@ impl super::StorageCluster {
                 let bucket_pg = primary_node.get_pg(pg_id.get())?;
                 let current = bucket_pg.head_bucket_record_raw(bucket)?;
                 let bucket_execution_generation =
-                    bucket_pg.reserve_bucket_execution_generation()?;
+                    bucket_pg.next_bucket_execution_generation_candidate()?;
                 let command = MetadataCommandEnvelope::new(
                     command_id,
                     MetadataCommandPayload::PutBucketVersioning(
@@ -1644,6 +1799,11 @@ impl super::StorageCluster {
                             "unexpected pending put bucket subresource command for bucket acl",
                         ));
                     }
+                    MetadataCommandPayload::MarkBucketDeleting(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending mark bucket deleting command for bucket acl",
+                        ));
+                    }
                     MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
                         self.drain_pending_completed_multipart_sequence_command(
                             pg_id, bucket, &command,
@@ -1680,7 +1840,7 @@ impl super::StorageCluster {
                 let bucket_pg = primary_node.get_pg(pg_id.get())?;
                 let current = bucket_pg.head_bucket_record_raw(bucket)?;
                 let bucket_execution_generation =
-                    bucket_pg.reserve_bucket_execution_generation()?;
+                    bucket_pg.next_bucket_execution_generation_candidate()?;
                 let command = MetadataCommandEnvelope::new(
                     command_id,
                     MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
@@ -1787,6 +1947,11 @@ impl super::StorageCluster {
                             "unexpected pending put bucket subresource command for bucket property",
                         ));
                     }
+                    MetadataCommandPayload::MarkBucketDeleting(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending mark bucket deleting command for bucket property",
+                        ));
+                    }
                     MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
                         self.drain_pending_completed_multipart_sequence_command(
                             pg_id, bucket, &command,
@@ -1823,7 +1988,7 @@ impl super::StorageCluster {
                 let bucket_pg = primary_node.get_pg(pg_id.get())?;
                 let current = bucket_pg.head_bucket_record_raw(bucket)?;
                 let bucket_execution_generation =
-                    bucket_pg.reserve_bucket_execution_generation()?;
+                    bucket_pg.next_bucket_execution_generation_candidate()?;
                 let command = MetadataCommandEnvelope::new(
                     command_id,
                     MetadataCommandPayload::PutBucketProperty(
@@ -1935,6 +2100,11 @@ impl super::StorageCluster {
                             "unexpected pending put bucket property command for bucket subresource",
                         ));
                     }
+                    MetadataCommandPayload::MarkBucketDeleting(_) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending mark bucket deleting command for bucket subresource",
+                        ));
+                    }
                     MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
                         self.drain_pending_completed_multipart_sequence_command(
                             pg_id, bucket, &command,
@@ -1970,7 +2140,7 @@ impl super::StorageCluster {
                 );
                 let bucket_pg = primary_node.get_pg(pg_id.get())?;
                 let bucket_execution_generation =
-                    bucket_pg.reserve_bucket_execution_generation()?;
+                    bucket_pg.next_bucket_execution_generation_candidate()?;
                 drop(bucket_pg);
                 let command = MetadataCommandEnvelope::new(
                     command_id,
@@ -6056,8 +6226,22 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<(), BucketWriteDrainError> {
-        self.metadata_primary_bridge_node()?
-            .test_create_deleting_bucket(bucket)
+        let owner_canonical_id = CanonicalUserId::from_principal("default-owner");
+        let acl_grants = AclGrants::default();
+        let create = CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: "default-owner",
+            owner_canonical_id: &owner_canonical_id,
+            acl_grants: &acl_grants,
+            public_read: false,
+            public_write: false,
+            versioning: BucketVersioningState::Disabled,
+            object_lock: BucketObjectLockConfig::default(),
+        };
+        let _ = self
+            .create_bucket_with_config_and_load_info(&create)
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        self.begin_bucket_delete(bucket)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

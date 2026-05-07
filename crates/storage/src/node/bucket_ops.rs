@@ -1,13 +1,17 @@
 use super::*;
+#[cfg(test)]
 use s3_types::{AclGrants, BucketVersioningState};
 use std::collections::HashMap;
 
+use crate::BucketInfo;
+#[cfg(test)]
 use crate::{
-    BucketEncryptionConfig, BucketInfo, BucketObjectLockConfig, BucketOwnershipControls,
-    CreateBucketConfig, PublicAccessBlockConfig, PutBucketSubresource,
+    BucketEncryptionConfig, BucketObjectLockConfig, BucketOwnershipControls, CreateBucketConfig,
+    PublicAccessBlockConfig, PutBucketSubresource,
 };
 
 impl SharedStorageNode {
+    #[cfg(test)]
     pub fn create_bucket_with_config_and_load_info(
         &self,
         config: &CreateBucketConfig<'_>,
@@ -31,6 +35,7 @@ impl SharedStorageNode {
         }
     }
 
+    #[cfg(test)]
     fn mutate_bucket_and_load_info(
         &self,
         bucket: &BucketName,
@@ -98,6 +103,7 @@ impl SharedStorageNode {
         }
     }
 
+    #[cfg(test)]
     pub fn begin_bucket_delete(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
         let drain = self.begin_bucket_write_drain(bucket)?;
         super::maybe_run_after_begin_bucket_delete_drain_hook(bucket);
@@ -149,6 +155,7 @@ impl SharedStorageNode {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn mark_bucket_deleting(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
         let pg_id = self.pg_topology.bucket_pg_for(bucket);
         let bucket_pg = self.get_pg(pg_id)?;
@@ -159,6 +166,7 @@ impl SharedStorageNode {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn delete_bucket_metadata(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
         let pg_id = self.pg_topology.bucket_pg_for(bucket);
         let bucket_pg = self.get_pg(pg_id)?;
@@ -166,6 +174,7 @@ impl SharedStorageNode {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn put_bucket_versioning_and_load_info(
         &self,
         bucket: &BucketName,
@@ -176,6 +185,7 @@ impl SharedStorageNode {
         })
     }
 
+    #[cfg(test)]
     pub fn put_bucket_object_lock_and_load_info(
         &self,
         bucket: &BucketName,
@@ -186,6 +196,7 @@ impl SharedStorageNode {
         })
     }
 
+    #[cfg(test)]
     pub fn put_bucket_encryption_and_load_info(
         &self,
         bucket: &BucketName,
@@ -196,6 +207,7 @@ impl SharedStorageNode {
         })
     }
 
+    #[cfg(test)]
     pub fn put_bucket_public_access_block_and_load_info(
         &self,
         bucket: &BucketName,
@@ -206,6 +218,7 @@ impl SharedStorageNode {
         })
     }
 
+    #[cfg(test)]
     pub fn delete_bucket_public_access_block_and_load_info(
         &self,
         bucket: &BucketName,
@@ -215,6 +228,7 @@ impl SharedStorageNode {
         })
     }
 
+    #[cfg(test)]
     pub fn put_bucket_ownership_controls_and_load_info(
         &self,
         bucket: &BucketName,
@@ -225,6 +239,7 @@ impl SharedStorageNode {
         })
     }
 
+    #[cfg(test)]
     pub fn delete_bucket_ownership_controls_and_load_info(
         &self,
         bucket: &BucketName,
@@ -234,6 +249,7 @@ impl SharedStorageNode {
         })
     }
 
+    #[cfg(test)]
     pub fn put_bucket_abac_enabled_and_load_info(
         &self,
         bucket: &BucketName,
@@ -244,6 +260,7 @@ impl SharedStorageNode {
         })
     }
 
+    #[cfg(test)]
     pub fn put_bucket_acl_and_load_info(
         &self,
         bucket: &BucketName,
@@ -262,6 +279,7 @@ impl SharedStorageNode {
         })
     }
 
+    #[cfg(test)]
     pub fn put_bucket_subresource_and_load_info(
         &self,
         bucket: &BucketName,
@@ -272,6 +290,7 @@ impl SharedStorageNode {
         })
     }
 
+    #[cfg(test)]
     pub fn delete_bucket_subresource_and_load_info(
         &self,
         bucket: &BucketName,
@@ -312,6 +331,7 @@ impl SharedStorageNode {
         )
     }
 
+    #[cfg(test)]
     pub fn try_finalize_bucket_delete(
         &self,
         bucket: &BucketName,

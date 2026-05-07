@@ -42,6 +42,7 @@ pub enum MetadataCommandApplyTestKind {
     PutBucketAcl,
     PutBucketProperty,
     PutBucketSubresource,
+    MarkBucketDeleting,
     AdvanceCompletedMultipartUploadSequence,
     ReserveObjectGeneration,
     ReleaseObjectGeneration,

@@ -43,6 +43,7 @@ const METADATA_COMMAND_DELETE_OBJECT_PAYLOAD_RECLAIM: u16 = 19;
 const METADATA_COMMAND_DELETE_COMPLETED_MULTIPART_UPLOAD: u16 = 20;
 const METADATA_COMMAND_ADVANCE_COMPLETED_MULTIPART_UPLOAD_SEQUENCE: u16 = 21;
 const METADATA_COMMAND_RESERVE_OBJECT_VERSION: u16 = 22;
+const METADATA_COMMAND_MARK_BUCKET_DELETING: u16 = 23;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct MetadataCommandLogIndex(NonZeroU64);
@@ -220,6 +221,7 @@ pub(crate) enum MetadataCommandPayload {
     PutBucketAcl(PutBucketAclCommand),
     PutBucketProperty(PutBucketPropertyCommand),
     PutBucketSubresource(PutBucketSubresourceCommand),
+    MarkBucketDeleting(MarkBucketDeletingCommand),
     ReserveObjectGeneration(ReserveObjectGenerationCommand),
     ReleaseObjectGeneration(ReleaseObjectGenerationCommand),
     ReserveObjectVersion(ReserveObjectVersionCommand),
@@ -247,6 +249,7 @@ impl MetadataCommandPayload {
             Self::PutBucketAcl(_) => METADATA_COMMAND_PUT_BUCKET_ACL,
             Self::PutBucketProperty(_) => METADATA_COMMAND_PUT_BUCKET_PROPERTY,
             Self::PutBucketSubresource(_) => METADATA_COMMAND_PUT_BUCKET_SUBRESOURCE,
+            Self::MarkBucketDeleting(_) => METADATA_COMMAND_MARK_BUCKET_DELETING,
             Self::ReserveObjectGeneration(_) => METADATA_COMMAND_RESERVE_OBJECT_GENERATION,
             Self::ReleaseObjectGeneration(_) => METADATA_COMMAND_RELEASE_OBJECT_GENERATION,
             Self::ReserveObjectVersion(_) => METADATA_COMMAND_RESERVE_OBJECT_VERSION,
@@ -269,6 +272,23 @@ impl MetadataCommandPayload {
                 METADATA_COMMAND_ADVANCE_COMPLETED_MULTIPART_UPLOAD_SEQUENCE
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MarkBucketDeletingCommand {
+    pub(crate) bucket: BucketRecord,
+}
+
+impl MarkBucketDeletingCommand {
+    pub(crate) fn from_bucket(mut bucket: BucketRecord) -> Self {
+        bucket.state = BucketState::Deleting;
+        bucket = bucket.command_metadata_projection();
+        Self { bucket }
+    }
+
+    pub(crate) fn bucket_name(&self) -> &BucketName {
+        &self.bucket.name
     }
 }
 
@@ -918,6 +938,9 @@ fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPaylo
         MetadataCommandPayload::PutBucketSubresource(command) => {
             encode_put_bucket_subresource(&mut out, command);
         }
+        MetadataCommandPayload::MarkBucketDeleting(command) => {
+            encode_mark_bucket_deleting(&mut out, command);
+        }
         MetadataCommandPayload::ReserveObjectGeneration(command) => {
             encode_reserve_object_generation(&mut out, command);
         }
@@ -994,6 +1017,10 @@ fn encode_put_bucket_subresource(out: &mut Vec<u8>, command: &PutBucketSubresour
     put_str(out, command.name.as_str());
     encode_bucket_subresource_mutation(out, &command.mutation);
     put_u64(out, command.bucket_execution_generation);
+}
+
+fn encode_mark_bucket_deleting(out: &mut Vec<u8>, command: &MarkBucketDeletingCommand) {
+    encode_bucket_record(out, &command.bucket);
 }
 
 fn encode_reserve_object_generation(out: &mut Vec<u8>, command: &ReserveObjectGenerationCommand) {
@@ -1891,6 +1918,27 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
+        assert!(envelope.verify_checksum());
+    }
+
+    #[test]
+    fn metadata_command_mark_bucket_deleting_encoding_is_stable() {
+        let command = MarkBucketDeletingCommand::from_bucket(test_bucket_record("bucket", 14));
+        let id = MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(3),
+            MetadataCommandLogIndex::new(14).unwrap(),
+        );
+        let envelope = MetadataCommandEnvelope::new(
+            id,
+            MetadataCommandPayload::MarkBucketDeleting(command.clone()),
+        );
+        let duplicate =
+            MetadataCommandEnvelope::new(id, MetadataCommandPayload::MarkBucketDeleting(command));
+
+        assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
+        assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
+        assert_eq!(envelope.checksum_crc64(), 0xaa6f66f9a614e924);
         assert!(envelope.verify_checksum());
     }
 

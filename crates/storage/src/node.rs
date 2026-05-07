@@ -12,9 +12,9 @@ use std::time::Instant;
 
 use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
 #[cfg(any(test, feature = "test-hooks"))]
-use s3_types::{
-    AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId, VersionId,
-};
+use s3_types::VersionId;
+#[cfg(test)]
+use s3_types::{AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId};
 
 use crate::error::{
     BucketSnapshotLoadError, BucketWriteDrainError, ObjectPgActionError, StoreError,
@@ -22,21 +22,25 @@ use crate::error::{
 use crate::pg_store::PgStore;
 use crate::pg_topology::PgTopology;
 use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
+#[cfg(test)]
+use crate::types::CreateBucketConfig;
+#[cfg(any(test, feature = "test-hooks"))]
+use crate::types::ListMultipartUploadsReq;
 use crate::types::{
     AuthorizedMultipartUploadRecord, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
-    BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind, EcShape,
-    GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq, ListPartsReq,
-    ListedMultipartParts, LoadedBucketSubresource, MultipartCompletionPreflight,
+    BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketSubresourceKind, EcShape, GenerationId,
+    ListPartsReq, ListedMultipartParts, LoadedBucketSubresource, MultipartCompletionPreflight,
     MultipartCompletionSnapshot, MultipartUploadManagementLookup, MultipartUploadRecord, ObjectKey,
     ObjectReadSnapshot, ObjectReadSnapshotOutcome, SessionId, ShardKey, StoredObject,
     StreamUploadState, StreamUploadTarget, UploadId, UploadState, WriteAck,
 };
+#[cfg(test)]
+use crate::types::{BucketState, ListObjectVersionsReq};
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::types::{
-    CreateBucketConfig, CreateStreamUploadReq, ListPartsResp, MultipartPartRecord,
-    MultipartPartSegmentRecord, MultipartReclaimRecord, ObjectPartRecord, ObjectSegmentRecord,
-    ObjectSegmentsReclaimRecord, PayloadReclaimRoot, PutLiveObjectReq, StreamUploadRecord,
-    StreamUploadSegmentRecord,
+    CreateStreamUploadReq, ListPartsResp, MultipartPartRecord, MultipartPartSegmentRecord,
+    MultipartReclaimRecord, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
+    PayloadReclaimRoot, PutLiveObjectReq, StreamUploadRecord, StreamUploadSegmentRecord,
 };
 
 const TRACE_TARGET: &str = "storage";
@@ -576,7 +580,7 @@ impl SharedStorageNode {
             % self.bucket_locks.len()
     }
 
-    fn notify_bucket_coordination_change(&self, bucket: &BucketName) {
+    pub(crate) fn notify_bucket_coordination_change(&self, bucket: &BucketName) {
         let idx = self.bucket_lock_index(bucket);
         let (generation_lock, generation_cvar) = &self.bucket_coordination[idx];
         let mut generation = generation_lock.lock().unwrap();
@@ -984,7 +988,7 @@ impl SharedStorageNode {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(test)]
     pub fn test_create_deleting_bucket(
         &self,
         bucket: &BucketName,
