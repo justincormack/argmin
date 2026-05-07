@@ -254,6 +254,11 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
+        name: "object_version_counters",
+        columns: &["bucket", "key", "next_version_id"],
+        filter: MetadataDigestFilter::AllRows,
+    },
+    MetadataDigestTable {
         name: "object_parts",
         columns: &[
             "bucket",
@@ -7208,6 +7213,7 @@ impl PgMetadataStore for PgStore {
             .ok_or_else(|| bucket_not_found(name.as_str()))
     }
 
+    #[cfg(test)]
     fn put_object_meta(&self, req: &PutObjectReq) -> Result<(), MetadataError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -7905,112 +7911,75 @@ impl PgMetadataStore for PgStore {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<VersionId, MetadataError> {
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
+        let max_existing: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT MAX(version_id) FROM objects WHERE bucket = ?1 AND key = ?2",
+                params![bucket, key],
+                |row| row.get(0),
+            )
+            .optional()
             .map_err(|e| MetadataError::Db {
-                context: "next version id (begin txn)",
+                context: "next version id (max existing)",
                 source: e,
-            })?;
-
-        let result: Result<VersionId, MetadataError> = (|| {
-            let max_existing: Option<i64> = self
-                .conn
-                .query_row(
-                    "SELECT MAX(version_id) FROM objects WHERE bucket = ?1 AND key = ?2",
-                    params![bucket, key],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| MetadataError::Db {
-                    context: "next version id (max existing)",
-                    source: e,
-                })?
-                .flatten();
-            let next_from_rows = match max_existing {
-                None => 1,
-                Some(v) => {
-                    let current = u64::try_from(v).map_err(|_| MetadataError::Db {
-                        context: "negative version_id in database",
-                        source: rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Integer,
-                            Box::from(format!("negative MAX(version_id): {v}")),
-                        ),
-                    })?;
-                    current.checked_add(1).ok_or_else(|| MetadataError::Db {
-                        context: "version_id overflow",
-                        source: rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Integer,
-                            Box::from("MAX(version_id) overflow"),
-                        ),
-                    })?
-                }
-            };
-
-            let stored_next: Option<i64> = self
-                .conn
-                .query_row(
-                    "SELECT next_version_id FROM object_version_counters \
-                     WHERE bucket = ?1 AND key = ?2",
-                    params![bucket, key],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| MetadataError::Db {
-                    context: "next version id (load counter)",
-                    source: e,
-                })?;
-            let next_from_counter = match stored_next {
-                None => 1,
-                Some(v) => u64::try_from(v).map_err(|_| MetadataError::Db {
-                    context: "negative next_version_id in database",
+            })?
+            .flatten();
+        let next_from_rows = match max_existing {
+            None => 1,
+            Some(v) => {
+                let current = u64::try_from(v).map_err(|_| MetadataError::Db {
+                    context: "negative version_id in database",
                     source: rusqlite::Error::FromSqlConversionFailure(
                         0,
                         rusqlite::types::Type::Integer,
-                        Box::from(format!("negative next_version_id: {v}")),
+                        Box::from(format!("negative MAX(version_id): {v}")),
                     ),
-                })?,
-            };
-            let next = next_from_rows.max(next_from_counter);
-            let following = next.checked_add(1).ok_or_else(|| MetadataError::Db {
-                context: "version_id overflow",
+                })?;
+                current.checked_add(1).ok_or_else(|| MetadataError::Db {
+                    context: "version_id overflow",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::from("MAX(version_id) overflow"),
+                    ),
+                })?
+            }
+        };
+
+        let stored_next: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT next_version_id FROM object_version_counters \
+                 WHERE bucket = ?1 AND key = ?2",
+                params![bucket, key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "next version id (load counter)",
+                source: e,
+            })?;
+        let next_from_counter = match stored_next {
+            None => 1,
+            Some(v) => u64::try_from(v).map_err(|_| MetadataError::Db {
+                context: "negative next_version_id in database",
                 source: rusqlite::Error::FromSqlConversionFailure(
                     0,
                     rusqlite::types::Type::Integer,
-                    Box::from("next_version_id overflow"),
+                    Box::from(format!("negative next_version_id: {v}")),
                 ),
-            })?;
-            self.conn
-                .execute(
-                    "INSERT INTO object_version_counters (bucket, key, next_version_id) \
-                     VALUES (?1, ?2, ?3) \
-                     ON CONFLICT(bucket, key) DO UPDATE SET next_version_id = excluded.next_version_id",
-                    params![bucket, key, following as i64],
-                )
-                .map_err(|e| MetadataError::Db {
-                    context: "next version id (store counter)",
-                    source: e,
-                })?;
-            Ok(VersionId::from_u64(next))
-        })();
-
-        match result {
-            Ok(version_id) => {
-                if let Err(e) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    return Err(MetadataError::Db {
-                        context: "next version id (commit txn)",
-                        source: e,
-                    });
-                }
-                Ok(version_id)
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
-        }
+            })?,
+        };
+        let next = next_from_rows.max(next_from_counter);
+        next.checked_add(1).ok_or_else(|| MetadataError::Db {
+            context: "version_id overflow",
+            source: rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Integer,
+                Box::from("next_version_id overflow"),
+            ),
+        })?;
+        Ok(VersionId::from_u64(next))
     }
 
     fn next_generation_id(
@@ -11694,6 +11663,7 @@ mod tests {
                     "object_generation_reservations",
                     MetadataDigestFilter::AllRows
                 ),
+                ("object_version_counters", MetadataDigestFilter::AllRows),
                 ("object_parts", MetadataDigestFilter::AllRows),
                 (
                     "object_segment_reclaim_segments",
@@ -12433,6 +12403,36 @@ mod tests {
                         "UPDATE multipart_reclaims SET created_at = ?1 \
                          WHERE bucket = ?2 AND key = ?3 AND generation_id = ?4",
                         params![114_i64, bucket.as_str(), key.as_str(), 3_i64],
+                    )
+                    .unwrap();
+            },
+        );
+    }
+
+    #[test]
+    fn metadata_state_digest_covers_object_version_counters() {
+        assert_metadata_state_digest_covers_mutation(
+            |store| {
+                let bucket = trusted_bucket_name("digest-bucket");
+                let key = trusted_object_key("object");
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO object_version_counters \
+                         (bucket, key, next_version_id) VALUES (?1, ?2, ?3)",
+                        params![bucket.as_str(), key.as_str(), 2_i64],
+                    )
+                    .unwrap();
+            },
+            |store| {
+                let bucket = trusted_bucket_name("digest-bucket");
+                let key = trusted_object_key("object");
+                store
+                    .conn
+                    .execute(
+                        "UPDATE object_version_counters SET next_version_id = ?1 \
+                         WHERE bucket = ?2 AND key = ?3",
+                        params![3_i64, bucket.as_str(), key.as_str()],
                     )
                     .unwrap();
             },

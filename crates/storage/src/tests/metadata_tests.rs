@@ -651,6 +651,26 @@ fn delete_bucket_clears_object_version_counter_records() {
 
     let v1 = store.next_version_id(&bucket, &key).unwrap();
     assert_eq!(v1, VersionId::from_u64(1));
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: v1,
+            owner: test_owner(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::MIN,
+            ec: EcShape { k: 4, m: 2 },
+            size: 10,
+            etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        }))
+        .unwrap();
     let counter_rows: i64 = store
         .connection()
         .query_row(
@@ -661,6 +681,7 @@ fn delete_bucket_clears_object_version_counter_records() {
         .unwrap();
     assert_eq!(counter_rows, 1);
 
+    store.delete_object_version(&bucket, &key, v1).unwrap();
     store.delete_bucket(&bucket).unwrap();
     let counter_rows: i64 = store
         .connection()
@@ -7790,6 +7811,27 @@ fn next_version_id_increments() {
         .unwrap();
     assert!(matches!(v2, VersionId::Versioned(_)));
     assert_ne!(v1, v2);
+}
+
+#[test]
+fn next_version_id_does_not_mutate_counter() {
+    let (_dir, store) = make_pg_store();
+    let bucket = bucket_name("bucket");
+    let key = object_key("k");
+
+    assert_eq!(
+        store.next_version_id(&bucket, &key).unwrap(),
+        VersionId::from_u64(1)
+    );
+    let counter_rows: i64 = store
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM object_version_counters WHERE bucket = ?1 AND key = ?2",
+            [bucket.as_str(), key.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(counter_rows, 0);
 }
 
 #[test]

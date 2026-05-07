@@ -77,13 +77,14 @@ command-owned durable serving, in-progress, and cleanup metadata:
 - `object_segment_reclaim_segments`
 - `object_segments`
 - `object_segments_reclaims`
+- `object_version_counters`
 - `objects`
 - `stream_upload_segments`
 - `stream_uploads`
 
 The current inventory still excludes state that is local-only or not yet
 owned by its own canonical command stream: bucket write-drain counters,
-`pg_counters`, `object_version_counters`, `multipart_uploads.state`, and
+`pg_counters`, `multipart_uploads.state`, and
 `buckets.completed_multipart_upload_sequence`. Those are Phase 7.3 gaps, not
 implicit exemptions from metadata integrity.
 

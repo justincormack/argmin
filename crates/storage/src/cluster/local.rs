@@ -1752,6 +1752,33 @@ mod tests {
         }
     }
 
+    fn assert_object_version_counter_on_acting_nodes(
+        map: &LocalClusterMap,
+        node_ids: &[NodeId],
+        object_pg: u32,
+        bucket: &crate::BucketName,
+        key: &crate::ObjectKey,
+        expected_next_version_id: u64,
+    ) {
+        for node_id in node_ids {
+            let node = map.node(*node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            let next_version_id: i64 = pg
+                .connection()
+                .query_row(
+                    "SELECT COALESCE(MAX(next_version_id), 0) \
+                     FROM object_version_counters WHERE bucket = ?1 AND key = ?2",
+                    rusqlite::params![bucket.as_str(), key.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                next_version_id as u64, expected_next_version_id,
+                "unexpected object version counter on node {node_id:?}"
+            );
+        }
+    }
+
     fn seed_streamed_multipart_completion(
         cluster: &crate::StorageCluster,
         bucket: &crate::BucketName,
@@ -1900,45 +1927,6 @@ mod tests {
                 completed_uploads[0].1
             );
         }
-    }
-
-    fn seed_prior_standard_object_on_node(
-        map: &LocalClusterMap,
-        node_id: NodeId,
-        object_pg: u32,
-        bucket: &crate::BucketName,
-        key: &crate::ObjectKey,
-    ) {
-        let node = map.node(node_id).unwrap().storage_node();
-        let pg = node.get_pg(object_pg).unwrap();
-        crate::PgMetadataStore::put_object_meta(
-            &*pg,
-            &crate::PutObjectReq::Live(crate::PutLiveObjectReq {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                version_id: crate::VersionId::Null,
-                owner: crate::OwnerIdentity::from_principal("seed-owner"),
-                acl_grants: crate::AclGrants::default(),
-                public_read: false,
-                generation_id: crate::GenerationId::MIN,
-                size: 1,
-                etag: crate::ObjectEtag::single_part(0x11),
-                ec: EcShape { k: 1, m: 0 },
-                layout: crate::ObjectLayout::Standard,
-                tags: None,
-                metadata_blob: None,
-                system_metadata_blob: None,
-                object_lock: crate::ObjectLockState::default(),
-                encryption: crate::ObjectEncryption::None,
-            }),
-        )
-        .unwrap();
-        assert_eq!(
-            pg.object_write_sequence(bucket.as_str(), key.as_str(), crate::VersionId::Null)
-                .unwrap(),
-            Some(1)
-        );
-        pg.refresh_metadata_command_state_digest().unwrap();
     }
 
     fn completed_multipart_order_on_node(
@@ -4535,7 +4523,7 @@ mod tests {
                 payload,
             )
             .unwrap();
-        let commit_req = direct_put_commit_req(
+        let mut commit_req = direct_put_commit_req(
             &bucket,
             &key,
             reservation_id,
@@ -4544,6 +4532,7 @@ mod tests {
             segment_okh,
             &written,
         );
+        commit_req.versioning = crate::BucketVersioningState::Enabled;
 
         let outcome = cluster
             .commit_direct_put_object_from_payload_shards(
@@ -4564,6 +4553,14 @@ mod tests {
             object_pg,
             &commit_req,
             &outcome,
+        );
+        assert_object_version_counter_on_acting_nodes(
+            &map,
+            &node_ids,
+            object_pg,
+            &bucket,
+            &key,
+            outcome.version_id.to_u64() + 1,
         );
 
         for node_id in node_ids {
@@ -5165,7 +5162,7 @@ mod tests {
                 payload,
             )
             .unwrap();
-        let commit_req = direct_put_commit_req(
+        let mut commit_req = direct_put_commit_req(
             &bucket,
             &key,
             reservation_id,
@@ -5174,6 +5171,7 @@ mod tests {
             segment_okh,
             &written,
         );
+        commit_req.versioning = crate::BucketVersioningState::Enabled;
 
         let outcome = cluster
             .commit_direct_put_object_from_payload_shards(
@@ -5194,6 +5192,14 @@ mod tests {
             object_pg,
             &commit_req,
             &outcome,
+        );
+        assert_object_version_counter_on_acting_nodes(
+            &map,
+            &node_ids,
+            object_pg,
+            &bucket,
+            &key,
+            outcome.version_id.to_u64() + 1,
         );
     }
 
@@ -7645,7 +7651,7 @@ mod tests {
                 payload,
             )
             .unwrap();
-        let commit_req = direct_put_commit_req(
+        let mut commit_req = direct_put_commit_req(
             &bucket,
             &key,
             reservation_id,
@@ -7654,6 +7660,7 @@ mod tests {
             segment_okh,
             &written,
         );
+        commit_req.versioning = crate::BucketVersioningState::Enabled;
 
         let _serial = lock_metadata_command_apply_hook_test();
         let fail_once = Arc::new(AtomicBool::new(true));
@@ -7741,6 +7748,14 @@ mod tests {
             object_pg,
             &commit_req,
             &outcome,
+        );
+        assert_object_version_counter_on_acting_nodes(
+            &map,
+            &node_ids,
+            object_pg,
+            &bucket,
+            &key,
+            outcome.version_id.to_u64() + 1,
         );
     }
 
@@ -8069,13 +8084,14 @@ mod tests {
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
         create_test_bucket(&cluster, &bucket);
-        let (req, expected_segment) =
+        let (mut req, mut expected_segment) =
             seed_streamed_multipart_completion(&cluster, &bucket, &key, "streamedcomplete");
-        seed_prior_standard_object_on_node(&map, NodeId::new(0), object_pg, &bucket, &key);
+        req.versioning = crate::BucketVersioningState::Enabled;
 
         let outcome = cluster
             .complete_multipart_upload_commit_serialized(req.clone(), 16)
             .unwrap();
+        expected_segment.version_id = outcome.version_id.to_u64();
 
         assert!(map
             .runtime_state()
@@ -8088,6 +8104,14 @@ mod tests {
             &req,
             &expected_segment,
             &outcome,
+        );
+        assert_object_version_counter_on_acting_nodes(
+            &map,
+            &node_ids,
+            object_pg,
+            &bucket,
+            &key,
+            outcome.version_id.to_u64() + 1,
         );
     }
 
@@ -9524,6 +9548,14 @@ mod tests {
                 other => panic!("expected delete marker on node {node_id:?}, got {other:?}"),
             }
         }
+        assert_object_version_counter_on_acting_nodes(
+            &map,
+            &node_ids,
+            object_pg,
+            &bucket,
+            &key,
+            marker.version_id.to_u64() + 1,
+        );
     }
 
     #[test]

@@ -1832,9 +1832,16 @@ Completed:
     concurrent uncommitted appends on distinct placed shard keys, while the
     command-owned `stream_upload_segments.segment_vid` value remains in the
     canonical digest
+  - moved `object_version_counters` behind object metadata command ownership:
+    `next_version_id` is now a read-only candidate allocator, while object
+    publish/delete-marker commands advance the durable counter during acting-set
+    command apply; the counter table is now included in the canonical digest
+  - narrowed the legacy `PgMetadataStore::put_object_meta` object-row seeder to
+    `cfg(test)`, so production code cannot mutate command-owned object rows or
+    version counters outside metadata command apply
   - retained explicit exclusions for state that is still local-only or still
     mutates outside its own command stream: bucket write-drain counters,
-    `pg_counters`, `object_version_counters`, `multipart_uploads.state`, and
+    `pg_counters`, `multipart_uploads.state`, and
     `buckets.completed_multipart_upload_sequence`
   - remaining Phase 7.3 work is to move those allocator/counter rows behind
     canonical command/checkpoint ownership, then include them in the digest

@@ -202,10 +202,11 @@ pub trait PgMetadataStore {
         name: &BucketName,
     ) -> Result<BucketEncryptionConfig, MetadataError>;
 
-    /// Insert or replace an object record.
+    /// Test-only object row seeder.
     ///
-    /// For VersionId::Null (unversioned): INSERT OR REPLACE (overwrite).
-    /// For VersionId::Versioned (versioned): INSERT only (new version).
+    /// Production object publication must go through metadata command apply so
+    /// digest-covered command-owned rows cannot be bypassed.
+    #[cfg(test)]
     fn put_object_meta(&self, req: &PutObjectReq) -> Result<(), MetadataError>;
 
     /// Get the latest object record (highest version_id).
@@ -287,7 +288,7 @@ pub trait PgMetadataStore {
         key: &ObjectKey,
     ) -> Result<Vec<StoredObject>, MetadataError>;
 
-    /// Get the next version_id for a key (MAX(version_id) + 1).
+    /// Get the next candidate version_id for a key without reserving it.
     ///
     /// Returns 1 if no versions exist.
     fn next_version_id(
