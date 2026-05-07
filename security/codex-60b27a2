@@ -1,0 +1,156 @@
+Completed-MPU prune poisons metadata digest
+Link: https://chatgpt.com/codex/cloud/security/findings/42dcdfd5611c8191829aca80020473f3?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 60b27a2
+Author: justin@specialbusservice.com
+Created: 06/05/2026, 20:38:58
+Assignee: Unassigned
+Signals: Security
+
+# Resolution
+Fixed in commit 022cbee8ce3969f74c69f5587bf05925b3e721bb
+(`Route completed MPU prune through metadata commands`).
+
+The fix adds a row-shaped `DeleteCompletedMultipartUpload` metadata command
+whose checksum covers the exact completed-MPU tombstone row. Completed-MPU
+pruning and bucket-finalization cleanup now scan routed metadata PG acting sets
+and remove each pruned tombstone through the metadata command apply path instead
+of mutating only the PG primary directly. Partial apply is retryable through the
+pending command mechanism, and the regression
+`completed_multipart_prune_partial_command_retries_and_preserves_digest` verifies
+that a failed prune can be retried and that later metadata commands on the PG do
+not hit a digest mismatch.
+
+# Summary
+Introduced. The pre-existing pruning path was safe only while completed_multipart_uploads was outside the canonical digest. This commit made the table digest-covered without converting pruning to a command-consistent acting-set mutation or refreshing the digest after the local primary-only delete.
+completed_multipart_uploads is now included in METADATA_DIGEST_TABLES, so changes to this table affect metadata_state_digest(). However, prune_completed_multipart_uploads_for_bucket_with_limit() is invoked after normal CompleteMultipartUpload processing and deletes old completed-MPU tombstones by calling metadata_pg(), which resolves only the primary node's PG. The delete is not applied to the acting set as a metadata command and does not refresh the affected replica's stored state_digest. For PGs whose digest gate is still active, the next metadata command runs metadata_state_digest_mismatch(), sees the changed completed_multipart_uploads table, and returns MetadataStateDigestMismatch instead of accepting the command. An authenticated writer can create an old completed MPU on a target PG, then complete enough newer MPUs on another PG to exceed the per-bucket retained tombstone limit and prune the old row, persistently denying subsequent writes/metadata operations on the target PG until administrative repair.
+
+# Evidence
+crates/server-core/src/coordinator/multipart.rs (L625 to 650)
+  Note: Normal CompleteMultipartUpload requests call complete_multipart_upload_commit_serialized with the retained completed-MPU limit, making the pruning path reachable during ordinary authenticated S3 API use.
+```
+        let completion_outcome = self
+            .storage_node
+            .complete_multipart_upload_commit_serialized(
+                storage::CompleteMultipartCommitRequest {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    upload_id: upload_id.clone(),
+                    versioning: bucket_info.versioning,
+                    owner: upload.owner.clone(),
+                    acl_grants: upload.acl_grants.clone(),
+                    public_read: upload.public_read,
+                    generation_id: upload.object_generation_id,
+                    size: total_size,
+                    etag_crc64,
+                    tags: upload.tags.clone(),
+                    metadata_blob: Some(upload.metadata_blob.clone()),
+                    system_metadata_blob: Some(system_metadata_bytes),
+                    object_lock: Self::resolve_new_object_lock_state(
+                        &bucket_info,
+                        upload.object_lock,
+                    )?,
+                    encryption: final_encryption,
+                    part_records: part_records.clone(),
+                },
+                COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT,
+            )
+```
+
+crates/storage/src/cluster/request_ops.rs (L1804 to 1825)
+  Note: The pruning routine scans completed MPU tombstones and deletes excess rows directly via metadata_pg(); it does not apply a metadata command to all acting replicas or refresh the digest.
+```
+    pub fn prune_completed_multipart_uploads_for_bucket_with_limit(
+        &self,
+        bucket: &BucketName,
+        keep: usize,
+    ) -> Result<(), ObjectPgActionError> {
+        crate::node::maybe_run_before_completed_multipart_prune_hook(bucket)?;
+
+        let mut uploads: Vec<(u32, UploadId, u64)> = Vec::new();
+        for pg_id in self.metadata_pg_ids() {
+            let pg = self.metadata_pg(pg_id)?;
+            let local = pg.list_completed_multipart_uploads_for_bucket(bucket.as_str())?;
+            uploads.extend(
+                local
+                    .into_iter()
+                    .map(|(upload_id, completion_order)| (pg_id, upload_id, completion_order)),
+            );
+        }
+
+        uploads.sort_by_key(|entry| std::cmp::Reverse(entry.2));
+        for (pg_id, upload_id, _) in uploads.into_iter().skip(keep) {
+            let pg = self.metadata_pg(pg_id)?;
+            pg.delete_completed_multipart_upload(&upload_id)?;
+```
+
+crates/storage/src/cluster/request_ops.rs (L461 to 463)
+  Note: metadata_pg() resolves the primary node's PG only, so the pruning delete is primary-local rather than acting-set consistent.
+```
+    fn metadata_pg(&self, pg_id: u32) -> Result<MutexGuard<'_, PgStore>, StoreError> {
+        self.metadata_pg_primary_node(pg_id)?.get_pg(pg_id)
+    }
+```
+
+crates/storage/src/pg_store.rs (L128 to 142)
+  Note: The commit adds completed_multipart_uploads to the canonical digest inventory, making deletes from this table affect metadata digest validation.
+```
+    MetadataDigestTable {
+        name: "completed_multipart_uploads",
+        columns: &[
+            "upload_id",
+            "bucket",
+            "key",
+            "completion_order",
+            "completed_at",
+            "owner_principal",
+            "owner_canonical_id",
+            "initiator_principal",
+            "initiator_canonical_id",
+        ],
+        filter: MetadataDigestFilter::AllRows,
+    },
+```
+
+crates/storage/src/pg_store.rs (L642 to 658)
+  Note: Future metadata commands check the stored digest before acceptance and fail with MetadataStateDigestMismatch after the out-of-band prune changes the digest-covered table.
+```
+    pub(crate) fn metadata_command_acceptance(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        if command.id().pg_id().get() != self.pg_id {
+            return Err(StoreError::MetadataCommandWrongPg {
+                node_id,
+                command_pg_id: command.id().pg_id().get(),
+                target_pg_id: self.pg_id,
+                cluster_epoch: command.id().cluster_epoch(),
+            });
+        }
+        if let Some((cluster_epoch, expected_digest, actual_digest)) =
+            self.metadata_state_digest_mismatch()?
+        {
+            return Err(StoreError::MetadataStateDigestMismatch {
+```
+
+crates/storage/src/pg_store.rs (L6596 to 6607)
+  Note: The completed MPU tombstone delete directly mutates the digest-covered table without updating metadata_command_replica_state.state_digest.
+```
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM completed_multipart_uploads WHERE upload_id = ?1",
+                params![upload_id.as_str()],
+            )
+            .map(|_| ())
+            .map_err(|e| MetadataError::Db {
+                context: "delete completed multipart upload",
+                source: e,
+            })
+    }
+```

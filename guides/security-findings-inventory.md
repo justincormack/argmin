@@ -46,6 +46,7 @@ for the current local security suite.
 | --- | --- | --- | --- |
 | `security/codex-2f977e8` Pending direct PUT can resurrect deleted objects | fixed in `1a4ff75` | `cargo nextest run -p storage object_delete_drains_pending_direct_put_commit_before_delete` | The finding was valid for `2f977e8`; object deletes now drain pending object metadata commands before observing or deleting current object state. |
 | `security/codex-d403b97` Unguarded stream-create pending commands can be lost | fixed in `1cc2543` | `cargo nextest run -p storage pending_metadata_command_insert_rejects_existing_without_overwrite stream_put_create_drains_unrelated_pending_create_before_new_session` | Pending metadata command insertion now rejects collisions without overwrite; stream-create drains the existing pending command and releases the losing reservation before retry/error. |
+| `security/codex-60b27a2` Completed-MPU prune poisons metadata digest | fixed in `022cbee` | `cargo nextest run -p storage completed_multipart_prune_partial_command_retries_and_preserves_digest` | Completed-MPU tombstone pruning and bucket-finalization cleanup now delete tombstones through a row-shaped metadata command applied to the owning PG acting set. |
 
 ## Stateful Multipart, Reclaim, Lifecycle, and Object Lock
 
