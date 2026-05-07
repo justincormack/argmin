@@ -563,6 +563,8 @@ pub(crate) struct CommitMultipartObjectCommand {
     pub(crate) selected_streaming_segments: Vec<MultipartPartSegmentRecord>,
     pub(crate) omitted_parts: Vec<MultipartPartRecord>,
     pub(crate) omitted_streaming_segments: Vec<MultipartPartSegmentRecord>,
+    pub(crate) stream_uploads: Vec<StreamUploadRecord>,
+    pub(crate) stream_upload_segments: Vec<StreamUploadSegmentRecord>,
     pub(crate) write_sequence: u64,
     pub(crate) completion_order: u64,
     pub(crate) completed_at_millis: u64,
@@ -1084,6 +1086,14 @@ fn encode_commit_multipart_object(out: &mut Vec<u8>, command: &CommitMultipartOb
     for segment in &command.omitted_streaming_segments {
         encode_multipart_part_segment(out, segment);
     }
+    put_u32(out, command.stream_uploads.len() as u32);
+    for session in &command.stream_uploads {
+        encode_stream_upload(out, session);
+    }
+    put_u32(out, command.stream_upload_segments.len() as u32);
+    for segment in &command.stream_upload_segments {
+        encode_stream_upload_segment(out, segment);
+    }
     put_u64(out, command.write_sequence);
     put_u64(out, command.completion_order);
     put_u64(out, command.completed_at_millis);
@@ -1163,13 +1173,7 @@ fn encode_put_object_metadata(out: &mut Vec<u8>, command: &PutObjectMetadataComm
 }
 
 fn encode_create_stream_upload(out: &mut Vec<u8>, command: &CreateStreamUploadCommand) {
-    put_str(out, command.session.session_id.as_str());
-    put_str(out, command.session.bucket.as_str());
-    put_str(out, command.session.key.as_str());
-    encode_stream_upload_target(out, &command.session.target);
-    put_u8(out, command.session.state as u8);
-    put_u64(out, command.session.created_at);
-    encode_object_encryption(out, &command.session.encryption);
+    encode_stream_upload(out, &command.session);
 }
 
 fn encode_append_stream_segment(out: &mut Vec<u8>, command: &AppendStreamSegmentCommand) {
@@ -1280,6 +1284,24 @@ fn encode_abort_multipart_upload_cleanup(out: &mut Vec<u8>, cleanup: &AbortMulti
     for segment in &cleanup.streaming_segments {
         encode_multipart_part_segment(out, segment);
     }
+    put_u32(out, cleanup.stream_uploads.len() as u32);
+    for session in &cleanup.stream_uploads {
+        encode_stream_upload(out, session);
+    }
+    put_u32(out, cleanup.stream_upload_segments.len() as u32);
+    for segment in &cleanup.stream_upload_segments {
+        encode_stream_upload_segment(out, segment);
+    }
+}
+
+fn encode_stream_upload(out: &mut Vec<u8>, session: &StreamUploadRecord) {
+    put_str(out, session.session_id.as_str());
+    put_str(out, session.bucket.as_str());
+    put_str(out, session.key.as_str());
+    encode_stream_upload_target(out, &session.target);
+    put_u8(out, session.state as u8);
+    put_u64(out, session.created_at);
+    encode_object_encryption(out, &session.encryption);
 }
 
 fn encode_multipart_upload(out: &mut Vec<u8>, upload: &MultipartUploadRecord) {
@@ -2330,6 +2352,19 @@ mod tests {
                 selected_streaming_segments: vec![selected_streaming_segment.clone()],
                 omitted_parts: vec![uploaded_part.clone()],
                 omitted_streaming_segments: vec![omitted_streaming_segment.clone()],
+                stream_uploads: vec![StreamUploadRecord {
+                    session_id: stream_session_id.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    target: StreamUploadTarget::UploadPart {
+                        upload_id: upload_id.clone(),
+                        part_number: 3,
+                    },
+                    state: StreamUploadState::InProgress,
+                    created_at: 558,
+                    encryption: ObjectEncryption::None,
+                }],
+                stream_upload_segments: vec![stream_segment.clone()],
                 write_sequence: 43,
                 completion_order: 12,
                 completed_at_millis: 556,
@@ -2446,6 +2481,19 @@ mod tests {
                     upload: multipart_upload.clone(),
                     parts: vec![uploaded_part.clone()],
                     streaming_segments: vec![omitted_streaming_segment.clone()],
+                    stream_uploads: vec![StreamUploadRecord {
+                        session_id: stream_session_id.clone(),
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        target: StreamUploadTarget::UploadPart {
+                            upload_id: upload_id.clone(),
+                            part_number: 2,
+                        },
+                        state: StreamUploadState::InProgress,
+                        created_at: 562,
+                        encryption: ObjectEncryption::None,
+                    }],
+                    stream_upload_segments: vec![stream_segment.clone()],
                 },
             })),
             MetadataCommandPayload::CreateStreamUpload(Box::new(
@@ -2551,7 +2599,7 @@ mod tests {
                 0x3acf49df359790d4,
                 0xb5a8e642f639b9a8,
                 0x892df6c0f857bf33,
-                0xfbb11e5c2fc9738c,
+                0x7920c33a006e1d68,
                 0x53fdbf4c6f062d53,
                 0x6df04a5fc73e478a,
                 0xbda5330ae032bc4d,
@@ -2562,7 +2610,7 @@ mod tests {
                 0x102e75d82949a914,
                 0x3a98e0cfac7868d4,
                 0x8b678e0025c9b1d3,
-                0xbdcef0c26be17ad5,
+                0x6262d109d843a323,
                 0x3c300c538341970d,
                 0xc680813c7b2166c5,
                 0xa9a8f76af3abec2e,

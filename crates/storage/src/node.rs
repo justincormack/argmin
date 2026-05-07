@@ -1039,7 +1039,9 @@ impl SharedStorageNode {
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = self.test_object_pg_id_for(bucket, key);
         let pg = self.get_pg(pg_id)?;
-        Ok(pg.set_upload_state(upload_id, state)?)
+        pg.set_upload_state(upload_id, state)?;
+        pg.refresh_metadata_command_state_digest()?;
+        Ok(())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

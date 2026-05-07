@@ -4149,6 +4149,7 @@ impl HttpFrontend {
             .append_stream_part_data(&crate::coordinator::AppendStreamPartRequest {
                 bucket: ctx.bucket().clone(),
                 key: ctx.key().clone(),
+                upload_id: ctx.upload_id(),
                 session_id: ctx.session_id(),
                 part_number: ctx.part_number(),
                 segment_index,
@@ -10417,13 +10418,14 @@ mod tests {
     ) -> crate::coordinator::UploadPartResult {
         let requester = HttpFrontend::requester_from_auth(&test_auth());
         let bucket_name = test_bucket_name(bucket);
+        let upload_id = parse_present_upload_id(upload_id).unwrap();
         let session = fe
             .coordinator
             .begin_stream_part(&BeginStreamPartRequest {
                 upload: multipart_object_request(
                     &bucket_name,
                     key,
-                    parse_present_upload_id(upload_id).unwrap(),
+                    upload_id.clone(),
                     requester.clone(),
                     None,
                 )
@@ -10444,6 +10446,7 @@ mod tests {
                     &crate::coordinator::AppendStreamPartRequest {
                         bucket: parse_bucket_name(bucket).unwrap(),
                         key: parse_object_key(key).unwrap(),
+                        upload_id: &upload_id,
                         session_id: &session.session_id,
                         part_number,
                         segment_index: segment_index as u32,
@@ -10464,7 +10467,7 @@ mod tests {
                     upload: multipart_object_request(
                         &bucket_name,
                         key,
-                        parse_present_upload_id(upload_id).unwrap(),
+                        upload_id.clone(),
                         requester,
                         None,
                     )

@@ -808,6 +808,7 @@ pub struct BeginStreamPartRequest<'a> {
 pub struct AppendStreamPartRequest<'a> {
     pub bucket: BucketName,
     pub key: ObjectKey,
+    pub upload_id: &'a storage::UploadId,
     pub session_id: &'a SessionId,
     pub part_number: u32,
     pub segment_index: u32,

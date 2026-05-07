@@ -423,8 +423,8 @@ pub trait PgMetadataStore {
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, MetadataError>;
 
-    /// Transition an upload's state. Only valid transitions from InProgress
-    /// are accepted; returns `UploadNotInProgress` otherwise.
+    /// Test hook for forcing an upload state.
+    #[cfg(any(test, feature = "test-hooks"))]
     fn set_upload_state(
         &self,
         upload_id: &UploadId,
@@ -510,7 +510,11 @@ pub trait PgMetadataStore {
         version_id: VersionId,
     ) -> Result<(), MetadataError>;
 
-    /// Atomically finalize a multipart upload.
+    /// Test-only direct multipart completion seeder.
+    ///
+    /// Production multipart completion must go through metadata command apply
+    /// so command-owned object, upload, completed-upload, and streamed
+    /// UploadPart session state cannot bypass the object-PG command stream.
     ///
     /// In a single transaction:
     /// 1. Transition upload to `Completing`
@@ -521,6 +525,7 @@ pub trait PgMetadataStore {
     /// 6. Delete omitted streamed part segment rows and return omitted payloads for shard cleanup
     /// 7. Record the completed upload for AbortMultipartUpload semantics
     /// 8. Delete the `multipart_uploads` + `multipart_parts` rows
+    #[cfg(test)]
     fn complete_multipart_commit(
         &self,
         upload_id: &UploadId,

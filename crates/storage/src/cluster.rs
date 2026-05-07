@@ -227,6 +227,14 @@ fn pending_command_completes_stream_session(
         MetadataCommandPayload::CommitStreamPart(commit) => {
             commit.bucket == *bucket && commit.key == *key && commit.session_id == *session_id
         }
+        MetadataCommandPayload::CommitMultipartObject(commit) => {
+            commit.object.bucket == *bucket
+                && commit.object.key == *key
+                && commit
+                    .stream_uploads
+                    .iter()
+                    .any(|session| session.session_id == *session_id)
+        }
         _ => false,
     }
 }
@@ -1377,6 +1385,12 @@ impl StorageCluster {
                         stale_generation_id,
                     );
                 }
+                self.delete_complete_multipart_cleanup_best_effort(
+                    &commit.object.bucket,
+                    &commit.object.key,
+                    commit.object.generation_id,
+                    &Self::complete_multipart_command_cleanup(commit),
+                );
             }
             MetadataCommandPayload::DeleteObjectVersion(delete) => {
                 if let Some(reclaim_generation_id) =
@@ -2286,12 +2300,13 @@ impl StorageCluster {
         request: &PrepareStreamUploadSegmentAppendReq,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_node = self.object_metadata_primary_node(bucket, key)?;
+        let _bucket_guard = object_node.lock_bucket(bucket);
         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
         let runtime_state = self.local_map.runtime_state();
-        self.object_metadata_primary_node(bucket, key)?
-            .prepare_stream_segment_append(bucket, key, request, || {
-                runtime_state.allocate_stream_segment_vid(&request.session_id)
-            })
+        object_node.prepare_stream_segment_append(bucket, key, request, || {
+            runtime_state.allocate_stream_segment_vid(&request.session_id)
+        })
     }
 
     pub fn write_stream_segment_payload_shards(

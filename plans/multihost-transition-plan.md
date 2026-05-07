@@ -1312,9 +1312,10 @@ Work items:
      - add `CommitMultipartObject` command payloads as the actual completed
        multipart object publication path, carrying the exact live object,
        manifest parts, selected streamed part segment rows, completed-upload
-       idempotence row data, omitted-part cleanup refs, deterministic object
-       write sequence, last modified timestamp, and stale payload reclaim rows
-       needed to converge replicas after completion
+       idempotence row data, omitted-part cleanup refs, active streamed
+       UploadPart session cleanup refs, deterministic object write sequence,
+       last modified timestamp, and stale payload reclaim rows needed to
+       converge replicas after completion
      - initially advanced each applying node's bucket-PG completed multipart
        upload sequence to at least the command's completion order before
        publishing the object-PG command; Phase 7.3 replaces that cross-PG side
@@ -1361,10 +1362,11 @@ Work items:
      - add an `AbortMultipartUpload` command payload so explicit abort deletes
        the multipart upload row, generation reservation, part rows, and streamed
        part staging metadata from every acting object-PG node
-     - keep payload shard deletion cluster-owned; abort preparation first marks
-       the upload `Aborting` on the object-PG primary, then carries the primary
-       cleanup snapshot in the abort command so partial-apply retries can still
-       clean uploaded part payloads after metadata converges
+     - keep payload shard deletion cluster-owned; abort preparation snapshots
+       the primary cleanup rows under the object-PG bucket lock and carries
+       them in the abort command so partial-apply retries can still clean
+       uploaded part and active streamed UploadPart payloads after metadata
+       converges
      - include regression coverage for create -> abort -> fresh create on the
        same key, proving abort does not leave replica-local generation
        reservations that poison the next create
@@ -1867,6 +1869,14 @@ Completed:
   - included `pg_counters` in the canonical full-PG digest so counter
     corruption or off-command allocator mutation is detected before later
     command apply
+  - included `multipart_uploads.state` in the canonical full-PG digest and
+    removed the abort-prepare path's off-command `Aborting` state write; abort
+    and complete commands now carry the exact terminal cleanup snapshot they
+    observed under the object-PG bucket lock and delete the upload row through
+    metadata command apply
+  - narrowed the raw multipart upload state setter to test/test-hook builds, so
+    production code cannot change digest-covered upload state outside command
+    apply
   - retained explicit exclusions for state that is still local-only or still
     mutates outside its own command stream:
     - bucket write-drain counters (`write_reservations_blocked` and
@@ -1874,13 +1884,7 @@ Completed:
       not canonical S3 metadata; they remain outside the metadata digest until
       the Phase 9 lease/fence model decides whether this state should stay
       process-local or become a replicated fence
-    - `multipart_uploads.state` is still excluded from the canonical
-      multipart-upload table range even though the rest of
-      `multipart_uploads` is digest-covered; Phase 7.3 needs to either make
-      upload state command-owned and digest-covered, or explicitly reclassify
-      it as non-canonical state
   - remaining Phase 7.3 work is:
-    - resolve the `multipart_uploads.state` classification and digest coverage
     - keep bucket write-drain counters documented as a Phase 9 fence/lease
       concern unless that phase moves them into canonical replicated metadata
 

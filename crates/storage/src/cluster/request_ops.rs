@@ -4280,7 +4280,7 @@ impl super::StorageCluster {
         result
     }
 
-    fn delete_complete_multipart_cleanup_best_effort(
+    pub(super) fn delete_complete_multipart_cleanup_best_effort(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -4312,6 +4312,14 @@ impl super::StorageCluster {
             );
         }
         self.delete_multipart_part_segments_best_effort(&cleanup.omitted_streaming_segments);
+        self.delete_staged_stream_segment_payload_shards_best_effort(
+            &cleanup.stream_upload_segments,
+        );
+        for session in &cleanup.stream_uploads {
+            self.local_map
+                .runtime_state()
+                .clear_stream_segment_vid_allocator(&session.session_id);
+        }
     }
 
     pub(super) fn delete_finalize_upload_part_cleanup_best_effort(
@@ -4375,6 +4383,14 @@ impl super::StorageCluster {
             );
         }
         self.delete_multipart_part_segments_best_effort(&cleanup.streaming_segments);
+        self.delete_staged_stream_segment_payload_shards_best_effort(
+            &cleanup.stream_upload_segments,
+        );
+        for session in &cleanup.stream_uploads {
+            self.local_map
+                .runtime_state()
+                .clear_stream_segment_vid_allocator(&session.session_id);
+        }
     }
 
     fn delete_multipart_part_segments_best_effort(&self, segments: &[MultipartPartSegmentRecord]) {
@@ -4831,10 +4847,11 @@ impl super::StorageCluster {
         action: impl FnOnce(&MultipartUploadRecord) -> Result<(AuthorizedMultipartUploadRecord, T), E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let _bucket_guard = primary_node.lock_bucket(bucket);
         let applied_commands = self
             .drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)
             .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-        let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let object_pg = primary_node.get_pg(pg_id.get())?;
         let upload = PgMetadataStore::get_multipart_upload(&*object_pg, upload_id)?;
         if upload.bucket != *bucket || upload.key != *key || upload.state != UploadState::InProgress
@@ -4908,10 +4925,11 @@ impl super::StorageCluster {
         let key = &authorized_upload.record().key;
         let upload_id = &authorized_upload.record().upload_id;
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let _bucket_guard = primary_node.lock_bucket(bucket);
         loop {
             let applied_commands =
                 self.drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)?;
-            let primary_node = self.object_metadata_primary_node(bucket, key)?;
             let object_pg = primary_node.get_pg(pg_id.get())?;
             let upload = PgMetadataStore::get_multipart_upload(&*object_pg, upload_id)?;
             if upload != *authorized_upload.record() || upload.state != UploadState::InProgress {
@@ -5145,13 +5163,44 @@ impl super::StorageCluster {
         }
     }
 
-    fn complete_multipart_command_cleanup(
+    pub(super) fn complete_multipart_command_cleanup(
         command: &CommitMultipartObjectCommand,
     ) -> CompleteMultipartCommitCleanup {
         CompleteMultipartCommitCleanup {
             omitted_parts: command.omitted_parts.clone(),
             omitted_streaming_segments: command.omitted_streaming_segments.clone(),
+            stream_uploads: command.stream_uploads.clone(),
+            stream_upload_segments: command.stream_upload_segments.clone(),
         }
+    }
+
+    fn snapshot_upload_part_stream_cleanup(
+        object_pg: &crate::PgStore,
+        upload_id: &UploadId,
+    ) -> Result<(Vec<StreamUploadRecord>, Vec<StreamUploadSegmentRecord>), ObjectPgActionError>
+    {
+        let mut stream_uploads = PgMetadataStore::list_all_stream_uploads(object_pg)?
+            .into_iter()
+            .filter(|session| {
+                matches!(
+                    &session.target,
+                    StreamUploadTarget::UploadPart {
+                        upload_id: session_upload_id,
+                        ..
+                    } if session_upload_id == upload_id
+                )
+            })
+            .collect::<Vec<_>>();
+        stream_uploads.sort_by(|a, b| a.session_id.as_str().cmp(b.session_id.as_str()));
+
+        let mut stream_upload_segments = Vec::new();
+        for session in &stream_uploads {
+            stream_upload_segments.extend(PgMetadataStore::list_stream_segments(
+                object_pg,
+                &session.session_id,
+            )?);
+        }
+        Ok((stream_uploads, stream_upload_segments))
     }
 
     fn reserve_completed_multipart_upload_order(
@@ -5303,14 +5352,7 @@ impl super::StorageCluster {
                         &req.part_records,
                     ) {
                         let outcome = Self::complete_multipart_outcome_from_command(commit);
-                        let cleanup = Self::complete_multipart_command_cleanup(commit);
                         self.apply_multipart_completion_command(pg_id, &bucket, &command)?;
-                        self.delete_complete_multipart_cleanup_best_effort(
-                            &bucket,
-                            &key,
-                            generation_id,
-                            &cleanup,
-                        );
                         self.prune_completed_multipart_uploads_for_bucket_with_limit(
                             &bucket,
                             keep_completed_uploads,
@@ -5435,6 +5477,8 @@ impl super::StorageCluster {
                     omitted_streaming_segments.push(segment);
                 }
             }
+            let (stream_uploads, stream_upload_segments) =
+                Self::snapshot_upload_part_stream_cleanup(&object_pg, &upload_id)?;
 
             let last_modified_millis = crate::clock::current_time_millis();
             let completed_at_millis = last_modified_millis;
@@ -5484,6 +5528,8 @@ impl super::StorageCluster {
                         selected_streaming_segments,
                         omitted_parts,
                         omitted_streaming_segments,
+                        stream_uploads,
+                        stream_upload_segments,
                         write_sequence,
                         completion_order,
                         completed_at_millis,
@@ -5504,13 +5550,6 @@ impl super::StorageCluster {
             let MetadataCommandPayload::CommitMultipartObject(commit) = command.payload() else {
                 unreachable!("new complete multipart command changed payload kind");
             };
-            let cleanup = Self::complete_multipart_command_cleanup(commit);
-            self.delete_complete_multipart_cleanup_best_effort(
-                &bucket,
-                &key,
-                generation_id,
-                &cleanup,
-            );
             self.prune_completed_multipart_uploads_for_bucket_with_limit(
                 &bucket,
                 keep_completed_uploads,
@@ -5750,6 +5789,18 @@ impl super::StorageCluster {
         upload_id: &UploadId,
     ) -> Result<bool, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let _bucket_guard = primary_node.lock_bucket(bucket);
+        self.abort_multipart_upload_locked(pg_id, bucket, key, upload_id)
+    }
+
+    fn abort_multipart_upload_locked(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<bool, ObjectPgActionError> {
         let runtime_state = self.local_map.runtime_state();
         'retry_after_pending_conflict: loop {
             while let Some(command) =
@@ -5797,8 +5848,20 @@ impl super::StorageCluster {
     ) -> Result<bool, ObjectPgActionError> {
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
-        let upload_id = &authorized_upload.record().upload_id;
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let _bucket_guard = primary_node.lock_bucket(bucket);
+        self.abort_authorized_multipart_upload_locked(pg_id, authorized_upload)
+    }
+
+    fn abort_authorized_multipart_upload_locked(
+        &self,
+        pg_id: PgId,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+    ) -> Result<bool, ObjectPgActionError> {
+        let bucket = &authorized_upload.record().bucket;
+        let key = &authorized_upload.record().key;
+        let upload_id = &authorized_upload.record().upload_id;
         let runtime_state = self.local_map.runtime_state();
         'retry_after_pending_conflict: loop {
             while let Some(command) =
@@ -5908,12 +5971,16 @@ impl super::StorageCluster {
             return Ok(Ok(false));
         };
         let BucketLifecycleContext {
+            bucket_node: lifecycle_bucket_node,
             _bucket_guard: _lifecycle_bucket_guard,
             raw_lifecycle,
             ..
         } = lifecycle_context;
 
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let _object_bucket_guard = (!std::ptr::eq(lifecycle_bucket_node, primary_node))
+            .then(|| primary_node.lock_bucket(bucket));
         while let Some(command) = self
             .local_map
             .runtime_state()
@@ -5932,7 +5999,6 @@ impl super::StorageCluster {
             }
         }
 
-        let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let upload = {
             let object_pg = primary_node.get_pg(pg_id.get())?;
             match PgMetadataStore::get_multipart_upload(&*object_pg, upload_id) {
@@ -5948,7 +6014,9 @@ impl super::StorageCluster {
         };
 
         if upload.state == UploadState::Aborting {
-            return self.abort_multipart_upload(bucket, key, upload_id).map(Ok);
+            return self
+                .abort_multipart_upload_locked(pg_id, bucket, key, upload_id)
+                .map(Ok);
         }
         if upload.state != UploadState::InProgress || raw_lifecycle.is_none() {
             return Ok(Ok(false));
@@ -5962,7 +6030,8 @@ impl super::StorageCluster {
             return Ok(Ok(false));
         }
 
-        self.abort_multipart_upload(bucket, key, upload_id).map(Ok)
+        self.abort_multipart_upload_locked(pg_id, bucket, key, upload_id)
+            .map(Ok)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -6283,8 +6352,15 @@ impl super::StorageCluster {
         upload_id: &UploadId,
         state: UploadState,
     ) -> Result<(), ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
-            .test_set_upload_state(bucket, key, upload_id, state)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        for node in self
+            .local_map
+            .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
+        {
+            node.storage_node()
+                .test_set_upload_state(bucket, key, upload_id, state)?;
+        }
+        Ok(())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

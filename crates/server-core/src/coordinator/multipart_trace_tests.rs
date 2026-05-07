@@ -288,6 +288,7 @@ impl MultipartTraceModel {
             }
             AbortActive => {
                 self.active_upload = false;
+                self.active_session = None;
                 self.part_committed = false;
                 self.last_upload_available = true;
             }
@@ -351,16 +352,10 @@ struct SameKeyUploadModelEntry {
     payload: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SameKeySessionState {
-    Active(SessionModelState),
-    Orphan(SessionModelState),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SameKeyUploadModel {
     uploads: Vec<SameKeyUploadModelEntry>,
-    current_session: Option<SameKeySessionState>,
+    current_session: Option<SessionModelState>,
     pending_payload: Option<Vec<u8>>,
     visible_payload: Option<Vec<u8>>,
     next_payload_id: u8,
@@ -382,7 +377,6 @@ impl SameKeyUploadModel {
     }
 
     fn legal_ops(&self) -> Vec<SameKeyUploadTraceOp> {
-        use SameKeySessionState::*;
         use SameKeyUploadTraceOp::*;
         use SessionModelState::*;
         let mut ops = match (
@@ -396,16 +390,16 @@ impl SameKeyUploadModel {
             (v, None) if v.as_slice() == [false] => {
                 vec![CreateUpload, BeginCurrentStream, AbortCurrent]
             }
-            (v, Some(Active(Empty))) if v.as_slice() == [false] => {
+            (v, Some(Empty)) if v.as_slice() == [false] => {
                 vec![AppendCurrentData, AbortCurrent, AbortCurrentSession]
             }
-            (v, Some(Active(HasData))) if v.as_slice() == [false] => {
+            (v, Some(HasData)) if v.as_slice() == [false] => {
                 vec![FinalizeCurrentPart, AbortCurrent, AbortCurrentSession]
             }
             (v, None) if v.as_slice() == [false, false] => {
                 vec![BeginCurrentStream, AbortCurrent, AbortOldest]
             }
-            (v, Some(Active(Empty))) if v.as_slice() == [false, false] => {
+            (v, Some(Empty)) if v.as_slice() == [false, false] => {
                 vec![
                     AppendCurrentData,
                     AbortCurrent,
@@ -413,7 +407,7 @@ impl SameKeyUploadModel {
                     AbortOldest,
                 ]
             }
-            (v, Some(Active(HasData))) if v.as_slice() == [false, false] => {
+            (v, Some(HasData)) if v.as_slice() == [false, false] => {
                 vec![
                     FinalizeCurrentPart,
                     AbortCurrent,
@@ -429,14 +423,14 @@ impl SameKeyUploadModel {
                     AbortOldest,
                 ]
             }
-            (v, Some(Active(Empty))) if v.as_slice() == [false, true] => vec![
+            (v, Some(Empty)) if v.as_slice() == [false, true] => vec![
                 AppendCurrentData,
                 CompleteCurrent,
                 AbortCurrent,
                 AbortCurrentSession,
                 AbortOldest,
             ],
-            (v, Some(Active(HasData))) if v.as_slice() == [false, true] => vec![
+            (v, Some(HasData)) if v.as_slice() == [false, true] => vec![
                 FinalizeCurrentPart,
                 AbortCurrent,
                 AbortCurrentSession,
@@ -450,13 +444,13 @@ impl SameKeyUploadModel {
                     AbortCurrent,
                 ]
             }
-            (v, Some(Active(Empty))) if v.as_slice() == [true] => vec![
+            (v, Some(Empty)) if v.as_slice() == [true] => vec![
                 AppendCurrentData,
                 CompleteCurrent,
                 AbortCurrent,
                 AbortCurrentSession,
             ],
-            (v, Some(Active(HasData))) if v.as_slice() == [true] => {
+            (v, Some(HasData)) if v.as_slice() == [true] => {
                 vec![FinalizeCurrentPart, AbortCurrent, AbortCurrentSession]
             }
             (v, None) if v.as_slice() == [true, false] => {
@@ -467,14 +461,14 @@ impl SameKeyUploadModel {
                     AbortOldest,
                 ]
             }
-            (v, Some(Active(Empty))) if v.as_slice() == [true, false] => vec![
+            (v, Some(Empty)) if v.as_slice() == [true, false] => vec![
                 AppendCurrentData,
                 AbortCurrent,
                 AbortCurrentSession,
                 CompleteOldest,
                 AbortOldest,
             ],
-            (v, Some(Active(HasData))) if v.as_slice() == [true, false] => vec![
+            (v, Some(HasData)) if v.as_slice() == [true, false] => vec![
                 FinalizeCurrentPart,
                 AbortCurrent,
                 AbortCurrentSession,
@@ -488,48 +482,19 @@ impl SameKeyUploadModel {
                 CompleteOldest,
                 AbortOldest,
             ],
-            (v, Some(Active(Empty))) if v.as_slice() == [true, true] => vec![
+            (v, Some(Empty)) if v.as_slice() == [true, true] => vec![
                 AppendCurrentData,
                 AbortCurrent,
                 AbortCurrentSession,
                 CompleteOldest,
                 AbortOldest,
             ],
-            (v, Some(Active(HasData))) if v.as_slice() == [true, true] => vec![
+            (v, Some(HasData)) if v.as_slice() == [true, true] => vec![
                 FinalizeCurrentPart,
                 AbortCurrent,
                 AbortCurrentSession,
                 CompleteOldest,
                 AbortOldest,
-            ],
-            (v, Some(Orphan(_))) if v.is_empty() => vec![AbortCurrentSession],
-            (v, Some(Orphan(_))) if v.as_slice() == [false] => {
-                vec![AbortCurrent, AbortCurrentSession]
-            }
-            (v, Some(Orphan(_))) if v.as_slice() == [true] => {
-                vec![CompleteCurrent, AbortCurrent, AbortCurrentSession]
-            }
-            (v, Some(Orphan(_))) if v.as_slice() == [false, false] => {
-                vec![AbortCurrent, AbortOldest, AbortCurrentSession]
-            }
-            (v, Some(Orphan(_))) if v.as_slice() == [false, true] => vec![
-                CompleteCurrent,
-                AbortCurrent,
-                AbortOldest,
-                AbortCurrentSession,
-            ],
-            (v, Some(Orphan(_))) if v.as_slice() == [true, false] => vec![
-                AbortCurrent,
-                CompleteOldest,
-                AbortOldest,
-                AbortCurrentSession,
-            ],
-            (v, Some(Orphan(_))) if v.as_slice() == [true, true] => vec![
-                CompleteCurrent,
-                AbortCurrent,
-                CompleteOldest,
-                AbortOldest,
-                AbortCurrentSession,
             ],
             _ => vec![CreateUpload],
         };
@@ -556,11 +521,10 @@ impl SameKeyUploadModel {
                 self.pending_payload = None;
             }
             BeginCurrentStream => {
-                self.current_session = Some(SameKeySessionState::Active(SessionModelState::Empty));
+                self.current_session = Some(SessionModelState::Empty);
             }
             AppendCurrentData => {
-                self.current_session =
-                    Some(SameKeySessionState::Active(SessionModelState::HasData));
+                self.current_session = Some(SessionModelState::HasData);
                 self.pending_payload =
                     Some(format!("trace-part-{}", self.next_payload_id).into_bytes());
                 self.next_payload_id = self.next_payload_id.wrapping_add(1);
@@ -581,23 +545,13 @@ impl SameKeyUploadModel {
                 self.visible_payload = Some(completed.payload);
                 self.has_last_terminal_upload = true;
                 self.has_last_completed = true;
-                self.current_session = match self.current_session {
-                    Some(SameKeySessionState::Active(state)) => {
-                        Some(SameKeySessionState::Orphan(state))
-                    }
-                    other => other,
-                };
+                self.current_session = None;
                 self.pending_payload = None;
             }
             AbortCurrent => {
                 self.uploads.pop();
                 self.has_last_terminal_upload = true;
-                self.current_session = match self.current_session {
-                    Some(SameKeySessionState::Active(state)) => {
-                        Some(SameKeySessionState::Orphan(state))
-                    }
-                    other => other,
-                };
+                self.current_session = None;
                 self.pending_payload = None;
             }
             CompleteOldest => {
@@ -680,18 +634,12 @@ impl MultipartVisibleObject {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MultipartTailSessionState {
-    Active(SessionModelState),
-    Orphan(SessionModelState),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MultipartHeadTailModel {
     upload_active: bool,
     head_committed: bool,
     head_fill: Option<u8>,
-    tail_session: Option<MultipartTailSessionState>,
+    tail_session: Option<SessionModelState>,
     tail_committed: bool,
     tail_fill: Option<u8>,
     object_visible: Option<MultipartVisibleObject>,
@@ -720,7 +668,6 @@ impl MultipartHeadTailModel {
 
     fn legal_ops(&self) -> Vec<MultipartHeadTailTraceOp> {
         use MultipartHeadTailTraceOp::*;
-        use MultipartTailSessionState::*;
         use SessionModelState::*;
         let mut ops = match (
             self.upload_active,
@@ -729,7 +676,6 @@ impl MultipartHeadTailModel {
             self.tail_committed,
         ) {
             (false, false, None, false) => vec![CreateUpload],
-            (false, false, Some(Orphan(_)), false) => vec![AbortTailSession],
             (true, false, None, false) => vec![UploadHeadPart, BeginTailStream, AbortUpload],
             (true, false, None, true) => vec![UploadHeadPart, BeginTailStream, AbortUpload],
             (true, true, None, false) => vec![
@@ -745,28 +691,28 @@ impl MultipartHeadTailModel {
                 CompleteHeadAndTail,
                 AbortUpload,
             ],
-            (true, false, Some(Active(Empty)), false) => {
+            (true, false, Some(Empty), false) => {
                 vec![AppendTailData, AbortUpload, AbortTailSession]
             }
-            (true, false, Some(Active(Empty)), true) => {
+            (true, false, Some(Empty), true) => {
                 vec![AppendTailData, AbortUpload, AbortTailSession]
             }
-            (true, true, Some(Active(Empty)), false) => {
+            (true, true, Some(Empty), false) => {
                 vec![AppendTailData, AbortUpload, AbortTailSession]
             }
-            (true, true, Some(Active(Empty)), true) => {
+            (true, true, Some(Empty), true) => {
                 vec![AppendTailData, AbortUpload, AbortTailSession]
             }
-            (true, false, Some(Active(HasData)), false) => {
+            (true, false, Some(HasData), false) => {
                 vec![FinalizeTailPart, AbortUpload, AbortTailSession]
             }
-            (true, false, Some(Active(HasData)), true) => {
+            (true, false, Some(HasData), true) => {
                 vec![FinalizeTailPart, AbortUpload, AbortTailSession]
             }
-            (true, true, Some(Active(HasData)), false) => {
+            (true, true, Some(HasData), false) => {
                 vec![FinalizeTailPart, AbortUpload, AbortTailSession]
             }
-            (true, true, Some(Active(HasData)), true) => {
+            (true, true, Some(HasData), true) => {
                 vec![FinalizeTailPart, AbortUpload, AbortTailSession]
             }
             _ => vec![CreateUpload],
@@ -798,10 +744,10 @@ impl MultipartHeadTailModel {
                 self.next_head_fill = self.next_head_fill.wrapping_add(1);
             }
             BeginTailStream => {
-                self.tail_session = Some(MultipartTailSessionState::Active(Empty));
+                self.tail_session = Some(Empty);
             }
             AppendTailData => {
-                self.tail_session = Some(MultipartTailSessionState::Active(HasData));
+                self.tail_session = Some(HasData);
             }
             FinalizeTailPart => {
                 self.tail_session = None;
@@ -839,12 +785,7 @@ impl MultipartHeadTailModel {
                 self.upload_active = false;
                 self.head_committed = false;
                 self.head_fill = None;
-                self.tail_session = match self.tail_session {
-                    Some(MultipartTailSessionState::Active(state)) => {
-                        Some(MultipartTailSessionState::Orphan(state))
-                    }
-                    other => other,
-                };
+                self.tail_session = None;
                 self.tail_committed = false;
                 self.tail_fill = None;
                 self.has_last_terminal_upload = true;
@@ -948,7 +889,6 @@ struct SameKeyUploadHarness {
     uploads: Vec<SameKeyUploadEntry>,
     next_payload_id: u8,
     current_session_id: Option<SessionId>,
-    current_session_orphaned: bool,
     pending_payload: Option<Vec<u8>>,
     last_terminal_upload_id: Option<UploadId>,
     last_completed_upload_id: Option<UploadId>,
@@ -977,7 +917,6 @@ impl SameKeyUploadHarness {
             uploads: Vec::new(),
             next_payload_id: 0,
             current_session_id: None,
-            current_session_orphaned: false,
             pending_payload: None,
             last_terminal_upload_id: None,
             last_completed_upload_id: None,
@@ -1020,7 +959,6 @@ impl SameKeyUploadHarness {
                 )
                 .unwrap();
                 self.current_session_id = Some(session.session_id);
-                self.current_session_orphaned = false;
             }
             SameKeyUploadTraceOp::AppendCurrentData => {
                 let session_id = self.current_session_id.as_ref().unwrap();
@@ -1062,7 +1000,6 @@ impl SameKeyUploadHarness {
                 );
                 current.payload = self.pending_payload.take().unwrap();
                 self.current_session_id = None;
-                self.current_session_orphaned = false;
             }
             SameKeyUploadTraceOp::AbortCurrentSession => {
                 let session_id = self.current_session_id.as_ref().unwrap();
@@ -1074,7 +1011,6 @@ impl SameKeyUploadHarness {
                     )
                     .unwrap();
                 self.current_session_id = None;
-                self.current_session_orphaned = false;
                 self.pending_payload = None;
             }
             SameKeyUploadTraceOp::CompleteCurrent => {
@@ -1102,7 +1038,7 @@ impl SameKeyUploadHarness {
                 self.last_terminal_upload_id = Some(completed.upload_id.clone());
                 self.last_completed_upload_id = Some(completed.upload_id);
                 self.last_completed_part_etag = completed.part_etag;
-                self.current_session_orphaned = self.current_session_id.is_some();
+                self.current_session_id = None;
                 self.pending_payload = None;
             }
             SameKeyUploadTraceOp::AbortCurrent => {
@@ -1115,7 +1051,7 @@ impl SameKeyUploadHarness {
                 ));
                 let aborted = self.uploads.pop().unwrap();
                 self.last_terminal_upload_id = Some(aborted.upload_id);
-                self.current_session_orphaned = self.current_session_id.is_some();
+                self.current_session_id = None;
                 self.pending_payload = None;
             }
             SameKeyUploadTraceOp::CompleteOldest => {
@@ -1404,6 +1340,7 @@ impl MultipartHeadTailHarness {
                 self.head_etag = None;
                 self.head_fill = None;
                 self.tail_etag = None;
+                self.tail_session_id = None;
                 self.tail_payload = None;
             }
             MultipartHeadTailTraceOp::AbortTailSession => {
@@ -1554,7 +1491,6 @@ impl MultipartTraceHarness {
             }
             MultipartTraceOp::AbortActive => {
                 let upload_id = self.current_upload_id.as_ref().unwrap();
-                let session_id = self.current_session_id.clone();
                 let _ = self.coord.abort_multipart_upload(&multipart_object_request(
                     TRACE_BUCKET,
                     TRACE_KEY,
@@ -1562,7 +1498,7 @@ impl MultipartTraceHarness {
                     test_requester(),
                 ));
                 self.current_upload_id = None;
-                self.current_session_id = session_id;
+                self.current_session_id = None;
                 self.last_part_etag = None;
             }
             MultipartTraceOp::AbortLast => {
@@ -1982,7 +1918,7 @@ fn assert_same_key_upload_trace_matches_model(
 }
 
 #[test]
-fn abort_active_upload_with_live_stream_part_session_removes_upload_and_requires_session_cleanup() {
+fn abort_active_upload_with_live_stream_part_session_cleans_session() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
     coord
@@ -2005,7 +1941,7 @@ fn abort_active_upload_with_live_stream_part_session_removes_upload_and_requires
         ))
         .unwrap();
     assert_eq!(harness.pending_upload_count(), 0);
-    assert_eq!(harness.active_session_count(), 1);
+    assert_eq!(harness.active_session_count(), 0);
 
     let err = harness
         .coord
@@ -2027,19 +1963,23 @@ fn abort_active_upload_with_live_stream_part_session_removes_upload_and_requires
         .unwrap_err();
     assert!(matches!(err, ServerError::ObjectNotFound { .. }));
 
-    harness
+    let err = harness
         .coord
         .abort_stream_part_session(
             &trusted_bucket_name(TRACE_BUCKET),
             &trusted_object_key(TRACE_KEY),
             session_id,
         )
-        .unwrap();
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
+    ));
     assert_eq!(harness.active_session_count(), 0);
 }
 
 #[test]
-fn completing_current_upload_with_live_replacement_stream_session_leaves_orphan_until_cleanup() {
+fn completing_current_upload_with_live_replacement_stream_session_cleans_session() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
     coord
@@ -2066,8 +2006,8 @@ fn completing_current_upload_with_live_replacement_stream_session_leaves_orphan_
     );
     assert_eq!(
         harness.active_session_count(),
-        1,
-        "the live replacement session should remain orphaned until explicit cleanup"
+        0,
+        "completing the upload should clean its live replacement stream session"
     );
 
     let parts_err = harness
@@ -2102,18 +2042,22 @@ fn completing_current_upload_with_live_replacement_stream_session_leaves_orphan_
         "completing the upload should still publish the committed payload"
     );
 
-    harness
+    let err = harness
         .coord
         .abort_stream_part_session(
             &trusted_bucket_name(TRACE_BUCKET),
             &trusted_object_key(TRACE_KEY),
             &replacement_session_id,
         )
-        .unwrap();
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
+    ));
     assert_eq!(
         harness.active_session_count(),
         0,
-        "explicit cleanup should remove the orphaned replacement session"
+        "the replacement session should already be cleaned"
     );
 }
 

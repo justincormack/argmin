@@ -2896,6 +2896,8 @@ pub struct CompleteMultipartCommitRequest {
 pub struct CompleteMultipartCommitCleanup {
     pub omitted_parts: Vec<MultipartPartRecord>,
     pub omitted_streaming_segments: Vec<MultipartPartSegmentRecord>,
+    pub stream_uploads: Vec<StreamUploadRecord>,
+    pub stream_upload_segments: Vec<StreamUploadSegmentRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -3171,6 +3173,8 @@ pub struct AbortMultipartUploadCleanup {
     pub upload: MultipartUploadRecord,
     pub parts: Vec<MultipartPartRecord>,
     pub streaming_segments: Vec<MultipartPartSegmentRecord>,
+    pub stream_uploads: Vec<StreamUploadRecord>,
+    pub stream_upload_segments: Vec<StreamUploadSegmentRecord>,
 }
 
 /// Committed segment record for a normal PutObject.

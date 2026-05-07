@@ -84,9 +84,9 @@ command-owned durable serving, in-progress, and cleanup metadata:
 - `stream_uploads`
 
 The current inventory still excludes state that is local-only or not yet
-owned by its own canonical command stream: bucket write-drain counters and
-`multipart_uploads.state`. Those are Phase 7.3 gaps, not implicit exemptions
-from metadata integrity.
+owned by its own canonical command stream: bucket write-drain counters. That is
+a Phase 9 fence/lease question, not an implicit exemption from metadata
+integrity.
 
 The full-PG encoding starts with a stable domain/version header. Each included
 table range then encodes explicit table and column names, filter identity, row
@@ -158,6 +158,17 @@ durable SQLite row. It only gives concurrent uncommitted stream appends distinct
 placed payload shard keys. The durable command records the concrete
 `stream_upload_segments.segment_vid` value that was used, and that segment row
 is included in the canonical metadata digest.
+
+Multipart upload state is canonical metadata. `CreateMultipartUpload` publishes
+an exact `InProgress` upload row, and terminal object-PG commands serialize
+through the pending command stream before deleting that row. Abort and complete
+preparation are protected by the object-PG bucket lock while they snapshot
+cleanup and install the pending command; abort does not write an intermediate
+`Aborting` state before the abort command exists. Terminal commands also carry
+active streamed UploadPart sessions and staged segment rows for that upload so
+command apply removes their metadata and cluster cleanup can delete their staged
+payload shards. `UploadState` values outside the command path are test-hook
+state injection only.
 
 Bucket metadata commands keep the AWS-facing operation split at the storage API
 boundary, but the durable command carries the command-owned bucket-table

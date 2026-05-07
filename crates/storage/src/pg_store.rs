@@ -224,6 +224,7 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "bucket",
             "key",
             "initiated_at",
+            "state",
             "tags",
             "metadata_blob",
             "system_metadata_blob",
@@ -3868,6 +3869,23 @@ impl PgStore {
             "commit multipart object command (begin txn)",
             "commit multipart object command (commit txn)",
             |store| {
+                let stream_uploads =
+                    store.list_stream_uploads_for_multipart_upload(&command.upload_id)?;
+                if stream_uploads != command.stream_uploads {
+                    return Err(MetadataError::Db {
+                        context: "commit multipart object command (stream uploads mismatch)",
+                        source: rusqlite::Error::InvalidQuery,
+                    });
+                }
+                let stream_upload_segments =
+                    store.list_stream_segments_for_sessions(&stream_uploads)?;
+                if stream_upload_segments != command.stream_upload_segments {
+                    return Err(MetadataError::Db {
+                        context:
+                            "commit multipart object command (stream upload segments mismatch)",
+                        source: rusqlite::Error::InvalidQuery,
+                    });
+                }
                 if let Some(stale_payload) = &command.stale_payload {
                     store.apply_multipart_overwrite_stale_payload_in_open_txn(
                         &command.object.bucket,
@@ -3896,6 +3914,9 @@ impl PgStore {
                 )?;
                 store.insert_completed_multipart_upload_in_open_txn(command)?;
                 store.release_multipart_completion_reservation_in_open_txn(command)?;
+                for session in &command.stream_uploads {
+                    store.delete_stream_upload(&session.session_id)?;
+                }
                 store.delete_multipart_upload_if_present_in_open_txn(&command.upload_id)?;
                 Ok(())
             },
@@ -4643,6 +4664,17 @@ impl PgStore {
                         state: session.state as u8,
                     });
                 }
+                if let StreamUploadTarget::UploadPart { upload_id, .. } = &session.target {
+                    let upload = store.get_multipart_upload(upload_id)?;
+                    if upload.bucket != command.bucket
+                        || upload.key != command.key
+                        || upload.state != UploadState::InProgress
+                    {
+                        return Err(MetadataError::NoSuchUpload {
+                            upload_id: upload_id.to_string(),
+                        });
+                    }
+                }
 
                 let existing = store
                     .list_stream_segments(&command.segment.session_id)?
@@ -5135,6 +5167,78 @@ impl PgStore {
         )
     }
 
+    fn list_stream_uploads_for_multipart_upload(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<Vec<StreamUploadRecord>, MetadataError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
+                 created_at, encryption_type, encryption_state FROM stream_uploads \
+                 WHERE op_kind = ?1 AND upload_id = ?2 ORDER BY session_id ASC",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "list stream uploads for multipart upload (prepare)",
+                source: e,
+            })?;
+        let rows = stmt
+            .query_map(
+                params![StreamUploadKind::UploadPart as u8, upload_id.as_str()],
+                |row| {
+                    let op_kind_raw: u8 = row.get(3)?;
+                    let state_raw: u8 = row.get(6)?;
+                    let upload_id: Option<UploadId> = row.get(4)?;
+                    let part_number: Option<i64> = row.get(5)?;
+                    Ok(StreamUploadRecord {
+                        session_id: row.get(0)?,
+                        bucket: row.get(1)?,
+                        key: row.get(2)?,
+                        target: PgStore::parse_stream_target(
+                            op_kind_raw,
+                            upload_id,
+                            part_number,
+                            3,
+                        )?,
+                        state: StreamUploadState::from_u8(state_raw).ok_or_else(|| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                6,
+                                rusqlite::types::Type::Integer,
+                                Box::from(format!("invalid stream state: {state_raw}")),
+                            )
+                        })?,
+                        created_at: row.get::<_, i64>(7)? as u64,
+                        encryption: Self::parse_object_encryption(
+                            row.get::<_, u8>(8)?,
+                            row.get::<_, Option<Vec<u8>>>(9)?,
+                            8,
+                            9,
+                        )?,
+                    })
+                },
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "list stream uploads for multipart upload (query)",
+                source: e,
+            })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| MetadataError::Db {
+                context: "list stream uploads for multipart upload (collect)",
+                source: e,
+            })
+    }
+
+    fn list_stream_segments_for_sessions(
+        &self,
+        sessions: &[StreamUploadRecord],
+    ) -> Result<Vec<StreamUploadSegmentRecord>, MetadataError> {
+        let mut segments = Vec::new();
+        for session in sessions {
+            segments.extend(self.list_stream_segments(&session.session_id)?);
+        }
+        Ok(segments)
+    }
+
     pub(crate) fn prepare_abort_multipart_upload_cleanup(
         &self,
         bucket: &BucketName,
@@ -5145,7 +5249,7 @@ impl PgStore {
             "prepare abort multipart upload cleanup (begin txn)",
             "prepare abort multipart upload cleanup (commit txn)",
             |store| {
-                let mut upload = match store.get_multipart_upload(upload_id) {
+                let upload = match store.get_multipart_upload(upload_id) {
                     Ok(upload) => {
                         if upload.bucket != *bucket || upload.key != *key {
                             return Err(MetadataError::NoSuchUpload {
@@ -5159,10 +5263,7 @@ impl PgStore {
                 };
 
                 match upload.state {
-                    UploadState::InProgress => {
-                        store.set_upload_state(upload_id, UploadState::Aborting)?;
-                        upload.state = UploadState::Aborting;
-                    }
+                    UploadState::InProgress => {}
                     UploadState::Aborting => {}
                     UploadState::Completing => return Ok(None),
                 }
@@ -5176,11 +5277,16 @@ impl PgStore {
                     .parts;
                 let streaming_segments =
                     store.get_all_multipart_part_segments_for_upload(upload_id)?;
+                let stream_uploads = store.list_stream_uploads_for_multipart_upload(upload_id)?;
+                let stream_upload_segments =
+                    store.list_stream_segments_for_sessions(&stream_uploads)?;
 
                 Ok(Some(AbortMultipartUploadCleanup {
                     upload,
                     parts,
                     streaming_segments,
+                    stream_uploads,
+                    stream_upload_segments,
                 }))
             },
         )
@@ -5194,21 +5300,18 @@ impl PgStore {
             "prepare authorized abort multipart upload cleanup (begin txn)",
             "prepare authorized abort multipart upload cleanup (commit txn)",
             |store| {
-                let mut upload =
-                    match store.get_multipart_upload(&authorized_upload.record().upload_id) {
-                        Ok(upload) => upload,
-                        Err(MetadataError::NoSuchUpload { .. }) => return Ok(None),
-                        Err(error) => return Err(error),
-                    };
+                let upload = match store.get_multipart_upload(&authorized_upload.record().upload_id)
+                {
+                    Ok(upload) => upload,
+                    Err(MetadataError::NoSuchUpload { .. }) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
                 if upload != *authorized_upload.record() {
                     return Ok(None);
                 }
 
                 match upload.state {
-                    UploadState::InProgress => {
-                        store.set_upload_state(&upload.upload_id, UploadState::Aborting)?;
-                        upload.state = UploadState::Aborting;
-                    }
+                    UploadState::InProgress => {}
                     UploadState::Aborting => {}
                     UploadState::Completing => return Ok(None),
                 }
@@ -5222,11 +5325,17 @@ impl PgStore {
                     .parts;
                 let streaming_segments =
                     store.get_all_multipart_part_segments_for_upload(&upload.upload_id)?;
+                let stream_uploads =
+                    store.list_stream_uploads_for_multipart_upload(&upload.upload_id)?;
+                let stream_upload_segments =
+                    store.list_stream_segments_for_sessions(&stream_uploads)?;
 
                 Ok(Some(AbortMultipartUploadCleanup {
                     upload,
                     parts,
                     streaming_segments,
+                    stream_uploads,
+                    stream_upload_segments,
                 }))
             },
         )
@@ -5240,7 +5349,7 @@ impl PgStore {
             "abort multipart upload command (begin txn)",
             "abort multipart upload command (commit txn)",
             |store| {
-                match store.get_multipart_upload(&command.upload_id) {
+                let upload_present = match store.get_multipart_upload(&command.upload_id) {
                     Ok(upload) => {
                         if upload.bucket != command.bucket || upload.key != command.key {
                             return Err(MetadataError::Db {
@@ -5248,20 +5357,38 @@ impl PgStore {
                                 source: rusqlite::Error::InvalidQuery,
                             });
                         }
-                        if upload.upload_id != command.cleanup.upload.upload_id
-                            || upload.bucket != command.cleanup.upload.bucket
-                            || upload.key != command.cleanup.upload.key
-                            || upload.object_generation_id
-                                != command.cleanup.upload.object_generation_id
-                        {
+                        if upload != command.cleanup.upload {
                             return Err(MetadataError::Db {
                                 context: "abort multipart upload command (cleanup mismatch)",
                                 source: rusqlite::Error::InvalidQuery,
                             });
                         }
+                        true
                     }
-                    Err(MetadataError::NoSuchUpload { .. }) => {}
+                    Err(MetadataError::NoSuchUpload { .. }) => false,
                     Err(error) => return Err(error),
+                };
+                if upload_present {
+                    let stream_uploads =
+                        store.list_stream_uploads_for_multipart_upload(&command.upload_id)?;
+                    if stream_uploads != command.cleanup.stream_uploads {
+                        return Err(MetadataError::Db {
+                            context: "abort multipart upload command (stream uploads mismatch)",
+                            source: rusqlite::Error::InvalidQuery,
+                        });
+                    }
+                    let stream_upload_segments =
+                        store.list_stream_segments_for_sessions(&stream_uploads)?;
+                    if stream_upload_segments != command.cleanup.stream_upload_segments {
+                        return Err(MetadataError::Db {
+                            context:
+                                "abort multipart upload command (stream upload segments mismatch)",
+                            source: rusqlite::Error::InvalidQuery,
+                        });
+                    }
+                    for session in &command.cleanup.stream_uploads {
+                        store.delete_stream_upload(&session.session_id)?;
+                    }
                 }
                 store.delete_multipart_part_segments_by_upload_id(&command.upload_id)?;
                 store
@@ -9063,6 +9190,7 @@ impl PgMetadataStore for PgStore {
             })
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     fn set_upload_state(
         &self,
         upload_id: &UploadId,
@@ -9987,6 +10115,7 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
+    #[cfg(test)]
     fn complete_multipart_commit(
         &self,
         upload_id: &UploadId,
@@ -10365,6 +10494,8 @@ impl PgMetadataStore for PgStore {
             Ok(CompleteMultipartCommitCleanup {
                 omitted_parts,
                 omitted_streaming_segments,
+                stream_uploads: Vec::new(),
+                stream_upload_segments: Vec::new(),
             })
         })();
 
@@ -12056,6 +12187,23 @@ mod tests {
 
     #[test]
     fn metadata_state_digest_covers_multipart_upload_and_part_state() {
+        assert_metadata_state_digest_covers_mutation(
+            |store| {
+                let upload_id = UploadId::new("s".repeat(UPLOAD_ID_LEN)).unwrap();
+                insert_digest_multipart_upload(store, &upload_id);
+            },
+            |store| {
+                let upload_id = UploadId::new("s".repeat(UPLOAD_ID_LEN)).unwrap();
+                store
+                    .conn
+                    .execute(
+                        "UPDATE multipart_uploads SET state = ?1 WHERE upload_id = ?2",
+                        params![UploadState::Aborting as u8, upload_id.as_str()],
+                    )
+                    .unwrap();
+            },
+        );
+
         assert_metadata_state_digest_covers_mutation(
             |store| {
                 let upload_id = UploadId::new("u".repeat(UPLOAD_ID_LEN)).unwrap();

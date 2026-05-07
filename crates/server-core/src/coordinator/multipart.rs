@@ -56,17 +56,42 @@ impl Coordinator {
         }
     }
 
+    fn map_upload_part_stream_error(
+        upload_id: &UploadId,
+        error: storage::ObjectPgActionError,
+    ) -> ServerError {
+        match error {
+            storage::ObjectPgActionError::Metadata(
+                storage::MetadataError::StreamSessionNotFound { .. }
+                | storage::MetadataError::StreamSessionNotInProgress { .. },
+            ) => ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            },
+            other => Self::map_object_pg_action_error(other),
+        }
+    }
+
     pub fn append_stream_part_data(
         &self,
         req: &AppendStreamPartRequest<'_>,
     ) -> Result<(), ServerError> {
-        let write_encryption = self.load_stream_part_write_encryption(
-            &req.bucket,
-            &req.key,
-            req.session_id,
-            req.part_number,
-            req.sse_customer,
-        )?;
+        let write_encryption = self
+            .load_stream_part_write_encryption(
+                &req.bucket,
+                &req.key,
+                req.session_id,
+                req.part_number,
+                req.sse_customer,
+            )
+            .map_err(|error| match error {
+                ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
+                | ServerError::Metadata(storage::MetadataError::StreamSessionNotInProgress {
+                    ..
+                }) => ServerError::NoSuchUpload {
+                    upload_id: req.upload_id.to_string(),
+                },
+                other => other,
+            })?;
         let storage_data = write_encryption.encrypt_segment(req.segment_index, req.data)?;
         self.append_stream_segment_for(
             &req.bucket,
@@ -75,6 +100,15 @@ impl Coordinator {
             req.segment_index,
             &storage_data,
         )
+        .map_err(|error| match error {
+            ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
+            | ServerError::Metadata(storage::MetadataError::StreamSessionNotInProgress {
+                ..
+            }) => ServerError::NoSuchUpload {
+                upload_id: req.upload_id.to_string(),
+            },
+            other => other,
+        })
     }
 
     /// Begin a streaming UploadPart session.
@@ -681,8 +715,8 @@ impl Coordinator {
 
     /// Abort an in-progress multipart upload.
     ///
-    /// Transitions to Aborting, best-effort deletes all part shard sets,
-    /// then deletes the upload and part metadata rows.
+    /// Publishes an abort metadata command, best-effort deletes all part shard
+    /// sets, then deletes the upload and part metadata rows.
     pub fn abort_multipart_upload(&self, req: &MultipartObjectRequest) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -1089,7 +1123,7 @@ impl Coordinator {
                     })
                 },
             )
-            .map_err(Self::map_object_pg_action_error)??;
+            .map_err(|error| Self::map_upload_part_stream_error(upload_id, error))??;
 
         result.last_modified = last_modified;
         Ok(result)

@@ -57,6 +57,7 @@ pub fn upload_part(
             coord.append_stream_part_data(&AppendStreamPartRequest {
                 bucket: req.upload.object.bucket.name_typed().clone(),
                 key: req.upload.object.key_typed().clone(),
+                upload_id: req.upload.upload_id_typed(),
                 session_id,
                 part_number: req.part_number,
                 segment_index: idx as u32,
