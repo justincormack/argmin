@@ -14,15 +14,15 @@ use super::{
     MetadataCommandApplyTestContext, MetadataCommandApplyTestKind,
 };
 use crate::metadata_command::{
-    AbortMultipartUploadCommand, BucketPropertyMutation, BucketRecord, BucketSubresourceMutation,
-    CommitDirectPutObjectCommand, CommitMultipartObjectCommand, CommitStreamPartCommand,
-    CreateBucketCommand, CreateMultipartUploadCommand, CreateStreamUploadCommand,
-    DeleteCompletedMultipartUploadCommand, DeleteObjectPayloadReclaimCommand,
-    DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
-    MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
-    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
-    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
-    PutObjectMetadataMutation,
+    AbortMultipartUploadCommand, AdvanceCompletedMultipartUploadSequenceCommand,
+    BucketPropertyMutation, BucketRecord, BucketSubresourceMutation, CommitDirectPutObjectCommand,
+    CommitMultipartObjectCommand, CommitStreamPartCommand, CreateBucketCommand,
+    CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteCompletedMultipartUploadCommand,
+    DeleteObjectPayloadReclaimCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
+    InsertDeleteMarkerCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
+    MetadataCommandId, MetadataCommandPayload, ObjectPayloadReclaimCommand, PutBucketAclCommand,
+    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
+    PutObjectMetadataCommand, PutObjectMetadataMutation,
 };
 use crate::*;
 
@@ -222,6 +222,11 @@ fn metadata_command_apply_test_context(
         MetadataCommandPayload::PutBucketSubresource(command) => (
             MetadataCommandApplyTestKind::PutBucketSubresource,
             Some(command.name.clone()),
+            None,
+        ),
+        MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(command) => (
+            MetadataCommandApplyTestKind::AdvanceCompletedMultipartUploadSequence,
+            Some(command.bucket.clone()),
             None,
         ),
         MetadataCommandPayload::ReserveObjectGeneration(command) => (
@@ -554,6 +559,12 @@ impl super::StorageCluster {
                             "unexpected pending put bucket subresource command for create bucket",
                         ));
                     }
+                    MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
+                        self.drain_pending_completed_multipart_sequence_command(
+                            pg_id, &bucket, &command,
+                        )?;
+                        continue;
+                    }
                     MetadataCommandPayload::ReserveObjectGeneration(_)
                     | MetadataCommandPayload::ReleaseObjectGeneration(_)
                     | MetadataCommandPayload::CommitDirectPutObject(_)
@@ -596,13 +607,12 @@ impl super::StorageCluster {
                     command_id,
                     MetadataCommandPayload::CreateBucket(command),
                 );
-                self.set_pending_metadata_command_for_bucket(
-                    pg_id,
-                    &bucket,
-                    &command,
-                    "conflicting pending command for create bucket",
-                )
-                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                if runtime_state
+                    .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone())
+                    .is_err()
+                {
+                    continue;
+                }
                 (command, true)
             };
             let outcome = self.finish_pending_metadata_command_to_acting_set(
@@ -686,27 +696,6 @@ impl super::StorageCluster {
                 applied_nodes,
                 source: source.into(),
             })?;
-            if let MetadataCommandPayload::CommitMultipartObject(commit) = command.payload() {
-                let bucket_pg_id = node
-                    .storage_node()
-                    .pg_topology()
-                    .bucket_pg_for(&commit.object.bucket);
-                let bucket_pg = node.storage_node().get_pg(bucket_pg_id).map_err(|source| {
-                    MetadataCommandApplyFailure {
-                        applied_nodes,
-                        source: source.into(),
-                    }
-                })?;
-                bucket_pg
-                    .advance_completed_multipart_upload_sequence_for_bucket(
-                        &commit.object.bucket,
-                        commit.completion_order,
-                    )
-                    .map_err(|source| MetadataCommandApplyFailure {
-                        applied_nodes,
-                        source: source.into(),
-                    })?;
-            }
             let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
                 MetadataCommandApplyFailure {
                     applied_nodes,
@@ -852,6 +841,22 @@ impl super::StorageCluster {
                 Err(source)
             }
         }
+    }
+
+    fn drain_pending_completed_multipart_sequence_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let outcome =
+            self.finish_pending_metadata_command_to_acting_set(pg_id, bucket, command, false)?;
+        if outcome == super::PendingMetadataCommandOutcome::Applied {
+            self.local_map
+                .runtime_state()
+                .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+        }
+        Ok(())
     }
 
     fn delete_bucket_from_acting_set(
@@ -1207,6 +1212,14 @@ impl super::StorageCluster {
                             .remove_pending_metadata_command_for_bucket(pg_id, &record.bucket);
                         continue;
                     }
+                    MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
+                        self.drain_pending_completed_multipart_sequence_command(
+                            pg_id,
+                            &record.bucket,
+                            &command,
+                        )?;
+                        continue;
+                    }
                     _ => {
                         return Err(conflicting_pending_metadata_command(
                             "unexpected pending command for completed multipart upload delete",
@@ -1227,13 +1240,16 @@ impl super::StorageCluster {
                         },
                     )),
                 );
-                self.set_pending_metadata_command_for_bucket(
-                    pg_id,
-                    &record.bucket,
-                    &command,
-                    "conflicting pending command for completed multipart upload delete",
-                )
-                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                if runtime_state
+                    .try_set_pending_metadata_command_for_bucket(
+                        pg_id,
+                        &record.bucket,
+                        command.clone(),
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
                 (command, true)
             };
             let outcome = self.finish_pending_metadata_command_to_acting_set(
@@ -1367,6 +1383,12 @@ impl super::StorageCluster {
                             "unexpected pending put bucket subresource command for versioning",
                         ));
                     }
+                    MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
+                        self.drain_pending_completed_multipart_sequence_command(
+                            pg_id, bucket, &command,
+                        )?;
+                        continue;
+                    }
                     MetadataCommandPayload::ReserveObjectGeneration(_)
                     | MetadataCommandPayload::ReleaseObjectGeneration(_)
                     | MetadataCommandPayload::CommitDirectPutObject(_)
@@ -1407,13 +1429,12 @@ impl super::StorageCluster {
                     ),
                 );
                 drop(bucket_pg);
-                self.set_pending_metadata_command_for_bucket(
-                    pg_id,
-                    bucket,
-                    &command,
-                    "conflicting pending command for bucket versioning",
-                )
-                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                if runtime_state
+                    .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
+                    .is_err()
+                {
+                    continue;
+                }
                 (command, true)
             };
             let outcome = self.finish_pending_metadata_command_to_acting_set(
@@ -1580,6 +1601,12 @@ impl super::StorageCluster {
                             "unexpected pending put bucket subresource command for bucket acl",
                         ));
                     }
+                    MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
+                        self.drain_pending_completed_multipart_sequence_command(
+                            pg_id, bucket, &command,
+                        )?;
+                        continue;
+                    }
                     MetadataCommandPayload::ReserveObjectGeneration(_)
                     | MetadataCommandPayload::ReleaseObjectGeneration(_)
                     | MetadataCommandPayload::CommitDirectPutObject(_)
@@ -1620,13 +1647,12 @@ impl super::StorageCluster {
                     )),
                 );
                 drop(bucket_pg);
-                self.set_pending_metadata_command_for_bucket(
-                    pg_id,
-                    bucket,
-                    &command,
-                    "conflicting pending command for bucket ACL",
-                )
-                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                if runtime_state
+                    .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
+                    .is_err()
+                {
+                    continue;
+                }
                 (command, true)
             };
             let outcome = self.finish_pending_metadata_command_to_acting_set(
@@ -1717,6 +1743,12 @@ impl super::StorageCluster {
                             "unexpected pending put bucket subresource command for bucket property",
                         ));
                     }
+                    MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
+                        self.drain_pending_completed_multipart_sequence_command(
+                            pg_id, bucket, &command,
+                        )?;
+                        continue;
+                    }
                     MetadataCommandPayload::ReserveObjectGeneration(_)
                     | MetadataCommandPayload::ReleaseObjectGeneration(_)
                     | MetadataCommandPayload::CommitDirectPutObject(_)
@@ -1757,13 +1789,12 @@ impl super::StorageCluster {
                     ),
                 );
                 drop(bucket_pg);
-                self.set_pending_metadata_command_for_bucket(
-                    pg_id,
-                    bucket,
-                    &command,
-                    "conflicting pending command for bucket property",
-                )
-                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                if runtime_state
+                    .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
+                    .is_err()
+                {
+                    continue;
+                }
                 (command, true)
             };
             let outcome = self.finish_pending_metadata_command_to_acting_set(
@@ -1859,6 +1890,12 @@ impl super::StorageCluster {
                             "unexpected pending put bucket property command for bucket subresource",
                         ));
                     }
+                    MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
+                        self.drain_pending_completed_multipart_sequence_command(
+                            pg_id, bucket, &command,
+                        )?;
+                        continue;
+                    }
                     MetadataCommandPayload::ReserveObjectGeneration(_)
                     | MetadataCommandPayload::ReleaseObjectGeneration(_)
                     | MetadataCommandPayload::CommitDirectPutObject(_)
@@ -1897,13 +1934,12 @@ impl super::StorageCluster {
                         bucket_execution_generation,
                     )),
                 );
-                self.set_pending_metadata_command_for_bucket(
-                    pg_id,
-                    bucket,
-                    &command,
-                    "conflicting pending command for bucket subresource",
-                )
-                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                if runtime_state
+                    .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
+                    .is_err()
+                {
+                    continue;
+                }
                 (command, true)
             };
             let outcome = self.finish_pending_metadata_command_to_acting_set(
@@ -4893,6 +4929,99 @@ impl super::StorageCluster {
         }
     }
 
+    fn reserve_completed_multipart_upload_order(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<u64, ObjectPgActionError> {
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        let primary_node = self.bucket_metadata_primary_node(bucket)?;
+        let runtime_state = self.local_map.runtime_state();
+        loop {
+            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                if let MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(advance) =
+                    command.payload()
+                {
+                    let completion_order = advance.completion_order;
+                    match self
+                        .finish_pending_metadata_command_to_acting_set(
+                            pg_id, bucket, &command, false,
+                        )
+                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
+                    {
+                        super::PendingMetadataCommandOutcome::Applied => {
+                            runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                            return Ok(completion_order);
+                        }
+                        super::PendingMetadataCommandOutcome::Abandoned => continue,
+                    }
+                }
+                match self
+                    .finish_pending_metadata_command_to_acting_set(pg_id, bucket, &command, false)
+                    .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
+                {
+                    super::PendingMetadataCommandOutcome::Applied => {
+                        runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                        continue;
+                    }
+                    super::PendingMetadataCommandOutcome::Abandoned => continue,
+                }
+            }
+
+            let bucket_pg = primary_node.get_pg(pg_id.get())?;
+            let current_order = bucket_pg.completed_multipart_upload_sequence_for_bucket(bucket)?;
+            let completion_order =
+                current_order
+                    .checked_add(1)
+                    .ok_or_else(|| MetadataError::Db {
+                        context: "reserve completed multipart upload order overflow",
+                        source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+                            "completed multipart upload sequence overflow",
+                        )),
+                    })?;
+            i64::try_from(completion_order).map_err(|_| MetadataError::Db {
+                context: "reserve completed multipart upload order overflow",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+                    "completed multipart upload sequence exceeds SQLite integer range",
+                )),
+            })?;
+            drop(bucket_pg);
+
+            let command = MetadataCommandEnvelope::new(
+                MetadataCommandId::new(
+                    self.operation_epoch(),
+                    pg_id,
+                    runtime_state.next_metadata_command_log_index(pg_id),
+                ),
+                MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
+                    AdvanceCompletedMultipartUploadSequenceCommand {
+                        bucket: bucket.clone(),
+                        completion_order,
+                    },
+                ),
+            );
+            if runtime_state
+                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
+                .is_err()
+            {
+                continue;
+            }
+            match self.finish_pending_metadata_command_to_acting_set(pg_id, bucket, &command, true)
+            {
+                Ok(super::PendingMetadataCommandOutcome::Applied) => {
+                    runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                    return Ok(completion_order);
+                }
+                Ok(super::PendingMetadataCommandOutcome::Abandoned) => continue,
+                Err(error) => {
+                    return Err(super::bucket_snapshot_error_to_object_pg_action_error(
+                        error,
+                    ))
+                }
+            }
+        }
+    }
+
     fn apply_multipart_completion_command(
         &self,
         pg_id: PgId,
@@ -5084,14 +5213,7 @@ impl super::StorageCluster {
                 )
             });
             drop(object_pg);
-            let completion_order = bucket_primary_node
-                .next_completed_multipart_upload_order_for_bucket(&bucket)
-                .map_err(|error| match error {
-                    BucketSnapshotLoadError::Store(error) => ObjectPgActionError::Store(error),
-                    BucketSnapshotLoadError::Metadata(error) => {
-                        ObjectPgActionError::Metadata(error)
-                    }
-                })?;
+            let completion_order = self.reserve_completed_multipart_upload_order(&bucket)?;
             let command = MetadataCommandEnvelope::new(
                 MetadataCommandId::new(
                     self.operation_epoch(),

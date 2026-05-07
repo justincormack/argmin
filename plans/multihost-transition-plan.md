@@ -1314,10 +1314,10 @@ Work items:
        idempotence row data, omitted-part cleanup refs, deterministic object
        write sequence, last modified timestamp, and stale payload reclaim rows
        needed to converge replicas after completion
-     - advance each applying node's bucket-PG completed multipart upload
-       sequence to at least the command's completion order before publishing
-       the object-PG command, so primary changes cannot reuse a lower
-       completed-upload pruning order
+     - initially advanced each applying node's bucket-PG completed multipart
+       upload sequence to at least the command's completion order before
+       publishing the object-PG command; Phase 7.3 replaces that cross-PG side
+       effect with an explicit bucket-PG sequence command
      - serialize completed-upload order allocation on the bucket-PG primary
        before constructing the object-PG completion command, so concurrent
        completions for the same bucket on different object PG primaries cannot
@@ -1488,8 +1488,9 @@ Work items:
        canonical binary inventory
      - the `buckets` digest uses an explicit committed-metadata column allowlist;
        transient write-drain counters such as `write_reservations_blocked` and
-       `active_write_reservations` are excluded, as is the local completed-MPU
-       order allocator column `completed_multipart_upload_sequence`
+       `active_write_reservations` are excluded; at the Phase 6.6 boundary the
+       local completed-MPU order allocator column
+       `completed_multipart_upload_sequence` was also still excluded
      - transient bridge/staging/reclaim/allocator tables are intentionally
        outside this digest until those paths are fully command-owned; examples
        include payload shard ack rows, stream session/control rows, raw stream
@@ -1839,10 +1840,18 @@ Completed:
   - narrowed the legacy `PgMetadataStore::put_object_meta` object-row seeder to
     `cfg(test)`, so production code cannot mutate command-owned object rows or
     version counters outside metadata command apply
+  - moved `buckets.completed_multipart_upload_sequence` behind an explicit
+    bucket-PG `AdvanceCompletedMultipartUploadSequence` metadata command:
+    CompleteMultipartUpload first reserves/advances the bucket sequence through
+    the bucket command stream, then uses that reserved order in the object-PG
+    `CommitMultipartObject` command; object-PG command apply no longer mutates
+    bucket-PG state as a side effect
+  - included `buckets.completed_multipart_upload_sequence` in the canonical
+    bucket-row digest and stopped treating it as local runtime state in bucket
+    command row projections
   - retained explicit exclusions for state that is still local-only or still
     mutates outside its own command stream: bucket write-drain counters,
-    `pg_counters`, `multipart_uploads.state`, and
-    `buckets.completed_multipart_upload_sequence`
+    `pg_counters`, and `multipart_uploads.state`
   - remaining Phase 7.3 work is to move those allocator/counter rows behind
     canonical command/checkpoint ownership, then include them in the digest
 

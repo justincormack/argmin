@@ -41,6 +41,7 @@ const METADATA_COMMAND_ABORT_MULTIPART_UPLOAD: u16 = 17;
 const METADATA_COMMAND_COMMIT_STREAM_PART: u16 = 18;
 const METADATA_COMMAND_DELETE_OBJECT_PAYLOAD_RECLAIM: u16 = 19;
 const METADATA_COMMAND_DELETE_COMPLETED_MULTIPART_UPLOAD: u16 = 20;
+const METADATA_COMMAND_ADVANCE_COMPLETED_MULTIPART_UPLOAD_SEQUENCE: u16 = 21;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct MetadataCommandLogIndex(NonZeroU64);
@@ -178,7 +179,6 @@ impl BucketRecord {
     pub(crate) fn command_metadata_projection(mut self) -> Self {
         self.write_reservations_blocked = false;
         self.active_write_reservations = 0;
-        self.completed_multipart_upload_sequence = 0;
         self
     }
 
@@ -234,6 +234,7 @@ pub(crate) enum MetadataCommandPayload {
     AbortMultipartUpload(Box<AbortMultipartUploadCommand>),
     DeleteObjectPayloadReclaim(Box<DeleteObjectPayloadReclaimCommand>),
     DeleteCompletedMultipartUpload(Box<DeleteCompletedMultipartUploadCommand>),
+    AdvanceCompletedMultipartUploadSequence(AdvanceCompletedMultipartUploadSequenceCommand),
 }
 
 impl MetadataCommandPayload {
@@ -260,6 +261,9 @@ impl MetadataCommandPayload {
             Self::DeleteObjectPayloadReclaim(_) => METADATA_COMMAND_DELETE_OBJECT_PAYLOAD_RECLAIM,
             Self::DeleteCompletedMultipartUpload(_) => {
                 METADATA_COMMAND_DELETE_COMPLETED_MULTIPART_UPLOAD
+            }
+            Self::AdvanceCompletedMultipartUploadSequence(_) => {
+                METADATA_COMMAND_ADVANCE_COMPLETED_MULTIPART_UPLOAD_SEQUENCE
             }
         }
     }
@@ -804,6 +808,12 @@ pub(crate) struct DeleteCompletedMultipartUploadCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdvanceCompletedMultipartUploadSequenceCommand {
+    pub(crate) bucket: BucketName,
+    pub(crate) completion_order: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MetadataCommandEnvelope {
     id: MetadataCommandId,
     payload: MetadataCommandPayload,
@@ -928,6 +938,9 @@ fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPaylo
         }
         MetadataCommandPayload::DeleteCompletedMultipartUpload(command) => {
             encode_delete_completed_multipart_upload(&mut out, command);
+        }
+        MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(command) => {
+            encode_advance_completed_multipart_upload_sequence(&mut out, command);
         }
     }
     out
@@ -1164,6 +1177,14 @@ fn encode_delete_completed_multipart_upload(
     command: &DeleteCompletedMultipartUploadCommand,
 ) {
     encode_completed_multipart_upload(out, &command.record);
+}
+
+fn encode_advance_completed_multipart_upload_sequence(
+    out: &mut Vec<u8>,
+    command: &AdvanceCompletedMultipartUploadSequenceCommand,
+) {
+    put_str(out, command.bucket.as_str());
+    put_u64(out, command.completion_order);
 }
 
 fn encode_completed_multipart_upload(out: &mut Vec<u8>, record: &CompletedMultipartUploadRecord) {
@@ -1805,7 +1826,7 @@ mod tests {
     }
 
     #[test]
-    fn bucket_command_encoding_ignores_local_runtime_state() {
+    fn bucket_command_encoding_ignores_runtime_write_reservation_state() {
         let mut current = test_bucket_record("bucket", 13);
         current.write_reservations_blocked = true;
         current.active_write_reservations = 7;
@@ -1814,7 +1835,7 @@ mod tests {
         let command = PutBucketAclCommand::from_bucket(current, AclGrants::default(), true, false);
         assert!(!command.bucket.write_reservations_blocked);
         assert_eq!(command.bucket.active_write_reservations, 0);
-        assert_eq!(command.bucket.completed_multipart_upload_sequence, 0);
+        assert_eq!(command.bucket.completed_multipart_upload_sequence, 11);
 
         let id = MetadataCommandId::new(
             ClusterEpoch::INITIAL,
@@ -1823,10 +1844,12 @@ mod tests {
         );
         let envelope =
             MetadataCommandEnvelope::new(id, MetadataCommandPayload::PutBucketAcl(command));
+        let mut duplicate_current = test_bucket_record("bucket", 13);
+        duplicate_current.completed_multipart_upload_sequence = 11;
         let duplicate = MetadataCommandEnvelope::new(
             id,
             MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
-                test_bucket_record("bucket", 13),
+                duplicate_current,
                 AclGrants::default(),
                 true,
                 false,
@@ -2411,6 +2434,12 @@ mod tests {
                     },
                 },
             )),
+            MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
+                AdvanceCompletedMultipartUploadSequenceCommand {
+                    bucket: BucketName::try_from("bucket".to_string()).unwrap(),
+                    completion_order: 13,
+                },
+            ),
         ];
 
         let mut checksums = Vec::new();
@@ -2455,6 +2484,7 @@ mod tests {
                 0x98ce7d1649b15c26,
                 0xa04e109e74c16cc7,
                 0x15662446b0772b90,
+                0x3042c38f0a8c894b,
             ]
         );
     }

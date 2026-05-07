@@ -65,7 +65,9 @@ lock helpers for:
 For multipart completion ordering, use:
 
 - `SharedStorageNode::lock_multipart_completion_bucket(...)`
-- `Coordinator::next_completed_multipart_upload_order_for_bucket(...)`
+- the storage-cluster completed-MPU order reservation path, which publishes an
+  `AdvanceCompletedMultipartUploadSequence` bucket-PG metadata command before
+  constructing the object-PG completion command
 - `Coordinator::prune_completed_multipart_uploads_for_bucket_with_limit(...)`
 
 Do not open-code this pattern in object paths:
@@ -78,7 +80,8 @@ Do not open-code this pattern in object paths:
 - shard-file visibility that bypasses metadata publication
 - shard-file writes while holding a PG mutex unless the code is intentionally changing the write visibility model
 - allocating multipart completion order before the multipart-completion bucket lock is held
-- taking a bucket/object PG lock and then calling `next_completed_multipart_upload_order_for_bucket(...)` if that path can reach the same bucket PG
+- taking a bucket/object PG lock and then reserving completed-MPU order if that
+  path can reach the same bucket PG
 - using `completed_at` timestamps or upload IDs as the authoritative prune order
 
 ## Why These Rules Exist

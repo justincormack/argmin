@@ -21,16 +21,17 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{
     metadata_command_log_hash, AbortMultipartUploadCommand, AbortStreamUploadCommand,
-    AppendStreamSegmentCommand, BucketPropertyEffect, BucketPropertyMutation, BucketRecord,
-    BucketSubresourceMutation, CommitDirectPutObjectCommand, CommitMultipartObjectCommand,
-    CommitStreamPartCommand, CreateBucketCommand, CreateMultipartUploadCommand,
-    CreateStreamUploadCommand, DeleteCompletedMultipartUploadCommand,
-    DeleteObjectPayloadReclaimCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
-    InsertDeleteMarkerCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
-    MetadataCommandLogIndex, MetadataCommandPayload, MetadataCommandReplicaState,
-    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
-    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
-    ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
+    AdvanceCompletedMultipartUploadSequenceCommand, AppendStreamSegmentCommand,
+    BucketPropertyEffect, BucketPropertyMutation, BucketRecord, BucketSubresourceMutation,
+    CommitDirectPutObjectCommand, CommitMultipartObjectCommand, CommitStreamPartCommand,
+    CreateBucketCommand, CreateMultipartUploadCommand, CreateStreamUploadCommand,
+    DeleteCompletedMultipartUploadCommand, DeleteObjectPayloadReclaimCommand,
+    DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
+    MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandLogIndex,
+    MetadataCommandPayload, MetadataCommandReplicaState, ObjectPayloadReclaimCommand,
+    PutBucketAclCommand, PutBucketPropertyCommand, PutBucketSubresourceCommand,
+    PutBucketVersioningCommand, PutObjectMetadataCommand, ReleaseObjectGenerationCommand,
+    ReserveObjectGenerationCommand,
 };
 use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
@@ -116,6 +117,7 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "bucket_policy_generation",
             "bucket_lifecycle_generation",
             "bucket_execution_generation",
+            "completed_multipart_upload_sequence",
             "bucket_abac_enabled",
             "default_encryption_type",
             "sse_c_blocked",
@@ -3119,6 +3121,15 @@ impl PgStore {
                 "bucket created_at exceeds i64",
             )),
         })?;
+        let completed_multipart_upload_sequence =
+            i64::try_from(bucket.completed_multipart_upload_sequence).map_err(|_| {
+                MetadataError::Db {
+                    context: "create bucket record (encode completed multipart sequence)",
+                    source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+                        "bucket completed multipart sequence exceeds i64",
+                    )),
+                }
+            })?;
         let (
             object_lock_enabled,
             object_lock_default_mode,
@@ -3173,7 +3184,7 @@ impl PgStore {
                         bucket.bucket_policy_generation as i64,
                         bucket.bucket_lifecycle_generation as i64,
                         bucket.bucket_execution_generation as i64,
-                        0_i64,
+                        completed_multipart_upload_sequence,
                         i32::from(bucket.bucket_abac_enabled),
                         bucket.encryption.default_encryption.map(|value| value as u8),
                         i32::from(bucket.encryption.sse_c_blocked),
@@ -3482,6 +3493,9 @@ impl PgStore {
             MetadataCommandPayload::PutBucketSubresource(subresource) => {
                 self.apply_put_bucket_subresource_command(subresource)
             }
+            MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(command) => {
+                self.apply_advance_completed_multipart_upload_sequence_command(command)
+            }
             MetadataCommandPayload::ReserveObjectGeneration(reservation) => {
                 self.apply_reserve_object_generation_command(reservation)
             }
@@ -3631,6 +3645,16 @@ impl PgStore {
             &command.name,
             &command.mutation,
             BucketExecutionGeneration::Explicit(command.bucket_execution_generation),
+        )
+    }
+
+    fn apply_advance_completed_multipart_upload_sequence_command(
+        &self,
+        command: &AdvanceCompletedMultipartUploadSequenceCommand,
+    ) -> Result<(), MetadataError> {
+        self.advance_completed_multipart_upload_sequence_for_bucket(
+            &command.bucket,
+            command.completion_order,
         )
     }
 
@@ -5936,29 +5960,6 @@ impl PgStore {
             ],
         )?;
         Ok(())
-    }
-
-    pub fn next_completed_multipart_upload_order_for_bucket(
-        &self,
-        bucket: &BucketName,
-    ) -> Result<u64, MetadataError> {
-        let bucket_name = bucket.as_str();
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets \
-                 SET completed_multipart_upload_sequence = completed_multipart_upload_sequence + 1 \
-                 WHERE name = ?1",
-                params![bucket_name],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "increment completed multipart upload sequence",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(bucket_not_found(bucket_name));
-        }
-        self.completed_multipart_upload_sequence_for_bucket(bucket)
     }
 
     pub(crate) fn completed_multipart_upload_sequence_for_bucket(

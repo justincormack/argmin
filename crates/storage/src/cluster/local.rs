@@ -1384,15 +1384,16 @@ fn prepare_local_node_data_dir(
 mod tests {
     use super::*;
     use crate::metadata_command::{
-        metadata_command_log_hash, BucketPropertyMutation, BucketSubresourceMutation,
-        CreateBucketCommand, MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandId,
+        metadata_command_log_hash, AdvanceCompletedMultipartUploadSequenceCommand,
+        BucketPropertyMutation, BucketSubresourceMutation, CreateBucketCommand,
+        MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandId,
         MetadataCommandLogIndex, MetadataCommandPayload, PutBucketAclCommand,
         PutObjectMetadataCommand,
     };
     use proptest::prelude::*;
     use proptest::test_runner::{TestCaseError, TestCaseResult};
     use std::collections::BTreeSet;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex, OnceLock};
     use std::time::Duration;
 
@@ -4833,7 +4834,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_state_digest_ignores_completed_multipart_order_allocator() {
+    fn metadata_state_digest_covers_completed_multipart_order_sequence() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let ec_shape = EcShape { k: 2, m: 1 };
@@ -4874,18 +4875,18 @@ mod tests {
         }
 
         let second_command = create_bucket_metadata_command(PgId::new(1), 2, next_bucket.clone());
-        cluster
+        let err = cluster
             .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &second_command)
-            .unwrap();
-
-        let node_zero_pg = map
-            .node(NodeId::new(0))
-            .unwrap()
-            .storage_node()
-            .get_pg(1)
-            .unwrap();
-        let info = crate::PgMetadataStore::head_bucket(&*node_zero_pg, &next_bucket).unwrap();
-        assert_eq!(info.name, next_bucket);
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Store(
+                    StoreError::MetadataStateDigestMismatch { .. }
+                )
+            ),
+            "expected direct completed-MPU sequence mutation to trip digest mismatch, got {err:?}"
+        );
     }
 
     #[test]
@@ -10930,6 +10931,103 @@ mod tests {
                 info.bucket_execution_generation,
                 partial_info.bucket_execution_generation
             );
+        }
+    }
+
+    #[test]
+    fn bucket_acl_drains_pending_completed_multipart_sequence_command() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "acl-drains-mpu-sequence-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let pg_id = PgId::new(1);
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                crate::ClusterEpoch::INITIAL,
+                pg_id,
+                map.runtime_state().next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
+                AdvanceCompletedMultipartUploadSequenceCommand {
+                    bucket: bucket.clone(),
+                    completion_order: 7,
+                },
+            ),
+        );
+        map.runtime_state()
+            .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone())
+            .unwrap();
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let apply_count = Arc::new(AtomicUsize::new(0));
+        let hook_bucket = bucket.clone();
+        let apply_count_hook = Arc::clone(&apply_count);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |_node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(advance)
+                        if advance.bucket == hook_bucket
+                            && apply_count_hook.fetch_add(1, Ordering::SeqCst) == 1 =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected completed multipart sequence apply failure",
+                            source: std::io::Error::other(
+                                "injected completed multipart sequence apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Store(StoreError::Io {
+                    context: "injected completed multipart sequence apply failure",
+                    ..
+                })
+            ),
+            "expected injected sequence apply failure, got {err:?}"
+        );
+        drop(hook_guard);
+
+        let acl_grants = crate::AclGrants::default();
+        let updated = cluster
+            .put_bucket_acl_and_load_info(&bucket, &acl_grants, true, false)
+            .unwrap();
+        assert!(updated.public_read);
+        assert!(!updated.public_write);
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info =
+                crate::traits::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.acl_grants, updated.acl_grants);
+            assert!(info.public_read);
+            assert!(!info.public_write);
+            assert_eq!(info.completed_multipart_upload_sequence, 7);
         }
     }
 

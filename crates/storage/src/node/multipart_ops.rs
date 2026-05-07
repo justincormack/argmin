@@ -1,14 +1,6 @@
 use super::*;
 
 impl SharedStorageNode {
-    pub fn next_completed_multipart_upload_order_for_bucket(
-        &self,
-        bucket: &BucketName,
-    ) -> Result<u64, BucketSnapshotLoadError> {
-        let bucket_pg = self.get_pg(self.pg_topology.bucket_pg_for(bucket))?;
-        Ok(bucket_pg.next_completed_multipart_upload_order_for_bucket(bucket)?)
-    }
-
     pub(super) fn load_in_progress_multipart_upload_from_object_pg(
         pg: &PgStore,
         bucket: &BucketName,

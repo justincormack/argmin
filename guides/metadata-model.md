@@ -84,8 +84,7 @@ command-owned durable serving, in-progress, and cleanup metadata:
 
 The current inventory still excludes state that is local-only or not yet
 owned by its own canonical command stream: bucket write-drain counters,
-`pg_counters`, `multipart_uploads.state`, and
-`buckets.completed_multipart_upload_sequence`. Those are Phase 7.3 gaps, not
+`pg_counters`, and `multipart_uploads.state`. Those are Phase 7.3 gaps, not
 implicit exemptions from metadata integrity.
 
 The full-PG encoding starts with a stable domain/version header. Each included
@@ -127,10 +126,11 @@ encodings.
 | `PutBucketAcl` | Storage-shaped | command-owned bucket row | post-mutation command-owned bucket row | matching command-owned bucket row post-image converges |
 | `PutBucketProperty` | Storage-shaped | command-owned bucket row | post-mutation command-owned bucket row plus property effect group | matching command-owned bucket row post-image converges |
 | `PutBucketSubresource` | Storage-shaped | bucket row generation | bucket subresource row, generation mirrors | matching subresource effect converges |
+| `AdvanceCompletedMultipartUploadSequence` | Storage-shaped | bucket completed-MPU sequence | advances bucket completed-MPU sequence to the command order | matching bucket/order converges |
 | `ReserveObjectGeneration` | Storage-shaped | object generation allocators and live/reclaim/reservation rows | generation reservation row | matching reservation id converges |
 | `ReleaseObjectGeneration` | Storage-shaped | generation reservation row | removes reservation row | missing matching reservation is idempotent |
 | `CommitDirectPutObject` | Storage-shaped | object row, version/write-sequence state, reservation row | object row, segment manifest, stale reclaim rows | matching object generation/reservation converges |
-| `CommitMultipartObject` | Storage-shaped | MPU rows, part rows, completed-MPU order, object state | object row, part manifest, selected segment rows, completed-MPU row, stale reclaim rows | matching upload completion converges |
+| `CommitMultipartObject` | Storage-shaped | MPU rows, part rows, reserved completed-MPU order, object state | object row, part manifest, selected segment rows, completed-MPU row, stale reclaim rows | matching upload completion converges |
 | `DeleteObjectVersion` | Storage-shaped | exact object version row | removes version, writes reclaim metadata for live payload | matching version/generation converges |
 | `InsertDeleteMarker` | Storage-shaped | object version/write-sequence state | delete marker row, optional stale reclaim metadata | matching bucket/key marker insertion converges |
 | `PutObjectMetadata` | Storage-shaped | exact object version row | post-mutation live object metadata row | matching live object post-image converges |
@@ -158,12 +158,15 @@ is included in the canonical metadata digest.
 
 Bucket metadata commands keep the AWS-facing operation split at the storage API
 boundary, but the durable command carries the command-owned bucket-table
-post-image. Local runtime columns such as write-drain counters and the
-completed-MPU order allocator are not part of bucket command checksums,
-preimage equality, or retry matching. Bucket property commands also carry the
-storage property group being changed so replay can validate that only the
-intended bucket-row columns changed. Raw bucket encryption columns are part of
-the row image; matching only the effective encryption behavior is not exact
+post-image. Local runtime columns such as write-drain counters are not part of
+bucket command checksums, preimage equality, or retry matching. The
+completed-MPU order sequence is command-owned: ordinary bucket-row post-image
+commands preserve its current value, and multipart completion advances it
+through `AdvanceCompletedMultipartUploadSequence` before publishing the object
+completion command. Bucket property commands also carry the storage property
+group being changed so replay can validate that only the intended bucket-row
+columns changed. Raw bucket encryption columns are part of the row image;
+matching only the effective encryption behavior is not exact
 enough.
 
 `PutObjectMetadata` keeps the AWS-facing "put tags", "delete tags", "put ACL",
