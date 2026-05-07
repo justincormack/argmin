@@ -9359,6 +9359,125 @@ mod tests {
     }
 
     #[test]
+    fn completed_multipart_order_drains_same_pg_object_command_with_cleanup_hooks() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, pg_id) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "mpu-order-drains-object-");
+            let key = key_for_object_pg(topology, &bucket, 1, "same-pg-key-");
+            (bucket, key, 1)
+        };
+        set_route_primary(&mut map, pg_id, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let committed = write_committed_direct_segment_for(
+            &cluster,
+            &bucket,
+            &key,
+            b"same pg object command cleanup",
+        );
+        assert!(cluster.try_take_reclaim_work().is_none());
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::DeleteObjectVersion(delete)
+                        if delete.bucket == hook_bucket
+                            && delete.key == hook_key
+                            && node_id == NodeId::new(1)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected same-pg object delete apply failure",
+                            source: std::io::Error::other(
+                                "injected same-pg object delete apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .delete_current_object_if(&bucket, &key, |_| Ok::<(), ()>(()))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected same-pg object delete apply failure",
+                    ..
+                })
+            ),
+            "expected injected delete failure, got {err:?}"
+        );
+        drop(hook_guard);
+        assert!(!fail_once.load(Ordering::SeqCst));
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(pg_id), &bucket)
+            .is_some());
+        assert!(cluster.try_take_reclaim_work().is_none());
+
+        let completion_order = cluster
+            .test_reserve_completed_multipart_upload_order(&bucket)
+            .unwrap();
+        assert_eq!(completion_order, 1);
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(pg_id), &bucket)
+            .is_none());
+        assert!(matches!(
+            cluster.try_take_reclaim_work(),
+            Some(crate::ReclaimWorkItem::ObjectPayload((
+                queued_bucket,
+                queued_key,
+                queued_generation_id
+            ))) if queued_bucket == bucket
+                && queued_key == key
+                && queued_generation_id == committed.generation_id
+        ));
+        assert!(cluster.try_take_reclaim_work().is_none());
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(pg_id).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+                Err(crate::MetadataError::ObjectNotFound)
+            ));
+            assert!(crate::PgMetadataStore::payload_reclaim_exists(
+                &*pg,
+                &bucket,
+                &key,
+                committed.generation_id
+            )
+            .unwrap());
+            let info =
+                crate::traits::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.completed_multipart_upload_sequence, completion_order);
+        }
+    }
+
+    #[test]
     fn object_metadata_update_commands_apply_to_all_acting_object_pg_nodes() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

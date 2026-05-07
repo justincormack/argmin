@@ -865,6 +865,42 @@ impl super::StorageCluster {
         Ok(())
     }
 
+    fn finish_pending_command_for_completed_multipart_order(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<super::PendingMetadataCommandOutcome, ObjectPgActionError> {
+        match command.payload() {
+            MetadataCommandPayload::ReserveObjectGeneration(_)
+            | MetadataCommandPayload::ReleaseObjectGeneration(_)
+            | MetadataCommandPayload::ReserveObjectVersion(_)
+            | MetadataCommandPayload::CommitDirectPutObject(_)
+            | MetadataCommandPayload::CommitMultipartObject(_)
+            | MetadataCommandPayload::DeleteObjectVersion(_)
+            | MetadataCommandPayload::InsertDeleteMarker(_)
+            | MetadataCommandPayload::PutObjectMetadata(_)
+            | MetadataCommandPayload::CreateStreamUpload(_)
+            | MetadataCommandPayload::AppendStreamSegment(_)
+            | MetadataCommandPayload::AbortStreamUpload(_)
+            | MetadataCommandPayload::CommitStreamPart(_)
+            | MetadataCommandPayload::CreateMultipartUpload(_)
+            | MetadataCommandPayload::AbortMultipartUpload(_)
+            | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
+                self.finish_pending_object_metadata_command_for_bucket(pg_id, bucket, command)
+            }
+            MetadataCommandPayload::CreateBucket(_)
+            | MetadataCommandPayload::PutBucketVersioning(_)
+            | MetadataCommandPayload::PutBucketAcl(_)
+            | MetadataCommandPayload::PutBucketProperty(_)
+            | MetadataCommandPayload::PutBucketSubresource(_)
+            | MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
+            | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => self
+                .finish_pending_metadata_command_to_acting_set(pg_id, bucket, command, false)
+                .map_err(super::bucket_snapshot_error_to_object_pg_action_error),
+        }
+    }
+
     fn delete_bucket_from_acting_set(
         &self,
         pg_id: PgId,
@@ -4976,8 +5012,7 @@ impl super::StorageCluster {
                     }
                 }
                 match self
-                    .finish_pending_metadata_command_to_acting_set(pg_id, bucket, &command, false)
-                    .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
+                    .finish_pending_command_for_completed_multipart_order(pg_id, bucket, &command)?
                 {
                     super::PendingMetadataCommandOutcome::Applied => {
                         runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
@@ -5039,6 +5074,14 @@ impl super::StorageCluster {
                 }
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_reserve_completed_multipart_upload_order(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<u64, ObjectPgActionError> {
+        self.reserve_completed_multipart_upload_order(bucket)
     }
 
     fn apply_multipart_completion_command(
