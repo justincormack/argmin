@@ -14,6 +14,7 @@ use crate::metadata_command::{
     CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteObjectVersionTarget,
     MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
     ObjectPayloadReclaimCommand, ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
+    ReserveObjectVersionCommand,
 };
 use crate::node::SharedStorageNode;
 use crate::traits::{PgMetadataStore, ShardStore};
@@ -44,6 +45,7 @@ pub enum MetadataCommandApplyTestKind {
     AdvanceCompletedMultipartUploadSequence,
     ReserveObjectGeneration,
     ReleaseObjectGeneration,
+    ReserveObjectVersion,
     CommitDirectPutObject,
     CommitMultipartObject,
     DeleteObjectVersion,
@@ -1008,6 +1010,57 @@ impl StorageCluster {
         }
     }
 
+    fn reserve_next_object_version(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        primary_node: &SharedStorageNode,
+    ) -> Result<VersionId, ObjectPgActionError> {
+        let runtime_state = self.local_map.runtime_state();
+        loop {
+            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                if let MetadataCommandPayload::ReserveObjectVersion(reservation) = command.payload()
+                {
+                    let reserved_version_id = reservation.version_id;
+                    let matches_request = reservation.matches_request(bucket, key);
+                    match self.finish_pending_object_metadata_command_for_bucket(
+                        pg_id, bucket, &command,
+                    )? {
+                        PendingMetadataCommandOutcome::Applied if matches_request => {
+                            return Ok(reserved_version_id);
+                        }
+                        PendingMetadataCommandOutcome::Applied
+                        | PendingMetadataCommandOutcome::Abandoned => continue,
+                    }
+                }
+                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                continue;
+            }
+
+            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let version_id = PgMetadataStore::next_version_id(&*object_pg, bucket, key)?;
+            drop(object_pg);
+            let command = MetadataCommandEnvelope::new(
+                self.next_object_metadata_command_id(pg_id),
+                MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+                    bucket.clone(),
+                    key.clone(),
+                    version_id,
+                )),
+            );
+            if runtime_state
+                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
+                .is_err()
+            {
+                continue;
+            }
+            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            return Ok(version_id);
+        }
+    }
+
     fn apply_pending_object_metadata_command_for_bucket(
         &self,
         pg_id: PgId,
@@ -1544,10 +1597,8 @@ impl StorageCluster {
                 runtime_state.pending_metadata_command_for_bucket(pg_id, &req.bucket)
             else {
                 let object_pg = object_node.get_pg(pg_id.get())?;
-                let command = match self
-                    .prepare_commit_direct_put_object_command(pg_id, &object_pg, req, action)
-                {
-                    Ok(Ok(command)) => command,
+                match self.validate_direct_put_commit_preconditions(&object_pg, req, action) {
+                    Ok(Ok(())) => {}
                     Ok(Err(error)) => {
                         drop(object_pg);
                         drop(_bucket_guard);
@@ -1566,6 +1617,61 @@ impl StorageCluster {
                         );
                         return Ok(Err(error));
                     }
+                    Err(error) => {
+                        drop(object_pg);
+                        drop(_bucket_guard);
+                        self.release_object_generation_reservation_after_pending_drain_best_effort(
+                            pg_id,
+                            &req.bucket,
+                            &req.key,
+                            &req.generation_reservation_id,
+                        );
+                        self.delete_direct_put_segment_payload_shards(
+                            req.data_pg_id,
+                            req.ec,
+                            &req.segment_okh,
+                            req.segment_vid,
+                            written_shards,
+                        );
+                        return Err(error);
+                    }
+                }
+                drop(object_pg);
+
+                let version_id = if req.versioning == crate::BucketVersioningState::Enabled {
+                    match self.reserve_next_object_version(
+                        pg_id,
+                        &req.bucket,
+                        &req.key,
+                        object_node,
+                    ) {
+                        Ok(version_id) => version_id,
+                        Err(error) => {
+                            drop(_bucket_guard);
+                            self.release_object_generation_reservation_after_pending_drain_best_effort(
+                                pg_id,
+                                &req.bucket,
+                                &req.key,
+                                &req.generation_reservation_id,
+                            );
+                            self.delete_direct_put_segment_payload_shards(
+                                req.data_pg_id,
+                                req.ec,
+                                &req.segment_okh,
+                                req.segment_vid,
+                                written_shards,
+                            );
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    VersionId::Null
+                };
+                let object_pg = object_node.get_pg(pg_id.get())?;
+                let command = match self
+                    .prepare_commit_direct_put_object_command(pg_id, &object_pg, req, version_id)
+                {
+                    Ok(command) => command,
                     Err(error) => {
                         drop(object_pg);
                         drop(_bucket_guard);
@@ -1814,13 +1920,12 @@ impl StorageCluster {
         }
     }
 
-    fn prepare_commit_direct_put_object_command<E>(
+    fn validate_direct_put_commit_preconditions<E>(
         &self,
-        pg_id: PgId,
         object_pg: &crate::PgStore,
         req: &CommitDirectPutObjectReq,
         action: impl FnOnce(DirectPutCommitSnapshot) -> Result<(), E>,
-    ) -> Result<Result<MetadataCommandEnvelope, E>, ObjectPgActionError> {
+    ) -> Result<Result<(), E>, ObjectPgActionError> {
         let reserved_generation = object_pg.get_object_generation_reservation(
             &req.bucket,
             &req.key,
@@ -1845,12 +1950,31 @@ impl StorageCluster {
         if let Err(error) = action(DirectPutCommitSnapshot { existing_etag }) {
             return Ok(Err(error));
         }
+        Ok(Ok(()))
+    }
 
-        let version_id = if req.versioning == crate::BucketVersioningState::Enabled {
-            PgMetadataStore::next_version_id(object_pg, &req.bucket, &req.key)?
-        } else {
-            VersionId::Null
-        };
+    fn prepare_commit_direct_put_object_command(
+        &self,
+        pg_id: PgId,
+        object_pg: &crate::PgStore,
+        req: &CommitDirectPutObjectReq,
+        version_id: VersionId,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        let reserved_generation = object_pg.get_object_generation_reservation(
+            &req.bucket,
+            &req.key,
+            &req.generation_reservation_id,
+        )?;
+        if reserved_generation != req.generation_id {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: format!(
+                    "object generation reservation mismatch: reserved {} but commit requested {}",
+                    reserved_generation.get(),
+                    req.generation_id.get()
+                ),
+            });
+        }
+
         let last_modified_millis = crate::clock::current_time_millis();
         let write_sequence =
             object_pg.next_object_write_sequence(req.bucket.as_str(), req.key.as_str())?;
@@ -1911,10 +2035,10 @@ impl StorageCluster {
                 .runtime_state()
                 .next_metadata_command_log_index(pg_id),
         );
-        Ok(Ok(MetadataCommandEnvelope::new(
+        Ok(MetadataCommandEnvelope::new(
             command_id,
             MetadataCommandPayload::CommitDirectPutObject(Box::new(command)),
-        )))
+        ))
     }
 
     fn snapshot_direct_put_stale_payload_command(

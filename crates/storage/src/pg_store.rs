@@ -31,7 +31,7 @@ use crate::metadata_command::{
     MetadataCommandPayload, MetadataCommandReplicaState, ObjectPayloadReclaimCommand,
     PutBucketAclCommand, PutBucketPropertyCommand, PutBucketSubresourceCommand,
     PutBucketVersioningCommand, PutObjectMetadataCommand, ReleaseObjectGenerationCommand,
-    ReserveObjectGenerationCommand,
+    ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
 };
 use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
@@ -3502,6 +3502,9 @@ impl PgStore {
             MetadataCommandPayload::ReleaseObjectGeneration(reservation) => {
                 self.apply_release_object_generation_command(reservation)
             }
+            MetadataCommandPayload::ReserveObjectVersion(version) => {
+                self.apply_reserve_object_version_command(version)
+            }
             MetadataCommandPayload::CommitDirectPutObject(command) => {
                 self.apply_commit_direct_put_object_command(command)
             }
@@ -3680,6 +3683,13 @@ impl PgStore {
             &command.key,
             &command.reservation_id,
         )
+    }
+
+    fn apply_reserve_object_version_command(
+        &self,
+        command: &ReserveObjectVersionCommand,
+    ) -> Result<(), MetadataError> {
+        self.reserve_object_version_explicit(&command.bucket, &command.key, command.version_id)
     }
 
     fn apply_commit_direct_put_object_command(
@@ -5854,6 +5864,28 @@ impl PgStore {
                 source: e,
             })?;
         Ok(())
+    }
+
+    fn reserve_object_version_explicit(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<(), MetadataError> {
+        if version_id.is_null() {
+            return Err(MetadataError::Db {
+                context: "reserve object version command null version",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        let expected = self.next_version_id(bucket, key)?;
+        if expected != version_id {
+            return Err(MetadataError::Db {
+                context: "reserve object version command stale version",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        self.advance_object_version_counter_in_open_txn(bucket, key, version_id)
     }
 
     pub(crate) fn object_write_sequence(
@@ -12437,6 +12469,102 @@ mod tests {
                     )
                     .unwrap();
             },
+        );
+    }
+
+    #[test]
+    fn reserve_object_version_command_advances_counter_exactly() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("bucket");
+        let key = trusted_object_key("object");
+
+        let first = PgMetadataStore::next_version_id(&store, &bucket, &key).unwrap();
+        assert_eq!(first, VersionId::from_u64(1));
+
+        let reserve_first = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+                bucket.clone(),
+                key.clone(),
+                first,
+            )),
+        );
+        store.apply_metadata_command(&reserve_first).unwrap();
+        assert_eq!(
+            PgMetadataStore::next_version_id(&store, &bucket, &key).unwrap(),
+            VersionId::from_u64(2)
+        );
+
+        let stale = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+                bucket.clone(),
+                key.clone(),
+                first,
+            )),
+        );
+        let err = store.apply_metadata_command(&stale).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MetadataError::Db {
+                    context: "reserve object version command stale version",
+                    ..
+                }
+            ),
+            "expected stale version reservation rejection, got {err:?}"
+        );
+
+        let second = PgMetadataStore::next_version_id(&store, &bucket, &key).unwrap();
+        let reserve_second = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(3).unwrap(),
+            ),
+            MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+                bucket.clone(),
+                key.clone(),
+                second,
+            )),
+        );
+        store.apply_metadata_command(&reserve_second).unwrap();
+        assert_eq!(
+            PgMetadataStore::next_version_id(&store, &bucket, &key).unwrap(),
+            VersionId::from_u64(3)
+        );
+
+        let null_reservation = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(4).unwrap(),
+            ),
+            MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+                bucket,
+                key,
+                VersionId::Null,
+            )),
+        );
+        let err = store.apply_metadata_command(&null_reservation).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MetadataError::Db {
+                    context: "reserve object version command null version",
+                    ..
+                }
+            ),
+            "expected null version reservation rejection, got {err:?}"
         );
     }
 

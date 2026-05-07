@@ -129,10 +129,11 @@ encodings.
 | `AdvanceCompletedMultipartUploadSequence` | Storage-shaped | bucket completed-MPU sequence | advances bucket completed-MPU sequence to the command order | matching bucket/order converges |
 | `ReserveObjectGeneration` | Storage-shaped | object generation allocators and live/reclaim/reservation rows | generation reservation row | matching reservation id converges |
 | `ReleaseObjectGeneration` | Storage-shaped | generation reservation row | removes reservation row | missing matching reservation is idempotent |
-| `CommitDirectPutObject` | Storage-shaped | object row, version/write-sequence state, reservation row | object row, segment manifest, stale reclaim rows | matching object generation/reservation converges |
-| `CommitMultipartObject` | Storage-shaped | MPU rows, part rows, reserved completed-MPU order, object state | object row, part manifest, selected segment rows, completed-MPU row, stale reclaim rows | matching upload completion converges |
+| `ReserveObjectVersion` | Storage-shaped | object version counter and existing object versions | advances the per-key object version counter to the reserved version | matching bucket/key/version converges |
+| `CommitDirectPutObject` | Storage-shaped | object row, reserved version/write-sequence state, reservation row | object row, segment manifest, stale reclaim rows | matching object generation/reservation converges |
+| `CommitMultipartObject` | Storage-shaped | MPU rows, part rows, reserved object version, reserved completed-MPU order, object state | object row, part manifest, selected segment rows, completed-MPU row, stale reclaim rows | matching upload completion converges |
 | `DeleteObjectVersion` | Storage-shaped | exact object version row | removes version, writes reclaim metadata for live payload | matching version/generation converges |
-| `InsertDeleteMarker` | Storage-shaped | object version/write-sequence state | delete marker row, optional stale reclaim metadata | matching bucket/key marker insertion converges |
+| `InsertDeleteMarker` | Storage-shaped | reserved object version/write-sequence state | delete marker row, optional stale reclaim metadata | matching bucket/key marker insertion converges |
 | `PutObjectMetadata` | Storage-shaped | exact object version row | post-mutation live object metadata row | matching live object post-image converges |
 | `CreateStreamUpload` | Storage-shaped | target object/upload row for validation | stream session row | matching session row converges |
 | `AppendStreamSegment` | Storage-shaped | stream session row and existing segment rows | stream segment row | matching segment row converges |

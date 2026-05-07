@@ -1864,6 +1864,26 @@ mod tests {
         expected_segment: &crate::MultipartPartSegmentRecord,
         outcome: &crate::CompleteMultipartCommitOutcome,
     ) {
+        assert_streamed_multipart_completion_on_acting_nodes_with_write_sequence(
+            map,
+            node_ids,
+            object_pg,
+            req,
+            expected_segment,
+            outcome,
+            1,
+        );
+    }
+
+    fn assert_streamed_multipart_completion_on_acting_nodes_with_write_sequence(
+        map: &LocalClusterMap,
+        node_ids: &[NodeId],
+        object_pg: u32,
+        req: &crate::CompleteMultipartCommitRequest,
+        expected_segment: &crate::MultipartPartSegmentRecord,
+        outcome: &crate::CompleteMultipartCommitOutcome,
+        expected_write_sequence: u64,
+    ) {
         let mut expected_completion_order = None;
         for node_id in node_ids {
             let node = map.node(*node_id).unwrap().storage_node();
@@ -1881,7 +1901,7 @@ mod tests {
             assert_eq!(
                 pg.object_write_sequence(req.bucket.as_str(), req.key.as_str(), outcome.version_id)
                     .unwrap(),
-                Some(1)
+                Some(expected_write_sequence)
             );
 
             let parts = crate::PgMetadataStore::get_object_parts(
@@ -4271,9 +4291,8 @@ mod tests {
                 PgId::new(object_pg),
                 &object_pg_store,
                 &abandoned_req,
-                |_| Ok::<(), ()>(()),
+                crate::VersionId::Null,
             )
-            .unwrap()
             .unwrap();
         drop(object_pg_store);
         let abandoned_shard_batch: Vec<(&ShardKey, crate::WriteAck)> = abandoned_written
@@ -4574,6 +4593,186 @@ mod tests {
             let stored =
                 crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &pending_key).unwrap();
             assert_eq!(stored.as_live().unwrap().tags.as_deref(), Some(tags));
+        }
+    }
+
+    #[test]
+    fn reserve_object_version_retry_reuses_pending_partial_replica_command() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let primary_node = cluster.object_metadata_primary_node(&bucket, &key).unwrap();
+        let pg_id = PgId::new(object_pg);
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::ReserveObjectVersion(reservation)
+                        if reservation.bucket == hook_bucket
+                            && reservation.key == hook_key
+                            && node_id == NodeId::new(1)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected reserve object version apply failure",
+                            source: std::io::Error::other(
+                                "injected reserve object version apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .reserve_next_object_version(pg_id, &bucket, &key, primary_node)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected reserve object version apply failure",
+                    ..
+                })
+            ),
+            "expected injected primary failure, got {err:?}"
+        );
+        drop(hook_guard);
+
+        let pending = map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(pg_id, &bucket)
+            .expect("partial version reservation must remain pending");
+        let MetadataCommandPayload::ReserveObjectVersion(reservation) = pending.payload() else {
+            panic!("expected pending ReserveObjectVersion, got {pending:?}");
+        };
+        assert_eq!(reservation.version_id, crate::VersionId::from_u64(1));
+        for node_id in [NodeId::new(0), NodeId::new(2)] {
+            assert_object_version_counter_on_acting_nodes(
+                &map,
+                &[node_id],
+                object_pg,
+                &bucket,
+                &key,
+                2,
+            );
+        }
+        assert_object_version_counter_on_acting_nodes(
+            &map,
+            &[NodeId::new(1)],
+            object_pg,
+            &bucket,
+            &key,
+            0,
+        );
+
+        let reserved = cluster
+            .reserve_next_object_version(pg_id, &bucket, &key, primary_node)
+            .unwrap();
+        assert_eq!(reserved, crate::VersionId::from_u64(1));
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(pg_id, &bucket)
+            .is_none());
+        assert_object_version_counter_on_acting_nodes(&map, &node_ids, object_pg, &bucket, &key, 2);
+    }
+
+    #[test]
+    fn direct_put_action_failure_does_not_reserve_object_version() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket_with_versioning(
+            &cluster,
+            &bucket,
+            crate::BucketVersioningState::Enabled,
+        );
+        let reservation_id = crate::SessionId::try_from("75".repeat(16)).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        let payload = b"conditional direct put should not reserve a version";
+        let segment_okh = [75; 16];
+        let written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                payload,
+            )
+            .unwrap();
+        let mut commit_req = direct_put_commit_req(
+            &bucket,
+            &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            &written,
+        );
+        commit_req.versioning = crate::BucketVersioningState::Enabled;
+
+        let err = cluster
+            .commit_direct_put_object_from_payload_shards(
+                &commit_req,
+                &written.written_shards,
+                |_| Err::<(), _>("conditional write rejected"),
+            )
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err, "conditional write rejected");
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+        assert_object_version_counter_on_acting_nodes(&map, &node_ids, object_pg, &bucket, &key, 0);
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+                Err(crate::MetadataError::ObjectNotFound)
+            ));
         }
     }
 
@@ -7296,6 +7495,115 @@ mod tests {
     }
 
     #[test]
+    fn versioned_stream_put_finalize_reserves_object_version_through_command_stream() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket_with_versioning(
+            &cluster,
+            &bucket,
+            crate::BucketVersioningState::Enabled,
+        );
+        let session_id = crate::SessionId::try_from("76".repeat(16)).unwrap();
+        cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                &session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap();
+        let payload = b"versioned stream put finalization";
+        let payload_crc64 = checksum::crc64::checksum(payload);
+        let (_target, segment) = cluster
+            .prepare_stream_segment_append(
+                &bucket,
+                &key,
+                &crate::PrepareStreamUploadSegmentAppendReq {
+                    session_id: session_id.clone(),
+                    segment_index: 0,
+                    size: payload.len() as u64,
+                    segment_crc64: Some(payload_crc64),
+                    segment_okh: [0x76; 16],
+                },
+            )
+            .unwrap();
+        let written_shards = cluster
+            .write_stream_segment_payload_shards(&segment, payload)
+            .unwrap();
+        let shard_batch = written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect::<Vec<_>>();
+        cluster
+            .commit_stream_segment_append(
+                &bucket,
+                &key,
+                &session_id,
+                segment.segment_index,
+                &segment,
+                &shard_batch,
+            )
+            .unwrap();
+
+        let outcome = cluster
+            .finalize_put_object_stream(&bucket, &key, &session_id, payload.len() as u64, |_| {
+                Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                    value: (),
+                    versioning: crate::BucketVersioningState::Enabled,
+                    owner: crate::OwnerIdentity::from_principal("owner"),
+                    acl_grants: crate::AclGrants::default(),
+                    public_read: false,
+                    size: payload.len() as u64,
+                    etag_crc64: payload_crc64,
+                    tags: None,
+                    metadata_blob: crate::SerializedMetadataBlob::default(),
+                    system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                    object_lock: crate::ObjectLockState::default(),
+                    encryption: crate::ObjectEncryption::None,
+                })
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.version_id, crate::VersionId::from_u64(1));
+
+        assert_object_version_counter_on_acting_nodes(&map, &node_ids, object_pg, &bucket, &key, 2);
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+            let live = stored.as_live().unwrap();
+            assert_eq!(live.version_id, outcome.version_id);
+            assert_eq!(live.size, payload.len() as u64);
+            assert_eq!(
+                pg.object_write_sequence(bucket.as_str(), key.as_str(), outcome.version_id,)
+                    .unwrap(),
+                Some(1),
+            );
+            assert!(matches!(
+                crate::PgMetadataStore::get_stream_upload(&*pg, &session_id),
+                Err(crate::MetadataError::StreamSessionNotFound { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn stream_part_finalize_pending_drain_clears_runtime_vid_allocator() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -8114,6 +8422,194 @@ mod tests {
             &key,
             outcome.version_id.to_u64() + 1,
         );
+    }
+
+    #[test]
+    fn versioned_direct_put_and_multipart_completion_allocate_versions_via_command_stream() {
+        #[derive(Default)]
+        struct VersionRaceState {
+            direct_at_apply: bool,
+            multipart_at_apply: bool,
+            release_direct: bool,
+        }
+
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket_with_versioning(
+            &cluster,
+            &bucket,
+            crate::BucketVersioningState::Enabled,
+        );
+        let (mut multipart_req, mut expected_multipart_segment) =
+            seed_streamed_multipart_completion(&cluster, &bucket, &key, "versionraceupload");
+        multipart_req.versioning = crate::BucketVersioningState::Enabled;
+
+        let reservation_id = crate::SessionId::try_from("73".repeat(16)).unwrap();
+        let direct_generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        let direct_payload = b"versioned direct put races multipart completion";
+        let direct_okh = [73; 16];
+        let direct_written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                direct_generation_id,
+                0,
+                &direct_okh,
+                direct_payload,
+            )
+            .unwrap();
+        let mut direct_req = direct_put_commit_req(
+            &bucket,
+            &key,
+            reservation_id.clone(),
+            direct_generation_id,
+            direct_payload,
+            direct_okh,
+            &direct_written,
+        );
+        direct_req.versioning = crate::BucketVersioningState::Enabled;
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let race_state = Arc::new((Mutex::new(VersionRaceState::default()), Condvar::new()));
+        let direct_seen = Arc::new(AtomicBool::new(false));
+        let multipart_seen = Arc::new(AtomicBool::new(false));
+        let hook_key = key.clone();
+        let hook_reservation_id = reservation_id.clone();
+        let hook_upload_id = multipart_req.upload_id.clone();
+        let expected_multipart_req = multipart_req.clone();
+        let hook_race_state = Arc::clone(&race_state);
+        let hook_direct_seen = Arc::clone(&direct_seen);
+        let hook_multipart_seen = Arc::clone(&multipart_seen);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |_node_id, command| {
+                let (lock, cvar) = &*hook_race_state;
+                match command.payload() {
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                        if commit.object.key == hook_key
+                            && commit.generation_reservation_id == hook_reservation_id
+                            && !hook_direct_seen.swap(true, Ordering::SeqCst) =>
+                    {
+                        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        state.direct_at_apply = true;
+                        cvar.notify_all();
+                        while !state.release_direct {
+                            state = cvar.wait(state).unwrap_or_else(|e| e.into_inner());
+                        }
+                    }
+                    MetadataCommandPayload::CommitMultipartObject(commit)
+                        if commit.upload_id == hook_upload_id
+                            && !hook_multipart_seen.swap(true, Ordering::SeqCst) =>
+                    {
+                        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        state.multipart_at_apply = true;
+                        cvar.notify_all();
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let direct_cluster = Arc::clone(&cluster);
+        let direct_written_shards = direct_written.written_shards.clone();
+        let direct_thread = std::thread::spawn(move || {
+            direct_cluster.commit_direct_put_object_from_payload_shards(
+                &direct_req,
+                &direct_written_shards,
+                |_| Ok::<_, ()>(()),
+            )
+        });
+
+        {
+            let (lock, cvar) = &*race_state;
+            let state = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let (state, _) = cvar
+                .wait_timeout_while(state, Duration::from_secs(5), |state| {
+                    !state.direct_at_apply
+                })
+                .unwrap();
+            assert!(
+                state.direct_at_apply,
+                "direct PUT did not reach command apply"
+            );
+        }
+
+        let multipart_cluster = Arc::clone(&cluster);
+        let multipart_thread = std::thread::spawn(move || {
+            multipart_cluster.complete_multipart_upload_commit_serialized(multipart_req, 16)
+        });
+
+        {
+            let (lock, cvar) = &*race_state;
+            let state = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let (mut state, _) = cvar
+                .wait_timeout_while(state, Duration::from_millis(100), |state| {
+                    !state.multipart_at_apply
+                })
+                .unwrap();
+            assert!(
+                !state.multipart_at_apply,
+                "multipart completion applied while direct PUT held the bucket command stream"
+            );
+            state.release_direct = true;
+            cvar.notify_all();
+        }
+
+        let direct_outcome = direct_thread.join().unwrap().unwrap().unwrap();
+        let multipart_outcome = multipart_thread.join().unwrap().unwrap();
+        drop(hook_guard);
+
+        assert_eq!(direct_outcome.version_id, crate::VersionId::from_u64(1));
+        assert_eq!(multipart_outcome.version_id, crate::VersionId::from_u64(2));
+        expected_multipart_segment.version_id = multipart_outcome.version_id.to_u64();
+
+        for node_id in node_ids {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            let direct_version = crate::PgMetadataStore::get_object_version(
+                &*pg,
+                &bucket,
+                &key,
+                direct_outcome.version_id,
+            )
+            .unwrap();
+            let direct_live = direct_version.as_live().unwrap();
+            assert_eq!(direct_live.generation_id, direct_generation_id);
+            assert!(direct_live.became_noncurrent_at.is_some());
+        }
+        assert_streamed_multipart_completion_on_acting_nodes_with_write_sequence(
+            &map,
+            &node_ids,
+            object_pg,
+            &expected_multipart_req,
+            &expected_multipart_segment,
+            &multipart_outcome,
+            2,
+        );
+        assert_object_version_counter_on_acting_nodes(&map, &node_ids, object_pg, &bucket, &key, 3);
     }
 
     #[test]
@@ -9389,6 +9885,89 @@ mod tests {
                 .unwrap()
                 .is_empty(),
                 "null live segment rows should be removed on node {node_id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_enabled_current_expiration_reserves_delete_marker_version() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket_with_versioning(
+            &cluster,
+            &bucket,
+            crate::BucketVersioningState::Enabled,
+        );
+        put_test_lifecycle(&cluster, &bucket);
+        let committed = write_committed_direct_segment_for_with_versioning(
+            &cluster,
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Enabled,
+            [0x77; 16],
+            [0x78; 16],
+            b"enabled lifecycle current",
+        );
+        assert_eq!(committed.version_id, crate::VersionId::from_u64(1));
+
+        let outcome = cluster
+            .expire_current_object_if_due(&bucket, &key, committed.version_id, |raw, record| {
+                assert_eq!(raw, Some("<LifecycleConfiguration/>"));
+                assert_eq!(record.generation_id, committed.generation_id);
+                Ok::<_, ()>(true)
+            })
+            .unwrap()
+            .unwrap()
+            .expect("enabled current live object should expire");
+        assert_eq!(outcome.reclaim_generation_id, None);
+        assert!(cluster.try_take_reclaim_work().is_none());
+
+        assert_object_version_counter_on_acting_nodes(&map, &node_ids, object_pg, &bucket, &key, 3);
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            let current = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+            let crate::StoredObject::DeleteMarker(marker) = current else {
+                panic!("expected current delete marker on node {node_id:?}, got {current:?}");
+            };
+            assert_eq!(marker.version_id, crate::VersionId::from_u64(2));
+
+            let stored_live = crate::PgMetadataStore::get_object_version(
+                &*pg,
+                &bucket,
+                &key,
+                committed.version_id,
+            )
+            .unwrap();
+            let live = stored_live.as_live().unwrap();
+            assert_eq!(live.generation_id, committed.generation_id);
+            assert!(live.became_noncurrent_at.is_some());
+            assert!(
+                !crate::PgMetadataStore::payload_reclaim_exists(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    committed.generation_id,
+                )
+                .unwrap(),
+                "enabled current expiration should not reclaim the preserved live version"
             );
         }
     }

@@ -239,6 +239,11 @@ fn metadata_command_apply_test_context(
             Some(command.bucket.clone()),
             Some(command.key.clone()),
         ),
+        MetadataCommandPayload::ReserveObjectVersion(command) => (
+            MetadataCommandApplyTestKind::ReserveObjectVersion,
+            Some(command.bucket.clone()),
+            Some(command.key.clone()),
+        ),
         MetadataCommandPayload::CommitDirectPutObject(command) => (
             MetadataCommandApplyTestKind::CommitDirectPutObject,
             Some(command.object.bucket.clone()),
@@ -567,6 +572,7 @@ impl super::StorageCluster {
                     }
                     MetadataCommandPayload::ReserveObjectGeneration(_)
                     | MetadataCommandPayload::ReleaseObjectGeneration(_)
+                    | MetadataCommandPayload::ReserveObjectVersion(_)
                     | MetadataCommandPayload::CommitDirectPutObject(_)
                     | MetadataCommandPayload::CommitMultipartObject(_)
                     | MetadataCommandPayload::DeleteObjectVersion(_)
@@ -1391,6 +1397,7 @@ impl super::StorageCluster {
                     }
                     MetadataCommandPayload::ReserveObjectGeneration(_)
                     | MetadataCommandPayload::ReleaseObjectGeneration(_)
+                    | MetadataCommandPayload::ReserveObjectVersion(_)
                     | MetadataCommandPayload::CommitDirectPutObject(_)
                     | MetadataCommandPayload::CommitMultipartObject(_)
                     | MetadataCommandPayload::DeleteObjectVersion(_)
@@ -1609,6 +1616,7 @@ impl super::StorageCluster {
                     }
                     MetadataCommandPayload::ReserveObjectGeneration(_)
                     | MetadataCommandPayload::ReleaseObjectGeneration(_)
+                    | MetadataCommandPayload::ReserveObjectVersion(_)
                     | MetadataCommandPayload::CommitDirectPutObject(_)
                     | MetadataCommandPayload::CommitMultipartObject(_)
                     | MetadataCommandPayload::DeleteObjectVersion(_)
@@ -1751,6 +1759,7 @@ impl super::StorageCluster {
                     }
                     MetadataCommandPayload::ReserveObjectGeneration(_)
                     | MetadataCommandPayload::ReleaseObjectGeneration(_)
+                    | MetadataCommandPayload::ReserveObjectVersion(_)
                     | MetadataCommandPayload::CommitDirectPutObject(_)
                     | MetadataCommandPayload::CommitMultipartObject(_)
                     | MetadataCommandPayload::DeleteObjectVersion(_)
@@ -1898,6 +1907,7 @@ impl super::StorageCluster {
                     }
                     MetadataCommandPayload::ReserveObjectGeneration(_)
                     | MetadataCommandPayload::ReleaseObjectGeneration(_)
+                    | MetadataCommandPayload::ReserveObjectVersion(_)
                     | MetadataCommandPayload::CommitDirectPutObject(_)
                     | MetadataCommandPayload::CommitMultipartObject(_)
                     | MetadataCommandPayload::DeleteObjectVersion(_)
@@ -3317,7 +3327,9 @@ impl super::StorageCluster {
                     Ok(value) => value,
                     Err(error) => return Ok(Err(error)),
                 };
-            let marker_vid = PgMetadataStore::next_version_id(&*object_pg, bucket, key)?;
+            drop(object_pg);
+            let marker_vid = self.reserve_next_object_version(pg_id, bucket, key, primary_node)?;
+            let object_pg = primary_node.get_pg(pg_id.get())?;
             let command = self.new_insert_delete_marker_command(
                 pg_id,
                 &object_pg,
@@ -3513,33 +3525,34 @@ impl super::StorageCluster {
                         self.live_delete_command_target(&object_pg, bucket, key, &record)?;
                     let reclaim_generation_id =
                         super::delete_object_version_reclaim_generation(&target);
-                    (
-                        self.new_delete_object_version_command(
-                            pg_id,
-                            bucket,
-                            key,
-                            record.version_id,
-                            target,
-                        ),
-                        reclaim_generation_id,
-                    )
+                    let command = self.new_delete_object_version_command(
+                        pg_id,
+                        bucket,
+                        key,
+                        record.version_id,
+                        target,
+                    );
+                    drop(object_pg);
+                    (command, reclaim_generation_id)
                 }
                 BucketVersioningState::Enabled => {
-                    let marker_vid = PgMetadataStore::next_version_id(&*object_pg, bucket, key)?;
-                    (
-                        self.new_insert_delete_marker_command(
-                            pg_id,
-                            &object_pg,
-                            InsertDeleteMarkerDraft {
-                                bucket,
-                                key,
-                                version_id: marker_vid,
-                                owner: &owner,
-                                stale_payload: None,
-                            },
-                        )?,
-                        None,
-                    )
+                    drop(object_pg);
+                    let marker_vid =
+                        self.reserve_next_object_version(pg_id, bucket, key, primary_node)?;
+                    let object_pg = primary_node.get_pg(pg_id.get())?;
+                    let command = self.new_insert_delete_marker_command(
+                        pg_id,
+                        &object_pg,
+                        InsertDeleteMarkerDraft {
+                            bucket,
+                            key,
+                            version_id: marker_vid,
+                            owner: &owner,
+                            stale_payload: None,
+                        },
+                    )?;
+                    drop(object_pg);
+                    (command, None)
                 }
                 BucketVersioningState::Suspended => {
                     let stale_payload = self.snapshot_direct_put_stale_payload_command(
@@ -3550,23 +3563,21 @@ impl super::StorageCluster {
                     )?;
                     let reclaim_generation_id =
                         super::object_payload_reclaim_generation(&stale_payload);
-                    (
-                        self.new_insert_delete_marker_command(
-                            pg_id,
-                            &object_pg,
-                            InsertDeleteMarkerDraft {
-                                bucket,
-                                key,
-                                version_id: VersionId::Null,
-                                owner: &owner,
-                                stale_payload,
-                            },
-                        )?,
-                        reclaim_generation_id,
-                    )
+                    let command = self.new_insert_delete_marker_command(
+                        pg_id,
+                        &object_pg,
+                        InsertDeleteMarkerDraft {
+                            bucket,
+                            key,
+                            version_id: VersionId::Null,
+                            owner: &owner,
+                            stale_payload,
+                        },
+                    )?;
+                    drop(object_pg);
+                    (command, reclaim_generation_id)
                 }
             };
-            drop(object_pg);
             self.set_pending_metadata_command_for_bucket(
                 pg_id,
                 bucket,
@@ -4389,94 +4400,102 @@ impl super::StorageCluster {
             });
         }
 
-        let (command, new_pending_command) = if let Some(command) = pending_command {
-            (command, false)
-        } else {
-            let version_id = if prepared.versioning == BucketVersioningState::Enabled {
-                PgMetadataStore::next_version_id(&*object_pg, bucket, key)?
-            } else {
-                VersionId::Null
-            };
-            let generation_id =
-                object_pg.get_object_generation_reservation(bucket, key, session_id)?;
-            let last_modified_millis = crate::clock::current_time_millis();
-            let write_sequence =
-                object_pg.next_object_write_sequence(bucket.as_str(), key.as_str())?;
-            let stale_payload = if version_id.is_null() {
-                self.snapshot_direct_put_stale_payload_command(
-                    &object_pg,
-                    bucket,
-                    key,
-                    last_modified_millis,
-                )?
-            } else {
-                None
-            };
-            let committed_segments: Vec<ObjectSegmentRecord> = staging_segments
-                .iter()
-                .map(|segment| ObjectSegmentRecord {
+        let (command, new_pending_command) = match pending_command {
+            Some(command) => {
+                drop(object_pg);
+                (command, false)
+            }
+            None => {
+                let (version_id, object_pg) =
+                    if prepared.versioning == BucketVersioningState::Enabled {
+                        drop(object_pg);
+                        let version_id =
+                            self.reserve_next_object_version(pg_id, bucket, key, primary_node)?;
+                        (version_id, primary_node.get_pg(pg_id.get())?)
+                    } else {
+                        (VersionId::Null, object_pg)
+                    };
+                let generation_id =
+                    object_pg.get_object_generation_reservation(bucket, key, session_id)?;
+                let last_modified_millis = crate::clock::current_time_millis();
+                let write_sequence =
+                    object_pg.next_object_write_sequence(bucket.as_str(), key.as_str())?;
+                let stale_payload = if version_id.is_null() {
+                    self.snapshot_direct_put_stale_payload_command(
+                        &object_pg,
+                        bucket,
+                        key,
+                        last_modified_millis,
+                    )?
+                } else {
+                    None
+                };
+                let committed_segments: Vec<ObjectSegmentRecord> = staging_segments
+                    .iter()
+                    .map(|segment| ObjectSegmentRecord {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        version_id,
+                        segment_index: segment.segment_index,
+                        size: segment.size,
+                        segment_crc64: segment.segment_crc64,
+                        segment_okh: segment.segment_okh,
+                        segment_vid: segment.segment_vid,
+                        data_pg_id: segment.data_pg_id,
+                        ec_k: segment.ec_k,
+                        ec_m: segment.ec_m,
+                    })
+                    .collect();
+                let object = PutLiveObjectReq {
                     bucket: bucket.clone(),
                     key: key.clone(),
                     version_id,
-                    segment_index: segment.segment_index,
-                    size: segment.size,
-                    segment_crc64: segment.segment_crc64,
-                    segment_okh: segment.segment_okh,
-                    segment_vid: segment.segment_vid,
-                    data_pg_id: segment.data_pg_id,
-                    ec_k: segment.ec_k,
-                    ec_m: segment.ec_m,
-                })
-                .collect();
-            let object = PutLiveObjectReq {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                version_id,
-                owner: prepared.owner.clone(),
-                acl_grants: prepared.acl_grants.clone(),
-                public_read: prepared.public_read,
-                generation_id,
-                size: prepared.size,
-                etag: ObjectEtag::single_part(prepared.etag_crc64),
-                ec: staging_segments
-                    .first()
-                    .map_or(self.default_payload_ec_shape(), |segment| EcShape {
-                        k: segment.ec_k,
-                        m: segment.ec_m,
-                    }),
-                layout: ObjectLayout::Standard,
-                tags: prepared.tags.clone(),
-                metadata_blob: Some(prepared.metadata_blob.clone()),
-                system_metadata_blob: Some(prepared.system_metadata_blob.clone()),
-                object_lock: prepared.object_lock,
-                encryption: prepared.encryption.clone(),
-            };
-            let command = MetadataCommandEnvelope::new(
-                MetadataCommandId::new(
-                    self.operation_epoch(),
+                    owner: prepared.owner.clone(),
+                    acl_grants: prepared.acl_grants.clone(),
+                    public_read: prepared.public_read,
+                    generation_id,
+                    size: prepared.size,
+                    etag: ObjectEtag::single_part(prepared.etag_crc64),
+                    ec: staging_segments.first().map_or(
+                        self.default_payload_ec_shape(),
+                        |segment| EcShape {
+                            k: segment.ec_k,
+                            m: segment.ec_m,
+                        },
+                    ),
+                    layout: ObjectLayout::Standard,
+                    tags: prepared.tags.clone(),
+                    metadata_blob: Some(prepared.metadata_blob.clone()),
+                    system_metadata_blob: Some(prepared.system_metadata_blob.clone()),
+                    object_lock: prepared.object_lock,
+                    encryption: prepared.encryption.clone(),
+                };
+                let command = MetadataCommandEnvelope::new(
+                    MetadataCommandId::new(
+                        self.operation_epoch(),
+                        pg_id,
+                        runtime_state.next_metadata_command_log_index(pg_id),
+                    ),
+                    MetadataCommandPayload::CommitDirectPutObject(Box::new(
+                        CommitDirectPutObjectCommand {
+                            object,
+                            segments: committed_segments,
+                            generation_reservation_id: session_id.clone(),
+                            write_sequence,
+                            last_modified_millis,
+                            stale_payload,
+                        },
+                    )),
+                );
+                self.set_pending_metadata_command_for_bucket(
                     pg_id,
-                    runtime_state.next_metadata_command_log_index(pg_id),
-                ),
-                MetadataCommandPayload::CommitDirectPutObject(Box::new(
-                    CommitDirectPutObjectCommand {
-                        object,
-                        segments: committed_segments,
-                        generation_reservation_id: session_id.clone(),
-                        write_sequence,
-                        last_modified_millis,
-                        stale_payload,
-                    },
-                )),
-            );
-            self.set_pending_metadata_command_for_bucket(
-                pg_id,
-                bucket,
-                &command,
-                "conflicting pending command for stream PUT finalization",
-            )?;
-            (command, true)
+                    bucket,
+                    &command,
+                    "conflicting pending command for stream PUT finalization",
+                )?;
+                (command, true)
+            }
         };
-        drop(object_pg);
 
         if new_pending_command {
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
@@ -5055,6 +5074,7 @@ impl super::StorageCluster {
         let bucket_primary_node = self.bucket_metadata_primary_node(&bucket)?;
         let _completion_guard = bucket_primary_node.lock_multipart_completion_bucket(&bucket);
         let primary_node = self.object_metadata_primary_node(&bucket, &key)?;
+        let _bucket_guard = primary_node.lock_bucket(&bucket);
         let runtime_state = self.local_map.runtime_state();
 
         'retry_after_pending_conflict: loop {
@@ -5114,10 +5134,13 @@ impl super::StorageCluster {
                 .into());
             }
 
-            let version_id = if req.versioning == BucketVersioningState::Enabled {
-                PgMetadataStore::next_version_id(&*object_pg, &bucket, &key)?
+            let (version_id, object_pg) = if req.versioning == BucketVersioningState::Enabled {
+                drop(object_pg);
+                let version_id =
+                    self.reserve_next_object_version(pg_id, &bucket, &key, primary_node)?;
+                (version_id, primary_node.get_pg(pg_id.get())?)
             } else {
-                VersionId::Null
+                (VersionId::Null, object_pg)
             };
             let stale_payload = if version_id.is_null() {
                 Self::snapshot_completed_multipart_stale_payload(&object_pg, &bucket, &key)?

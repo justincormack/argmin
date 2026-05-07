@@ -42,6 +42,7 @@ const METADATA_COMMAND_COMMIT_STREAM_PART: u16 = 18;
 const METADATA_COMMAND_DELETE_OBJECT_PAYLOAD_RECLAIM: u16 = 19;
 const METADATA_COMMAND_DELETE_COMPLETED_MULTIPART_UPLOAD: u16 = 20;
 const METADATA_COMMAND_ADVANCE_COMPLETED_MULTIPART_UPLOAD_SEQUENCE: u16 = 21;
+const METADATA_COMMAND_RESERVE_OBJECT_VERSION: u16 = 22;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct MetadataCommandLogIndex(NonZeroU64);
@@ -221,6 +222,7 @@ pub(crate) enum MetadataCommandPayload {
     PutBucketSubresource(PutBucketSubresourceCommand),
     ReserveObjectGeneration(ReserveObjectGenerationCommand),
     ReleaseObjectGeneration(ReleaseObjectGenerationCommand),
+    ReserveObjectVersion(ReserveObjectVersionCommand),
     CommitDirectPutObject(Box<CommitDirectPutObjectCommand>),
     CommitMultipartObject(Box<CommitMultipartObjectCommand>),
     DeleteObjectVersion(Box<DeleteObjectVersionCommand>),
@@ -247,6 +249,7 @@ impl MetadataCommandPayload {
             Self::PutBucketSubresource(_) => METADATA_COMMAND_PUT_BUCKET_SUBRESOURCE,
             Self::ReserveObjectGeneration(_) => METADATA_COMMAND_RESERVE_OBJECT_GENERATION,
             Self::ReleaseObjectGeneration(_) => METADATA_COMMAND_RELEASE_OBJECT_GENERATION,
+            Self::ReserveObjectVersion(_) => METADATA_COMMAND_RESERVE_OBJECT_VERSION,
             Self::CommitDirectPutObject(_) => METADATA_COMMAND_COMMIT_DIRECT_PUT_OBJECT,
             Self::CommitMultipartObject(_) => METADATA_COMMAND_COMMIT_MULTIPART_OBJECT,
             Self::DeleteObjectVersion(_) => METADATA_COMMAND_DELETE_OBJECT_VERSION,
@@ -483,6 +486,27 @@ impl ReleaseObjectGenerationCommand {
         reservation_id: &SessionId,
     ) -> bool {
         self.bucket == *bucket && self.key == *key && self.reservation_id == *reservation_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReserveObjectVersionCommand {
+    pub(crate) bucket: BucketName,
+    pub(crate) key: ObjectKey,
+    pub(crate) version_id: VersionId,
+}
+
+impl ReserveObjectVersionCommand {
+    pub(crate) fn new(bucket: BucketName, key: ObjectKey, version_id: VersionId) -> Self {
+        Self {
+            bucket,
+            key,
+            version_id,
+        }
+    }
+
+    pub(crate) fn matches_request(&self, bucket: &BucketName, key: &ObjectKey) -> bool {
+        self.bucket == *bucket && self.key == *key
     }
 }
 
@@ -900,6 +924,9 @@ fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPaylo
         MetadataCommandPayload::ReleaseObjectGeneration(command) => {
             encode_release_object_generation(&mut out, command);
         }
+        MetadataCommandPayload::ReserveObjectVersion(command) => {
+            encode_reserve_object_version(&mut out, command);
+        }
         MetadataCommandPayload::CommitDirectPutObject(command) => {
             encode_commit_direct_put_object(&mut out, command);
         }
@@ -981,6 +1008,12 @@ fn encode_release_object_generation(out: &mut Vec<u8>, command: &ReleaseObjectGe
     put_str(out, command.bucket.as_str());
     put_str(out, command.key.as_str());
     put_str(out, command.reservation_id.as_str());
+}
+
+fn encode_reserve_object_version(out: &mut Vec<u8>, command: &ReserveObjectVersionCommand) {
+    put_str(out, command.bucket.as_str());
+    put_str(out, command.key.as_str());
+    encode_version_id(out, command.version_id);
 }
 
 fn encode_commit_direct_put_object(out: &mut Vec<u8>, command: &CommitDirectPutObjectCommand) {
@@ -2221,6 +2254,11 @@ mod tests {
                 key.clone(),
                 reservation_id.clone(),
             )),
+            MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+                bucket.clone(),
+                key.clone(),
+                VersionId::from_u64(7),
+            )),
             MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
                 object: object.clone(),
                 segments: vec![segment.clone()],
@@ -2462,29 +2500,30 @@ mod tests {
             [
                 0x5fc3fd9935e6b23a,
                 0x56db6be41cc9a89c,
-                0xee750f881921402d,
-                0xfe04371c6a46ec80,
-                0x8e971303e9b59031,
-                0x66ff987ed0727bc1,
-                0x37077018dfee09b9,
-                0xfce4f84779e4e364,
-                0xa1b20e6eb91852f7,
-                0x4a877a8134817636,
-                0x6c3bf60387ba55f3,
-                0x488205d249e6ecb4,
-                0x2a86200ef59abfce,
-                0xbedac82e848dc420,
-                0x73de85dc53ef998c,
-                0x2c69c1feb283495d,
-                0x9e020e0cc8c2f954,
-                0xf1b058002ad6040e,
-                0x7555192579a20442,
-                0x505fc17b646186f2,
-                0xff13404730caba1e,
-                0x98ce7d1649b15c26,
-                0xa04e109e74c16cc7,
-                0x15662446b0772b90,
-                0x3042c38f0a8c894b,
+                0x3acf49df359790d4,
+                0xb5a8e642f639b9a8,
+                0x892df6c0f857bf33,
+                0xfbb11e5c2fc9738c,
+                0x53fdbf4c6f062d53,
+                0x6df04a5fc73e478a,
+                0xbda5330ae032bc4d,
+                0x2c1290d732a2f1be,
+                0x4d1e49e9ee7ba6ce,
+                0x5e16bf9dc0031ca5,
+                0xe4a9882d6f443342,
+                0x102e75d82949a914,
+                0x3a98e0cfac7868d4,
+                0x8b678e0025c9b1d3,
+                0xbdcef0c26be17ad5,
+                0x3c300c538341970d,
+                0xc680813c7b2166c5,
+                0xa9a8f76af3abec2e,
+                0x427f3ded4746d8c9,
+                0xa81b57c84330b04f,
+                0x3761b68d22ccd74d,
+                0x3038eaf05b1f79b2,
+                0xce5696140098157d,
+                0x8f99afc705991815,
             ]
         );
     }

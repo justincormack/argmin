@@ -90,8 +90,8 @@ Do not open-code this pattern in object paths:
 - Without short append lock windows, slow clients or durable shard IO can block unrelated work.
 - Without metadata-locked snapshotting plus payload leases, reads can race with
   overwrite/delete reclaim and observe mixed snapshots or missing payload.
-- Without locked version allocation, concurrent versioned writes can choose the
-  same `version_id`.
+- Without command-owned version allocation, concurrent versioned writes can
+  choose the same `version_id`.
 - Without a durable-before-visible rule, reads can observe metadata that points
   at shard files that were never fully committed, or bypass cleanup rules by
   treating orphan files as live payload.

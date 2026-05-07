@@ -1268,8 +1268,9 @@ Work items:
        partial direct PUT publish converges the prior command stream before
        starting the replacement write
      - keep per-key object version allocation monotonic through explicit
-       `object_version_counters`, advance those counters on replicated object
-       command apply, and remove bucket-owned counter rows on bucket delete
+       `object_version_counters`, reserve numbered versions through the object
+       metadata command stream before publish/delete-marker commands consume
+       them, and remove bucket-owned counter rows on bucket delete
      - route direct PUT object publication through a prepared command carrying
        the explicit live-object row, segment rows, write sequence, last-modified
        timestamp, reservation ID, and any stale payload reclaim rows needed by
@@ -1834,9 +1835,11 @@ Completed:
     command-owned `stream_upload_segments.segment_vid` value remains in the
     canonical digest
   - moved `object_version_counters` behind object metadata command ownership:
-    `next_version_id` is now a read-only candidate allocator, while object
-    publish/delete-marker commands advance the durable counter during acting-set
-    command apply; the counter table is now included in the canonical digest
+    `next_version_id` is now a read-only candidate allocator, and versioned
+    object writers apply an explicit `ReserveObjectVersion` command before
+    publish/delete-marker commands consume the reserved ID; object publish
+    commands still carry the exact version ID and keep the counter monotonic
+    during apply, while the counter table is included in the canonical digest
   - narrowed the legacy `PgMetadataStore::put_object_meta` object-row seeder to
     `cfg(test)`, so production code cannot mutate command-owned object rows or
     version counters outside metadata command apply
