@@ -1024,7 +1024,7 @@ impl StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
         key: &ObjectKey,
-        primary_node: &SharedStorageNode,
+        _primary_node: &SharedStorageNode,
     ) -> Result<VersionId, ObjectPgActionError> {
         let runtime_state = self.local_map.runtime_state();
         loop {
@@ -1048,9 +1048,7 @@ impl StorageCluster {
                 continue;
             }
 
-            let object_pg = primary_node.get_pg(pg_id.get())?;
-            let version_id = PgMetadataStore::next_version_id(&*object_pg, bucket, key)?;
-            drop(object_pg);
+            let version_id = self.max_next_object_version_id_on_acting_set(pg_id, bucket, key)?;
             let command = MetadataCommandEnvelope::new(
                 self.next_object_metadata_command_id(pg_id),
                 MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
@@ -1068,6 +1066,26 @@ impl StorageCluster {
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             return Ok(version_id);
         }
+    }
+
+    fn max_next_object_version_id_on_acting_set(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<VersionId, ObjectPgActionError> {
+        let mut version_id = VersionId::from_u64(1);
+        for node in self
+            .local_map
+            .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
+        {
+            let pg = node.storage_node().get_pg(pg_id.get())?;
+            let candidate = PgMetadataStore::next_version_id(&*pg, bucket, key)?;
+            if candidate.to_u64() > version_id.to_u64() {
+                version_id = candidate;
+            }
+        }
+        Ok(version_id)
     }
 
     fn apply_pending_object_metadata_command_for_bucket(

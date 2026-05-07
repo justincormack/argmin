@@ -4726,6 +4726,118 @@ mod tests {
     }
 
     #[test]
+    fn reserve_object_version_partial_apply_after_reopen_uses_max_counter() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let primary_node = cluster.object_metadata_primary_node(&bucket, &key).unwrap();
+        let pg_id = PgId::new(object_pg);
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::ReserveObjectVersion(reservation)
+                        if reservation.bucket == hook_bucket
+                            && reservation.key == hook_key
+                            && node_id == NodeId::new(1)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected lost reserve object version apply failure",
+                            source: std::io::Error::other(
+                                "injected lost reserve object version apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .reserve_next_object_version(pg_id, &bucket, &key, primary_node)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected lost reserve object version apply failure",
+                    ..
+                })
+            ),
+            "expected injected primary failure, got {err:?}"
+        );
+        drop(hook_guard);
+
+        assert_object_version_counter_on_acting_nodes(
+            &map,
+            &[NodeId::new(0), NodeId::new(2)],
+            object_pg,
+            &bucket,
+            &key,
+            2,
+        );
+        assert_object_version_counter_on_acting_nodes(
+            &map,
+            &[NodeId::new(1)],
+            object_pg,
+            &bucket,
+            &key,
+            0,
+        );
+
+        drop(cluster);
+        drop(map);
+
+        let mut reopened =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        set_route_primary(&mut reopened, object_pg, NodeId::new(1));
+        let reopened = Arc::new(reopened);
+        let reopened_cluster =
+            crate::StorageCluster::from_local_map(Arc::clone(&reopened)).unwrap();
+        let reopened_primary = reopened_cluster
+            .object_metadata_primary_node(&bucket, &key)
+            .unwrap();
+
+        let reserved = reopened_cluster
+            .reserve_next_object_version(pg_id, &bucket, &key, reopened_primary)
+            .unwrap();
+        assert_eq!(reserved, crate::VersionId::from_u64(2));
+        assert_object_version_counter_on_acting_nodes(
+            &reopened, &node_ids, object_pg, &bucket, &key, 3,
+        );
+
+        let reserved = reopened_cluster
+            .reserve_next_object_version(pg_id, &bucket, &key, reopened_primary)
+            .unwrap();
+        assert_eq!(reserved, crate::VersionId::from_u64(3));
+        assert_object_version_counter_on_acting_nodes(
+            &reopened, &node_ids, object_pg, &bucket, &key, 4,
+        );
+    }
+
+    #[test]
     fn direct_put_action_failure_does_not_reserve_object_version() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

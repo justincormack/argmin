@@ -6067,12 +6067,17 @@ impl PgStore {
             });
         }
         let expected = self.next_version_id(bucket, key)?;
-        if expected != version_id {
+        if expected.to_u64() > version_id.to_u64() {
             return Err(MetadataError::Db {
                 context: "reserve object version command stale version",
                 source: rusqlite::Error::InvalidQuery,
             });
         }
+        // A command from the active primary may be ahead of this replica if a
+        // prior reservation partially applied before restart and the pending
+        // in-memory command was lost. Advancing forward is safe for this
+        // allocator: version ids are opaque and gaps are preferable to making
+        // the key permanently unwritable.
         self.advance_object_version_counter_in_open_txn(bucket, key, version_id)
     }
 
@@ -12814,6 +12819,32 @@ mod tests {
                 }
             ),
             "expected null version reservation rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reserve_object_version_command_advances_lower_counter_forward() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("bucket");
+        let key = trusted_object_key("object");
+
+        let forward = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+                bucket.clone(),
+                key.clone(),
+                VersionId::from_u64(3),
+            )),
+        );
+        store.apply_metadata_command(&forward).unwrap();
+        assert_eq!(
+            PgMetadataStore::next_version_id(&store, &bucket, &key).unwrap(),
+            VersionId::from_u64(4)
         );
     }
 

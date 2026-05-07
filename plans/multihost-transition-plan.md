@@ -1842,6 +1842,13 @@ Completed:
     publish/delete-marker commands consume the reserved ID; object publish
     commands still carry the exact version ID and keep the counter monotonic
     during apply, while the counter table is included in the canonical digest
+  - hardened `ReserveObjectVersion` after partial apply plus local-cluster
+    reopen: new reservations choose the maximum next-version candidate across
+    the acting set, and replicas whose local counter is lower advance forward
+    under the command; this can leave gaps in opaque version IDs, but prevents
+    a lost in-memory pending reservation from making a versioned key
+    permanently unwritable before Phase 7.4 adds durable replay/checkpoint
+    repair
   - narrowed the legacy `PgMetadataStore::put_object_meta` object-row seeder to
     `cfg(test)`, so production code cannot mutate command-owned object rows or
     version counters outside metadata command apply
