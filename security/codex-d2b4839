@@ -1,0 +1,382 @@
+Active writes can block bucket ACL and property changes
+Link: https://chatgpt.com/codex/cloud/security/findings/44ce229d8c94819195ef00244e39043c?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Resolution
+Fixed in commit `4c2768d` (`Exclude bucket runtime state from metadata commands`).
+
+The fix projects `BucketRecord` down to command-owned bucket metadata at the
+metadata-command boundary. Local runtime fields
+`write_reservations_blocked`, `active_write_reservations`, and
+`completed_multipart_upload_sequence` are no longer included in bucket command
+checksums, retry matching, or PgStore bucket-command preimage equality. Bucket
+command apply still preserves those local runtime fields on each replica.
+
+Regression coverage was added for ACL, versioning, and public-access-block
+commands while the routed bucket primary has an active local write reservation,
+plus command-encoding coverage proving local runtime state is not serialized
+into bucket command payloads.
+
+Verification before the fix commit:
+- `cargo nextest run -p storage`
+- `cargo nextest run`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt`
+
+# Metadata
+Repo: justincormack/argmin
+Commit: d2b4839
+Author: justin@specialbusservice.com
+Created: 06/05/2026, 17:27:59
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced bug: full bucket post-images include replica-local transient reservation state, causing legitimate bucket metadata commands to be rejected during concurrent writes.
+BucketRecord now includes write_reservations_blocked and active_write_reservations and derives full-record equality. PutBucketAcl/PutBucketProperty/PutBucketVersioning commands are built from the primary node's raw BucketRecord. However active_write_reservations is a local, transient counter incremented while object writes are in progress on the bucket metadata primary. Bucket metadata commands are then applied to all acting nodes, with non-primary replicas applied before the primary. Those replicas normally have active_write_reservations = 0, while the command target captured the primary's nonzero counter. put_bucket_record_update_inner validates the command by comparing the full expected BucketRecord to the target, so the transient counter mismatch is treated as a conflicting command and the ACL/property/versioning change fails. A client that can keep write reservations active, especially on a public-write bucket, can repeatedly prevent the owner from disabling public write/read or applying public access block settings.
+
+# Validation
+## Rubric
+- [x] Confirm `BucketRecord` full equality includes transient reservation fields (`write_reservations_blocked`, `active_write_reservations`).
+- [x] Confirm bucket ACL/property/versioning metadata commands are built from the primary node's raw `BucketRecord`, so primary-local counters can enter the command target.
+- [x] Confirm write reservations are local counter updates held during object writes and not replicated metadata-log state.
+- [x] Confirm replicated command application reaches non-primary replicas first and bucket update validation compares the full expected/target record.
+- [x] Dynamically reproduce with two stores: primary has `active_write_reservations=1`, replica has `0`, command target captures `1`, replica rejects with `apply conflicting bucket acl command`; same mutation succeeds after counter returns to `0`.
+## Report
+Validated the finding with a targeted Rust unit-test PoC plus a non-interactive LLDB trace. The vulnerable state is present in code: `BucketRecord` derives full `PartialEq/Eq` and includes `active_write_reservations` at `crates/storage/src/metadata_command.rs:103-117`. Bucket ACL commands are constructed from `head_bucket_record_raw(bucket)` on the primary and then wrapped with a new execution generation at `crates/storage/src/cluster/request_ops.rs:1473-1484`; bucket properties use the same raw-record pattern at `request_ops.rs:1609-1621`, and versioning does likewise at `request_ops.rs:1261-1271`. Write reservations are local SQL counter updates (`active_write_reservations = active_write_reservations + 1`) in `crates/storage/src/pg_store.rs:6658-6675`, and object write flow holds that reservation while the write action runs in `crates/storage/src/node/bucket_ops.rs:401-419`. Replicated command application sorts non-primary nodes before the primary at `crates/storage/src/cluster/request_ops.rs:647` and applies with `apply_metadata_command_and_record` at `request_ops.rs:694-700`. The rejection point is `put_bucket_record_update_inner`: it loads the replica's current raw bucket at `pg_store.rs:2979`, checks the full target/preimage at `pg_store.rs:2995-2999`, and `bucket_record_preimage_matches_update` only mutates intended ACL/property/versioning fields before comparing the entire `BucketRecord` at `pg_store.rs:3196-3223`.
+
+The PoC patch adds `poc_primary_write_reservation_acl_command_conflicts_on_replica`, creating two `PgStore`s as primary/replica, applying an identical create-bucket metadata command, acquiring a write reservation only on the primary, then building a `PutBucketAclCommand` from the primary raw `BucketRecord`. Running `cargo test -p storage poc_primary_write_reservation_acl_command_conflicts_on_replica --no-default-features -- --nocapture` produced: `reservation mismatch reproduced: primary_active=1 replica_active=0 target_generation=2 err=Db { context: "apply conflicting bucket acl command", source: InvalidQuery }`, followed by `same ACL change succeeds after reservation release: target_active=0 target_generation=3`. This directly shows the legitimate ACL change is rejected only while the primary-local transient reservation counter is captured in the command.
+
+Debugger evidence: LLDB stopped at `bucket_record_preimage_matches_update` just before `expected == *target` (`pg_store.rs:3223`). Expressions showed `current.active_write_reservations = 0`, `target.active_write_reservations = 1`, `expected.active_write_reservations = 0`, `current.bucket_execution_generation = 1`, and `target.bucket_execution_generation = 2`. Backtrace: `bucket_record_preimage_matches_update` -> `put_bucket_record_update_inner` at `pg_store.rs:2995` -> `apply_put_bucket_acl_command` -> `apply_metadata_command` -> PoC test. Crash/valgrind/ASan were considered: this is a logic flaw, not a memory-crash bug; valgrind was not installed; ASan build was blocked because stable rustc rejected `-Zsanitizer=address` without nightly.
+
+# Evidence
+crates/storage/src/cluster/request_ops.rs (L1468 to 1485)
+  Note: PutBucketAcl commands are built from the primary node's raw BucketRecord, so any active primary write reservation is captured in the replicated command target.
+```
+                let command_id = MetadataCommandId::new(
+                    self.operation_epoch(),
+                    pg_id,
+                    runtime_state.next_metadata_command_log_index(pg_id),
+                );
+                let bucket_pg = primary_node.get_pg(pg_id.get())?;
+                let current = bucket_pg.head_bucket_record_raw(bucket)?;
+                let bucket_execution_generation =
+                    bucket_pg.reserve_bucket_execution_generation()?;
+                let command = MetadataCommandEnvelope::new(
+                    command_id,
+                    MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
+                        current.with_execution_generation(bucket_execution_generation),
+                        acl_grants.clone(),
+                        public_read,
+                        public_write,
+                    )),
+                );
+```
+
+crates/storage/src/cluster/request_ops.rs (L1609 to 1621)
+  Note: Bucket property commands are likewise built from the raw current BucketRecord, including transient reservation counters.
+```
+                let bucket_pg = primary_node.get_pg(pg_id.get())?;
+                let current = bucket_pg.head_bucket_record_raw(bucket)?;
+                let bucket_execution_generation =
+                    bucket_pg.reserve_bucket_execution_generation()?;
+                let command = MetadataCommandEnvelope::new(
+                    command_id,
+                    MetadataCommandPayload::PutBucketProperty(
+                        PutBucketPropertyCommand::from_bucket_and_mutation(
+                            current.with_execution_generation(bucket_execution_generation),
+                            mutation.clone(),
+                        ),
+                    ),
+                );
+```
+
+crates/storage/src/cluster/request_ops.rs (L627 to 701)
+  Note: Metadata commands are applied to all acting nodes, with non-primary nodes sorted before the primary, so replicas with different transient counters validate the command first.
+```
+    fn apply_metadata_command_to_acting_set_from_origin(
+        &self,
+        origin_node_id: NodeId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), MetadataCommandApplyFailure> {
+        let runtime_state = self.local_map.runtime_state();
+        let _apply_guard = runtime_state.lock_metadata_command_apply();
+        let pg_id = command.id().pg_id();
+        let mut nodes = self
+            .local_map
+            .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id)
+            .map_err(|source| MetadataCommandApplyFailure {
+                applied_nodes: 0,
+                source: source.into(),
+            })?;
+        let primary_node_id = self
+            .local_map
+            .pg_route(pg_id)
+            .expect("validated metadata PG command route must exist")
+            .primary_node_id();
+        nodes.sort_by_key(|node| node.node_id() == primary_node_id);
+        for (applied_nodes, node) in nodes.into_iter().enumerate() {
+            let acceptance = self
+                .local_map
+                .validate_metadata_command_for_replica(
+                    origin_node_id,
+                    node.node_id(),
+                    pg_id,
+                    command,
+                )
+                .map_err(|source| MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                })?;
+            if acceptance == MetadataCommandAcceptance::AlreadyApplied {
+                continue;
+            }
+            maybe_run_before_metadata_command_apply_hook(
+                self.metadata_command_apply_test_hook_scope_id(),
+                node.node_id(),
+                command,
+            )
+            .map_err(|source| MetadataCommandApplyFailure {
+                applied_nodes,
+                source: source.into(),
+            })?;
+            if let MetadataCommandPayload::CommitMultipartObject(commit) = command.payload() {
+                let bucket_pg_id = node
+                    .storage_node()
+                    .pg_topology()
+                    .bucket_pg_for(&commit.object.bucket);
+                let bucket_pg = node.storage_node().get_pg(bucket_pg_id).map_err(|source| {
+                    MetadataCommandApplyFailure {
+                        applied_nodes,
+                        source: source.into(),
+                    }
+                })?;
+                bucket_pg
+                    .advance_completed_multipart_upload_sequence_for_bucket(
+                        &commit.object.bucket,
+                        commit.completion_order,
+                    )
+                    .map_err(|source| MetadataCommandApplyFailure {
+                        applied_nodes,
+                        source: source.into(),
+                    })?;
+            }
+            let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
+                MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                }
+            })?;
+            pg.apply_metadata_command_and_record(node.node_id().as_u32(), command)
+                .map_err(|source| MetadataCommandApplyFailure {
+```
+
+crates/storage/src/metadata_command.rs (L103 to 126)
+  Note: BucketRecord derives full equality and now includes transient local fields write_reservations_blocked and active_write_reservations.
+```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketRecord {
+    pub(crate) name: BucketName,
+    pub(crate) owner_principal: String,
+    pub(crate) owner_canonical_id: CanonicalUserId,
+    pub(crate) created_at: u64,
+    pub(crate) region: u16,
+    pub(crate) state: BucketState,
+    pub(crate) versioning: BucketVersioningState,
+    pub(crate) object_lock: BucketObjectLockConfig,
+    pub(crate) acl_grants: AclGrants,
+    pub(crate) public_read: bool,
+    pub(crate) public_write: bool,
+    pub(crate) write_reservations_blocked: bool,
+    pub(crate) active_write_reservations: u32,
+    pub(crate) public_access_block: Option<PublicAccessBlockConfig>,
+    pub(crate) ownership_controls: Option<BucketOwnershipControls>,
+    pub(crate) bucket_policy_public: bool,
+    pub(crate) bucket_policy_generation: u64,
+    pub(crate) bucket_lifecycle_generation: u64,
+    pub(crate) bucket_execution_generation: u64,
+    pub(crate) completed_multipart_upload_sequence: u64,
+    pub(crate) bucket_abac_enabled: bool,
+    pub(crate) encryption: BucketEncryptionConfig,
+```
+
+crates/storage/src/node/bucket_ops.rs (L401 to 419)
+  Note: Object writes acquire a bucket write reservation, drop the PG lock, run the write action, and only release the reservation afterward, leaving active_write_reservations nonzero during the write.
+```
+    pub(crate) fn with_bucket_write_reservation_snapshot<T, E>(
+        &self,
+        bucket: &BucketName,
+        request: BucketSnapshotRequest,
+        action: impl FnOnce(BucketSnapshot) -> Result<Result<T, E>, BucketSnapshotLoadError>,
+    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        loop {
+            let pg_id = self.pg_topology.bucket_pg_for(bucket);
+            let bucket_pg = self.get_pg(pg_id)?;
+            match PgMetadataStore::acquire_bucket_write_reservation(&*bucket_pg, bucket) {
+                Ok(_info) => {
+                    let result = (|| {
+                        let snapshot =
+                            Self::load_bucket_snapshot_from_pg(&bucket_pg, bucket, request)?;
+                        drop(bucket_pg);
+                        action(snapshot)
+                    })();
+                    let release_result = self.release_bucket_write_reservation(bucket);
+                    return Self::finish_bucket_write_snapshot_operation(result, release_result);
+```
+
+crates/storage/src/pg_store.rs (L2972 to 3000)
+  Note: Applying a bucket record update rejects the command if the full target post-image does not match the current record plus the intended effect.
+```
+    fn put_bucket_record_update_inner(
+        &self,
+        target: &BucketRecord,
+        effect: BucketRecordUpdateEffect,
+        stale_context: &'static str,
+        conflict_context: &'static str,
+    ) -> Result<(), MetadataError> {
+        let current = self.head_bucket_record_raw(&target.name)?;
+        if current == *target {
+            return Ok(());
+        }
+        if current.bucket_execution_generation == target.bucket_execution_generation {
+            return Err(MetadataError::Db {
+                context: conflict_context,
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        if current.bucket_execution_generation > target.bucket_execution_generation {
+            return Err(MetadataError::Db {
+                context: stale_context,
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        if !Self::bucket_record_preimage_matches_update(&current, target, effect) {
+            return Err(MetadataError::Db {
+                context: conflict_context,
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+```
+
+crates/storage/src/pg_store.rs (L3194 to 3223)
+  Note: The preimage check only mutates the intended bucket property/ACL/versioning fields, then compares the entire BucketRecord, so differing active_write_reservations causes a conflict.
+```
+        effect: BucketRecordUpdateEffect,
+    ) -> bool {
+        let mut expected = current.clone();
+        expected.bucket_execution_generation = target.bucket_execution_generation;
+        match effect {
+            BucketRecordUpdateEffect::Versioning => {
+                expected.versioning = target.versioning;
+            }
+            BucketRecordUpdateEffect::Acl => {
+                expected.acl_grants = target.acl_grants.clone();
+                expected.public_read = target.public_read;
+                expected.public_write = target.public_write;
+            }
+            BucketRecordUpdateEffect::Property(BucketPropertyEffect::ObjectLock) => {
+                expected.object_lock = target.object_lock;
+            }
+            BucketRecordUpdateEffect::Property(BucketPropertyEffect::Encryption) => {
+                expected.encryption = target.encryption;
+            }
+            BucketRecordUpdateEffect::Property(BucketPropertyEffect::PublicAccessBlock) => {
+                expected.public_access_block = target.public_access_block;
+            }
+            BucketRecordUpdateEffect::Property(BucketPropertyEffect::OwnershipControls) => {
+                expected.ownership_controls = target.ownership_controls;
+            }
+            BucketRecordUpdateEffect::Property(BucketPropertyEffect::AbacEnabled) => {
+                expected.bucket_abac_enabled = target.bucket_abac_enabled;
+            }
+        }
+        expected == *target
+```
+
+crates/storage/src/pg_store.rs (L6661 to 6692)
+  Note: The write reservation counter is incremented and decremented as local bucket state rather than through the metadata command log.
+```
+    ) -> Result<BucketInfo, MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets \
+                 SET active_write_reservations = active_write_reservations + 1 \
+                 WHERE name = ?1 AND state = ?2 AND write_reservations_blocked = 0",
+                params![name.as_str(), BucketState::Active as u8],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "acquire bucket write reservation",
+                source: e,
+            })?;
+        if updated == 1 {
+            return self.head_bucket_raw(name);
+        }
+        let info = self.head_bucket_raw(name)?;
+        if info.state == BucketState::Active && info.write_reservations_blocked {
+            return Err(MetadataError::BucketWriteDraining);
+        }
+        Err(bucket_not_found(name.as_str()))
+    }
+
+    fn release_bucket_write_reservation(&self, name: &BucketName) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets \
+                 SET active_write_reservations = active_write_reservations - 1 \
+                 WHERE name = ?1 AND active_write_reservations > 0",
+                params![name.as_str()],
+            )
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Kept at medium. The code evidence and validation PoC show a real, reachable runtime logic flaw: primary-local active_write_reservations is captured in replicated bucket metadata command targets, replicas apply first, and full BucketRecord comparison rejects owner/admin security-setting updates during concurrent writes. The realistic impact is a targeted control-plane denial of service that can prolong an already public-write/read state, not an authentication bypass or direct confidentiality/integrity compromise. Preconditions and operational controls keep it below high, but public-write anonymous reachability and the ability to block revocation make it security-relevant rather than a mere correctness bug.
+## Likelihood
+high - The exploit uses normal remote S3 write requests and a normal owner/admin bucket update, and an executable validation PoC demonstrated the replica mismatch. However, it requires an already writable bucket for the attacker and a timing/concurrency condition; public-write buckets are security-sensitive but not the default safe posture, and repository artifacts show no public ingress by default. | Remote network vector
+## Impact
+medium - The attacker can repeatedly block legitimate bucket ACL, public-access-block, versioning, or property changes while holding write reservations. This can delay revocation of public write/read or hardening controls, but it does not directly grant new access, bypass SigV4, read private objects, execute code, or cause permanent data loss.
+## Assumptions
+- The argmin-s3 binary is deployed as the S3-compatible runtime service, not only as a test harness.
+- At least two local/acting storage nodes are configured; this is plausible because ARGMIN_LOCAL_NODE_COUNT defaults to the EC total shard count rather than one node.
+- An attacker can issue object writes to the target bucket, either because the bucket is public-write or because the attacker has valid write permissions.
+- The bucket owner or an authorized principal attempts an ACL, versioning, or bucket-property update while attacker-controlled writes keep a primary-local write reservation active.
+- reachable argmin-s3 HTTP/S3 endpoint
+- bucket already grants attacker write ability, such as public-write ACL or valid write credential
+- concurrent owner/admin bucket ACL, public-access-block, versioning, or property update
+- multi-node acting set or replica state where primary and non-primary active_write_reservations can differ
+## Path
+attacker PutObject -> primary active_write_reservations=1
+owner PutBucketAcl/PAB/versioning -> command target captures counter=1
+replica active_write_reservations=0 -> full-record preimage compare fails -> owner update rejected
+## Path evidence
+- `crates/storage/src/metadata_command.rs:103-117` - BucketRecord derives full PartialEq/Eq and includes transient active_write_reservations.
+- `crates/storage/src/cluster/request_ops.rs:1468-1485` - PutBucketAcl command is built from the primary node's raw BucketRecord.
+- `crates/storage/src/cluster/request_ops.rs:1258-1273` - PutBucketVersioning uses the same raw primary BucketRecord command construction pattern.
+- `crates/storage/src/cluster/request_ops.rs:1609-1622` - PutBucketProperty uses the same raw primary BucketRecord command construction pattern, covering PublicAccessBlock and other properties.
+- `crates/storage/src/node/bucket_ops.rs:401-419` - Object write path acquires a bucket write reservation, runs the write action, then releases it.
+- `crates/storage/src/pg_store.rs:6658-6676` - The write reservation is a local SQL counter increment of active_write_reservations rather than a replicated metadata command.
+- `crates/storage/src/cluster/request_ops.rs:627-700` - Metadata command application sorts non-primary nodes before the primary and applies the command on each PG.
+- `crates/storage/src/pg_store.rs:2979-2999` - Bucket record updates reject the command when the current record does not match the expected full preimage/update.
+- `crates/storage/src/pg_store.rs:3194-3223` - Preimage matching only mutates intended ACL/property/versioning fields and then compares the entire BucketRecord, so transient counter differences cause conflict.
+- `crates/server-http/src/http/mod.rs:2561-2606` - PutBucketAcl is a normal HTTP/S3 operation routed to coordinator validation and mutation.
+- `crates/server-http/src/http/mod.rs:2410-2420` - PutBucketPublicAccessBlock is a normal HTTP/S3 operation routed to coordinator mutation.
+- `crates/server-core/src/coordinator/authz.rs:444-455` - Object writes are allowed by effective public_write, making anonymous exploitation plausible for intentionally public-write buckets.
+- `crates/argmin-s3/src/config.rs:85-90` - Local node count defaults to the erasure-code total shard count, making multi-node local replica state plausible by default.
+- `crates/argmin-s3/src/main.rs:106-108` - The production binary opens the configured local storage nodes for the running storage cluster.
+## Narrative
+The finding is real and in scope. The main argmin-s3 service opens local storage nodes and exposes S3 HTTP operations. Bucket metadata commands for ACL, versioning, and properties are built from head_bucket_record_raw on the primary, while BucketRecord derives full equality and includes active_write_reservations. Object writes increment active_write_reservations locally and hold it while the write action runs. Replicated metadata commands are applied to non-primary nodes before the primary; on a replica with active_write_reservations=0, put_bucket_record_update_inner compares the full expected BucketRecord and rejects the update as conflicting. This is reachable through normal S3 writes plus owner/admin bucket control-plane requests. The security impact is a targeted denial of service against revoking/hardening bucket access state, especially for already public-write buckets; it does not itself bypass authentication or expose private data, so medium severity is appropriate.
+## Controls
+- SigV4 authentication is enforced when credentials are supplied; missing auth becomes an anonymous requester for public ACL semantics
+- Owner/admin authorization is required for PutBucketAcl and PutBucketPublicAccessBlock
+- PublicAccessBlock and ACL logic can disable public access when the update succeeds
+- HTTP server has max_connections and max_inflight_requests semaphores
+- HTTP server has header and body idle timeouts
+- TLS is available only when configured with certificate and key paths
+## Blindspots
+- Static-only repository review found no Kubernetes, Terraform, Docker, or load balancer manifests, so actual public exposure cannot be confirmed.
+- This phase did not run a full end-to-end HTTP exploit; it relies on repository code paths plus the provided executable storage-layer validation PoC.
+- Exact exploit duration depends on deployment limits, object sizes, client throughput, and whether buckets are public-write or only writable by authenticated clients.
