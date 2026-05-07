@@ -140,6 +140,7 @@ encodings.
 | `CreateMultipartUpload` | Storage-shaped | object generation allocators and reservation rows | multipart upload row and generation reservation row | matching upload row converges |
 | `AbortMultipartUpload` | Storage-shaped | upload row, part rows, staged part segments | upload/part metadata cleanup rows | matching upload abort converges |
 | `DeleteObjectPayloadReclaim` | Storage-shaped | reclaim root and manifest rows | removes reclaim metadata | matching reclaim root converges |
+| `DeleteCompletedMultipartUpload` | Storage-shaped | exact completed-MPU tombstone row | removes completed-MPU tombstone row | missing matching tombstone is idempotent |
 
 For row-shaped create commands, retry matching is exact over the stored row
 published by the command. Matching only the original request fields is not

@@ -1099,7 +1099,8 @@ Work items:
      - move completed multipart tombstone pruning from the metadata-primary
        bridge to explicit fanout over routed metadata PG primaries
      - preserve the existing global newest-`keep` ordering across PGs before
-       deleting older tombstones from their owning PG primary
+       deleting older tombstones through a command-owned acting-set mutation on
+       their owning PG
      - keep bucket snapshot-pair locking, bucket delete/finalization, lease
        bookkeeping, and worker queues on the bridge until they are split into
        explicit per-PG or coordination paths
@@ -1822,6 +1823,10 @@ Completed:
     stream-session timestamp forcing, to update every object-PG acting node and
     refresh each replica's state digest, so test-only setup does not hide real
     digest divergence
+  - added `DeleteCompletedMultipartUpload` as a row-shaped metadata command
+    for completed-MPU tombstone pruning and bucket-finalization cleanup; direct
+    primary-local deletion is not valid now that completed tombstones are
+    covered by the canonical metadata digest
   - removed durable `stream_uploads.next_segment_vid`; stream segment payload
     generation allocation is now local runtime state used only to keep
     concurrent uncommitted appends on distinct placed shard keys, while the

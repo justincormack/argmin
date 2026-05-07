@@ -55,6 +55,7 @@ pub enum MetadataCommandApplyTestKind {
     CreateMultipartUpload,
     AbortMultipartUpload,
     DeleteObjectPayloadReclaim,
+    DeleteCompletedMultipartUpload,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]

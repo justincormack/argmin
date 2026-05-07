@@ -9,13 +9,14 @@ use s3_types::{
 use crate::types::{
     AbortMultipartUploadCleanup, BucketEncryptionConfig, BucketName, BucketObjectOwnership,
     BucketOwnershipControls, BucketState, BucketSubresourceAux, BucketSubresourceKind,
-    ClusterEpoch, CreateBucketConfig, CreateMultipartUploadReq, CreateStreamUploadReq,
-    GenerationId, LiveObjectRecord, ManagedEncryptionAlgorithm, MultipartPartRecord,
-    MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimRecord,
-    MultipartUploadRecord, ObjectEncryption, ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord,
-    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, OwnerIdentity, PgId, PublicAccessBlockConfig,
-    PutLiveObjectReq, SerializedTagSet, SessionId, StreamUploadRecord, StreamUploadSegmentRecord,
-    StreamUploadState, StreamUploadTarget, UploadId, VersionId,
+    ClusterEpoch, CompletedMultipartUploadRecord, CreateBucketConfig, CreateMultipartUploadReq,
+    CreateStreamUploadReq, GenerationId, LiveObjectRecord, ManagedEncryptionAlgorithm,
+    MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
+    MultipartReclaimRecord, MultipartUploadRecord, ObjectEncryption, ObjectEtag, ObjectKey,
+    ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
+    OwnerIdentity, PgId, PublicAccessBlockConfig, PutLiveObjectReq, SerializedTagSet, SessionId,
+    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId,
+    VersionId,
 };
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
@@ -39,6 +40,7 @@ const METADATA_COMMAND_CREATE_MULTIPART_UPLOAD: u16 = 16;
 const METADATA_COMMAND_ABORT_MULTIPART_UPLOAD: u16 = 17;
 const METADATA_COMMAND_COMMIT_STREAM_PART: u16 = 18;
 const METADATA_COMMAND_DELETE_OBJECT_PAYLOAD_RECLAIM: u16 = 19;
+const METADATA_COMMAND_DELETE_COMPLETED_MULTIPART_UPLOAD: u16 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct MetadataCommandLogIndex(NonZeroU64);
@@ -231,6 +233,7 @@ pub(crate) enum MetadataCommandPayload {
     CreateMultipartUpload(Box<CreateMultipartUploadCommand>),
     AbortMultipartUpload(Box<AbortMultipartUploadCommand>),
     DeleteObjectPayloadReclaim(Box<DeleteObjectPayloadReclaimCommand>),
+    DeleteCompletedMultipartUpload(Box<DeleteCompletedMultipartUploadCommand>),
 }
 
 impl MetadataCommandPayload {
@@ -255,6 +258,9 @@ impl MetadataCommandPayload {
             Self::CreateMultipartUpload(_) => METADATA_COMMAND_CREATE_MULTIPART_UPLOAD,
             Self::AbortMultipartUpload(_) => METADATA_COMMAND_ABORT_MULTIPART_UPLOAD,
             Self::DeleteObjectPayloadReclaim(_) => METADATA_COMMAND_DELETE_OBJECT_PAYLOAD_RECLAIM,
+            Self::DeleteCompletedMultipartUpload(_) => {
+                METADATA_COMMAND_DELETE_COMPLETED_MULTIPART_UPLOAD
+            }
         }
     }
 }
@@ -793,6 +799,11 @@ pub(crate) struct AbortMultipartUploadCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeleteCompletedMultipartUploadCommand {
+    pub(crate) record: CompletedMultipartUploadRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MetadataCommandEnvelope {
     id: MetadataCommandId,
     payload: MetadataCommandPayload,
@@ -914,6 +925,9 @@ fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPaylo
         }
         MetadataCommandPayload::DeleteObjectPayloadReclaim(command) => {
             encode_delete_object_payload_reclaim(&mut out, command);
+        }
+        MetadataCommandPayload::DeleteCompletedMultipartUpload(command) => {
+            encode_delete_completed_multipart_upload(&mut out, command);
         }
     }
     out
@@ -1143,6 +1157,23 @@ fn encode_delete_object_payload_reclaim(
     put_str(out, command.key.as_str());
     put_u64(out, command.generation_id.get());
     encode_object_payload_reclaim(out, &command.payload);
+}
+
+fn encode_delete_completed_multipart_upload(
+    out: &mut Vec<u8>,
+    command: &DeleteCompletedMultipartUploadCommand,
+) {
+    encode_completed_multipart_upload(out, &command.record);
+}
+
+fn encode_completed_multipart_upload(out: &mut Vec<u8>, record: &CompletedMultipartUploadRecord) {
+    put_str(out, record.upload_id.as_str());
+    put_str(out, record.bucket.as_str());
+    put_str(out, record.key.as_str());
+    put_u64(out, record.completion_order);
+    put_u64(out, record.completed_at);
+    encode_optional_owner_identity(out, record.initiator.as_ref());
+    encode_owner_identity(out, &record.owner);
 }
 
 fn encode_object_payload_reclaim(out: &mut Vec<u8>, reclaim: &ObjectPayloadReclaimCommand) {
@@ -2359,14 +2390,27 @@ mod tests {
             )),
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
                 object: LiveObjectRecord {
-                    bucket,
-                    key,
+                    bucket: bucket.clone(),
+                    key: key.clone(),
                     version_id: VersionId::from_u64(8),
                     acl_grants: AclGrants::default(),
                     public_read: true,
                     ..metadata_object
                 },
             })),
+            MetadataCommandPayload::DeleteCompletedMultipartUpload(Box::new(
+                DeleteCompletedMultipartUploadCommand {
+                    record: CompletedMultipartUploadRecord {
+                        upload_id,
+                        bucket,
+                        key,
+                        completion_order: 12,
+                        completed_at: 556,
+                        initiator: Some(OwnerIdentity::from_principal("initiator")),
+                        owner: OwnerIdentity::from_principal("owner"),
+                    },
+                },
+            )),
         ];
 
         let mut checksums = Vec::new();
@@ -2410,6 +2454,7 @@ mod tests {
                 0xff13404730caba1e,
                 0x98ce7d1649b15c26,
                 0xa04e109e74c16cc7,
+                0x15662446b0772b90,
             ]
         );
     }

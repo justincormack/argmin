@@ -2223,6 +2223,13 @@ mod tests {
             &[part],
         )
         .unwrap();
+        pg.connection()
+            .execute(
+                "UPDATE completed_multipart_uploads SET completed_at = ?1 WHERE upload_id = ?2",
+                rusqlite::params![completion_order as i64, upload_id.as_str()],
+            )
+            .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
     }
 
     fn set_route_primary(map: &mut LocalClusterMap, pg_id: u32, primary_node_id: NodeId) {
@@ -12298,6 +12305,7 @@ mod tests {
             .pg_topology();
         let older_key = key_for_object_pg(topology, &bucket, 1, "older-");
         let newer_key = key_for_object_pg(topology, &bucket, 2, "newer-");
+        let post_prune_bucket = bucket_for_pg(topology, 1, "post-prune-");
         set_route_primary(&mut map, 1, NodeId::new(1));
         set_route_primary(&mut map, 2, NodeId::new(2));
 
@@ -12366,6 +12374,112 @@ mod tests {
                 .is_some(),
             "newer routed completed-upload tombstone should be retained"
         );
+        drop(node_one_pg);
+        drop(node_two_pg);
+
+        create_test_bucket(&cluster, &post_prune_bucket);
+    }
+
+    #[test]
+    fn completed_multipart_prune_partial_command_retries_and_preserves_digest() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let bucket =
+            crate::BucketName::try_from("completed-prune-retry-bucket".to_string()).unwrap();
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let key = key_for_object_pg(topology, &bucket, 1, "retry-");
+        let post_prune_bucket = bucket_for_pg(topology, 1, "post-prune-retry-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+        let upload_id = upload_id_from_label("retryCompleted");
+        for node_id in node_ids {
+            seed_completed_multipart_upload_record(&map, node_id, 1, &bucket, &key, &upload_id, 1);
+        }
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                if matches!(
+                    command.payload(),
+                    MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
+                ) && node_id == NodeId::new(2)
+                    && fail_once_hook.swap(false, Ordering::SeqCst)
+                {
+                    return Err(StoreError::Io {
+                        context: "injected completed multipart prune failure",
+                        source: std::io::Error::other("injected completed multipart prune failure"),
+                    });
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .prune_completed_multipart_uploads_for_bucket_with_limit(&bucket, 0)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io { .. })
+            ),
+            "expected injected partial prune failure, got {err:?}"
+        );
+        assert!(
+            crate::PgMetadataStore::get_completed_multipart_upload(
+                &*map
+                    .node(NodeId::new(0))
+                    .unwrap()
+                    .storage_node()
+                    .get_pg(1)
+                    .unwrap(),
+                &upload_id,
+            )
+            .unwrap()
+            .is_none(),
+            "first applied replica should have deleted the tombstone"
+        );
+        assert!(
+            crate::PgMetadataStore::get_completed_multipart_upload(
+                &*map
+                    .node(NodeId::new(2))
+                    .unwrap()
+                    .storage_node()
+                    .get_pg(1)
+                    .unwrap(),
+                &upload_id,
+            )
+            .unwrap()
+            .is_some(),
+            "failed replica should still have the tombstone before retry"
+        );
+        drop(hook_guard);
+
+        cluster
+            .prune_completed_multipart_uploads_for_bucket_with_limit(&bucket, 0)
+            .unwrap();
+        for node_id in node_ids {
+            assert!(
+                crate::PgMetadataStore::get_completed_multipart_upload(
+                    &*map.node(node_id).unwrap().storage_node().get_pg(1).unwrap(),
+                    &upload_id,
+                )
+                .unwrap()
+                .is_none(),
+                "retry should delete tombstone on node {node_id:?}"
+            );
+        }
+        create_test_bucket(&cluster, &post_prune_bucket);
     }
 
     #[test]
@@ -12412,6 +12526,7 @@ mod tests {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(2).unwrap();
             crate::PgMetadataStore::delete_object_meta(&*pg, &bucket, &live_key).unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
         }
 
         let node_two = map.node(NodeId::new(2)).unwrap().storage_node();
@@ -12427,6 +12542,7 @@ mod tests {
         );
         let node_two_pg = node_two.get_pg(2).unwrap();
         crate::PgMetadataStore::delete_object_meta(&*node_two_pg, &bucket, &tombstone_key).unwrap();
+        node_two_pg.refresh_metadata_command_state_digest().unwrap();
         assert!(crate::PgMetadataStore::get_completed_multipart_upload(
             &*node_two_pg,
             &completed_upload

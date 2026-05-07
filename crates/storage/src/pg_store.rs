@@ -24,12 +24,13 @@ use crate::metadata_command::{
     AppendStreamSegmentCommand, BucketPropertyEffect, BucketPropertyMutation, BucketRecord,
     BucketSubresourceMutation, CommitDirectPutObjectCommand, CommitMultipartObjectCommand,
     CommitStreamPartCommand, CreateBucketCommand, CreateMultipartUploadCommand,
-    CreateStreamUploadCommand, DeleteObjectPayloadReclaimCommand, DeleteObjectVersionCommand,
-    DeleteObjectVersionTarget, InsertDeleteMarkerCommand, MetadataCommandAcceptance,
-    MetadataCommandEnvelope, MetadataCommandLogIndex, MetadataCommandPayload,
-    MetadataCommandReplicaState, ObjectPayloadReclaimCommand, PutBucketAclCommand,
-    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
-    PutObjectMetadataCommand, ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
+    CreateStreamUploadCommand, DeleteCompletedMultipartUploadCommand,
+    DeleteObjectPayloadReclaimCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
+    InsertDeleteMarkerCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
+    MetadataCommandLogIndex, MetadataCommandPayload, MetadataCommandReplicaState,
+    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
+    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
+    ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
 };
 use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
@@ -3518,6 +3519,9 @@ impl PgStore {
             MetadataCommandPayload::DeleteObjectPayloadReclaim(command) => {
                 self.apply_delete_object_payload_reclaim_command(command)
             }
+            MetadataCommandPayload::DeleteCompletedMultipartUpload(command) => {
+                self.apply_delete_completed_multipart_upload_command(command)
+            }
         }
     }
 
@@ -4171,6 +4175,22 @@ impl PgStore {
                     }
                 }
             }
+        }
+    }
+
+    fn apply_delete_completed_multipart_upload_command(
+        &self,
+        command: &DeleteCompletedMultipartUploadCommand,
+    ) -> Result<(), MetadataError> {
+        match PgMetadataStore::get_completed_multipart_upload(self, &command.record.upload_id)? {
+            Some(existing) if existing == command.record => {
+                self.delete_completed_multipart_upload(&command.record.upload_id)
+            }
+            Some(_) => Err(MetadataError::Db {
+                context: "delete completed multipart upload command row mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            }),
+            None => Ok(()),
         }
     }
 
@@ -5966,10 +5986,24 @@ impl PgStore {
         &self,
         bucket: &str,
     ) -> Result<Vec<(UploadId, u64)>, MetadataError> {
+        self.list_completed_multipart_upload_records_for_bucket(bucket)
+            .map(|records| {
+                records
+                    .into_iter()
+                    .map(|record| (record.upload_id, record.completion_order))
+                    .collect()
+            })
+    }
+
+    pub(crate) fn list_completed_multipart_upload_records_for_bucket(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<CompletedMultipartUploadRecord>, MetadataError> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT upload_id, completion_order \
+                "SELECT upload_id, bucket, key, completion_order, completed_at, \
+                        owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id \
                  FROM completed_multipart_uploads \
                  WHERE bucket = ?1",
             )
@@ -5979,7 +6013,7 @@ impl PgStore {
             })?;
         let rows = stmt
             .query_map(params![bucket], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                Self::completed_multipart_upload_record_from_row(row)
             })
             .map_err(|e| MetadataError::Db {
                 context: "query list completed multipart uploads for bucket",
@@ -5987,30 +6021,48 @@ impl PgStore {
             })?;
         let mut uploads = Vec::new();
         for row in rows {
-            let (upload_id, completion_order) = row.map_err(|e| MetadataError::Db {
+            uploads.push(row.map_err(|e| MetadataError::Db {
                 context: "row list completed multipart uploads for bucket",
                 source: e,
-            })?;
-            uploads.push((
-                UploadId::try_from(upload_id).map_err(|error| MetadataError::Db {
-                    context: "decode completed multipart upload id",
-                    source: rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    ),
-                })?,
-                completion_order.try_into().map_err(|_| MetadataError::Db {
-                    context: "decode completed multipart upload completion order",
-                    source: rusqlite::Error::FromSqlConversionFailure(
-                        1,
-                        rusqlite::types::Type::Integer,
-                        Box::from("negative completion order"),
-                    ),
-                })?,
-            ));
+            })?);
         }
         Ok(uploads)
+    }
+
+    fn completed_multipart_upload_record_from_row(
+        row: &rusqlite::Row<'_>,
+    ) -> Result<CompletedMultipartUploadRecord, rusqlite::Error> {
+        let completion_order = row.get::<_, i64>(3)?.try_into().map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Integer,
+                Box::from("negative completion order"),
+            )
+        })?;
+        let completed_at = row.get::<_, i64>(4)?.try_into().map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Integer,
+                Box::from("negative completed_at"),
+            )
+        })?;
+        let owner = Self::parse_owner_identity(row, 5, 6, "owner_principal", "owner_canonical_id")?;
+        let initiator = Self::parse_optional_owner_identity(
+            row,
+            7,
+            8,
+            "initiator_principal",
+            "initiator_canonical_id",
+        )?;
+        Ok(CompletedMultipartUploadRecord {
+            upload_id: row.get(0)?,
+            bucket: row.get(1)?,
+            key: row.get(2)?,
+            completion_order,
+            completed_at,
+            initiator,
+            owner,
+        })
     }
 
     fn reserve_object_generation_explicit(
@@ -9071,34 +9123,12 @@ impl PgMetadataStore for PgStore {
     ) -> Result<Option<CompletedMultipartUploadRecord>, MetadataError> {
         self.conn
             .query_row(
-                "SELECT upload_id, bucket, key, completed_at, owner_principal, owner_canonical_id, \
+                "SELECT upload_id, bucket, key, completion_order, completed_at, \
+                 owner_principal, owner_canonical_id, \
                  initiator_principal, initiator_canonical_id \
                  FROM completed_multipart_uploads WHERE upload_id = ?1",
                 params![upload_id.as_str()],
-                |row| {
-                    let owner = Self::parse_owner_identity(
-                        row,
-                        4,
-                        5,
-                        "owner_principal",
-                        "owner_canonical_id",
-                    )?;
-                    let initiator = Self::parse_optional_owner_identity(
-                        row,
-                        6,
-                        7,
-                        "initiator_principal",
-                        "initiator_canonical_id",
-                    )?;
-                    Ok(CompletedMultipartUploadRecord {
-                        upload_id: row.get(0)?,
-                        bucket: row.get(1)?,
-                        key: row.get(2)?,
-                        completed_at: row.get::<_, i64>(3)? as u64,
-                        initiator,
-                        owner,
-                    })
-                },
+                Self::completed_multipart_upload_record_from_row,
             )
             .optional()
             .map_err(|e| MetadataError::Db {

@@ -17,11 +17,12 @@ use crate::metadata_command::{
     AbortMultipartUploadCommand, BucketPropertyMutation, BucketRecord, BucketSubresourceMutation,
     CommitDirectPutObjectCommand, CommitMultipartObjectCommand, CommitStreamPartCommand,
     CreateBucketCommand, CreateMultipartUploadCommand, CreateStreamUploadCommand,
-    DeleteObjectPayloadReclaimCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
-    InsertDeleteMarkerCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
-    MetadataCommandId, MetadataCommandPayload, ObjectPayloadReclaimCommand, PutBucketAclCommand,
-    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
-    PutObjectMetadataCommand, PutObjectMetadataMutation,
+    DeleteCompletedMultipartUploadCommand, DeleteObjectPayloadReclaimCommand,
+    DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
+    MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
+    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
+    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
+    PutObjectMetadataMutation,
 };
 use crate::*;
 
@@ -293,6 +294,11 @@ fn metadata_command_apply_test_context(
             Some(command.bucket.clone()),
             Some(command.key.clone()),
         ),
+        MetadataCommandPayload::DeleteCompletedMultipartUpload(command) => (
+            MetadataCommandApplyTestKind::DeleteCompletedMultipartUpload,
+            Some(command.record.bucket.clone()),
+            Some(command.record.key.clone()),
+        ),
     };
     MetadataCommandApplyTestContext {
         node_id,
@@ -378,6 +384,15 @@ fn conflicting_pending_metadata_command(context: &'static str) -> BucketSnapshot
         source: std::io::Error::other("conflicting pending metadata command"),
     }
     .into()
+}
+
+fn bucket_snapshot_error_to_bucket_write_drain_error(
+    error: BucketSnapshotLoadError,
+) -> BucketWriteDrainError {
+    match error {
+        BucketSnapshotLoadError::Store(error) => BucketWriteDrainError::Store(error),
+        BucketSnapshotLoadError::Metadata(error) => BucketWriteDrainError::Metadata(error),
+    }
 }
 
 #[derive(Debug)]
@@ -552,7 +567,8 @@ impl super::StorageCluster {
                     | MetadataCommandPayload::CommitStreamPart(_)
                     | MetadataCommandPayload::CreateMultipartUpload(_)
                     | MetadataCommandPayload::AbortMultipartUpload(_)
-                    | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
+                    | MetadataCommandPayload::DeleteObjectPayloadReclaim(_)
+                    | MetadataCommandPayload::DeleteCompletedMultipartUpload(_) => {
                         return Err(conflicting_pending_metadata_command(
                             "unexpected pending object command for create bucket",
                         ));
@@ -1109,11 +1125,129 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<(), BucketWriteDrainError> {
-        for pg_id in self.metadata_pg_ids() {
-            let pg = self.metadata_pg(pg_id)?;
-            PgMetadataStore::delete_completed_multipart_uploads_for_bucket(&*pg, bucket)?;
+        let records =
+            self.completed_multipart_upload_records_for_bucket::<BucketWriteDrainError>(bucket)?;
+        for (pg_id, record) in records {
+            self.delete_completed_multipart_upload_record_with_command(pg_id, record)
+                .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
         }
         Ok(())
+    }
+
+    fn completed_multipart_upload_records_for_bucket<E>(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Vec<(PgId, CompletedMultipartUploadRecord)>, E>
+    where
+        E: From<StoreError> + From<MetadataError>,
+    {
+        let mut records = HashMap::<(u32, UploadId), CompletedMultipartUploadRecord>::new();
+        for raw_pg_id in self.metadata_pg_ids() {
+            let pg_id = PgId::new(raw_pg_id);
+            let nodes = self
+                .local_map
+                .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?;
+            for node in nodes {
+                let pg = node.storage_node().get_pg(pg_id.get())?;
+                for record in
+                    pg.list_completed_multipart_upload_records_for_bucket(bucket.as_str())?
+                {
+                    let key = (pg_id.get(), record.upload_id.clone());
+                    match records.entry(key) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(record);
+                        }
+                        std::collections::hash_map::Entry::Occupied(entry)
+                            if entry.get() == &record => {}
+                        std::collections::hash_map::Entry::Occupied(_) => {
+                            return Err(MetadataError::Db {
+                                context:
+                                    "conflicting completed multipart upload tombstone replicas",
+                                source: rusqlite::Error::InvalidQuery,
+                            }
+                            .into());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(records
+            .into_iter()
+            .map(|((pg_id, _), record)| (PgId::new(pg_id), record))
+            .collect())
+    }
+
+    fn delete_completed_multipart_upload_record_with_command(
+        &self,
+        pg_id: PgId,
+        record: CompletedMultipartUploadRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let runtime_state = self.local_map.runtime_state();
+        loop {
+            let (command, clear_pending_on_zero_apply) = if let Some(command) =
+                runtime_state.pending_metadata_command_for_bucket(pg_id, &record.bucket)
+            {
+                match command.payload() {
+                    MetadataCommandPayload::DeleteCompletedMultipartUpload(delete)
+                        if delete.record == record =>
+                    {
+                        (command, false)
+                    }
+                    MetadataCommandPayload::DeleteCompletedMultipartUpload(_) => {
+                        let outcome = self.finish_pending_metadata_command_to_acting_set(
+                            pg_id,
+                            &record.bucket,
+                            &command,
+                            false,
+                        )?;
+                        if outcome == super::PendingMetadataCommandOutcome::Abandoned {
+                            continue;
+                        }
+                        runtime_state
+                            .remove_pending_metadata_command_for_bucket(pg_id, &record.bucket);
+                        continue;
+                    }
+                    _ => {
+                        return Err(conflicting_pending_metadata_command(
+                            "unexpected pending command for completed multipart upload delete",
+                        ));
+                    }
+                }
+            } else {
+                let command_id = MetadataCommandId::new(
+                    self.operation_epoch(),
+                    pg_id,
+                    runtime_state.next_metadata_command_log_index(pg_id),
+                );
+                let command = MetadataCommandEnvelope::new(
+                    command_id,
+                    MetadataCommandPayload::DeleteCompletedMultipartUpload(Box::new(
+                        DeleteCompletedMultipartUploadCommand {
+                            record: record.clone(),
+                        },
+                    )),
+                );
+                self.set_pending_metadata_command_for_bucket(
+                    pg_id,
+                    &record.bucket,
+                    &command,
+                    "conflicting pending command for completed multipart upload delete",
+                )
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                (command, true)
+            };
+            let outcome = self.finish_pending_metadata_command_to_acting_set(
+                pg_id,
+                &record.bucket,
+                &command,
+                clear_pending_on_zero_apply,
+            )?;
+            if outcome == super::PendingMetadataCommandOutcome::Abandoned {
+                continue;
+            }
+            runtime_state.remove_pending_metadata_command_for_bucket(pg_id, &record.bucket);
+            return Ok(());
+        }
     }
 
     pub fn head_bucket_info(
@@ -1246,7 +1380,8 @@ impl super::StorageCluster {
                     | MetadataCommandPayload::CommitStreamPart(_)
                     | MetadataCommandPayload::CreateMultipartUpload(_)
                     | MetadataCommandPayload::AbortMultipartUpload(_)
-                    | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
+                    | MetadataCommandPayload::DeleteObjectPayloadReclaim(_)
+                    | MetadataCommandPayload::DeleteCompletedMultipartUpload(_) => {
                         return Err(conflicting_pending_metadata_command(
                             "unexpected pending object command for versioning",
                         ));
@@ -1458,7 +1593,8 @@ impl super::StorageCluster {
                     | MetadataCommandPayload::CommitStreamPart(_)
                     | MetadataCommandPayload::CreateMultipartUpload(_)
                     | MetadataCommandPayload::AbortMultipartUpload(_)
-                    | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
+                    | MetadataCommandPayload::DeleteObjectPayloadReclaim(_)
+                    | MetadataCommandPayload::DeleteCompletedMultipartUpload(_) => {
                         return Err(conflicting_pending_metadata_command(
                             "unexpected pending object command for bucket acl",
                         ));
@@ -1594,7 +1730,8 @@ impl super::StorageCluster {
                     | MetadataCommandPayload::CommitStreamPart(_)
                     | MetadataCommandPayload::CreateMultipartUpload(_)
                     | MetadataCommandPayload::AbortMultipartUpload(_)
-                    | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
+                    | MetadataCommandPayload::DeleteObjectPayloadReclaim(_)
+                    | MetadataCommandPayload::DeleteCompletedMultipartUpload(_) => {
                         return Err(conflicting_pending_metadata_command(
                             "unexpected pending object command for bucket property",
                         ));
@@ -1735,7 +1872,8 @@ impl super::StorageCluster {
                     | MetadataCommandPayload::CommitStreamPart(_)
                     | MetadataCommandPayload::CreateMultipartUpload(_)
                     | MetadataCommandPayload::AbortMultipartUpload(_)
-                    | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
+                    | MetadataCommandPayload::DeleteObjectPayloadReclaim(_)
+                    | MetadataCommandPayload::DeleteCompletedMultipartUpload(_) => {
                         return Err(conflicting_pending_metadata_command(
                             "unexpected pending object command for bucket subresource",
                         ));
@@ -1808,21 +1946,18 @@ impl super::StorageCluster {
     ) -> Result<(), ObjectPgActionError> {
         crate::node::maybe_run_before_completed_multipart_prune_hook(bucket)?;
 
-        let mut uploads: Vec<(u32, UploadId, u64)> = Vec::new();
-        for pg_id in self.metadata_pg_ids() {
-            let pg = self.metadata_pg(pg_id)?;
-            let local = pg.list_completed_multipart_uploads_for_bucket(bucket.as_str())?;
-            uploads.extend(
-                local
-                    .into_iter()
-                    .map(|(upload_id, completion_order)| (pg_id, upload_id, completion_order)),
-            );
-        }
-
-        uploads.sort_by_key(|entry| std::cmp::Reverse(entry.2));
-        for (pg_id, upload_id, _) in uploads.into_iter().skip(keep) {
-            let pg = self.metadata_pg(pg_id)?;
-            pg.delete_completed_multipart_upload(&upload_id)?;
+        let mut uploads =
+            self.completed_multipart_upload_records_for_bucket::<ObjectPgActionError>(bucket)?;
+        uploads.sort_by(|(left_pg, left), (right_pg, right)| {
+            right
+                .completion_order
+                .cmp(&left.completion_order)
+                .then_with(|| left_pg.get().cmp(&right_pg.get()))
+                .then_with(|| left.upload_id.as_str().cmp(right.upload_id.as_str()))
+        });
+        for (pg_id, record) in uploads.into_iter().skip(keep) {
+            self.delete_completed_multipart_upload_record_with_command(pg_id, record)
+                .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
         }
         Ok(())
     }

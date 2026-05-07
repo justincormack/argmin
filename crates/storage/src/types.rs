@@ -2808,11 +2808,12 @@ impl std::ops::Deref for AuthorizedMultipartUploadRecord {
 }
 
 /// Completed multipart upload record retained for AbortMultipartUpload semantics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletedMultipartUploadRecord {
     pub upload_id: UploadId,
     pub bucket: BucketName,
     pub key: ObjectKey,
+    pub completion_order: u64,
     pub completed_at: u64,
     pub initiator: Option<OwnerIdentity>,
     pub owner: OwnerIdentity,
