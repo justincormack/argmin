@@ -252,18 +252,19 @@ kind, and hash-chain links, then comparing the stored state digest with the
 current canonical materialized metadata digest. The online full-state digest
 gate remains bounded until checkpoint/range blocks exist; once a local command
 stream crosses that bound, the replica state stores an unverified digest
-sentinel. Restart validation treats that sentinel as untrusted and fails closed
-rather than admitting the PG as clean. Missing or corrupted prefix entries, hash
-mismatches, materialized-row drift, or a missing replica-state row on a nonempty
-PG fail cluster open for that replica instead of silently accepting the state.
-After each opened replica validates locally, `LocalClusterMap::open` also
-requires all opened replicas for the PG to agree on the validated epoch, applied
-log index, log hash, and canonical state digest. A stale but internally
-coherent replica is therefore rejected as divergent until a later peering/repair
-phase can rebuild or exclude it deliberately. This agreement check also rejects
-replicas that have the same materialized metadata digest but a different
-accepted command-log history; until standalone replay/checkpoint repair exists,
-matching rows are not enough to prove a replica is clean.
+sentinel. Restart validation treats that sentinel as a mandatory full-digest
+recompute point, persists the recomputed digest, and only then admits the PG as
+locally clean. Missing or corrupted prefix entries, hash mismatches,
+materialized-row drift, or a missing replica-state row on a nonempty PG fail
+cluster open for that replica instead of silently accepting the state. After
+each opened replica validates locally, `LocalClusterMap::open` also requires all
+opened replicas for the PG to agree on the validated epoch, applied log index,
+log hash, and canonical state digest. A stale but internally coherent replica is
+therefore rejected as divergent until a later peering/repair phase can rebuild
+or exclude it deliberately. This agreement check also rejects replicas that have
+the same materialized metadata digest but a different accepted command-log
+history; until standalone replay/checkpoint repair exists, matching rows are not
+enough to prove a replica is clean.
 Replica-state initialization is allowed only for a freshly initialized empty PG
 with the schema baseline and no command log. Log entries beyond the applied
 prefix remain retained tail entries, not a checkpoint.

@@ -1500,10 +1500,10 @@ Work items:
        segment staging rows, multipart upload/control rows, multipart part
        staging rows, reclaim rows, and local allocator counters
      - the online full-state digest gate remains bounded to early/small local
-       command streams to avoid quadratic command execution on large traces, but
-       restart validation now treats the unverified sentinel as fail-closed; a
-       large uncheckpointed prefix cannot rejoin as clean until Phase 7.5/Phase
-       10 introduces a scalable verified checkpoint/range digest boundary
+       command streams to avoid quadratic command execution on large traces; if
+       a local command stream crosses that bound, restart validation treats the
+       unverified sentinel as a mandatory full-digest recompute point, persists
+       the recomputed digest, and only then admits the PG as locally clean
      - tests cover atomic apply-plus-record rollback, durable duplicate retry
        after reopen, post-reopen allocation past persisted log entries,
        zero-apply tombstone convergence, partial tombstone retry, abandoned
@@ -1981,10 +1981,11 @@ Completed:
   - added restart regressions for a missing applied log entry, missing
     replica-state row on a nonempty PG, reordered row identity, corrupted hash
     link, corrupted materialized metadata row, a large prefix whose state
-    digest is explicitly unverified, and a stale-but-internally-coherent replica
-    whose validated command prefix differs from peers, all of which now fail
-    cluster open instead of letting the replica join cleanly when the
-    durable/materialized state is not coherent or not in acting-set agreement
+    digest is explicitly unverified and must be recomputed/persisted during
+    open, and a stale-but-internally-coherent replica whose validated command
+    prefix differs from peers; incoherent durable/materialized state or
+    acting-set disagreement still fails cluster open rather than admitting the
+    replica as clean
 - Phase 7.4 step 4:
   - expanded restart divergence coverage for non-reference replica row
     corruption and for replicas with the same materialized metadata digest but

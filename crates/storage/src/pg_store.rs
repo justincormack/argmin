@@ -754,14 +754,7 @@ impl PgStore {
                 current_epoch: cluster_epoch,
             });
         }
-        if state.state_digest == METADATA_STATE_DIGEST_UNVERIFIED {
-            return Err(StoreError::MetadataStateDigestUnverified {
-                node_id,
-                pg_id: self.pg_id,
-                cluster_epoch,
-                applied_log_index: state.applied_log_index,
-            });
-        }
+        let mut state = state;
         let mut applied_log_hash = 0_u64;
         for raw_log_index in 1..=state.applied_log_index {
             let log_index = MetadataCommandLogIndex::new(raw_log_index)
@@ -824,14 +817,16 @@ impl PgStore {
                 actual_log_hash: state.applied_log_hash,
             });
         }
-        if let Some((cluster_epoch, expected_digest, actual_digest)) =
-            self.metadata_state_digest_mismatch()?
-        {
+        let actual_digest = self.metadata_state_digest()?;
+        if state.state_digest == METADATA_STATE_DIGEST_UNVERIFIED {
+            self.store_metadata_command_state_digest(actual_digest)?;
+            state.state_digest = actual_digest;
+        } else if state.state_digest != actual_digest {
             return Err(StoreError::MetadataStateDigestMismatch {
                 node_id,
                 pg_id: self.pg_id,
-                cluster_epoch,
-                expected_digest,
+                cluster_epoch: state.cluster_epoch,
+                expected_digest: state.state_digest,
                 actual_digest,
             });
         }
@@ -1153,6 +1148,10 @@ impl PgStore {
     pub(crate) fn refresh_metadata_command_state_digest(&self) -> Result<(), StoreError> {
         let state = self.metadata_command_replica_state()?;
         let state_digest = self.online_metadata_state_digest(state.applied_log_index)?;
+        self.store_metadata_command_state_digest(state_digest)
+    }
+
+    fn store_metadata_command_state_digest(&self, state_digest: u64) -> Result<(), StoreError> {
         self.conn
             .execute(
                 "UPDATE metadata_command_replica_state SET state_digest = ?1 WHERE singleton = 0",
@@ -1163,21 +1162,6 @@ impl PgStore {
                 source: e,
             })?;
         Ok(())
-    }
-
-    fn metadata_state_digest_mismatch(
-        &self,
-    ) -> Result<Option<(ClusterEpoch, u64, u64)>, StoreError> {
-        let state = self.metadata_command_replica_state()?;
-        let actual_digest = self.metadata_state_digest()?;
-        if state.state_digest == actual_digest {
-            return Ok(None);
-        }
-        Ok(Some((
-            state.cluster_epoch,
-            state.state_digest,
-            actual_digest,
-        )))
     }
 
     fn online_metadata_state_digest_mismatch(
@@ -1393,7 +1377,8 @@ impl PgStore {
     fn online_metadata_state_digest(&self, applied_log_index: u64) -> Result<u64, StoreError> {
         // Full table scans are quadratic when run before every command in a
         // large local trace. Keep this online corruption gate bounded; restart
-        // validation treats the sentinel as unverified and fails closed.
+        // validation recomputes and persists a full digest when it sees this
+        // sentinel.
         if applied_log_index > METADATA_STATE_DIGEST_ONLINE_COMMAND_LIMIT {
             return Ok(METADATA_STATE_DIGEST_UNVERIFIED);
         }

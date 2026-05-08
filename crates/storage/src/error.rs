@@ -178,16 +178,6 @@ pub enum StoreError {
     },
 
     #[error(
-        "metadata state digest is unverified for local node {node_id} PG {pg_id} epoch {cluster_epoch} log index {applied_log_index}"
-    )]
-    MetadataStateDigestUnverified {
-        node_id: u32,
-        pg_id: u32,
-        cluster_epoch: ClusterEpoch,
-        applied_log_index: u64,
-    },
-
-    #[error(
         "metadata state digest mismatch for local node {node_id} PG {pg_id} epoch {cluster_epoch}: expected {expected_digest:#018X}, got {actual_digest:#018X}"
     )]
     MetadataStateDigestMismatch {

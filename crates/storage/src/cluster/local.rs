@@ -5936,7 +5936,7 @@ mod tests {
     }
 
     #[test]
-    fn local_cluster_reopen_rejects_unverified_large_command_stream_digest() {
+    fn local_cluster_reopen_recomputes_unverified_large_command_stream_digest() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let ec_shape = EcShape { k: 2, m: 1 };
@@ -5973,14 +5973,23 @@ mod tests {
         drop(cluster);
         drop(map);
 
-        let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
-        assert!(matches!(
-            err,
-            ClusterBuildError::OpenLocalNode {
-                node_id: 0,
-                source: StoreError::MetadataStateDigestUnverified { pg_id: 1, .. }
+        let reopened = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let mut reference = None;
+        for node_id in node_ids {
+            let pg = reopened
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            let state = pg.metadata_command_replica_state().unwrap();
+            assert_eq!(state.applied_log_index, 129);
+            assert_ne!(state.state_digest, 0);
+            match reference {
+                Some(reference) => assert_eq!(state, reference),
+                None => reference = Some(state),
             }
-        ));
+        }
     }
 
     #[test]
