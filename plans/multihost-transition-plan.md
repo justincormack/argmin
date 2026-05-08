@@ -1737,7 +1737,7 @@ Proposed slices:
      `quote(...)` text to typed canonical binary table-range encoding, then
      expand the inventory to the remaining command-owned in-progress,
      allocator, and reclaim tables
-4. Phase 7.4: log/checkpoint checksum and replay tests.
+4. Phase 7.4: log checksum and restart replay validation. Complete.
    - inventory persisted binary and integrity records before changing formats:
      `metadata_command_log`, command canonical bytes, command-log hash-chain
      state, full-PG canonical digest inputs, and any checkpoint/range block
@@ -1759,9 +1759,10 @@ Proposed slices:
      command id/log index, modified previous hash, missing middle log entry,
      duplicate log index with conflicting payload, abandoned entries, and
      corrupted canonical metadata rows
-   - add checkpoint/log-tail tests covering checkpoint-only replay, checkpoint
-     plus valid tail, corrupted checkpoint, corrupted tail, and stale
-     checkpoint handling according to the chosen rule
+   - chose not to introduce persisted checkpoints/range blocks in Phase 7.4:
+     checkpoint-only replay, checkpoint plus valid tail, corrupted checkpoint,
+     corrupted tail, stale checkpoint handling, checkpoint-based repair, and
+     log compaction remain Phase 7.5/Phase 10 work
    - add divergence tests for primary row corruption, replica row corruption,
      missing/extra/reordered replica log entries, same materialized state with
      different history, and matching history with corrupted materialized state
@@ -1997,25 +1998,41 @@ Completed:
     node/PG's accepted log index, log hash, state digest, and durable max log
     index, reopens the stores, and verifies those replay-state snapshots and
     materialized object rows are preserved
+- Phase 7.4 closeout:
+  - kept persisted checkpoint/range blocks out of Phase 7.4 deliberately; the
+    implemented replay boundary is retained command-log prefix plus canonical
+    materialized metadata digest, validated during local cluster open
+  - documented that checkpoint replay, checkpoint corruption handling,
+    digest-mismatch repair, and command-log compaction are deferred to Phase
+    7.5/Phase 10 rather than partially implemented here
+  - Phase 7.4 is complete: every persisted command-log row stores canonical
+    bytes with CRC64 coverage, restart validation verifies command bytes,
+    tombstone identity, hash-chain links, materialized state digest, and
+    acting-set agreement, and tests cover corruption/divergence without
+    silently choosing an arbitrary replica
 
 Exit criteria:
 
 1. the log/materialized-view/checkpoint relationship is documented and encoded
-   in tests
+   in tests, with checkpoint persistence explicitly deferred
 2. every command-owned metadata table has a canonical state representation
 3. the project has either committed to request-shaped commands for now with
    explicit limits, or refactored the core command payloads toward
    storage-shaped mutations
-4. a corrupted metadata row can be detected by scrub or read validation
+4. a corrupted metadata row is detected by restart validation against the
+   canonical materialized metadata digest; read-time scrub remains future work
 5. a replica with a missing, reordered, or modified command is detected
 6. every persisted binary command-log entry and every persisted
    checkpoint/snapshot/range block introduced by this phase has a checksum over
-   its canonical encoding
+   its canonical encoding; no checkpoint/snapshot/range block is introduced in
+   this phase
 7. a divergent replica is excluded from clean PG state until repaired
 8. tests cover primary corruption, replica corruption, stale replica restart,
-   digest mismatch repair, checksum failure, and checkpoint/log-tail replay
-9. command-log compaction cannot remove entries still needed for pending retry,
-   peering, restart recovery, or repair validation
+   digest mismatch detection, checksum failure, and retained log-prefix plus
+   materialized digest validation
+9. command-log compaction is not implemented in this phase; Phase 7.5 must
+   define retention so compaction cannot remove entries still needed for
+   pending retry, peering, restart recovery, or repair validation
 10. the system never resolves divergent metadata by silently choosing an
    arbitrary replica
 

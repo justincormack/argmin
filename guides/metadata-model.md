@@ -227,7 +227,7 @@ replay gap.
 | `metadata_command_log` row | Persisted in each PG SQLite store | Applied rows persist canonical command bytes; abandoned rows persist a distinct tombstone encoding with tombstone magic/version, epoch, PG, log index, and original command checksum; row keys and hash-link fields persist `cluster_epoch`, `pg_id`, `log_index`, `command_checksum`, `abandoned`, `previous_log_hash`, and `log_hash` | `command_checksum` is CRC64 over the persisted `command_bytes`; loaded rows verify the bytes' embedded epoch, PG, log index, and applied-vs-tombstone kind against the SQL row before use; applied rows must decode as a known payload kind and consume the whole command byte slice; `log_hash` links epoch, PG, log index, previous hash, and command checksum | Validates accepted command identity, duplicate/conflict handling, sparse-prefix advancement, abandoned-command identity, and hash-chain continuity; future replay can consume applied command bytes directly |
 | `metadata_command_replica_state` row | Persisted singleton in each PG SQLite store | `cluster_epoch`, `applied_log_index`, `applied_log_hash`, `state_digest` | `applied_log_hash` is the current command-log prefix hash; `state_digest` is the current canonical full-PG digest at that prefix | Fast fail-closed check that materialized state still matches the accepted log prefix; not a checkpoint by itself |
 | Canonical full-PG state digest input | Generated from the materialized SQLite serving view; only the digest value is persisted in replica state | Stable table/range domain header, explicit table and column names, range/filter identity, row boundaries, and typed values for the explicit canonical inventory | `state_digest` is computed over the full canonical table-range encoding | Detects materialized-row divergence and corruption; cannot replay state because the encoded row stream is not persisted as a block |
-| Checkpoint/snapshot/range block | Not persisted yet | To be defined if Phase 7.4 introduces blocks: kind/version, PG, epoch, covered log index, range identity, row count or range metadata, and canonical row bytes or range digest | Must carry a checksum over the whole canonical block | Future compact replay equivalence point. If Phase 7.4 does not introduce persisted blocks, checkpoint semantics remain a Phase 7.5/Phase 10 item |
+| Checkpoint/snapshot/range block | Not persisted yet | To be defined in Phase 7.5/Phase 10: kind/version, PG, epoch, covered log index, range identity, row count or range metadata, and canonical row bytes or range digest | Must carry a checksum over the whole canonical block | Future compact replay equivalence point. Phase 7.4 deliberately keeps checkpoint semantics deferred |
 | Object payload bytes | Persisted as placed payload shards, outside metadata command-log/checkpoint records | Not included in metadata canonical bytes; metadata stores payload descriptors such as size, layout, placement references, segment/part CRC64, and EC shape | Payload shards have their own shard checksums; metadata descriptors and payload CRC64 values are covered by command/state encodings | Replay restores metadata references, not object bytes; payload recovery/repair validates shard data separately |
 
 ## Integrity And Divergence
@@ -243,7 +243,8 @@ the stable command-encoding test matrix. Those tests also run the applied
 command-log verifier against the exact encoded bytes, so encoder/verifier drift
 fails before a row can be accepted into the durable prefix.
 
-Until checkpoint/range blocks are introduced, local restart validation treats
+Phase 7.4 does not introduce checkpoint/range blocks. Until those blocks are
+introduced, local restart validation treats
 the materialized SQLite state plus the retained command-log prefix as the
 replay boundary. `LocalClusterMap::open` validates every opened PG's
 `metadata_command_replica_state` by walking log entries `1..=applied_log_index`,
@@ -272,6 +273,12 @@ Replay-state tests build representative bucket and object metadata through
 `StorageCluster`, then reopen the local stores and require the accepted log
 prefix, hash, digest, durable max log index, and materialized rows to remain
 stable.
+
+Digest mismatch repair, checkpoint-only replay, checkpoint-plus-tail replay,
+checkpoint corruption handling, and command-log compaction are not implemented
+by Phase 7.4. Until Phase 7.5/Phase 10 defines compact equivalence points and
+repair authority, validated startup either accepts an agreeing acting set or
+fails closed.
 
 Replica disagreement is never resolved by choosing the first or fastest answer.
 The allowed outcomes are:
