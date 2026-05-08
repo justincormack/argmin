@@ -66,7 +66,9 @@ pub use shard_key_hash::{
     multipart_part_segment_key_hash, object_key_hash, part_key_hash, segment_key_hash,
     stream_segment_key_hash,
 };
-pub use traits::{PgMetadataStore, ShardStore, StorageNode};
+#[cfg(test)]
+pub(crate) use traits::PgMetadataStore;
+pub use traits::{ShardStore, StorageNode};
 pub use types::*;
 
 #[cfg(test)]

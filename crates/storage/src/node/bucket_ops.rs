@@ -170,7 +170,7 @@ impl SharedStorageNode {
     pub fn delete_bucket_metadata(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
         let pg_id = self.pg_topology.bucket_pg_for(bucket);
         let bucket_pg = self.get_pg(pg_id)?;
-        PgMetadataStore::delete_bucket(&*bucket_pg, bucket)?;
+        PgMetadataStore::delete_finalized_bucket(&*bucket_pg, bucket)?;
         Ok(())
     }
 

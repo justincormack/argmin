@@ -191,6 +191,19 @@ command stream: after the write-drain fence and emptiness check, it publishes a
 `MarkBucketDeleting` bucket-row post-image rather than mutating the bucket state
 or `pg_counters` directly.
 
+Direct command-owned metadata mutation is not a production API. `PgMetadataStore`
+is crate-private, its legacy direct mutators are test-only or explicit test
+hooks, and `SharedStorageNode` does not expose production bucket/object
+mutation helpers that bypass `StorageCluster`. Production metadata mutation
+should enter through a routed command API, then use private `PgStore` helpers
+inside metadata command apply. The named exception is finalized bucket row
+deletion: `PgMetadataStore::delete_finalized_bucket` is only for the cluster
+fanout step after `MarkBucketDeleting` has committed, new writes have drained,
+and all visible data and reclaim roots have been removed. Each local PgStore
+delete verifies the bucket row is already `Deleting`; an `Active` replica is
+treated as divergence and the finalized-delete fanout fails rather than hiding
+the mismatch.
+
 `PutObjectMetadata` keeps the AWS-facing "put tags", "delete tags", "put ACL",
 "put retention", and "put legal hold" distinctions at the coordinator/storage
 API boundary, but the durable command carries the post-mutation live object row.

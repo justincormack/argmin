@@ -404,6 +404,9 @@ pub enum MetadataError {
     #[error("bucket not empty")]
     BucketNotEmpty,
 
+    #[error("bucket is not finalized for delete: state {state:?}")]
+    BucketNotFinalizedForDelete { state: crate::types::BucketState },
+
     #[error("bucket write reservations are draining")]
     BucketWriteDraining,
 

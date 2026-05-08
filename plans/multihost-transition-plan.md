@@ -1852,6 +1852,17 @@ Completed:
   - narrowed the legacy `PgMetadataStore::put_object_meta` object-row seeder to
     `cfg(test)`, so production code cannot mutate command-owned object rows or
     version counters outside metadata command apply
+  - made `PgMetadataStore` crate-private and removed its public re-export; the
+    remaining old direct command-owned bucket/object/multipart/stream mutators
+    are gated to tests or explicit test hooks, while production mutations
+    enter through `StorageCluster` command APIs and private `PgStore` command
+    apply helpers
+  - renamed the remaining production bucket-row delete hook to
+    `PgMetadataStore::delete_finalized_bucket` and documented it as the explicit
+    finalization exception: it is only used by the cluster acting-set fanout
+    after `MarkBucketDeleting`, write drain, visible-data checks, and reclaim
+    checks have completed; each local delete fails closed unless the replica row
+    is already `Deleting`
   - moved `buckets.completed_multipart_upload_sequence` behind an explicit
     bucket-PG `AdvanceCompletedMultipartUploadSequence` metadata command:
     CompleteMultipartUpload first reserves/advances the bucket sequence through

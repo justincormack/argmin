@@ -1012,7 +1012,9 @@ fn bucket_deletion_lifecycle() {
     assert!(buckets.is_empty());
 
     // Final delete.
-    store.delete_bucket(&bucket_name("doomed")).unwrap();
+    store
+        .delete_finalized_bucket(&bucket_name("doomed"))
+        .unwrap();
 
     // Completely gone.
     let err = store.head_bucket_raw(&bucket_name("doomed")).unwrap_err();

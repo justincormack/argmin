@@ -25,6 +25,7 @@ use crate::metadata_command::{
     PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
     PutObjectMetadataMutation,
 };
+use crate::traits::PgMetadataStore;
 use crate::*;
 
 const INTERNAL_LIST_PAGE_SIZE: u32 = 1_000;
@@ -930,7 +931,7 @@ impl super::StorageCluster {
 
         for node in nodes {
             let pg = node.storage_node().get_pg(pg_id.get())?;
-            match PgMetadataStore::delete_bucket(&*pg, bucket) {
+            match PgMetadataStore::delete_finalized_bucket(&*pg, bucket) {
                 Ok(()) => {
                     pg.refresh_metadata_command_state_digest()?;
                 }

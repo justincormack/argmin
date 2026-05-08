@@ -533,7 +533,22 @@ fn file_bucket_metadata_create_head_list_delete() {
     assert_eq!(owner1[0].name, "alpha");
     assert_eq!(owner1[1].name, "beta");
 
-    store.delete_bucket(&bucket_name("alpha")).unwrap();
+    let active_delete_err = store
+        .delete_finalized_bucket(&bucket_name("alpha"))
+        .unwrap_err();
+    assert!(matches!(
+        active_delete_err,
+        crate::error::MetadataError::BucketNotFinalizedForDelete {
+            state: BucketState::Active
+        }
+    ));
+    store
+        .begin_bucket_write_drain(&bucket_name("alpha"))
+        .unwrap();
+    store.mark_bucket_deleting(&bucket_name("alpha")).unwrap();
+    store
+        .delete_finalized_bucket(&bucket_name("alpha"))
+        .unwrap();
     let err = store.head_bucket(&bucket_name("alpha")).unwrap_err();
     assert!(matches!(
         err,
@@ -545,7 +560,7 @@ fn file_bucket_metadata_create_head_list_delete() {
 fn file_bucket_metadata_delete_nonexistent() {
     let (_dir, store) = make_pg_store();
     let err = store
-        .delete_bucket(&bucket_name("no-such-bucket"))
+        .delete_finalized_bucket(&bucket_name("no-such-bucket"))
         .unwrap_err();
     assert!(matches!(
         err,
@@ -625,7 +640,13 @@ fn delete_bucket_clears_completed_multipart_upload_records() {
         .unwrap()
         .is_some());
 
-    store.delete_bucket(&bucket_name("bucket")).unwrap();
+    store
+        .begin_bucket_write_drain(&bucket_name("bucket"))
+        .unwrap();
+    store.mark_bucket_deleting(&bucket_name("bucket")).unwrap();
+    store
+        .delete_finalized_bucket(&bucket_name("bucket"))
+        .unwrap();
 
     assert!(store
         .get_completed_multipart_upload(&multipart_upload_id("completed-upload"))
@@ -682,7 +703,9 @@ fn delete_bucket_clears_object_version_counter_records() {
     assert_eq!(counter_rows, 1);
 
     store.delete_object_version(&bucket, &key, v1).unwrap();
-    store.delete_bucket(&bucket).unwrap();
+    store.begin_bucket_write_drain(&bucket).unwrap();
+    store.mark_bucket_deleting(&bucket).unwrap();
+    store.delete_finalized_bucket(&bucket).unwrap();
     let counter_rows: i64 = store
         .connection()
         .query_row(
@@ -1173,7 +1196,7 @@ fn file_bucket_execution_generation_advances_across_delete_recreate() {
         .bucket_execution_generation;
     store.begin_bucket_write_drain(&bucket).unwrap();
     store.mark_bucket_deleting(&bucket).unwrap();
-    store.delete_bucket(&bucket).unwrap();
+    store.delete_finalized_bucket(&bucket).unwrap();
     store
         .create_bucket(
             &bucket,
@@ -1520,7 +1543,13 @@ fn delete_bucket_cascades_bucket_subresources() {
         .unwrap()
         .is_some());
 
-    store.delete_bucket(&bucket_name("bucket")).unwrap();
+    store
+        .begin_bucket_write_drain(&bucket_name("bucket"))
+        .unwrap();
+    store.mark_bucket_deleting(&bucket_name("bucket")).unwrap();
+    store
+        .delete_finalized_bucket(&bucket_name("bucket"))
+        .unwrap();
 
     store
         .create_bucket(

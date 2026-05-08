@@ -13355,6 +13355,89 @@ mod tests {
     }
 
     #[test]
+    fn finalized_bucket_delete_fails_closed_on_active_replica() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "delete-diverged-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        cluster.begin_bucket_delete(&bucket).unwrap();
+
+        let divergent_node = map.node(NodeId::new(0)).unwrap().storage_node();
+        let divergent_pg = divergent_node.get_pg(1).unwrap();
+        crate::PgMetadataStore::delete_finalized_bucket(&*divergent_pg, &bucket).unwrap();
+        divergent_pg
+            .refresh_metadata_command_state_digest()
+            .unwrap();
+        crate::PgMetadataStore::create_bucket(
+            &*divergent_pg,
+            &bucket,
+            "owner",
+            &crate::CanonicalUserId::from_principal("owner"),
+            &crate::AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        divergent_pg
+            .refresh_metadata_command_state_digest()
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_raw(&*divergent_pg, &bucket)
+                .unwrap()
+                .state,
+            crate::BucketState::Active
+        );
+        drop(divergent_pg);
+
+        let err = cluster.try_finalize_bucket_delete(&bucket).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketWriteDrainError::Metadata(
+                    crate::MetadataError::BucketNotFinalizedForDelete {
+                        state: crate::BucketState::Active
+                    }
+                )
+            ),
+            "expected active replica to fail finalized delete, got {err:?}"
+        );
+
+        let divergent_pg = divergent_node.get_pg(1).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_raw(&*divergent_pg, &bucket)
+                .unwrap()
+                .state,
+            crate::BucketState::Active
+        );
+        let primary_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket)
+                .unwrap()
+                .state,
+            crate::BucketState::Deleting
+        );
+    }
+
+    #[test]
     fn bucket_snapshot_pair_routes_to_bucket_pg_primaries() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

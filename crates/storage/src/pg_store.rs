@@ -19,19 +19,21 @@ use rusqlite::types::ValueRef;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
+#[cfg(test)]
+use crate::metadata_command::BucketPropertyMutation;
 use crate::metadata_command::{
     metadata_command_log_hash, AbortMultipartUploadCommand, AbortStreamUploadCommand,
     AdvanceCompletedMultipartUploadSequenceCommand, AppendStreamSegmentCommand,
-    BucketPropertyEffect, BucketPropertyMutation, BucketRecord, BucketSubresourceMutation,
-    CommitDirectPutObjectCommand, CommitMultipartObjectCommand, CommitStreamPartCommand,
-    CreateBucketCommand, CreateMultipartUploadCommand, CreateStreamUploadCommand,
-    DeleteCompletedMultipartUploadCommand, DeleteObjectPayloadReclaimCommand,
-    DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
-    MarkBucketDeletingCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
-    MetadataCommandLogIndex, MetadataCommandPayload, MetadataCommandReplicaState,
-    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
-    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
-    ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
+    BucketPropertyEffect, BucketRecord, BucketSubresourceMutation, CommitDirectPutObjectCommand,
+    CommitMultipartObjectCommand, CommitStreamPartCommand, CreateBucketCommand,
+    CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteCompletedMultipartUploadCommand,
+    DeleteObjectPayloadReclaimCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
+    InsertDeleteMarkerCommand, MarkBucketDeletingCommand, MetadataCommandAcceptance,
+    MetadataCommandEnvelope, MetadataCommandLogIndex, MetadataCommandPayload,
+    MetadataCommandReplicaState, ObjectPayloadReclaimCommand, PutBucketAclCommand,
+    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
+    PutObjectMetadataCommand, ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
+    ReserveObjectVersionCommand,
 };
 use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
@@ -60,6 +62,7 @@ FROM buckets";
 /// Must differ from any real version_id (0 for unversioned, 1+ for versioned) so that
 /// in-progress staging rows are invisible to reads of completed objects.
 const PART_SEGMENT_STAGING_VERSION_ID: VersionId = MULTIPART_PART_SEGMENT_STAGING_VERSION_ID;
+#[cfg(test)]
 type StreamSessionRow = (u8, u8, BucketName, ObjectKey, Option<UploadId>, Option<i64>);
 
 const METADATA_STATE_DIGEST_UNVERIFIED: u64 = 0;
@@ -392,6 +395,7 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
 
 #[derive(Debug, Clone, Copy)]
 enum BucketExecutionGeneration {
+    #[cfg(test)]
     Allocate,
     Explicit(u64),
 }
@@ -1188,6 +1192,7 @@ impl PgStore {
     }
 
     /// Get the current unix timestamp in milliseconds.
+    #[cfg(any(test, feature = "test-hooks"))]
     fn now_millis() -> u64 {
         crate::clock::current_time_millis()
     }
@@ -1478,6 +1483,7 @@ impl PgStore {
         })
     }
 
+    #[cfg(test)]
     fn row_to_object_part_range(
         row: &rusqlite::Row<'_>,
     ) -> rusqlite::Result<ObjectPartRangeRecord> {
@@ -2223,22 +2229,26 @@ impl PgStore {
         }
 
         let info = self.head_bucket_raw(name)?;
-        if let BucketExecutionGeneration::Explicit(explicit) = generation {
-            if info.bucket_execution_generation == explicit {
-                if self.bucket_subresource_matches(&info, mutation)? {
-                    return Ok(());
+        match generation {
+            BucketExecutionGeneration::Explicit(explicit) => {
+                if info.bucket_execution_generation == explicit {
+                    if self.bucket_subresource_matches(&info, mutation)? {
+                        return Ok(());
+                    }
+                    return Err(MetadataError::Db {
+                        context: bucket_subresource_conflict_context(mutation),
+                        source: rusqlite::Error::InvalidQuery,
+                    });
                 }
-                return Err(MetadataError::Db {
-                    context: bucket_subresource_conflict_context(mutation),
-                    source: rusqlite::Error::InvalidQuery,
-                });
+                if info.bucket_execution_generation > explicit {
+                    return Err(MetadataError::Db {
+                        context: bucket_subresource_stale_context(mutation),
+                        source: rusqlite::Error::InvalidQuery,
+                    });
+                }
             }
-            if info.bucket_execution_generation > explicit {
-                return Err(MetadataError::Db {
-                    context: bucket_subresource_stale_context(mutation),
-                    source: rusqlite::Error::InvalidQuery,
-                });
-            }
+            #[cfg(test)]
+            BucketExecutionGeneration::Allocate => {}
         }
 
         self.with_immediate_txn(
@@ -2379,6 +2389,7 @@ impl PgStore {
                 }
 
                 let execution_generation = match generation {
+                    #[cfg(test)]
                     BucketExecutionGeneration::Allocate => store
                         .next_bucket_execution_generation_in_txn(
                             "put bucket subresource command (allocate execution generation)",
@@ -2407,6 +2418,7 @@ impl PgStore {
         )
     }
 
+    #[cfg(test)]
     fn put_bucket_subresource_internal(
         &self,
         name: &BucketName,
@@ -2425,6 +2437,7 @@ impl PgStore {
         )
     }
 
+    #[cfg(test)]
     fn delete_bucket_subresource_internal(
         &self,
         name: &BucketName,
@@ -2963,6 +2976,7 @@ impl PgStore {
         }
     }
 
+    #[cfg(test)]
     fn next_bucket_execution_generation_in_txn(
         &self,
         context: &'static str,
@@ -3041,6 +3055,7 @@ impl PgStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn create_bucket_with_config(
         &self,
         config: &CreateBucketConfig<'_>,
@@ -3052,6 +3067,7 @@ impl PgStore {
         )
     }
 
+    #[cfg(test)]
     fn create_bucket_with_config_inner(
         &self,
         config: &CreateBucketConfig<'_>,
@@ -3091,6 +3107,7 @@ impl PgStore {
             "create bucket (commit txn)",
             |store| {
                 let generation = match generation {
+                    #[cfg(test)]
                     BucketExecutionGeneration::Allocate => store
                         .next_bucket_execution_generation_in_txn(
                             "create bucket (allocate execution generation)",
@@ -3740,7 +3757,7 @@ impl PgStore {
         &self,
         command: &ReleaseObjectGenerationCommand,
     ) -> Result<(), MetadataError> {
-        self.delete_object_generation_reservation(
+        self.delete_object_generation_reservation_direct(
             &command.bucket,
             &command.key,
             &command.reservation_id,
@@ -3784,7 +3801,7 @@ impl PgStore {
                     command.write_sequence,
                     command.last_modified_millis,
                 )?;
-                store.delete_object_generation_reservation(
+                store.delete_object_generation_reservation_direct(
                     &command.object.bucket,
                     &command.object.key,
                     &command.generation_reservation_id,
@@ -3900,7 +3917,7 @@ impl PgStore {
                     command.write_sequence,
                     command.last_modified_millis,
                 )?;
-                store.delete_multipart_part_segments(
+                store.delete_multipart_part_segments_direct(
                     &command.object.bucket,
                     &command.object.key,
                     command.object.version_id,
@@ -3915,7 +3932,7 @@ impl PgStore {
                 store.insert_completed_multipart_upload_in_open_txn(command)?;
                 store.release_multipart_completion_reservation_in_open_txn(command)?;
                 for session in &command.stream_uploads {
-                    store.delete_stream_upload(&session.session_id)?;
+                    store.delete_stream_upload_direct(&session.session_id)?;
                 }
                 store.delete_multipart_upload_if_present_in_open_txn(&command.upload_id)?;
                 Ok(())
@@ -4173,8 +4190,8 @@ impl PgStore {
             }
             ObjectPayloadReclaimCommand::Multipart(reclaim) => {
                 self.put_multipart_reclaim_in_open_txn(reclaim)?;
-                self.delete_multipart_part_segments(bucket, key, version_id)?;
-                self.delete_object_parts(bucket, key, version_id)
+                self.delete_multipart_part_segments_direct(bucket, key, version_id)?;
+                self.delete_object_parts_direct(bucket, key, version_id)
             }
         }
     }
@@ -4189,12 +4206,12 @@ impl PgStore {
         match stale_payload {
             ObjectPayloadReclaimCommand::Segments(reclaim) => {
                 self.put_object_segments_reclaim_in_open_txn(reclaim)?;
-                self.delete_object_segments(bucket, key, version_id)
+                self.delete_object_segments_direct(bucket, key, version_id)
             }
             ObjectPayloadReclaimCommand::Multipart(reclaim) => {
                 self.put_multipart_reclaim_in_open_txn(reclaim)?;
-                self.delete_multipart_part_segments(bucket, key, version_id)?;
-                self.delete_object_parts(bucket, key, version_id)
+                self.delete_multipart_part_segments_direct(bucket, key, version_id)?;
+                self.delete_object_parts_direct(bucket, key, version_id)
             }
         }
     }
@@ -4236,11 +4253,12 @@ impl PgStore {
                     &command.key,
                     command.generation_id,
                 )? {
-                    Some(existing) if existing == *expected => self.delete_object_segments_reclaim(
-                        &command.bucket,
-                        &command.key,
-                        command.generation_id,
-                    ),
+                    Some(existing) if existing == *expected => self
+                        .delete_object_segments_reclaim_direct(
+                            &command.bucket,
+                            &command.key,
+                            command.generation_id,
+                        ),
                     Some(_) => Err(MetadataError::Db {
                         context: "delete object payload reclaim command segment mismatch",
                         source: rusqlite::Error::InvalidQuery,
@@ -4269,11 +4287,12 @@ impl PgStore {
                     &command.key,
                     command.generation_id,
                 )? {
-                    Some(existing) if existing == *expected => self.delete_multipart_reclaim(
-                        &command.bucket,
-                        &command.key,
-                        command.generation_id,
-                    ),
+                    Some(existing) if existing == *expected => self
+                        .delete_multipart_reclaim_direct(
+                            &command.bucket,
+                            &command.key,
+                            command.generation_id,
+                        ),
                     Some(_) => Err(MetadataError::Db {
                         context: "delete object payload reclaim command multipart mismatch",
                         source: rusqlite::Error::InvalidQuery,
@@ -4352,7 +4371,7 @@ impl PgStore {
                         match payload {
                             ObjectPayloadReclaimCommand::Segments(reclaim) => {
                                 store.put_object_segments_reclaim_in_open_txn(reclaim)?;
-                                store.delete_object_segments(
+                                store.delete_object_segments_direct(
                                     &command.bucket,
                                     &command.key,
                                     command.version_id,
@@ -4360,12 +4379,12 @@ impl PgStore {
                             }
                             ObjectPayloadReclaimCommand::Multipart(reclaim) => {
                                 store.put_multipart_reclaim_in_open_txn(reclaim)?;
-                                store.delete_multipart_part_segments(
+                                store.delete_multipart_part_segments_direct(
                                     &command.bucket,
                                     &command.key,
                                     command.version_id,
                                 )?;
-                                store.delete_object_parts(
+                                store.delete_object_parts_direct(
                                     &command.bucket,
                                     &command.key,
                                     command.version_id,
@@ -4686,7 +4705,7 @@ impl PgStore {
                         context: "append stream segment command existing segment mismatch",
                         source: rusqlite::Error::InvalidQuery,
                     }),
-                    None => store.append_stream_segment(&command.segment),
+                    None => store.append_stream_segment_direct(&command.segment),
                 }
             },
         )
@@ -4723,8 +4742,11 @@ impl PgStore {
                         source: rusqlite::Error::InvalidQuery,
                     });
                 }
-                store.set_stream_upload_state(&command.session_id, StreamUploadState::Aborted)?;
-                store.delete_stream_upload(&command.session_id)
+                store.set_stream_upload_state_direct(
+                    &command.session_id,
+                    StreamUploadState::Aborted,
+                )?;
+                store.delete_stream_upload_direct(&command.session_id)
             },
         )
     }
@@ -4743,8 +4765,10 @@ impl PgStore {
             |store| {
                 store.validate_commit_stream_part_command(command)?;
 
-                store
-                    .set_stream_upload_state(&command.session_id, StreamUploadState::Completing)?;
+                store.set_stream_upload_state_direct(
+                    &command.session_id,
+                    StreamUploadState::Completing,
+                )?;
                 store.insert_multipart_part_explicit(&command.part)?;
                 store.delete_multipart_part_segments_for_upload_part(
                     &command.bucket,
@@ -4753,7 +4777,7 @@ impl PgStore {
                     command.part.part_number,
                 )?;
                 store.insert_multipart_part_segments_explicit(&command.segments)?;
-                store.delete_stream_upload(&command.session_id)
+                store.delete_stream_upload_direct(&command.session_id)
             },
         )
     }
@@ -5387,10 +5411,10 @@ impl PgStore {
                         });
                     }
                     for session in &command.cleanup.stream_uploads {
-                        store.delete_stream_upload(&session.session_id)?;
+                        store.delete_stream_upload_direct(&session.session_id)?;
                     }
                 }
-                store.delete_multipart_part_segments_by_upload_id(&command.upload_id)?;
+                store.delete_multipart_part_segments_by_upload_id_direct(&command.upload_id)?;
                 store
                     .conn
                     .execute(
@@ -5501,6 +5525,7 @@ impl PgStore {
         Ok(())
     }
 
+    #[cfg(test)]
     fn put_bucket_versioning_inner(
         &self,
         name: &BucketName,
@@ -5575,6 +5600,7 @@ impl PgStore {
             "put bucket versioning (commit txn)",
             |store| {
                 let generation = match generation {
+                    #[cfg(test)]
                     BucketExecutionGeneration::Allocate => store
                         .next_bucket_execution_generation_in_txn(
                             "put bucket versioning (allocate execution generation)",
@@ -5605,6 +5631,7 @@ impl PgStore {
         )
     }
 
+    #[cfg(test)]
     fn put_bucket_acl_inner(
         &self,
         name: &BucketName,
@@ -5683,6 +5710,7 @@ impl PgStore {
             "put bucket acl (commit txn)",
             |store| {
                 let generation = match generation {
+                    #[cfg(test)]
                     BucketExecutionGeneration::Allocate => store
                         .next_bucket_execution_generation_in_txn(
                             "put bucket acl (allocate execution generation)",
@@ -5724,6 +5752,7 @@ impl PgStore {
         )
     }
 
+    #[cfg(test)]
     fn bucket_property_matches(
         &self,
         info: &BucketInfo,
@@ -5746,6 +5775,7 @@ impl PgStore {
         }
     }
 
+    #[cfg(test)]
     fn put_bucket_property_inner(
         &self,
         name: &BucketName,
@@ -5776,6 +5806,7 @@ impl PgStore {
             "put bucket property (commit txn)",
             |store| {
                 let generation = match generation {
+                    #[cfg(test)]
                     BucketExecutionGeneration::Allocate => store
                         .next_bucket_execution_generation_in_txn(
                             "put bucket property (allocate execution generation)",
@@ -6836,10 +6867,7 @@ impl PgStore {
         Ok(())
     }
 
-    pub fn delete_completed_multipart_upload(
-        &self,
-        upload_id: &UploadId,
-    ) -> Result<(), MetadataError> {
+    fn delete_completed_multipart_upload(&self, upload_id: &UploadId) -> Result<(), MetadataError> {
         self.conn
             .execute(
                 "DELETE FROM completed_multipart_uploads WHERE upload_id = ?1",
@@ -6854,6 +6882,7 @@ impl PgStore {
 }
 
 impl PgMetadataStore for PgStore {
+    #[cfg(test)]
     fn create_bucket(
         &self,
         name: &BucketName,
@@ -6875,10 +6904,10 @@ impl PgMetadataStore for PgStore {
         })
     }
 
-    fn delete_bucket(&self, name: &BucketName) -> Result<(), MetadataError> {
+    fn delete_finalized_bucket(&self, name: &BucketName) -> Result<(), MetadataError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "PgStore::delete_bucket",
+            "PgStore::delete_finalized_bucket",
             "pg_id={} bucket={:?}",
             self.pg_id,
             name
@@ -6886,23 +6915,61 @@ impl PgMetadataStore for PgStore {
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
-                context: "delete bucket (begin txn)",
+                context: "delete finalized bucket (begin txn)",
                 source: e,
             })?;
-        let result = (|| -> Result<usize, rusqlite::Error> {
-            let deleted = self.conn.execute(
-                "DELETE FROM buckets WHERE name = ?1",
-                params![name.as_str()],
-            )?;
+        let result = (|| -> Result<usize, MetadataError> {
+            let state = self
+                .conn
+                .query_row(
+                    "SELECT state FROM buckets WHERE name = ?1",
+                    params![name.as_str()],
+                    |row| row.get::<_, u8>(0),
+                )
+                .optional()
+                .map_err(|source| MetadataError::Db {
+                    context: "delete finalized bucket (load state)",
+                    source,
+                })?;
+            let Some(state) = state else {
+                return Ok(0);
+            };
+            let state = BucketState::from_u8(state).ok_or_else(|| MetadataError::Db {
+                context: "delete finalized bucket (invalid bucket state)",
+                source: rusqlite::Error::InvalidQuery,
+            })?;
+            if state != BucketState::Deleting {
+                return Err(MetadataError::BucketNotFinalizedForDelete { state });
+            }
+            let deleted = self
+                .conn
+                .execute(
+                    "DELETE FROM buckets WHERE name = ?1 AND state = ?2",
+                    params![name.as_str(), BucketState::Deleting as u8],
+                )
+                .map_err(|source| MetadataError::Db {
+                    context: "delete finalized bucket (delete row)",
+                    source,
+                })?;
             if deleted != 0 {
-                self.conn.execute(
-                    "DELETE FROM completed_multipart_uploads WHERE bucket = ?1",
-                    params![name.as_str()],
-                )?;
-                self.conn.execute(
-                    "DELETE FROM object_version_counters WHERE bucket = ?1",
-                    params![name.as_str()],
-                )?;
+                self.conn
+                    .execute(
+                        "DELETE FROM completed_multipart_uploads WHERE bucket = ?1",
+                        params![name.as_str()],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "delete finalized bucket (delete completed MPU records)",
+                        source,
+                    })?;
+                self.conn
+                    .execute(
+                        "DELETE FROM object_version_counters WHERE bucket = ?1",
+                        params![name.as_str()],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "delete finalized bucket (delete version counters)",
+                        source,
+                    })?;
             }
             Ok(deleted)
         })();
@@ -6911,17 +6978,14 @@ impl PgMetadataStore for PgStore {
                 self.conn
                     .execute_batch("COMMIT")
                     .map_err(|e| MetadataError::Db {
-                        context: "delete bucket (commit txn)",
+                        context: "delete finalized bucket (commit txn)",
                         source: e,
                     })?;
                 deleted
             }
-            Err(source) => {
+            Err(error) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
-                return Err(MetadataError::Db {
-                    context: "delete bucket",
-                    source,
-                });
+                return Err(error);
             }
         };
         if deleted == 0 {
@@ -7086,6 +7150,7 @@ impl PgMetadataStore for PgStore {
         Ok(buckets)
     }
 
+    #[cfg(test)]
     fn mark_bucket_deleting(&self, name: &BucketName) -> Result<(), MetadataError> {
         self.with_immediate_txn(
             "mark bucket deleting (begin txn)",
@@ -7210,6 +7275,7 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
+    #[cfg(test)]
     fn put_bucket_versioning(
         &self,
         name: &BucketName,
@@ -7218,6 +7284,7 @@ impl PgMetadataStore for PgStore {
         self.put_bucket_versioning_inner(name, state, BucketExecutionGeneration::Allocate)
     }
 
+    #[cfg(test)]
     fn put_bucket_object_lock(
         &self,
         name: &BucketName,
@@ -7230,6 +7297,7 @@ impl PgMetadataStore for PgStore {
         )
     }
 
+    #[cfg(test)]
     fn put_bucket_acl(
         &self,
         name: &BucketName,
@@ -7246,6 +7314,7 @@ impl PgMetadataStore for PgStore {
         )
     }
 
+    #[cfg(test)]
     fn put_bucket_subresource(
         &self,
         name: &BucketName,
@@ -7262,6 +7331,7 @@ impl PgMetadataStore for PgStore {
         self.get_bucket_subresource_internal(name.as_str(), kind)
     }
 
+    #[cfg(test)]
     fn delete_bucket_subresource(
         &self,
         name: &BucketName,
@@ -7270,6 +7340,7 @@ impl PgMetadataStore for PgStore {
         self.delete_bucket_subresource_internal(name, kind)
     }
 
+    #[cfg(test)]
     fn put_bucket_public_access_block(
         &self,
         name: &BucketName,
@@ -7282,6 +7353,7 @@ impl PgMetadataStore for PgStore {
         )
     }
 
+    #[cfg(test)]
     fn get_bucket_public_access_block(
         &self,
         name: &BucketName,
@@ -7317,6 +7389,7 @@ impl PgMetadataStore for PgStore {
             .ok_or_else(|| bucket_not_found(name.as_str()))
     }
 
+    #[cfg(test)]
     fn delete_bucket_public_access_block(&self, name: &BucketName) -> Result<(), MetadataError> {
         self.put_bucket_property_inner(
             name,
@@ -7325,6 +7398,7 @@ impl PgMetadataStore for PgStore {
         )
     }
 
+    #[cfg(test)]
     fn put_bucket_ownership_controls(
         &self,
         name: &BucketName,
@@ -7337,6 +7411,7 @@ impl PgMetadataStore for PgStore {
         )
     }
 
+    #[cfg(test)]
     fn get_bucket_ownership_controls(
         &self,
         name: &BucketName,
@@ -7355,6 +7430,7 @@ impl PgMetadataStore for PgStore {
             .ok_or_else(|| bucket_not_found(name.as_str()))
     }
 
+    #[cfg(test)]
     fn delete_bucket_ownership_controls(&self, name: &BucketName) -> Result<(), MetadataError> {
         self.put_bucket_property_inner(
             name,
@@ -7363,6 +7439,7 @@ impl PgMetadataStore for PgStore {
         )
     }
 
+    #[cfg(test)]
     fn put_bucket_abac_enabled(
         &self,
         name: &BucketName,
@@ -7375,6 +7452,7 @@ impl PgMetadataStore for PgStore {
         )
     }
 
+    #[cfg(test)]
     fn get_bucket_abac_enabled(&self, name: &BucketName) -> Result<bool, MetadataError> {
         self.conn
             .query_row(
@@ -7391,6 +7469,7 @@ impl PgMetadataStore for PgStore {
             })
     }
 
+    #[cfg(test)]
     fn put_bucket_encryption(
         &self,
         name: &BucketName,
@@ -7403,6 +7482,7 @@ impl PgMetadataStore for PgStore {
         )
     }
 
+    #[cfg(test)]
     fn get_bucket_encryption(
         &self,
         name: &BucketName,
@@ -7651,6 +7731,7 @@ impl PgMetadataStore for PgStore {
             .ok_or(MetadataError::ObjectNotFound)
     }
 
+    #[cfg(test)]
     fn put_object_acl(
         &self,
         bucket: &BucketName,
@@ -7700,6 +7781,7 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
+    #[cfg(test)]
     fn put_object_retention(
         &self,
         bucket: &BucketName,
@@ -7757,6 +7839,7 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
+    #[cfg(test)]
     fn put_object_legal_hold(
         &self,
         bucket: &BucketName,
@@ -7804,6 +7887,7 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
+    #[cfg(test)]
     fn delete_object_meta(
         &self,
         bucket: &BucketName,
@@ -7829,6 +7913,7 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
+    #[cfg(test)]
     fn delete_object_version(
         &self,
         bucket: &BucketName,
@@ -8268,6 +8353,7 @@ impl PgMetadataStore for PgStore {
         })
     }
 
+    #[cfg(test)]
     fn reserve_object_generation(
         &self,
         bucket: &BucketName,
@@ -8349,25 +8435,17 @@ impl PgMetadataStore for PgStore {
         })
     }
 
+    #[cfg(test)]
     fn delete_object_generation_reservation(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<(), MetadataError> {
-        self.conn
-            .execute(
-                "DELETE FROM object_generation_reservations \
-                 WHERE reservation_id = ?1 AND bucket = ?2 AND key = ?3",
-                params![reservation_id.as_str(), bucket, key],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "delete object generation reservation",
-                source: e,
-            })?;
-        Ok(())
+        self.delete_object_generation_reservation_direct(bucket, key, reservation_id)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     fn put_object_segments_reclaim(
         &self,
         reclaim: &ObjectSegmentsReclaimRecord,
@@ -8528,25 +8606,17 @@ impl PgMetadataStore for PgStore {
         }))
     }
 
+    #[cfg(test)]
     fn delete_object_segments_reclaim(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<(), MetadataError> {
-        self.conn
-            .execute(
-                "DELETE FROM object_segments_reclaims \
-                 WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3",
-                params![bucket, key, generation_id.get() as i64],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "delete object segments reclaim",
-                source: e,
-            })?;
-        Ok(())
+        self.delete_object_segments_reclaim_direct(bucket, key, generation_id)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     fn put_multipart_reclaim(&self, reclaim: &MultipartReclaimRecord) -> Result<(), MetadataError> {
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
@@ -8874,23 +8944,14 @@ impl PgMetadataStore for PgStore {
         }))
     }
 
+    #[cfg(test)]
     fn delete_multipart_reclaim(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<(), MetadataError> {
-        self.conn
-            .execute(
-                "DELETE FROM multipart_reclaims \
-                 WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3",
-                params![bucket, key, generation_id.get() as i64],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "delete multipart reclaim",
-                source: e,
-            })?;
-        Ok(())
+        self.delete_multipart_reclaim_direct(bucket, key, generation_id)
     }
 
     fn payload_reclaim_exists(
@@ -8952,6 +9013,7 @@ impl PgMetadataStore for PgStore {
             })
     }
 
+    #[cfg(test)]
     fn put_object_tags(
         &self,
         bucket: &BucketName,
@@ -9029,6 +9091,7 @@ impl PgMetadataStore for PgStore {
         }
     }
 
+    #[cfg(test)]
     fn delete_object_tags(
         &self,
         bucket: &BucketName,
@@ -9068,6 +9131,7 @@ impl PgMetadataStore for PgStore {
 
     // ── Multipart upload methods ──────────────────────────────────
 
+    #[cfg(test)]
     fn create_multipart_upload(&self, req: &CreateMultipartUploadReq) -> Result<(), MetadataError> {
         let object_generation_id = self.next_generation_id(&req.bucket, &req.key)?;
         let command = CreateMultipartUploadCommand::from_request(
@@ -9258,6 +9322,7 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
+    #[cfg(test)]
     fn delete_multipart_upload(&self, upload_id: &UploadId) -> Result<(), MetadataError> {
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
@@ -9333,6 +9398,7 @@ impl PgMetadataStore for PgStore {
             })
     }
 
+    #[cfg(test)]
     fn delete_completed_multipart_uploads_for_bucket(
         &self,
         bucket: &BucketName,
@@ -9553,6 +9619,7 @@ impl PgMetadataStore for PgStore {
         })
     }
 
+    #[cfg(test)]
     fn upsert_multipart_part(
         &self,
         part: &MultipartPartRecord,
@@ -9629,6 +9696,7 @@ impl PgMetadataStore for PgStore {
         }
     }
 
+    #[cfg(test)]
     fn upsert_multipart_part_segments(
         &self,
         part: &MultipartPartRecord,
@@ -9906,6 +9974,7 @@ impl PgMetadataStore for PgStore {
         })
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     fn commit_object_parts(&self, parts: &[ObjectPartRecord]) -> Result<(), MetadataError> {
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
@@ -10008,6 +10077,7 @@ impl PgMetadataStore for PgStore {
         Ok(parts)
     }
 
+    #[cfg(test)]
     fn get_object_parts_overlapping_range(
         &self,
         bucket: &BucketName,
@@ -10101,23 +10171,14 @@ impl PgMetadataStore for PgStore {
         Ok(parts)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     fn delete_object_parts(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<(), MetadataError> {
-        self.conn
-            .execute(
-                "DELETE FROM object_parts \
-                 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                params![bucket, key, version_id.to_u64() as i64],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "delete object parts",
-                source: e,
-            })?;
-        Ok(())
+        self.delete_object_parts_direct(bucket, key, version_id)
     }
 
     #[cfg(test)]
@@ -10526,6 +10587,7 @@ impl PgMetadataStore for PgStore {
     }
     // ── Streaming upload session methods ──────────────────────────────
 
+    #[cfg(any(test, feature = "test-hooks"))]
     fn create_stream_upload(&self, req: &CreateStreamUploadReq) -> Result<(), MetadataError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -10591,63 +10653,18 @@ impl PgMetadataStore for PgStore {
             })
     }
 
+    #[cfg(test)]
     fn set_stream_upload_state(
         &self,
         session_id: &SessionId,
         new_state: StreamUploadState,
     ) -> Result<(), MetadataError> {
-        let current: u8 = self
-            .conn
-            .query_row(
-                "SELECT state FROM stream_uploads WHERE session_id = ?1",
-                params![session_id.as_str()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "get stream upload state",
-                source: e,
-            })?
-            .ok_or_else(|| MetadataError::StreamSessionNotFound {
-                session_id: session_id.as_str().to_owned(),
-            })?;
-
-        if current != StreamUploadState::InProgress as u8 {
-            return Err(MetadataError::StreamSessionNotInProgress { state: current });
-        }
-
-        self.conn
-            .execute(
-                "UPDATE stream_uploads SET state = ?1 WHERE session_id = ?2",
-                params![new_state as u8, session_id.as_str()],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "set stream upload state",
-                source: e,
-            })?;
-        Ok(())
+        self.set_stream_upload_state_direct(session_id, new_state)
     }
 
+    #[cfg(test)]
     fn delete_stream_upload(&self, session_id: &SessionId) -> Result<(), MetadataError> {
-        self.conn
-            .execute(
-                "DELETE FROM stream_uploads WHERE session_id = ?1",
-                params![session_id.as_str()],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "delete stream upload",
-                source: e,
-            })?;
-        self.conn
-            .execute(
-                "DELETE FROM object_generation_reservations WHERE reservation_id = ?1",
-                params![session_id.as_str()],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "delete stream upload generation reservation",
-                source: e,
-            })?;
-        Ok(())
+        self.delete_stream_upload_direct(session_id)
     }
 
     fn list_all_stream_uploads(&self) -> Result<Vec<StreamUploadRecord>, MetadataError> {
@@ -10699,32 +10716,12 @@ impl PgMetadataStore for PgStore {
             })
     }
 
+    #[cfg(test)]
     fn append_stream_segment(
         &self,
         segment: &StreamUploadSegmentRecord,
     ) -> Result<(), MetadataError> {
-        self.conn
-                .execute(
-                    "INSERT INTO stream_upload_segments \
-                 (session_id, segment_index, size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    segment.session_id,
-                    segment.segment_index,
-                    segment.size as i64,
-                    segment.segment_crc64.map(|v| v as i64),
-                    segment.segment_okh.as_slice(),
-                    segment.segment_vid.get() as i64,
-                    segment.data_pg_id,
-                    segment.ec_k,
-                    segment.ec_m,
-                ],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "append stream segment",
-                source: e,
-            })?;
-        Ok(())
+        self.append_stream_segment_direct(segment)
     }
 
     fn list_stream_segments(
@@ -10778,6 +10775,7 @@ impl PgMetadataStore for PgStore {
         Ok(segments)
     }
 
+    #[cfg(test)]
     fn commit_stream_put(
         &self,
         session_id: &SessionId,
@@ -11037,6 +11035,7 @@ impl PgMetadataStore for PgStore {
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     fn put_object_with_segments(
         &self,
         obj: &PutLiveObjectReq,
@@ -11229,6 +11228,7 @@ impl PgMetadataStore for PgStore {
         }
     }
 
+    #[cfg(test)]
     fn commit_stream_part(
         &self,
         session_id: &SessionId,
@@ -11527,23 +11527,14 @@ impl PgMetadataStore for PgStore {
         Ok(segments)
     }
 
+    #[cfg(test)]
     fn delete_object_segments(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<(), MetadataError> {
-        self.conn
-            .execute(
-                "DELETE FROM object_segments \
-                 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                params![bucket, key, version_id.to_u64() as i64],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "delete stream object segments",
-                source: e,
-            })?;
-        Ok(())
+        self.delete_object_segments_direct(bucket, key, version_id)
     }
 
     fn get_multipart_part_segments(
@@ -11665,23 +11656,14 @@ impl PgMetadataStore for PgStore {
             })
     }
 
+    #[cfg(test)]
     fn delete_multipart_part_segments(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<(), MetadataError> {
-        self.conn
-            .execute(
-                "DELETE FROM multipart_part_segments \
-                 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                params![bucket, key, version_id.to_u64() as i64],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "delete multipart part segments",
-                source: e,
-            })?;
-        Ok(())
+        self.delete_multipart_part_segments_direct(bucket, key, version_id)
     }
 
     fn get_all_multipart_part_segments_for_upload(
@@ -11736,7 +11718,218 @@ impl PgMetadataStore for PgStore {
             })
     }
 
+    #[cfg(test)]
     fn delete_multipart_part_segments_by_upload_id(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<(), MetadataError> {
+        self.delete_multipart_part_segments_by_upload_id_direct(upload_id)
+    }
+}
+
+impl PgStore {
+    fn delete_object_generation_reservation_direct(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM object_generation_reservations \
+                 WHERE reservation_id = ?1 AND bucket = ?2 AND key = ?3",
+                params![reservation_id.as_str(), bucket, key],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete object generation reservation",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn delete_object_segments_reclaim_direct(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM object_segments_reclaims \
+                 WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3",
+                params![bucket, key, generation_id.get() as i64],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete object segments reclaim",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn delete_multipart_reclaim_direct(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM multipart_reclaims \
+                 WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3",
+                params![bucket, key, generation_id.get() as i64],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete multipart reclaim",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn delete_object_parts_direct(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM object_parts \
+                 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![bucket, key, version_id.to_u64() as i64],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete object parts",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn set_stream_upload_state_direct(
+        &self,
+        session_id: &SessionId,
+        new_state: StreamUploadState,
+    ) -> Result<(), MetadataError> {
+        let current: u8 = self
+            .conn
+            .query_row(
+                "SELECT state FROM stream_uploads WHERE session_id = ?1",
+                params![session_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get stream upload state",
+                source: e,
+            })?
+            .ok_or_else(|| MetadataError::StreamSessionNotFound {
+                session_id: session_id.as_str().to_owned(),
+            })?;
+
+        if current != StreamUploadState::InProgress as u8 {
+            return Err(MetadataError::StreamSessionNotInProgress { state: current });
+        }
+
+        self.conn
+            .execute(
+                "UPDATE stream_uploads SET state = ?1 WHERE session_id = ?2",
+                params![new_state as u8, session_id.as_str()],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "set stream upload state",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn delete_stream_upload_direct(&self, session_id: &SessionId) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM stream_uploads WHERE session_id = ?1",
+                params![session_id.as_str()],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete stream upload",
+                source: e,
+            })?;
+        self.conn
+            .execute(
+                "DELETE FROM object_generation_reservations WHERE reservation_id = ?1",
+                params![session_id.as_str()],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete stream upload generation reservation",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn append_stream_segment_direct(
+        &self,
+        segment: &StreamUploadSegmentRecord,
+    ) -> Result<(), MetadataError> {
+        self.conn
+                .execute(
+                    "INSERT INTO stream_upload_segments \
+                 (session_id, segment_index, size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    segment.session_id,
+                    segment.segment_index,
+                    segment.size as i64,
+                    segment.segment_crc64.map(|v| v as i64),
+                    segment.segment_okh.as_slice(),
+                    segment.segment_vid.get() as i64,
+                    segment.data_pg_id,
+                    segment.ec_k,
+                    segment.ec_m,
+                ],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "append stream segment",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn delete_object_segments_direct(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM object_segments \
+                 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![bucket, key, version_id.to_u64() as i64],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete stream object segments",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn delete_multipart_part_segments_direct(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM multipart_part_segments \
+                 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![bucket, key, version_id.to_u64() as i64],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete multipart part segments",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn delete_multipart_part_segments_by_upload_id_direct(
         &self,
         upload_id: &UploadId,
     ) -> Result<(), MetadataError> {

@@ -34,10 +34,11 @@ pub trait ShardStore {
 /// Tracks S3 object records within a single placement group.
 /// The coordinator fans out across all PGs for operations like
 /// ListObjectsV2.
-pub trait PgMetadataStore {
+pub(crate) trait PgMetadataStore {
     // ── Bucket metadata methods ─────────────────────────────────────
 
-    /// Create a new bucket.
+    /// Test-only direct bucket row seeder.
+    #[cfg(test)]
     fn create_bucket(
         &self,
         name: &BucketName,
@@ -48,10 +49,14 @@ pub trait PgMetadataStore {
         public_write: bool,
     ) -> Result<(), MetadataError>;
 
-    /// Delete a bucket row.
+    /// Delete a bucket row after bucket deletion has been finalized.
     ///
-    /// Emptiness checks are handled at coordinator level.
-    fn delete_bucket(&self, name: &BucketName) -> Result<(), MetadataError>;
+    /// This is the explicit finalized-delete exception to command-owned bucket
+    /// mutation: the bucket has already been moved to `Deleting` by a routed
+    /// metadata command, new writes are drained, all PGs have been checked for
+    /// visible data and reclaim roots, and the cluster layer fans out this row
+    /// deletion to the bucket PG acting set.
+    fn delete_finalized_bucket(&self, name: &BucketName) -> Result<(), MetadataError>;
 
     /// Get bucket metadata.
     fn head_bucket(&self, name: &BucketName) -> Result<BucketInfo, MetadataError>;
@@ -76,6 +81,7 @@ pub trait PgMetadataStore {
 
     /// Mark a bucket as deleting so it is hidden from normal operations while
     /// background cleanup drains outstanding reclaim work.
+    #[cfg(test)]
     fn mark_bucket_deleting(&self, name: &BucketName) -> Result<(), MetadataError>;
 
     /// Acquire a short-lived bucket write reservation.
@@ -101,6 +107,7 @@ pub trait PgMetadataStore {
     ///
     /// Validates transitions: Disabled→Enabled and Enabled↔Suspended are allowed.
     /// Enabled→Disabled is rejected.
+    #[cfg(test)]
     fn put_bucket_versioning(
         &self,
         name: &BucketName,
@@ -108,6 +115,7 @@ pub trait PgMetadataStore {
     ) -> Result<(), MetadataError>;
 
     /// Store bucket-level Object Lock configuration.
+    #[cfg(test)]
     fn put_bucket_object_lock(
         &self,
         name: &BucketName,
@@ -115,6 +123,7 @@ pub trait PgMetadataStore {
     ) -> Result<(), MetadataError>;
 
     /// Update a bucket's public ACL flags.
+    #[cfg(test)]
     fn put_bucket_acl(
         &self,
         name: &BucketName,
@@ -127,6 +136,7 @@ pub trait PgMetadataStore {
     ///
     /// This is the generic storage boundary for bucket-scoped configuration
     /// payloads whose primary stored form is an opaque string.
+    #[cfg(test)]
     fn put_bucket_subresource(
         &self,
         name: &BucketName,
@@ -141,6 +151,7 @@ pub trait PgMetadataStore {
     ) -> Result<Option<StoredBucketSubresource>, MetadataError>;
 
     /// Delete an opaque bucket subresource. Idempotent.
+    #[cfg(test)]
     fn delete_bucket_subresource(
         &self,
         name: &BucketName,
@@ -148,6 +159,7 @@ pub trait PgMetadataStore {
     ) -> Result<(), MetadataError>;
 
     /// Store the bucket public access block configuration.
+    #[cfg(test)]
     fn put_bucket_public_access_block(
         &self,
         name: &BucketName,
@@ -155,15 +167,18 @@ pub trait PgMetadataStore {
     ) -> Result<(), MetadataError>;
 
     /// Retrieve the bucket public access block configuration.
+    #[cfg(test)]
     fn get_bucket_public_access_block(
         &self,
         name: &BucketName,
     ) -> Result<Option<PublicAccessBlockConfig>, MetadataError>;
 
     /// Delete the bucket public access block configuration. Idempotent.
+    #[cfg(test)]
     fn delete_bucket_public_access_block(&self, name: &BucketName) -> Result<(), MetadataError>;
 
     /// Store the bucket ownership controls configuration.
+    #[cfg(test)]
     fn put_bucket_ownership_controls(
         &self,
         name: &BucketName,
@@ -171,15 +186,18 @@ pub trait PgMetadataStore {
     ) -> Result<(), MetadataError>;
 
     /// Retrieve the bucket ownership controls configuration.
+    #[cfg(test)]
     fn get_bucket_ownership_controls(
         &self,
         name: &BucketName,
     ) -> Result<Option<BucketOwnershipControls>, MetadataError>;
 
     /// Delete the bucket ownership controls configuration. Idempotent.
+    #[cfg(test)]
     fn delete_bucket_ownership_controls(&self, name: &BucketName) -> Result<(), MetadataError>;
 
     /// Store whether bucket ABAC is enabled for the bucket.
+    #[cfg(test)]
     fn put_bucket_abac_enabled(
         &self,
         name: &BucketName,
@@ -187,9 +205,11 @@ pub trait PgMetadataStore {
     ) -> Result<(), MetadataError>;
 
     /// Retrieve whether bucket ABAC is enabled for the bucket.
+    #[cfg(test)]
     fn get_bucket_abac_enabled(&self, name: &BucketName) -> Result<bool, MetadataError>;
 
     /// Store the currently supported bucket encryption configuration subset.
+    #[cfg(test)]
     fn put_bucket_encryption(
         &self,
         name: &BucketName,
@@ -197,6 +217,7 @@ pub trait PgMetadataStore {
     ) -> Result<(), MetadataError>;
 
     /// Retrieve the currently supported bucket encryption configuration subset.
+    #[cfg(test)]
     fn get_bucket_encryption(
         &self,
         name: &BucketName,
@@ -228,6 +249,7 @@ pub trait PgMetadataStore {
     ) -> Result<StoredObject, MetadataError>;
 
     /// Update the ACL grants for a specific live object version.
+    #[cfg(test)]
     fn put_object_acl(
         &self,
         bucket: &BucketName,
@@ -238,6 +260,7 @@ pub trait PgMetadataStore {
     ) -> Result<(), MetadataError>;
 
     /// Update retention metadata for a specific live object version.
+    #[cfg(test)]
     fn put_object_retention(
         &self,
         bucket: &BucketName,
@@ -247,6 +270,7 @@ pub trait PgMetadataStore {
     ) -> Result<(), MetadataError>;
 
     /// Update legal hold metadata for a specific live object version.
+    #[cfg(test)]
     fn put_object_legal_hold(
         &self,
         bucket: &BucketName,
@@ -256,10 +280,12 @@ pub trait PgMetadataStore {
     ) -> Result<(), MetadataError>;
 
     /// Delete all versions of an object's metadata.
+    #[cfg(test)]
     fn delete_object_meta(&self, bucket: &BucketName, key: &ObjectKey)
         -> Result<(), MetadataError>;
 
     /// Delete a specific version of an object's metadata.
+    #[cfg(test)]
     fn delete_object_version(
         &self,
         bucket: &BucketName,
@@ -307,6 +333,7 @@ pub trait PgMetadataStore {
     ) -> Result<GenerationId, MetadataError>;
 
     /// Reserve a unique internal payload generation for an in-flight object write.
+    #[cfg(test)]
     fn reserve_object_generation(
         &self,
         bucket: &BucketName,
@@ -322,7 +349,8 @@ pub trait PgMetadataStore {
         reservation_id: &SessionId,
     ) -> Result<GenerationId, MetadataError>;
 
-    /// Release an object payload generation reservation.
+    /// Test-only direct release of an object payload generation reservation.
+    #[cfg(test)]
     fn delete_object_generation_reservation(
         &self,
         bucket: &BucketName,
@@ -331,6 +359,7 @@ pub trait PgMetadataStore {
     ) -> Result<(), MetadataError>;
 
     /// Insert a durable reclaim record for a standard segmented payload.
+    #[cfg(any(test, feature = "test-hooks"))]
     fn put_object_segments_reclaim(
         &self,
         reclaim: &ObjectSegmentsReclaimRecord,
@@ -344,7 +373,8 @@ pub trait PgMetadataStore {
         generation_id: GenerationId,
     ) -> Result<Option<ObjectSegmentsReclaimRecord>, MetadataError>;
 
-    /// Delete a durable reclaim record for a standard segmented payload generation.
+    /// Test-only direct delete of a standard segmented payload reclaim record.
+    #[cfg(test)]
     fn delete_object_segments_reclaim(
         &self,
         bucket: &BucketName,
@@ -353,6 +383,7 @@ pub trait PgMetadataStore {
     ) -> Result<(), MetadataError>;
 
     /// Insert a durable reclaim record for a multipart payload.
+    #[cfg(any(test, feature = "test-hooks"))]
     fn put_multipart_reclaim(&self, reclaim: &MultipartReclaimRecord) -> Result<(), MetadataError>;
 
     /// Look up a durable reclaim record for a multipart payload generation.
@@ -363,7 +394,8 @@ pub trait PgMetadataStore {
         generation_id: GenerationId,
     ) -> Result<Option<MultipartReclaimRecord>, MetadataError>;
 
-    /// Delete a durable reclaim record for a multipart payload generation.
+    /// Test-only direct delete of a multipart payload reclaim record.
+    #[cfg(test)]
     fn delete_multipart_reclaim(
         &self,
         bucket: &BucketName,
@@ -388,6 +420,7 @@ pub trait PgMetadataStore {
     ) -> Result<Option<PayloadReclaimRoot>, MetadataError>;
 
     /// Store tags for an object version (serialized XML string).
+    #[cfg(test)]
     fn put_object_tags(
         &self,
         bucket: &BucketName,
@@ -405,6 +438,7 @@ pub trait PgMetadataStore {
     ) -> Result<Option<String>, MetadataError>;
 
     /// Delete tags for an object version. Idempotent.
+    #[cfg(test)]
     fn delete_object_tags(
         &self,
         bucket: &BucketName,
@@ -415,6 +449,7 @@ pub trait PgMetadataStore {
     // ── Multipart upload methods ───────────────────────────────────
 
     /// Create a new multipart upload record.
+    #[cfg(test)]
     fn create_multipart_upload(&self, req: &CreateMultipartUploadReq) -> Result<(), MetadataError>;
 
     /// Get an in-progress multipart upload record.
@@ -432,6 +467,7 @@ pub trait PgMetadataStore {
     ) -> Result<(), MetadataError>;
 
     /// Delete a multipart upload and its parts (CASCADE).
+    #[cfg(test)]
     fn delete_multipart_upload(&self, upload_id: &UploadId) -> Result<(), MetadataError>;
 
     /// Get a completed multipart upload record retained for abort semantics.
@@ -441,6 +477,7 @@ pub trait PgMetadataStore {
     ) -> Result<Option<CompletedMultipartUploadRecord>, MetadataError>;
 
     /// Delete all completed multipart upload records for a bucket.
+    #[cfg(test)]
     fn delete_completed_multipart_uploads_for_bucket(
         &self,
         bucket: &BucketName,
@@ -454,6 +491,7 @@ pub trait PgMetadataStore {
 
     /// Upsert a part row for an in-progress upload. Returns the previous
     /// generation if the part was overwritten.
+    #[cfg(test)]
     fn upsert_multipart_part(
         &self,
         part: &MultipartPartRecord,
@@ -463,6 +501,7 @@ pub trait PgMetadataStore {
     ///
     /// Returns the previous part generation, if any, together with the prior
     /// staged segment rows for this upload/part_number.
+    #[cfg(test)]
     fn upsert_multipart_part_segments(
         &self,
         part: &MultipartPartRecord,
@@ -480,6 +519,7 @@ pub trait PgMetadataStore {
     fn list_multipart_parts(&self, req: &ListPartsReq) -> Result<ListPartsResp, MetadataError>;
 
     /// Commit manifest rows into `object_parts` for a completed multipart object.
+    #[cfg(any(test, feature = "test-hooks"))]
     fn commit_object_parts(&self, parts: &[ObjectPartRecord]) -> Result<(), MetadataError>;
 
     /// Read committed manifest parts for a multipart object.
@@ -493,6 +533,7 @@ pub trait PgMetadataStore {
     /// Read committed manifest parts overlapping a byte range within a multipart object.
     ///
     /// `start` is inclusive and `end_exclusive` is exclusive.
+    #[cfg(test)]
     fn get_object_parts_overlapping_range(
         &self,
         bucket: &BucketName,
@@ -502,7 +543,8 @@ pub trait PgMetadataStore {
         end_exclusive: u64,
     ) -> Result<Vec<ObjectPartRangeRecord>, MetadataError>;
 
-    /// Delete committed manifest parts for an object version.
+    /// Test-only direct delete of committed manifest parts for an object version.
+    #[cfg(any(test, feature = "test-hooks"))]
     fn delete_object_parts(
         &self,
         bucket: &BucketName,
@@ -537,6 +579,7 @@ pub trait PgMetadataStore {
     // ── Streaming upload session methods ──────────────────────────────
 
     /// Create a new streaming upload session.
+    #[cfg(any(test, feature = "test-hooks"))]
     fn create_stream_upload(&self, req: &CreateStreamUploadReq) -> Result<(), MetadataError>;
 
     /// Get a streaming upload session by ID.
@@ -545,14 +588,16 @@ pub trait PgMetadataStore {
         session_id: &SessionId,
     ) -> Result<StreamUploadRecord, MetadataError>;
 
-    /// Transition a streaming upload session state. Only valid from InProgress.
+    /// Test-only direct transition of a streaming upload session state.
+    #[cfg(test)]
     fn set_stream_upload_state(
         &self,
         session_id: &SessionId,
         new_state: StreamUploadState,
     ) -> Result<(), MetadataError>;
 
-    /// Delete a streaming upload session and its staging segments (CASCADE).
+    /// Test-only direct delete of a streaming upload session and staging segments.
+    #[cfg(test)]
     fn delete_stream_upload(&self, session_id: &SessionId) -> Result<(), MetadataError>;
 
     /// List all streaming upload sessions on this PG.
@@ -560,7 +605,8 @@ pub trait PgMetadataStore {
     /// Used by the startup scavenger to find abandoned sessions.
     fn list_all_stream_uploads(&self) -> Result<Vec<StreamUploadRecord>, MetadataError>;
 
-    /// Append a staging segment record to an in-progress streaming session.
+    /// Test-only direct append of a staging segment record.
+    #[cfg(test)]
     fn append_stream_segment(
         &self,
         segment: &StreamUploadSegmentRecord,
@@ -581,6 +627,7 @@ pub trait PgMetadataStore {
     /// 4. Insert committed object segment rows
     /// 5. Delete the stream_uploads + stream_upload_segments staging rows
     /// 6. Mark session Completed (implicitly via deletion)
+    #[cfg(test)]
     fn commit_stream_put(
         &self,
         session_id: &SessionId,
@@ -594,6 +641,7 @@ pub trait PgMetadataStore {
     /// 1. Write/overwrite the object metadata row
     /// 2. Delete any prior object_segments for this version_id
     /// 3. Insert committed object segment rows
+    #[cfg(any(test, feature = "test-hooks"))]
     fn put_object_with_segments(
         &self,
         obj: &PutLiveObjectReq,
@@ -609,6 +657,7 @@ pub trait PgMetadataStore {
     ///    this re-upload so callers can clean up their shard data
     /// 4. Insert committed multipart part segment rows
     /// 5. Delete the stream_uploads + stream_upload_segments staging rows
+    #[cfg(test)]
     fn commit_stream_part(
         &self,
         session_id: &SessionId,
@@ -624,7 +673,8 @@ pub trait PgMetadataStore {
         version_id: VersionId,
     ) -> Result<Vec<ObjectSegmentRecord>, MetadataError>;
 
-    /// Delete committed segments for an object version.
+    /// Test-only direct delete of committed segments for an object version.
+    #[cfg(test)]
     fn delete_object_segments(
         &self,
         bucket: &BucketName,
@@ -650,7 +700,8 @@ pub trait PgMetadataStore {
         part_number: u32,
     ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError>;
 
-    /// Delete all committed part segments for an object version.
+    /// Test-only direct delete of committed part segments for an object version.
+    #[cfg(test)]
     fn delete_multipart_part_segments(
         &self,
         bucket: &BucketName,
@@ -665,7 +716,8 @@ pub trait PgMetadataStore {
         upload_id: &UploadId,
     ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError>;
 
-    /// Delete all segment records for a given upload_id.
+    /// Test-only direct delete of all segment records for a given upload_id.
+    #[cfg(test)]
     fn delete_multipart_part_segments_by_upload_id(
         &self,
         upload_id: &UploadId,

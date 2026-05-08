@@ -47,6 +47,15 @@ Every public `StorageCluster` operation must fit one of these classes:
   object PG for the target object. A pending command for a stream must block
   later metadata mutations on that same stream until the pending command
   converges or the bucket incarnation is finalized away.
+- Direct mutation of command-owned metadata is not a production boundary.
+  Legacy `PgMetadataStore` and `SharedStorageNode` mutators for digest-covered
+  bucket, object, upload, stream, reclaim, and allocator rows must be test-only,
+  explicit test hooks, or private `PgStore` helpers used during metadata command
+  apply. `PgMetadataStore::delete_finalized_bucket` is the explicit bucket
+  finalization exception and may only be called by the cluster acting-set fanout
+  after `MarkBucketDeleting`, write drain, visible-data checks, and reclaim
+  checks have completed. The PgStore implementation must fail closed if the
+  local row still exists in any state other than `Deleting`.
 - Best-effort cleanup may suppress cleanup errors, but typed route/control-plane
   errors must not collapse into `NotFound` or generic IO before the suppression
   point.

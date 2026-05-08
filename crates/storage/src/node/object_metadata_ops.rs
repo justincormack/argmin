@@ -1,5 +1,7 @@
 use super::*;
-use s3_types::{AclGrants, LegalHoldStatus, ObjectRetention, StoredLegalHoldStatus, VersionId};
+#[cfg(test)]
+use s3_types::{AclGrants, StoredLegalHoldStatus};
+use s3_types::{LegalHoldStatus, ObjectRetention, VersionId};
 
 impl SharedStorageNode {
     fn with_object_metadata_if<T>(
@@ -32,6 +34,7 @@ impl SharedStorageNode {
         })
     }
 
+    #[cfg(test)]
     pub fn put_object_tags_if<E>(
         &self,
         bucket: &BucketName,
@@ -49,6 +52,7 @@ impl SharedStorageNode {
         })
     }
 
+    #[cfg(test)]
     pub fn delete_object_tags_if<E>(
         &self,
         bucket: &BucketName,
@@ -65,6 +69,7 @@ impl SharedStorageNode {
         })
     }
 
+    #[cfg(test)]
     pub fn put_object_retention_if<E>(
         &self,
         bucket: &BucketName,
@@ -82,6 +87,7 @@ impl SharedStorageNode {
         })
     }
 
+    #[cfg(test)]
     pub fn put_object_legal_hold_if<E>(
         &self,
         bucket: &BucketName,
@@ -99,6 +105,7 @@ impl SharedStorageNode {
         })
     }
 
+    #[cfg(test)]
     pub fn put_object_acl_if<E>(
         &self,
         bucket: &BucketName,
