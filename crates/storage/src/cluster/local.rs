@@ -9,6 +9,7 @@ use super::ShardLocation;
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 use crate::metadata_command::{
     MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandLogIndex,
+    MetadataCommandReplicaState,
 };
 use crate::{
     BucketName, ClusterEpoch, DataPgId, EcShape, GenerationId, ObjectKey, PgId, PgState,
@@ -667,6 +668,7 @@ impl LocalClusterMap {
                 LocalNodeStore::new(node_id, canonical_data_dir, Arc::new(storage_node)),
             );
         }
+        validate_metadata_command_replay_state(&nodes, &pg_ids, ClusterEpoch::INITIAL)?;
 
         let metadata_primary = nodes
             .get(&metadata_primary_node_id)
@@ -1262,6 +1264,54 @@ fn seed_metadata_command_indexes(
     Ok(indexes)
 }
 
+fn validate_metadata_command_replay_state(
+    nodes: &BTreeMap<NodeId, LocalNodeStore>,
+    pg_ids: &[PgId],
+    cluster_epoch: ClusterEpoch,
+) -> Result<(), ClusterBuildError> {
+    for &pg_id in pg_ids {
+        let mut reference: Option<(NodeId, MetadataCommandReplicaState)> = None;
+        for node in nodes.values() {
+            let node_id = node.node_id();
+            let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
+                ClusterBuildError::OpenLocalNode {
+                    node_id: node_id.as_u32(),
+                    source,
+                }
+            })?;
+            let state = pg
+                .validate_metadata_command_replay_state(node_id.as_u32(), cluster_epoch)
+                .map_err(|source| ClusterBuildError::OpenLocalNode {
+                    node_id: node_id.as_u32(),
+                    source,
+                })?;
+            if let Some((reference_node_id, reference_state)) = reference {
+                if state != reference_state {
+                    return Err(ClusterBuildError::OpenLocalNode {
+                        node_id: node_id.as_u32(),
+                        source: StoreError::MetadataCommandReplicaStateDiverged {
+                            node_id: node_id.as_u32(),
+                            reference_node_id: reference_node_id.as_u32(),
+                            pg_id: pg_id.get(),
+                            cluster_epoch: state.cluster_epoch,
+                            reference_cluster_epoch: reference_state.cluster_epoch,
+                            applied_log_index: state.applied_log_index,
+                            reference_applied_log_index: reference_state.applied_log_index,
+                            applied_log_hash: state.applied_log_hash,
+                            reference_applied_log_hash: reference_state.applied_log_hash,
+                            state_digest: state.state_digest,
+                            reference_state_digest: reference_state.state_digest,
+                        },
+                    });
+                }
+            } else {
+                reference = Some((node_id, state));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_local_pg_ids(pg_ids: &[u32]) -> Result<Vec<PgId>, ClusterBuildError> {
     if pg_ids.is_empty() {
         return Err(ClusterBuildError::EmptyPgSet);
@@ -1386,9 +1436,8 @@ mod tests {
     use crate::metadata_command::{
         metadata_command_log_hash, AdvanceCompletedMultipartUploadSequenceCommand,
         BucketPropertyMutation, BucketSubresourceMutation, CreateBucketCommand,
-        MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandId,
-        MetadataCommandLogIndex, MetadataCommandPayload, PutBucketAclCommand,
-        PutObjectMetadataCommand,
+        MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
+        MetadataCommandPayload, PutBucketAclCommand, PutObjectMetadataCommand,
     };
     use proptest::prelude::*;
     use proptest::test_runner::{TestCaseError, TestCaseResult};
@@ -3427,6 +3476,370 @@ mod tests {
     }
 
     #[test]
+    fn local_cluster_reopen_rejects_missing_applied_command_log_entry() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        {
+            let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+            let topology = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "missing-log-");
+            set_route_primary(&mut map, 1, NodeId::new(1));
+            let map = Arc::new(map);
+            let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            let command = create_bucket_metadata_command(PgId::new(1), 1, bucket);
+            cluster
+                .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+                .unwrap();
+            let node_zero_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            node_zero_pg
+                .connection()
+                .execute("DELETE FROM metadata_command_log WHERE log_index = 1", [])
+                .unwrap();
+        }
+
+        let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
+        assert!(matches!(
+            err,
+            ClusterBuildError::OpenLocalNode {
+                node_id: 0,
+                source: StoreError::MetadataCommandLogConflict {
+                    pg_id: 1,
+                    log_index: 1,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn local_cluster_reopen_rejects_reordered_applied_command_log_entry() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        {
+            let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+            let topology = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let first_bucket = bucket_for_pg(topology, 1, "reordered-log-first-");
+            let second_bucket = bucket_for_pg(topology, 1, "reordered-log-second-");
+            set_route_primary(&mut map, 1, NodeId::new(1));
+            let map = Arc::new(map);
+            let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            let first_command = create_bucket_metadata_command(PgId::new(1), 1, first_bucket);
+            let second_command = create_bucket_metadata_command(PgId::new(1), 2, second_bucket);
+            cluster
+                .test_apply_metadata_command_to_acting_set_from_origin(
+                    NodeId::new(1),
+                    &first_command,
+                )
+                .unwrap();
+            cluster
+                .test_apply_metadata_command_to_acting_set_from_origin(
+                    NodeId::new(1),
+                    &second_command,
+                )
+                .unwrap();
+            let node_zero_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            node_zero_pg
+                .connection()
+                .execute(
+                    "UPDATE metadata_command_log \
+                     SET command_checksum = ?1, command_bytes = ?2 \
+                     WHERE log_index = 1",
+                    rusqlite::params![
+                        second_command.checksum_crc64() as i64,
+                        second_command.command_bytes(),
+                    ],
+                )
+                .unwrap();
+        }
+
+        let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
+        assert!(matches!(
+            err,
+            ClusterBuildError::OpenLocalNode {
+                node_id: 0,
+                source: StoreError::MetadataCommandLogConflict {
+                    pg_id: 1,
+                    log_index: 1,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn local_cluster_reopen_rejects_corrupt_applied_command_log_hash() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        {
+            let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+            let topology = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "corrupt-log-hash-");
+            set_route_primary(&mut map, 1, NodeId::new(1));
+            let map = Arc::new(map);
+            let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            let command = create_bucket_metadata_command(PgId::new(1), 1, bucket);
+            cluster
+                .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+                .unwrap();
+            let node_zero_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            node_zero_pg
+                .connection()
+                .execute(
+                    "UPDATE metadata_command_log SET previous_log_hash = ?1 WHERE log_index = 1",
+                    rusqlite::params![123_i64],
+                )
+                .unwrap();
+        }
+
+        let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
+        assert!(matches!(
+            err,
+            ClusterBuildError::OpenLocalNode {
+                node_id: 0,
+                source: StoreError::MetadataCommandLogHashMismatch {
+                    pg_id: 1,
+                    log_index: 1,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn local_cluster_reopen_rejects_materialized_state_digest_mismatch() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        {
+            let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+            let topology = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "corrupt-state-");
+            set_route_primary(&mut map, 1, NodeId::new(1));
+            let map = Arc::new(map);
+            let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            let command = create_bucket_metadata_command(PgId::new(1), 1, bucket.clone());
+            cluster
+                .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+                .unwrap();
+            let node_zero_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            node_zero_pg
+                .connection()
+                .execute(
+                    "UPDATE buckets SET public_read = 1 WHERE name = ?1",
+                    rusqlite::params![bucket.as_str()],
+                )
+                .unwrap();
+        }
+
+        let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
+        assert!(matches!(
+            err,
+            ClusterBuildError::OpenLocalNode {
+                node_id: 0,
+                source: StoreError::MetadataStateDigestMismatch { pg_id: 1, .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn local_cluster_reopen_rejects_missing_replica_state_for_nonempty_pg() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        {
+            let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+            let topology = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "missing-replica-state-");
+            set_route_primary(&mut map, 1, NodeId::new(1));
+            let map = Arc::new(map);
+            let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            let command = create_bucket_metadata_command(PgId::new(1), 1, bucket);
+            cluster
+                .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+                .unwrap();
+            let node_zero_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            node_zero_pg
+                .connection()
+                .execute(
+                    "DELETE FROM metadata_command_replica_state WHERE singleton = 0",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
+        assert!(matches!(
+            err,
+            ClusterBuildError::OpenLocalNode {
+                node_id: 0,
+                source: StoreError::MetadataCommandReplicaStateMissing { pg_id: 1 }
+            }
+        ));
+    }
+
+    #[test]
+    fn local_cluster_reopen_rejects_replica_state_disagreement() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        {
+            let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+            let topology = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let first_bucket = bucket_for_pg(topology, 1, "replica-agree-first-");
+            let second_bucket = bucket_for_pg(topology, 1, "replica-agree-second-");
+            set_route_primary(&mut map, 1, NodeId::new(1));
+            let map = Arc::new(map);
+            let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            let first_command = create_bucket_metadata_command(PgId::new(1), 1, first_bucket);
+            let second_command =
+                create_bucket_metadata_command(PgId::new(1), 2, second_bucket.clone());
+            cluster
+                .test_apply_metadata_command_to_acting_set_from_origin(
+                    NodeId::new(1),
+                    &first_command,
+                )
+                .unwrap();
+            let stale_state = {
+                let node_zero_pg = map
+                    .node(NodeId::new(0))
+                    .unwrap()
+                    .storage_node()
+                    .get_pg(1)
+                    .unwrap();
+                (
+                    node_zero_pg.metadata_command_replica_state().unwrap(),
+                    node_zero_pg
+                        .connection()
+                        .query_row(
+                            "SELECT next_bucket_execution_generation \
+                             FROM pg_counters WHERE singleton = 0",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                )
+            };
+            cluster
+                .test_apply_metadata_command_to_acting_set_from_origin(
+                    NodeId::new(1),
+                    &second_command,
+                )
+                .unwrap();
+            let node_zero_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            node_zero_pg
+                .connection()
+                .execute("DELETE FROM metadata_command_log WHERE log_index = 2", [])
+                .unwrap();
+            node_zero_pg
+                .connection()
+                .execute(
+                    "DELETE FROM buckets WHERE name = ?1",
+                    rusqlite::params![second_bucket.as_str()],
+                )
+                .unwrap();
+            node_zero_pg
+                .connection()
+                .execute(
+                    "UPDATE pg_counters \
+                     SET next_bucket_execution_generation = ?1 \
+                     WHERE singleton = 0",
+                    rusqlite::params![stale_state.1],
+                )
+                .unwrap();
+            node_zero_pg
+                .connection()
+                .execute(
+                    "UPDATE metadata_command_replica_state \
+                     SET cluster_epoch = ?1, applied_log_index = ?2, \
+                         applied_log_hash = ?3, state_digest = ?4 \
+                     WHERE singleton = 0",
+                    rusqlite::params![
+                        stale_state.0.cluster_epoch.get() as i64,
+                        stale_state.0.applied_log_index as i64,
+                        stale_state.0.applied_log_hash as i64,
+                        stale_state.0.state_digest as i64,
+                    ],
+                )
+                .unwrap();
+        }
+
+        let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClusterBuildError::OpenLocalNode {
+                    node_id: 1,
+                    source: StoreError::MetadataCommandReplicaStateDiverged {
+                        pg_id: 1,
+                        reference_node_id: 0,
+                        applied_log_index: 2,
+                        reference_applied_log_index: 1,
+                        ..
+                    }
+                }
+            ),
+            "unexpected reopen error: {err:?}"
+        );
+    }
+
+    #[test]
     fn metadata_command_log_index_allocator_seeds_from_reopened_log() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -4726,7 +5139,7 @@ mod tests {
     }
 
     #[test]
-    fn reserve_object_version_partial_apply_after_reopen_uses_max_counter() {
+    fn reserve_object_version_partial_apply_after_reopen_fails_closed() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let ec_shape = EcShape { k: 2, m: 1 };
@@ -4810,31 +5223,24 @@ mod tests {
         drop(cluster);
         drop(map);
 
-        let mut reopened =
-            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
-        set_route_primary(&mut reopened, object_pg, NodeId::new(1));
-        let reopened = Arc::new(reopened);
-        let reopened_cluster =
-            crate::StorageCluster::from_local_map(Arc::clone(&reopened)).unwrap();
-        let reopened_primary = reopened_cluster
-            .object_metadata_primary_node(&bucket, &key)
-            .unwrap();
-
-        let reserved = reopened_cluster
-            .reserve_next_object_version(pg_id, &bucket, &key, reopened_primary)
-            .unwrap();
-        assert_eq!(reserved, crate::VersionId::from_u64(2));
-        assert_object_version_counter_on_acting_nodes(
-            &reopened, &node_ids, object_pg, &bucket, &key, 3,
-        );
-
-        let reserved = reopened_cluster
-            .reserve_next_object_version(pg_id, &bucket, &key, reopened_primary)
-            .unwrap();
-        assert_eq!(reserved, crate::VersionId::from_u64(3));
-        assert_object_version_counter_on_acting_nodes(
-            &reopened, &node_ids, object_pg, &bucket, &key, 4,
-        );
+        let err =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap_err();
+        match err {
+            ClusterBuildError::OpenLocalNode {
+                source:
+                    StoreError::MetadataCommandReplicaStateDiverged {
+                        pg_id,
+                        applied_log_index,
+                        reference_applied_log_index,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(pg_id, object_pg);
+                assert_ne!(applied_log_index, reference_applied_log_index);
+            }
+            other => panic!("expected divergent replica state on reopen, got {other:?}"),
+        }
     }
 
     #[test]
@@ -5280,7 +5686,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_state_digest_gate_is_bounded_for_large_local_command_streams() {
+    fn local_cluster_reopen_rejects_unverified_large_command_stream_digest() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let ec_shape = EcShape { k: 2, m: 1 };
@@ -5290,16 +5696,18 @@ mod tests {
             .node(NodeId::new(0))
             .unwrap()
             .storage_node()
-            .pg_topology();
-        let first_bucket = bucket_for_pg(topology, 1, "digest-bound-1-");
-        let final_bucket = bucket_for_pg(topology, 1, "digest-bound-final-");
-
+            .pg_topology()
+            .clone();
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
-        let first_command = create_bucket_metadata_command(PgId::new(1), 1, first_bucket.clone());
-        cluster
-            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &first_command)
-            .unwrap();
+
+        for log_index in 1..=129 {
+            let bucket = bucket_for_pg(&topology, 1, &format!("digest-verified-{log_index}-"));
+            let command = create_bucket_metadata_command(PgId::new(1), log_index, bucket.clone());
+            cluster
+                .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+                .unwrap();
+        }
 
         let node_zero_pg = map
             .node(NodeId::new(0))
@@ -5307,37 +5715,22 @@ mod tests {
             .storage_node()
             .get_pg(1)
             .unwrap();
-        node_zero_pg
-            .connection()
-            .execute(
-                "UPDATE metadata_command_replica_state \
-                 SET applied_log_index = 129, applied_log_hash = 0, state_digest = 0 \
-                 WHERE singleton = 0",
-                [],
-            )
-            .unwrap();
-        assert_eq!(
-            node_zero_pg
-                .metadata_command_replica_state()
-                .unwrap()
-                .state_digest,
-            0
-        );
-        node_zero_pg
-            .connection()
-            .execute(
-                "UPDATE buckets SET public_read = 1 WHERE name = ?1",
-                rusqlite::params![&first_bucket],
-            )
-            .unwrap();
+        let state = node_zero_pg.metadata_command_replica_state().unwrap();
+        assert_eq!(state.applied_log_index, 129);
+        assert_eq!(state.state_digest, 0);
 
-        let final_command = create_bucket_metadata_command(PgId::new(1), 130, final_bucket.clone());
-        assert_eq!(
-            node_zero_pg
-                .metadata_command_acceptance(0, &final_command)
-                .unwrap(),
-            MetadataCommandAcceptance::Apply
-        );
+        drop(node_zero_pg);
+        drop(cluster);
+        drop(map);
+
+        let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
+        assert!(matches!(
+            err,
+            ClusterBuildError::OpenLocalNode {
+                node_id: 0,
+                source: StoreError::MetadataStateDigestUnverified { pg_id: 1, .. }
+            }
+        ));
     }
 
     #[test]

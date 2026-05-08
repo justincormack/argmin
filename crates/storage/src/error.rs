@@ -157,6 +157,36 @@ pub enum StoreError {
         actual_log_hash: u64,
     },
 
+    #[error("metadata command replica state is missing for PG {pg_id}")]
+    MetadataCommandReplicaStateMissing { pg_id: u32 },
+
+    #[error(
+        "metadata command replica state diverged for PG {pg_id}: local node {node_id} has epoch {cluster_epoch}, log index {applied_log_index}, log hash {applied_log_hash:#018X}, digest {state_digest:#018X}; reference local node {reference_node_id} has epoch {reference_cluster_epoch}, log index {reference_applied_log_index}, log hash {reference_applied_log_hash:#018X}, digest {reference_state_digest:#018X}"
+    )]
+    MetadataCommandReplicaStateDiverged {
+        node_id: u32,
+        reference_node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        reference_cluster_epoch: ClusterEpoch,
+        applied_log_index: u64,
+        reference_applied_log_index: u64,
+        applied_log_hash: u64,
+        reference_applied_log_hash: u64,
+        state_digest: u64,
+        reference_state_digest: u64,
+    },
+
+    #[error(
+        "metadata state digest is unverified for local node {node_id} PG {pg_id} epoch {cluster_epoch} log index {applied_log_index}"
+    )]
+    MetadataStateDigestUnverified {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        applied_log_index: u64,
+    },
+
     #[error(
         "metadata state digest mismatch for local node {node_id} PG {pg_id} epoch {cluster_epoch}: expected {expected_digest:#018X}, got {actual_digest:#018X}"
     )]

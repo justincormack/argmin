@@ -594,6 +594,9 @@ impl PgStore {
         if exists.is_some() {
             return Ok(());
         }
+        if !self.metadata_command_replica_state_can_initialize()? {
+            return Err(StoreError::MetadataCommandReplicaStateMissing { pg_id: self.pg_id });
+        }
 
         let state_digest = self.metadata_state_digest()?;
         self.conn
@@ -608,6 +611,75 @@ impl PgStore {
                 source: e,
             })?;
         Ok(())
+    }
+
+    fn metadata_command_replica_state_can_initialize(&self) -> Result<bool, StoreError> {
+        if self
+            .conn
+            .query_row("SELECT 1 FROM metadata_command_log LIMIT 1", [], |_| Ok(()))
+            .optional()
+            .map_err(|e| StoreError::Db {
+                context: "check metadata command log emptiness",
+                source: e,
+            })?
+            .is_some()
+        {
+            return Ok(false);
+        }
+
+        for table in METADATA_DIGEST_TABLES {
+            if table.name == "pg_counters" {
+                let has_default_counter = self
+                    .conn
+                    .query_row(
+                        "SELECT 1 FROM pg_counters \
+                         WHERE singleton = 0 AND next_bucket_execution_generation = 0",
+                        [],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(|e| StoreError::Db {
+                        context: "check canonical metadata counter baseline",
+                        source: e,
+                    })?
+                    .is_some();
+                let has_unexpected_counter = self
+                    .conn
+                    .query_row(
+                        "SELECT 1 FROM pg_counters \
+                         WHERE singleton != 0 OR next_bucket_execution_generation != 0 \
+                         LIMIT 1",
+                        [],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(|e| StoreError::Db {
+                        context: "check canonical metadata counter baseline",
+                        source: e,
+                    })?
+                    .is_some();
+                if !has_default_counter || has_unexpected_counter {
+                    return Ok(false);
+                }
+                continue;
+            }
+            let table_sql = quote_sql_identifier(table.name);
+            let where_clause = Self::metadata_digest_where_clause(table.filter);
+            let sql = format!("SELECT 1 FROM {table_sql}{where_clause} LIMIT 1");
+            if self
+                .conn
+                .query_row(&sql, [], |_| Ok(()))
+                .optional()
+                .map_err(|e| StoreError::Db {
+                    context: "check canonical metadata state emptiness",
+                    source: e,
+                })?
+                .is_some()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub(crate) fn metadata_command_replica_state(
@@ -665,6 +737,105 @@ impl PgStore {
                     Box::from("negative metadata command log index"),
                 ),
             })
+    }
+
+    pub(crate) fn validate_metadata_command_replay_state(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let state = self.metadata_command_replica_state()?;
+        let pg_id = PgId::new(self.pg_id);
+        if state.cluster_epoch != cluster_epoch {
+            return Err(StoreError::StaleMetadataCommand {
+                node_id,
+                pg_id: self.pg_id,
+                command_epoch: state.cluster_epoch,
+                current_epoch: cluster_epoch,
+            });
+        }
+        if state.state_digest == METADATA_STATE_DIGEST_UNVERIFIED {
+            return Err(StoreError::MetadataStateDigestUnverified {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                applied_log_index: state.applied_log_index,
+            });
+        }
+        let mut applied_log_hash = 0_u64;
+        for raw_log_index in 1..=state.applied_log_index {
+            let log_index = MetadataCommandLogIndex::new(raw_log_index)
+                .expect("applied metadata command log index is non-zero");
+            let Some(entry) = self.load_metadata_command_log_entry(
+                "load metadata command log entry for replay validation",
+                cluster_epoch,
+                pg_id,
+                log_index,
+            )?
+            else {
+                return Err(StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id: self.pg_id,
+                    cluster_epoch,
+                    log_index: raw_log_index,
+                });
+            };
+            self.verify_metadata_command_log_entry(
+                node_id,
+                cluster_epoch,
+                pg_id,
+                log_index,
+                &entry,
+            )?;
+            let expected_log_hash = metadata_command_log_hash(
+                cluster_epoch,
+                pg_id,
+                log_index,
+                applied_log_hash,
+                entry.command_checksum,
+            );
+            match (entry.previous_log_hash, entry.log_hash) {
+                (Some(previous_log_hash), Some(log_hash))
+                    if previous_log_hash == applied_log_hash && log_hash == expected_log_hash => {}
+                (previous_log_hash, log_hash) => {
+                    return Err(StoreError::MetadataCommandLogHashMismatch {
+                        node_id,
+                        pg_id: self.pg_id,
+                        cluster_epoch,
+                        log_index: raw_log_index,
+                        expected_previous_log_hash: applied_log_hash,
+                        actual_previous_log_hash: previous_log_hash.unwrap_or_default(),
+                        expected_log_hash,
+                        actual_log_hash: log_hash.unwrap_or_default(),
+                    });
+                }
+            }
+            applied_log_hash = expected_log_hash;
+        }
+        if applied_log_hash != state.applied_log_hash {
+            return Err(StoreError::MetadataCommandLogHashMismatch {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                log_index: state.applied_log_index,
+                expected_previous_log_hash: applied_log_hash,
+                actual_previous_log_hash: state.applied_log_hash,
+                expected_log_hash: applied_log_hash,
+                actual_log_hash: state.applied_log_hash,
+            });
+        }
+        if let Some((cluster_epoch, expected_digest, actual_digest)) =
+            self.metadata_state_digest_mismatch()?
+        {
+            return Err(StoreError::MetadataStateDigestMismatch {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                expected_digest,
+                actual_digest,
+            });
+        }
+        Ok(state)
     }
 
     fn load_metadata_command_log_entry(
@@ -799,7 +970,7 @@ impl PgStore {
             });
         }
         if let Some((cluster_epoch, expected_digest, actual_digest)) =
-            self.metadata_state_digest_mismatch()?
+            self.online_metadata_state_digest_mismatch()?
         {
             return Err(StoreError::MetadataStateDigestMismatch {
                 node_id,
@@ -839,7 +1010,7 @@ impl PgStore {
             });
         }
         if let Some((cluster_epoch, expected_digest, actual_digest)) =
-            self.metadata_state_digest_mismatch()?
+            self.online_metadata_state_digest_mismatch()?
         {
             return Err(StoreError::MetadataStateDigestMismatch {
                 node_id,
@@ -995,6 +1166,21 @@ impl PgStore {
     }
 
     fn metadata_state_digest_mismatch(
+        &self,
+    ) -> Result<Option<(ClusterEpoch, u64, u64)>, StoreError> {
+        let state = self.metadata_command_replica_state()?;
+        let actual_digest = self.metadata_state_digest()?;
+        if state.state_digest == actual_digest {
+            return Ok(None);
+        }
+        Ok(Some((
+            state.cluster_epoch,
+            state.state_digest,
+            actual_digest,
+        )))
+    }
+
+    fn online_metadata_state_digest_mismatch(
         &self,
     ) -> Result<Option<(ClusterEpoch, u64, u64)>, StoreError> {
         let state = self.metadata_command_replica_state()?;
@@ -1206,8 +1392,8 @@ impl PgStore {
 
     fn online_metadata_state_digest(&self, applied_log_index: u64) -> Result<u64, StoreError> {
         // Full table scans are quadratic when run before every command in a
-        // large local trace. Keep this online corruption gate bounded; durable
-        // command-log checks remain online for every command.
+        // large local trace. Keep this online corruption gate bounded; restart
+        // validation treats the sentinel as unverified and fails closed.
         if applied_log_index > METADATA_STATE_DIGEST_ONLINE_COMMAND_LIMIT {
             return Ok(METADATA_STATE_DIGEST_UNVERIFIED);
         }

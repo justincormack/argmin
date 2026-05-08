@@ -1499,11 +1499,11 @@ Work items:
        include payload shard ack rows, stream session/control rows, raw stream
        segment staging rows, multipart upload/control rows, multipart part
        staging rows, reclaim rows, and local allocator counters
-     - the online full-state digest gate is bounded to early/small local command
-       streams to avoid quadratic command execution on large traces; after that
-       bound, replicas still enforce durable command-log duplicate/conflict and
-       hash-prefix checks, and scalable incremental/audit digest verification is
-       follow-up work before large production PGs
+     - the online full-state digest gate remains bounded to early/small local
+       command streams to avoid quadratic command execution on large traces, but
+       restart validation now treats the unverified sentinel as fail-closed; a
+       large uncheckpointed prefix cannot rejoin as clean until Phase 7.5/Phase
+       10 introduces a scalable verified checkpoint/range digest boundary
      - tests cover atomic apply-plus-record rollback, durable duplicate retry
        after reopen, post-reopen allocation past persisted log entries,
        zero-apply tombstone convergence, partial tombstone retry, abandoned
@@ -1969,6 +1969,22 @@ Completed:
     corruption, malformed-but-checksummed applied bytes, abandoned tombstone
     identity, row-key/kind mismatch, and conflict rollback with a
     valid-but-different command-log row
+- Phase 7.4 step 3:
+  - chose not to introduce persisted checkpoint/range blocks in this slice;
+    checkpoint semantics remain deferred to Phase 7.5/Phase 10, and the current
+    replay boundary is retained command-log prefix plus materialized canonical
+    state digest
+  - added local-cluster restart validation that walks every opened PG's applied
+    command-log prefix, verifies persisted command bytes/checksums,
+    applied-vs-abandoned identity, and hash-chain links, then compares the
+    materialized metadata state against the stored canonical digest
+  - added restart regressions for a missing applied log entry, missing
+    replica-state row on a nonempty PG, reordered row identity, corrupted hash
+    link, corrupted materialized metadata row, a large prefix whose state
+    digest is explicitly unverified, and a stale-but-internally-coherent replica
+    whose validated command prefix differs from peers, all of which now fail
+    cluster open instead of letting the replica join cleanly when the
+    durable/materialized state is not coherent or not in acting-set agreement
 
 Exit criteria:
 
