@@ -267,6 +267,10 @@ matching rows are not enough to prove a replica is clean.
 Replica-state initialization is allowed only for a freshly initialized empty PG
 with the schema baseline and no command log. Log entries beyond the applied
 prefix remain retained tail entries, not a checkpoint.
+Replay-state tests build representative bucket and object metadata through
+`StorageCluster`, then reopen the local stores and require the accepted log
+prefix, hash, digest, durable max log index, and materialized rows to remain
+stable.
 
 Replica disagreement is never resolved by choosing the first or fastest answer.
 The allowed outcomes are:

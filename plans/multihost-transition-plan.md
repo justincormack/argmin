@@ -1990,6 +1990,12 @@ Completed:
     corruption and for replicas with the same materialized metadata digest but
     different accepted command-log history; both fail cluster open rather than
     resolving divergence by choosing an arbitrary replica
+- Phase 7.4 step 5:
+  - added a positive local-cluster replay/open harness that builds mixed bucket
+    and object metadata through `StorageCluster`, captures each opened
+    node/PG's accepted log index, log hash, state digest, and durable max log
+    index, reopens the stores, and verifies those replay-state snapshots and
+    materialized object rows are preserved
 
 Exit criteria:
 

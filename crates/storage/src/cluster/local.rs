@@ -1472,6 +1472,36 @@ mod tests {
         locations: Vec<ShardLocation>,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ReplayStateSnapshot {
+        state: crate::metadata_command::MetadataCommandReplicaState,
+        max_log_index: u64,
+    }
+
+    fn collect_metadata_replay_snapshot(
+        map: &LocalClusterMap,
+        node_ids: &[NodeId],
+        pg_ids: &[u32],
+    ) -> std::collections::BTreeMap<(u32, u32), ReplayStateSnapshot> {
+        let mut snapshot = std::collections::BTreeMap::new();
+        for &node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            for &pg_id in pg_ids {
+                let pg = node.get_pg(pg_id).unwrap();
+                snapshot.insert(
+                    (node_id.as_u32(), pg_id),
+                    ReplayStateSnapshot {
+                        state: pg.metadata_command_replica_state().unwrap(),
+                        max_log_index: pg
+                            .max_metadata_command_log_index(ClusterEpoch::INITIAL)
+                            .unwrap(),
+                    },
+                );
+            }
+        }
+        snapshot
+    }
+
     fn write_committed_direct_segment(
         cluster: &crate::StorageCluster,
         payload: &[u8],
@@ -3472,6 +3502,96 @@ mod tests {
             assert_eq!(state.applied_log_index, 1);
             let info = crate::PgMetadataStore::head_bucket(&*pg, &bucket).unwrap();
             assert_eq!(info.name, bucket);
+        }
+    }
+
+    #[test]
+    fn local_cluster_reopen_preserves_mixed_storage_cluster_history() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let (bucket, key, object_pg, committed, before_reopen) = {
+            let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+            let (bucket, key, object_pg, data_pg) = {
+                let topology = map
+                    .node(NodeId::new(0))
+                    .unwrap()
+                    .storage_node()
+                    .pg_topology();
+                let bucket = bucket_for_pg(topology, 1, "replay-harness-");
+                let key = key_for_object_pg(topology, &bucket, 2, "replay-object-");
+                let data_pg = topology
+                    .object_generation_segment_data_pg(&bucket, &key, crate::GenerationId::MIN, 0)
+                    .get();
+                let object_pg = topology.object_pg_for(&bucket, &key);
+                (bucket, key, object_pg, data_pg)
+            };
+            assert_eq!(object_pg, 2);
+            set_route_primary(&mut map, 1, NodeId::new(1));
+            set_route_primary(&mut map, object_pg, NodeId::new(2));
+            set_route_primary(&mut map, data_pg, NodeId::new(0));
+
+            let map = Arc::new(map);
+            let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            create_test_bucket_with_versioning(
+                &cluster,
+                &bucket,
+                crate::BucketVersioningState::Enabled,
+            );
+            put_test_lifecycle(&cluster, &bucket);
+            let committed = write_committed_direct_segment_for_with_versioning(
+                &cluster,
+                &bucket,
+                &key,
+                crate::BucketVersioningState::Enabled,
+                [91; 16],
+                [92; 16],
+                b"phase 7.4 replay harness object",
+            );
+            let tags =
+                "<Tagging><TagSet><Tag><Key>phase</Key><Value>7.4</Value></Tag></TagSet></Tagging>";
+            let tagged_version = cluster
+                .put_object_tags_if(&bucket, &key, None, tags, |stored| {
+                    Ok::<_, ()>(stored.version_id())
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(tagged_version, committed.version_id);
+            let before_reopen = collect_metadata_replay_snapshot(&map, &node_ids, &pg_ids);
+            drop(cluster);
+            drop(map);
+            (bucket, key, object_pg, committed, before_reopen)
+        };
+
+        let mut reopened = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        set_route_primary(&mut reopened, 1, NodeId::new(1));
+        set_route_primary(&mut reopened, object_pg, NodeId::new(2));
+        let after_reopen = collect_metadata_replay_snapshot(&reopened, &node_ids, &pg_ids);
+        assert_eq!(after_reopen, before_reopen);
+
+        for node_id in node_ids {
+            let pg = reopened
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            let stored = crate::PgMetadataStore::get_object_version(
+                &*pg,
+                &bucket,
+                &key,
+                committed.version_id,
+            )
+            .unwrap();
+            let live = stored.as_live().unwrap();
+            assert_eq!(
+                live.tags.as_ref().map(|tags| tags.as_str()),
+                Some(
+                    "<Tagging><TagSet><Tag><Key>phase</Key><Value>7.4</Value></Tag></TagSet></Tagging>"
+                )
+            );
+            assert_eq!(live.size, committed.payload.len() as u64);
         }
     }
 
