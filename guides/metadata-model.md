@@ -280,6 +280,32 @@ by Phase 7.4. Until Phase 7.5/Phase 10 defines compact equivalence points and
 repair authority, validated startup either accepts an agreeing acting set or
 fails closed.
 
+## Command Log Retention
+
+Before durable checkpoint/range blocks exist, command-log retention is
+conservative: every accepted command-log row at or below the applied prefix is
+required for restart validation. Applied rows and abandoned tombstone rows are
+retained under the same rule because both contribute to the command-log hash
+chain. Sparse tail rows beyond the applied prefix are also retained; a missing
+earlier command can still arrive later and let the prefix advance through that
+tail. Pending commands remain retained until they converge or are durably
+abandoned.
+
+The materialized `state_digest` is a validation digest, not a compaction
+authority. It proves that the current SQLite serving view matches the accepted
+prefix; it does not contain enough bytes to replay state or safely discard the
+prefix. Until a checkpoint records PG, epoch, applied log index, applied log
+hash, canonical state or row/range bytes, and checksums over those canonical
+bytes, command-log compaction must be an explicit no-op.
+
+Current storage exposes per-PG command-log stats for retained entries,
+abandoned rows, sparse tail rows, and missing applied-prefix rows. The
+compaction entry point reports `UnsupportedUntilCheckpoint` and does not delete
+rows. Future checkpoint-backed compaction may prune only log entries covered by
+a durable checkpoint or equivalent compact proof that all required acting-set
+replicas agree on; pending commands and sparse tail rows beyond that point must
+remain retained.
+
 Replica disagreement is never resolved by choosing the first or fastest answer.
 The allowed outcomes are:
 

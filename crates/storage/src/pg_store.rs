@@ -76,6 +76,49 @@ enum MetadataDigestFilter {
     AllRows,
 }
 
+/// Command-log retention summary for one PG replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataCommandLogStats {
+    /// Cluster epoch whose command-log rows were counted.
+    pub cluster_epoch: ClusterEpoch,
+    /// Placement group stored by this PgStore.
+    pub pg_id: PgId,
+    /// Lowest retained log index for this epoch, if any rows are retained.
+    pub min_log_index: Option<u64>,
+    /// Highest retained log index for this epoch, if any rows are retained.
+    pub max_log_index: Option<u64>,
+    /// Highest contiguous log index accepted by this replica.
+    pub applied_log_index: u64,
+    /// Number of retained command-log rows for this epoch.
+    pub retained_entries: u64,
+    /// Number of retained abandoned/tombstone command-log rows.
+    pub abandoned_entries: u64,
+    /// Retained rows beyond the current applied prefix.
+    pub pending_tail_entries: u64,
+    /// Missing rows inside the current applied prefix.
+    pub missing_applied_prefix_entries: u64,
+    /// Highest log index that can be compacted before, if compaction is safe.
+    pub compactable_before: Option<u64>,
+}
+
+/// Result of attempting metadata command-log compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataCommandLogCompactionStatus {
+    /// Compaction is disabled until checkpoint-backed equivalence exists.
+    UnsupportedUntilCheckpoint { retained_entries: u64 },
+}
+
+fn decode_nonnegative_u64(context: &'static str, raw: i64) -> Result<u64, StoreError> {
+    raw.try_into().map_err(|_| StoreError::Db {
+        context,
+        source: rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            Box::from("negative integer where non-negative value was expected"),
+        ),
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MetadataDigestTable {
     name: &'static str,
@@ -1143,6 +1186,90 @@ impl PgStore {
             return Err(self.metadata_command_log_conflict(node_id, command));
         }
         self.advance_metadata_command_log_state(node_id, command.id().cluster_epoch())
+    }
+
+    pub fn metadata_command_log_stats(
+        &self,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandLogStats, StoreError> {
+        let state = self.metadata_command_replica_state()?;
+        if state.cluster_epoch != cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: self.pg_id,
+                operation_epoch: cluster_epoch,
+                current_epoch: state.cluster_epoch,
+            });
+        }
+        let (raw_min, raw_max, raw_retained, raw_abandoned, raw_applied_entries) = self
+            .conn
+            .query_row(
+                "SELECT min(log_index), max(log_index), count(*), \
+                        coalesce(sum(abandoned), 0), \
+                        coalesce(sum(CASE WHEN log_index <= ?3 THEN 1 ELSE 0 END), 0) \
+                   FROM metadata_command_log \
+                  WHERE cluster_epoch = ?1 AND pg_id = ?2",
+                params![
+                    cluster_epoch.get() as i64,
+                    self.pg_id as i64,
+                    state.applied_log_index as i64,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .map_err(|e| StoreError::Db {
+                context: "load metadata command log stats",
+                source: e,
+            })?;
+
+        let min_log_index = raw_min
+            .map(|raw| decode_nonnegative_u64("decode minimum metadata command log index", raw))
+            .transpose()?;
+        let max_log_index = raw_max
+            .map(|raw| decode_nonnegative_u64("decode maximum metadata command log index", raw))
+            .transpose()?;
+        let retained_entries =
+            decode_nonnegative_u64("decode metadata command log retained count", raw_retained)?;
+        let abandoned_entries =
+            decode_nonnegative_u64("decode metadata command log abandoned count", raw_abandoned)?;
+        let applied_entries = decode_nonnegative_u64(
+            "decode metadata command log applied-prefix count",
+            raw_applied_entries,
+        )?;
+        let missing_applied_prefix_entries =
+            state.applied_log_index.saturating_sub(applied_entries);
+        let pending_tail_entries = retained_entries.saturating_sub(applied_entries);
+
+        Ok(MetadataCommandLogStats {
+            cluster_epoch,
+            pg_id: PgId::new(self.pg_id),
+            min_log_index,
+            max_log_index,
+            applied_log_index: state.applied_log_index,
+            retained_entries,
+            abandoned_entries,
+            pending_tail_entries,
+            missing_applied_prefix_entries,
+            compactable_before: None,
+        })
+    }
+
+    pub fn compact_metadata_command_log_without_checkpoint(
+        &self,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandLogCompactionStatus, StoreError> {
+        let stats = self.metadata_command_log_stats(cluster_epoch)?;
+        Ok(
+            MetadataCommandLogCompactionStatus::UnsupportedUntilCheckpoint {
+                retained_entries: stats.retained_entries,
+            },
+        )
     }
 
     pub(crate) fn refresh_metadata_command_state_digest(&self) -> Result<(), StoreError> {
@@ -12504,6 +12631,113 @@ mod tests {
                 .metadata_command_abandon_acceptance(0, &different_command)
                 .unwrap_err(),
             StoreError::MetadataCommandLogConflict { .. }
+        ));
+    }
+
+    #[test]
+    fn metadata_command_log_stats_include_retained_prefix_and_tail() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let applied_command =
+            create_bucket_probe_command(1, 1, trusted_bucket_name("stats-applied"), 1);
+        let abandoned_command =
+            create_bucket_probe_command(1, 2, trusted_bucket_name("stats-abandoned"), 2);
+        let tail_command = create_bucket_probe_command(1, 4, trusted_bucket_name("stats-tail"), 4);
+
+        store
+            .record_metadata_command_applied(0, &applied_command)
+            .unwrap();
+        store
+            .record_metadata_command_abandoned(0, &abandoned_command)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO metadata_command_log \
+                 (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, NULL, NULL)",
+                params![
+                    ClusterEpoch::INITIAL.get() as i64,
+                    1_i64,
+                    4_i64,
+                    tail_command.checksum_crc64() as i64,
+                    tail_command.command_bytes(),
+                ],
+            )
+            .unwrap();
+
+        let stats = store
+            .metadata_command_log_stats(ClusterEpoch::INITIAL)
+            .unwrap();
+        assert_eq!(stats.cluster_epoch, ClusterEpoch::INITIAL);
+        assert_eq!(stats.pg_id, PgId::new(1));
+        assert_eq!(stats.min_log_index, Some(1));
+        assert_eq!(stats.max_log_index, Some(4));
+        assert_eq!(stats.applied_log_index, 2);
+        assert_eq!(stats.retained_entries, 3);
+        assert_eq!(stats.abandoned_entries, 1);
+        assert_eq!(stats.pending_tail_entries, 1);
+        assert_eq!(stats.missing_applied_prefix_entries, 0);
+        assert_eq!(stats.compactable_before, None);
+    }
+
+    #[test]
+    fn metadata_command_log_compaction_without_checkpoint_is_explicit_noop() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let first = create_bucket_probe_command(1, 1, trusted_bucket_name("retain-first"), 1);
+        let second = create_bucket_probe_command(1, 2, trusted_bucket_name("retain-second"), 2);
+
+        store.record_metadata_command_applied(0, &first).unwrap();
+        store.record_metadata_command_abandoned(0, &second).unwrap();
+
+        let before = store
+            .metadata_command_log_stats(ClusterEpoch::INITIAL)
+            .unwrap();
+        assert_eq!(before.retained_entries, 2);
+
+        let status = store
+            .compact_metadata_command_log_without_checkpoint(ClusterEpoch::INITIAL)
+            .unwrap();
+        assert_eq!(
+            status,
+            MetadataCommandLogCompactionStatus::UnsupportedUntilCheckpoint {
+                retained_entries: 2
+            }
+        );
+
+        let after = store
+            .metadata_command_log_stats(ClusterEpoch::INITIAL)
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn metadata_command_log_stats_reject_stale_epoch() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let stale_epoch = ClusterEpoch::new(2).unwrap();
+
+        let err = store.metadata_command_log_stats(stale_epoch).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::StaleMetadataOperation {
+                pg_id: 1,
+                operation_epoch,
+                current_epoch: ClusterEpoch::INITIAL,
+            } if operation_epoch == stale_epoch
+        ));
+
+        let err = store
+            .compact_metadata_command_log_without_checkpoint(stale_epoch)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::StaleMetadataOperation {
+                pg_id: 1,
+                operation_epoch,
+                current_epoch: ClusterEpoch::INITIAL,
+            } if operation_epoch == stale_epoch
         ));
     }
 

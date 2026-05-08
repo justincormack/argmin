@@ -1770,8 +1770,39 @@ Proposed slices:
      with the implemented formats, checksum coverage, replay guarantees, and
      any retention/compaction items deferred to Phase 7.5
 5. Phase 7.5: retention and compaction policy.
-   - implement or fully specify command-log retention around pending retry,
-     restart, peering, repair, and checkpoint equivalence
+   - define the pre-checkpoint retention contract:
+     - retain every accepted command-log row in the applied prefix
+       `1..=applied_log_index`
+     - retain abandoned/tombstone rows exactly like applied rows until a durable
+       checkpoint or equivalent compact proof covers them
+     - retain sparse tail rows beyond the applied prefix because a missing
+       earlier command can later arrive and advance the prefix
+     - retain pending commands and any rows needed for retry/idempotence until
+       the pending operation converges or is durably abandoned
+     - retain enough log history for restart validation and acting-set
+       agreement; a materialized state digest alone is not a compaction
+       authority
+   - add mechanical guardrails before implementing compaction:
+     - expose command-log retention stats per PG: min/max log index, applied
+       index, retained count, abandoned count, sparse tail count, and missing
+       applied-prefix entries
+     - make the compaction entry point explicitly return
+       `UnsupportedUntilCheckpoint` while no durable checkpoint/range block
+       exists
+     - add tests proving unsupported compaction is a no-op and retained applied
+       rows remain required for restart validation
+   - specify the future checkpoint equivalence shape without building it yet:
+     - checkpoint covers PG, epoch, applied log index, applied log hash, and
+       canonical state digest or canonical row/range blocks
+     - every checkpoint and row/range block carries a CRC64 over its canonical
+       bytes
+     - compaction may delete log rows only at or below a checkpoint that all
+       required acting-set replicas agree on
+     - sparse tail rows and pending commands beyond the checkpoint remain
+       retained
+   - close the phase as retention policy plus guardrails; checkpoint-backed
+     compaction, repair authority, and peering use of checkpoints remain Phase
+     10 work unless Phase 7.5 explicitly expands scope
 
 Completed:
 
@@ -2010,6 +2041,19 @@ Completed:
     tombstone identity, hash-chain links, materialized state digest, and
     acting-set agreement, and tests cover corruption/divergence without
     silently choosing an arbitrary replica
+- Phase 7.5 first slice:
+  - documented the pre-checkpoint retention contract: applied-prefix rows,
+    abandoned tombstones, sparse tail rows, pending retry rows, and any rows
+    needed for restart validation and acting-set agreement are retained until a
+    durable checkpoint or equivalent compact proof exists
+  - added `PgStore` command-log introspection for retained rows, abandoned
+    rows, sparse tail rows, missing applied-prefix rows, min/max log index, and
+    the current applied index
+  - added an explicit compaction guard that returns
+    `UnsupportedUntilCheckpoint` and leaves rows untouched while checkpoint
+    persistence is not implemented
+  - added PgStore regressions proving pre-checkpoint compaction is a no-op and
+    stats expose both retained applied-prefix rows and sparse tail rows
 
 Exit criteria:
 
