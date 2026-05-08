@@ -132,6 +132,18 @@ pub enum StoreError {
     },
 
     #[error(
+        "metadata command log checksum mismatch for local node {node_id} PG {pg_id} epoch {cluster_epoch} log index {log_index}: stored checksum {stored_checksum:#018X}, computed checksum {computed_checksum:#018X}"
+    )]
+    MetadataCommandLogChecksumMismatch {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+        stored_checksum: u64,
+        computed_checksum: u64,
+    },
+
+    #[error(
         "metadata command log hash mismatch for local node {node_id} PG {pg_id} epoch {cluster_epoch} log index {log_index}: expected previous hash {expected_previous_log_hash:#018X} and log hash {expected_log_hash:#018X}, found previous hash {actual_previous_log_hash:#018X} and log hash {actual_log_hash:#018X}"
     )]
     MetadataCommandLogHashMismatch {

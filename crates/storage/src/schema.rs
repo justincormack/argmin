@@ -422,6 +422,7 @@ CREATE TABLE IF NOT EXISTS metadata_command_log (
     pg_id            INTEGER NOT NULL CHECK (pg_id >= 0),
     log_index        INTEGER NOT NULL CHECK (log_index > 0),
     command_checksum INTEGER NOT NULL,
+    command_bytes    BLOB NOT NULL,
     abandoned        INTEGER NOT NULL DEFAULT 0 CHECK (abandoned IN (0, 1)),
     previous_log_hash INTEGER,
     log_hash         INTEGER,

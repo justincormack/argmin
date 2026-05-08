@@ -802,12 +802,13 @@ impl super::StorageCluster {
                     source: source.into(),
                 }
             })?;
-            if pg.metadata_command_abandoned(command).map_err(|source| {
-                MetadataCommandApplyFailure {
+            if pg
+                .metadata_command_abandoned(node.node_id().as_u32(), command)
+                .map_err(|source| MetadataCommandApplyFailure {
                     applied_nodes,
                     source: source.into(),
-                }
-            })? {
+                })?
+            {
                 return Ok(true);
             }
         }

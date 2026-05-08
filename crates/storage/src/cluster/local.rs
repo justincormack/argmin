@@ -4956,11 +4956,64 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+            crate::BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogChecksumMismatch {
                 node_id: 0,
                 pg_id: 1,
                 cluster_epoch: ClusterEpoch::INITIAL,
                 log_index: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn metadata_command_log_bytes_mismatch_prevents_ack() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "bytes-mismatch-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let command = create_bucket_metadata_command(PgId::new(1), 1, bucket);
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+            .unwrap();
+
+        {
+            let node_zero_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            node_zero_pg
+                .connection()
+                .execute(
+                    "UPDATE metadata_command_log SET command_bytes = ?1 WHERE log_index = 1",
+                    rusqlite::params![b"corrupt-command-bytes".as_slice()],
+                )
+                .unwrap();
+        }
+
+        let err = cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogChecksumMismatch {
+                node_id: 0,
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 1,
+                ..
             })
         ));
     }

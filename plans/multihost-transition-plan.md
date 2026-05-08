@@ -1946,9 +1946,29 @@ Completed:
     `metadata_command_log` rows, in-memory canonical command bytes,
     `metadata_command_replica_state`, full-PG canonical digest input,
     checkpoint/range block gap, and the object-payload boundary
-  - made the replay gap explicit: command-log rows currently persist the
+  - made the then-current replay gap explicit: command-log rows persisted the
     command checksum and hash-chain links, but not the canonical command bytes
     needed for standalone log replay
+- Phase 7.4 step 2:
+  - persisted canonical command bytes in `metadata_command_log.command_bytes`
+    for applied commands
+  - replaced the abandoned-command zero checksum sentinel with a distinct
+    canonical tombstone encoding whose checksum is tied to the original command
+    checksum
+  - verified persisted command bytes against `command_checksum` before
+    idempotence, abandon, and hash-prefix advancement decisions
+  - added command-log header decoding so stored bytes must agree with the SQL
+    row's epoch, PG, log index, and applied-vs-tombstone kind before prefix
+    advancement treats the row as valid
+  - tightened applied-row validation so checksum-consistent bytes must also
+    decode as a known command payload and consume the full command byte slice
+  - wired the applied-row verifier into the stable command-encoding matrix so
+    every maintained command payload encoding must also be accepted by the
+    persisted-log validator, including representative branch variants
+  - added regressions for stored checksum corruption, stored command-byte
+    corruption, malformed-but-checksummed applied bytes, abandoned tombstone
+    identity, row-key/kind mismatch, and conflict rollback with a
+    valid-but-different command-log row
 
 Exit criteria:
 

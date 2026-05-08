@@ -22,18 +22,19 @@ use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 #[cfg(test)]
 use crate::metadata_command::BucketPropertyMutation;
 use crate::metadata_command::{
-    metadata_command_log_hash, AbortMultipartUploadCommand, AbortStreamUploadCommand,
+    decode_metadata_command_log_entry_header, metadata_command_log_hash,
+    AbortMultipartUploadCommand, AbortStreamUploadCommand,
     AdvanceCompletedMultipartUploadSequenceCommand, AppendStreamSegmentCommand,
     BucketPropertyEffect, BucketRecord, BucketSubresourceMutation, CommitDirectPutObjectCommand,
     CommitMultipartObjectCommand, CommitStreamPartCommand, CreateBucketCommand,
     CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteCompletedMultipartUploadCommand,
     DeleteObjectPayloadReclaimCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
     InsertDeleteMarkerCommand, MarkBucketDeletingCommand, MetadataCommandAcceptance,
-    MetadataCommandEnvelope, MetadataCommandLogIndex, MetadataCommandPayload,
-    MetadataCommandReplicaState, ObjectPayloadReclaimCommand, PutBucketAclCommand,
-    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
-    PutObjectMetadataCommand, ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
-    ReserveObjectVersionCommand,
+    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogEntryKind,
+    MetadataCommandLogIndex, MetadataCommandPayload, MetadataCommandReplicaState,
+    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
+    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
+    ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
 };
 use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
@@ -67,7 +68,6 @@ type StreamSessionRow = (u8, u8, BucketName, ObjectKey, Option<UploadId>, Option
 
 const METADATA_STATE_DIGEST_UNVERIFIED: u64 = 0;
 const METADATA_STATE_DIGEST_ONLINE_COMMAND_LIMIT: u64 = 128;
-const ABANDONED_METADATA_COMMAND_CHECKSUM: u64 = 0;
 const METADATA_CANONICAL_STATE_ENCODING_VERSION: u8 = 1;
 const METADATA_CANONICAL_PG_STATE_DOMAIN: &[u8] = b"argmin.metadata.pg-state";
 
@@ -506,6 +506,15 @@ pub struct PgStore {
     conn: Connection,
 }
 
+#[derive(Debug)]
+struct MetadataCommandLogEntry {
+    command_checksum: u64,
+    command_bytes: Vec<u8>,
+    abandoned: bool,
+    previous_log_hash: Option<u64>,
+    log_hash: Option<u64>,
+}
+
 impl PgStore {
     /// Open (or create) a PG store at the given directory.
     ///
@@ -658,6 +667,124 @@ impl PgStore {
             })
     }
 
+    fn load_metadata_command_log_entry(
+        &self,
+        context: &'static str,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        log_index: MetadataCommandLogIndex,
+    ) -> Result<Option<MetadataCommandLogEntry>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT command_checksum, command_bytes, abandoned, previous_log_hash, log_hash \
+                 FROM metadata_command_log \
+                 WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+                params![
+                    cluster_epoch.get() as i64,
+                    pg_id.get() as i64,
+                    log_index.get() as i64,
+                ],
+                |row| {
+                    Ok(MetadataCommandLogEntry {
+                        command_checksum: row.get::<_, i64>(0)? as u64,
+                        command_bytes: row.get::<_, Vec<u8>>(1)?,
+                        abandoned: row.get::<_, i64>(2)? != 0,
+                        previous_log_hash: row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
+                        log_hash: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| StoreError::Db { context, source: e })
+    }
+
+    fn verify_metadata_command_log_entry(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        log_index: MetadataCommandLogIndex,
+        entry: &MetadataCommandLogEntry,
+    ) -> Result<(), StoreError> {
+        let computed_checksum = checksum::crc64::checksum(&entry.command_bytes);
+        if computed_checksum != entry.command_checksum {
+            return Err(StoreError::MetadataCommandLogChecksumMismatch {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                log_index: log_index.get(),
+                stored_checksum: entry.command_checksum,
+                computed_checksum,
+            });
+        }
+
+        let header =
+            decode_metadata_command_log_entry_header(&entry.command_bytes).map_err(|_| {
+                StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id: self.pg_id,
+                    cluster_epoch,
+                    log_index: log_index.get(),
+                }
+            })?;
+        let expected_kind = if entry.abandoned {
+            matches!(header.kind(), MetadataCommandLogEntryKind::Abandoned { .. })
+        } else {
+            header.kind() == MetadataCommandLogEntryKind::Applied
+        };
+        if header.id() == MetadataCommandId::new(cluster_epoch, pg_id, log_index) && expected_kind {
+            return Ok(());
+        }
+        Err(StoreError::MetadataCommandLogConflict {
+            node_id,
+            pg_id: self.pg_id,
+            cluster_epoch,
+            log_index: log_index.get(),
+        })
+    }
+
+    fn metadata_command_log_entry_matches(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+        entry: &MetadataCommandLogEntry,
+        abandoned: bool,
+    ) -> Result<bool, StoreError> {
+        self.verify_metadata_command_log_entry(
+            node_id,
+            command.id().cluster_epoch(),
+            command.id().pg_id(),
+            command.id().log_index(),
+            entry,
+        )?;
+
+        if entry.abandoned != abandoned {
+            return Ok(false);
+        }
+        let (expected_checksum, expected_bytes) = if abandoned {
+            (
+                command.abandoned_log_checksum_crc64(),
+                command.abandoned_log_bytes(),
+            )
+        } else {
+            (command.checksum_crc64(), command.command_bytes())
+        };
+        Ok(entry.command_checksum == expected_checksum && entry.command_bytes == expected_bytes)
+    }
+
+    fn metadata_command_log_conflict(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+    ) -> StoreError {
+        StoreError::MetadataCommandLogConflict {
+            node_id,
+            pg_id: self.pg_id,
+            cluster_epoch: command.id().cluster_epoch(),
+            log_index: command.id().log_index().get(),
+        }
+    }
+
     pub(crate) fn metadata_command_acceptance(
         &self,
         node_id: u32,
@@ -683,36 +810,19 @@ impl PgStore {
             });
         }
 
-        let command_log_entry = self
-            .conn
-            .query_row(
-                "SELECT command_checksum, abandoned FROM metadata_command_log \
-                 WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
-                params![
-                    command.id().cluster_epoch().get() as i64,
-                    command.id().pg_id().get() as i64,
-                    command.id().log_index().get() as i64,
-                ],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0)),
-            )
-            .optional()
-            .map_err(|e| StoreError::Db {
-                context: "load metadata command log entry",
-                source: e,
-            })?;
-
-        let Some((command_checksum, abandoned)) = command_log_entry else {
+        let Some(entry) = self.load_metadata_command_log_entry(
+            "load metadata command log entry",
+            command.id().cluster_epoch(),
+            command.id().pg_id(),
+            command.id().log_index(),
+        )?
+        else {
             return Ok(MetadataCommandAcceptance::Apply);
         };
-        if !abandoned && command_checksum as u64 == command.checksum_crc64() {
+        if self.metadata_command_log_entry_matches(node_id, command, &entry, false)? {
             return Ok(MetadataCommandAcceptance::AlreadyApplied);
         }
-        Err(StoreError::MetadataCommandLogConflict {
-            node_id,
-            pg_id: self.pg_id,
-            cluster_epoch: command.id().cluster_epoch(),
-            log_index: command.id().log_index().get(),
-        })
+        Err(self.metadata_command_log_conflict(node_id, command))
     }
 
     pub(crate) fn metadata_command_abandon_acceptance(
@@ -739,66 +849,39 @@ impl PgStore {
                 actual_digest,
             });
         }
-        let command_log_entry = self
-            .conn
-            .query_row(
-                "SELECT command_checksum, abandoned FROM metadata_command_log \
-                 WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
-                params![
-                    command.id().cluster_epoch().get() as i64,
-                    command.id().pg_id().get() as i64,
-                    command.id().log_index().get() as i64,
-                ],
-                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? != 0)),
-            )
-            .optional()
-            .map_err(|e| StoreError::Db {
-                context: "load metadata command abandon log entry",
-                source: e,
-            })?;
-
-        let Some((command_checksum, abandoned)) = command_log_entry else {
+        let Some(entry) = self.load_metadata_command_log_entry(
+            "load metadata command abandon log entry",
+            command.id().cluster_epoch(),
+            command.id().pg_id(),
+            command.id().log_index(),
+        )?
+        else {
             return Ok(MetadataCommandAcceptance::Apply);
         };
-        if abandoned && command_checksum == ABANDONED_METADATA_COMMAND_CHECKSUM {
+        if self.metadata_command_log_entry_matches(node_id, command, &entry, true)? {
             return Ok(MetadataCommandAcceptance::AlreadyApplied);
         }
-        Err(StoreError::MetadataCommandLogConflict {
-            node_id,
-            pg_id: self.pg_id,
-            cluster_epoch: command.id().cluster_epoch(),
-            log_index: command.id().log_index().get(),
-        })
+        Err(self.metadata_command_log_conflict(node_id, command))
     }
 
     pub(crate) fn metadata_command_abandoned(
         &self,
+        node_id: u32,
         command: &MetadataCommandEnvelope,
     ) -> Result<bool, StoreError> {
         if command.id().pg_id().get() != self.pg_id {
             return Ok(false);
         }
-        let row = self
-            .conn
-            .query_row(
-                "SELECT command_checksum, abandoned FROM metadata_command_log \
-                 WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
-                params![
-                    command.id().cluster_epoch().get() as i64,
-                    command.id().pg_id().get() as i64,
-                    command.id().log_index().get() as i64,
-                ],
-                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? != 0)),
-            )
-            .optional()
-            .map_err(|e| StoreError::Db {
-                context: "load metadata command abandoned state",
-                source: e,
-            })?;
-        Ok(matches!(
-            row,
-            Some((ABANDONED_METADATA_COMMAND_CHECKSUM, true))
-        ))
+        let Some(entry) = self.load_metadata_command_log_entry(
+            "load metadata command abandoned state",
+            command.id().cluster_epoch(),
+            command.id().pg_id(),
+            command.id().log_index(),
+        )?
+        else {
+            return Ok(false);
+        };
+        self.metadata_command_log_entry_matches(node_id, command, &entry, true)
     }
 
     pub(crate) fn record_metadata_command_applied(
@@ -814,17 +897,19 @@ impl PgStore {
                 cluster_epoch: command.id().cluster_epoch(),
             });
         }
+        let command_bytes = command.command_bytes();
         self.conn
             .execute(
                 "INSERT INTO metadata_command_log \
-                 (cluster_epoch, pg_id, log_index, command_checksum, abandoned, previous_log_hash, log_hash) \
-                 VALUES (?1, ?2, ?3, ?4, 0, NULL, NULL) \
+                 (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, NULL, NULL) \
                  ON CONFLICT(cluster_epoch, pg_id, log_index) DO NOTHING",
                 params![
                     command.id().cluster_epoch().get() as i64,
                     command.id().pg_id().get() as i64,
                     command.id().log_index().get() as i64,
                     command.checksum_crc64() as i64,
+                    command_bytes,
                 ],
             )
             .map_err(|e| StoreError::Db {
@@ -832,29 +917,16 @@ impl PgStore {
                 source: e,
             })?;
 
-        let (stored_checksum, abandoned) = self
-            .conn
-            .query_row(
-                "SELECT command_checksum, abandoned FROM metadata_command_log \
-                 WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
-                params![
-                    command.id().cluster_epoch().get() as i64,
-                    command.id().pg_id().get() as i64,
-                    command.id().log_index().get() as i64,
-                ],
-                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? != 0)),
-            )
-            .map_err(|e| StoreError::Db {
-                context: "load recorded metadata command log entry",
-                source: e,
-            })?;
-        if abandoned || stored_checksum != command.checksum_crc64() {
-            return Err(StoreError::MetadataCommandLogConflict {
-                node_id,
-                pg_id: self.pg_id,
-                cluster_epoch: command.id().cluster_epoch(),
-                log_index: command.id().log_index().get(),
-            });
+        let entry = self
+            .load_metadata_command_log_entry(
+                "load recorded metadata command log entry",
+                command.id().cluster_epoch(),
+                command.id().pg_id(),
+                command.id().log_index(),
+            )?
+            .expect("metadata command log insert must leave an entry");
+        if !self.metadata_command_log_entry_matches(node_id, command, &entry, false)? {
+            return Err(self.metadata_command_log_conflict(node_id, command));
         }
         self.advance_metadata_command_log_state(node_id, command.id().cluster_epoch())
     }
@@ -872,17 +944,20 @@ impl PgStore {
                 cluster_epoch: command.id().cluster_epoch(),
             });
         }
+        let command_bytes = command.abandoned_log_bytes();
+        let command_checksum = command.abandoned_log_checksum_crc64();
         self.conn
             .execute(
                 "INSERT INTO metadata_command_log \
-                 (cluster_epoch, pg_id, log_index, command_checksum, abandoned, previous_log_hash, log_hash) \
-                 VALUES (?1, ?2, ?3, ?4, 1, NULL, NULL) \
+                 (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL, NULL) \
                  ON CONFLICT(cluster_epoch, pg_id, log_index) DO NOTHING",
                 params![
                     command.id().cluster_epoch().get() as i64,
                     command.id().pg_id().get() as i64,
                     command.id().log_index().get() as i64,
-                    ABANDONED_METADATA_COMMAND_CHECKSUM as i64,
+                    command_checksum as i64,
+                    command_bytes,
                 ],
             )
             .map_err(|e| StoreError::Db {
@@ -890,29 +965,16 @@ impl PgStore {
                 source: e,
             })?;
 
-        let (stored_checksum, abandoned) = self
-            .conn
-            .query_row(
-                "SELECT command_checksum, abandoned FROM metadata_command_log \
-                 WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
-                params![
-                    command.id().cluster_epoch().get() as i64,
-                    command.id().pg_id().get() as i64,
-                    command.id().log_index().get() as i64,
-                ],
-                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? != 0)),
-            )
-            .map_err(|e| StoreError::Db {
-                context: "load abandoned metadata command log entry",
-                source: e,
-            })?;
-        if !abandoned || stored_checksum != ABANDONED_METADATA_COMMAND_CHECKSUM {
-            return Err(StoreError::MetadataCommandLogConflict {
-                node_id,
-                pg_id: self.pg_id,
-                cluster_epoch: command.id().cluster_epoch(),
-                log_index: command.id().log_index().get(),
-            });
+        let entry = self
+            .load_metadata_command_log_entry(
+                "load abandoned metadata command log entry",
+                command.id().cluster_epoch(),
+                command.id().pg_id(),
+                command.id().log_index(),
+            )?
+            .expect("abandoned metadata command log insert must leave an entry");
+        if !self.metadata_command_log_entry_matches(node_id, command, &entry, true)? {
+            return Err(self.metadata_command_log_conflict(node_id, command));
         }
         self.advance_metadata_command_log_state(node_id, command.id().cluster_epoch())
     }
@@ -969,43 +1031,32 @@ impl PgStore {
         let mut applied_log_index = state.applied_log_index;
         let mut applied_log_hash = state.applied_log_hash;
         while let Some(next_log_index) = applied_log_index.checked_add(1) {
-            let row = self
-                .conn
-                .query_row(
-                    "SELECT command_checksum, previous_log_hash, log_hash \
-                     FROM metadata_command_log \
-                     WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
-                    params![
-                        cluster_epoch.get() as i64,
-                        self.pg_id as i64,
-                        next_log_index as i64,
-                    ],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, Option<i64>>(1)?,
-                            row.get::<_, Option<i64>>(2)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(|e| StoreError::Db {
-                    context: "load next metadata command log entry",
-                    source: e,
-                })?;
-            let Some((command_checksum, previous_log_hash, log_hash)) = row else {
-                break;
-            };
             let log_index = MetadataCommandLogIndex::new(next_log_index)
                 .expect("metadata command log index is non-zero");
+            let Some(entry) = self.load_metadata_command_log_entry(
+                "load next metadata command log entry",
+                cluster_epoch,
+                pg_id,
+                log_index,
+            )?
+            else {
+                break;
+            };
+            self.verify_metadata_command_log_entry(
+                node_id,
+                cluster_epoch,
+                pg_id,
+                log_index,
+                &entry,
+            )?;
             let expected_log_hash = metadata_command_log_hash(
                 cluster_epoch,
                 pg_id,
                 log_index,
                 applied_log_hash,
-                command_checksum as u64,
+                entry.command_checksum,
             );
-            match (previous_log_hash, log_hash) {
+            match (entry.previous_log_hash, entry.log_hash) {
                 (None, None) => {
                     self.conn
                         .execute(
@@ -1026,8 +1077,7 @@ impl PgStore {
                         })?;
                 }
                 (Some(previous_log_hash), Some(log_hash))
-                    if previous_log_hash as u64 == applied_log_hash
-                        && log_hash as u64 == expected_log_hash => {}
+                    if previous_log_hash == applied_log_hash && log_hash == expected_log_hash => {}
                 (previous_log_hash, log_hash) => {
                     return Err(StoreError::MetadataCommandLogHashMismatch {
                         node_id,
@@ -1035,9 +1085,9 @@ impl PgStore {
                         cluster_epoch,
                         log_index: next_log_index,
                         expected_previous_log_hash: applied_log_hash,
-                        actual_previous_log_hash: previous_log_hash.unwrap_or_default() as u64,
+                        actual_previous_log_hash: previous_log_hash.unwrap_or_default(),
                         expected_log_hash,
-                        actual_log_hash: log_hash.unwrap_or_default() as u64,
+                        actual_log_hash: log_hash.unwrap_or_default(),
                     });
                 }
             }
@@ -12210,18 +12260,20 @@ mod tests {
         let store = PgStore::open(tmp.path(), 1).unwrap();
         let bucket = trusted_bucket_name("rollback-bucket");
         let command = create_bucket_probe_command(1, 1, bucket.clone(), 1);
-        let conflicting_checksum = command.checksum_crc64() ^ 1;
+        let conflicting_command =
+            create_bucket_probe_command(1, 1, trusted_bucket_name("conflict-bucket"), 1);
         store
             .conn
             .execute(
                 "INSERT INTO metadata_command_log \
-                 (cluster_epoch, pg_id, log_index, command_checksum, previous_log_hash, log_hash) \
-                 VALUES (?1, ?2, ?3, ?4, NULL, NULL)",
+                 (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, NULL, NULL)",
                 params![
                     ClusterEpoch::INITIAL.get() as i64,
                     1_i64,
                     1_i64,
-                    conflicting_checksum as i64,
+                    conflicting_command.checksum_crc64() as i64,
+                    conflicting_command.command_bytes(),
                 ],
             )
             .unwrap();
@@ -12243,6 +12295,149 @@ mod tests {
             ),
             "bucket creation must roll back when log recording fails"
         );
+    }
+
+    #[test]
+    fn abandoned_metadata_command_log_rows_match_original_command() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let abandoned_command =
+            create_bucket_probe_command(1, 1, trusted_bucket_name("abandoned-bucket"), 1);
+        let different_command =
+            create_bucket_probe_command(1, 1, trusted_bucket_name("different-bucket"), 1);
+
+        store
+            .record_metadata_command_abandoned(0, &abandoned_command)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .metadata_command_abandon_acceptance(0, &abandoned_command)
+                .unwrap(),
+            MetadataCommandAcceptance::AlreadyApplied
+        );
+        assert!(
+            store
+                .metadata_command_abandoned(0, &abandoned_command)
+                .unwrap(),
+            "abandoned row should match its original command"
+        );
+        assert!(
+            !store
+                .metadata_command_abandoned(0, &different_command)
+                .unwrap(),
+            "abandoned tombstones are tied to the original command checksum"
+        );
+        assert!(matches!(
+            store
+                .metadata_command_abandon_acceptance(0, &different_command)
+                .unwrap_err(),
+            StoreError::MetadataCommandLogConflict { .. }
+        ));
+    }
+
+    #[test]
+    fn metadata_command_log_prefix_rejects_row_key_and_kind_mismatch() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let command_with_wrong_embedded_index =
+            create_bucket_probe_command(1, 2, trusted_bucket_name("wrong-index"), 1);
+        store
+            .conn
+            .execute(
+                "INSERT INTO metadata_command_log \
+                 (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, NULL, NULL)",
+                params![
+                    ClusterEpoch::INITIAL.get() as i64,
+                    1_i64,
+                    1_i64,
+                    command_with_wrong_embedded_index.checksum_crc64() as i64,
+                    command_with_wrong_embedded_index.command_bytes(),
+                ],
+            )
+            .unwrap();
+        let next_command = create_bucket_probe_command(1, 2, trusted_bucket_name("next"), 1);
+        let err = store
+            .record_metadata_command_applied(0, &next_command)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::MetadataCommandLogConflict {
+                pg_id: 1,
+                log_index: 1,
+                ..
+            }
+        ));
+
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let applied_command = create_bucket_probe_command(1, 1, trusted_bucket_name("applied"), 1);
+        store
+            .conn
+            .execute(
+                "INSERT INTO metadata_command_log \
+                 (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL, NULL)",
+                params![
+                    ClusterEpoch::INITIAL.get() as i64,
+                    1_i64,
+                    1_i64,
+                    applied_command.checksum_crc64() as i64,
+                    applied_command.command_bytes(),
+                ],
+            )
+            .unwrap();
+        let next_command = create_bucket_probe_command(1, 2, trusted_bucket_name("next"), 1);
+        let err = store
+            .record_metadata_command_applied(0, &next_command)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::MetadataCommandLogConflict {
+                pg_id: 1,
+                log_index: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn metadata_command_log_prefix_rejects_malformed_applied_bytes() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let command = create_bucket_probe_command(1, 1, trusted_bucket_name("malformed"), 1);
+        let mut malformed_bytes = command.command_bytes();
+        malformed_bytes.push(0);
+        let malformed_checksum = checksum::crc64::checksum(&malformed_bytes);
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO metadata_command_log \
+                 (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, NULL, NULL)",
+                params![
+                    ClusterEpoch::INITIAL.get() as i64,
+                    1_i64,
+                    1_i64,
+                    malformed_checksum as i64,
+                    malformed_bytes,
+                ],
+            )
+            .unwrap();
+        let next_command = create_bucket_probe_command(1, 2, trusted_bucket_name("next"), 1);
+        let err = store
+            .record_metadata_command_applied(0, &next_command)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::MetadataCommandLogConflict {
+                pg_id: 1,
+                log_index: 1,
+                ..
+            }
+        ));
     }
 
     #[test]

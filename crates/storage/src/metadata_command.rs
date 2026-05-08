@@ -21,6 +21,8 @@ use crate::types::{
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
 const METADATA_COMMAND_ENCODING_VERSION: u16 = 1;
+const ABANDONED_METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command-abandoned";
+const ABANDONED_METADATA_COMMAND_ENCODING_VERSION: u16 = 1;
 const METADATA_COMMAND_CREATE_BUCKET: u16 = 1;
 const METADATA_COMMAND_PUT_BUCKET_VERSIONING: u16 = 2;
 const METADATA_COMMAND_PUT_BUCKET_ACL: u16 = 3;
@@ -62,6 +64,28 @@ impl MetadataCommandLogIndex {
 pub(crate) enum MetadataCommandAcceptance {
     Apply,
     AlreadyApplied,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetadataCommandLogEntryKind {
+    Applied,
+    Abandoned { original_command_checksum: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetadataCommandLogEntryHeader {
+    id: MetadataCommandId,
+    kind: MetadataCommandLogEntryKind,
+}
+
+impl MetadataCommandLogEntryHeader {
+    pub(crate) fn id(self) -> MetadataCommandId {
+        self.id
+    }
+
+    pub(crate) fn kind(self) -> MetadataCommandLogEntryKind {
+        self.kind
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -888,16 +912,27 @@ impl MetadataCommandEnvelope {
         self.checksum_crc64
     }
 
+    pub(crate) fn command_bytes(&self) -> Vec<u8> {
+        canonical_command_bytes(self.id, &self.payload)
+    }
+
+    pub(crate) fn abandoned_log_bytes(&self) -> Vec<u8> {
+        abandoned_command_log_bytes(self.id, self.checksum_crc64)
+    }
+
+    pub(crate) fn abandoned_log_checksum_crc64(&self) -> u64 {
+        checksum::crc64::checksum(&self.abandoned_log_bytes())
+    }
+
     #[cfg(test)]
     pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
-        let mut out = canonical_command_bytes(self.id, &self.payload);
+        let mut out = self.command_bytes();
         put_u64(&mut out, self.checksum_crc64);
         out
     }
 
     pub(crate) fn verify_checksum(&self) -> bool {
-        checksum::crc64::checksum(&canonical_command_bytes(self.id, &self.payload))
-            == self.checksum_crc64
+        checksum::crc64::checksum(&self.command_bytes()) == self.checksum_crc64
     }
 }
 
@@ -916,6 +951,58 @@ pub(crate) fn metadata_command_log_hash(
     put_u64(&mut out, previous_log_hash);
     put_u64(&mut out, command_checksum);
     checksum::crc64::checksum(&out)
+}
+
+fn abandoned_command_log_bytes(id: MetadataCommandId, command_checksum: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_bytes(&mut out, ABANDONED_METADATA_COMMAND_MAGIC);
+    put_u16(&mut out, ABANDONED_METADATA_COMMAND_ENCODING_VERSION);
+    put_u64(&mut out, id.cluster_epoch().get());
+    put_u32(&mut out, id.pg_id().get());
+    put_u64(&mut out, id.log_index().get());
+    put_u64(&mut out, command_checksum);
+    out
+}
+
+pub(crate) fn decode_metadata_command_log_entry_header(
+    bytes: &[u8],
+) -> Result<MetadataCommandLogEntryHeader, String> {
+    let mut decoder = MetadataCommandLogEntryDecoder::new(bytes);
+    let magic = decoder.read_bytes()?;
+    if magic == METADATA_COMMAND_MAGIC {
+        let version = decoder.read_u16()?;
+        if version != METADATA_COMMAND_ENCODING_VERSION {
+            return Err(format!(
+                "unsupported metadata command encoding version {version}"
+            ));
+        }
+        let id = decoder.read_command_id()?;
+        let payload_kind = decoder.read_u16()?;
+        decoder.skip_metadata_command_payload(payload_kind)?;
+        decoder.finish()?;
+        return Ok(MetadataCommandLogEntryHeader {
+            id,
+            kind: MetadataCommandLogEntryKind::Applied,
+        });
+    }
+    if magic == ABANDONED_METADATA_COMMAND_MAGIC {
+        let version = decoder.read_u16()?;
+        if version != ABANDONED_METADATA_COMMAND_ENCODING_VERSION {
+            return Err(format!(
+                "unsupported abandoned metadata command encoding version {version}"
+            ));
+        }
+        let id = decoder.read_command_id()?;
+        let original_command_checksum = decoder.read_u64()?;
+        decoder.finish()?;
+        return Ok(MetadataCommandLogEntryHeader {
+            id,
+            kind: MetadataCommandLogEntryKind::Abandoned {
+                original_command_checksum,
+            },
+        });
+    }
+    Err("unknown metadata command log entry magic".to_string())
 }
 
 fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPayload) -> Vec<u8> {
@@ -996,6 +1083,717 @@ fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPaylo
         }
     }
     out
+}
+
+struct MetadataCommandLogEntryDecoder<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> MetadataCommandLogEntryDecoder<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn read_exact(&mut self, len: usize) -> Result<&'a [u8], String> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| "metadata command log entry offset overflowed".to_string())?;
+        let slice = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| "truncated metadata command log entry".to_string())?;
+        self.offset = end;
+        Ok(slice)
+    }
+
+    fn read_bytes(&mut self) -> Result<&'a [u8], String> {
+        let len = self.read_u32()? as usize;
+        self.read_exact(len)
+    }
+
+    fn read_u16(&mut self) -> Result<u16, String> {
+        let bytes: [u8; 2] = self
+            .read_exact(2)?
+            .try_into()
+            .expect("read_exact returned two bytes");
+        Ok(u16::from_le_bytes(bytes))
+    }
+
+    fn read_u8(&mut self) -> Result<u8, String> {
+        Ok(self.read_exact(1)?[0])
+    }
+
+    fn read_u32(&mut self) -> Result<u32, String> {
+        let bytes: [u8; 4] = self
+            .read_exact(4)?
+            .try_into()
+            .expect("read_exact returned four bytes");
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, String> {
+        let bytes: [u8; 8] = self
+            .read_exact(8)?
+            .try_into()
+            .expect("read_exact returned eight bytes");
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn read_command_id(&mut self) -> Result<MetadataCommandId, String> {
+        let cluster_epoch = ClusterEpoch::new(self.read_u64()?)
+            .ok_or_else(|| "metadata command log entry stores zero cluster epoch".to_string())?;
+        let pg_id = PgId::new(self.read_u32()?);
+        let log_index = MetadataCommandLogIndex::new(self.read_u64()?)
+            .ok_or_else(|| "metadata command log entry stores zero log index".to_string())?;
+        Ok(MetadataCommandId::new(cluster_epoch, pg_id, log_index))
+    }
+
+    fn skip_metadata_command_payload(&mut self, kind_id: u16) -> Result<(), String> {
+        match kind_id {
+            METADATA_COMMAND_CREATE_BUCKET
+            | METADATA_COMMAND_PUT_BUCKET_VERSIONING
+            | METADATA_COMMAND_PUT_BUCKET_ACL
+            | METADATA_COMMAND_MARK_BUCKET_DELETING => self.skip_bucket_record(),
+            METADATA_COMMAND_PUT_BUCKET_PROPERTY => {
+                self.skip_bucket_record()?;
+                self.read_valid_u8("bucket property effect", 0..=4)
+            }
+            METADATA_COMMAND_PUT_BUCKET_SUBRESOURCE => {
+                self.skip_str()?;
+                self.skip_bucket_subresource_mutation()?;
+                self.read_u64()?;
+                Ok(())
+            }
+            METADATA_COMMAND_RESERVE_OBJECT_GENERATION => {
+                self.skip_str()?;
+                self.skip_str()?;
+                self.skip_str()?;
+                self.read_nonzero_u64("reserved object generation")?;
+                self.read_u64()?;
+                Ok(())
+            }
+            METADATA_COMMAND_RELEASE_OBJECT_GENERATION => {
+                self.skip_str()?;
+                self.skip_str()?;
+                self.skip_str()
+            }
+            METADATA_COMMAND_RESERVE_OBJECT_VERSION => {
+                self.skip_str()?;
+                self.skip_str()?;
+                self.read_u64()?;
+                Ok(())
+            }
+            METADATA_COMMAND_COMMIT_DIRECT_PUT_OBJECT => {
+                self.skip_put_live_object()?;
+                self.skip_repeated(Self::skip_object_segment)?;
+                self.skip_str()?;
+                self.read_u64()?;
+                self.read_u64()?;
+                self.skip_optional_stale_payload()
+            }
+            METADATA_COMMAND_COMMIT_MULTIPART_OBJECT => {
+                self.skip_str()?;
+                self.skip_put_live_object()?;
+                self.skip_repeated(Self::skip_object_part)?;
+                self.skip_repeated(Self::skip_multipart_part_segment)?;
+                self.skip_repeated(Self::skip_multipart_part)?;
+                self.skip_repeated(Self::skip_multipart_part_segment)?;
+                self.skip_repeated(Self::skip_stream_upload)?;
+                self.skip_repeated(Self::skip_stream_upload_segment)?;
+                self.read_u64()?;
+                self.read_u64()?;
+                self.read_u64()?;
+                self.skip_optional_owner_identity()?;
+                self.read_u64()?;
+                self.skip_optional_stale_payload()
+            }
+            METADATA_COMMAND_DELETE_OBJECT_VERSION => {
+                self.skip_str()?;
+                self.skip_str()?;
+                self.read_u64()?;
+                match self.read_u8()? {
+                    1 => Ok(()),
+                    2 => {
+                        self.read_nonzero_u64("deleted object generation")?;
+                        self.skip_object_layout()?;
+                        self.skip_live_payload_reclaim()
+                    }
+                    tag => Err(format!("invalid delete object target tag {tag}")),
+                }
+            }
+            METADATA_COMMAND_INSERT_DELETE_MARKER => {
+                self.skip_str()?;
+                self.skip_str()?;
+                self.read_u64()?;
+                self.skip_owner_identity()?;
+                self.read_u64()?;
+                self.read_u64()?;
+                self.skip_optional_stale_payload()
+            }
+            METADATA_COMMAND_PUT_OBJECT_METADATA => self.skip_live_object_record(),
+            METADATA_COMMAND_CREATE_STREAM_UPLOAD => self.skip_stream_upload(),
+            METADATA_COMMAND_APPEND_STREAM_SEGMENT => {
+                self.skip_str()?;
+                self.skip_str()?;
+                self.skip_stream_upload_segment()
+            }
+            METADATA_COMMAND_ABORT_STREAM_UPLOAD => {
+                self.skip_str()?;
+                self.skip_str()?;
+                self.skip_str()?;
+                self.skip_repeated(Self::skip_stream_upload_segment)
+            }
+            METADATA_COMMAND_COMMIT_STREAM_PART => {
+                self.skip_str()?;
+                self.skip_str()?;
+                self.skip_str()?;
+                self.skip_multipart_upload()?;
+                self.skip_multipart_part()?;
+                self.skip_repeated(Self::skip_multipart_part_segment)?;
+                self.skip_optional_multipart_part()?;
+                self.skip_repeated(Self::skip_multipart_part_segment)
+            }
+            METADATA_COMMAND_CREATE_MULTIPART_UPLOAD => self.skip_multipart_upload(),
+            METADATA_COMMAND_ABORT_MULTIPART_UPLOAD => {
+                self.skip_str()?;
+                self.skip_str()?;
+                self.skip_str()?;
+                self.skip_abort_multipart_upload_cleanup()
+            }
+            METADATA_COMMAND_DELETE_OBJECT_PAYLOAD_RECLAIM => {
+                self.skip_str()?;
+                self.skip_str()?;
+                self.read_nonzero_u64("payload reclaim generation")?;
+                self.skip_object_payload_reclaim()
+            }
+            METADATA_COMMAND_DELETE_COMPLETED_MULTIPART_UPLOAD => {
+                self.skip_completed_multipart_upload()
+            }
+            METADATA_COMMAND_ADVANCE_COMPLETED_MULTIPART_UPLOAD_SEQUENCE => {
+                self.skip_str()?;
+                self.read_u64()?;
+                Ok(())
+            }
+            _ => Err(format!("unknown metadata command payload kind {kind_id}")),
+        }
+    }
+
+    fn skip_repeated(
+        &mut self,
+        mut skip_item: impl FnMut(&mut Self) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let count = self.read_u32()?;
+        for _ in 0..count {
+            skip_item(self)?;
+        }
+        Ok(())
+    }
+
+    fn skip_optional(
+        &mut self,
+        skip_value: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<(), String> {
+        match self.read_u8()? {
+            0 => Ok(()),
+            1 => skip_value(self),
+            tag => Err(format!("invalid optional tag {tag}")),
+        }
+    }
+
+    fn skip_str(&mut self) -> Result<(), String> {
+        self.read_bytes().map(|_| ())
+    }
+
+    fn skip_optional_str(&mut self) -> Result<(), String> {
+        self.skip_optional(Self::skip_str)
+    }
+
+    fn skip_optional_bytes(&mut self) -> Result<(), String> {
+        self.skip_optional(|decoder| decoder.read_bytes().map(|_| ()))
+    }
+
+    fn skip_optional_u64(&mut self) -> Result<(), String> {
+        self.skip_optional(|decoder| decoder.read_u64().map(|_| ()))
+    }
+
+    fn skip_bool(&mut self) -> Result<(), String> {
+        self.read_valid_u8("bool", 0..=1)
+    }
+
+    fn read_valid_u8(
+        &mut self,
+        field: &'static str,
+        valid: std::ops::RangeInclusive<u8>,
+    ) -> Result<(), String> {
+        let value = self.read_u8()?;
+        if valid.contains(&value) {
+            Ok(())
+        } else {
+            Err(format!("invalid {field} value {value}"))
+        }
+    }
+
+    fn read_nonzero_u32(&mut self, field: &'static str) -> Result<(), String> {
+        let value = self.read_u32()?;
+        if value == 0 {
+            Err(format!("{field} must be non-zero"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn read_nonzero_u64(&mut self, field: &'static str) -> Result<(), String> {
+        let value = self.read_u64()?;
+        if value == 0 {
+            Err(format!("{field} must be non-zero"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn skip_bucket_record(&mut self) -> Result<(), String> {
+        self.skip_str()?;
+        self.skip_str()?;
+        self.skip_str()?;
+        self.read_u64()?;
+        self.read_u16()?;
+        self.read_valid_u8("bucket state", 0..=1)?;
+        self.read_valid_u8("bucket versioning state", 0..=2)?;
+        self.skip_bucket_object_lock()?;
+        self.skip_str()?;
+        self.skip_bool()?;
+        self.skip_bool()?;
+        self.skip_public_access_block()?;
+        self.skip_ownership_controls()?;
+        self.skip_bool()?;
+        self.read_u64()?;
+        self.read_u64()?;
+        self.read_u64()?;
+        self.skip_bool()?;
+        self.skip_bucket_encryption()
+    }
+
+    fn skip_put_live_object(&mut self) -> Result<(), String> {
+        self.skip_str()?;
+        self.skip_str()?;
+        self.read_u64()?;
+        self.skip_owner_identity()?;
+        self.skip_str()?;
+        self.skip_bool()?;
+        self.read_nonzero_u64("object generation")?;
+        self.read_u64()?;
+        self.skip_object_etag()?;
+        self.read_u8()?;
+        self.read_u8()?;
+        self.skip_object_layout()?;
+        self.skip_optional_str()?;
+        self.skip_optional_bytes()?;
+        self.skip_optional_bytes()?;
+        self.skip_object_lock_state()?;
+        self.skip_object_encryption()
+    }
+
+    fn skip_live_object_record(&mut self) -> Result<(), String> {
+        self.skip_str()?;
+        self.skip_str()?;
+        self.read_u64()?;
+        self.skip_owner_identity()?;
+        self.skip_str()?;
+        self.skip_bool()?;
+        self.read_nonzero_u64("object generation")?;
+        self.read_u64()?;
+        self.skip_object_etag()?;
+        self.read_u64()?;
+        self.skip_optional_u64()?;
+        self.read_valid_u8("storage class", 0..=0)?;
+        self.read_u8()?;
+        self.read_u8()?;
+        self.skip_object_layout()?;
+        self.skip_optional_str()?;
+        self.skip_optional_bytes()?;
+        self.skip_optional_bytes()?;
+        self.skip_object_lock_state()?;
+        self.skip_object_encryption()
+    }
+
+    fn skip_object_segment(&mut self) -> Result<(), String> {
+        self.skip_str()?;
+        self.skip_str()?;
+        self.read_u64()?;
+        self.read_u32()?;
+        self.read_u64()?;
+        self.skip_optional_u64()?;
+        self.read_bytes()?;
+        self.read_nonzero_u64("object segment VID")?;
+        self.read_u32()?;
+        self.read_u8()?;
+        self.read_u8()?;
+        Ok(())
+    }
+
+    fn skip_object_part(&mut self) -> Result<(), String> {
+        self.skip_str()?;
+        self.skip_str()?;
+        self.read_u64()?;
+        self.read_u32()?;
+        self.read_u64()?;
+        self.read_bytes()?;
+        self.read_valid_u8("etag kind", 0..=1)?;
+        self.read_bytes()?;
+        self.read_nonzero_u64("object part VID")?;
+        self.read_u8()?;
+        self.read_u8()?;
+        self.read_u32()?;
+        self.skip_optional_bytes()
+    }
+
+    fn skip_multipart_part(&mut self) -> Result<(), String> {
+        self.skip_str()?;
+        self.read_u32()?;
+        self.read_u32()?;
+        self.read_u64()?;
+        self.read_bytes()?;
+        self.read_valid_u8("etag kind", 0..=1)?;
+        self.read_bytes()?;
+        self.read_nonzero_u64("multipart part VID")?;
+        self.read_u8()?;
+        self.read_u8()?;
+        self.read_u64()?;
+        self.skip_optional_bytes()
+    }
+
+    fn skip_optional_multipart_part(&mut self) -> Result<(), String> {
+        self.skip_optional(Self::skip_multipart_part)
+    }
+
+    fn skip_multipart_part_segment(&mut self) -> Result<(), String> {
+        self.skip_str()?;
+        self.skip_str()?;
+        self.skip_str()?;
+        self.read_u64()?;
+        self.read_u32()?;
+        self.read_u32()?;
+        self.read_u64()?;
+        self.skip_optional_u64()?;
+        self.read_bytes()?;
+        self.read_nonzero_u64("multipart part segment VID")?;
+        self.read_u32()?;
+        self.read_u8()?;
+        self.read_u8()?;
+        Ok(())
+    }
+
+    fn skip_stream_upload(&mut self) -> Result<(), String> {
+        self.skip_str()?;
+        self.skip_str()?;
+        self.skip_str()?;
+        self.skip_stream_upload_target()?;
+        self.read_valid_u8("stream upload state", 0..=3)?;
+        self.read_u64()?;
+        self.skip_object_encryption()
+    }
+
+    fn skip_stream_upload_target(&mut self) -> Result<(), String> {
+        match self.read_u8()? {
+            0 => Ok(()),
+            1 => {
+                self.skip_str()?;
+                self.read_u32()?;
+                Ok(())
+            }
+            tag => Err(format!("invalid stream upload target tag {tag}")),
+        }
+    }
+
+    fn skip_stream_upload_segment(&mut self) -> Result<(), String> {
+        self.skip_str()?;
+        self.read_u32()?;
+        self.read_u64()?;
+        self.skip_optional_u64()?;
+        self.read_bytes()?;
+        self.read_nonzero_u64("stream upload segment VID")?;
+        self.read_u32()?;
+        self.read_u8()?;
+        self.read_u8()?;
+        Ok(())
+    }
+
+    fn skip_multipart_upload(&mut self) -> Result<(), String> {
+        self.skip_str()?;
+        self.skip_str()?;
+        self.skip_str()?;
+        self.read_u64()?;
+        self.read_valid_u8("multipart upload state", 0..=2)?;
+        self.skip_optional_str()?;
+        self.read_bytes()?;
+        self.read_bytes()?;
+        self.skip_optional_owner_identity()?;
+        self.skip_owner_identity()?;
+        self.skip_str()?;
+        self.skip_bool()?;
+        self.read_nonzero_u64("multipart upload object generation")?;
+        self.skip_object_lock_state()?;
+        self.skip_optional_multipart_checksum_config()?;
+        self.skip_object_encryption()
+    }
+
+    fn skip_completed_multipart_upload(&mut self) -> Result<(), String> {
+        self.skip_str()?;
+        self.skip_str()?;
+        self.skip_str()?;
+        self.read_u64()?;
+        self.read_u64()?;
+        self.skip_optional_owner_identity()?;
+        self.skip_owner_identity()
+    }
+
+    fn skip_object_payload_reclaim(&mut self) -> Result<(), String> {
+        match self.read_u8()? {
+            0 => self.skip_object_segments_reclaim(),
+            1 => self.skip_multipart_reclaim(),
+            tag => Err(format!("invalid object payload reclaim tag {tag}")),
+        }
+    }
+
+    fn skip_live_payload_reclaim(&mut self) -> Result<(), String> {
+        match self.read_u8()? {
+            1 => self.skip_object_segments_reclaim(),
+            2 => self.skip_multipart_reclaim(),
+            tag => Err(format!("invalid live payload reclaim tag {tag}")),
+        }
+    }
+
+    fn skip_optional_stale_payload(&mut self) -> Result<(), String> {
+        match self.read_u8()? {
+            0 => Ok(()),
+            1 => self.skip_object_segments_reclaim(),
+            2 => self.skip_multipart_reclaim(),
+            tag => Err(format!("invalid stale payload tag {tag}")),
+        }
+    }
+
+    fn skip_object_segments_reclaim(&mut self) -> Result<(), String> {
+        self.skip_str()?;
+        self.skip_str()?;
+        self.read_nonzero_u64("object segments reclaim generation")?;
+        self.read_u64()?;
+        self.skip_repeated(|decoder| {
+            decoder.read_u32()?;
+            decoder.read_bytes()?;
+            decoder.read_nonzero_u64("object segments reclaim segment VID")?;
+            decoder.read_u32()?;
+            decoder.read_u8()?;
+            decoder.read_u8()?;
+            Ok(())
+        })
+    }
+
+    fn skip_multipart_reclaim(&mut self) -> Result<(), String> {
+        self.skip_str()?;
+        self.skip_str()?;
+        self.read_nonzero_u64("multipart reclaim generation")?;
+        self.read_u64()?;
+        self.skip_repeated(|decoder| match decoder.read_u8()? {
+            1 => {
+                decoder.read_u32()?;
+                decoder.read_bytes()?;
+                decoder.read_nonzero_u64("multipart reclaim part VID")?;
+                decoder.read_u32()?;
+                decoder.read_u8()?;
+                decoder.read_u8()?;
+                Ok(())
+            }
+            2 => {
+                decoder.read_u32()?;
+                decoder.skip_repeated(|decoder| {
+                    decoder.read_u32()?;
+                    decoder.read_u32()?;
+                    decoder.read_bytes()?;
+                    decoder.read_nonzero_u64("multipart reclaim segment VID")?;
+                    decoder.read_u32()?;
+                    decoder.read_u8()?;
+                    decoder.read_u8()?;
+                    Ok(())
+                })
+            }
+            tag => Err(format!("invalid multipart reclaim part tag {tag}")),
+        })
+    }
+
+    fn skip_abort_multipart_upload_cleanup(&mut self) -> Result<(), String> {
+        self.skip_multipart_upload()?;
+        self.skip_repeated(Self::skip_multipart_part)?;
+        self.skip_repeated(Self::skip_multipart_part_segment)?;
+        self.skip_repeated(Self::skip_stream_upload)?;
+        self.skip_repeated(Self::skip_stream_upload_segment)
+    }
+
+    fn skip_object_etag(&mut self) -> Result<(), String> {
+        match self.read_u8()? {
+            1 => {
+                self.read_crc64_bytes("single-part etag CRC64")?;
+                Ok(())
+            }
+            2 => {
+                self.read_crc64_bytes("multipart etag CRC64")?;
+                self.read_nonzero_u32("multipart etag parts count")
+            }
+            tag => Err(format!("invalid object etag tag {tag}")),
+        }
+    }
+
+    fn read_crc64_bytes(&mut self, field: &'static str) -> Result<(), String> {
+        let bytes = self.read_bytes()?;
+        if bytes.len() == 8 {
+            Ok(())
+        } else {
+            Err(format!("{field} must be exactly 8 bytes"))
+        }
+    }
+
+    fn skip_object_layout(&mut self) -> Result<(), String> {
+        match self.read_u8()? {
+            1 => Ok(()),
+            2 => self.read_nonzero_u32("multipart layout parts count"),
+            tag => Err(format!("invalid object layout tag {tag}")),
+        }
+    }
+
+    fn skip_object_lock_state(&mut self) -> Result<(), String> {
+        match self.read_u8()? {
+            0 => {}
+            1 => {
+                self.read_u64()?;
+                self.read_valid_u8("object lock retention mode", 0..=1)?;
+            }
+            tag => return Err(format!("invalid object retention tag {tag}")),
+        }
+        self.read_valid_u8("stored legal hold status", 0..=2)
+    }
+
+    fn skip_object_encryption(&mut self) -> Result<(), String> {
+        let encryption_type = self.read_u8()?;
+        if !matches!(encryption_type, 0..=2) {
+            return Err(format!("invalid object encryption type {encryption_type}"));
+        }
+        let has_state = match self.read_u8()? {
+            0 => false,
+            1 => {
+                self.read_bytes()?;
+                true
+            }
+            tag => {
+                return Err(format!(
+                    "invalid optional object encryption state tag {tag}"
+                ))
+            }
+        };
+        match (encryption_type, has_state) {
+            (0, false) | (1 | 2, true) => Ok(()),
+            (0, true) => Err("unencrypted object must not carry encryption state".to_string()),
+            (1 | 2, false) => Err("encrypted object is missing encryption state".to_string()),
+            _ => unreachable!("object encryption type was validated above"),
+        }
+    }
+
+    fn skip_owner_identity(&mut self) -> Result<(), String> {
+        self.skip_str()?;
+        self.skip_str()
+    }
+
+    fn skip_optional_owner_identity(&mut self) -> Result<(), String> {
+        self.skip_optional(Self::skip_owner_identity)
+    }
+
+    fn skip_optional_multipart_checksum_config(&mut self) -> Result<(), String> {
+        self.skip_optional(|decoder| {
+            decoder.read_valid_u8("multipart checksum algorithm", 0..=4)?;
+            decoder.read_valid_u8("multipart checksum type", 0..=1)
+        })
+    }
+
+    fn skip_bucket_subresource_mutation(&mut self) -> Result<(), String> {
+        match self.read_u8()? {
+            1 => {
+                let kind = self.read_bucket_subresource_kind()?;
+                self.skip_str()?;
+                self.skip_bucket_subresource_aux(kind)
+            }
+            2 => {
+                self.read_bucket_subresource_kind()?;
+                Ok(())
+            }
+            tag => Err(format!("invalid bucket subresource mutation tag {tag}")),
+        }
+    }
+
+    fn read_bucket_subresource_kind(&mut self) -> Result<u8, String> {
+        let kind = self.read_u8()?;
+        if matches!(kind, 0 | 1 | 4 | 5) {
+            Ok(kind)
+        } else {
+            Err(format!("invalid bucket subresource kind {kind}"))
+        }
+    }
+
+    fn skip_bucket_subresource_aux(&mut self, kind: u8) -> Result<(), String> {
+        match self.read_u8()? {
+            0 if matches!(kind, 0 | 1 | 5) => Ok(()),
+            1 if kind == 4 => self.skip_bool(),
+            tag => Err(format!(
+                "bucket subresource kind {kind} does not support aux tag {tag}"
+            )),
+        }
+    }
+
+    fn skip_bucket_encryption(&mut self) -> Result<(), String> {
+        match self.read_u8()? {
+            0 => {}
+            1 => self.read_valid_u8("managed encryption algorithm", 1..=1)?,
+            tag => return Err(format!("invalid bucket encryption tag {tag}")),
+        }
+        self.skip_bool()
+    }
+
+    fn skip_public_access_block(&mut self) -> Result<(), String> {
+        self.skip_optional(|decoder| {
+            decoder.skip_bool()?;
+            decoder.skip_bool()?;
+            decoder.skip_bool()?;
+            decoder.skip_bool()
+        })
+    }
+
+    fn skip_ownership_controls(&mut self) -> Result<(), String> {
+        self.skip_optional(|decoder| decoder.read_valid_u8("bucket object ownership", 0..=2))
+    }
+
+    fn skip_bucket_object_lock(&mut self) -> Result<(), String> {
+        self.skip_bool()?;
+        match self.read_u8()? {
+            0 => Ok(()),
+            1 => {
+                self.read_valid_u8("object lock default retention mode", 0..=1)?;
+                match self.read_u8()? {
+                    1 | 2 => self.read_nonzero_u32("object lock default retention period"),
+                    tag => Err(format!(
+                        "invalid object lock default retention period tag {tag}"
+                    )),
+                }
+            }
+            tag => Err(format!("invalid bucket object lock retention tag {tag}")),
+        }
+    }
+
+    fn finish(&self) -> Result<(), String> {
+        if self.offset == self.bytes.len() {
+            Ok(())
+        } else {
+            Err("metadata command log entry has trailing bytes".to_string())
+        }
+    }
 }
 
 fn encode_create_bucket(out: &mut Vec<u8>, command: &CreateBucketCommand) {
@@ -1800,8 +2598,11 @@ fn put_u64(out: &mut Vec<u8>, value: u64) {
 mod tests {
     use super::*;
     use crate::types::{
-        EcShape, MultipartReclaimPartSegmentRecord, ObjectSegmentsReclaimSegmentRecord,
-        OwnerIdentity, SerializedMetadataBlob, SerializedSystemMetadataBlob, StorageClass,
+        ChecksumAlgorithm, ChecksumType, EcShape, MultipartChecksumConfig,
+        MultipartReclaimPartSegmentRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity,
+        SerializedMetadataBlob, SerializedSystemMetadataBlob, SseS3ObjectState, StorageClass,
+        SSE_S3_CHECKSUM_NONCE_LEN, SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAPPED_DEK_LEN,
+        SSE_S3_WRAP_NONCE_LEN,
     };
 
     fn test_bucket_record(name: &str, generation: u64) -> BucketRecord {
@@ -1822,6 +2623,20 @@ mod tests {
             generation,
         )
         .unwrap()
+    }
+
+    fn assert_applied_log_decoder_accepts(envelope: &MetadataCommandEnvelope) {
+        let header = decode_metadata_command_log_entry_header(&envelope.command_bytes())
+            .expect("applied command bytes must decode");
+        assert_eq!(header.id(), envelope.id());
+        assert_eq!(header.kind(), MetadataCommandLogEntryKind::Applied);
+
+        let mut trailing_bytes = envelope.command_bytes();
+        trailing_bytes.push(0);
+        assert!(
+            decode_metadata_command_log_entry_header(&trailing_bytes).is_err(),
+            "applied command decoder must reject trailing bytes"
+        );
     }
 
     #[test]
@@ -1856,7 +2671,68 @@ mod tests {
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
         assert!(envelope.verify_checksum());
+        assert_applied_log_decoder_accepts(&envelope);
         assert_eq!(envelope.checksum_crc64(), 0x66809b9080b3d0ce);
+    }
+
+    #[test]
+    fn metadata_command_log_entry_header_decodes_applied_and_abandoned_rows() {
+        let owner = CanonicalUserId::from_principal("owner");
+        let acl_grants = AclGrants::default();
+        let command = CreateBucketCommand::from_config(
+            &CreateBucketConfig {
+                name: "bucket",
+                owner_principal: "owner",
+                owner_canonical_id: &owner,
+                acl_grants: &acl_grants,
+                public_read: false,
+                public_write: true,
+                versioning: BucketVersioningState::Enabled,
+                object_lock: BucketObjectLockConfig::default(),
+            },
+            123,
+            7,
+        )
+        .unwrap();
+        let id = MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(3),
+            MetadataCommandLogIndex::new(9).unwrap(),
+        );
+        let envelope =
+            MetadataCommandEnvelope::new(id, MetadataCommandPayload::CreateBucket(command));
+
+        let applied_header = decode_metadata_command_log_entry_header(&envelope.command_bytes())
+            .expect("applied command bytes decode");
+        assert_eq!(applied_header.id(), id);
+        assert_eq!(applied_header.kind(), MetadataCommandLogEntryKind::Applied);
+
+        let mut applied_with_trailing_bytes = envelope.command_bytes();
+        applied_with_trailing_bytes.push(0);
+        assert!(
+            decode_metadata_command_log_entry_header(&applied_with_trailing_bytes).is_err(),
+            "applied command decoder must reject trailing bytes"
+        );
+
+        let mut applied_with_unknown_kind = envelope.command_bytes();
+        let kind_offset = 4 + METADATA_COMMAND_MAGIC.len() + 2 + 8 + 4 + 8;
+        applied_with_unknown_kind[kind_offset..kind_offset + 2]
+            .copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(
+            decode_metadata_command_log_entry_header(&applied_with_unknown_kind).is_err(),
+            "applied command decoder must reject unknown payload kinds"
+        );
+
+        let abandoned_header =
+            decode_metadata_command_log_entry_header(&envelope.abandoned_log_bytes())
+                .expect("abandoned command bytes decode");
+        assert_eq!(abandoned_header.id(), id);
+        assert_eq!(
+            abandoned_header.kind(),
+            MetadataCommandLogEntryKind::Abandoned {
+                original_command_checksum: envelope.checksum_crc64()
+            }
+        );
     }
 
     #[test]
@@ -1881,6 +2757,7 @@ mod tests {
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
         assert_eq!(envelope.checksum_crc64(), 0x5b70f24232e19e41);
         assert!(envelope.verify_checksum());
+        assert_applied_log_decoder_accepts(&envelope);
     }
 
     #[test]
@@ -1905,6 +2782,7 @@ mod tests {
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
         assert_eq!(envelope.checksum_crc64(), 0xef5303af8c76b99e);
         assert!(envelope.verify_checksum());
+        assert_applied_log_decoder_accepts(&envelope);
     }
 
     #[test]
@@ -1941,6 +2819,7 @@ mod tests {
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
         assert!(envelope.verify_checksum());
+        assert_applied_log_decoder_accepts(&envelope);
     }
 
     #[test]
@@ -1962,6 +2841,7 @@ mod tests {
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
         assert_eq!(envelope.checksum_crc64(), 0xaa6f66f9a614e924);
         assert!(envelope.verify_checksum());
+        assert_applied_log_decoder_accepts(&envelope);
     }
 
     #[test]
@@ -2032,6 +2912,7 @@ mod tests {
             assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
             assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
             assert!(envelope.verify_checksum());
+            assert_applied_log_decoder_accepts(&envelope);
             checksums.push(envelope.checksum_crc64());
         }
         assert_eq!(
@@ -2112,6 +2993,7 @@ mod tests {
             assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
             assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
             assert!(envelope.verify_checksum());
+            assert_applied_log_decoder_accepts(&envelope);
             checksums.push(envelope.checksum_crc64());
         }
         assert_eq!(
@@ -2215,6 +3097,17 @@ mod tests {
             checksum: None,
         };
         let upload_id = UploadId::try_from(format!("{}{}", "upload", ".".repeat(122))).unwrap();
+        let multipart_checksum =
+            MultipartChecksumConfig::new(ChecksumAlgorithm::Sha256, Some(ChecksumType::Composite))
+                .unwrap();
+        let sse_s3_encryption = ObjectEncryption::SseS3(SseS3ObjectState {
+            wrapping_key_id: 9,
+            wrap_nonce: [10; SSE_S3_WRAP_NONCE_LEN],
+            wrapped_dek: [11; SSE_S3_WRAPPED_DEK_LEN],
+            segment_nonce_prefix: [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+            checksum_nonce: [13; SSE_S3_CHECKSUM_NONCE_LEN],
+            encrypted_checksum_metadata: vec![14, 15, 16],
+        });
         let multipart_upload = MultipartUploadRecord {
             upload_id: upload_id.clone(),
             bucket: bucket.clone(),
@@ -2232,6 +3125,10 @@ mod tests {
             object_lock: ObjectLockState::default(),
             checksum: None,
             encryption: ObjectEncryption::None,
+        };
+        let multipart_upload_with_checksum = MultipartUploadRecord {
+            checksum: Some(multipart_checksum),
+            ..multipart_upload.clone()
         };
         let uploaded_part = MultipartPartRecord {
             upload_id: upload_id.clone(),
@@ -2388,6 +3285,18 @@ mod tests {
                     payload: segment_reclaim.clone(),
                 },
             })),
+            MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::from_u64(11),
+                target: DeleteObjectVersionTarget::Live {
+                    generation_id,
+                    layout: ObjectLayout::MultipartManifest {
+                        parts_count: std::num::NonZeroU32::new(1).unwrap(),
+                    },
+                    payload: multipart_reclaim.clone(),
+                },
+            })),
             MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
                 bucket: bucket.clone(),
                 key: key.clone(),
@@ -2473,6 +3382,9 @@ mod tests {
                     560,
                 ),
             )),
+            MetadataCommandPayload::CreateMultipartUpload(Box::new(CreateMultipartUploadCommand {
+                upload: multipart_upload_with_checksum,
+            })),
             MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
                 bucket: bucket.clone(),
                 key: key.clone(),
@@ -2506,6 +3418,33 @@ mod tests {
                         encryption: ObjectEncryption::None,
                     },
                     561,
+                ),
+            )),
+            MetadataCommandPayload::CreateStreamUpload(Box::new(
+                CreateStreamUploadCommand::from_request(
+                    CreateStreamUploadReq {
+                        session_id: SessionId::try_from("32".repeat(16)).unwrap(),
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        target: StreamUploadTarget::UploadPart {
+                            upload_id: upload_id.clone(),
+                            part_number: 2,
+                        },
+                        encryption: ObjectEncryption::None,
+                    },
+                    562,
+                ),
+            )),
+            MetadataCommandPayload::CreateStreamUpload(Box::new(
+                CreateStreamUploadCommand::from_request(
+                    CreateStreamUploadReq {
+                        session_id: SessionId::try_from("33".repeat(16)).unwrap(),
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        target: StreamUploadTarget::PutObject,
+                        encryption: sse_s3_encryption,
+                    },
+                    563,
                 ),
             )),
             MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
@@ -2589,6 +3528,7 @@ mod tests {
             assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
             assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
             assert!(envelope.verify_checksum());
+            assert_applied_log_decoder_accepts(&envelope);
             checksums.push(envelope.checksum_crc64());
         }
         assert_eq!(
@@ -2602,24 +3542,28 @@ mod tests {
                 0x7920c33a006e1d68,
                 0x53fdbf4c6f062d53,
                 0x6df04a5fc73e478a,
-                0xbda5330ae032bc4d,
-                0x2c1290d732a2f1be,
-                0x4d1e49e9ee7ba6ce,
-                0x5e16bf9dc0031ca5,
-                0xe4a9882d6f443342,
-                0x102e75d82949a914,
-                0x3a98e0cfac7868d4,
-                0x8b678e0025c9b1d3,
-                0x6262d109d843a323,
-                0x3c300c538341970d,
-                0xc680813c7b2166c5,
-                0xa9a8f76af3abec2e,
-                0x427f3ded4746d8c9,
-                0xa81b57c84330b04f,
-                0x3761b68d22ccd74d,
-                0x3038eaf05b1f79b2,
-                0xce5696140098157d,
-                0x8f99afc705991815,
+                0x2a3c1d82cb08bbdd,
+                0x6a5e23df842faebe,
+                0x8e2a154ef6fa870e,
+                0xa3de4500905f67bf,
+                0xc0d44346162de207,
+                0x74df7243409a2637,
+                0x5fd68ba34c3c927a,
+                0xaaee1aa183a67da1,
+                0x423d5ce8ecc3f471,
+                0xa10946bfbddcbb08,
+                0x8f0590d0286f0dc4,
+                0x4c8d2ebe4cd0d8d4,
+                0x5dd9ac5f99954560,
+                0xf89fe8126b9974bf,
+                0x8d3e5d6cb995e021,
+                0x873424a13234f823,
+                0x7cf30e2471f346ae,
+                0xa9cde2110916a8a6,
+                0x0e53aa8cb595ea77,
+                0x7198824f0ecf3d31,
+                0x13ddd49bdbc91001,
+                0x1946524188e07bbb,
             ]
         );
     }
