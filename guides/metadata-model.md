@@ -213,6 +213,24 @@ API boundary, but the durable command carries the post-mutation live object row.
 Retry matching compares that row image rather than reconstructing AWS request
 semantics from materialized state.
 
+## Persisted Integrity Record Inventory
+
+Phase 7.4 starts from this inventory of persisted or soon-to-be-persisted
+binary/integrity records. The important current gap is that
+`metadata_command_log` persists command checksums and hash-chain state, but not
+the canonical command bytes themselves. That is enough for duplicate/conflict
+checks and hash-chain validation, but not enough for standalone replay from the
+log.
+
+| Record | Current Persistence | Encoded Bytes | Checksum Or Hash Coverage | Replay Role |
+| --- | --- | --- | --- | --- |
+| Metadata command canonical bytes | Generated in memory by `MetadataCommandEnvelope`; not persisted as bytes today | `canonical_command_bytes`: domain magic, version, epoch, PG, log index, payload kind, and storage-shaped payload fields | `checksum_crc64` is CRC64 over those canonical bytes | Target source for command replay once persisted; today only used while the command object is live |
+| `metadata_command_log` row | Persisted in each PG SQLite store | `cluster_epoch`, `pg_id`, `log_index`, `command_checksum`, `abandoned`, `previous_log_hash`, `log_hash` | Applied rows store the command CRC64; abandoned rows store the abandoned-command sentinel checksum. `log_hash` links epoch, PG, log index, previous hash, and command checksum | Validates accepted command identity, duplicate/conflict handling, sparse-prefix advancement, and hash-chain continuity; cannot reconstruct a command payload by itself yet |
+| `metadata_command_replica_state` row | Persisted singleton in each PG SQLite store | `cluster_epoch`, `applied_log_index`, `applied_log_hash`, `state_digest` | `applied_log_hash` is the current command-log prefix hash; `state_digest` is the current canonical full-PG digest at that prefix | Fast fail-closed check that materialized state still matches the accepted log prefix; not a checkpoint by itself |
+| Canonical full-PG state digest input | Generated from the materialized SQLite serving view; only the digest value is persisted in replica state | Stable table/range domain header, explicit table and column names, range/filter identity, row boundaries, and typed values for the explicit canonical inventory | `state_digest` is computed over the full canonical table-range encoding | Detects materialized-row divergence and corruption; cannot replay state because the encoded row stream is not persisted as a block |
+| Checkpoint/snapshot/range block | Not persisted yet | To be defined if Phase 7.4 introduces blocks: kind/version, PG, epoch, covered log index, range identity, row count or range metadata, and canonical row bytes or range digest | Must carry a checksum over the whole canonical block | Future compact replay equivalence point. If Phase 7.4 does not introduce persisted blocks, checkpoint semantics remain a Phase 7.5/Phase 10 item |
+| Object payload bytes | Persisted as placed payload shards, outside metadata command-log/checkpoint records | Not included in metadata canonical bytes; metadata stores payload descriptors such as size, layout, placement references, segment/part CRC64, and EC shape | Payload shards have their own shard checksums; metadata descriptors and payload CRC64 values are covered by command/state encodings | Replay restores metadata references, not object bytes; payload recovery/repair validates shard data separately |
+
 ## Integrity And Divergence
 
 Every persisted binary command-log entry must carry a checksum over its

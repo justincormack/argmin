@@ -1738,10 +1738,36 @@ Proposed slices:
      expand the inventory to the remaining command-owned in-progress,
      allocator, and reclaim tables
 4. Phase 7.4: log/checkpoint checksum and replay tests.
+   - inventory persisted binary and integrity records before changing formats:
+     `metadata_command_log`, command canonical bytes, command-log hash-chain
+     state, full-PG canonical digest inputs, and any checkpoint/range block
+     format introduced in this phase
    - add or update persisted binary formats so every log entry and every new
-     checkpoint/range block has a checksum over its canonical encoding
-   - add corruption, replay, checkpoint/log-tail, and divergence tests against
-     the canonical encodings
+     checkpoint/range block has a checksum over its canonical encoding; the
+     current log row stores command checksums and hash links, but not the
+     canonical command bytes needed for standalone replay
+   - define whether Phase 7.4 introduces persisted checkpoints/range blocks or
+     only proves log-tail replay against the current full-PG canonical digest;
+     if a checkpoint/range block is introduced, it must carry kind/version, PG,
+     epoch, range identity, row count/range metadata, canonical bytes or digest,
+     and a checksum over that block
+   - add a storage-level replay harness that creates state through
+     `StorageCluster`, reopens stores, validates or replays the durable command
+     history, compares canonical state before and after, and uses direct
+     metadata mutation only for explicit corruption/divergence injection
+   - add corruption tests for modified command payload/checksum, modified
+     command id/log index, modified previous hash, missing middle log entry,
+     duplicate log index with conflicting payload, abandoned entries, and
+     corrupted canonical metadata rows
+   - add checkpoint/log-tail tests covering checkpoint-only replay, checkpoint
+     plus valid tail, corrupted checkpoint, corrupted tail, and stale
+     checkpoint handling according to the chosen rule
+   - add divergence tests for primary row corruption, replica row corruption,
+     missing/extra/reordered replica log entries, same materialized state with
+     different history, and matching history with corrupted materialized state
+   - close out by updating [metadata-model.md](../guides/metadata-model.md)
+     with the implemented formats, checksum coverage, replay guarantees, and
+     any retention/compaction items deferred to Phase 7.5
 5. Phase 7.5: retention and compaction policy.
    - implement or fully specify command-log retention around pending retry,
      restart, peering, repair, and checkpoint equivalence
@@ -1914,6 +1940,15 @@ Completed:
     command-owned metadata table, production direct mutators for digest-covered
     metadata are gated or private, and bucket write-drain counters are
     explicitly deferred to the Phase 9 fence/lease model
+- Phase 7.4 step 1:
+  - added the persisted integrity record inventory to
+    [metadata-model.md](../guides/metadata-model.md), covering current
+    `metadata_command_log` rows, in-memory canonical command bytes,
+    `metadata_command_replica_state`, full-PG canonical digest input,
+    checkpoint/range block gap, and the object-payload boundary
+  - made the replay gap explicit: command-log rows currently persist the
+    command checksum and hash-chain links, but not the canonical command bytes
+    needed for standalone log replay
 
 Exit criteria:
 
