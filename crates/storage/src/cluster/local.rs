@@ -3681,6 +3681,54 @@ mod tests {
     }
 
     #[test]
+    fn local_cluster_reopen_rejects_replica_materialized_state_digest_mismatch() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        {
+            let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+            let topology = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "corrupt-replica-state-");
+            set_route_primary(&mut map, 1, NodeId::new(1));
+            let map = Arc::new(map);
+            let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            let command = create_bucket_metadata_command(PgId::new(1), 1, bucket.clone());
+            cluster
+                .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+                .unwrap();
+            let replica_pg = map
+                .node(NodeId::new(1))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            replica_pg
+                .connection()
+                .execute(
+                    "UPDATE buckets SET public_read = 1 WHERE name = ?1",
+                    rusqlite::params![bucket.as_str()],
+                )
+                .unwrap();
+        }
+
+        let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClusterBuildError::OpenLocalNode {
+                    node_id: 1,
+                    source: StoreError::MetadataStateDigestMismatch { pg_id: 1, .. }
+                }
+            ),
+            "unexpected reopen error: {err:?}"
+        );
+    }
+
+    #[test]
     fn local_cluster_reopen_rejects_missing_replica_state_for_nonempty_pg() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -3830,6 +3878,88 @@ mod tests {
                         pg_id: 1,
                         reference_node_id: 0,
                         applied_log_index: 2,
+                        reference_applied_log_index: 1,
+                        ..
+                    }
+                }
+            ),
+            "unexpected reopen error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn local_cluster_reopen_rejects_same_state_with_different_history() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        {
+            let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+            let topology = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "same-state-history-");
+            let alternate_bucket = bucket_for_pg(topology, 1, "alternate-history-");
+            set_route_primary(&mut map, 1, NodeId::new(1));
+            let map = Arc::new(map);
+            let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            let command = create_bucket_metadata_command(PgId::new(1), 1, bucket);
+            cluster
+                .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+                .unwrap();
+
+            let alternate_command =
+                create_bucket_metadata_command(PgId::new(1), 1, alternate_bucket);
+            let alternate_hash = metadata_command_log_hash(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(1).unwrap(),
+                0,
+                alternate_command.checksum_crc64(),
+            );
+            let replica_pg = map
+                .node(NodeId::new(1))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            replica_pg
+                .connection()
+                .execute(
+                    "UPDATE metadata_command_log \
+                     SET command_checksum = ?1, command_bytes = ?2, \
+                         previous_log_hash = ?3, log_hash = ?4 \
+                     WHERE log_index = 1",
+                    rusqlite::params![
+                        alternate_command.checksum_crc64() as i64,
+                        alternate_command.command_bytes(),
+                        0_i64,
+                        alternate_hash as i64,
+                    ],
+                )
+                .unwrap();
+            replica_pg
+                .connection()
+                .execute(
+                    "UPDATE metadata_command_replica_state \
+                     SET applied_log_hash = ?1 \
+                     WHERE singleton = 0",
+                    rusqlite::params![alternate_hash as i64],
+                )
+                .unwrap();
+        }
+
+        let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClusterBuildError::OpenLocalNode {
+                    node_id: 1,
+                    source: StoreError::MetadataCommandReplicaStateDiverged {
+                        pg_id: 1,
+                        reference_node_id: 0,
+                        applied_log_index: 1,
                         reference_applied_log_index: 1,
                         ..
                     }

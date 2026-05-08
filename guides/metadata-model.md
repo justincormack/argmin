@@ -260,7 +260,10 @@ After each opened replica validates locally, `LocalClusterMap::open` also
 requires all opened replicas for the PG to agree on the validated epoch, applied
 log index, log hash, and canonical state digest. A stale but internally
 coherent replica is therefore rejected as divergent until a later peering/repair
-phase can rebuild or exclude it deliberately.
+phase can rebuild or exclude it deliberately. This agreement check also rejects
+replicas that have the same materialized metadata digest but a different
+accepted command-log history; until standalone replay/checkpoint repair exists,
+matching rows are not enough to prove a replica is clean.
 Replica-state initialization is allowed only for a freshly initialized empty PG
 with the schema baseline and no command log. Log entries beyond the applied
 prefix remain retained tail entries, not a checkpoint.

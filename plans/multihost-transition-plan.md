@@ -1985,6 +1985,11 @@ Completed:
     whose validated command prefix differs from peers, all of which now fail
     cluster open instead of letting the replica join cleanly when the
     durable/materialized state is not coherent or not in acting-set agreement
+- Phase 7.4 step 4:
+  - expanded restart divergence coverage for non-reference replica row
+    corruption and for replicas with the same materialized metadata digest but
+    different accepted command-log history; both fail cluster open rather than
+    resolving divergence by choosing an arbitrary replica
 
 Exit criteria:
 
