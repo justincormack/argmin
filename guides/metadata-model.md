@@ -83,10 +83,13 @@ command-owned durable serving, in-progress, and cleanup metadata:
 - `stream_upload_segments`
 - `stream_uploads`
 
-The current inventory still excludes state that is local-only or not yet
-owned by its own canonical command stream: bucket write-drain counters. That is
-a Phase 9 fence/lease question, not an implicit exemption from metadata
-integrity.
+The current inventory still excludes bucket write-drain counters:
+`write_reservations_blocked` and `active_write_reservations`. Those counters
+are a Phase 9 fence/lease question, not canonical S3 metadata and not an
+implicit exemption from metadata integrity. Until Phase 9 decides whether this
+state stays process-local or becomes a replicated fence, the only production
+off-command bucket-row writes allowed for them are the explicit
+write-drain/reservation helpers.
 
 The full-PG encoding starts with a stable domain/version header. Each included
 table range then encodes explicit table and column names, filter identity, row

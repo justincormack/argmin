@@ -70,17 +70,42 @@ similar external suites, but not in ordinary unit/property tests.
 
 Run `./scripts/check-storage-cluster-boundaries` as part of broad local
 verification while the multihost transition is in progress. The script fails on
-review patterns that should break loudly before Phase 6:
+boundary regressions that should break loudly during command-log and multihost
+work:
 
 - broad `self.single_node` use outside the approved `StorageCluster` bridge
   helpers
 - production shard read/write/delete calls that bypass placed `StorageCluster`
   IO
 - legacy metadata-primary payload write paths
+- ungated production `PgMetadataStore` methods that are not in the explicit
+  read-only/finalized-delete/write-drain allowlist
 - route/control-plane errors converted through generic `StoreError::Io`
 
 The operation classes and bridge-era invariants are documented in
 [storage-cluster-invariants.md](storage-cluster-invariants.md).
+
+## Storage Metadata Test Setup
+
+Prefer production request paths when creating ordinary metadata state in tests.
+Coordinator tests should normally use `Coordinator` methods, and storage-cluster
+tests should normally use `StorageCluster` command APIs. This keeps the test
+surface exercising epoch fencing, pending-command retry, command-log
+validation, placement routing, cleanup ownership, and replica fanout.
+
+Direct `PgMetadataStore` access is appropriate only for narrowly scoped cases:
+
+- low-level `PgStore` tests that validate schema constraints, indexes,
+  canonical row encoding, or exact table behavior
+- assertions against replica-local rows after a production API call
+- deliberate fault injection, divergence, corruption, or otherwise unreachable
+  intermediate state
+- test hooks that model a crash/retry point more precisely than a public API can
+
+When a cluster or coordinator test uses direct `PgMetadataStore` mutation, add a
+short comment explaining the unreachable or divergent state being created. Avoid
+using it as a setup shortcut for normal buckets, objects, multipart uploads,
+stream sessions, reclaim records, or bucket subresources.
 
 ## External Test Scripts
 

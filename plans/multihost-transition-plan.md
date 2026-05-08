@@ -1728,7 +1728,7 @@ Proposed slices:
    - rename or replace request-oriented retry comparison helpers where touched,
      so storage pending-command retry compares command intent/effect rather than
      AWS request semantics
-3. Phase 7.3: canonical binary state encoding.
+3. Phase 7.3: canonical binary state encoding. Complete.
    - define row, table-range, and full-PG encodings that do not depend on
      SQLite row formatting
    - include payload descriptors and payload CRC64 values, but not object
@@ -1902,9 +1902,18 @@ Completed:
       not canonical S3 metadata; they remain outside the metadata digest until
       the Phase 9 lease/fence model decides whether this state should stay
       process-local or become a replicated fence
-  - remaining Phase 7.3 work is:
-    - keep bucket write-drain counters documented as a Phase 9 fence/lease
-      concern unless that phase moves them into canonical replicated metadata
+  - added a mechanical storage-cluster boundary check that fails closed if new
+    ungated production `PgMetadataStore` methods are added outside the explicit
+    read-only/finalized-delete/write-drain allowlist
+  - documented the test setup rule that normal cluster/coordinator metadata
+    state should be created through production `StorageCluster` or
+    `Coordinator` APIs; direct `PgMetadataStore` mutation is reserved for
+    PgStore unit coverage, replica-local assertions, and explicit
+    fault-injection/divergence setup with a comment
+  - Phase 7.3 is complete: canonical binary state encoding covers every current
+    command-owned metadata table, production direct mutators for digest-covered
+    metadata are gated or private, and bucket write-drain counters are
+    explicitly deferred to the Phase 9 fence/lease model
 
 Exit criteria:
 

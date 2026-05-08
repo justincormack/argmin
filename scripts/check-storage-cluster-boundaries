@@ -130,6 +130,86 @@ fail_with_matches \
     "Legacy metadata-primary payload write path reintroduced" \
     "$legacy_payload_matches"
 
+production_metadata_methods=$(
+    awk '
+    function is_allowed_production_method(name) {
+        return name == "delete_finalized_bucket" \
+            || name == "acquire_bucket_write_reservation" \
+            || name == "release_bucket_write_reservation" \
+            || name == "begin_bucket_write_drain" \
+            || name == "end_bucket_write_drain" \
+            || name == "head_bucket" \
+            || name == "head_bucket_raw" \
+            || name == "head_bucket_record_raw" \
+            || name == "list_buckets" \
+            || name == "list_buckets_with_lifecycle" \
+            || name == "list_buckets_with_aborting_multipart_uploads" \
+            || name == "get_bucket_subresource" \
+            || name == "get_object_meta" \
+            || name == "get_object_version" \
+            || name == "list_objects" \
+            || name == "list_object_versions" \
+            || name == "list_object_versions_for_key" \
+            || name == "next_version_id" \
+            || name == "next_generation_id" \
+            || name == "get_object_generation_reservation" \
+            || name == "get_object_segments_reclaim" \
+            || name == "get_multipart_reclaim" \
+            || name == "payload_reclaim_exists" \
+            || name == "get_bucket_payload_reclaim_root" \
+            || name == "get_object_tags" \
+            || name == "get_multipart_upload" \
+            || name == "get_completed_multipart_upload" \
+            || name == "list_multipart_uploads" \
+            || name == "get_multipart_part" \
+            || name == "list_multipart_parts" \
+            || name == "get_object_parts" \
+            || name == "get_stream_upload" \
+            || name == "list_all_stream_uploads" \
+            || name == "list_stream_segments" \
+            || name == "get_object_segments" \
+            || name == "get_multipart_part_segments" \
+            || name == "get_multipart_part_segments_for_upload_part" \
+            || name == "get_all_multipart_part_segments_for_upload"
+    }
+    /^pub\(crate\) trait PgMetadataStore/ {
+        in_pg_metadata_store = 1
+        next
+    }
+    in_pg_metadata_store && /^}/ {
+        in_pg_metadata_store = 0
+        pending_test_hook_cfg = 0
+        next
+    }
+    !in_pg_metadata_store {
+        next
+    }
+    /^    #\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ || /^    #\[cfg\(test\)\]/ {
+        pending_test_hook_cfg = 1
+        next
+    }
+    /^    #\[/ {
+        next
+    }
+    /^    fn [A-Za-z0-9_]+/ {
+        method_name = $0
+        sub(/^    fn /, "", method_name)
+        sub(/\(.*/, "", method_name)
+        if (!pending_test_hook_cfg && !is_allowed_production_method(method_name)) {
+            print FILENAME ":" FNR ":" $0
+        }
+        pending_test_hook_cfg = 0
+        next
+    }
+    $0 !~ /^[[:space:]]*$/ && $0 !~ /^    \/\// {
+        pending_test_hook_cfg = 0
+    }
+    ' crates/storage/src/traits.rs
+)
+fail_with_matches \
+    "Ungated production PgMetadataStore method outside the explicit allowlist" \
+    "$production_metadata_methods"
+
 generic_route_io_matches=$(
     rg -n --color=never \
         'std::io::Error::other\((error|other)\.to_string\(\)\)|StoreError::Io[[:space:]]*\{[[:space:]]*context:[^}]*route|StoreError::Io[[:space:]]*\{[[:space:]]*context:[^}]*PG' \
