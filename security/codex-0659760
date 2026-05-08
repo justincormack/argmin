@@ -1,0 +1,107 @@
+Restart DoS after 128 metadata commands
+Link: https://chatgpt.com/codex/cloud/security/findings/1c1fd1db8af8819186b5507d97db2bd5?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 0659760
+Author: justin@specialbusservice.com
+Created: 08/05/2026, 16:03:50
+Assignee: Unassigned
+Signals: Security
+
+# Summary
+Introduced: startup validation was added in this commit and made the pre-existing bounded digest sentinel fatal on reopen, while the normal online update path still persists that sentinel after 128 commands.
+The new LocalClusterMap startup path validates every PG replica before the storage cluster is returned. PgStore::validate_metadata_command_replay_state now treats METADATA_STATE_DIGEST_UNVERIFIED as a fatal error. However, online_metadata_state_digest intentionally returns that same sentinel once applied_log_index exceeds METADATA_STATE_DIGEST_ONLINE_COMMAND_LIMIT, which is 128. Therefore, normal metadata activity beyond 128 commands in any PG persists state_digest = 0, and the next process restart will fail during StorageCluster::open_local_nodes. This creates a latent persistent denial of service: an authenticated client able to perform metadata-mutating S3 operations, such as bucket/object/multipart state changes, can push a PG over the threshold and wait for or induce a restart/crash to prevent the server from coming back up.
+
+# Evidence
+crates/argmin-s3/src/main.rs (L106 to 110)
+  Note: Production startup exits if StorageCluster::open_local_nodes fails, turning the validation failure into a service restart denial of service.
+```
+    let node_ids: Vec<NodeId> = (0..config.local_node_count).map(NodeId::new).collect();
+    let storage_cluster = StorageCluster::open_local_nodes(data_dir, &node_ids, &pg_ids, ec_shape)
+        .unwrap_or_else(|e| {
+            eprintln!("failed to open local storage cluster: {e}");
+            std::process::exit(1);
+```
+
+crates/storage/src/cluster/local.rs (L655 to 672)
+  Note: The new validation is called during LocalClusterMap::open, so any PG with the sentinel causes cluster opening to fail.
+```
+        let mut nodes = BTreeMap::new();
+        for (node_id, canonical_data_dir) in validated_configs {
+            let storage_node = SharedStorageNode::open_with_default_ec_shape(
+                &canonical_data_dir,
+                &storage_pg_ids,
+                default_ec_shape,
+            )
+            .map_err(|source| ClusterBuildError::OpenLocalNode {
+                node_id: node_id.as_u32(),
+                source,
+            })?;
+            nodes.insert(
+                node_id,
+                LocalNodeStore::new(node_id, canonical_data_dir, Arc::new(storage_node)),
+            );
+        }
+        validate_metadata_command_replay_state(&nodes, &pg_ids, ClusterEpoch::INITIAL)?;
+```
+
+crates/storage/src/pg_store.rs (L1393 to 1399)
+  Note: Normal online metadata command processing deliberately stores the unverified sentinel once the applied log index exceeds 128.
+```
+    fn online_metadata_state_digest(&self, applied_log_index: u64) -> Result<u64, StoreError> {
+        // Full table scans are quadratic when run before every command in a
+        // large local trace. Keep this online corruption gate bounded; restart
+        // validation treats the sentinel as unverified and fails closed.
+        if applied_log_index > METADATA_STATE_DIGEST_ONLINE_COMMAND_LIMIT {
+            return Ok(METADATA_STATE_DIGEST_UNVERIFIED);
+        }
+```
+
+crates/storage/src/pg_store.rs (L69 to 70)
+  Note: Defines the unverified digest sentinel as 0 and the online digest cutoff as 128 commands.
+```
+const METADATA_STATE_DIGEST_UNVERIFIED: u64 = 0;
+const METADATA_STATE_DIGEST_ONLINE_COMMAND_LIMIT: u64 = 128;
+```
+
+crates/storage/src/pg_store.rs (L757 to 764)
+  Note: New restart replay validation treats the unverified digest sentinel as a fatal error.
+```
+        if state.state_digest == METADATA_STATE_DIGEST_UNVERIFIED {
+            return Err(StoreError::MetadataStateDigestUnverified {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                applied_log_index: state.applied_log_index,
+            });
+        }
+```
+
+# Resolution
+Fixed in `e77fe33` (`Fix restart validation for unverified metadata digest`).
+
+Restart validation now treats `METADATA_STATE_DIGEST_UNVERIFIED` as an
+intentional bounded-online-path marker rather than a fatal clean-open failure.
+When a local PG has crossed the online digest limit, reopen walks the durable
+command-log prefix, recomputes the full canonical materialized metadata digest,
+persists that digest into `metadata_command_replica_state`, and only then
+compares validated replica state across the acting set. Corrupt log entries,
+hash-chain mismatches, materialized-row drift, missing replica state, and
+replica disagreement still fail closed.
+
+The regression
+`local_cluster_reopen_recomputes_unverified_large_command_stream_digest` covers
+a 129-command stream that stores the sentinel before shutdown and successfully
+reopens only after recomputing and persisting matching full digests on all
+replicas.
+
+Verification for the fix:
+- `cargo fmt`
+- `cargo nextest run -p storage local_cluster_reopen_recomputes_unverified_large_command_stream_digest`
+- `cargo nextest run -p storage`
+- `./scripts/check-storage-cluster-boundaries`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo nextest run`
