@@ -1,0 +1,171 @@
+Unverified metadata digest is trusted after restart
+Link: https://chatgpt.com/codex/cloud/security/findings/841b26293ff081919c28d792b60d6ea9?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: e77fe33
+Author: justin@specialbusservice.com
+Created: 08/05/2026, 18:49:00
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: restart validation now turns METADATA_STATE_DIGEST_UNVERIFIED into a persisted digest of the current materialized rows. This removes the previous fail-closed behavior for unverified large command streams and can admit corrupted/tampered metadata as clean.
+For placement groups whose applied metadata command index exceeds the online digest limit, the stored state digest is set to the sentinel value 0. Before this commit, restart validation rejected that sentinel as unverified. The new code recomputes a digest from the current SQLite materialized metadata and stores it as the trusted digest without replaying the command log to prove that the rows are the result of the accepted command history. If the materialized metadata was corrupted or tampered with while the sentinel was present, restart can now make that corruption authoritative. Cross-replica agreement only catches differing replicas; it does not protect single-node configurations or identical corruption/tampering across replicas. Metadata includes security-relevant fields such as bucket/object ACL/public flags, ownership, encryption state, and object layout, so accepting bad metadata can affect confidentiality and integrity.
+
+# Validation
+## Rubric
+- [x] Confirm large metadata command streams can persist the unverified digest sentinel 0 after the online digest limit.
+- [x] Confirm restart validation handles sentinel 0 by digesting current materialized SQLite metadata and persisting that digest, rather than failing closed.
+- [x] Demonstrate tampering of a security-relevant materialized metadata field while sentinel 0 is present.
+- [x] Demonstrate a single-node restart succeeds and changes state_digest from 0 to a nonzero trusted digest over tampered rows.
+- [x] Demonstrate a subsequent restart accepts the tampered metadata as clean/trusted.
+## Report
+Validated the finding as a logic/integrity vulnerability. Code review showed the relevant path: crates/storage/src/pg_store.rs:1377-1385 returns METADATA_STATE_DIGEST_UNVERIFIED/0 once applied_log_index > 128; crates/storage/src/pg_store.rs:820-824 recomputes metadata_state_digest() from the current materialized SQLite rows when it sees sentinel 0; crates/storage/src/pg_store.rs:1154-1164 persists that recomputed digest into metadata_command_replica_state; crates/storage/src/cluster/local.rs:1272-1309 compares only the post-validation replica states. The bucket table includes security-relevant public_read/public_write/ACL fields at crates/storage/src/schema.rs:373-375.
+
+Dynamic PoC: I injected a targeted unit test that opens a valid single-node local cluster, applies 129 metadata create-bucket commands so the stored digest becomes sentinel 0, directly tampers SQLite with `UPDATE buckets SET public_read = 1`, then reopens the cluster. The reopen succeeded, stored a nonzero digest over the tampered rows, and a second reopen accepted that digest as trusted. Command output: `before_restart: applied_log_index=129 state_digest=0`; `after_direct_sql_tamper: bucket=validation-poc-1-0 public_read=true`; `after_restart: applied_log_index=129 state_digest=7301272145618881068`; `second_restart: trusted_digest=7301272145618881068 public_read=true`; test result ok. This demonstrates corrupted/tampered materialized metadata can become authoritative in a single-node configuration.
+
+Crash/valgrind/debugger attempts: direct cargo test reproduced the logic issue without a crash; valgrind was not installed; lldb was available and ran the PoC test non-interactively, exiting status 0 after printing the same acceptance evidence. Because this is not a memory-safety crash, successful non-crashing behavior is the vulnerability.
+
+# Resolution
+Fixed in commit 4f50981 (`Harden metadata digest validation`).
+
+The fix removes `METADATA_STATE_DIGEST_UNVERIFIED` and no longer treats any persisted digest value as an invitation to trust current materialized SQLite rows on restart. Metadata command apply now maintains a durable per-table digest cache: before applying a command it verifies the command-owned tables that command can touch, then refreshes those table digests and persists the composed PG state digest as part of command state advancement. Restart validation still recomputes the full materialized metadata digest from SQLite rows and compares it to the persisted command replica state, so tampered materialized rows fail closed instead of becoming the new trusted baseline.
+
+The canonical metadata digest was also tightened: each table range carries explicit table/filter/column/order-column identity, text values remain length-prefixed, and blob values are represented as byte length plus CRC64 of the blob contents. Object payload bytes are not included in the metadata command log, but committed descriptor rows include payload CRC64 fields and those rows are digest-covered.
+
+Regression coverage includes a large-prefix reopen test that applies 129 metadata commands, tampers a bucket `public_read` row, and asserts `LocalClusterMap::open` rejects the store with `MetadataStateDigestMismatch`. Additional focused tests cover digest-covered command-owned segment/reclaim tables and the online affected-table verification path.
+
+# Evidence
+crates/storage/src/cluster/local.rs (L1272 to 1309)
+  Note: Replica agreement compares the post-validation state, but this only detects different recomputed digests; it cannot detect single-replica or identical materialized metadata corruption.
+```
+    for &pg_id in pg_ids {
+        let mut reference: Option<(NodeId, MetadataCommandReplicaState)> = None;
+        for node in nodes.values() {
+            let node_id = node.node_id();
+            let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
+                ClusterBuildError::OpenLocalNode {
+                    node_id: node_id.as_u32(),
+                    source,
+                }
+            })?;
+            let state = pg
+                .validate_metadata_command_replay_state(node_id.as_u32(), cluster_epoch)
+                .map_err(|source| ClusterBuildError::OpenLocalNode {
+                    node_id: node_id.as_u32(),
+                    source,
+                })?;
+            if let Some((reference_node_id, reference_state)) = reference {
+                if state != reference_state {
+                    return Err(ClusterBuildError::OpenLocalNode {
+                        node_id: node_id.as_u32(),
+                        source: StoreError::MetadataCommandReplicaStateDiverged {
+                            node_id: node_id.as_u32(),
+                            reference_node_id: reference_node_id.as_u32(),
+                            pg_id: pg_id.get(),
+                            cluster_epoch: state.cluster_epoch,
+                            reference_cluster_epoch: reference_state.cluster_epoch,
+                            applied_log_index: state.applied_log_index,
+                            reference_applied_log_index: reference_state.applied_log_index,
+                            applied_log_hash: state.applied_log_hash,
+                            reference_applied_log_hash: reference_state.applied_log_hash,
+                            state_digest: state.state_digest,
+                            reference_state_digest: reference_state.state_digest,
+                        },
+                    });
+                }
+            } else {
+                reference = Some((node_id, state));
+            }
+```
+
+crates/storage/src/pg_store.rs (L1154 to 1164)
+  Note: This helper persists the recomputed digest into metadata_command_replica_state, making the current materialized metadata the new trusted baseline.
+```
+    fn store_metadata_command_state_digest(&self, state_digest: u64) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "UPDATE metadata_command_replica_state SET state_digest = ?1 WHERE singleton = 0",
+                params![state_digest as i64],
+            )
+            .map_err(|e| StoreError::Db {
+                context: "refresh metadata command state digest",
+                source: e,
+            })?;
+        Ok(())
+```
+
+crates/storage/src/pg_store.rs (L1377 to 1384)
+  Note: Large command streams intentionally store METADATA_STATE_DIGEST_UNVERIFIED once the online digest limit is exceeded, creating the state that restart validation now accepts by recomputation.
+```
+    fn online_metadata_state_digest(&self, applied_log_index: u64) -> Result<u64, StoreError> {
+        // Full table scans are quadratic when run before every command in a
+        // large local trace. Keep this online corruption gate bounded; restart
+        // validation recomputes and persists a full digest when it sees this
+        // sentinel.
+        if applied_log_index > METADATA_STATE_DIGEST_ONLINE_COMMAND_LIMIT {
+            return Ok(METADATA_STATE_DIGEST_UNVERIFIED);
+        }
+```
+
+crates/storage/src/pg_store.rs (L820 to 824)
+  Note: When the persisted digest is the unverified sentinel, restart validation recomputes a digest from the current materialized metadata and stores it as trusted instead of rejecting or replay-verifying the state.
+```
+        let actual_digest = self.metadata_state_digest()?;
+        if state.state_digest == METADATA_STATE_DIGEST_UNVERIFIED {
+            self.store_metadata_command_state_digest(actual_digest)?;
+            state.state_digest = actual_digest;
+        } else if state.state_digest != actual_digest {
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Severity remains medium. The code evidence supports the vulnerability: after applied_log_index exceeds 128, state_digest can be 0; restart validation accepts that sentinel by hashing mutable materialized SQLite rows and persisting the result; security-relevant bucket ACL/public flags are part of those rows. The validated PoC demonstrates public_read tampering becoming trusted after restart. However, the attack path is local datastore tampering, not unauthenticated or authenticated network access through the S3 API. The threat model assumes filesystem permissions protect ARGMIN_DATA_DIR, making exploitation low likelihood and preventing high/critical classification despite meaningful confidentiality/integrity impact if the local preconditions are met.
+## Likelihood
+low - The vulnerable code runs in the main product, but there is no evidence of a remote HTTP path to set arbitrary metadata rows. Exploitation requires local filesystem/database write access or equivalent corruption plus a restart and a large metadata command stream, so practical likelihood is low under the stated deployment assumptions.
+## Impact
+medium - If the attacker can tamper with SQLite metadata while the sentinel is present, restart can make modified ACL/public flags, ownership, encryption, or object layout metadata authoritative. This can affect confidentiality and integrity of stored objects, but only after a privileged local datastore-tampering precondition.
+## Assumptions
+- The deployed service uses the main argmin-s3 binary and local SQLite-backed storage.
+- An attacker can modify the storage metadata database only if they have local filesystem write access to ARGMIN_DATA_DIR, compromised backup/restore media, or an equivalent privileged local foothold.
+- The service is restarted after tampering or corruption while metadata_command_replica_state.state_digest is the unverified sentinel.
+- Default network exposure is localhost, but ARGMIN_LISTEN_ADDR can be configured to bind publicly.
+- metadata command applied_log_index greater than 128 so the online digest is stored as METADATA_STATE_DIGEST_UNVERIFIED
+- local write access to the SQLite metadata database or equivalent tampering/corruption of materialized metadata rows
+- service restart/open of the local storage cluster
+## Path
+Local DB write/corruption
+  -> state_digest == 0 after >128 metadata commands
+  -> restart/open local cluster
+  -> recompute digest from current SQLite rows
+  -> persist digest as trusted
+  -> altered ACL/public/object metadata used by S3 service
+## Path evidence
+- `crates/storage/src/pg_store.rs:69-70` - Defines METADATA_STATE_DIGEST_UNVERIFIED as 0 and the online command limit as 128.
+- `crates/storage/src/pg_store.rs:820-824` - Restart validation recomputes metadata_state_digest from current materialized rows and stores it when the persisted state digest is the unverified sentinel.
+- `crates/storage/src/pg_store.rs:1154-1164` - Persists the recomputed digest into metadata_command_replica_state, making current rows the future trusted baseline.
+- `crates/storage/src/pg_store.rs:1377-1385` - For applied_log_index greater than 128, online_metadata_state_digest returns the unverified sentinel rather than a real digest.
+- `crates/storage/src/cluster/local.rs:666-672` - Production local cluster open calls validate_metadata_command_replay_state during startup/open.
+- `crates/storage/src/cluster/local.rs:1272-1309` - Replica agreement compares post-validation states and therefore cannot detect a single replica accepting tampered rows or identical tampering across replicas.
+- `crates/storage/src/schema.rs:373-375` - Bucket metadata includes security-relevant acl_grants, public_read, and public_write fields.
+- `crates/argmin-s3/src/config.rs:31-68` - Main service configuration is environment-driven, including credentials, data directory, TLS paths, and default localhost listen address 127.0.0.1:9000.
+- `crates/argmin-s3/src/main.rs:130-153` - Main binary creates OwnerAccountAdmin credentials from environment variables and binds a TCP listener for the S3 HTTP service.
+## Narrative
+The finding is real in the production storage path. For metadata command streams beyond 128 entries, online digesting returns the sentinel value 0. During local cluster open, restart validation recomputes a digest from the current SQLite materialized metadata when it sees that sentinel and persists the digest as trusted. Replica comparison only compares the post-validation states, so it does not protect single-node deployments or identical tampering. The impact can be security-relevant because bucket metadata contains ACL and public_read/public_write fields. However, exploitation requires local write access or equivalent tampering of the service datastore plus a restart, so this is not remotely reachable through the S3 HTTP API and medium severity is appropriate.
+## Controls
+- SigV4 authentication for HTTP requests
+- OwnerAccountAdmin authorization profile for configured credential
+- default bind address 127.0.0.1:9000
+- optional TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- metadata command replay state validation on local cluster open
+- cross-replica post-validation state comparison
+- filesystem permissions assumed to protect ARGMIN_DATA_DIR
+## Blindspots
+- Static review did not enumerate all deployment manifests because the repository contains no Kubernetes or load-balancer manifests in the inspected paths.
+- No cloud APIs were queried, so actual production exposure and filesystem permission hardening are unknown.
+- Static analysis cannot prove whether a separate vulnerability could provide the required local database write primitive.
+- The exact blast radius depends on deployment topology, replica count, backup/restore workflow, and whether ARGMIN_LISTEN_ADDR is configured publicly.
