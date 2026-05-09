@@ -2147,6 +2147,29 @@ Completed:
     metadata work; CRC64 hashing is not a material hotspot
   - Phase 7.6 must measure each optimisation slice independently rather than
     hiding the cost with broad test harness shape changes
+- Phase 7.6.1 first current-path optimisation slice:
+  - increased the per-PG SQLite prepared-statement cache and routed hot
+    command-log, metadata digest state, object-version counter, direct object
+    write, delete-marker, object metadata update, and object-version delete SQL
+    through cached statements
+  - collapsed cached PG metadata digest calculation from one query per
+    digest-covered table to one cached query over `metadata_table_digests`
+  - representative selected server-core measurements:
+    - before: 67.563 summed test-seconds, 34.755s wall
+    - after command/digest helper caching: 49.436 summed test-seconds, 25.406s
+      wall
+    - after object-write/delete helper caching: 45.294 summed test-seconds,
+      23.653s wall
+  - `list_object_versions_clamps_oversized_max_keys` improved from 11.839s to
+    6.801s in the selected nextest run; the focused `perf` sample dropped from
+    roughly 53.4B cycles before Phase 7.6.1 to roughly 31.4B cycles, with
+    SQLite prepare/planning samples dropping from roughly 47.9% to roughly
+    25.5%
+  - `test_versioning_list_object_versions_oversized_max_keys_returns_at_most_1000_entries`
+    improved from 25.540s before this slice to 16.881s in the isolated S3
+    harness run
+  - simple PUT/GET remained effectively flat, which matches the goal of
+    reducing metadata-command overhead rather than changing payload behavior
 
 Exit criteria:
 

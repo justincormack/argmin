@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::functions::{Context, FunctionFlags};
 use rusqlite::types::ValueRef;
-use rusqlite::{params, params_from_iter, Connection, Error as SqlError, OptionalExtension};
+use rusqlite::{
+    params, params_from_iter, Connection, Error as SqlError, OptionalExtension, Params, Row,
+};
 
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 #[cfg(test)]
@@ -672,6 +674,8 @@ pub struct PgStore {
     conn: Connection,
 }
 
+const PG_STORE_STATEMENT_CACHE_CAPACITY: usize = 256;
+
 #[derive(Debug)]
 struct MetadataCommandLogEntry {
     command_checksum: u64,
@@ -711,6 +715,7 @@ impl PgStore {
             context: "open pg database",
             source: e,
         })?;
+        conn.set_prepared_statement_cache_capacity(PG_STORE_STATEMENT_CACHE_CAPACITY);
 
         conn.execute_batch("PRAGMA recursive_triggers = ON")
             .map_err(|e| StoreError::Db {
@@ -761,6 +766,70 @@ impl PgStore {
         &self.conn
     }
 
+    fn query_row_cached<T, P, F>(
+        &self,
+        sql: &str,
+        params: P,
+        context: &'static str,
+        f: F,
+    ) -> Result<T, StoreError>
+    where
+        P: Params,
+        F: FnOnce(&Row<'_>) -> rusqlite::Result<T>,
+    {
+        self.conn
+            .prepare_cached(sql)
+            .and_then(|mut stmt| stmt.query_row(params, f))
+            .map_err(|e| StoreError::Db { context, source: e })
+    }
+
+    fn query_row_cached_optional<T, P, F>(
+        &self,
+        sql: &str,
+        params: P,
+        context: &'static str,
+        f: F,
+    ) -> Result<Option<T>, StoreError>
+    where
+        P: Params,
+        F: FnOnce(&Row<'_>) -> rusqlite::Result<T>,
+    {
+        self.conn
+            .prepare_cached(sql)
+            .and_then(|mut stmt| stmt.query_row(params, f).optional())
+            .map_err(|e| StoreError::Db { context, source: e })
+    }
+
+    fn execute_cached<P>(
+        &self,
+        sql: &str,
+        params: P,
+        context: &'static str,
+    ) -> Result<usize, StoreError>
+    where
+        P: Params,
+    {
+        self.conn
+            .prepare_cached(sql)
+            .and_then(|mut stmt| stmt.execute(params))
+            .map_err(|e| StoreError::Db { context, source: e })
+    }
+
+    fn execute_cached_metadata<P>(
+        &self,
+        sql: &str,
+        params: P,
+        context: &'static str,
+    ) -> Result<usize, MetadataError>
+    where
+        P: Params,
+    {
+        self.conn
+            .prepare_cached(sql)
+            .and_then(|mut stmt| stmt.execute(params))
+            .map_err(|e| MetadataError::Db { context, source: e })
+    }
+
     fn ensure_metadata_digest_bootstrap(&self) -> Result<(), StoreError> {
         if !self.metadata_digest_bootstrap_needs_repair()? {
             return Ok(());
@@ -808,60 +877,47 @@ impl PgStore {
     }
 
     fn metadata_digest_bootstrap_complete(&self) -> Result<bool, StoreError> {
-        self.conn
-            .query_row(
-                "SELECT completed FROM metadata_digest_bootstrap_state WHERE singleton = 0",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map(|completed| completed == Some(1))
-            .map_err(|e| StoreError::Db {
-                context: "check metadata digest bootstrap state",
-                source: e,
-            })
+        self.query_row_cached_optional(
+            "SELECT completed FROM metadata_digest_bootstrap_state WHERE singleton = 0",
+            [],
+            "check metadata digest bootstrap state",
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|completed| completed == Some(1))
     }
 
     fn mark_metadata_digest_bootstrap_complete(&self) -> Result<(), StoreError> {
-        self.conn
-            .execute(
-                "INSERT INTO metadata_digest_bootstrap_state (singleton, completed) \
-                 VALUES (0, 1) \
-                 ON CONFLICT(singleton) DO UPDATE SET completed = excluded.completed",
-                [],
-            )
-            .map(|_| ())
-            .map_err(|e| StoreError::Db {
-                context: "mark metadata digest bootstrap complete",
-                source: e,
-            })
+        self.execute_cached(
+            "INSERT INTO metadata_digest_bootstrap_state (singleton, completed) \
+             VALUES (0, 1) \
+             ON CONFLICT(singleton) DO UPDATE SET completed = excluded.completed",
+            [],
+            "mark metadata digest bootstrap complete",
+        )
+        .map(|_| ())
     }
 
     fn install_metadata_digest_triggers(&self) -> Result<(), StoreError> {
         for table in METADATA_DIGEST_TABLES {
             if !self.metadata_digest_row_exists(table)? {
-                self.conn
-                    .execute(
-                        "INSERT INTO metadata_table_digests \
+                self.execute_cached(
+                    "INSERT INTO metadata_table_digests \
                      (table_name, table_digest, row_count, row_hash_xor, row_hash_sum) \
                      VALUES (?1, ?2, 0, 0, 0) \
                      ON CONFLICT(table_name) DO NOTHING",
-                        params![
-                            table.name,
-                            metadata_table_digest_from_stats(
-                                table,
-                                MetadataTableDigestStats {
-                                    row_count: 0,
-                                    row_hash_xor: 0,
-                                    row_hash_sum: 0,
-                                },
-                            ) as i64,
-                        ],
-                    )
-                    .map_err(|e| StoreError::Db {
-                        context: "initialize metadata digest table row",
-                        source: e,
-                    })?;
+                    params![
+                        table.name,
+                        metadata_table_digest_from_stats(
+                            table,
+                            MetadataTableDigestStats {
+                                row_count: 0,
+                                row_hash_xor: 0,
+                                row_hash_sum: 0,
+                            },
+                        ) as i64,
+                    ],
+                    "initialize metadata digest table row",
+                )?;
             }
 
             if !self.metadata_digest_triggers_complete(table)? {
@@ -877,18 +933,13 @@ impl PgStore {
     }
 
     fn metadata_digest_row_exists(&self, table: &MetadataDigestTable) -> Result<bool, StoreError> {
-        self.conn
-            .query_row(
-                "SELECT 1 FROM metadata_table_digests WHERE table_name = ?1",
-                params![table.name],
-                |_| Ok(()),
-            )
-            .optional()
-            .map(|exists| exists.is_some())
-            .map_err(|e| StoreError::Db {
-                context: "check metadata digest table row",
-                source: e,
-            })
+        self.query_row_cached_optional(
+            "SELECT 1 FROM metadata_table_digests WHERE table_name = ?1",
+            params![table.name],
+            "check metadata digest table row",
+            |_| Ok(()),
+        )
+        .map(|exists| exists.is_some())
     }
 
     fn metadata_digest_triggers_complete(
@@ -897,17 +948,12 @@ impl PgStore {
     ) -> Result<bool, StoreError> {
         for suffix in ["ai", "ad", "au"] {
             let exists = self
-                .conn
-                .query_row(
+                .query_row_cached_optional(
                     "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
                     params![format!("metadata_digest_{}_{}", table.name, suffix)],
+                    "check metadata digest trigger",
                     |_| Ok(()),
-                )
-                .optional()
-                .map_err(|e| StoreError::Db {
-                    context: "check metadata digest trigger",
-                    source: e,
-                })?
+                )?
                 .is_some();
             if !exists {
                 return Ok(false);
@@ -971,18 +1017,12 @@ impl PgStore {
     }
 
     fn ensure_metadata_command_replica_state(&self) -> Result<(), StoreError> {
-        let exists = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM metadata_command_replica_state WHERE singleton = 0",
-                [],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(|e| StoreError::Db {
-                context: "load metadata command replica state",
-                source: e,
-            })?;
+        let exists = self.query_row_cached_optional(
+            "SELECT 1 FROM metadata_command_replica_state WHERE singleton = 0",
+            [],
+            "load metadata command replica state",
+            |_| Ok(()),
+        )?;
         if exists.is_some() {
             return Ok(());
         }
@@ -991,29 +1031,24 @@ impl PgStore {
         }
 
         let state_digest = self.metadata_state_digest()?;
-        self.conn
-            .execute(
-                "INSERT INTO metadata_command_replica_state \
-                 (singleton, cluster_epoch, applied_log_index, applied_log_hash, state_digest) \
-                 VALUES (0, ?1, 0, 0, ?2)",
-                params![ClusterEpoch::INITIAL.get() as i64, state_digest as i64],
-            )
-            .map_err(|e| StoreError::Db {
-                context: "initialize metadata command replica state",
-                source: e,
-            })?;
+        self.execute_cached(
+            "INSERT INTO metadata_command_replica_state \
+             (singleton, cluster_epoch, applied_log_index, applied_log_hash, state_digest) \
+             VALUES (0, ?1, 0, 0, ?2)",
+            params![ClusterEpoch::INITIAL.get() as i64, state_digest as i64],
+            "initialize metadata command replica state",
+        )?;
         Ok(())
     }
 
     fn metadata_command_replica_state_can_initialize(&self) -> Result<bool, StoreError> {
         if self
-            .conn
-            .query_row("SELECT 1 FROM metadata_command_log LIMIT 1", [], |_| Ok(()))
-            .optional()
-            .map_err(|e| StoreError::Db {
-                context: "check metadata command log emptiness",
-                source: e,
-            })?
+            .query_row_cached_optional(
+                "SELECT 1 FROM metadata_command_log LIMIT 1",
+                [],
+                "check metadata command log emptiness",
+                |_| Ok(()),
+            )?
             .is_some()
         {
             return Ok(false);
@@ -1022,33 +1057,23 @@ impl PgStore {
         for table in METADATA_DIGEST_TABLES {
             if table.name == "pg_counters" {
                 let has_default_counter = self
-                    .conn
-                    .query_row(
+                    .query_row_cached_optional(
                         "SELECT 1 FROM pg_counters \
                          WHERE singleton = 0 AND next_bucket_execution_generation = 0",
                         [],
+                        "check canonical metadata counter baseline",
                         |_| Ok(()),
-                    )
-                    .optional()
-                    .map_err(|e| StoreError::Db {
-                        context: "check canonical metadata counter baseline",
-                        source: e,
-                    })?
+                    )?
                     .is_some();
                 let has_unexpected_counter = self
-                    .conn
-                    .query_row(
+                    .query_row_cached_optional(
                         "SELECT 1 FROM pg_counters \
                          WHERE singleton != 0 OR next_bucket_execution_generation != 0 \
                          LIMIT 1",
                         [],
+                        "check canonical metadata counter baseline",
                         |_| Ok(()),
-                    )
-                    .optional()
-                    .map_err(|e| StoreError::Db {
-                        context: "check canonical metadata counter baseline",
-                        source: e,
-                    })?
+                    )?
                     .is_some();
                 if !has_default_counter || has_unexpected_counter {
                     return Ok(false);
@@ -1082,18 +1107,13 @@ impl PgStore {
             i64,
             i64,
             i64,
-        ) = self
-            .conn
-            .query_row(
-                "SELECT cluster_epoch, applied_log_index, applied_log_hash, state_digest \
-                 FROM metadata_command_replica_state WHERE singleton = 0",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .map_err(|e| StoreError::Db {
-                context: "load metadata command replica state",
-                source: e,
-            })?;
+        ) = self.query_row_cached(
+            "SELECT cluster_epoch, applied_log_index, applied_log_hash, state_digest \
+             FROM metadata_command_replica_state WHERE singleton = 0",
+            [],
+            "load metadata command replica state",
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
         Ok(MetadataCommandReplicaState {
             cluster_epoch: ClusterEpoch::new(cluster_epoch as u64)
                 .expect("metadata command replica state stores non-zero epoch"),
@@ -1107,18 +1127,13 @@ impl PgStore {
         &self,
         cluster_epoch: ClusterEpoch,
     ) -> Result<u64, StoreError> {
-        let raw = self
-            .conn
-            .query_row(
-                "SELECT max(log_index) FROM metadata_command_log \
-                 WHERE cluster_epoch = ?1 AND pg_id = ?2",
-                params![cluster_epoch.get() as i64, self.pg_id as i64],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .map_err(|e| StoreError::Db {
-                context: "load max metadata command log index",
-                source: e,
-            })?;
+        let raw = self.query_row_cached(
+            "SELECT max(log_index) FROM metadata_command_log \
+             WHERE cluster_epoch = ?1 AND pg_id = ?2",
+            params![cluster_epoch.get() as i64, self.pg_id as i64],
+            "load max metadata command log index",
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
         raw.unwrap_or_default()
             .try_into()
             .map_err(|_| StoreError::Db {
@@ -1228,28 +1243,26 @@ impl PgStore {
         pg_id: PgId,
         log_index: MetadataCommandLogIndex,
     ) -> Result<Option<MetadataCommandLogEntry>, StoreError> {
-        self.conn
-            .query_row(
-                "SELECT command_checksum, command_bytes, abandoned, previous_log_hash, log_hash \
-                 FROM metadata_command_log \
-                 WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
-                params![
-                    cluster_epoch.get() as i64,
-                    pg_id.get() as i64,
-                    log_index.get() as i64,
-                ],
-                |row| {
-                    Ok(MetadataCommandLogEntry {
-                        command_checksum: row.get::<_, i64>(0)? as u64,
-                        command_bytes: row.get::<_, Vec<u8>>(1)?,
-                        abandoned: row.get::<_, i64>(2)? != 0,
-                        previous_log_hash: row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
-                        log_hash: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
-                    })
-                },
-            )
-            .optional()
-            .map_err(|e| StoreError::Db { context, source: e })
+        self.query_row_cached_optional(
+            "SELECT command_checksum, command_bytes, abandoned, previous_log_hash, log_hash \
+             FROM metadata_command_log \
+             WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+            params![
+                cluster_epoch.get() as i64,
+                pg_id.get() as i64,
+                log_index.get() as i64,
+            ],
+            context,
+            |row| {
+                Ok(MetadataCommandLogEntry {
+                    command_checksum: row.get::<_, i64>(0)? as u64,
+                    command_bytes: row.get::<_, Vec<u8>>(1)?,
+                    abandoned: row.get::<_, i64>(2)? != 0,
+                    previous_log_hash: row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
+                    log_hash: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
+                })
+            },
+        )
     }
 
     fn verify_metadata_command_log_entry(
@@ -1452,24 +1465,20 @@ impl PgStore {
             });
         }
         let command_bytes = command.command_bytes();
-        self.conn
-            .execute(
-                "INSERT INTO metadata_command_log \
-                 (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, NULL, NULL) \
-                 ON CONFLICT(cluster_epoch, pg_id, log_index) DO NOTHING",
-                params![
-                    command.id().cluster_epoch().get() as i64,
-                    command.id().pg_id().get() as i64,
-                    command.id().log_index().get() as i64,
-                    command.checksum_crc64() as i64,
-                    command_bytes,
-                ],
-            )
-            .map_err(|e| StoreError::Db {
-                context: "record metadata command log entry",
-                source: e,
-            })?;
+        self.execute_cached(
+            "INSERT INTO metadata_command_log \
+             (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, NULL, NULL) \
+             ON CONFLICT(cluster_epoch, pg_id, log_index) DO NOTHING",
+            params![
+                command.id().cluster_epoch().get() as i64,
+                command.id().pg_id().get() as i64,
+                command.id().log_index().get() as i64,
+                command.checksum_crc64() as i64,
+                command_bytes,
+            ],
+            "record metadata command log entry",
+        )?;
 
         let entry = self
             .load_metadata_command_log_entry(
@@ -1500,24 +1509,20 @@ impl PgStore {
         }
         let command_bytes = command.abandoned_log_bytes();
         let command_checksum = command.abandoned_log_checksum_crc64();
-        self.conn
-            .execute(
-                "INSERT INTO metadata_command_log \
-                 (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL, NULL) \
-                 ON CONFLICT(cluster_epoch, pg_id, log_index) DO NOTHING",
-                params![
-                    command.id().cluster_epoch().get() as i64,
-                    command.id().pg_id().get() as i64,
-                    command.id().log_index().get() as i64,
-                    command_checksum as i64,
-                    command_bytes,
-                ],
-            )
-            .map_err(|e| StoreError::Db {
-                context: "record abandoned metadata command log entry",
-                source: e,
-            })?;
+        self.execute_cached(
+            "INSERT INTO metadata_command_log \
+             (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL, NULL) \
+             ON CONFLICT(cluster_epoch, pg_id, log_index) DO NOTHING",
+            params![
+                command.id().cluster_epoch().get() as i64,
+                command.id().pg_id().get() as i64,
+                command.id().log_index().get() as i64,
+                command_checksum as i64,
+                command_bytes,
+            ],
+            "record abandoned metadata command log entry",
+        )?;
 
         let entry = self
             .load_metadata_command_log_entry(
@@ -1546,18 +1551,18 @@ impl PgStore {
             });
         }
         let (raw_min, raw_max, raw_retained, raw_abandoned, raw_applied_entries) = self
-            .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT min(log_index), max(log_index), count(*), \
-                        coalesce(sum(abandoned), 0), \
-                        coalesce(sum(CASE WHEN log_index <= ?3 THEN 1 ELSE 0 END), 0) \
-                   FROM metadata_command_log \
-                  WHERE cluster_epoch = ?1 AND pg_id = ?2",
+                    coalesce(sum(abandoned), 0), \
+                    coalesce(sum(CASE WHEN log_index <= ?3 THEN 1 ELSE 0 END), 0) \
+                 FROM metadata_command_log \
+                 WHERE cluster_epoch = ?1 AND pg_id = ?2",
                 params![
                     cluster_epoch.get() as i64,
                     self.pg_id as i64,
                     state.applied_log_index as i64,
                 ],
+                "load metadata command log stats",
                 |row| {
                     Ok((
                         row.get::<_, Option<i64>>(0)?,
@@ -1567,11 +1572,7 @@ impl PgStore {
                         row.get::<_, i64>(4)?,
                     ))
                 },
-            )
-            .map_err(|e| StoreError::Db {
-                context: "load metadata command log stats",
-                source: e,
-            })?;
+            )?;
 
         let min_log_index = raw_min
             .map(|raw| decode_nonnegative_u64("decode minimum metadata command log index", raw))
@@ -1624,15 +1625,11 @@ impl PgStore {
     }
 
     fn store_metadata_command_state_digest(&self, state_digest: u64) -> Result<(), StoreError> {
-        self.conn
-            .execute(
-                "UPDATE metadata_command_replica_state SET state_digest = ?1 WHERE singleton = 0",
-                params![state_digest as i64],
-            )
-            .map_err(|e| StoreError::Db {
-                context: "refresh metadata command state digest",
-                source: e,
-            })?;
+        self.execute_cached(
+            "UPDATE metadata_command_replica_state SET state_digest = ?1 WHERE singleton = 0",
+            params![state_digest as i64],
+            "refresh metadata command state digest",
+        )?;
         Ok(())
     }
 
@@ -1713,23 +1710,19 @@ impl PgStore {
             );
             match (entry.previous_log_hash, entry.log_hash) {
                 (None, None) => {
-                    self.conn
-                        .execute(
-                            "UPDATE metadata_command_log \
-                             SET previous_log_hash = ?1, log_hash = ?2 \
-                             WHERE cluster_epoch = ?3 AND pg_id = ?4 AND log_index = ?5",
-                            params![
-                                applied_log_hash as i64,
-                                expected_log_hash as i64,
-                                cluster_epoch.get() as i64,
-                                self.pg_id as i64,
-                                next_log_index as i64,
-                            ],
-                        )
-                        .map_err(|e| StoreError::Db {
-                            context: "update metadata command log hash",
-                            source: e,
-                        })?;
+                    self.execute_cached(
+                        "UPDATE metadata_command_log \
+                         SET previous_log_hash = ?1, log_hash = ?2 \
+                         WHERE cluster_epoch = ?3 AND pg_id = ?4 AND log_index = ?5",
+                        params![
+                            applied_log_hash as i64,
+                            expected_log_hash as i64,
+                            cluster_epoch.get() as i64,
+                            self.pg_id as i64,
+                            next_log_index as i64,
+                        ],
+                        "update metadata command log hash",
+                    )?;
                 }
                 (Some(previous_log_hash), Some(log_hash))
                     if previous_log_hash == applied_log_hash && log_hash == expected_log_hash => {}
@@ -1751,23 +1744,24 @@ impl PgStore {
         }
 
         let state_digest = self.cached_metadata_state_digest()?;
-        self.conn
-            .execute(
-                "UPDATE metadata_command_replica_state \
-                 SET cluster_epoch = ?1, applied_log_index = ?2, applied_log_hash = ?3, state_digest = ?4 \
-                 WHERE singleton = 0",
-                params![
-                    cluster_epoch.get() as i64,
-                    applied_log_index as i64,
-                    applied_log_hash as i64,
-                    state_digest as i64,
-                ],
-            )
-            .map_err(|e| StoreError::Db {
-                context: "update metadata command replica state",
-                source: e,
-            })?;
-        self.metadata_command_replica_state()
+        self.execute_cached(
+            "UPDATE metadata_command_replica_state \
+             SET cluster_epoch = ?1, applied_log_index = ?2, applied_log_hash = ?3, state_digest = ?4 \
+             WHERE singleton = 0",
+            params![
+                cluster_epoch.get() as i64,
+                applied_log_index as i64,
+                applied_log_hash as i64,
+                state_digest as i64,
+            ],
+            "update metadata command replica state",
+        )?;
+        Ok(MetadataCommandReplicaState {
+            cluster_epoch,
+            applied_log_index,
+            applied_log_hash,
+            state_digest,
+        })
     }
 
     fn metadata_state_digest(&self) -> Result<u64, StoreError> {
@@ -1867,68 +1861,101 @@ impl PgStore {
     fn refresh_metadata_table_digest(&self, table: &MetadataDigestTable) -> Result<(), StoreError> {
         let stats = self.metadata_table_digest_stats(table)?;
         let table_digest = metadata_table_digest_from_stats(table, stats);
-        self.conn
-            .execute(
-                "INSERT INTO metadata_table_digests \
-                 (table_name, table_digest, row_count, row_hash_xor, row_hash_sum) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT(table_name) DO UPDATE SET \
-                    table_digest = excluded.table_digest, \
-                    row_count = excluded.row_count, \
-                    row_hash_xor = excluded.row_hash_xor, \
-                    row_hash_sum = excluded.row_hash_sum",
-                params![
-                    table.name,
-                    table_digest as i64,
-                    stats.row_count as i64,
-                    stats.row_hash_xor as i64,
-                    stats.row_hash_sum as i64,
-                ],
-            )
-            .map_err(|e| StoreError::Db {
-                context: "refresh metadata table digest",
-                source: e,
-            })?;
+        self.execute_cached(
+            "INSERT INTO metadata_table_digests \
+             (table_name, table_digest, row_count, row_hash_xor, row_hash_sum) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(table_name) DO UPDATE SET \
+                table_digest = excluded.table_digest, \
+                row_count = excluded.row_count, \
+                row_hash_xor = excluded.row_hash_xor, \
+                row_hash_sum = excluded.row_hash_sum",
+            params![
+                table.name,
+                table_digest as i64,
+                stats.row_count as i64,
+                stats.row_hash_xor as i64,
+                stats.row_hash_sum as i64,
+            ],
+            "refresh metadata table digest",
+        )?;
         Ok(())
     }
 
+    #[cfg(test)]
     fn cached_metadata_table_digest(&self, table: &MetadataDigestTable) -> Result<u64, StoreError> {
-        let raw = self
-            .conn
-            .query_row(
-                "SELECT table_digest FROM metadata_table_digests WHERE table_name = ?1",
-                params![table.name],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(|e| StoreError::Db {
-                context: "load cached metadata table digest",
-                source: e,
-            })?;
+        let raw = self.query_row_cached_optional(
+            "SELECT table_digest FROM metadata_table_digests WHERE table_name = ?1",
+            params![table.name],
+            "load cached metadata table digest",
+            |row| row.get::<_, i64>(0),
+        )?;
         match raw {
             Some(value) => Ok(value as u64),
             None => {
                 self.refresh_all_metadata_table_digests()?;
-                self.conn
-                    .query_row(
-                        "SELECT table_digest FROM metadata_table_digests WHERE table_name = ?1",
-                        params![table.name],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .map(|value| value as u64)
-                    .map_err(|e| StoreError::Db {
-                        context: "load initialized cached metadata table digest",
-                        source: e,
-                    })
+                self.query_row_cached(
+                    "SELECT table_digest FROM metadata_table_digests WHERE table_name = ?1",
+                    params![table.name],
+                    "load initialized cached metadata table digest",
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|value| value as u64)
             }
         }
     }
 
+    fn cached_metadata_table_digests(&self) -> Result<HashMap<String, u64>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT table_name, table_digest FROM metadata_table_digests")
+            .map_err(|e| StoreError::Db {
+                context: "prepare cached metadata table digests",
+                source: e,
+            })?;
+        let mut rows = stmt.query([]).map_err(|e| StoreError::Db {
+            context: "load cached metadata table digests",
+            source: e,
+        })?;
+        let mut digests = HashMap::with_capacity(METADATA_DIGEST_TABLES.len());
+        while let Some(row) = rows.next().map_err(|e| StoreError::Db {
+            context: "load cached metadata table digest row",
+            source: e,
+        })? {
+            let table_name = row.get::<_, String>(0).map_err(|e| StoreError::Db {
+                context: "decode cached metadata table digest name",
+                source: e,
+            })?;
+            let table_digest = row.get::<_, i64>(1).map_err(|e| StoreError::Db {
+                context: "decode cached metadata table digest",
+                source: e,
+            })? as u64;
+            digests.insert(table_name, table_digest);
+        }
+        Ok(digests)
+    }
+
     fn cached_metadata_state_digest(&self) -> Result<u64, StoreError> {
+        let mut table_digests = self.cached_metadata_table_digests()?;
+        if METADATA_DIGEST_TABLES
+            .iter()
+            .any(|table| !table_digests.contains_key(table.name))
+        {
+            self.refresh_all_metadata_table_digests()?;
+            table_digests = self.cached_metadata_table_digests()?;
+        }
+
         let mut hasher = checksum::crc64::Hasher::new();
         Self::digest_canonical_pg_state_header(&mut hasher);
         for table in METADATA_DIGEST_TABLES {
-            let table_digest = self.cached_metadata_table_digest(table)?;
+            let table_digest =
+                table_digests
+                    .get(table.name)
+                    .copied()
+                    .ok_or_else(|| StoreError::Db {
+                        context: "load initialized cached metadata table digest",
+                        source: rusqlite::Error::QueryReturnedNoRows,
+                    })?;
             Self::digest_metadata_table_digest_entry(&mut hasher, table, table_digest);
         }
         Ok(hasher.finalize())
@@ -5301,31 +5328,26 @@ impl PgStore {
                 context: "put object metadata command (encode object lock)",
                 source: e,
             })?;
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE objects \
-                 SET tags = ?1, acl_grants = ?2, public_read = ?3, \
-                     object_lock_retention_mode = ?4, object_lock_retain_until = ?5, \
-                     object_lock_legal_hold = ?6 \
-                 WHERE bucket = ?7 AND key = ?8 AND version_id = ?9 AND status = ?10",
-                params![
-                    tags,
-                    object.acl_grants.serialized(),
-                    i32::from(object.public_read),
-                    object_lock_retention_mode,
-                    object_lock_retain_until,
-                    object_lock_legal_hold,
-                    &object.bucket,
-                    &object.key,
-                    object.version_id.to_u64() as i64,
-                    ObjectState::Live as u8,
-                ],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put object metadata command",
-                source: e,
-            })?;
+        let updated = self.execute_cached_metadata(
+            "UPDATE objects \
+             SET tags = ?1, acl_grants = ?2, public_read = ?3, \
+                 object_lock_retention_mode = ?4, object_lock_retain_until = ?5, \
+                 object_lock_legal_hold = ?6 \
+             WHERE bucket = ?7 AND key = ?8 AND version_id = ?9 AND status = ?10",
+            params![
+                tags,
+                object.acl_grants.serialized(),
+                i32::from(object.public_read),
+                object_lock_retention_mode,
+                object_lock_retain_until,
+                object_lock_legal_hold,
+                &object.bucket,
+                &object.key,
+                object.version_id.to_u64() as i64,
+                ObjectState::Live as u8,
+            ],
+            "put object metadata command",
+        )?;
         if updated == 0 {
             return Err(MetadataError::ObjectNotFound);
         }
@@ -6264,24 +6286,20 @@ impl PgStore {
               storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read) \
              VALUES (?1, ?2, ?3, ?4, NULL, 0, zeroblob(0), 0, ?5, 0, 0, 0, 1, 0, NULL, NULL, NULL, 0, NULL, ?6, ?7, ?8, 0)"
         };
-        self.conn
-            .execute(
-                sql,
-                params![
-                    command.bucket,
-                    command.key,
-                    command.version_id.to_u64() as i64,
-                    command.write_sequence as i64,
-                    command.last_modified_millis as i64,
-                    command.owner.principal,
-                    command.owner.canonical_id.as_str(),
-                    "",
-                ],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put object meta (delete marker)",
-                source: e,
-            })?;
+        self.execute_cached_metadata(
+            sql,
+            params![
+                command.bucket,
+                command.key,
+                command.version_id.to_u64() as i64,
+                command.write_sequence as i64,
+                command.last_modified_millis as i64,
+                command.owner.principal,
+                command.owner.canonical_id.as_str(),
+                "",
+            ],
+            "put object meta (delete marker)",
+        )?;
         Ok(())
     }
 
@@ -6299,15 +6317,11 @@ impl PgStore {
             })?
             .is_some_and(|(current_version_id, _)| current_version_id == version_id);
 
-        self.conn
-            .execute(
-                "DELETE FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                params![bucket, key, version_id.to_u64() as i64],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "delete object version",
-                source: e,
-            })?;
+        self.execute_cached_metadata(
+            "DELETE FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+            params![bucket, key, version_id.to_u64() as i64],
+            "delete object version",
+        )?;
 
         if deleted_was_current {
             self.clear_current_live_noncurrent(bucket.as_str(), key.as_str())
@@ -6864,18 +6878,14 @@ impl PgStore {
                 Box::from("version_id exceeds SQLite integer range"),
             ),
         })?;
-        self.conn
-            .execute(
-                "INSERT INTO object_version_counters (bucket, key, next_version_id) \
-                 VALUES (?1, ?2, ?3) \
-                 ON CONFLICT(bucket, key) DO UPDATE SET \
-                     next_version_id = max(object_version_counters.next_version_id, excluded.next_version_id)",
-                params![bucket, key, following],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "advance object version counter",
-                source: e,
-            })?;
+        self.execute_cached_metadata(
+            "INSERT INTO object_version_counters (bucket, key, next_version_id) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(bucket, key) DO UPDATE SET \
+                 next_version_id = max(object_version_counters.next_version_id, excluded.next_version_id)",
+            params![bucket, key, following],
+            "advance object version counter",
+        )?;
         Ok(())
     }
 
@@ -6913,11 +6923,15 @@ impl PgStore {
         version_id: VersionId,
     ) -> Result<Option<u64>, MetadataError> {
         self.conn
-            .query_row(
+            .prepare_cached(
                 "SELECT write_sequence FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                params![bucket, key, version_id.to_u64() as i64],
-                |row| row.get::<_, i64>(0),
             )
+            .and_then(|mut stmt| {
+                stmt.query_row(
+                    params![bucket, key, version_id.to_u64() as i64],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
             .optional()
             .map_err(|e| MetadataError::Db {
                 context: "get object write sequence",
@@ -6942,18 +6956,19 @@ impl PgStore {
         key: &str,
     ) -> Result<Option<(VersionId, ObjectState)>, rusqlite::Error> {
         self.conn
-            .query_row(
+            .prepare_cached(
                 "SELECT version_id, status FROM objects \
                  WHERE bucket = ?1 AND key = ?2 \
                  ORDER BY write_sequence DESC LIMIT 1",
-                params![bucket, key],
-                |row| {
+            )
+            .and_then(|mut stmt| {
+                stmt.query_row(params![bucket, key], |row| {
                     let version_id = Self::parse_version_id(row.get::<_, i64>(0)?, 0)?;
                     let status =
                         Self::parse_enum(row.get::<_, u8>(1)?, 1, "status", ObjectState::from_u8)?;
                     Ok((version_id, status))
-                },
-            )
+                })
+            })
             .optional()
     }
 
@@ -6971,18 +6986,19 @@ impl PgStore {
             return Ok(());
         }
 
-        self.conn.execute(
-            "UPDATE objects SET became_noncurrent_at = ?1 \
+        self.conn
+            .prepare_cached(
+                "UPDATE objects SET became_noncurrent_at = ?1 \
              WHERE bucket = ?2 AND key = ?3 AND version_id = ?4 AND status = ?5 \
                AND became_noncurrent_at IS NULL",
-            params![
+            )?
+            .execute(params![
                 transition_time as i64,
                 bucket,
                 key,
                 current_version_id.to_u64() as i64,
                 ObjectState::Live as u8,
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 
@@ -6998,17 +7014,18 @@ impl PgStore {
             return Ok(());
         }
 
-        self.conn.execute(
-            "UPDATE objects SET became_noncurrent_at = NULL \
+        self.conn
+            .prepare_cached(
+                "UPDATE objects SET became_noncurrent_at = NULL \
              WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND status = ?4 \
                AND became_noncurrent_at IS NOT NULL",
-            params![
+            )?
+            .execute(params![
                 bucket,
                 key,
                 current_version_id.to_u64() as i64,
                 ObjectState::Live as u8,
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 
@@ -7389,57 +7406,49 @@ impl PgStore {
               storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)"
         };
-        self.conn
-            .execute(
-                obj_sql,
-                params![
-                    obj.bucket,
-                    obj.key,
-                    obj.version_id.to_u64() as i64,
-                    write_sequence as i64,
-                    obj.generation_id.get() as i64,
-                    obj.size as i64,
-                    obj.etag.as_bytes().as_slice(),
-                    etag_kind,
-                    last_modified as i64,
-                    obj.ec.k,
-                    obj.ec.m,
-                    status,
-                    data_layout,
-                    parts_count,
-                    tags,
-                    metadata_blob,
-                    system_metadata_blob,
-                    encryption_type,
-                    encryption_state,
-                    obj.owner.principal,
-                    obj.owner.canonical_id.as_str(),
-                    obj.acl_grants.serialized(),
-                    i32::from(obj.public_read),
-                    object_lock_retention_mode,
-                    object_lock_retain_until,
-                    object_lock_legal_hold,
-                ],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put explicit segment object (write object)",
-                source: e,
-            })?;
+        self.execute_cached_metadata(
+            obj_sql,
+            params![
+                obj.bucket,
+                obj.key,
+                obj.version_id.to_u64() as i64,
+                write_sequence as i64,
+                obj.generation_id.get() as i64,
+                obj.size as i64,
+                obj.etag.as_bytes().as_slice(),
+                etag_kind,
+                last_modified as i64,
+                obj.ec.k,
+                obj.ec.m,
+                status,
+                data_layout,
+                parts_count,
+                tags,
+                metadata_blob,
+                system_metadata_blob,
+                encryption_type,
+                encryption_state,
+                obj.owner.principal,
+                obj.owner.canonical_id.as_str(),
+                obj.acl_grants.serialized(),
+                i32::from(obj.public_read),
+                object_lock_retention_mode,
+                object_lock_retain_until,
+                object_lock_legal_hold,
+            ],
+            "put explicit segment object (write object)",
+        )?;
 
-        self.conn
-            .execute(
-                "DELETE FROM object_segments \
-                 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                params![obj.bucket, obj.key, obj.version_id.to_u64() as i64],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put explicit segment object (delete prior segments)",
-                source: e,
-            })?;
+        self.execute_cached_metadata(
+            "DELETE FROM object_segments \
+             WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+            params![obj.bucket, obj.key, obj.version_id.to_u64() as i64],
+            "put explicit segment object (delete prior segments)",
+        )?;
 
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "INSERT INTO object_segments \
                  (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, segment_vid, \
                   data_pg_id, ec_k, ec_m) \
