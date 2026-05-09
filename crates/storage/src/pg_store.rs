@@ -66,8 +66,6 @@ const PART_SEGMENT_STAGING_VERSION_ID: VersionId = MULTIPART_PART_SEGMENT_STAGIN
 #[cfg(test)]
 type StreamSessionRow = (u8, u8, BucketName, ObjectKey, Option<UploadId>, Option<i64>);
 
-const METADATA_STATE_DIGEST_UNVERIFIED: u64 = 0;
-const METADATA_STATE_DIGEST_ONLINE_COMMAND_LIMIT: u64 = 128;
 const METADATA_CANONICAL_STATE_ENCODING_VERSION: u8 = 1;
 const METADATA_CANONICAL_PG_STATE_DOMAIN: &[u8] = b"argmin.metadata.pg-state";
 
@@ -123,6 +121,7 @@ fn decode_nonnegative_u64(context: &'static str, raw: i64) -> Result<u64, StoreE
 struct MetadataDigestTable {
     name: &'static str,
     columns: &'static [&'static str],
+    order_columns: &'static [&'static str],
     filter: MetadataDigestFilter,
 }
 
@@ -138,6 +137,7 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
     MetadataDigestTable {
         name: "bucket_subresources",
         columns: &["bucket_name", "kind", "body", "generation", "aux_int_1"],
+        order_columns: &["bucket_name", "kind"],
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
@@ -172,6 +172,7 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "object_lock_default_days",
             "object_lock_default_years",
         ],
+        order_columns: &["name"],
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
@@ -187,6 +188,7 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "initiator_principal",
             "initiator_canonical_id",
         ],
+        order_columns: &["upload_id"],
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
@@ -206,6 +208,7 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "ec_k",
             "ec_m",
         ],
+        order_columns: &["bucket", "key", "upload_id", "part_number", "segment_index"],
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
@@ -224,6 +227,7 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "last_modified",
             "checksum",
         ],
+        order_columns: &["upload_id", "part_number"],
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
@@ -239,6 +243,13 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "data_pg_id",
             "ec_k",
             "ec_m",
+        ],
+        order_columns: &[
+            "bucket",
+            "key",
+            "generation_id",
+            "part_number",
+            "segment_index",
         ],
         filter: MetadataDigestFilter::AllRows,
     },
@@ -256,11 +267,13 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "ec_k",
             "ec_m",
         ],
+        order_columns: &["bucket", "key", "generation_id", "part_number"],
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
         name: "multipart_reclaims",
         columns: &["bucket", "key", "generation_id", "created_at"],
+        order_columns: &["bucket", "key", "generation_id"],
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
@@ -289,6 +302,7 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "object_lock_retain_until",
             "object_lock_legal_hold",
         ],
+        order_columns: &["upload_id"],
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
@@ -300,11 +314,13 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "generation_id",
             "created_at",
         ],
+        order_columns: &["reservation_id"],
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
         name: "object_version_counters",
         columns: &["bucket", "key", "next_version_id"],
+        order_columns: &["bucket", "key"],
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
@@ -325,6 +341,7 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "data_pg_id",
             "checksum",
         ],
+        order_columns: &["bucket", "key", "version_id", "part_number"],
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
@@ -340,6 +357,7 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "ec_k",
             "ec_m",
         ],
+        order_columns: &["bucket", "key", "generation_id", "segment_index"],
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
@@ -357,11 +375,13 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "ec_k",
             "ec_m",
         ],
+        order_columns: &["bucket", "key", "version_id", "segment_index"],
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
         name: "object_segments_reclaims",
         columns: &["bucket", "key", "generation_id", "created_at"],
+        order_columns: &["bucket", "key", "generation_id"],
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
@@ -396,11 +416,13 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "object_lock_legal_hold",
             "became_noncurrent_at",
         ],
+        order_columns: &["bucket", "key", "version_id"],
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
         name: "pg_counters",
         columns: &["singleton", "next_bucket_execution_generation"],
+        order_columns: &["singleton"],
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
@@ -416,6 +438,7 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "ec_k",
             "ec_m",
         ],
+        order_columns: &["session_id", "segment_index"],
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
@@ -432,9 +455,103 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "encryption_type",
             "encryption_state",
         ],
+        order_columns: &["session_id"],
         filter: MetadataDigestFilter::AllRows,
     },
 ];
+
+const BUCKET_RECORD_TABLES: &[&str] = &["buckets", "pg_counters"];
+const BUCKET_SUBRESOURCE_TABLES: &[&str] = &["bucket_subresources", "buckets", "pg_counters"];
+const BUCKET_SEQUENCE_TABLES: &[&str] = &["buckets"];
+const OBJECT_GENERATION_RESERVATION_TABLES: &[&str] = &["object_generation_reservations"];
+const OBJECT_VERSION_COUNTER_TABLES: &[&str] = &["object_version_counters"];
+const DIRECT_OBJECT_COMMIT_TABLES: &[&str] = &[
+    "objects",
+    "object_segments",
+    "object_generation_reservations",
+    "stream_uploads",
+    "stream_upload_segments",
+];
+const DIRECT_OBJECT_COMMIT_STALE_SEGMENTS_TABLES: &[&str] = &[
+    "objects",
+    "object_segments",
+    "object_generation_reservations",
+    "stream_uploads",
+    "stream_upload_segments",
+    "object_segments_reclaims",
+    "object_segment_reclaim_segments",
+];
+const DIRECT_OBJECT_COMMIT_STALE_MULTIPART_TABLES: &[&str] = &[
+    "objects",
+    "object_segments",
+    "object_generation_reservations",
+    "stream_uploads",
+    "stream_upload_segments",
+    "multipart_reclaims",
+    "multipart_reclaim_parts",
+    "multipart_reclaim_part_segments",
+    "object_parts",
+    "multipart_part_segments",
+];
+const MULTIPART_OBJECT_COMMIT_TABLES: &[&str] = &[
+    "objects",
+    "object_segments",
+    "object_parts",
+    "object_segments_reclaims",
+    "object_segment_reclaim_segments",
+    "multipart_uploads",
+    "multipart_parts",
+    "multipart_part_segments",
+    "multipart_reclaims",
+    "multipart_reclaim_parts",
+    "multipart_reclaim_part_segments",
+    "completed_multipart_uploads",
+    "stream_uploads",
+    "stream_upload_segments",
+    "object_generation_reservations",
+];
+const OBJECT_DELETE_MARKER_TABLES: &[&str] = &["objects"];
+const OBJECT_SEGMENT_DELETE_TABLES: &[&str] = &[
+    "objects",
+    "object_segments",
+    "object_segments_reclaims",
+    "object_segment_reclaim_segments",
+];
+const OBJECT_MULTIPART_DELETE_TABLES: &[&str] = &[
+    "objects",
+    "object_parts",
+    "multipart_part_segments",
+    "multipart_reclaims",
+    "multipart_reclaim_parts",
+    "multipart_reclaim_part_segments",
+];
+const OBJECT_METADATA_TABLES: &[&str] = &["objects"];
+const STREAM_CREATE_TABLES: &[&str] = &["stream_uploads", "object_generation_reservations"];
+const STREAM_APPEND_TABLES: &[&str] = &["stream_upload_segments"];
+const STREAM_TERMINAL_TABLES: &[&str] = &[
+    "stream_uploads",
+    "stream_upload_segments",
+    "multipart_parts",
+    "multipart_part_segments",
+    "object_generation_reservations",
+];
+const MULTIPART_CREATE_TABLES: &[&str] = &["multipart_uploads", "object_generation_reservations"];
+const MULTIPART_ABORT_TABLES: &[&str] = &[
+    "multipart_uploads",
+    "multipart_parts",
+    "multipart_part_segments",
+    "stream_uploads",
+    "stream_upload_segments",
+    "object_generation_reservations",
+];
+const PAYLOAD_RECLAIM_TABLES: &[&str] = &[
+    "object_segments_reclaims",
+    "object_segment_reclaim_segments",
+    "multipart_reclaims",
+    "multipart_reclaim_parts",
+    "multipart_reclaim_part_segments",
+];
+const COMPLETED_MULTIPART_TABLES: &[&str] = &["completed_multipart_uploads"];
 
 #[derive(Debug, Clone, Copy)]
 enum BucketExecutionGeneration {
@@ -525,6 +642,13 @@ fn digest_len_prefixed_bytes(hasher: &mut checksum::crc64::Hasher, bytes: &[u8])
     hasher.update(bytes);
 }
 
+fn digest_len_prefixed_bytes_crc64(hasher: &mut checksum::crc64::Hasher, bytes: &[u8]) {
+    let mut value_hasher = checksum::crc64::Hasher::new();
+    value_hasher.update(bytes);
+    digest_u64(hasher, bytes.len() as u64);
+    digest_u64(hasher, value_hasher.finalize());
+}
+
 fn digest_u8(hasher: &mut checksum::crc64::Hasher, value: u8) {
     hasher.update(&[value]);
 }
@@ -539,6 +663,62 @@ fn digest_u64(hasher: &mut checksum::crc64::Hasher, value: u64) {
 
 fn quote_sql_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn metadata_command_affected_table_names(
+    payload: &MetadataCommandPayload,
+) -> &'static [&'static str] {
+    match payload {
+        MetadataCommandPayload::CreateBucket(_)
+        | MetadataCommandPayload::PutBucketVersioning(_)
+        | MetadataCommandPayload::PutBucketAcl(_)
+        | MetadataCommandPayload::PutBucketProperty(_)
+        | MetadataCommandPayload::MarkBucketDeleting(_) => BUCKET_RECORD_TABLES,
+        MetadataCommandPayload::PutBucketSubresource(_) => BUCKET_SUBRESOURCE_TABLES,
+        MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
+            BUCKET_SEQUENCE_TABLES
+        }
+        MetadataCommandPayload::ReserveObjectGeneration(_)
+        | MetadataCommandPayload::ReleaseObjectGeneration(_) => {
+            OBJECT_GENERATION_RESERVATION_TABLES
+        }
+        MetadataCommandPayload::ReserveObjectVersion(_) => OBJECT_VERSION_COUNTER_TABLES,
+        MetadataCommandPayload::CommitDirectPutObject(commit) => match &commit.stale_payload {
+            None => DIRECT_OBJECT_COMMIT_TABLES,
+            Some(ObjectPayloadReclaimCommand::Segments(_)) => {
+                DIRECT_OBJECT_COMMIT_STALE_SEGMENTS_TABLES
+            }
+            Some(ObjectPayloadReclaimCommand::Multipart(_)) => {
+                DIRECT_OBJECT_COMMIT_STALE_MULTIPART_TABLES
+            }
+        },
+        MetadataCommandPayload::CommitMultipartObject(_) => MULTIPART_OBJECT_COMMIT_TABLES,
+        MetadataCommandPayload::DeleteObjectVersion(delete) => match &delete.target {
+            DeleteObjectVersionTarget::DeleteMarker => OBJECT_DELETE_MARKER_TABLES,
+            DeleteObjectVersionTarget::Live {
+                payload: ObjectPayloadReclaimCommand::Segments(_),
+                ..
+            } => OBJECT_SEGMENT_DELETE_TABLES,
+            DeleteObjectVersionTarget::Live {
+                payload: ObjectPayloadReclaimCommand::Multipart(_),
+                ..
+            } => OBJECT_MULTIPART_DELETE_TABLES,
+        },
+        MetadataCommandPayload::InsertDeleteMarker(marker) => match &marker.stale_payload {
+            None => OBJECT_DELETE_MARKER_TABLES,
+            Some(ObjectPayloadReclaimCommand::Segments(_)) => OBJECT_SEGMENT_DELETE_TABLES,
+            Some(ObjectPayloadReclaimCommand::Multipart(_)) => OBJECT_MULTIPART_DELETE_TABLES,
+        },
+        MetadataCommandPayload::PutObjectMetadata(_) => OBJECT_METADATA_TABLES,
+        MetadataCommandPayload::CreateStreamUpload(_) => STREAM_CREATE_TABLES,
+        MetadataCommandPayload::AppendStreamSegment(_) => STREAM_APPEND_TABLES,
+        MetadataCommandPayload::AbortStreamUpload(_)
+        | MetadataCommandPayload::CommitStreamPart(_) => STREAM_TERMINAL_TABLES,
+        MetadataCommandPayload::CreateMultipartUpload(_) => MULTIPART_CREATE_TABLES,
+        MetadataCommandPayload::AbortMultipartUpload(_) => MULTIPART_ABORT_TABLES,
+        MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => PAYLOAD_RECLAIM_TABLES,
+        MetadataCommandPayload::DeleteCompletedMultipartUpload(_) => COMPLETED_MULTIPART_TABLES,
+    }
 }
 
 /// Per-PG store combining shard file I/O with SQLite metadata.
@@ -797,7 +977,6 @@ impl PgStore {
                 current_epoch: cluster_epoch,
             });
         }
-        let mut state = state;
         let mut applied_log_hash = 0_u64;
         for raw_log_index in 1..=state.applied_log_index {
             let log_index = MetadataCommandLogIndex::new(raw_log_index)
@@ -861,10 +1040,7 @@ impl PgStore {
             });
         }
         let actual_digest = self.metadata_state_digest()?;
-        if state.state_digest == METADATA_STATE_DIGEST_UNVERIFIED {
-            self.store_metadata_command_state_digest(actual_digest)?;
-            state.state_digest = actual_digest;
-        } else if state.state_digest != actual_digest {
+        if state.state_digest != actual_digest {
             return Err(StoreError::MetadataStateDigestMismatch {
                 node_id,
                 pg_id: self.pg_id,
@@ -1008,7 +1184,7 @@ impl PgStore {
             });
         }
         if let Some((cluster_epoch, expected_digest, actual_digest)) =
-            self.online_metadata_state_digest_mismatch()?
+            self.metadata_state_digest_mismatch()?
         {
             return Err(StoreError::MetadataStateDigestMismatch {
                 node_id,
@@ -1048,7 +1224,7 @@ impl PgStore {
             });
         }
         if let Some((cluster_epoch, expected_digest, actual_digest)) =
-            self.online_metadata_state_digest_mismatch()?
+            self.metadata_state_digest_mismatch()?
         {
             return Err(StoreError::MetadataStateDigestMismatch {
                 node_id,
@@ -1137,6 +1313,9 @@ impl PgStore {
         if !self.metadata_command_log_entry_matches(node_id, command, &entry, false)? {
             return Err(self.metadata_command_log_conflict(node_id, command));
         }
+        self.refresh_metadata_table_digests(metadata_command_affected_table_names(
+            command.payload(),
+        ))?;
         self.advance_metadata_command_log_state(node_id, command.id().cluster_epoch())
     }
 
@@ -1273,8 +1452,8 @@ impl PgStore {
     }
 
     pub(crate) fn refresh_metadata_command_state_digest(&self) -> Result<(), StoreError> {
-        let state = self.metadata_command_replica_state()?;
-        let state_digest = self.online_metadata_state_digest(state.applied_log_index)?;
+        self.refresh_all_metadata_table_digests()?;
+        let state_digest = self.cached_metadata_state_digest()?;
         self.store_metadata_command_state_digest(state_digest)
     }
 
@@ -1291,14 +1470,11 @@ impl PgStore {
         Ok(())
     }
 
-    fn online_metadata_state_digest_mismatch(
+    fn metadata_state_digest_mismatch(
         &self,
     ) -> Result<Option<(ClusterEpoch, u64, u64)>, StoreError> {
         let state = self.metadata_command_replica_state()?;
-        if state.state_digest == METADATA_STATE_DIGEST_UNVERIFIED {
-            return Ok(None);
-        }
-        let actual_digest = self.metadata_state_digest()?;
+        let actual_digest = self.cached_metadata_state_digest()?;
         if state.state_digest == actual_digest {
             return Ok(None);
         }
@@ -1316,11 +1492,12 @@ impl PgStore {
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         let mut state = self.metadata_command_replica_state()?;
         if state.cluster_epoch != cluster_epoch {
+            self.refresh_all_metadata_table_digests()?;
             state = MetadataCommandReplicaState {
                 cluster_epoch,
                 applied_log_index: 0,
                 applied_log_hash: 0,
-                state_digest: self.online_metadata_state_digest(0)?,
+                state_digest: self.cached_metadata_state_digest()?,
             };
         }
 
@@ -1392,7 +1569,7 @@ impl PgStore {
             applied_log_hash = expected_log_hash;
         }
 
-        let state_digest = self.online_metadata_state_digest(applied_log_index)?;
+        let state_digest = self.cached_metadata_state_digest()?;
         self.conn
             .execute(
                 "UPDATE metadata_command_replica_state \
@@ -1416,7 +1593,8 @@ impl PgStore {
         let mut hasher = checksum::crc64::Hasher::new();
         Self::digest_canonical_pg_state_header(&mut hasher);
         for table in METADATA_DIGEST_TABLES {
-            self.digest_canonical_metadata_table_range(&mut hasher, table)?;
+            let table_digest = self.metadata_table_digest(table)?;
+            Self::digest_metadata_table_digest_entry(&mut hasher, table, table_digest);
         }
         Ok(hasher.finalize())
     }
@@ -1425,6 +1603,22 @@ impl PgStore {
         digest_len_prefixed_bytes(hasher, METADATA_CANONICAL_PG_STATE_DOMAIN);
         digest_u8(hasher, METADATA_CANONICAL_STATE_ENCODING_VERSION);
         digest_u64(hasher, METADATA_DIGEST_TABLES.len() as u64);
+    }
+
+    fn digest_metadata_table_digest_entry(
+        hasher: &mut checksum::crc64::Hasher,
+        table: &MetadataDigestTable,
+        table_digest: u64,
+    ) {
+        digest_u8(hasher, 0x12);
+        digest_len_prefixed_bytes(hasher, table.name.as_bytes());
+        digest_u64(hasher, table_digest);
+    }
+
+    fn metadata_table_digest(&self, table: &MetadataDigestTable) -> Result<u64, StoreError> {
+        let mut hasher = checksum::crc64::Hasher::new();
+        self.digest_canonical_metadata_table_range(&mut hasher, table)?;
+        Ok(hasher.finalize())
     }
 
     fn digest_canonical_metadata_table_range(
@@ -1439,6 +1633,10 @@ impl PgStore {
         for column in table.columns {
             digest_len_prefixed_bytes(hasher, column.as_bytes());
         }
+        digest_u64(hasher, table.order_columns.len() as u64);
+        for column in table.order_columns {
+            digest_len_prefixed_bytes(hasher, column.as_bytes());
+        }
 
         let where_clause = Self::metadata_digest_where_clause(table.filter);
         let table_sql = quote_sql_identifier(table.name);
@@ -1448,10 +1646,15 @@ impl PgStore {
             .map(|column| quote_sql_identifier(column))
             .collect();
         let select_values = quoted_columns.join(", ");
-        let order_by = quoted_columns.join(", ");
+        let quoted_order_columns: Vec<String> = table
+            .order_columns
+            .iter()
+            .map(|column| quote_sql_identifier(column))
+            .collect();
+        let order_by = quoted_order_columns.join(", ");
         let sql =
             format!("SELECT {select_values} FROM {table_sql}{where_clause} ORDER BY {order_by}");
-        let mut stmt = self.conn.prepare(&sql).map_err(|e| StoreError::Db {
+        let mut stmt = self.conn.prepare_cached(&sql).map_err(|e| StoreError::Db {
             context: "prepare canonical metadata table range scan",
             source: e,
         })?;
@@ -1477,6 +1680,116 @@ impl PgStore {
         Ok(())
     }
 
+    fn metadata_digest_table_by_name(
+        &self,
+        table_name: &str,
+    ) -> Result<&'static MetadataDigestTable, StoreError> {
+        METADATA_DIGEST_TABLES
+            .iter()
+            .find(|table| table.name == table_name)
+            .ok_or_else(|| StoreError::Db {
+                context: "lookup metadata digest table",
+                source: rusqlite::Error::InvalidParameterName(table_name.to_string()),
+            })
+    }
+
+    fn refresh_all_metadata_table_digests(&self) -> Result<(), StoreError> {
+        for table in METADATA_DIGEST_TABLES {
+            self.refresh_metadata_table_digest(table)?;
+        }
+        Ok(())
+    }
+
+    fn refresh_metadata_table_digests(&self, table_names: &[&str]) -> Result<(), StoreError> {
+        for table_name in table_names {
+            let table = self.metadata_digest_table_by_name(table_name)?;
+            self.refresh_metadata_table_digest(table)?;
+        }
+        Ok(())
+    }
+
+    fn refresh_metadata_table_digest(&self, table: &MetadataDigestTable) -> Result<(), StoreError> {
+        let table_digest = self.metadata_table_digest(table)?;
+        self.conn
+            .execute(
+                "INSERT INTO metadata_table_digests (table_name, table_digest) \
+                 VALUES (?1, ?2) \
+                 ON CONFLICT(table_name) DO UPDATE SET table_digest = excluded.table_digest",
+                params![table.name, table_digest as i64],
+            )
+            .map_err(|e| StoreError::Db {
+                context: "refresh metadata table digest",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn cached_metadata_table_digest(&self, table: &MetadataDigestTable) -> Result<u64, StoreError> {
+        let raw = self
+            .conn
+            .query_row(
+                "SELECT table_digest FROM metadata_table_digests WHERE table_name = ?1",
+                params![table.name],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| StoreError::Db {
+                context: "load cached metadata table digest",
+                source: e,
+            })?;
+        match raw {
+            Some(value) => Ok(value as u64),
+            None => {
+                self.refresh_all_metadata_table_digests()?;
+                self.conn
+                    .query_row(
+                        "SELECT table_digest FROM metadata_table_digests WHERE table_name = ?1",
+                        params![table.name],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map(|value| value as u64)
+                    .map_err(|e| StoreError::Db {
+                        context: "load initialized cached metadata table digest",
+                        source: e,
+                    })
+            }
+        }
+    }
+
+    fn cached_metadata_state_digest(&self) -> Result<u64, StoreError> {
+        let mut hasher = checksum::crc64::Hasher::new();
+        Self::digest_canonical_pg_state_header(&mut hasher);
+        for table in METADATA_DIGEST_TABLES {
+            let table_digest = self.cached_metadata_table_digest(table)?;
+            Self::digest_metadata_table_digest_entry(&mut hasher, table, table_digest);
+        }
+        Ok(hasher.finalize())
+    }
+
+    fn verify_metadata_table_digests(
+        &self,
+        node_id: u32,
+        table_names: &[&str],
+    ) -> Result<(), StoreError> {
+        let state = self.metadata_command_replica_state()?;
+        for table_name in table_names {
+            let table = self.metadata_digest_table_by_name(table_name)?;
+            let expected_digest = self.cached_metadata_table_digest(table)?;
+            let actual_digest = self.metadata_table_digest(table)?;
+            if expected_digest != actual_digest {
+                let actual_state_digest = self.metadata_state_digest()?;
+                return Err(StoreError::MetadataStateDigestMismatch {
+                    node_id,
+                    pg_id: self.pg_id,
+                    cluster_epoch: state.cluster_epoch,
+                    expected_digest: state.state_digest,
+                    actual_digest: actual_state_digest,
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn digest_canonical_sql_value(hasher: &mut checksum::crc64::Hasher, value: ValueRef<'_>) {
         match value {
             ValueRef::Null => {
@@ -1496,20 +1809,9 @@ impl PgStore {
             }
             ValueRef::Blob(value) => {
                 digest_u8(hasher, 0x04);
-                digest_len_prefixed_bytes(hasher, value);
+                digest_len_prefixed_bytes_crc64(hasher, value);
             }
         }
-    }
-
-    fn online_metadata_state_digest(&self, applied_log_index: u64) -> Result<u64, StoreError> {
-        // Full table scans are quadratic when run before every command in a
-        // large local trace. Keep this online corruption gate bounded; restart
-        // validation recomputes and persists a full digest when it sees this
-        // sentinel.
-        if applied_log_index > METADATA_STATE_DIGEST_ONLINE_COMMAND_LIMIT {
-            return Ok(METADATA_STATE_DIGEST_UNVERIFIED);
-        }
-        self.metadata_state_digest()
     }
 
     fn metadata_digest_where_clause(filter: MetadataDigestFilter) -> String {
@@ -3977,6 +4279,11 @@ impl PgStore {
             })?;
 
         let result = (|| {
+            self.verify_metadata_table_digests(
+                node_id,
+                metadata_command_affected_table_names(command.payload()),
+            )
+            .map_err(BucketSnapshotLoadError::Store)?;
             self.apply_metadata_command(command)
                 .map_err(BucketSnapshotLoadError::Metadata)?;
             self.record_metadata_command_applied(node_id, command)
@@ -12362,8 +12669,9 @@ mod tests {
         store.refresh_metadata_command_state_digest().unwrap();
         mutate(&store);
 
-        let command = create_bucket_probe_command(1, 1, trusted_bucket_name("probe"), 1);
-        let err = store.metadata_command_acceptance(0, &command).unwrap_err();
+        let err = store
+            .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
+            .unwrap_err();
         assert_metadata_state_digest_mismatch(err);
     }
 
@@ -12884,8 +13192,9 @@ mod tests {
             )
             .unwrap();
 
-        let command = create_bucket_probe_command(1, 1, trusted_bucket_name("probe"), 1);
-        let err = store.metadata_command_acceptance(0, &command).unwrap_err();
+        let err = store
+            .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
+            .unwrap_err();
         assert_metadata_state_digest_mismatch(err);
     }
 
@@ -12931,8 +13240,9 @@ mod tests {
             )
             .unwrap();
 
-        let command = create_bucket_probe_command(1, 1, trusted_bucket_name("probe"), 1);
-        let err = store.metadata_command_acceptance(0, &command).unwrap_err();
+        let err = store
+            .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
+            .unwrap_err();
         assert_metadata_state_digest_mismatch(err);
     }
 
@@ -12978,8 +13288,9 @@ mod tests {
             )
             .unwrap();
 
-        let command = create_bucket_probe_command(1, 1, trusted_bucket_name("probe"), 1);
-        let err = store.metadata_command_acceptance(0, &command).unwrap_err();
+        let err = store
+            .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
+            .unwrap_err();
         assert_metadata_state_digest_mismatch(err);
     }
 

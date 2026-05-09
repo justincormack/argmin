@@ -439,6 +439,15 @@ CREATE TABLE IF NOT EXISTS metadata_command_replica_state (
     state_digest      INTEGER NOT NULL DEFAULT 0
 )";
 
+/// Per-table canonical digest cache used to update replica state cheaply after
+/// command apply. Restart validation recomputes the materialized digest from
+/// the command-owned tables and does not trust this cache.
+const CREATE_METADATA_TABLE_DIGESTS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS metadata_table_digests (
+    table_name   TEXT PRIMARY KEY,
+    table_digest INTEGER NOT NULL
+)";
+
 /// Bucket-scoped opaque subresource storage.
 const CREATE_BUCKET_SUBRESOURCES_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS bucket_subresources (
@@ -498,6 +507,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_PG_COUNTERS_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_LOG_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_REPLICA_STATE_TABLE, [])?;
+    conn.execute(CREATE_METADATA_TABLE_DIGESTS_TABLE, [])?;
     conn.execute(
         "INSERT INTO pg_counters (singleton, next_bucket_execution_generation) \
          VALUES (0, 0) \

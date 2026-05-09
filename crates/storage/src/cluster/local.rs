@@ -1893,6 +1893,19 @@ mod tests {
         crate::CompleteMultipartCommitRequest,
         crate::MultipartPartSegmentRecord,
     ) {
+        seed_streamed_multipart_completion_with_existing(cluster, bucket, key, upload_label, false)
+    }
+
+    fn seed_streamed_multipart_completion_with_existing(
+        cluster: &crate::StorageCluster,
+        bucket: &crate::BucketName,
+        key: &crate::ObjectKey,
+        upload_label: &str,
+        expect_existing_object: bool,
+    ) -> (
+        crate::CompleteMultipartCommitRequest,
+        crate::MultipartPartSegmentRecord,
+    ) {
         let upload_id = upload_id_from_label(upload_label);
         cluster
             .create_multipart_upload(
@@ -1900,7 +1913,7 @@ mod tests {
                 key,
                 crate::BucketSnapshotRequest::default(),
                 |_snapshot, existing_object| {
-                    assert!(existing_object.is_none());
+                    assert_eq!(existing_object.is_some(), expect_existing_object);
                     Ok::<_, ()>((
                         (),
                         crate::CreateMultipartUploadReq {
@@ -5936,7 +5949,7 @@ mod tests {
     }
 
     #[test]
-    fn local_cluster_reopen_recomputes_unverified_large_command_stream_digest() {
+    fn local_cluster_reopen_rejects_large_command_stream_materialized_tamper() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let ec_shape = EcShape { k: 2, m: 1 };
@@ -5950,9 +5963,13 @@ mod tests {
             .clone();
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let mut first_bucket = None;
 
         for log_index in 1..=129 {
             let bucket = bucket_for_pg(&topology, 1, &format!("digest-verified-{log_index}-"));
+            if first_bucket.is_none() {
+                first_bucket = Some(bucket.clone());
+            }
             let command = create_bucket_metadata_command(PgId::new(1), log_index, bucket.clone());
             cluster
                 .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
@@ -5967,29 +5984,30 @@ mod tests {
             .unwrap();
         let state = node_zero_pg.metadata_command_replica_state().unwrap();
         assert_eq!(state.applied_log_index, 129);
-        assert_eq!(state.state_digest, 0);
+        assert_ne!(state.state_digest, 0);
+        node_zero_pg
+            .connection()
+            .execute(
+                "UPDATE buckets SET public_read = 1 WHERE name = ?1",
+                rusqlite::params![first_bucket.unwrap().as_str()],
+            )
+            .unwrap();
 
         drop(node_zero_pg);
         drop(cluster);
         drop(map);
 
-        let reopened = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
-        let mut reference = None;
-        for node_id in node_ids {
-            let pg = reopened
-                .node(node_id)
-                .unwrap()
-                .storage_node()
-                .get_pg(1)
-                .unwrap();
-            let state = pg.metadata_command_replica_state().unwrap();
-            assert_eq!(state.applied_log_index, 129);
-            assert_ne!(state.state_digest, 0);
-            match reference {
-                Some(reference) => assert_eq!(state, reference),
-                None => reference = Some(state),
-            }
-        }
+        let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClusterBuildError::OpenLocalNode {
+                    node_id: 0,
+                    source: StoreError::MetadataStateDigestMismatch { pg_id: 1, .. }
+                }
+            ),
+            "unexpected reopen error: {err:?}"
+        );
     }
 
     #[test]
@@ -9527,6 +9545,67 @@ mod tests {
             &key,
             outcome.version_id.to_u64() + 1,
         );
+    }
+
+    #[test]
+    fn multipart_completion_over_standard_object_reopens_with_valid_digest() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap());
+        let (bucket, key, object_pg, _) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let old = write_committed_direct_segment_for(
+            &cluster,
+            &bucket,
+            &key,
+            b"old standard object payload",
+        );
+        let (req, expected_segment) = seed_streamed_multipart_completion_with_existing(
+            &cluster,
+            &bucket,
+            &key,
+            "stdoverwrite",
+            true,
+        );
+
+        let outcome = cluster
+            .complete_multipart_upload_commit_serialized(req.clone(), 16)
+            .unwrap();
+        assert!(
+            matches!(
+                outcome.stale_payload,
+                Some(crate::CompletedMultipartStalePayload::Segments { generation_id, .. })
+                    if generation_id == old.generation_id
+            ),
+            "multipart overwrite should record stale standard payload"
+        );
+        assert_streamed_multipart_completion_on_acting_nodes_with_write_sequence(
+            &map,
+            &node_ids,
+            object_pg,
+            &req,
+            &expected_segment,
+            &outcome,
+            2,
+        );
+
+        drop(cluster);
+        drop(map);
+        LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape)
+            .expect("multipart overwrite should leave restart digest valid");
     }
 
     #[test]

@@ -1499,11 +1499,11 @@ Work items:
        include payload shard ack rows, stream session/control rows, raw stream
        segment staging rows, multipart upload/control rows, multipart part
        staging rows, reclaim rows, and local allocator counters
-     - the online full-state digest gate remains bounded to early/small local
-       command streams to avoid quadratic command execution on large traces; if
-       a local command stream crosses that bound, restart validation treats the
-       unverified sentinel as a mandatory full-digest recompute point, persists
-       the recomputed digest, and only then admits the PG as locally clean
+     - command apply keeps a per-table digest cache: it verifies the
+       command-owned tables touched by the command, refreshes those table
+       digests after apply, and persists the composed PG state digest;
+       restart validation still recomputes the digest from materialized rows
+       and must not derive new trust from those rows alone
      - tests cover atomic apply-plus-record rollback, durable duplicate retry
        after reopen, post-reopen allocation past persisted log entries,
        zero-apply tombstone convergence, partial tombstone retry, abandoned
@@ -1873,6 +1873,9 @@ Completed:
   - canonical value encoding distinguishes `NULL`, integers, text, blobs, and
     real values before hashing, so metadata bitrot checks no longer depend on
     SQLite text formatting
+  - blob values in canonical table digests are encoded as byte length plus
+    CRC64 of the blob contents; object payload bytes remain outside the command
+    log, while payload descriptor rows include payload CRC64 values
   - expanded the online digest inventory to command-owned durable upload,
     stream, reclaim, and reservation rows:
     `multipart_uploads`, `multipart_parts`, all `multipart_part_segments`
@@ -2010,14 +2013,17 @@ Completed:
     command-log prefix, verifies persisted command bytes/checksums,
     applied-vs-abandoned identity, and hash-chain links, then compares the
     materialized metadata state against the stored canonical digest
+  - added a per-table digest cache for the command-apply path; online apply
+    verifies and refreshes only the command-owned tables touched by the command,
+    while restart validation still recomputes the full materialized digest from
+    SQLite rows
   - added restart regressions for a missing applied log entry, missing
     replica-state row on a nonempty PG, reordered row identity, corrupted hash
-    link, corrupted materialized metadata row, a large prefix whose state
-    digest is explicitly unverified and must be recomputed/persisted during
-    open, and a stale-but-internally-coherent replica whose validated command
-    prefix differs from peers; incoherent durable/materialized state or
-    acting-set disagreement still fails cluster open rather than admitting the
-    replica as clean
+    link, corrupted materialized metadata row, large-prefix materialized
+    metadata tampering with a previously verified digest, and a
+    stale-but-internally-coherent replica whose validated command prefix differs
+    from peers; incoherent durable/materialized state or acting-set disagreement
+    still fails cluster open rather than admitting the replica as clean
 - Phase 7.4 step 4:
   - expanded restart divergence coverage for non-reference replica row
     corruption and for replicas with the same materialized metadata digest but

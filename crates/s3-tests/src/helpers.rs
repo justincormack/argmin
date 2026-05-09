@@ -1024,15 +1024,29 @@ pub async fn cleanup_versioned_bucket(client: &Client, bucket: &str) {
             break;
         }
 
-        let delete = aws_sdk_s3::types::Delete::builder()
-            .set_objects(Some(objects))
-            .quiet(true)
-            .build()
-            .unwrap();
-        delete_objects_with_md5(client, bucket, delete)
-            .send()
-            .await
-            .expect("delete objects");
+        for chunk in objects.chunks(25) {
+            let mut last_error = None;
+            for _ in 0..5 {
+                let delete = aws_sdk_s3::types::Delete::builder()
+                    .set_objects(Some(chunk.to_vec()))
+                    .quiet(true)
+                    .build()
+                    .unwrap();
+                match delete_objects_with_md5(client, bucket, delete).send().await {
+                    Ok(_) => {
+                        last_error = None;
+                        break;
+                    }
+                    Err(err) => {
+                        last_error = Some(err);
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+            }
+            if let Some(err) = last_error {
+                panic!("delete objects: {err:?}");
+            }
+        }
     }
 
     client
