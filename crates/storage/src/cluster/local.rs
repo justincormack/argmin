@@ -9601,6 +9601,20 @@ mod tests {
             &outcome,
             2,
         );
+        for node_id in &node_ids {
+            let pg = map
+                .nodes
+                .get(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            assert_eq!(
+                pg.test_metadata_digest_table_mismatches().unwrap(),
+                Vec::<(String, u64, u64)>::new(),
+                "node {node_id:?} should keep digest cache in sync before reopen"
+            );
+        }
 
         drop(cluster);
         drop(map);

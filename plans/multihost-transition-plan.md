@@ -1803,12 +1803,12 @@ Proposed slices:
    - close the phase as retention policy plus guardrails; checkpoint-backed
      compaction, repair authority, and peering use of checkpoints remain Phase
      10 work unless Phase 7.5 explicitly expands scope
-   - note for later hardening: command affected-table maps are now part of the
-     metadata integrity boundary because they decide which cached table digests
-     are verified and refreshed during command apply. Before checkpoint-backed
-     compaction or repair trusts those maps, add command/table-map coverage that
-     applies each metadata command variant and asserts the cached PG digest
-     matches a full materialized recompute.
+   - note for later hardening: metadata digest maintenance must remain
+     independent of request-shaped command table maps. Digest updates are
+     maintained from SQLite row changes; before checkpoint-backed compaction or
+     repair trusts checkpoints, add coverage that exercises representative
+     command variants and asserts the cached PG digest still matches a full
+     materialized recompute.
 
 Completed:
 
@@ -2068,9 +2068,12 @@ Completed:
     stats expose both retained applied-prefix rows and sparse tail rows
   - explicitly kept checkpoint-backed compaction, checkpoint repair authority,
     and peering use of checkpoints deferred to Phase 10
-  - recorded command affected-table map coverage as follow-up hardening because
-    stale table-map entries can leave cached metadata digests inconsistent with
-    materialized SQLite state until restart validation detects the mismatch
+  - replaced command affected-table digest refresh with SQLite-maintained
+    digest stats so common object PUT/delete paths do not scan growing metadata
+    tables on every applied command
+  - guarded digest trigger/bootstrap repair with a durable completion marker
+    written after the full cache refresh, so partial trigger installation or
+    interrupted refresh is retried on the next open
   - Phase 7.5 is complete: retention policy is fail-closed before checkpoints,
     compaction is an explicit no-op, and the exposed stats make retained log
     state inspectable without deleting rows

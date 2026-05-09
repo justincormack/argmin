@@ -1024,7 +1024,7 @@ pub async fn cleanup_versioned_bucket(client: &Client, bucket: &str) {
             break;
         }
 
-        for chunk in objects.chunks(25) {
+        for chunk in objects.chunks(100) {
             let mut last_error = None;
             for _ in 0..5 {
                 let delete = aws_sdk_s3::types::Delete::builder()

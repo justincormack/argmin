@@ -15,7 +15,7 @@ placement = { path = "../placement" }
 s3-types = { path = "../s3-types" }
 rapidhash = "4.4"
 ring = "0.17"
-rusqlite = { version = "0.33", features = ["bundled"] }
+rusqlite = { version = "0.33", features = ["bundled", "functions"] }
 thiserror = "2"
 
 [dev-dependencies]

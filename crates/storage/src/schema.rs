@@ -445,7 +445,19 @@ CREATE TABLE IF NOT EXISTS metadata_command_replica_state (
 const CREATE_METADATA_TABLE_DIGESTS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS metadata_table_digests (
     table_name   TEXT PRIMARY KEY,
-    table_digest INTEGER NOT NULL
+    table_digest INTEGER NOT NULL,
+    row_count    INTEGER NOT NULL DEFAULT 0 CHECK (row_count >= 0),
+    row_hash_xor INTEGER NOT NULL DEFAULT 0,
+    row_hash_sum INTEGER NOT NULL DEFAULT 0
+)";
+
+/// Durable marker proving metadata digest triggers and cache stats were
+/// bootstrapped atomically. Missing marker forces a one-time full refresh on
+/// open, including for stores created before this marker existed.
+const CREATE_METADATA_DIGEST_BOOTSTRAP_STATE_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS metadata_digest_bootstrap_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
+    completed INTEGER NOT NULL CHECK (completed IN (0, 1))
 )";
 
 /// Bucket-scoped opaque subresource storage.
@@ -508,6 +520,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_METADATA_COMMAND_LOG_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_REPLICA_STATE_TABLE, [])?;
     conn.execute(CREATE_METADATA_TABLE_DIGESTS_TABLE, [])?;
+    conn.execute(CREATE_METADATA_DIGEST_BOOTSTRAP_STATE_TABLE, [])?;
     conn.execute(
         "INSERT INTO pg_counters (singleton, next_bucket_execution_generation) \
          VALUES (0, 0) \
@@ -526,6 +539,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_object_became_noncurrent_columns(conn)?;
     migrate_multipart_upload_tag_columns(conn)?;
     migrate_multipart_upload_object_generation_columns(conn)?;
+    migrate_metadata_table_digest_columns(conn)?;
     create_object_lock_triggers(conn)?;
     Ok(())
 }
@@ -634,6 +648,28 @@ fn migrate_object_write_sequence_columns(conn: &Connection) -> Result<(), rusqli
         )?;
     }
 
+    Ok(())
+}
+
+fn migrate_metadata_table_digest_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    add_column_if_missing(
+        conn,
+        "metadata_table_digests",
+        "row_count",
+        "ALTER TABLE metadata_table_digests ADD COLUMN row_count INTEGER NOT NULL DEFAULT 0 CHECK (row_count >= 0)",
+    )?;
+    add_column_if_missing(
+        conn,
+        "metadata_table_digests",
+        "row_hash_xor",
+        "ALTER TABLE metadata_table_digests ADD COLUMN row_hash_xor INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "metadata_table_digests",
+        "row_hash_sum",
+        "ALTER TABLE metadata_table_digests ADD COLUMN row_hash_sum INTEGER NOT NULL DEFAULT 0",
+    )?;
     Ok(())
 }
 
