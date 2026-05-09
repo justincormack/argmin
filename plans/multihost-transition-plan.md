@@ -1769,7 +1769,7 @@ Proposed slices:
    - close out by updating [metadata-model.md](../guides/metadata-model.md)
      with the implemented formats, checksum coverage, replay guarantees, and
      any retention/compaction items deferred to Phase 7.5
-5. Phase 7.5: retention and compaction policy.
+5. Phase 7.5: retention and compaction policy. Complete.
    - define the pre-checkpoint retention contract:
      - retain every accepted command-log row in the applied prefix
        `1..=applied_log_index`
@@ -1803,6 +1803,12 @@ Proposed slices:
    - close the phase as retention policy plus guardrails; checkpoint-backed
      compaction, repair authority, and peering use of checkpoints remain Phase
      10 work unless Phase 7.5 explicitly expands scope
+   - note for later hardening: command affected-table maps are now part of the
+     metadata integrity boundary because they decide which cached table digests
+     are verified and refreshed during command apply. Before checkpoint-backed
+     compaction or repair trusts those maps, add command/table-map coverage that
+     applies each metadata command variant and asserts the cached PG digest
+     matches a full materialized recompute.
 
 Completed:
 
@@ -2047,7 +2053,7 @@ Completed:
     tombstone identity, hash-chain links, materialized state digest, and
     acting-set agreement, and tests cover corruption/divergence without
     silently choosing an arbitrary replica
-- Phase 7.5 first slice:
+- Phase 7.5 closeout:
   - documented the pre-checkpoint retention contract: applied-prefix rows,
     abandoned tombstones, sparse tail rows, pending retry rows, and any rows
     needed for restart validation and acting-set agreement are retained until a
@@ -2060,6 +2066,14 @@ Completed:
     persistence is not implemented
   - added PgStore regressions proving pre-checkpoint compaction is a no-op and
     stats expose both retained applied-prefix rows and sparse tail rows
+  - explicitly kept checkpoint-backed compaction, checkpoint repair authority,
+    and peering use of checkpoints deferred to Phase 10
+  - recorded command affected-table map coverage as follow-up hardening because
+    stale table-map entries can leave cached metadata digests inconsistent with
+    materialized SQLite state until restart validation detects the mismatch
+  - Phase 7.5 is complete: retention policy is fail-closed before checkpoints,
+    compaction is an explicit no-op, and the exposed stats make retained log
+    state inspectable without deleting rows
 
 Exit criteria:
 
