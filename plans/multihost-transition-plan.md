@@ -1809,6 +1809,64 @@ Proposed slices:
      repair trusts checkpoints, add coverage that exercises representative
      command variants and asserts the cached PG digest still matches a full
      materialized recompute.
+6. Phase 7.6: metadata-command performance stabilisation.
+   - add a bounded optimisation phase before Phase 8 because the Phase 7
+     command-log and digest hardening increased full-suite runtime from roughly
+     122s at `b553724a13da5979971435bfac4e5f4d706cc609` to roughly 177s after
+     Phase 7.5 closeout
+   - keep this phase split into two distinct work streams:
+     - Phase 7.6.1 current-path optimisation: reduce overhead without changing
+       request semantics, storage APIs, command granularity, or coordinator
+       operation ordering
+     - Phase 7.6.2 semantic batching design: introduce real storage-layer batch
+       commands only where the S3 operation model and command-log invariants
+       justify a batch as one storage mutation
+   - measure every slice before and after:
+     - full `cargo nextest run` wall time
+     - summed libtest per-test seconds grouped by server-core authz model,
+       server-core coordinator, storage, server-http, and external S3 tests
+     - representative isolated tests:
+       `authz_model_phase2_get_object_acl_existing_matrix`,
+       `authz_model_phase4_put_object_write_matrix`,
+       `list_object_versions_clamps_oversized_max_keys`,
+       `test_versioning_list_object_versions_oversized_max_keys_returns_at_most_1000_entries`,
+       and `prop_storage_version_listing_pagination_roundtrip`
+     - one `perf record/report` sample for
+       `list_object_versions_clamps_oversized_max_keys`, tracking total cycles,
+       SQLite prepare/planning cost, command-log/digest maintenance cost, and
+       CRC/hash cost
+   - Phase 7.6.1 current-path optimisation candidates:
+     - replace hot repeated `PgStore` statement preparation with
+       `prepare_cached` or an explicit `PgStore` statement-cache pattern where
+       lifetimes and transactions remain clear
+     - reduce redundant command-log state loads and prefix-advance queries
+       inside a single command transaction without weakening restart validation
+       or idempotence
+     - keep incremental metadata digest triggers and bootstrap validation, but
+       make sure common write paths do not re-run full table scans
+     - verify that simple PUT/GET remains flat and that improvements land in
+       metadata-heavy object/bucket mutation and listing paths
+   - Phase 7.6.2 semantic batching design candidates:
+     - evaluate `DeleteObjects` as a storage-level batch command rather than a
+       coordinator loop over independent deletes
+     - define batch command idempotence, partial-failure/tombstone behavior,
+       command-log encoding, canonical digest inputs, and AWS error reporting
+       before implementation
+     - do not use batching as a shortcut around correctness: each batch must be
+       a real storage semantic with deterministic replay and the same external
+       S3 behavior as the equivalent AWS operation
+     - keep batch work out of Phase 7.6.1 measurements so low-risk overhead
+       reductions and semantic API changes are not conflated
+   - exit criteria:
+     - current-path optimisation measurements identify which overheads were
+       reduced and which remain
+     - any remaining major slowdown has an explicit owner: statement
+       preparation, command-log transaction volume, replica fanout, digest
+       maintenance, or coordinator semantic batching
+     - no batching API is introduced without a command-log/replay/idempotence
+       design and focused regressions
+     - the plan records whether Phase 8 proceeds with the current metadata
+       command cost or waits for Phase 7.6.2 batch work
 
 Completed:
 
@@ -2077,6 +2135,18 @@ Completed:
   - Phase 7.5 is complete: retention policy is fail-closed before checkpoints,
     compaction is an explicit no-op, and the exposed stats make retained log
     state inspectable without deleting rows
+- Phase 7.6 setup:
+  - profiling against `b553724a13da5979971435bfac4e5f4d706cc609` showed the
+    remaining slowdown is concentrated in metadata-heavy server-core/storage
+    paths, while the external S3 harness is approximately flat overall
+  - representative current-vs-baseline isolated tests show roughly 1.7x-2.1x
+    overhead on authz/model/listing/versioning paths, while simple PUT/GET is
+    effectively unchanged
+  - `perf` on `list_object_versions_clamps_oversized_max_keys` points at
+    repeated SQLite statement preparation/planning and extra command-log/digest
+    metadata work; CRC64 hashing is not a material hotspot
+  - Phase 7.6 must measure each optimisation slice independently rather than
+    hiding the cost with broad test harness shape changes
 
 Exit criteria:
 
