@@ -428,10 +428,10 @@ impl SharedStorageNode {
             let pg_id = self.pg_topology.bucket_pg_for(bucket);
             let bucket_pg = self.get_pg(pg_id)?;
             match PgMetadataStore::acquire_bucket_write_reservation(&*bucket_pg, bucket) {
-                Ok(_info) => {
+                Ok(info) => {
                     let result = (|| {
                         let snapshot =
-                            Self::load_bucket_snapshot_from_pg(&bucket_pg, bucket, request)?;
+                            Self::load_bucket_snapshot_from_info_and_pg(&bucket_pg, info, request)?;
                         drop(bucket_pg);
                         action(snapshot)
                     })();
@@ -542,27 +542,35 @@ impl SharedStorageNode {
         request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
         let bucket_info = bucket_pg.head_bucket(bucket)?;
+        Self::load_bucket_snapshot_from_info_and_pg(bucket_pg, bucket_info, request)
+    }
+
+    fn load_bucket_snapshot_from_info_and_pg(
+        bucket_pg: &PgStore,
+        bucket_info: BucketInfo,
+        request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
         let policy = Self::load_bucket_snapshot_subresource(
             bucket_pg,
-            bucket,
+            &bucket_info.name,
             request.policy,
             BucketSubresourceKind::Policy,
         )?;
         let tags = Self::load_bucket_snapshot_subresource(
             bucket_pg,
-            bucket,
+            &bucket_info.name,
             request.tags.should_load(&bucket_info),
             BucketSubresourceKind::Tagging,
         )?;
         let lifecycle = Self::load_bucket_snapshot_subresource(
             bucket_pg,
-            bucket,
+            &bucket_info.name,
             request.lifecycle,
             BucketSubresourceKind::Lifecycle,
         )?;
         let cors = Self::load_bucket_snapshot_subresource(
             bucket_pg,
-            bucket,
+            &bucket_info.name,
             request.cors,
             BucketSubresourceKind::Cors,
         )?;

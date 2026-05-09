@@ -57,13 +57,21 @@ SELECT name, owner_principal, owner_canonical_id, created_at, region, state, ver
        EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 5 AND body IS NOT NULL) AS bucket_lifecycle_present, \
        bucket_lifecycle_generation, bucket_execution_generation, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
 FROM buckets";
+const BUCKET_INFO_BY_NAME_SELECT: &str = "\
+SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, \
+       public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls_mode, \
+       EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 4 AND body IS NOT NULL) AS bucket_policy_present, \
+       bucket_policy_public, bucket_policy_generation, \
+       EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 5 AND body IS NOT NULL) AS bucket_lifecycle_present, \
+       bucket_lifecycle_generation, bucket_execution_generation, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
+FROM buckets WHERE name = ?1";
 
-const BUCKET_RECORD_SELECT: &str = "\
+const BUCKET_RECORD_BY_NAME_SELECT: &str = "\
 SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, \
        public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls_mode, \
        bucket_policy_public, bucket_policy_generation, bucket_lifecycle_generation, bucket_execution_generation, completed_multipart_upload_sequence, bucket_abac_enabled, default_encryption_type, sse_c_blocked, \
        object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
-FROM buckets";
+FROM buckets WHERE name = ?1";
 
 /// Part segment rows use a sentinel version_id during staging (pre-CompleteMultipartUpload).
 /// Must differ from any real version_id (0 for unversioned, 1+ for versioned) so that
@@ -731,6 +739,8 @@ pub struct PgStore {
     tmp_dir: PathBuf,
     conn: Connection,
     clean_metadata_digest_revision: AtomicU64,
+    #[cfg(test)]
+    metadata_command_log_prefix_fast_path_hits: AtomicU64,
 }
 
 const PG_STORE_STATEMENT_CACHE_CAPACITY: usize = 1024;
@@ -812,6 +822,8 @@ impl PgStore {
             tmp_dir,
             conn,
             clean_metadata_digest_revision: AtomicU64::new(UNCLEAN_METADATA_DIGEST_REVISION),
+            #[cfg(test)]
+            metadata_command_log_prefix_fast_path_hits: AtomicU64::new(0),
         })
         .and_then(|store| {
             store.ensure_metadata_digest_bootstrap()?;
@@ -1885,6 +1897,54 @@ impl PgStore {
         let pg_id = PgId::new(self.pg_id);
         let mut applied_log_index = state.applied_log_index;
         let mut applied_log_hash = state.applied_log_hash;
+        if let Some((inserted_log_index, command_checksum)) = inserted_entry {
+            if applied_log_index
+                .checked_add(1)
+                .is_some_and(|next| inserted_log_index.get() == next)
+                && !self.metadata_command_log_has_tail_after(cluster_epoch, inserted_log_index)?
+            {
+                let expected_log_hash = metadata_command_log_hash(
+                    cluster_epoch,
+                    pg_id,
+                    inserted_log_index,
+                    applied_log_hash,
+                    command_checksum,
+                );
+                let updated = self.execute_cached(
+                    "UPDATE metadata_command_log \
+                     SET previous_log_hash = ?1, log_hash = ?2 \
+                     WHERE cluster_epoch = ?3 AND pg_id = ?4 AND log_index = ?5 \
+                       AND previous_log_hash IS NULL AND log_hash IS NULL",
+                    params![
+                        applied_log_hash as i64,
+                        expected_log_hash as i64,
+                        cluster_epoch.get() as i64,
+                        self.pg_id as i64,
+                        inserted_log_index.get() as i64,
+                    ],
+                    "update inserted metadata command log hash",
+                )?;
+                if updated != 1 {
+                    return Err(StoreError::MetadataCommandLogConflict {
+                        node_id,
+                        pg_id: self.pg_id,
+                        cluster_epoch,
+                        log_index: inserted_log_index.get(),
+                    });
+                }
+                applied_log_index = inserted_log_index.get();
+                applied_log_hash = expected_log_hash;
+                #[cfg(test)]
+                self.metadata_command_log_prefix_fast_path_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                return self.update_metadata_command_replica_state(
+                    cluster_epoch,
+                    applied_log_index,
+                    applied_log_hash,
+                );
+            }
+        }
+
         while let Some(next_log_index) = applied_log_index.checked_add(1) {
             let log_index = MetadataCommandLogIndex::new(next_log_index)
                 .expect("metadata command log index is non-zero");
@@ -1984,6 +2044,19 @@ impl PgStore {
             applied_log_hash = expected_log_hash;
         }
 
+        self.update_metadata_command_replica_state(
+            cluster_epoch,
+            applied_log_index,
+            applied_log_hash,
+        )
+    }
+
+    fn update_metadata_command_replica_state(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        applied_log_index: u64,
+        applied_log_hash: u64,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
         let state_digest = self.cached_metadata_state_digest()?;
         self.execute_cached(
             "UPDATE metadata_command_replica_state \
@@ -2003,6 +2076,26 @@ impl PgStore {
             applied_log_hash,
             state_digest,
         })
+    }
+
+    fn metadata_command_log_has_tail_after(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        log_index: MetadataCommandLogIndex,
+    ) -> Result<bool, StoreError> {
+        self.query_row_cached_optional(
+            "SELECT 1 FROM metadata_command_log \
+             WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index > ?3 \
+             LIMIT 1",
+            params![
+                cluster_epoch.get() as i64,
+                self.pg_id as i64,
+                log_index.get() as i64,
+            ],
+            "check metadata command log tail",
+            |_| Ok(()),
+        )
+        .map(|value| value.is_some())
     }
 
     fn metadata_state_digest(&self) -> Result<u64, StoreError> {
@@ -6531,13 +6624,20 @@ impl PgStore {
         key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<(), MetadataError> {
-        let deleted_was_current = self
-            .current_object_head(bucket.as_str(), key.as_str())
-            .map_err(|e| MetadataError::Db {
-                context: "delete object version (lookup current)",
-                source: e,
-            })?
-            .is_some_and(|(current_version_id, _)| current_version_id == version_id);
+        let deleted_was_current: bool = self.query_row_cached_metadata(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM objects \
+                 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
+                   AND version_id = ( \
+                       SELECT version_id FROM objects \
+                       WHERE bucket = ?1 AND key = ?2 \
+                       ORDER BY write_sequence DESC LIMIT 1 \
+                   ) \
+             )",
+            params![bucket, key, version_id.to_u64() as i64],
+            "delete object version (lookup current)",
+            |row| row.get::<_, i64>(0).map(|value| value != 0),
+        )?;
 
         self.execute_cached_metadata(
             "DELETE FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
@@ -7123,28 +7223,6 @@ impl PgStore {
             .transpose()
     }
 
-    fn current_object_head(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> Result<Option<(VersionId, ObjectState)>, rusqlite::Error> {
-        self.conn
-            .prepare_cached(
-                "SELECT version_id, status FROM objects \
-                 WHERE bucket = ?1 AND key = ?2 \
-                 ORDER BY write_sequence DESC LIMIT 1",
-            )
-            .and_then(|mut stmt| {
-                stmt.query_row(params![bucket, key], |row| {
-                    let version_id = Self::parse_version_id(row.get::<_, i64>(0)?, 0)?;
-                    let status =
-                        Self::parse_enum(row.get::<_, u8>(1)?, 1, "status", ObjectState::from_u8)?;
-                    Ok((version_id, status))
-                })
-            })
-            .optional()
-    }
-
     fn mark_current_live_noncurrent(
         &self,
         bucket: &str,
@@ -7152,24 +7230,24 @@ impl PgStore {
         replacement_version_id: VersionId,
         transition_time: u64,
     ) -> Result<(), rusqlite::Error> {
-        let Some((current_version_id, status)) = self.current_object_head(bucket, key)? else {
-            return Ok(());
-        };
-        if status != ObjectState::Live || current_version_id == replacement_version_id {
-            return Ok(());
-        }
-
         self.conn
             .prepare_cached(
                 "UPDATE objects SET became_noncurrent_at = ?1 \
-             WHERE bucket = ?2 AND key = ?3 AND version_id = ?4 AND status = ?5 \
-               AND became_noncurrent_at IS NULL",
+                 WHERE bucket = ?2 AND key = ?3 \
+                   AND version_id = ( \
+                       SELECT version_id FROM objects \
+                       WHERE bucket = ?2 AND key = ?3 \
+                       ORDER BY write_sequence DESC LIMIT 1 \
+                   ) \
+                   AND version_id <> ?4 \
+                   AND status = ?5 \
+                   AND became_noncurrent_at IS NULL",
             )?
             .execute(params![
                 transition_time as i64,
                 bucket,
                 key,
-                current_version_id.to_u64() as i64,
+                replacement_version_id.to_u64() as i64,
                 ObjectState::Live as u8,
             ])?;
         Ok(())
@@ -7180,25 +7258,19 @@ impl PgStore {
         bucket: &str,
         key: &str,
     ) -> Result<(), rusqlite::Error> {
-        let Some((current_version_id, status)) = self.current_object_head(bucket, key)? else {
-            return Ok(());
-        };
-        if status != ObjectState::Live {
-            return Ok(());
-        }
-
         self.conn
             .prepare_cached(
                 "UPDATE objects SET became_noncurrent_at = NULL \
-             WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND status = ?4 \
-               AND became_noncurrent_at IS NOT NULL",
+                 WHERE bucket = ?1 AND key = ?2 \
+                   AND version_id = ( \
+                       SELECT version_id FROM objects \
+                       WHERE bucket = ?1 AND key = ?2 \
+                       ORDER BY write_sequence DESC LIMIT 1 \
+                   ) \
+                   AND status = ?3 \
+                   AND became_noncurrent_at IS NOT NULL",
             )?
-            .execute(params![
-                bucket,
-                key,
-                current_version_id.to_u64() as i64,
-                ObjectState::Live as u8,
-            ])?;
+            .execute(params![bucket, key, ObjectState::Live as u8])?;
         Ok(())
     }
 
@@ -7982,33 +8054,23 @@ impl PgMetadataStore for PgStore {
     }
 
     fn head_bucket_raw(&self, name: &BucketName) -> Result<BucketInfo, MetadataError> {
-        self.conn
-            .query_row(
-                &format!("{BUCKET_INFO_SELECT} WHERE name = ?1"),
-                params![name.as_str()],
-                Self::row_to_bucket_info,
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "head bucket raw",
-                source: e,
-            })?
-            .ok_or_else(|| bucket_not_found(name.as_str()))
+        self.query_row_cached_optional_metadata(
+            BUCKET_INFO_BY_NAME_SELECT,
+            params![name.as_str()],
+            "head bucket raw",
+            Self::row_to_bucket_info,
+        )?
+        .ok_or_else(|| bucket_not_found(name.as_str()))
     }
 
     fn head_bucket_record_raw(&self, name: &BucketName) -> Result<BucketRecord, MetadataError> {
-        self.conn
-            .query_row(
-                &format!("{BUCKET_RECORD_SELECT} WHERE name = ?1"),
-                params![name.as_str()],
-                Self::row_to_bucket_record,
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "head bucket record raw",
-                source: e,
-            })?
-            .ok_or_else(|| bucket_not_found(name.as_str()))
+        self.query_row_cached_optional_metadata(
+            BUCKET_RECORD_BY_NAME_SELECT,
+            params![name.as_str()],
+            "head bucket record raw",
+            Self::row_to_bucket_record,
+        )?
+        .ok_or_else(|| bucket_not_found(name.as_str()))
     }
 
     fn list_buckets(&self, owner_canonical_id: &str) -> Result<Vec<BucketInfo>, MetadataError> {
@@ -9153,14 +9215,16 @@ impl PgMetadataStore for PgStore {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<VersionId, MetadataError> {
-        let max_existing: Option<i64> = self
-            .query_row_cached_optional_metadata(
-                "SELECT MAX(version_id) FROM objects WHERE bucket = ?1 AND key = ?2",
+        let (max_existing, stored_next): (Option<i64>, Option<i64>) = self
+            .query_row_cached_metadata(
+                "SELECT \
+                    (SELECT MAX(version_id) FROM objects WHERE bucket = ?1 AND key = ?2), \
+                    (SELECT next_version_id FROM object_version_counters \
+                         WHERE bucket = ?1 AND key = ?2)",
                 params![bucket, key],
-                "next version id (max existing)",
-                |row| row.get(0),
-            )?
-            .flatten();
+                "next version id",
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
         let next_from_rows = match max_existing {
             None => 1,
             Some(v) => {
@@ -9183,13 +9247,6 @@ impl PgMetadataStore for PgStore {
             }
         };
 
-        let stored_next: Option<i64> = self.query_row_cached_optional_metadata(
-            "SELECT next_version_id FROM object_version_counters \
-                 WHERE bucket = ?1 AND key = ?2",
-            params![bucket, key],
-            "next version id (load counter)",
-            |row| row.get(0),
-        )?;
         let next_from_counter = match stored_next {
             None => 1,
             Some(v) => u64::try_from(v).map_err(|_| MetadataError::Db {
@@ -13388,6 +13445,47 @@ mod tests {
             ),
             "bucket creation must roll back when log recording fails"
         );
+    }
+
+    #[test]
+    fn metadata_command_log_contiguous_insert_uses_prefix_fast_path() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let command = create_bucket_probe_command(1, 1, trusted_bucket_name("fast-path"), 1);
+        let before = store
+            .metadata_command_log_prefix_fast_path_hits
+            .load(Ordering::Relaxed);
+
+        let state = store.record_metadata_command_applied(0, &command).unwrap();
+
+        assert!(
+            store
+                .metadata_command_log_prefix_fast_path_hits
+                .load(Ordering::Relaxed)
+                > before,
+            "contiguous insert without a durable tail should take the prefix fast path"
+        );
+        let expected_log_hash = metadata_command_log_hash(
+            ClusterEpoch::INITIAL,
+            PgId::new(1),
+            MetadataCommandLogIndex::new(1).unwrap(),
+            0,
+            command.checksum_crc64(),
+        );
+        assert_eq!(state.applied_log_index, 1);
+        assert_eq!(state.applied_log_hash, expected_log_hash);
+
+        let (previous_log_hash, log_hash): (Option<i64>, Option<i64>) = store
+            .conn
+            .query_row(
+                "SELECT previous_log_hash, log_hash \
+                 FROM metadata_command_log WHERE log_index = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(previous_log_hash, Some(0));
+        assert_eq!(log_hash, Some(expected_log_hash as i64));
     }
 
     #[test]

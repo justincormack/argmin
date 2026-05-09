@@ -2320,6 +2320,52 @@ Completed:
       volume/transaction count, bucket info loads, object insert side effects,
       and object listing/read statement shapes; test-only schema/bootstrap
       overhead should stay lower priority unless it masks production costs
+  - Phase 7.6.1 current-path bucket/version/log follow-up:
+    - clean full-suite baseline after the previous command/digest slice was
+      `cargo nextest run` passing 4528 tests in 118.100s
+    - added a one-row command-log prefix fast path for the common case where a
+      newly inserted command is exactly `applied_log_index + 1` and there is no
+      durable tail row to fold in; conflict, retry, gap-filling, and
+      malformed-row paths still use the full durable row validation path
+    - changed hot bucket-by-name and bucket-record-by-name lookups to fixed
+      cached statements and reused the `BucketInfo` already loaded by bucket
+      write-reservation acquisition when constructing write snapshots
+    - combined the object-version allocator's `MAX(version_id)` and
+      `object_version_counters.next_version_id` reads into one cached statement,
+      preserving the same max-of-materialized-state-and-counter allocation rule
+    - tried a digest clean-revision micro-optimisation that replaced the
+      combined state/revision read with a revision-only read on the clean path;
+      statement profiling showed it doubled revision reads without improving the
+      representative path, so it was reverted
+    - representative isolated
+      `authz_model_phase2_get_object_acl_existing_matrix` timing moved from
+      16.161s at the start of this follow-up to 14.724s after fixed cached
+      bucket lookups, 14.540s after write-snapshot bucket-row reuse, and
+      14.747s after the final combined-version/log-fast-path slice in the
+      latest sample
+    - statement-profile counts for that authz case show bucket-info loads fell
+      from about 39.7k to about 34.4k; the old separate
+      `MAX(version_id)`/counter reads became one combined allocator read
+    - full-suite validation after the bucket/version/log changes was
+      `cargo nextest run` passing 4528 tests in 112.784s; after the
+      current-object bookkeeping rewrite, deterministic fast-path coverage, and
+      re-verification it was 4529 passing in 114.522s
+    - collapsed current-object bookkeeping for object writes/deletes from
+      select-then-update into indexed single-statement updates/lookups using
+      `(bucket, key, write_sequence DESC)`; focused version-selection tests and
+      property checks stayed clean, while isolated timing samples remained
+      within noise (`authz_model_phase2_get_object_acl_existing_matrix`
+      15.225s, oversized version-listing 15.426s when sampled concurrently)
+    - current statement profiling for the authz representative emitted about
+      747k SQLite profile events; remaining high-frequency production-shaped
+      buckets are still command-log/digest bookkeeping (`metadata_command_log`,
+      `metadata_table_digests`, replica-state loads/updates and digest
+      revision reads), followed by bucket info loads, version allocation, and
+      object insert/currentness statements
+    - listing representatives remain improved in isolated runs:
+      `list_object_versions_clamps_oversized_max_keys` measured 5.164s and
+      `test_versioning_list_object_versions_oversized_max_keys_returns_at_most_1000_entries`
+      measured 13.985s
 
 Exit criteria:
 
