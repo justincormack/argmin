@@ -2170,6 +2170,24 @@ Completed:
     harness run
   - simple PUT/GET remained effectively flat, which matches the goal of
     reducing metadata-command overhead rather than changing payload behavior
+- Phase 7.6.1 second current-path optimisation slice:
+  - routed additional hot `PgStore` prepared statements through SQLite's
+    statement cache, including dynamic listing/query shapes that repeat across
+    authz/model and version-listing tests; some production `.prepare()` sites
+    remain for lower-volume shard, part, and segment helpers and can be
+    considered in later current-path optimisation slices if perf points there
+  - avoided one redundant command-log row reload on the common path where a
+    newly inserted command is the next contiguous applied-prefix entry; conflict
+    and retry paths still reload and validate the durable row
+  - tried combining digest trigger maintenance into a single trigger `UPDATE`,
+    measured it as slower, and reverted that part
+  - representative selected server-core measurements improved from the prior
+    committed 45.294 summed test-seconds / 23.653s wall to 44.010 summed
+    test-seconds / 22.992s wall
+  - `list_object_versions_clamps_oversized_max_keys` improved from 6.801s to
+    6.550s in the selected nextest run; the isolated perf sample was roughly
+    30.5B cycles with SQLite prepare/planning still around 23%
+  - the isolated S3 oversized versioning test improved from 16.881s to 16.130s
 
 Exit criteria:
 

@@ -1465,7 +1465,7 @@ impl PgStore {
             });
         }
         let command_bytes = command.command_bytes();
-        self.execute_cached(
+        let inserted = self.execute_cached(
             "INSERT INTO metadata_command_log \
              (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
              VALUES (?1, ?2, ?3, ?4, ?5, 0, NULL, NULL) \
@@ -1480,18 +1480,26 @@ impl PgStore {
             "record metadata command log entry",
         )?;
 
-        let entry = self
-            .load_metadata_command_log_entry(
-                "load recorded metadata command log entry",
-                command.id().cluster_epoch(),
-                command.id().pg_id(),
-                command.id().log_index(),
-            )?
-            .expect("metadata command log insert must leave an entry");
-        if !self.metadata_command_log_entry_matches(node_id, command, &entry, false)? {
-            return Err(self.metadata_command_log_conflict(node_id, command));
+        if inserted == 0 {
+            let entry = self
+                .load_metadata_command_log_entry(
+                    "load recorded metadata command log entry",
+                    command.id().cluster_epoch(),
+                    command.id().pg_id(),
+                    command.id().log_index(),
+                )?
+                .expect("metadata command log conflict must leave an entry");
+            if !self.metadata_command_log_entry_matches(node_id, command, &entry, false)? {
+                return Err(self.metadata_command_log_conflict(node_id, command));
+            }
         }
-        self.advance_metadata_command_log_state(node_id, command.id().cluster_epoch())
+        let inserted_entry =
+            (inserted > 0).then_some((command.id().log_index(), command.checksum_crc64()));
+        self.advance_metadata_command_log_state_with_inserted(
+            node_id,
+            command.id().cluster_epoch(),
+            inserted_entry,
+        )
     }
 
     pub(crate) fn record_metadata_command_abandoned(
@@ -1509,7 +1517,7 @@ impl PgStore {
         }
         let command_bytes = command.abandoned_log_bytes();
         let command_checksum = command.abandoned_log_checksum_crc64();
-        self.execute_cached(
+        let inserted = self.execute_cached(
             "INSERT INTO metadata_command_log \
              (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
              VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL, NULL) \
@@ -1524,18 +1532,25 @@ impl PgStore {
             "record abandoned metadata command log entry",
         )?;
 
-        let entry = self
-            .load_metadata_command_log_entry(
-                "load abandoned metadata command log entry",
-                command.id().cluster_epoch(),
-                command.id().pg_id(),
-                command.id().log_index(),
-            )?
-            .expect("abandoned metadata command log insert must leave an entry");
-        if !self.metadata_command_log_entry_matches(node_id, command, &entry, true)? {
-            return Err(self.metadata_command_log_conflict(node_id, command));
+        if inserted == 0 {
+            let entry = self
+                .load_metadata_command_log_entry(
+                    "load abandoned metadata command log entry",
+                    command.id().cluster_epoch(),
+                    command.id().pg_id(),
+                    command.id().log_index(),
+                )?
+                .expect("abandoned metadata command log conflict must leave an entry");
+            if !self.metadata_command_log_entry_matches(node_id, command, &entry, true)? {
+                return Err(self.metadata_command_log_conflict(node_id, command));
+            }
         }
-        self.advance_metadata_command_log_state(node_id, command.id().cluster_epoch())
+        let inserted_entry = (inserted > 0).then_some((command.id().log_index(), command_checksum));
+        self.advance_metadata_command_log_state_with_inserted(
+            node_id,
+            command.id().cluster_epoch(),
+            inserted_entry,
+        )
     }
 
     pub fn metadata_command_log_stats(
@@ -1663,10 +1678,11 @@ impl PgStore {
         )))
     }
 
-    fn advance_metadata_command_log_state(
+    fn advance_metadata_command_log_state_with_inserted(
         &self,
         node_id: u32,
         cluster_epoch: ClusterEpoch,
+        inserted_entry: Option<(MetadataCommandLogIndex, u64)>,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         let mut state = self.metadata_command_replica_state()?;
         if state.cluster_epoch != cluster_epoch {
@@ -1685,60 +1701,98 @@ impl PgStore {
         while let Some(next_log_index) = applied_log_index.checked_add(1) {
             let log_index = MetadataCommandLogIndex::new(next_log_index)
                 .expect("metadata command log index is non-zero");
-            let Some(entry) = self.load_metadata_command_log_entry(
-                "load next metadata command log entry",
-                cluster_epoch,
-                pg_id,
-                log_index,
-            )?
-            else {
-                break;
-            };
-            self.verify_metadata_command_log_entry(
-                node_id,
-                cluster_epoch,
-                pg_id,
-                log_index,
-                &entry,
-            )?;
-            let expected_log_hash = metadata_command_log_hash(
-                cluster_epoch,
-                pg_id,
-                log_index,
-                applied_log_hash,
-                entry.command_checksum,
-            );
-            match (entry.previous_log_hash, entry.log_hash) {
-                (None, None) => {
-                    self.execute_cached(
-                        "UPDATE metadata_command_log \
-                         SET previous_log_hash = ?1, log_hash = ?2 \
-                         WHERE cluster_epoch = ?3 AND pg_id = ?4 AND log_index = ?5",
-                        params![
-                            applied_log_hash as i64,
-                            expected_log_hash as i64,
-                            cluster_epoch.get() as i64,
-                            self.pg_id as i64,
-                            next_log_index as i64,
-                        ],
-                        "update metadata command log hash",
-                    )?;
-                }
-                (Some(previous_log_hash), Some(log_hash))
-                    if previous_log_hash == applied_log_hash && log_hash == expected_log_hash => {}
-                (previous_log_hash, log_hash) => {
-                    return Err(StoreError::MetadataCommandLogHashMismatch {
+
+            let expected_log_hash = if let Some((inserted_log_index, command_checksum)) =
+                inserted_entry.filter(|(inserted_log_index, _)| *inserted_log_index == log_index)
+            {
+                let expected_log_hash = metadata_command_log_hash(
+                    cluster_epoch,
+                    pg_id,
+                    inserted_log_index,
+                    applied_log_hash,
+                    command_checksum,
+                );
+                let updated = self.execute_cached(
+                    "UPDATE metadata_command_log \
+                     SET previous_log_hash = ?1, log_hash = ?2 \
+                     WHERE cluster_epoch = ?3 AND pg_id = ?4 AND log_index = ?5 \
+                       AND previous_log_hash IS NULL AND log_hash IS NULL",
+                    params![
+                        applied_log_hash as i64,
+                        expected_log_hash as i64,
+                        cluster_epoch.get() as i64,
+                        self.pg_id as i64,
+                        next_log_index as i64,
+                    ],
+                    "update inserted metadata command log hash",
+                )?;
+                if updated != 1 {
+                    return Err(StoreError::MetadataCommandLogConflict {
                         node_id,
                         pg_id: self.pg_id,
                         cluster_epoch,
                         log_index: next_log_index,
-                        expected_previous_log_hash: applied_log_hash,
-                        actual_previous_log_hash: previous_log_hash.unwrap_or_default(),
-                        expected_log_hash,
-                        actual_log_hash: log_hash.unwrap_or_default(),
                     });
                 }
-            }
+                expected_log_hash
+            } else {
+                let Some(entry) = self.load_metadata_command_log_entry(
+                    "load next metadata command log entry",
+                    cluster_epoch,
+                    pg_id,
+                    log_index,
+                )?
+                else {
+                    break;
+                };
+                self.verify_metadata_command_log_entry(
+                    node_id,
+                    cluster_epoch,
+                    pg_id,
+                    log_index,
+                    &entry,
+                )?;
+                let expected_log_hash = metadata_command_log_hash(
+                    cluster_epoch,
+                    pg_id,
+                    log_index,
+                    applied_log_hash,
+                    entry.command_checksum,
+                );
+                match (entry.previous_log_hash, entry.log_hash) {
+                    (None, None) => {
+                        self.execute_cached(
+                            "UPDATE metadata_command_log \
+                             SET previous_log_hash = ?1, log_hash = ?2 \
+                             WHERE cluster_epoch = ?3 AND pg_id = ?4 AND log_index = ?5",
+                            params![
+                                applied_log_hash as i64,
+                                expected_log_hash as i64,
+                                cluster_epoch.get() as i64,
+                                self.pg_id as i64,
+                                next_log_index as i64,
+                            ],
+                            "update metadata command log hash",
+                        )?;
+                    }
+                    (Some(previous_log_hash), Some(log_hash))
+                        if previous_log_hash == applied_log_hash
+                            && log_hash == expected_log_hash => {}
+                    (previous_log_hash, log_hash) => {
+                        return Err(StoreError::MetadataCommandLogHashMismatch {
+                            node_id,
+                            pg_id: self.pg_id,
+                            cluster_epoch,
+                            log_index: next_log_index,
+                            expected_previous_log_hash: applied_log_hash,
+                            actual_previous_log_hash: previous_log_hash.unwrap_or_default(),
+                            expected_log_hash,
+                            actual_log_hash: log_hash.unwrap_or_default(),
+                        });
+                    }
+                }
+                expected_log_hash
+            };
             applied_log_index = next_log_index;
             applied_log_hash = expected_log_hash;
         }
@@ -8826,10 +8880,13 @@ impl PgMetadataStore for PgStore {
 
         let params_refs: Vec<&dyn rusqlite::types::ToSql> =
             params_vec.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = self.conn.prepare(&sql).map_err(|e| MetadataError::Db {
-            context: "prepare list objects",
-            source: e,
-        })?;
+        let mut stmt = self
+            .conn
+            .prepare_cached(&sql)
+            .map_err(|e| MetadataError::Db {
+                context: "prepare list objects",
+                source: e,
+            })?;
 
         let rows = stmt
             .query_map(params_refs.as_slice(), Self::row_to_object_record)
@@ -8942,10 +8999,13 @@ impl PgMetadataStore for PgStore {
 
         let params_refs: Vec<&dyn rusqlite::types::ToSql> =
             params_vec.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = self.conn.prepare(&sql).map_err(|e| MetadataError::Db {
-            context: "prepare list object versions",
-            source: e,
-        })?;
+        let mut stmt = self
+            .conn
+            .prepare_cached(&sql)
+            .map_err(|e| MetadataError::Db {
+                context: "prepare list object versions",
+                source: e,
+            })?;
 
         let rows = stmt
             .query_map(params_refs.as_slice(), Self::row_to_object_record)
@@ -10292,10 +10352,13 @@ impl PgMetadataStore for PgStore {
 
         let params_refs: Vec<&dyn rusqlite::types::ToSql> =
             params_vec.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = self.conn.prepare(&sql).map_err(|e| MetadataError::Db {
-            context: "prepare list multipart uploads",
-            source: e,
-        })?;
+        let mut stmt = self
+            .conn
+            .prepare_cached(&sql)
+            .map_err(|e| MetadataError::Db {
+                context: "prepare list multipart uploads",
+                source: e,
+            })?;
 
         let rows = stmt
             .query_map(params_refs.as_slice(), |row| {
@@ -10535,7 +10598,7 @@ impl PgMetadataStore for PgStore {
                     )
                     .optional()?;
 
-                let mut prev_stmt = self.conn.prepare(
+                let mut prev_stmt = self.conn.prepare_cached(
                     "SELECT bucket, key, upload_id, version_id, part_number, segment_index, size, \
                  segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
                  FROM multipart_part_segments \
@@ -10605,7 +10668,7 @@ impl PgMetadataStore for PgStore {
                     ],
                 )?;
 
-                let mut stmt = self.conn.prepare(
+                let mut stmt = self.conn.prepare_cached(
                     "INSERT INTO multipart_part_segments \
                  (bucket, key, upload_id, version_id, part_number, segment_index, size, \
                   segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
@@ -10739,10 +10802,13 @@ impl PgMetadataStore for PgStore {
 
         let params_refs: Vec<&dyn rusqlite::types::ToSql> =
             params_vec.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = self.conn.prepare(&sql).map_err(|e| MetadataError::Db {
-            context: "prepare list multipart parts",
-            source: e,
-        })?;
+        let mut stmt = self
+            .conn
+            .prepare_cached(&sql)
+            .map_err(|e| MetadataError::Db {
+                context: "prepare list multipart parts",
+                source: e,
+            })?;
 
         let rows = stmt
             .query_map(params_refs.as_slice(), Self::row_to_multipart_part)
@@ -10787,7 +10853,7 @@ impl PgMetadataStore for PgStore {
             })?;
 
         let result = (|| {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = self.conn.prepare_cached(
                 "INSERT INTO object_parts \
                  (bucket, key, version_id, part_number, object_offset_start, size, etag, etag_kind, \
                   part_okh, part_vid, ec_k, ec_m, data_pg_id, checksum) \
@@ -11088,7 +11154,7 @@ impl PgMetadataStore for PgStore {
             }
 
             let omitted_parts = {
-                let mut stmt = self.conn.prepare(
+                let mut stmt = self.conn.prepare_cached(
                     "SELECT upload_id, part_number, generation, size, etag, etag_kind, \
                      part_okh, part_vid, ec_k, ec_m, last_modified, checksum \
                      FROM multipart_parts WHERE upload_id = ?1 ORDER BY part_number ASC",
@@ -11106,7 +11172,7 @@ impl PgMetadataStore for PgStore {
             };
 
             let (omitted_streaming_segments, omitted_streaming_part_numbers) = {
-                let mut stmt = self.conn.prepare(
+                let mut stmt = self.conn.prepare_cached(
                     "SELECT bucket, key, upload_id, version_id, part_number, segment_index, \
                      size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
                      FROM multipart_part_segments \
@@ -11232,7 +11298,7 @@ impl PgMetadataStore for PgStore {
 
             // 4. Insert new manifest rows.
             {
-                let mut stmt = self.conn.prepare(
+                let mut stmt = self.conn.prepare_cached(
                     "INSERT INTO object_parts \
                      (bucket, key, version_id, part_number, object_offset_start, size, etag, etag_kind, \
                       part_okh, part_vid, ec_k, ec_m, data_pg_id, checksum) \
