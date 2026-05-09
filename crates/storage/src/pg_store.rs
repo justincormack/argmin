@@ -11,11 +11,14 @@
 ///   tmp/
 /// ```
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::functions::{Context, FunctionFlags};
+use rusqlite::trace::{TraceEvent, TraceEventCodes};
 use rusqlite::types::ValueRef;
 use rusqlite::{
     params, params_from_iter, Connection, Error as SqlError, OptionalExtension, Params, Row,
@@ -626,6 +629,61 @@ fn register_metadata_digest_sql_functions(conn: &Connection) -> rusqlite::Result
     Ok(())
 }
 
+fn install_sqlite_profile_hook(conn: &Connection) {
+    let Ok(raw_threshold) = env::var("ARGMIN_SQLITE_PROFILE_MS") else {
+        return;
+    };
+    let Ok(threshold_ms) = raw_threshold.parse::<u64>() else {
+        eprintln!(
+            "argmin_sqlite_profile invalid ARGMIN_SQLITE_PROFILE_MS={raw_threshold:?}; expected integer milliseconds"
+        );
+        return;
+    };
+    SQLITE_PROFILE_THRESHOLD_NANOS.store(threshold_ms.saturating_mul(1_000_000), Ordering::Relaxed);
+    conn.trace_v2(
+        TraceEventCodes::SQLITE_TRACE_PROFILE,
+        Some(sqlite_profile_callback),
+    );
+}
+
+fn sqlite_profile_callback(event: TraceEvent<'_>) {
+    let TraceEvent::Profile(stmt, duration) = event else {
+        return;
+    };
+    let threshold = SQLITE_PROFILE_THRESHOLD_NANOS.load(Ordering::Relaxed);
+    if threshold == SQLITE_PROFILE_DISABLED || duration.as_nanos() < u128::from(threshold) {
+        return;
+    }
+    eprintln!(
+        "argmin_sqlite_profile duration_us={} sql=\"{}\"",
+        duration.as_micros(),
+        compact_sql_for_log(stmt.sql().as_ref())
+    );
+}
+
+fn compact_sql_for_log(sql: &str) -> String {
+    const MAX_LOGGED_SQL_BYTES: usize = 512;
+
+    let mut compact = String::with_capacity(sql.len().min(MAX_LOGGED_SQL_BYTES));
+    let mut last_was_space = false;
+    for ch in sql.chars() {
+        if compact.len() >= MAX_LOGGED_SQL_BYTES {
+            compact.push_str("...");
+            break;
+        }
+        if ch.is_whitespace() {
+            if !last_was_space {
+                compact.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            compact.push(ch);
+            last_was_space = false;
+        }
+    }
+    compact.trim().to_owned()
+}
+
 fn metadata_row_digest_sql(ctx: &Context<'_>) -> rusqlite::Result<u64> {
     if ctx.is_empty() {
         return Err(sqlite_user_function_error(
@@ -672,9 +730,13 @@ pub struct PgStore {
     shards_dir: PathBuf,
     tmp_dir: PathBuf,
     conn: Connection,
+    clean_metadata_digest_revision: AtomicU64,
 }
 
-const PG_STORE_STATEMENT_CACHE_CAPACITY: usize = 256;
+const PG_STORE_STATEMENT_CACHE_CAPACITY: usize = 1024;
+const SQLITE_PROFILE_DISABLED: u64 = u64::MAX;
+const UNCLEAN_METADATA_DIGEST_REVISION: u64 = u64::MAX;
+static SQLITE_PROFILE_THRESHOLD_NANOS: AtomicU64 = AtomicU64::new(SQLITE_PROFILE_DISABLED);
 
 #[derive(Debug)]
 struct MetadataCommandLogEntry {
@@ -716,6 +778,7 @@ impl PgStore {
             source: e,
         })?;
         conn.set_prepared_statement_cache_capacity(PG_STORE_STATEMENT_CACHE_CAPACITY);
+        install_sqlite_profile_hook(&conn);
 
         conn.execute_batch("PRAGMA recursive_triggers = ON")
             .map_err(|e| StoreError::Db {
@@ -748,6 +811,7 @@ impl PgStore {
             shards_dir,
             tmp_dir,
             conn,
+            clean_metadata_digest_revision: AtomicU64::new(UNCLEAN_METADATA_DIGEST_REVISION),
         })
         .and_then(|store| {
             store.ensure_metadata_digest_bootstrap()?;
@@ -827,6 +891,40 @@ impl PgStore {
         self.conn
             .prepare_cached(sql)
             .and_then(|mut stmt| stmt.execute(params))
+            .map_err(|e| MetadataError::Db { context, source: e })
+    }
+
+    fn query_row_cached_metadata<T, P, F>(
+        &self,
+        sql: &str,
+        params: P,
+        context: &'static str,
+        f: F,
+    ) -> Result<T, MetadataError>
+    where
+        P: Params,
+        F: FnOnce(&Row<'_>) -> rusqlite::Result<T>,
+    {
+        self.conn
+            .prepare_cached(sql)
+            .and_then(|mut stmt| stmt.query_row(params, f))
+            .map_err(|e| MetadataError::Db { context, source: e })
+    }
+
+    fn query_row_cached_optional_metadata<T, P, F>(
+        &self,
+        sql: &str,
+        params: P,
+        context: &'static str,
+        f: F,
+    ) -> Result<Option<T>, MetadataError>
+    where
+        P: Params,
+        F: FnOnce(&Row<'_>) -> rusqlite::Result<T>,
+    {
+        self.conn
+            .prepare_cached(sql)
+            .and_then(|mut stmt| stmt.query_row(params, f).optional())
             .map_err(|e| MetadataError::Db { context, source: e })
     }
 
@@ -968,40 +1066,64 @@ impl PgStore {
         let new_digest = Self::metadata_row_digest_sql_expr(table, "NEW");
         let old_digest = Self::metadata_row_digest_sql_expr(table, "OLD");
         format!(
-            "CREATE TRIGGER IF NOT EXISTS metadata_digest_{name}_ai \
-             AFTER INSERT ON {table_name} BEGIN \
-               UPDATE metadata_table_digests \
-                  SET row_count = row_count + 1, \
-                      row_hash_xor = argmin_crc64_xor(row_hash_xor, {new_digest}), \
-                      row_hash_sum = argmin_crc64_add(row_hash_sum, {new_digest}) \
-                WHERE table_name = {table_literal}; \
-               UPDATE metadata_table_digests \
-                  SET table_digest = argmin_metadata_table_digest(table_name, row_count, row_hash_xor, row_hash_sum) \
-                WHERE table_name = {table_literal}; \
-             END; \
-             CREATE TRIGGER IF NOT EXISTS metadata_digest_{name}_ad \
-             AFTER DELETE ON {table_name} BEGIN \
-               UPDATE metadata_table_digests \
-                  SET row_count = row_count - 1, \
-                      row_hash_xor = argmin_crc64_xor(row_hash_xor, {old_digest}), \
-                      row_hash_sum = argmin_crc64_sub(row_hash_sum, {old_digest}) \
-                WHERE table_name = {table_literal}; \
-               UPDATE metadata_table_digests \
-                  SET table_digest = argmin_metadata_table_digest(table_name, row_count, row_hash_xor, row_hash_sum) \
-                WHERE table_name = {table_literal}; \
-             END; \
-             CREATE TRIGGER IF NOT EXISTS metadata_digest_{name}_au \
-             AFTER UPDATE ON {table_name} BEGIN \
-               UPDATE metadata_table_digests \
-                  SET row_hash_xor = argmin_crc64_xor(argmin_crc64_xor(row_hash_xor, {old_digest}), {new_digest}), \
-                      row_hash_sum = argmin_crc64_add(argmin_crc64_sub(row_hash_sum, {old_digest}), {new_digest}) \
-                WHERE table_name = {table_literal}; \
-               UPDATE metadata_table_digests \
-                  SET table_digest = argmin_metadata_table_digest(table_name, row_count, row_hash_xor, row_hash_sum) \
-                WHERE table_name = {table_literal}; \
-             END;",
-            name = table.name,
-        )
+			"CREATE TRIGGER IF NOT EXISTS metadata_digest_{name}_ai \
+			 AFTER INSERT ON {table_name} BEGIN \
+			   UPDATE metadata_table_digests \
+			      SET (row_count, row_hash_xor, row_hash_sum, table_digest) = ( \
+			          SELECT next_count, next_xor, next_sum, \
+			                 argmin_metadata_table_digest(table_name, next_count, next_xor, next_sum) \
+			            FROM ( \
+			              SELECT row_count + 1 AS next_count, \
+			                     argmin_crc64_xor(row_hash_xor, row_digest) AS next_xor, \
+			                     argmin_crc64_add(row_hash_sum, row_digest) AS next_sum \
+			                FROM (SELECT {new_digest} AS row_digest) \
+			            ) \
+				      ) \
+				    WHERE table_name = {table_literal}; \
+				   UPDATE metadata_digest_revision \
+				      SET revision = revision + 1 \
+				    WHERE singleton = 0; \
+				 END; \
+				 CREATE TRIGGER IF NOT EXISTS metadata_digest_{name}_ad \
+				 AFTER DELETE ON {table_name} BEGIN \
+			   UPDATE metadata_table_digests \
+			      SET (row_count, row_hash_xor, row_hash_sum, table_digest) = ( \
+			          SELECT next_count, next_xor, next_sum, \
+			                 argmin_metadata_table_digest(table_name, next_count, next_xor, next_sum) \
+			            FROM ( \
+			              SELECT row_count - 1 AS next_count, \
+			                     argmin_crc64_xor(row_hash_xor, row_digest) AS next_xor, \
+			                     argmin_crc64_sub(row_hash_sum, row_digest) AS next_sum \
+			                FROM (SELECT {old_digest} AS row_digest) \
+			            ) \
+				      ) \
+				    WHERE table_name = {table_literal}; \
+				   UPDATE metadata_digest_revision \
+				      SET revision = revision + 1 \
+				    WHERE singleton = 0; \
+				 END; \
+				 CREATE TRIGGER IF NOT EXISTS metadata_digest_{name}_au \
+				 AFTER UPDATE ON {table_name} BEGIN \
+			   UPDATE metadata_table_digests \
+			      SET (row_hash_xor, row_hash_sum, table_digest) = ( \
+			          SELECT next_xor, next_sum, \
+			                 argmin_metadata_table_digest(table_name, row_count, next_xor, next_sum) \
+			            FROM ( \
+			              SELECT argmin_crc64_xor(argmin_crc64_xor(row_hash_xor, old_row_digest), new_row_digest) AS next_xor, \
+			                     argmin_crc64_add(argmin_crc64_sub(row_hash_sum, old_row_digest), new_row_digest) AS next_sum \
+			                FROM ( \
+			                  SELECT {old_digest} AS old_row_digest, \
+			                         {new_digest} AS new_row_digest \
+			                ) \
+			            ) \
+				      ) \
+				    WHERE table_name = {table_literal}; \
+				   UPDATE metadata_digest_revision \
+				      SET revision = revision + 1 \
+				    WHERE singleton = 0; \
+				 END;",
+			name = table.name,
+		)
     }
 
     fn metadata_row_digest_sql_expr(table: &MetadataDigestTable, qualifier: &str) -> String {
@@ -1123,6 +1245,42 @@ impl PgStore {
         })
     }
 
+    fn metadata_command_replica_state_with_digest_revision(
+        &self,
+    ) -> Result<(MetadataCommandReplicaState, u64), StoreError> {
+        let (cluster_epoch, applied_log_index, applied_log_hash, state_digest, revision): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = self.query_row_cached(
+            "SELECT s.cluster_epoch, s.applied_log_index, s.applied_log_hash, s.state_digest, r.revision \
+             FROM metadata_command_replica_state s, metadata_digest_revision r \
+             WHERE s.singleton = 0 AND r.singleton = 0",
+            [],
+            "load metadata command replica state and digest revision",
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        let state = MetadataCommandReplicaState {
+            cluster_epoch: ClusterEpoch::new(cluster_epoch as u64)
+                .expect("metadata command replica state stores non-zero epoch"),
+            applied_log_index: applied_log_index as u64,
+            applied_log_hash: applied_log_hash as u64,
+            state_digest: state_digest as u64,
+        };
+        let revision = decode_nonnegative_u64("decode metadata digest revision", revision)?;
+        Ok((state, revision))
+    }
+
     pub(crate) fn max_metadata_command_log_index(
         &self,
         cluster_epoch: ClusterEpoch,
@@ -1233,6 +1391,7 @@ impl PgStore {
                 actual_digest,
             });
         }
+        self.mark_metadata_state_digest_clean()?;
         Ok(state)
     }
 
@@ -1645,7 +1804,30 @@ impl PgStore {
             params![state_digest as i64],
             "refresh metadata command state digest",
         )?;
+        self.mark_metadata_state_digest_clean()?;
         Ok(())
+    }
+
+    fn metadata_digest_revision(&self) -> Result<u64, StoreError> {
+        let raw = self.query_row_cached(
+            "SELECT revision FROM metadata_digest_revision WHERE singleton = 0",
+            [],
+            "load metadata digest revision",
+            |row| row.get::<_, i64>(0),
+        )?;
+        decode_nonnegative_u64("decode metadata digest revision", raw)
+    }
+
+    fn mark_metadata_state_digest_clean(&self) -> Result<(), StoreError> {
+        let revision = self.metadata_digest_revision()?;
+        self.clean_metadata_digest_revision
+            .store(revision, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn invalidate_clean_metadata_digest_revision(&self) {
+        self.clean_metadata_digest_revision
+            .store(UNCLEAN_METADATA_DIGEST_REVISION, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -1666,9 +1848,14 @@ impl PgStore {
     fn metadata_state_digest_mismatch(
         &self,
     ) -> Result<Option<(ClusterEpoch, u64, u64)>, StoreError> {
-        let state = self.metadata_command_replica_state()?;
+        let (state, revision) = self.metadata_command_replica_state_with_digest_revision()?;
+        if self.clean_metadata_digest_revision.load(Ordering::Relaxed) == revision {
+            return Ok(None);
+        }
         let actual_digest = self.cached_metadata_state_digest()?;
         if state.state_digest == actual_digest {
+            self.clean_metadata_digest_revision
+                .store(revision, Ordering::Relaxed);
             return Ok(None);
         }
         Ok(Some((
@@ -1800,7 +1987,7 @@ impl PgStore {
         let state_digest = self.cached_metadata_state_digest()?;
         self.execute_cached(
             "UPDATE metadata_command_replica_state \
-             SET cluster_epoch = ?1, applied_log_index = ?2, applied_log_hash = ?3, state_digest = ?4 \
+			 SET cluster_epoch = ?1, applied_log_index = ?2, applied_log_hash = ?3, state_digest = ?4 \
              WHERE singleton = 0",
             params![
                 cluster_epoch.get() as i64,
@@ -1909,6 +2096,16 @@ impl PgStore {
         for table in METADATA_DIGEST_TABLES {
             self.refresh_metadata_table_digest(table)?;
         }
+        self.bump_metadata_digest_revision()?;
+        Ok(())
+    }
+
+    fn bump_metadata_digest_revision(&self) -> Result<(), StoreError> {
+        self.execute_cached(
+            "UPDATE metadata_digest_revision SET revision = revision + 1 WHERE singleton = 0",
+            [],
+            "bump metadata digest revision",
+        )?;
         Ok(())
     }
 
@@ -2201,7 +2398,7 @@ impl PgStore {
         let result: Result<(), StoreError> = (|| {
             let mut stmt = self
                 .conn
-                .prepare(
+                .prepare_cached(
                     "INSERT OR REPLACE INTO shards (shard_key, data_size, crc64_nvme, created_at, status) \
                      VALUES (?1, ?2, ?3, ?4, 0)",
                 )
@@ -2269,7 +2466,7 @@ impl PgStore {
         let result: Result<(), MetadataError> = (|| {
             let mut shard_stmt = self
                 .conn
-                .prepare(
+                .prepare_cached(
                     "INSERT OR REPLACE INTO shards (shard_key, data_size, crc64_nvme, created_at, status) \
                      VALUES (?1, ?2, ?3, ?4, 0)",
                 )
@@ -3135,133 +3332,78 @@ impl PgStore {
                     "put bucket subresource command (check bucket exists)",
                 )?;
 
-                let kind = match mutation {
+                let (kind, policy_public, subresource_generation) = match mutation {
                     BucketSubresourceMutation::Put { kind, body, aux } => {
-                        match kind {
-                            BucketSubresourceKind::Cors | BucketSubresourceKind::Tagging => {}
-                            BucketSubresourceKind::Policy => {
-                                store
-                                    .conn
-                                    .execute(
-                                        "UPDATE buckets SET bucket_policy_public = ?1 WHERE name = ?2",
-                                        params![i32::from(aux.policy_is_public().unwrap()), name.as_str()],
-                                    )
-                                    .map_err(|source| MetadataError::Db {
-                                        context: "put bucket subresource command (update bucket policy summary)",
-                                        source,
-                                    })?;
-                            }
-                            BucketSubresourceKind::Lifecycle => {}
-                        }
                         if !kind.supports_aux(*aux) {
                             return Err(Self::bucket_subresource_invalid_aux(*kind, *aux));
                         }
-                        store
-                            .conn
-                            .execute(
+                        let policy_public = match kind {
+                            BucketSubresourceKind::Policy => Some(aux.policy_is_public().unwrap()),
+                            BucketSubresourceKind::Lifecycle
+                            | BucketSubresourceKind::Cors
+                            | BucketSubresourceKind::Tagging => None,
+                        };
+                        let subresource_generation = store
+                            .query_row_cached_metadata(
                                 "INSERT INTO bucket_subresources (bucket_name, kind, body, generation, aux_int_1) \
                                  VALUES (?1, ?2, ?3, 1, ?4) \
                                  ON CONFLICT(bucket_name, kind) DO UPDATE SET \
                                      body = excluded.body, \
                                      generation = bucket_subresources.generation + 1, \
-                                     aux_int_1 = excluded.aux_int_1",
+                                     aux_int_1 = excluded.aux_int_1 \
+                                 RETURNING generation",
                                 params![
                                     name.as_str(),
                                     *kind as u8 as i64,
                                     body,
                                     Self::bucket_subresource_aux_int_1_to_sql(*aux),
                                 ],
+                                "put bucket subresource command (upsert subresource row)",
+                                |row| row.get::<_, i64>(0),
                             )
-                            .map_err(|source| MetadataError::Db {
-                                context: "put bucket subresource command (upsert subresource row)",
-                                source,
+                            .and_then(|raw| {
+                                Self::parse_bucket_subresource_generation(raw, 0).map_err(
+                                    |source| MetadataError::Db {
+                                        context:
+                                            "put bucket subresource command (parse generation)",
+                                        source,
+                                    },
+                                )
                             })?;
-                        *kind
+                        (*kind, policy_public, subresource_generation)
                     }
                     BucketSubresourceMutation::Delete { kind } => {
-                        match kind {
-                            BucketSubresourceKind::Cors | BucketSubresourceKind::Tagging => {}
-                            BucketSubresourceKind::Policy => {
-                                store
-                                    .conn
-                                    .execute(
-                                        "UPDATE buckets SET bucket_policy_public = 0 WHERE name = ?1",
-                                        params![name.as_str()],
-                                    )
-                                    .map_err(|source| MetadataError::Db {
-                                        context: "put bucket subresource command (clear bucket policy summary)",
-                                        source,
-                                    })?;
-                            }
-                            BucketSubresourceKind::Lifecycle => {}
-                        }
-                        store
-                            .conn
-                            .execute(
+                        let policy_public = match kind {
+                            BucketSubresourceKind::Policy => Some(false),
+                            BucketSubresourceKind::Lifecycle
+                            | BucketSubresourceKind::Cors
+                            | BucketSubresourceKind::Tagging => None,
+                        };
+                        let subresource_generation = store
+                            .query_row_cached_metadata(
                                 "INSERT INTO bucket_subresources (bucket_name, kind, body, generation, aux_int_1) \
                                  VALUES (?1, ?2, NULL, 1, NULL) \
                                  ON CONFLICT(bucket_name, kind) DO UPDATE SET \
                                      body = NULL, \
                                      generation = bucket_subresources.generation + 1, \
-                                     aux_int_1 = NULL",
+                                     aux_int_1 = NULL \
+                                 RETURNING generation",
                                 params![name.as_str(), *kind as u8 as i64],
+                                "put bucket subresource command (tombstone subresource row)",
+                                |row| row.get::<_, i64>(0),
                             )
-                            .map_err(|source| MetadataError::Db {
-                                context: "put bucket subresource command (tombstone subresource row)",
-                                source,
+                            .and_then(|raw| {
+                                Self::parse_bucket_subresource_generation(raw, 0).map_err(
+                                    |source| MetadataError::Db {
+                                        context:
+                                            "put bucket subresource command (parse generation)",
+                                        source,
+                                    },
+                                )
                             })?;
-                        *kind
+                        (*kind, policy_public, subresource_generation)
                     }
                 };
-
-                let subresource_generation = store
-                    .conn
-                    .query_row(
-                        "SELECT generation FROM bucket_subresources \
-                         WHERE bucket_name = ?1 AND kind = ?2",
-                        params![name.as_str(), kind as u8 as i64],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .map_err(|source| MetadataError::Db {
-                        context: "put bucket subresource command (load generation)",
-                        source,
-                    })
-                    .and_then(|raw| {
-                        Self::parse_bucket_subresource_generation(raw, 0).map_err(|source| {
-                            MetadataError::Db {
-                                context: "put bucket subresource command (parse generation)",
-                                source,
-                            }
-                        })
-                    })?;
-
-                match kind {
-                    BucketSubresourceKind::Policy => {
-                        store
-                            .conn
-                            .execute(
-                                "UPDATE buckets SET bucket_policy_generation = ?1 WHERE name = ?2",
-                                params![subresource_generation as i64, name.as_str()],
-                            )
-                            .map_err(|source| MetadataError::Db {
-                                context: "put bucket subresource command (update policy generation mirror)",
-                                source,
-                            })?;
-                    }
-                    BucketSubresourceKind::Lifecycle => {
-                        store
-                            .conn
-                            .execute(
-                                "UPDATE buckets SET bucket_lifecycle_generation = ?1 WHERE name = ?2",
-                                params![subresource_generation as i64, name.as_str()],
-                            )
-                            .map_err(|source| MetadataError::Db {
-                                context: "put bucket subresource command (update lifecycle generation mirror)",
-                                source,
-                            })?;
-                    }
-                    BucketSubresourceKind::Cors | BucketSubresourceKind::Tagging => {}
-                }
 
                 let execution_generation = match generation {
                     #[cfg(test)]
@@ -3277,16 +3419,44 @@ impl PgStore {
                         generation
                     }
                 };
-                store
-                    .conn
-                    .execute(
-                        "UPDATE buckets SET bucket_execution_generation = ?1 WHERE name = ?2",
-                        params![execution_generation as i64, name.as_str()],
-                    )
-                    .map_err(|source| MetadataError::Db {
-                        context: "put bucket subresource command (bump execution generation)",
-                        source,
-                    })?;
+                let updated = match kind {
+                    BucketSubresourceKind::Policy => store.execute_cached_metadata(
+                        "UPDATE buckets \
+                         SET bucket_policy_public = ?1, \
+                             bucket_policy_generation = ?2, \
+                             bucket_execution_generation = ?3 \
+                         WHERE name = ?4",
+                        params![
+                            i32::from(policy_public.expect("policy commands set policy summary")),
+                            subresource_generation as i64,
+                            execution_generation as i64,
+                            name.as_str(),
+                        ],
+                        "put bucket subresource command (update policy bucket mirrors)",
+                    )?,
+                    BucketSubresourceKind::Lifecycle => store.execute_cached_metadata(
+                        "UPDATE buckets \
+                         SET bucket_lifecycle_generation = ?1, \
+                             bucket_execution_generation = ?2 \
+                         WHERE name = ?3",
+                        params![
+                            subresource_generation as i64,
+                            execution_generation as i64,
+                            name.as_str(),
+                        ],
+                        "put bucket subresource command (update lifecycle bucket mirrors)",
+                    )?,
+                    BucketSubresourceKind::Cors | BucketSubresourceKind::Tagging => {
+                        store.execute_cached_metadata(
+                            "UPDATE buckets SET bucket_execution_generation = ?1 WHERE name = ?2",
+                            params![execution_generation as i64, name.as_str()],
+                            "put bucket subresource command (bump execution generation)",
+                        )?
+                    }
+                };
+                if updated == 0 {
+                    return Err(bucket_not_found(name.as_str()));
+                }
 
                 Ok(())
             },
@@ -3856,40 +4026,35 @@ impl PgStore {
         &self,
         context: &'static str,
     ) -> Result<u64, MetadataError> {
-        self.conn
-            .query_row(
-                "UPDATE pg_counters \
-                 SET next_bucket_execution_generation = next_bucket_execution_generation + 1 \
-                 WHERE singleton = 0 \
-                 RETURNING next_bucket_execution_generation",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|source| MetadataError::Db { context, source })
-            .and_then(|raw| {
-                raw.try_into().map_err(|_| MetadataError::Db {
-                    context: "decode next bucket execution generation",
-                    source: rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Integer,
-                        Box::from("negative next_bucket_execution_generation"),
-                    ),
-                })
+        self.query_row_cached_metadata(
+            "UPDATE pg_counters \
+             SET next_bucket_execution_generation = next_bucket_execution_generation + 1 \
+             WHERE singleton = 0 \
+             RETURNING next_bucket_execution_generation",
+            [],
+            context,
+            |row| row.get::<_, i64>(0),
+        )
+        .and_then(|raw| {
+            raw.try_into().map_err(|_| MetadataError::Db {
+                context: "decode next bucket execution generation",
+                source: rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    Box::from("negative next_bucket_execution_generation"),
+                ),
             })
+        })
     }
 
     pub(crate) fn next_bucket_execution_generation_candidate(&self) -> Result<u64, MetadataError> {
         let current: u64 = self
-            .conn
-            .query_row(
+            .query_row_cached_metadata(
                 "SELECT next_bucket_execution_generation FROM pg_counters WHERE singleton = 0",
                 [],
+                "read next bucket execution generation candidate",
                 |row| row.get::<_, i64>(0),
             )
-            .map_err(|source| MetadataError::Db {
-                context: "read next bucket execution generation candidate",
-                source,
-            })
             .and_then(|raw| {
                 raw.try_into().map_err(|_| MetadataError::Db {
                     context: "decode next bucket execution generation candidate",
@@ -3919,14 +4084,13 @@ impl PgStore {
                 "bucket execution generation exceeds i64",
             )),
         })?;
-        self.conn
-            .execute(
-                "UPDATE pg_counters \
-                 SET next_bucket_execution_generation = max(next_bucket_execution_generation, ?1) \
-                 WHERE singleton = 0",
-                params![generation],
-            )
-            .map_err(|source| MetadataError::Db { context, source })?;
+        self.execute_cached_metadata(
+            "UPDATE pg_counters \
+             SET next_bucket_execution_generation = max(next_bucket_execution_generation, ?1) \
+             WHERE singleton = 0",
+            params![generation],
+            context,
+        )?;
         Ok(())
     }
 
@@ -4514,15 +4678,19 @@ impl PgStore {
             Ok(state) => {
                 if let Err(source) = self.conn.execute_batch("COMMIT") {
                     let _ = self.conn.execute_batch("ROLLBACK");
+                    self.invalidate_clean_metadata_digest_revision();
                     return Err(BucketSnapshotLoadError::Metadata(MetadataError::Db {
                         context: "apply metadata command and record (commit txn)",
                         source,
                     }));
                 }
+                self.mark_metadata_state_digest_clean()
+                    .map_err(BucketSnapshotLoadError::Store)?;
                 Ok(state)
             }
             Err(error) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
+                self.invalidate_clean_metadata_digest_revision();
                 Err(error)
             }
         }
@@ -4876,7 +5044,7 @@ impl PgStore {
     ) -> Result<(), MetadataError> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "INSERT INTO multipart_part_segments \
                  (bucket, key, upload_id, version_id, part_number, segment_index, size, \
                   segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
@@ -5887,7 +6055,7 @@ impl PgStore {
     ) -> Result<(), MetadataError> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "INSERT INTO multipart_part_segments \
                  (bucket, key, upload_id, version_id, part_number, segment_index, size, \
                   segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
@@ -6067,7 +6235,7 @@ impl PgStore {
     ) -> Result<Vec<StreamUploadRecord>, MetadataError> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
                  created_at, encryption_type, encryption_state FROM stream_uploads \
                  WHERE op_kind = ?1 AND upload_id = ?2 ORDER BY session_id ASC",
@@ -6395,21 +6563,16 @@ impl PgStore {
         generation: BucketExecutionGeneration,
     ) -> Result<(), MetadataError> {
         let (current, current_generation): (BucketVersioningState, u64) = self
-            .conn
-            .query_row(
+            .query_row_cached_optional_metadata(
                 "SELECT versioning, bucket_execution_generation FROM buckets WHERE name = ?1",
                 params![name.as_str()],
+                "get bucket versioning",
                 |row| {
                     let raw_versioning = row.get::<_, u8>(0)?;
                     let raw_generation = row.get::<_, i64>(1)?;
                     Ok((raw_versioning, raw_generation))
                 },
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "get bucket versioning",
-                source: e,
-            })?
+            )?
             .ok_or_else(|| bucket_not_found(name.as_str()))
             .and_then(|(raw_versioning, raw_generation)| {
                 let versioning =
@@ -6475,19 +6638,14 @@ impl PgStore {
                         generation
                     }
                 };
-                store
-                    .conn
-                    .execute(
-                        "UPDATE buckets \
-                         SET versioning = ?1, \
-                             bucket_execution_generation = ?2 \
-                         WHERE name = ?3",
-                        params![state as u8 as i64, generation as i64, name.as_str()],
-                    )
-                    .map_err(|source| MetadataError::Db {
-                        context: "put bucket versioning",
-                        source,
-                    })?;
+                store.execute_cached_metadata(
+                    "UPDATE buckets \
+                     SET versioning = ?1, \
+                         bucket_execution_generation = ?2 \
+                     WHERE name = ?3",
+                    params![state as u8 as i64, generation as i64, name.as_str()],
+                    "put bucket versioning",
+                )?;
                 Ok(())
             },
         )
@@ -6508,12 +6666,12 @@ impl PgStore {
             bool,
             u64,
         ) = self
-            .conn
-            .query_row(
+            .query_row_cached_optional_metadata(
                 "SELECT acl_grants, public_read, public_write, bucket_execution_generation \
                  FROM buckets \
                  WHERE name = ?1",
                 params![name.as_str()],
+                "get bucket acl",
                 |row| {
                     let raw_acl_grants = row.get::<_, String>(0)?;
                     let public_read = row.get::<_, i64>(1)? != 0;
@@ -6521,12 +6679,7 @@ impl PgStore {
                     let raw_generation = row.get::<_, i64>(3)?;
                     Ok((raw_acl_grants, public_read, public_write, raw_generation))
                 },
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "get bucket acl",
-                source: e,
-            })?
+            )?
             .ok_or_else(|| bucket_not_found(name.as_str()))
             .and_then(
                 |(raw_acl_grants, public_read, public_write, raw_generation)| {
@@ -6585,27 +6738,22 @@ impl PgStore {
                         generation
                     }
                 };
-                let updated = store
-                    .conn
-                    .execute(
-                        "UPDATE buckets \
-                         SET acl_grants = ?1, \
-                             public_read = ?2, \
-                             public_write = ?3, \
-                             bucket_execution_generation = ?4 \
-                         WHERE name = ?5",
-                        params![
-                            acl_grants.serialized(),
-                            i32::from(public_read),
-                            i32::from(public_write),
-                            generation as i64,
-                            name.as_str()
-                        ],
-                    )
-                    .map_err(|source| MetadataError::Db {
-                        context: "put bucket acl",
-                        source,
-                    })?;
+                let updated = store.execute_cached_metadata(
+                    "UPDATE buckets \
+                     SET acl_grants = ?1, \
+                         public_read = ?2, \
+                         public_write = ?3, \
+                         bucket_execution_generation = ?4 \
+                     WHERE name = ?5",
+                    params![
+                        acl_grants.serialized(),
+                        i32::from(public_read),
+                        i32::from(public_write),
+                        generation as i64,
+                        name.as_str()
+                    ],
+                    "put bucket acl",
+                )?;
                 if updated == 0 {
                     return Err(bucket_not_found(name.as_str()));
                 }
@@ -6690,49 +6838,39 @@ impl PgStore {
                                     source: e,
                                 }
                             })?;
-                        store
-                            .conn
-                            .execute(
-                                "UPDATE buckets \
-                                 SET object_lock_enabled = ?1, \
-                                     object_lock_default_mode = ?2, \
-                                     object_lock_default_days = ?3, \
-                                     object_lock_default_years = ?4, \
-                                     bucket_execution_generation = ?5 \
-                                 WHERE name = ?6",
-                                params![
-                                    enabled,
-                                    default_mode,
-                                    default_days,
-                                    default_years,
-                                    generation as i64,
-                                    name.as_str()
-                                ],
-                            )
-                            .map_err(|source| MetadataError::Db {
-                                context: "put bucket object lock",
-                                source,
-                            })?
-                    }
-                    BucketPropertyMutation::Encryption(config) => store
-                        .conn
-                        .execute(
+                        store.execute_cached_metadata(
                             "UPDATE buckets \
+                             SET object_lock_enabled = ?1, \
+                                 object_lock_default_mode = ?2, \
+                                 object_lock_default_days = ?3, \
+                                 object_lock_default_years = ?4, \
+                                 bucket_execution_generation = ?5 \
+                             WHERE name = ?6",
+                            params![
+                                enabled,
+                                default_mode,
+                                default_days,
+                                default_years,
+                                generation as i64,
+                                name.as_str()
+                            ],
+                            "put bucket object lock",
+                        )?
+                    }
+                    BucketPropertyMutation::Encryption(config) => store.execute_cached_metadata(
+                        "UPDATE buckets \
                              SET default_encryption_type = ?1, \
                                  sse_c_blocked = ?2, \
                                  bucket_execution_generation = ?3 \
                              WHERE name = ?4",
-                            params![
-                                config.default_encryption.map(|value| value as u8),
-                                i32::from(config.sse_c_blocked),
-                                generation as i64,
-                                name.as_str()
-                            ],
-                        )
-                        .map_err(|source| MetadataError::Db {
-                            context: "put bucket encryption",
-                            source,
-                        })?,
+                        params![
+                            config.default_encryption.map(|value| value as u8),
+                            i32::from(config.sse_c_blocked),
+                            generation as i64,
+                            name.as_str()
+                        ],
+                        "put bucket encryption",
+                    )?,
                     BucketPropertyMutation::PublicAccessBlock(config) => {
                         let (
                             present,
@@ -6741,35 +6879,29 @@ impl PgStore {
                             block_public_policy,
                             restrict_public_buckets,
                         ) = Self::public_access_block_sql_values(*config);
-                        store
-                            .conn
-                            .execute(
-                                "UPDATE buckets SET \
-                                     public_access_block_present = ?1, \
-                                     public_access_block_block_public_acls = ?2, \
-                                     public_access_block_ignore_public_acls = ?3, \
-                                     public_access_block_block_public_policy = ?4, \
-                                     public_access_block_restrict_public_buckets = ?5, \
-                                     bucket_execution_generation = ?6 \
-                                 WHERE name = ?7",
-                                params![
-                                    present,
-                                    block_public_acls,
-                                    ignore_public_acls,
-                                    block_public_policy,
-                                    restrict_public_buckets,
-                                    generation as i64,
-                                    name.as_str(),
-                                ],
-                            )
-                            .map_err(|source| MetadataError::Db {
-                                context: "put bucket public access block",
-                                source,
-                            })?
+                        store.execute_cached_metadata(
+                            "UPDATE buckets SET \
+                                 public_access_block_present = ?1, \
+                                 public_access_block_block_public_acls = ?2, \
+                                 public_access_block_ignore_public_acls = ?3, \
+                                 public_access_block_block_public_policy = ?4, \
+                                 public_access_block_restrict_public_buckets = ?5, \
+                                 bucket_execution_generation = ?6 \
+                             WHERE name = ?7",
+                            params![
+                                present,
+                                block_public_acls,
+                                ignore_public_acls,
+                                block_public_policy,
+                                restrict_public_buckets,
+                                generation as i64,
+                                name.as_str(),
+                            ],
+                            "put bucket public access block",
+                        )?
                     }
                     BucketPropertyMutation::OwnershipControls(config) => store
-                        .conn
-                        .execute(
+                        .execute_cached_metadata(
                             "UPDATE buckets \
                              SET ownership_controls_mode = ?1, \
                                  bucket_execution_generation = ?2 \
@@ -6779,28 +6911,20 @@ impl PgStore {
                                 generation as i64,
                                 name.as_str()
                             ],
-                        )
-                        .map_err(|source| MetadataError::Db {
-                            context: "put bucket ownership controls",
-                            source,
-                        })?,
-                    BucketPropertyMutation::AbacEnabled(enabled) => store
-                        .conn
-                        .execute(
-                            "UPDATE buckets \
+                            "put bucket ownership controls",
+                        )?,
+                    BucketPropertyMutation::AbacEnabled(enabled) => store.execute_cached_metadata(
+                        "UPDATE buckets \
                              SET bucket_abac_enabled = ?1, \
                                  bucket_execution_generation = ?2 \
                              WHERE name = ?3",
-                            params![
-                                if *enabled { 1 } else { 0 },
-                                generation as i64,
-                                name.as_str()
-                            ],
-                        )
-                        .map_err(|source| MetadataError::Db {
-                            context: "put bucket abac enabled",
-                            source,
-                        })?,
+                        params![
+                            if *enabled { 1 } else { 0 },
+                            generation as i64,
+                            name.as_str()
+                        ],
+                        "put bucket abac enabled",
+                    )?,
                 };
                 if updated == 0 {
                     return Err(bucket_not_found(name.as_str()));
@@ -6827,7 +6951,7 @@ impl PgStore {
         );
         let mut stmt = self
             .conn
-            .prepare(&sql)
+            .prepare_cached(&sql)
             .map_err(|source| MetadataError::Db {
                 context: "prepare load bucket execution generations",
                 source,
@@ -6868,17 +6992,12 @@ impl PgStore {
         key: &str,
     ) -> Result<u64, MetadataError> {
         let max: Option<i64> = self
-            .conn
-            .query_row(
+            .query_row_cached_optional_metadata(
                 "SELECT MAX(write_sequence) FROM objects WHERE bucket = ?1 AND key = ?2",
                 params![bucket, key],
+                "next object write sequence",
                 |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "next object write sequence",
-                source: e,
-            })?
+            )?
             .flatten();
 
         match max {
@@ -7088,25 +7207,21 @@ impl PgStore {
         bucket: &BucketName,
     ) -> Result<u64, MetadataError> {
         let bucket = bucket.as_str();
-        self.conn
-            .query_row(
-                "SELECT completed_multipart_upload_sequence FROM buckets WHERE name = ?1",
-                params![bucket],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "read completed multipart upload sequence",
-                source: e,
-            })?
-            .try_into()
-            .map_err(|_| MetadataError::Db {
-                context: "decode completed multipart upload sequence",
-                source: rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Integer,
-                    Box::from("negative completed multipart upload sequence"),
-                ),
-            })
+        self.query_row_cached_metadata(
+            "SELECT completed_multipart_upload_sequence FROM buckets WHERE name = ?1",
+            params![bucket],
+            "read completed multipart upload sequence",
+            |row| row.get::<_, i64>(0),
+        )?
+        .try_into()
+        .map_err(|_| MetadataError::Db {
+            context: "decode completed multipart upload sequence",
+            source: rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Integer,
+                Box::from("negative completed multipart upload sequence"),
+            ),
+        })
     }
 
     pub fn list_completed_multipart_uploads_for_bucket(
@@ -7128,7 +7243,7 @@ impl PgStore {
     ) -> Result<Vec<CompletedMultipartUploadRecord>, MetadataError> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT upload_id, bucket, key, completion_order, completed_at, \
                         owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id \
                  FROM completed_multipart_uploads \
@@ -7677,7 +7792,7 @@ impl PgStore {
 
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "INSERT INTO object_parts \
                  (bucket, key, version_id, part_number, object_offset_start, size, etag, etag_kind, \
                   part_okh, part_vid, ec_k, ec_m, data_pg_id, checksum) \
@@ -7906,7 +8021,7 @@ impl PgMetadataStore for PgStore {
         );
         let mut stmt = self
             .conn
-            .prepare(&format!(
+            .prepare_cached(&format!(
                 "{BUCKET_INFO_SELECT} WHERE owner_canonical_id = ?1 AND state = ?2 ORDER BY name ASC"
             ))
             .map_err(|e| MetadataError::Db {
@@ -7942,7 +8057,7 @@ impl PgMetadataStore for PgStore {
         );
         let mut stmt = self
             .conn
-            .prepare(&format!(
+            .prepare_cached(&format!(
                 "{BUCKET_INFO_SELECT} \
                  JOIN bucket_subresources AS lifecycle \
                    ON lifecycle.bucket_name = buckets.name \
@@ -7982,7 +8097,7 @@ impl PgMetadataStore for PgStore {
         );
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT DISTINCT bucket FROM multipart_uploads \
                  WHERE state = ?1 ORDER BY bucket ASC",
             )
@@ -8452,42 +8567,38 @@ impl PgMetadataStore for PgStore {
                       storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)"
                 };
-                self.conn
-                    .execute(
-                        sql,
-                        params![
-                            req.bucket,
-                            req.key,
-                            req.version_id.to_u64() as i64,
-                            write_sequence as i64,
-                            req.generation_id.get() as i64,
-                            req.size as i64,
-                            req.etag.as_bytes().as_slice(),
-                            etag_kind_u8,
-                            now as i64,
-                            req.ec.k,
-                            req.ec.m,
-                            status_u8,
-                            data_layout_u8,
-                            parts_count,
-                            tags,
-                            metadata_blob,
-                            system_metadata_blob,
-                            encryption_type,
-                            encryption_state,
-                            req.owner.principal,
-                            req.owner.canonical_id.as_str(),
-                            req.acl_grants.serialized(),
-                            i32::from(req.public_read),
-                            object_lock_retention_mode,
-                            object_lock_retain_until,
-                            object_lock_legal_hold,
-                        ],
-                    )
-                    .map_err(|e| MetadataError::Db {
-                        context: "put object meta",
-                        source: e,
-                    })?;
+                self.execute_cached_metadata(
+                    sql,
+                    params![
+                        req.bucket,
+                        req.key,
+                        req.version_id.to_u64() as i64,
+                        write_sequence as i64,
+                        req.generation_id.get() as i64,
+                        req.size as i64,
+                        req.etag.as_bytes().as_slice(),
+                        etag_kind_u8,
+                        now as i64,
+                        req.ec.k,
+                        req.ec.m,
+                        status_u8,
+                        data_layout_u8,
+                        parts_count,
+                        tags,
+                        metadata_blob,
+                        system_metadata_blob,
+                        encryption_type,
+                        encryption_state,
+                        req.owner.principal,
+                        req.owner.canonical_id.as_str(),
+                        req.acl_grants.serialized(),
+                        i32::from(req.public_read),
+                        object_lock_retention_mode,
+                        object_lock_retain_until,
+                        object_lock_legal_hold,
+                    ],
+                    "put object meta",
+                )?;
                 Ok(())
             }
             PutObjectReq::DeleteMarker(req) => {
@@ -8536,22 +8647,17 @@ impl PgMetadataStore for PgStore {
             bucket,
             key
         );
-        self.conn
-            .query_row(
-                "SELECT bucket, key, version_id, generation_id, size, etag, etag_kind, \
-                 last_modified, storage_class, ec_k, ec_m, status, tags, \
-                 data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold \
-                 , became_noncurrent_at \
-                 FROM objects WHERE bucket = ?1 AND key = ?2 \
-                 ORDER BY write_sequence DESC LIMIT 1",
-                params![bucket, key],
-                Self::row_to_object_record,
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "get object meta",
-                source: e,
-            })?
+        self.query_row_cached_optional_metadata(
+            "SELECT bucket, key, version_id, generation_id, size, etag, etag_kind, \
+             last_modified, storage_class, ec_k, ec_m, status, tags, \
+             data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold \
+             , became_noncurrent_at \
+             FROM objects WHERE bucket = ?1 AND key = ?2 \
+             ORDER BY write_sequence DESC LIMIT 1",
+            params![bucket, key],
+            "get object meta",
+            Self::row_to_object_record,
+        )?
             .ok_or(MetadataError::ObjectNotFound)
     }
 
@@ -8570,21 +8676,16 @@ impl PgMetadataStore for PgStore {
             key,
             version_id
         );
-        self.conn
-            .query_row(
-                "SELECT bucket, key, version_id, generation_id, size, etag, etag_kind, \
-                 last_modified, storage_class, ec_k, ec_m, status, tags, \
-                 data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold \
-                 , became_noncurrent_at \
-                 FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                params![bucket, key, version_id.to_u64() as i64],
-                Self::row_to_object_record,
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "get object version",
-                source: e,
-            })?
+        self.query_row_cached_optional_metadata(
+            "SELECT bucket, key, version_id, generation_id, size, etag, etag_kind, \
+             last_modified, storage_class, ec_k, ec_m, status, tags, \
+             data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold \
+             , became_noncurrent_at \
+             FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+            params![bucket, key, version_id.to_u64() as i64],
+            "get object version",
+            Self::row_to_object_record,
+        )?
             .ok_or(MetadataError::ObjectNotFound)
     }
 
@@ -8597,37 +8698,26 @@ impl PgMetadataStore for PgStore {
         acl_grants: &AclGrants,
         public_read: bool,
     ) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE objects SET acl_grants = ?1, public_read = ?2 \
-                 WHERE bucket = ?3 AND key = ?4 AND version_id = ?5 AND status = ?6",
-                params![
-                    acl_grants.serialized(),
-                    i32::from(public_read),
-                    bucket,
-                    key,
-                    version_id.to_u64() as i64,
-                    ObjectState::Live as u8
-                ],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put object acl",
-                source: e,
-            })?;
+        let updated = self.execute_cached_metadata(
+            "UPDATE objects SET acl_grants = ?1, public_read = ?2 \
+             WHERE bucket = ?3 AND key = ?4 AND version_id = ?5 AND status = ?6",
+            params![
+                acl_grants.serialized(),
+                i32::from(public_read),
+                bucket,
+                key,
+                version_id.to_u64() as i64,
+                ObjectState::Live as u8
+            ],
+            "put object acl",
+        )?;
         if updated == 0 {
-            let status = self
-                .conn
-                .query_row(
-                    "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                    params![bucket, key, version_id.to_u64() as i64],
-                    |row| row.get::<_, u8>(0),
-                )
-                .optional()
-                .map_err(|e| MetadataError::Db {
-                    context: "put object acl (check status)",
-                    source: e,
-                })?;
+            let status = self.query_row_cached_optional_metadata(
+                "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![bucket, key, version_id.to_u64() as i64],
+                "put object acl (check status)",
+                |row| row.get::<_, u8>(0),
+            )?;
             return match status {
                 Some(v) if v == ObjectState::DeleteMarker as u8 => {
                     Err(MetadataError::MethodNotAllowedOnDeleteMarker)
@@ -8654,38 +8744,27 @@ impl PgMetadataStore for PgStore {
                     retention.retain_until_unix_seconds
                 ))),
             })?;
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE objects \
-                 SET object_lock_retention_mode = ?1, object_lock_retain_until = ?2 \
-                 WHERE bucket = ?3 AND key = ?4 AND version_id = ?5 AND status = ?6",
-                params![
-                    retention.mode as u8,
-                    retain_until,
-                    bucket,
-                    key,
-                    version_id.to_u64() as i64,
-                    ObjectState::Live as u8
-                ],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put object retention",
-                source: e,
-            })?;
+        let updated = self.execute_cached_metadata(
+            "UPDATE objects \
+             SET object_lock_retention_mode = ?1, object_lock_retain_until = ?2 \
+             WHERE bucket = ?3 AND key = ?4 AND version_id = ?5 AND status = ?6",
+            params![
+                retention.mode as u8,
+                retain_until,
+                bucket,
+                key,
+                version_id.to_u64() as i64,
+                ObjectState::Live as u8
+            ],
+            "put object retention",
+        )?;
         if updated == 0 {
-            let status = self
-                .conn
-                .query_row(
-                    "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                    params![bucket, key, version_id.to_u64() as i64],
-                    |row| row.get::<_, u8>(0),
-                )
-                .optional()
-                .map_err(|e| MetadataError::Db {
-                    context: "put object retention (check status)",
-                    source: e,
-                })?;
+            let status = self.query_row_cached_optional_metadata(
+                "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![bucket, key, version_id.to_u64() as i64],
+                "put object retention (check status)",
+                |row| row.get::<_, u8>(0),
+            )?;
             return match status {
                 Some(v) if v == ObjectState::DeleteMarker as u8 => {
                     Err(MetadataError::MethodNotAllowedOnDeleteMarker)
@@ -8704,36 +8783,25 @@ impl PgMetadataStore for PgStore {
         version_id: VersionId,
         legal_hold: StoredLegalHoldStatus,
     ) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE objects SET object_lock_legal_hold = ?1 \
-                 WHERE bucket = ?2 AND key = ?3 AND version_id = ?4 AND status = ?5",
-                params![
-                    legal_hold as u8,
-                    bucket,
-                    key,
-                    version_id.to_u64() as i64,
-                    ObjectState::Live as u8
-                ],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put object legal hold",
-                source: e,
-            })?;
+        let updated = self.execute_cached_metadata(
+            "UPDATE objects SET object_lock_legal_hold = ?1 \
+             WHERE bucket = ?2 AND key = ?3 AND version_id = ?4 AND status = ?5",
+            params![
+                legal_hold as u8,
+                bucket,
+                key,
+                version_id.to_u64() as i64,
+                ObjectState::Live as u8
+            ],
+            "put object legal hold",
+        )?;
         if updated == 0 {
-            let status = self
-                .conn
-                .query_row(
-                    "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                    params![bucket, key, version_id.to_u64() as i64],
-                    |row| row.get::<_, u8>(0),
-                )
-                .optional()
-                .map_err(|e| MetadataError::Db {
-                    context: "put object legal hold (check status)",
-                    source: e,
-                })?;
+            let status = self.query_row_cached_optional_metadata(
+                "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![bucket, key, version_id.to_u64() as i64],
+                "put object legal hold (check status)",
+                |row| row.get::<_, u8>(0),
+            )?;
             return match status {
                 Some(v) if v == ObjectState::DeleteMarker as u8 => {
                     Err(MetadataError::MethodNotAllowedOnDeleteMarker)
@@ -9050,7 +9118,7 @@ impl PgMetadataStore for PgStore {
     ) -> Result<Vec<StoredObject>, MetadataError> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT bucket, key, version_id, generation_id, size, etag, etag_kind, \
                  last_modified, storage_class, ec_k, ec_m, status, tags, \
                  data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold, became_noncurrent_at \
@@ -9086,17 +9154,12 @@ impl PgMetadataStore for PgStore {
         key: &ObjectKey,
     ) -> Result<VersionId, MetadataError> {
         let max_existing: Option<i64> = self
-            .conn
-            .query_row(
+            .query_row_cached_optional_metadata(
                 "SELECT MAX(version_id) FROM objects WHERE bucket = ?1 AND key = ?2",
                 params![bucket, key],
+                "next version id (max existing)",
                 |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "next version id (max existing)",
-                source: e,
-            })?
+            )?
             .flatten();
         let next_from_rows = match max_existing {
             None => 1,
@@ -9120,19 +9183,13 @@ impl PgMetadataStore for PgStore {
             }
         };
 
-        let stored_next: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT next_version_id FROM object_version_counters \
+        let stored_next: Option<i64> = self.query_row_cached_optional_metadata(
+            "SELECT next_version_id FROM object_version_counters \
                  WHERE bucket = ?1 AND key = ?2",
-                params![bucket, key],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "next version id (load counter)",
-                source: e,
-            })?;
+            params![bucket, key],
+            "next version id (load counter)",
+            |row| row.get(0),
+        )?;
         let next_from_counter = match stored_next {
             None => 1,
             Some(v) => u64::try_from(v).map_err(|_| MetadataError::Db {
@@ -9162,8 +9219,7 @@ impl PgMetadataStore for PgStore {
         key: &ObjectKey,
     ) -> Result<GenerationId, MetadataError> {
         let max: Option<i64> = self
-            .conn
-            .query_row(
+            .query_row_cached_optional_metadata(
                 "SELECT MAX(generation_id) FROM (
                      SELECT generation_id FROM objects WHERE bucket = ?1 AND key = ?2
                      UNION ALL
@@ -9176,13 +9232,9 @@ impl PgMetadataStore for PgStore {
                      SELECT generation_id FROM object_generation_reservations WHERE bucket = ?1 AND key = ?2
                  )",
                 params![bucket, key],
+                "next generation id",
                 |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "next generation id",
-                source: e,
-            })?
+            )?
             .flatten();
 
         let next = match max {
@@ -9232,23 +9284,19 @@ impl PgMetadataStore for PgStore {
 
         let result: Result<GenerationId, MetadataError> = (|| {
             let generation_id = self.next_generation_id(bucket, key)?;
-            self.conn
-                .execute(
-                    "INSERT INTO object_generation_reservations \
-                     (reservation_id, bucket, key, generation_id, created_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        reservation_id.as_str(),
-                        bucket,
-                        key,
-                        generation_id.get() as i64,
-                        PgStore::now_millis() as i64,
-                    ],
-                )
-                .map_err(|e| MetadataError::Db {
-                    context: "reserve object generation (insert reservation)",
-                    source: e,
-                })?;
+            self.execute_cached_metadata(
+                "INSERT INTO object_generation_reservations \
+                 (reservation_id, bucket, key, generation_id, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    reservation_id.as_str(),
+                    bucket,
+                    key,
+                    generation_id.get() as i64,
+                    PgStore::now_millis() as i64,
+                ],
+                "reserve object generation (insert reservation)",
+            )?;
             Ok(generation_id)
         })();
 
@@ -9277,18 +9325,13 @@ impl PgMetadataStore for PgStore {
         reservation_id: &SessionId,
     ) -> Result<GenerationId, MetadataError> {
         let raw: i64 = self
-            .conn
-            .query_row(
+            .query_row_cached_optional_metadata(
                 "SELECT generation_id FROM object_generation_reservations \
                  WHERE reservation_id = ?1 AND bucket = ?2 AND key = ?3",
                 params![reservation_id.as_str(), bucket, key],
+                "get object generation reservation",
                 |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "get object generation reservation",
-                source: e,
-            })?
+            )?
             .ok_or_else(|| MetadataError::ObjectGenerationReservationNotFound {
                 reservation_id: reservation_id.as_str().to_owned(),
             })?;
@@ -9416,7 +9459,7 @@ impl PgMetadataStore for PgStore {
 
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT segment_index, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
                  FROM object_segment_reclaim_segments \
                  WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3 \
@@ -9644,7 +9687,7 @@ impl PgMetadataStore for PgStore {
 
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT part_number, storage_kind, part_okh, part_vid, data_pg_id, ec_k, ec_m \
                  FROM multipart_reclaim_parts \
                  WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3 \
@@ -9747,7 +9790,7 @@ impl PgMetadataStore for PgStore {
                 MultipartReclaimPartKind::Segments => {
                     let mut segment_stmt = self
                         .conn
-                        .prepare(
+                        .prepare_cached(
                             "SELECT part_number, segment_index, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
                              FROM multipart_reclaim_part_segments \
                              WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3 AND part_number = ?4 \
@@ -9823,57 +9866,48 @@ impl PgMetadataStore for PgStore {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<bool, MetadataError> {
-        self.conn
-            .query_row(
-                "SELECT
-                    EXISTS(
-                        SELECT 1 FROM object_segments_reclaims
-                        WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3
-                    )
-                    OR EXISTS(
-                        SELECT 1 FROM multipart_reclaims
-                        WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3
-                    )",
-                params![bucket, key, generation_id.get() as i64],
-                |row| Ok(row.get::<_, i64>(0)? != 0),
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "payload reclaim exists",
-                source: e,
-            })
+        self.query_row_cached_metadata(
+            "SELECT
+                EXISTS(
+                    SELECT 1 FROM object_segments_reclaims
+                    WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3
+                )
+                OR EXISTS(
+                    SELECT 1 FROM multipart_reclaims
+                    WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3
+                )",
+            params![bucket, key, generation_id.get() as i64],
+            "payload reclaim exists",
+            |row| Ok(row.get::<_, i64>(0)? != 0),
+        )
     }
 
     fn get_bucket_payload_reclaim_root(
         &self,
         bucket: &BucketName,
     ) -> Result<Option<PayloadReclaimRoot>, MetadataError> {
-        self.conn
-            .query_row(
-                "SELECT bucket, key, generation_id FROM (
-                     SELECT bucket, key, generation_id FROM object_segments_reclaims WHERE bucket = ?1
-                     UNION ALL
-                     SELECT bucket, key, generation_id FROM multipart_reclaims WHERE bucket = ?1
-                 )
-                 ORDER BY key ASC, generation_id ASC
-                 LIMIT 1",
-                params![bucket],
-                |row| {
-                    Ok(PayloadReclaimRoot {
-                        bucket: row.get(0)?,
-                        key: row.get(1)?,
-                        generation_id: Self::parse_generation_id(
-                            row.get::<_, i64>(2)?,
-                            2,
-                            "generation_id",
-                        )?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "get bucket payload reclaim root",
-                source: e,
-            })
+        self.query_row_cached_optional_metadata(
+            "SELECT bucket, key, generation_id FROM (
+                 SELECT bucket, key, generation_id FROM object_segments_reclaims WHERE bucket = ?1
+                 UNION ALL
+                 SELECT bucket, key, generation_id FROM multipart_reclaims WHERE bucket = ?1
+             )
+             ORDER BY key ASC, generation_id ASC
+             LIMIT 1",
+            params![bucket],
+            "get bucket payload reclaim root",
+            |row| {
+                Ok(PayloadReclaimRoot {
+                    bucket: row.get(0)?,
+                    key: row.get(1)?,
+                    generation_id: Self::parse_generation_id(
+                        row.get::<_, i64>(2)?,
+                        2,
+                        "generation_id",
+                    )?,
+                })
+            },
+        )
     }
 
     #[cfg(test)]
@@ -9884,29 +9918,18 @@ impl PgMetadataStore for PgStore {
         version_id: VersionId,
         tags: &str,
     ) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE objects SET tags = ?1 WHERE bucket = ?2 AND key = ?3 AND version_id = ?4 AND status = 0",
-                params![tags, bucket, key, version_id.to_u64() as i64],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put object tags",
-                source: e,
-            })?;
+        let updated = self.execute_cached_metadata(
+            "UPDATE objects SET tags = ?1 WHERE bucket = ?2 AND key = ?3 AND version_id = ?4 AND status = 0",
+            params![tags, bucket, key, version_id.to_u64() as i64],
+            "put object tags",
+        )?;
         if updated == 0 {
-            let status: Option<u8> = self
-                .conn
-                .query_row(
-                    "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                    params![bucket, key, version_id.to_u64() as i64],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| MetadataError::Db {
-                    context: "put object tags (check status)",
-                    source: e,
-                })?;
+            let status: Option<u8> = self.query_row_cached_optional_metadata(
+                "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![bucket, key, version_id.to_u64() as i64],
+                "put object tags (check status)",
+                |row| row.get(0),
+            )?;
             return match status {
                 Some(1) => Err(MetadataError::MethodNotAllowedOnDeleteMarker),
                 _ => Err(MetadataError::ObjectNotFound),
@@ -9921,32 +9944,22 @@ impl PgMetadataStore for PgStore {
         key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<Option<String>, MetadataError> {
-        let result = self.conn
-            .query_row(
+        let result = self
+            .query_row_cached_optional_metadata(
                 "SELECT tags FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND status = 0",
                 params![bucket, key, version_id.to_u64() as i64],
+                "get object tags",
                 |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "get object tags",
-                source: e,
-            })?;
+            )?;
         if let Some(tags) = result {
             Ok(tags)
         } else {
-            let status: Option<u8> = self
-                .conn
-                .query_row(
-                    "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                    params![bucket, key, version_id.to_u64() as i64],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| MetadataError::Db {
-                    context: "get object tags (check status)",
-                    source: e,
-                })?;
+            let status: Option<u8> = self.query_row_cached_optional_metadata(
+                "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![bucket, key, version_id.to_u64() as i64],
+                "get object tags (check status)",
+                |row| row.get(0),
+            )?;
             match status {
                 Some(1) => Err(MetadataError::MethodNotAllowedOnDeleteMarker),
                 _ => Err(MetadataError::ObjectNotFound),
@@ -9961,29 +9974,18 @@ impl PgMetadataStore for PgStore {
         key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE objects SET tags = NULL WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND status = 0",
-                params![bucket, key, version_id.to_u64() as i64],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "delete object tags",
-                source: e,
-            })?;
+        let updated = self.execute_cached_metadata(
+            "UPDATE objects SET tags = NULL WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND status = 0",
+            params![bucket, key, version_id.to_u64() as i64],
+            "delete object tags",
+        )?;
         if updated == 0 {
-            let status: Option<u8> = self
-                .conn
-                .query_row(
-                    "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                    params![bucket, key, version_id.to_u64() as i64],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| MetadataError::Db {
-                    context: "delete object tags (check status)",
-                    source: e,
-                })?;
+            let status: Option<u8> = self.query_row_cached_optional_metadata(
+                "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![bucket, key, version_id.to_u64() as i64],
+                "delete object tags (check status)",
+                |row| row.get(0),
+            )?;
             return match status {
                 Some(1) => Err(MetadataError::MethodNotAllowedOnDeleteMarker),
                 _ => Err(MetadataError::ObjectNotFound),
@@ -10914,7 +10916,7 @@ impl PgMetadataStore for PgStore {
     ) -> Result<Vec<ObjectPartRecord>, MetadataError> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT bucket, key, version_id, part_number, size, etag, etag_kind, \
                  part_okh, part_vid, ec_k, ec_m, data_pg_id, checksum \
                  FROM object_parts \
@@ -10961,7 +10963,7 @@ impl PgMetadataStore for PgStore {
 
         let mut first_stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT bucket, key, version_id, part_number, size, etag, etag_kind, \
                  part_okh, part_vid, ec_k, ec_m, data_pg_id, checksum, object_offset_start \
                  FROM object_parts \
@@ -11000,7 +11002,7 @@ impl PgMetadataStore for PgStore {
         let mut parts = vec![first];
         let mut tail_stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT bucket, key, version_id, part_number, size, etag, etag_kind, \
                  part_okh, part_vid, ec_k, ec_m, data_pg_id, checksum, object_offset_start \
                  FROM object_parts \
@@ -11539,7 +11541,7 @@ impl PgMetadataStore for PgStore {
     fn list_all_stream_uploads(&self) -> Result<Vec<StreamUploadRecord>, MetadataError> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
                  created_at, encryption_type, encryption_state FROM stream_uploads",
             )
@@ -11599,7 +11601,7 @@ impl PgMetadataStore for PgStore {
     ) -> Result<Vec<StreamUploadSegmentRecord>, MetadataError> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT session_id, segment_index, size, segment_okh, segment_vid, data_pg_id, \
                  segment_crc64, ec_k, ec_m FROM stream_upload_segments \
                  WHERE session_id = ?1 ORDER BY segment_index ASC",
@@ -11823,7 +11825,7 @@ impl PgMetadataStore for PgStore {
             {
                 let mut stmt = self
                     .conn
-                    .prepare(
+                    .prepare_cached(
                         "INSERT INTO object_segments \
                          (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, segment_vid, \
                           data_pg_id, ec_k, ec_m) \
@@ -12033,7 +12035,7 @@ impl PgMetadataStore for PgStore {
 
             let mut stmt = self
                 .conn
-                .prepare(
+                .prepare_cached(
                     "INSERT INTO object_segments \
                      (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, segment_vid, \
                       data_pg_id, ec_k, ec_m) \
@@ -12194,7 +12196,7 @@ impl PgMetadataStore for PgStore {
             let displaced_segments = {
                 let mut stmt = self
                     .conn
-                    .prepare(
+                    .prepare_cached(
                         "SELECT bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, segment_okh, \
                          segment_vid, data_pg_id, ec_k, ec_m FROM multipart_part_segments \
                          WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3 AND part_number = ?4 \
@@ -12265,7 +12267,7 @@ impl PgMetadataStore for PgStore {
             {
                 let mut stmt = self
                     .conn
-                    .prepare(
+                    .prepare_cached(
                         "INSERT INTO multipart_part_segments \
                          (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, segment_okh, \
                           segment_vid, data_pg_id, ec_k, ec_m) \
@@ -12348,7 +12350,7 @@ impl PgMetadataStore for PgStore {
     ) -> Result<Vec<ObjectSegmentRecord>, MetadataError> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, segment_vid, \
                  data_pg_id, ec_k, ec_m FROM object_segments \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
@@ -12415,7 +12417,7 @@ impl PgMetadataStore for PgStore {
     ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, segment_okh, \
                  segment_vid, data_pg_id, ec_k, ec_m FROM multipart_part_segments \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND part_number = ?4 \
@@ -12477,7 +12479,7 @@ impl PgMetadataStore for PgStore {
     ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT bucket, key, upload_id, version_id, part_number, segment_index, \
                  size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
                  FROM multipart_part_segments \
@@ -12541,7 +12543,7 @@ impl PgMetadataStore for PgStore {
     ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT bucket, key, upload_id, version_id, part_number, segment_index, \
                  size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
                  FROM multipart_part_segments \
@@ -12941,6 +12943,115 @@ mod tests {
             )
             .unwrap();
         assert_cached_metadata_digest_matches_materialized(&store);
+    }
+
+    #[test]
+    fn metadata_command_acceptance_detects_dirty_cached_digest() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("digest-bucket");
+        let key = trusted_object_key("object");
+        store
+            .conn
+            .execute(
+                "INSERT INTO object_version_counters \
+				 (bucket, key, next_version_id) VALUES (?1, ?2, ?3)",
+                params![bucket.as_str(), key.as_str(), 2_i64],
+            )
+            .unwrap();
+        store.refresh_metadata_command_state_digest().unwrap();
+
+        store
+            .conn
+            .execute(
+                "UPDATE object_version_counters SET next_version_id = ?1 \
+				 WHERE bucket = ?2 AND key = ?3",
+                params![3_i64, bucket.as_str(), key.as_str()],
+            )
+            .unwrap();
+
+        let command =
+            create_bucket_probe_command(store.pg_id, 1, trusted_bucket_name("new-bucket"), 1);
+        let err = store.metadata_command_acceptance(0, &command).unwrap_err();
+        assert_metadata_state_digest_mismatch(err);
+    }
+
+    #[test]
+    fn metadata_command_acceptance_detects_cross_connection_dirty_cached_digest() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("digest-bucket");
+        let key = trusted_object_key("object");
+        store
+            .conn
+            .execute(
+                "INSERT INTO object_version_counters \
+				 (bucket, key, next_version_id) VALUES (?1, ?2, ?3)",
+                params![bucket.as_str(), key.as_str(), 2_i64],
+            )
+            .unwrap();
+        store.refresh_metadata_command_state_digest().unwrap();
+
+        let other_store = PgStore::open(tmp.path(), 1).unwrap();
+        other_store
+            .conn
+            .execute(
+                "UPDATE object_version_counters SET next_version_id = ?1 \
+				 WHERE bucket = ?2 AND key = ?3",
+                params![3_i64, bucket.as_str(), key.as_str()],
+            )
+            .unwrap();
+
+        let command =
+            create_bucket_probe_command(store.pg_id, 1, trusted_bucket_name("new-bucket"), 1);
+        let err = store.metadata_command_acceptance(0, &command).unwrap_err();
+        assert_metadata_state_digest_mismatch(err);
+    }
+
+    #[test]
+    fn rolled_back_command_record_does_not_mark_digest_revision_clean() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("digest-bucket");
+        let key = trusted_object_key("object");
+        store
+            .conn
+            .execute(
+                "INSERT INTO object_version_counters \
+                 (bucket, key, next_version_id) VALUES (?1, ?2, ?3)",
+                params![bucket.as_str(), key.as_str(), 2_i64],
+            )
+            .unwrap();
+        store.refresh_metadata_command_state_digest().unwrap();
+        let clean_revision = store.clean_metadata_digest_revision.load(Ordering::Relaxed);
+
+        let command =
+            create_bucket_probe_command(store.pg_id, 1, trusted_bucket_name("new-bucket"), 1);
+        store.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        store.apply_metadata_command(&command).unwrap();
+        store.record_metadata_command_applied(0, &command).unwrap();
+        let transaction_revision = store.metadata_digest_revision().unwrap();
+        assert_ne!(clean_revision, transaction_revision);
+        store.conn.execute_batch("ROLLBACK").unwrap();
+
+        assert_eq!(
+            clean_revision,
+            store.clean_metadata_digest_revision.load(Ordering::Relaxed),
+            "recording inside an uncommitted transaction must not advance the clean revision"
+        );
+
+        let other_store = PgStore::open(tmp.path(), 1).unwrap();
+        other_store
+            .conn
+            .execute(
+                "UPDATE object_version_counters SET next_version_id = ?1 \
+                 WHERE bucket = ?2 AND key = ?3",
+                params![3_i64, bucket.as_str(), key.as_str()],
+            )
+            .unwrap();
+
+        let err = store.metadata_command_acceptance(0, &command).unwrap_err();
+        assert_metadata_state_digest_mismatch(err);
     }
 
     #[test]

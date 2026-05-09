@@ -451,6 +451,16 @@ CREATE TABLE IF NOT EXISTS metadata_table_digests (
     row_hash_sum INTEGER NOT NULL DEFAULT 0
 )";
 
+/// Durable cross-connection revision for the metadata digest cache. Digest
+/// triggers bump this whenever command-owned metadata changes, allowing an open
+/// PgStore handle to skip digest scans only when its clean revision still
+/// matches the database.
+const CREATE_METADATA_DIGEST_REVISION_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS metadata_digest_revision (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
+    revision  INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0)
+)";
+
 /// Durable marker proving metadata digest triggers and cache stats were
 /// bootstrapped atomically. Missing marker forces a one-time full refresh on
 /// open, including for stores created before this marker existed.
@@ -520,9 +530,16 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_METADATA_COMMAND_LOG_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_REPLICA_STATE_TABLE, [])?;
     conn.execute(CREATE_METADATA_TABLE_DIGESTS_TABLE, [])?;
+    conn.execute(CREATE_METADATA_DIGEST_REVISION_TABLE, [])?;
     conn.execute(CREATE_METADATA_DIGEST_BOOTSTRAP_STATE_TABLE, [])?;
     conn.execute(
         "INSERT INTO pg_counters (singleton, next_bucket_execution_generation) \
+         VALUES (0, 0) \
+         ON CONFLICT(singleton) DO NOTHING",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO metadata_digest_revision (singleton, revision) \
          VALUES (0, 0) \
          ON CONFLICT(singleton) DO NOTHING",
         [],

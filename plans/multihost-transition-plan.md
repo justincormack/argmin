@@ -2188,6 +2188,138 @@ Completed:
     6.550s in the selected nextest run; the isolated perf sample was roughly
     30.5B cycles with SQLite prepare/planning still around 23%
   - the isolated S3 oversized versioning test improved from 16.881s to 16.130s
+- Phase 7.6.1 full-suite checkpoint after the first two current-path
+  optimisation slices:
+  - clean `cargo nextest run` completed 4525 tests in 137.108s, down from the
+    Phase 7.5 closeout run's 177.927s and closer to the
+    `b553724a13da5979971435bfac4e5f4d706cc609` baseline of 123.266s
+  - summed libtest per-test time improved from 2721.7s to 2080.4s; the b553
+    baseline was 1923.7s
+  - remaining grouped deltas versus b553 are concentrated in:
+    server-core authz/model at 1044.8s versus 929.7s, server-core coordinator
+    non-model at 285.6s versus 234.8s, and storage unit/integration at 114.6s
+    versus 65.1s
+  - the external S3 harness is no longer the main regression in this sample:
+    it measured 575.3s summed test time versus 642.0s at b553
+  - the next current-path profiling targets are
+    `authz_model_phase2_get_object_acl_existing_matrix`,
+    `prop_storage_timestamp_tie_invariance`, and a representative
+    multipart/reclaim trace property; these cover the largest remaining
+    authz/model, storage property, and coordinator trace costs without changing
+    request semantics
+- Phase 7.6.1 remaining-hotspot profiling after the full-suite checkpoint:
+  - isolated `perf record` timings were 22.416s for
+    `authz_model_phase2_get_object_acl_existing_matrix`, 9.105s for
+    `prop_storage_timestamp_tie_invariance`, and 6.810s for
+    `prop_reclaim_queue_trace_matches_model`; isolated timings are lower than
+    full-suite timings because they avoid nextest contention
+  - flat perf samples still show SQLite as the largest remaining cost class:
+    about 46% sqlite-ish symbols in the authz ACL matrix, about 58% in the
+    storage timestamp property, and about 55% in the reclaim trace property
+  - SQLite prepare/parser/tokenizer/trigger-construction symbols remain a
+    material part of that cost, especially in the storage and reclaim property
+    tests where `sqlite3GetToken`, `yy_reduce`, `yy_find_shift_action`,
+    `sqlite3Parser`, `sqlite3RunParser`, `triggerSpanDup`, and
+    `sqlite3_str_vappendf` are prominent
+  - CRC/hash work is not the dominant remaining issue in the storage/reclaim
+    properties, but it is visible in the authz ACL matrix where policy/model
+    hash work and metadata digest CRC work are mixed with SQLite execution
+  - the next low-risk current-path work should focus on eliminating remaining
+    repeated SQLite parse sites that are still on hot metadata/property paths,
+    then separately decide whether repeated per-case PgStore/schema/bootstrap
+    setup in property/model tests should be reduced as test harness overhead
+    rather than production request-path overhead
+- Phase 7.6.1 SQLite cache follow-up:
+  - converted the remaining explicit `PgStore` `.prepare(...)` call sites to
+    `.prepare_cached(...)`, added metadata-error cached query helpers, and
+    routed additional hot fixed statement shapes through them: bucket execution
+    generation reads/advances, test bucket ACL/versioning/property mutations,
+    object write/version/generation allocation reads, object metadata
+    put/get/version reads, object ACL/tags/retention/legal-hold mutations,
+    generation reservation reads/inserts, completed-MPU sequence reads, and
+    reclaim-root/existence lookups
+  - increased the per-PG SQLite prepared statement cache from 256 to 1024
+    entries after measuring 2048 as no better on the representative sample
+  - representative isolated timings:
+    - after only the broad `.prepare_cached(...)` sweep:
+      `authz_model_phase2_get_object_acl_existing_matrix` 22.183s,
+      `prop_storage_timestamp_tie_invariance` 9.063s, and
+      `prop_reclaim_queue_trace_matches_model` 6.770s
+    - after the metadata cached-helper/cache-capacity follow-up:
+      `authz_model_phase2_get_object_acl_existing_matrix` 21.611s,
+      `prop_storage_timestamp_tie_invariance` 8.753s, and
+      `prop_reclaim_queue_trace_matches_model` 6.759s
+    - with a 2048-entry statement cache:
+      `authz_model_phase2_get_object_acl_existing_matrix` 21.655s,
+      `prop_storage_timestamp_tie_invariance` 8.730s, and
+      `prop_reclaim_queue_trace_matches_model` 6.932s, so 1024 remains the
+      current choice
+  - the concrete external oversized versioning regression case,
+    `test_versioning_list_object_versions_oversized_max_keys_returns_at_most_1000_entries`,
+    measured 15.073s in an isolated current run without the temporary delete
+    chunking workaround
+  - new flat `perf` samples still show SQLite execution and parse/name lookup
+    as the largest remaining cost class: storage timestamp is led by
+    `sqlite3GetToken`, `sqlite3VdbeExec`, `yy_reduce`,
+    `yy_find_shift_action`, `sqlite3_str_vappendf`, `sqlite3Parser`, and
+    `sqlite3RunParser`; authz ACL is led by `sqlite3VdbeExec`,
+    `sqlite3StrICmp`, `lookupName`, `exprDup`, WAL checksum work, and
+    application CRC/hash work
+  - the cache follow-up is therefore useful but modest; remaining Phase 7.6.1
+    work should look for high-cardinality dynamic SQL, repeated schema/store
+    bootstrap in model/property harnesses, and command-log transaction/query
+    volume rather than expecting fixed-statement caching alone to close the
+    full gap
+  - added opt-in SQLite statement profiling with
+    `ARGMIN_SQLITE_PROFILE_MS=<milliseconds>`; it uses
+    `sqlite3_trace_v2(SQLITE_TRACE_PROFILE)` through `rusqlite` and logs
+    per-statement elapsed time plus normalized SQL text
+  - statement-profile aggregation shows the storage timestamp property has
+    about 206k SQLite profile events; top total-time buckets are repeated
+    schema/migration/bootstrap statements across temporary PgStores, including
+    `ALTER TABLE ... ADD COLUMN ...`, `SELECT 1 FROM sqlite_master WHERE type =
+    'trigger'`, digest trigger creation, `COMMIT`, and object insert/listing
+    statements
+	  - statement-profile aggregation for
+	    `authz_model_phase2_get_object_acl_existing_matrix` shows about 791k SQLite
+	    profile events; top total-time buckets are command-log and digest
+	    transaction volume rather than isolated long queries: `COMMIT`,
+	    `SELECT table_name, table_digest FROM metadata_table_digests`, command-log
+	    row lookups, replica-state loads, bucket info loads, and bucket/object
+	    mutation fanout
+	  - in both samples SQLite's profile callback reported a 1ms maximum per
+	    statement, so the visible slowdown is many repeated SQLite statements and
+	    transaction boundaries rather than a small number of individually long
+	    queries
+  - Phase 7.6.1 production-path command/digest optimisation follow-up:
+    - consolidated bucket-policy subresource mutation so a `PutBucketPolicy` or
+      delete-policy command writes the subresource row with `RETURNING
+      generation`, advances the bucket execution counter, and updates
+      `bucket_policy_public`, `bucket_policy_generation`, and
+      `bucket_execution_generation` in one bucket-row update instead of three
+      separate bucket updates
+    - changed metadata digest triggers to update digest stats and `table_digest`
+      in one tuple assignment while computing the changed row digest once; this
+      keeps the same digest format but reduces per-row trigger work for command
+      owned tables
+    - added a durable `metadata_digest_revision` row bumped by the same digest
+      triggers; command acceptance still recomputes and compares the digest after
+      dirty/off-log writes, including writes from another SQLite connection to
+      the same PG, but skips the `metadata_table_digests` scan when this handle's
+      last-clean revision still matches the durable revision
+    - representative isolated
+      `authz_model_phase2_get_object_acl_existing_matrix` timings improved from
+      21.611s after the statement-cache follow-up to 17.515s after bucket
+      subresource consolidation, 16.923s after tuple digest triggers, and
+      16.373s after the durable digest-revision check
+    - the statement-profile event count for that authz case fell from about
+      791k before these command/digest optimisations to about 766k; the
+      `SELECT table_name, table_digest FROM metadata_table_digests` count fell
+      from 88,944 to 48,700
+    - remaining production-shaped hotspots are still mostly command-log
+      volume/transaction count, bucket info loads, object insert side effects,
+      and object listing/read statement shapes; test-only schema/bootstrap
+      overhead should stay lower priority unless it masks production costs
 
 Exit criteria:
 
