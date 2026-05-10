@@ -1814,13 +1814,16 @@ Proposed slices:
      command-log and digest hardening increased full-suite runtime from roughly
      122s at `b553724a13da5979971435bfac4e5f4d706cc609` to roughly 177s after
      Phase 7.5 closeout
-   - keep this phase split into two distinct work streams:
-     - Phase 7.6.1 current-path optimisation: reduce overhead without changing
-       request semantics, storage APIs, command granularity, or coordinator
-       operation ordering
-     - Phase 7.6.2 semantic batching design: introduce real storage-layer batch
-       commands only where the S3 operation model and command-log invariants
-       justify a batch as one storage mutation
+   - keep this phase focused on current-path optimisation: reduce overhead
+     without changing request semantics, storage APIs, command granularity, or
+     coordinator operation ordering
+   - semantic batching is deliberately split out of this phase. The main
+     regression has been recovered by current-path work, and batching requires
+     separate analysis: it only helps when a request contains multiple objects
+     routed to the same metadata PG, and it needs a command-log, retry,
+     partial-failure, and AWS per-object error design before implementation.
+     Track that work in
+     [delete-objects-batch-command-plan.md](delete-objects-batch-command-plan.md).
    - measure every slice before and after:
      - full `cargo nextest run` wall time
      - summed libtest per-test seconds grouped by server-core authz model,
@@ -1846,27 +1849,15 @@ Proposed slices:
        make sure common write paths do not re-run full table scans
      - verify that simple PUT/GET remains flat and that improvements land in
        metadata-heavy object/bucket mutation and listing paths
-   - Phase 7.6.2 semantic batching design candidates:
-     - evaluate `DeleteObjects` as a storage-level batch command rather than a
-       coordinator loop over independent deletes
-     - define batch command idempotence, partial-failure/tombstone behavior,
-       command-log encoding, canonical digest inputs, and AWS error reporting
-       before implementation
-     - do not use batching as a shortcut around correctness: each batch must be
-       a real storage semantic with deterministic replay and the same external
-       S3 behavior as the equivalent AWS operation
-     - keep batch work out of Phase 7.6.1 measurements so low-risk overhead
-       reductions and semantic API changes are not conflated
    - exit criteria:
      - current-path optimisation measurements identify which overheads were
        reduced and which remain
      - any remaining major slowdown has an explicit owner: statement
        preparation, command-log transaction volume, replica fanout, digest
        maintenance, or coordinator semantic batching
-     - no batching API is introduced without a command-log/replay/idempotence
-       design and focused regressions
-     - the plan records whether Phase 8 proceeds with the current metadata
-       command cost or waits for Phase 7.6.2 batch work
+     - no batching API is introduced in Phase 7.6
+     - the plan records that Phase 8 can proceed with the current metadata
+       command cost; storage-level batching is a later standalone project
 
 Completed:
 
@@ -2379,6 +2370,16 @@ Completed:
       `list_object_versions_clamps_oversized_max_keys` measured 5.164s and
       `test_versioning_list_object_versions_oversized_max_keys_returns_at_most_1000_entries`
       measured 13.985s
+  - Phase 7.6 is complete for the multihost transition plan:
+    - the full-suite runtime recovered from the Phase 7.5 closeout regression
+      and is back below the original `b553724a13da5979971435bfac4e5f4d706cc609`
+      comparison point in the latest clean run
+    - current-path work recovered the main performance loss without changing
+      request semantics or storage command granularity
+    - `DeleteObjects` storage-level batching has been moved to
+      [delete-objects-batch-command-plan.md](delete-objects-batch-command-plan.md)
+      because it is a semantic API change that needs separate cost/benefit and
+      failure-mode analysis before implementation
 
 Exit criteria:
 
