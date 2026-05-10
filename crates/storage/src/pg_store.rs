@@ -28,8 +28,8 @@ use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 #[cfg(test)]
 use crate::metadata_command::BucketPropertyMutation;
 use crate::metadata_command::{
-    decode_metadata_command_log_entry_header, metadata_command_log_hash,
-    AbortMultipartUploadCommand, AbortStreamUploadCommand,
+    abandoned_command_log_bytes, decode_metadata_command_log_entry_header,
+    metadata_command_log_hash, AbortMultipartUploadCommand, AbortStreamUploadCommand,
     AdvanceCompletedMultipartUploadSequenceCommand, AppendStreamSegmentCommand,
     BucketPropertyEffect, BucketRecord, BucketSubresourceMutation, CommitDirectPutObjectCommand,
     CommitMultipartObjectCommand, CommitStreamPartCommand, CreateBucketCommand,
@@ -757,6 +757,21 @@ struct MetadataCommandLogEntry {
     log_hash: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingMetadataCommandSlot {
+    pub(crate) id: MetadataCommandId,
+    pub(crate) command_checksum: u64,
+    pub(crate) command_bytes: Vec<u8>,
+    pub(crate) scope_bucket: Option<BucketName>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingMetadataCommandSlotAction {
+    Unresolved,
+    CleanTerminal,
+    AdvanceAbandonedThenClean,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MetadataCommandRecordResult {
     state: MetadataCommandReplicaState,
@@ -1322,12 +1337,234 @@ impl PgStore {
             })
     }
 
+    pub(crate) fn pending_metadata_command_slot(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<Option<PendingMetadataCommandSlot>, StoreError> {
+        let raw = self.query_row_cached_optional(
+            "SELECT cluster_epoch, pg_id, log_index, command_checksum, command_bytes, scope_bucket \
+             FROM metadata_command_pending_slot WHERE singleton = 0",
+            [],
+            "load metadata command pending slot",
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )?;
+        let Some((
+            raw_cluster_epoch,
+            raw_pg_id,
+            raw_log_index,
+            raw_command_checksum,
+            command_bytes,
+            raw_scope_bucket,
+        )) = raw
+        else {
+            return Ok(None);
+        };
+        let stored_epoch = ClusterEpoch::new(decode_nonnegative_u64(
+            "decode pending slot cluster epoch",
+            raw_cluster_epoch,
+        )?)
+        .expect("pending slot stores non-zero cluster epoch");
+        if stored_epoch != cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: self.pg_id,
+                operation_epoch: cluster_epoch,
+                current_epoch: stored_epoch,
+            });
+        }
+        let stored_pg_id: u32 = raw_pg_id.try_into().map_err(|_| StoreError::Db {
+            context: "decode pending slot PG id",
+            source: rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Integer,
+                Box::from("negative metadata command pending slot PG id"),
+            ),
+        })?;
+        if stored_pg_id != self.pg_id {
+            return Err(StoreError::MetadataCommandWrongPg {
+                node_id,
+                command_pg_id: stored_pg_id,
+                target_pg_id: self.pg_id,
+                cluster_epoch,
+            });
+        }
+        let log_index = MetadataCommandLogIndex::new(decode_nonnegative_u64(
+            "decode pending slot log index",
+            raw_log_index,
+        )?)
+        .expect("pending slot stores non-zero log index");
+        let computed_checksum = checksum::crc64::checksum(&command_bytes);
+        let command_checksum = raw_command_checksum as u64;
+        if computed_checksum != command_checksum {
+            return Err(StoreError::MetadataCommandLogChecksumMismatch {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                log_index: log_index.get(),
+                stored_checksum: command_checksum,
+                computed_checksum,
+            });
+        }
+        let header = decode_metadata_command_log_entry_header(&command_bytes).map_err(|_| {
+            StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                log_index: log_index.get(),
+            }
+        })?;
+        let id = MetadataCommandId::new(cluster_epoch, PgId::new(self.pg_id), log_index);
+        if header.id() != id || header.kind() != MetadataCommandLogEntryKind::Applied {
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                log_index: log_index.get(),
+            });
+        }
+        let scope_bucket = raw_scope_bucket
+            .map(BucketName::try_from)
+            .transpose()
+            .map_err(|reason| StoreError::Db {
+                context: "decode pending slot scope bucket",
+                source: rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::from(reason.to_string()),
+                ),
+            })?;
+        Ok(Some(PendingMetadataCommandSlot {
+            id,
+            command_checksum,
+            command_bytes,
+            scope_bucket,
+        }))
+    }
+
+    // Wired into the cluster request paths in the later Phase 9.2 slices; the
+    // durable primitive is tested here before replacing the process-local map.
+    #[allow(dead_code)]
+    pub(crate) fn try_insert_pending_metadata_command_slot(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+        scope_bucket: Option<&BucketName>,
+    ) -> Result<(), StoreError> {
+        if command.id().pg_id().get() != self.pg_id {
+            return Err(StoreError::MetadataCommandWrongPg {
+                node_id,
+                command_pg_id: command.id().pg_id().get(),
+                target_pg_id: self.pg_id,
+                cluster_epoch: command.id().cluster_epoch(),
+            });
+        }
+        let command_bytes = command.command_bytes();
+        let inserted = self.execute_cached(
+            "INSERT INTO metadata_command_pending_slot \
+             (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, scope_bucket) \
+             VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(singleton) DO NOTHING",
+            params![
+                command.id().cluster_epoch().get() as i64,
+                command.id().pg_id().get() as i64,
+                command.id().log_index().get() as i64,
+                command.checksum_crc64() as i64,
+                command_bytes,
+                scope_bucket.map(BucketName::as_str),
+            ],
+            "insert metadata command pending slot",
+        )?;
+        if inserted == 1 {
+            return Ok(());
+        }
+        let existing = self
+            .pending_metadata_command_slot(node_id, command.id().cluster_epoch())?
+            .ok_or_else(|| StoreError::MetadataCommandPendingConflict {
+                pg_id: self.pg_id,
+                cluster_epoch: command.id().cluster_epoch(),
+                existing_log_index: 0,
+                candidate_log_index: command.id().log_index().get(),
+            })?;
+        if existing.command_checksum == command.checksum_crc64()
+            && existing.command_bytes == command.command_bytes()
+        {
+            return Ok(());
+        }
+        Err(StoreError::MetadataCommandPendingConflict {
+            pg_id: self.pg_id,
+            cluster_epoch: command.id().cluster_epoch(),
+            existing_log_index: existing.id.log_index().get(),
+            candidate_log_index: command.id().log_index().get(),
+        })
+    }
+
+    // See `try_insert_pending_metadata_command_slot`.
+    #[allow(dead_code)]
+    pub(crate) fn remove_pending_metadata_command_slot(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError> {
+        if command.id().pg_id().get() != self.pg_id {
+            return Err(StoreError::MetadataCommandWrongPg {
+                node_id,
+                command_pg_id: command.id().pg_id().get(),
+                target_pg_id: self.pg_id,
+                cluster_epoch: command.id().cluster_epoch(),
+            });
+        }
+        let Some(slot) =
+            self.pending_metadata_command_slot(node_id, command.id().cluster_epoch())?
+        else {
+            return Ok(false);
+        };
+        if slot.id != command.id()
+            || slot.command_checksum != command.checksum_crc64()
+            || slot.command_bytes != command.command_bytes()
+        {
+            return Ok(false);
+        }
+        let Some(entry) = self.load_metadata_command_log_entry(
+            "load terminal metadata command log entry before pending slot removal",
+            command.id().cluster_epoch(),
+            command.id().pg_id(),
+            command.id().log_index(),
+        )?
+        else {
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch: command.id().cluster_epoch(),
+                log_index: command.id().log_index().get(),
+            });
+        };
+        if !self.pending_slot_terminal_entry_matches(node_id, &slot, &entry)? {
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch: command.id().cluster_epoch(),
+                log_index: command.id().log_index().get(),
+            });
+        }
+        self.remove_pending_metadata_command_slot_exact(node_id, &slot)?;
+        Ok(true)
+    }
+
     pub(crate) fn validate_metadata_command_replay_state(
         &self,
         node_id: u32,
         cluster_epoch: ClusterEpoch,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
-        let state = self.metadata_command_replica_state()?;
+        let mut state = self.metadata_command_replica_state()?;
         let pg_id = PgId::new(self.pg_id);
         if state.cluster_epoch != cluster_epoch {
             return Err(StoreError::StaleMetadataCommand {
@@ -1336,6 +1573,24 @@ impl PgStore {
                 command_epoch: state.cluster_epoch,
                 current_epoch: cluster_epoch,
             });
+        }
+        if let Some(slot) = self.pending_metadata_command_slot(node_id, cluster_epoch)? {
+            match self.validate_pending_metadata_command_slot_relation(node_id, &state, &slot)? {
+                PendingMetadataCommandSlotAction::Unresolved => {}
+                PendingMetadataCommandSlotAction::CleanTerminal => {
+                    self.remove_pending_metadata_command_slot_exact(node_id, &slot)?;
+                }
+                PendingMetadataCommandSlotAction::AdvanceAbandonedThenClean => {
+                    let record = self.advance_metadata_command_log_state_with_inserted(
+                        node_id,
+                        cluster_epoch,
+                        None,
+                    )?;
+                    self.mark_metadata_state_digest_clean_at_revision(record.digest_revision);
+                    state = record.state;
+                    self.remove_pending_metadata_command_slot_exact(node_id, &slot)?;
+                }
+            }
         }
         let mut applied_log_hash = 0_u64;
         for raw_log_index in 1..=state.applied_log_index {
@@ -1529,6 +1784,131 @@ impl PgStore {
         }
     }
 
+    fn pending_slot_terminal_entry_matches(
+        &self,
+        node_id: u32,
+        slot: &PendingMetadataCommandSlot,
+        entry: &MetadataCommandLogEntry,
+    ) -> Result<bool, StoreError> {
+        self.verify_metadata_command_log_entry(
+            node_id,
+            slot.id.cluster_epoch(),
+            slot.id.pg_id(),
+            slot.id.log_index(),
+            entry,
+        )?;
+        if entry.abandoned {
+            let expected_bytes = abandoned_command_log_bytes(slot.id, slot.command_checksum);
+            return Ok(
+                entry.command_checksum == checksum::crc64::checksum(&expected_bytes)
+                    && entry.command_bytes == expected_bytes,
+            );
+        }
+        Ok(entry.command_checksum == slot.command_checksum
+            && entry.command_bytes == slot.command_bytes)
+    }
+
+    fn validate_pending_metadata_command_slot_relation(
+        &self,
+        node_id: u32,
+        state: &MetadataCommandReplicaState,
+        slot: &PendingMetadataCommandSlot,
+    ) -> Result<PendingMetadataCommandSlotAction, StoreError> {
+        let slot_index = slot.id.log_index().get();
+        let next_index = state.applied_log_index.checked_add(1).ok_or(
+            StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch: state.cluster_epoch,
+                log_index: slot_index,
+            },
+        )?;
+        if slot_index == next_index {
+            let existing_entry = self.load_metadata_command_log_entry(
+                "load pending metadata command slot terminal entry",
+                slot.id.cluster_epoch(),
+                slot.id.pg_id(),
+                slot.id.log_index(),
+            )?;
+            let Some(entry) = existing_entry else {
+                return Ok(PendingMetadataCommandSlotAction::Unresolved);
+            };
+            if entry.abandoned && self.pending_slot_terminal_entry_matches(node_id, slot, &entry)? {
+                return Ok(PendingMetadataCommandSlotAction::AdvanceAbandonedThenClean);
+            }
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch: state.cluster_epoch,
+                log_index: slot_index,
+            });
+        }
+        if slot_index > next_index {
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch: state.cluster_epoch,
+                log_index: slot_index,
+            });
+        }
+        let Some(entry) = self.load_metadata_command_log_entry(
+            "load terminal metadata command log entry for pending slot",
+            slot.id.cluster_epoch(),
+            slot.id.pg_id(),
+            slot.id.log_index(),
+        )?
+        else {
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch: state.cluster_epoch,
+                log_index: slot_index,
+            });
+        };
+        if self.pending_slot_terminal_entry_matches(node_id, slot, &entry)? {
+            return Ok(PendingMetadataCommandSlotAction::CleanTerminal);
+        }
+        Err(StoreError::MetadataCommandLogConflict {
+            node_id,
+            pg_id: self.pg_id,
+            cluster_epoch: state.cluster_epoch,
+            log_index: slot_index,
+        })
+    }
+
+    fn remove_pending_metadata_command_slot_exact(
+        &self,
+        node_id: u32,
+        slot: &PendingMetadataCommandSlot,
+    ) -> Result<(), StoreError> {
+        let removed = self.execute_cached(
+            "DELETE FROM metadata_command_pending_slot \
+             WHERE singleton = 0 \
+               AND cluster_epoch = ?1 \
+               AND pg_id = ?2 \
+               AND log_index = ?3 \
+               AND command_checksum = ?4 \
+               AND command_bytes = ?5",
+            params![
+                slot.id.cluster_epoch().get() as i64,
+                slot.id.pg_id().get() as i64,
+                slot.id.log_index().get() as i64,
+                slot.command_checksum as i64,
+                slot.command_bytes.as_slice(),
+            ],
+            "remove exact metadata command pending slot",
+        )?;
+        if removed == 1 {
+            return Ok(());
+        }
+        Err(StoreError::MetadataCommandLogConflict {
+            node_id,
+            pg_id: self.pg_id,
+            cluster_epoch: slot.id.cluster_epoch(),
+            log_index: slot.id.log_index().get(),
+        })
+    }
+
     pub(crate) fn metadata_command_acceptance(
         &self,
         node_id: u32,
@@ -1694,8 +2074,33 @@ impl PgStore {
         node_id: u32,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
-        self.record_metadata_command_abandoned_inner(node_id, command)
-            .map(|result| result.state)
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|source| StoreError::Db {
+                context: "record abandoned metadata command (begin txn)",
+                source,
+            })?;
+
+        let result = self.record_metadata_command_abandoned_inner(node_id, command);
+        match result {
+            Ok(record) => {
+                if let Err(source) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    self.invalidate_clean_metadata_digest_revision();
+                    return Err(StoreError::Db {
+                        context: "record abandoned metadata command (commit txn)",
+                        source,
+                    });
+                }
+                self.mark_metadata_state_digest_clean_at_revision(record.digest_revision);
+                Ok(record.state)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                self.invalidate_clean_metadata_digest_revision();
+                Err(error)
+            }
+        }
     }
 
     fn record_metadata_command_abandoned_inner(
@@ -13592,6 +13997,162 @@ mod tests {
             .unwrap();
         assert_eq!(previous_log_hash, Some(0));
         assert_eq!(log_hash, Some(expected_log_hash as i64));
+    }
+
+    #[test]
+    fn pending_metadata_command_slot_is_pg_scoped_and_persistent() {
+        let tmp = test_util::tempdir();
+        let first_bucket = trusted_bucket_name("pending-slot-one");
+        let second_bucket = trusted_bucket_name("pending-slot-two");
+        let first_command = create_bucket_probe_command(1, 1, first_bucket.clone(), 1);
+        let second_command = create_bucket_probe_command(1, 2, second_bucket.clone(), 2);
+
+        {
+            let store = PgStore::open(tmp.path(), 1).unwrap();
+            store
+                .try_insert_pending_metadata_command_slot(0, &first_command, Some(&first_bucket))
+                .unwrap();
+            store
+                .try_insert_pending_metadata_command_slot(0, &first_command, Some(&first_bucket))
+                .unwrap();
+
+            let err = store
+                .try_insert_pending_metadata_command_slot(0, &second_command, Some(&second_bucket))
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                StoreError::MetadataCommandPendingConflict {
+                    pg_id: 1,
+                    existing_log_index: 1,
+                    candidate_log_index: 2,
+                    ..
+                }
+            ));
+        }
+
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let slot = store
+            .pending_metadata_command_slot(0, ClusterEpoch::INITIAL)
+            .unwrap()
+            .expect("pending slot should persist across reopen");
+        assert_eq!(slot.id, first_command.id());
+        assert_eq!(slot.command_checksum, first_command.checksum_crc64());
+        assert_eq!(slot.command_bytes, first_command.command_bytes());
+        assert_eq!(slot.scope_bucket.as_ref(), Some(&first_bucket));
+        let err = store
+            .remove_pending_metadata_command_slot(0, &first_command)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::MetadataCommandLogConflict { .. }),
+            "slot removal before a terminal log row must fail, got {err:?}"
+        );
+        store
+            .record_metadata_command_abandoned(0, &first_command)
+            .unwrap();
+
+        assert!(
+            !store
+                .remove_pending_metadata_command_slot(0, &second_command)
+                .unwrap(),
+            "non-matching command must not clear the durable slot"
+        );
+        assert!(
+            store
+                .remove_pending_metadata_command_slot(0, &first_command)
+                .unwrap(),
+            "matching command should clear the durable slot"
+        );
+        assert!(
+            store
+                .pending_metadata_command_slot(0, ClusterEpoch::INITIAL)
+                .unwrap()
+                .is_none(),
+            "slot should be empty after exact removal"
+        );
+    }
+
+    #[test]
+    fn pending_metadata_command_slot_validation_rejects_log_gap() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("pending-slot-gap");
+        let command = create_bucket_probe_command(1, 2, bucket.clone(), 2);
+        store
+            .try_insert_pending_metadata_command_slot(0, &command, Some(&bucket))
+            .unwrap();
+
+        let err = store
+            .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::MetadataCommandLogConflict { .. }),
+            "pending slot ahead of applied prefix must fail validation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn terminal_pending_metadata_command_slot_is_cleaned_on_validation() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("terminal-pending-slot");
+        let command = create_bucket_probe_command(1, 1, bucket.clone(), 1);
+        store
+            .try_insert_pending_metadata_command_slot(0, &command, Some(&bucket))
+            .unwrap();
+        store.record_metadata_command_applied(0, &command).unwrap();
+
+        let state = store
+            .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
+            .unwrap();
+        assert_eq!(state.applied_log_index, 1);
+        assert!(
+            store
+                .pending_metadata_command_slot(0, ClusterEpoch::INITIAL)
+                .unwrap()
+                .is_none(),
+            "validation should clean a pending slot whose terminal record is already durable"
+        );
+    }
+
+    #[test]
+    fn abandoned_pending_slot_with_unadvanced_replica_state_recovers_on_validation() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("abandoned-pending-slot");
+        let command = create_bucket_probe_command(1, 1, bucket.clone(), 1);
+        store
+            .try_insert_pending_metadata_command_slot(0, &command, Some(&bucket))
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO metadata_command_log \
+                 (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL, NULL)",
+                params![
+                    ClusterEpoch::INITIAL.get() as i64,
+                    1_i64,
+                    1_i64,
+                    command.abandoned_log_checksum_crc64() as i64,
+                    command.abandoned_log_bytes(),
+                ],
+            )
+            .unwrap();
+
+        let before = store.metadata_command_replica_state().unwrap();
+        assert_eq!(before.applied_log_index, 0);
+
+        let recovered = store
+            .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
+            .unwrap();
+        assert_eq!(recovered.applied_log_index, 1);
+        assert!(
+            store
+                .pending_metadata_command_slot(0, ClusterEpoch::INITIAL)
+                .unwrap()
+                .is_none(),
+            "validation should advance matching abandoned row and clean the pending slot"
+        );
     }
 
     #[test]

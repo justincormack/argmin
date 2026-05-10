@@ -668,7 +668,7 @@ impl LocalClusterMap {
                 LocalNodeStore::new(node_id, canonical_data_dir, Arc::new(storage_node)),
             );
         }
-        validate_metadata_command_replay_state(&nodes, &pg_ids, ClusterEpoch::INITIAL)?;
+        validate_metadata_command_replay_state(&nodes, &pg_routes, &pg_ids, ClusterEpoch::INITIAL)?;
 
         let metadata_primary = nodes
             .get(&metadata_primary_node_id)
@@ -1266,10 +1266,15 @@ fn seed_metadata_command_indexes(
 
 fn validate_metadata_command_replay_state(
     nodes: &BTreeMap<NodeId, LocalNodeStore>,
+    pg_routes: &BTreeMap<PgId, LocalPgRoute>,
     pg_ids: &[PgId],
     cluster_epoch: ClusterEpoch,
 ) -> Result<(), ClusterBuildError> {
     for &pg_id in pg_ids {
+        let primary_node_id = pg_routes
+            .get(&pg_id)
+            .expect("validated PG id should have a route")
+            .primary_node_id();
         let mut reference: Option<(NodeId, MetadataCommandReplicaState)> = None;
         for node in nodes.values() {
             let node_id = node.node_id();
@@ -1306,6 +1311,23 @@ fn validate_metadata_command_replay_state(
                 }
             } else {
                 reference = Some((node_id, state));
+            }
+            let pending_slot = pg
+                .pending_metadata_command_slot(node_id.as_u32(), cluster_epoch)
+                .map_err(|source| ClusterBuildError::OpenLocalNode {
+                    node_id: node_id.as_u32(),
+                    source,
+                })?;
+            if pending_slot.is_some() && node_id != primary_node_id {
+                return Err(ClusterBuildError::OpenLocalNode {
+                    node_id: node_id.as_u32(),
+                    source: StoreError::MetadataCommandPendingOnNonPrimary {
+                        node_id: node_id.as_u32(),
+                        primary_node_id: primary_node_id.as_u32(),
+                        pg_id: pg_id.get(),
+                        cluster_epoch,
+                    },
+                });
             }
         }
     }
@@ -3648,6 +3670,46 @@ mod tests {
                 source: StoreError::MetadataCommandLogConflict {
                     pg_id: 1,
                     log_index: 1,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn local_cluster_reopen_rejects_pending_slot_on_non_primary_replica() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        {
+            let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+            let topology = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "non-primary-pending-slot-");
+            let command = create_bucket_metadata_command(PgId::new(1), 1, bucket.clone());
+            let non_primary_pg = map
+                .node(NodeId::new(1))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            non_primary_pg
+                .try_insert_pending_metadata_command_slot(1, &command, Some(&bucket))
+                .unwrap();
+        }
+
+        let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
+        assert!(matches!(
+            err,
+            ClusterBuildError::OpenLocalNode {
+                node_id: 1,
+                source: StoreError::MetadataCommandPendingOnNonPrimary {
+                    node_id: 1,
+                    primary_node_id: 0,
+                    pg_id: 1,
                     ..
                 }
             }

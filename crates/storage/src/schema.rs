@@ -429,6 +429,22 @@ CREATE TABLE IF NOT EXISTS metadata_command_log (
     PRIMARY KEY (cluster_epoch, pg_id, log_index)
 )";
 
+/// Per-PG unresolved metadata command slot.
+///
+/// Each PG database owns at most one slot. The command bytes are the canonical
+/// applied command bytes, not serving metadata; this table is runtime
+/// coordination state for retry and convergence.
+const CREATE_METADATA_COMMAND_PENDING_SLOT_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS metadata_command_pending_slot (
+    singleton        INTEGER PRIMARY KEY CHECK (singleton = 0),
+    cluster_epoch    INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    pg_id            INTEGER NOT NULL CHECK (pg_id >= 0),
+    log_index        INTEGER NOT NULL CHECK (log_index > 0),
+    command_checksum INTEGER NOT NULL,
+    command_bytes    BLOB NOT NULL,
+    scope_bucket     TEXT
+)";
+
 /// Per-PG durable metadata command replay state for this replica.
 const CREATE_METADATA_COMMAND_REPLICA_STATE_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS metadata_command_replica_state (
@@ -528,6 +544,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_BUCKETS_OWNER_LIST_INDEX, [])?;
     conn.execute(CREATE_PG_COUNTERS_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_LOG_TABLE, [])?;
+    conn.execute(CREATE_METADATA_COMMAND_PENDING_SLOT_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_REPLICA_STATE_TABLE, [])?;
     conn.execute(CREATE_METADATA_TABLE_DIGESTS_TABLE, [])?;
     conn.execute(CREATE_METADATA_DIGEST_REVISION_TABLE, [])?;

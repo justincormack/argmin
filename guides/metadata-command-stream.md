@@ -29,18 +29,25 @@ Phase 9.2 target keeps the unit of ordering small and explicit.
 ## Command Slots
 
 A command slot is a durable intent for one metadata command on one PG. It is
-created before acting-set fanout and remains visible until the command has
-reached a terminal durable state.
+created on the PG primary before acting-set fanout and remains visible until
+the command has reached a terminal durable state. Non-primary replicas must not
+store unresolved command slots; they store only accepted command-log entries
+and materialized metadata state.
 
-A command slot records at least:
+The Phase 9.2 implementation starts with a minimal unresolved-slot row. It
+records:
 
 - PG id
 - log index
 - command id, checksum, and canonical command bytes
 - command kind and diagnostic scope, such as bucket, object key, upload id, or
   stream session id where available
-- state: pending, applied, or abandoned
-- creation and update timestamps
+
+The broader target model may add explicit slot state and timestamps if they are
+needed for observability, retry ownership, or timeout handling. A terminal
+applied or abandoned state is currently represented by the command log itself;
+once the terminal log entry is durable, recovery should clean the unresolved
+slot row.
 
 The slot is coordination state, not serving metadata. Request paths must not
 derive visible S3 state from a pending slot. Serving state is the materialized

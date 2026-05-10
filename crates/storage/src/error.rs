@@ -132,6 +132,26 @@ pub enum StoreError {
     },
 
     #[error(
+        "metadata command pending slot for PG {pg_id} epoch {cluster_epoch} already contains log index {existing_log_index}, cannot install log index {candidate_log_index}"
+    )]
+    MetadataCommandPendingConflict {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        existing_log_index: u64,
+        candidate_log_index: u64,
+    },
+
+    #[error(
+        "metadata command pending slot for PG {pg_id} epoch {cluster_epoch} exists on local node {node_id}, expected primary node {primary_node_id}"
+    )]
+    MetadataCommandPendingOnNonPrimary {
+        node_id: u32,
+        primary_node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+
+    #[error(
         "metadata command log checksum mismatch for local node {node_id} PG {pg_id} epoch {cluster_epoch} log index {log_index}: stored checksum {stored_checksum:#018X}, computed checksum {computed_checksum:#018X}"
     )]
     MetadataCommandLogChecksumMismatch {

@@ -953,7 +953,7 @@ pub(crate) fn metadata_command_log_hash(
     checksum::crc64::checksum(&out)
 }
 
-fn abandoned_command_log_bytes(id: MetadataCommandId, command_checksum: u64) -> Vec<u8> {
+pub(crate) fn abandoned_command_log_bytes(id: MetadataCommandId, command_checksum: u64) -> Vec<u8> {
     let mut out = Vec::new();
     put_bytes(&mut out, ABANDONED_METADATA_COMMAND_MAGIC);
     put_u16(&mut out, ABANDONED_METADATA_COMMAND_ENCODING_VERSION);
