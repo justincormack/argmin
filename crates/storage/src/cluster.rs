@@ -930,7 +930,7 @@ impl StorageCluster {
         loop {
             if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
             {
-                let abandoned_reservation = match command.payload() {
+                match command.payload() {
                     MetadataCommandPayload::ReserveObjectGeneration(reservation)
                         if reservation.matches_request(bucket, key, reservation_id) =>
                     {
@@ -942,28 +942,23 @@ impl StorageCluster {
                             PendingMetadataCommandOutcome::Abandoned => continue,
                         }
                     }
-                    MetadataCommandPayload::ReserveObjectGeneration(reservation) => {
-                        Some((reservation.key.clone(), reservation.reservation_id.clone()))
-                    }
-                    _ => None,
-                };
-
-                let outcome = self
-                    .finish_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
-                if let Some((abandoned_key, abandoned_reservation_id)) = abandoned_reservation {
-                    if outcome == PendingMetadataCommandOutcome::Applied {
-                        self.release_abandoned_object_generation_reservation(
-                            pg_id,
-                            bucket,
-                            &abandoned_key,
-                            &abandoned_reservation_id,
-                        )?;
-                    }
+                    _ => {}
                 }
+                self.finish_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
                 continue;
             }
 
             let object_pg = primary_node.get_pg(pg_id.get())?;
+            match PgMetadataStore::get_object_generation_reservation(
+                &*object_pg,
+                bucket,
+                key,
+                reservation_id,
+            ) {
+                Ok(generation_id) => return Ok(generation_id),
+                Err(MetadataError::ObjectGenerationReservationNotFound { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
             let generation_id = object_pg.next_generation_id(bucket, key)?;
             drop(object_pg);
             let command_id = MetadataCommandId::new(
@@ -983,12 +978,12 @@ impl StorageCluster {
                     ),
                 ),
             );
-            self.set_pending_metadata_command_for_bucket(
-                pg_id,
-                bucket,
-                &command,
-                "conflicting pending command for object generation reservation",
-            )?;
+            if runtime_state
+                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
+                .is_err()
+            {
+                continue;
+            }
             match self.apply_metadata_command_to_acting_set(&command) {
                 Ok(()) => {
                     self.local_map
@@ -1195,38 +1190,64 @@ impl StorageCluster {
         reservation_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
         let runtime_state = self.local_map.runtime_state();
-        let command = MetadataCommandEnvelope::new(
-            self.next_object_metadata_command_id(pg_id),
-            MetadataCommandPayload::ReleaseObjectGeneration(ReleaseObjectGenerationCommand::new(
-                bucket.clone(),
-                key.clone(),
-                reservation_id.clone(),
-            )),
-        );
-        if runtime_state
-            .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
-            .is_err()
-        {
-            return Err(conflicting_pending_object_metadata_command(
-                "conflicting pending command for abandoned object generation reservation release",
-            ));
-        }
-        if self
-            .metadata_command_has_abandoned_log_on_acting_set(&command)
-            .map_err(|error| bucket_snapshot_error_to_object_pg_action_error(error.source))?
-        {
-            return Err(conflicting_pending_object_metadata_command(
-                "abandoned pending command for required object generation reservation release",
-            ));
-        }
-        match self.apply_metadata_command_to_acting_set(&command) {
-            Ok(()) => {
-                runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
-                Ok(())
+        loop {
+            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+            {
+                match command.payload() {
+                    MetadataCommandPayload::ReleaseObjectGeneration(reservation)
+                        if reservation.matches_request(bucket, key, reservation_id) =>
+                    {
+                        match self.finish_pending_object_metadata_command_for_bucket(
+                            pg_id, bucket, &command,
+                        )? {
+                            PendingMetadataCommandOutcome::Applied => return Ok(()),
+                            PendingMetadataCommandOutcome::Abandoned => continue,
+                        }
+                    }
+                    _ => {
+                        self.finish_pending_object_metadata_command_for_bucket(
+                            pg_id, bucket, &command,
+                        )?;
+                        continue;
+                    }
+                }
             }
-            Err(error) => Err(bucket_snapshot_error_to_object_pg_action_error(
-                error.source,
-            )),
+
+            let command = MetadataCommandEnvelope::new(
+                self.next_object_metadata_command_id(pg_id),
+                MetadataCommandPayload::ReleaseObjectGeneration(
+                    ReleaseObjectGenerationCommand::new(
+                        bucket.clone(),
+                        key.clone(),
+                        reservation_id.clone(),
+                    ),
+                ),
+            );
+            if runtime_state
+                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
+                .is_err()
+            {
+                continue;
+            }
+            match self.apply_metadata_command_to_acting_set(&command) {
+                Ok(()) => {
+                    runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                    return Ok(());
+                }
+                Err(error) => {
+                    if error.applied_nodes == 0 {
+                        self.record_abandoned_metadata_command_to_acting_set(&command)
+                            .map_err(|error| {
+                                bucket_snapshot_error_to_object_pg_action_error(error.source)
+                            })?;
+                        runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                        continue;
+                    }
+                    return Err(bucket_snapshot_error_to_object_pg_action_error(
+                        error.source,
+                    ));
+                }
+            }
         }
     }
 
@@ -1462,44 +1483,6 @@ impl StorageCluster {
         }
     }
 
-    fn release_abandoned_object_generation_reservation(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        reservation_id: &SessionId,
-    ) -> Result<(), ObjectPgActionError> {
-        let runtime_state = self.local_map.runtime_state();
-        let command_id = MetadataCommandId::new(
-            self.operation_epoch(),
-            pg_id,
-            runtime_state.next_metadata_command_log_index(pg_id),
-        );
-        let command = MetadataCommandEnvelope::new(
-            command_id,
-            MetadataCommandPayload::ReleaseObjectGeneration(ReleaseObjectGenerationCommand::new(
-                bucket.clone(),
-                key.clone(),
-                reservation_id.clone(),
-            )),
-        );
-        self.set_pending_metadata_command_for_bucket(
-            pg_id,
-            bucket,
-            &command,
-            "conflicting pending command for abandoned object generation reservation release",
-        )?;
-        match self.apply_metadata_command_to_acting_set(&command) {
-            Ok(()) => {
-                runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
-                Ok(())
-            }
-            Err(error) => Err(bucket_snapshot_error_to_object_pg_action_error(
-                error.source,
-            )),
-        }
-    }
-
     fn release_object_generation_reservation_after_pending_drain_best_effort(
         &self,
         pg_id: PgId,
@@ -1522,35 +1505,28 @@ impl StorageCluster {
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let _bucket_guard = primary_node.lock_bucket(bucket);
         let runtime_state = self.local_map.runtime_state();
-        let (command, clear_pending_on_zero_apply) = if let Some(command) =
-            runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
-        {
-            if self
-                .metadata_command_has_abandoned_log_on_acting_set(&command)
-                .map_err(|error| bucket_snapshot_error_to_object_pg_action_error(error.source))?
+        loop {
+            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
             {
-                self.record_abandoned_metadata_command_to_acting_set(&command)
-                    .map_err(|error| {
-                        bucket_snapshot_error_to_object_pg_action_error(error.source)
-                    })?;
-                runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
-                return Err(conflicting_pending_object_metadata_command(
-                    "abandoned pending command for object generation reservation release",
-                ));
-            }
-            match command.payload() {
-                MetadataCommandPayload::ReleaseObjectGeneration(reservation)
-                    if reservation.matches_request(bucket, key, reservation_id) =>
-                {
-                    (command, false)
-                }
-                _ => {
-                    return Err(conflicting_pending_object_metadata_command(
-                        "conflicting pending command for object generation reservation release",
-                    ));
+                match command.payload() {
+                    MetadataCommandPayload::ReleaseObjectGeneration(reservation)
+                        if reservation.matches_request(bucket, key, reservation_id) =>
+                    {
+                        match self.finish_pending_object_metadata_command_for_bucket(
+                            pg_id, bucket, &command,
+                        )? {
+                            PendingMetadataCommandOutcome::Applied => return Ok(()),
+                            PendingMetadataCommandOutcome::Abandoned => continue,
+                        }
+                    }
+                    _ => {
+                        self.finish_pending_object_metadata_command_for_bucket(
+                            pg_id, bucket, &command,
+                        )?;
+                        continue;
+                    }
                 }
             }
-        } else {
             let command_id = MetadataCommandId::new(
                 self.operation_epoch(),
                 pg_id,
@@ -1566,34 +1542,34 @@ impl StorageCluster {
                     ),
                 ),
             );
-            self.set_pending_metadata_command_for_bucket(
-                pg_id,
-                bucket,
-                &command,
-                "conflicting pending command for object generation reservation release",
-            )?;
-            (command, true)
-        };
-        match self.apply_metadata_command_to_acting_set(&command) {
-            Ok(()) => {
-                self.local_map
-                    .runtime_state()
-                    .remove_pending_metadata_command_for_bucket(pg_id, bucket);
-                Ok(())
+            if runtime_state
+                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
+                .is_err()
+            {
+                continue;
             }
-            Err(error) => {
-                if clear_pending_on_zero_apply && error.applied_nodes == 0 {
-                    self.record_abandoned_metadata_command_to_acting_set(&command)
-                        .map_err(|error| {
-                            bucket_snapshot_error_to_object_pg_action_error(error.source)
-                        })?;
+            match self.apply_metadata_command_to_acting_set(&command) {
+                Ok(()) => {
                     self.local_map
                         .runtime_state()
                         .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                    return Ok(());
                 }
-                Err(bucket_snapshot_error_to_object_pg_action_error(
-                    error.source,
-                ))
+                Err(error) => {
+                    if error.applied_nodes == 0 {
+                        self.record_abandoned_metadata_command_to_acting_set(&command)
+                            .map_err(|error| {
+                                bucket_snapshot_error_to_object_pg_action_error(error.source)
+                            })?;
+                        self.local_map
+                            .runtime_state()
+                            .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                        continue;
+                    }
+                    return Err(bucket_snapshot_error_to_object_pg_action_error(
+                        error.source,
+                    ));
+                }
             }
         }
     }

@@ -49,6 +49,20 @@ applied or abandoned state is currently represented by the command log itself;
 once the terminal log entry is durable, recovery should clean the unresolved
 slot row.
 
+The transitional in-process retry cache must follow the same shape while the
+request paths are being moved over: it is keyed by PG, not by bucket or object.
+Older helper names may still mention buckets because callers use a bucket to
+derive the routed metadata PG, but a pending command for any bucket on that PG
+occupies the single stream slot.
+
+Finishing another request's pending slot must not steal ownership of resources
+created by that command. In particular, draining a non-matching
+`ReserveObjectGeneration` command applies the reservation and leaves it owned by
+its original reservation id; the drainer must not release it just because it was
+not the current request. Cleanup of genuinely orphaned reservations needs
+durable ownership/scavenger semantics, not a best-effort guess by a later
+request.
+
 The slot is coordination state, not serving metadata. Request paths must not
 derive visible S3 state from a pending slot. Serving state is the materialized
 metadata tables whose accepted log prefix and digest agree with the command

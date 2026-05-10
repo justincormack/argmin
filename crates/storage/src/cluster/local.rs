@@ -216,7 +216,7 @@ pub(crate) struct LocalClusterRuntimeState {
     reclaim_queue: (Mutex<LocalReclaimQueueState>, Condvar),
     metadata_command_indexes: Mutex<HashMap<PgId, u64>>,
     metadata_command_apply_lock: Mutex<()>,
-    pending_metadata_commands: Mutex<HashMap<(PgId, BucketName), MetadataCommandEnvelope>>,
+    pending_metadata_commands: Mutex<HashMap<PgId, MetadataCommandEnvelope>>,
     stream_segment_vids: Mutex<HashMap<SessionId, u64>>,
 }
 
@@ -322,10 +322,11 @@ impl LocalClusterRuntimeState {
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Option<MetadataCommandEnvelope> {
+        let _ = bucket;
         self.pending_metadata_commands
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&(pg_id, bucket.clone()))
+            .get(&pg_id)
             .cloned()
     }
 
@@ -339,7 +340,8 @@ impl LocalClusterRuntimeState {
             .pending_metadata_commands
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        match pending_commands.entry((pg_id, bucket.clone())) {
+        let _ = bucket;
+        match pending_commands.entry(pg_id) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(command);
                 Ok(())
@@ -353,10 +355,11 @@ impl LocalClusterRuntimeState {
         pg_id: PgId,
         bucket: &BucketName,
     ) {
+        let _ = bucket;
         self.pending_metadata_commands
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&(pg_id, bucket.clone()));
+            .remove(&pg_id);
     }
 
     pub(crate) fn clear_pending_metadata_command_for_bucket(
@@ -364,12 +367,11 @@ impl LocalClusterRuntimeState {
         pg_id: PgId,
         bucket: &BucketName,
     ) {
+        let _ = bucket;
         self.pending_metadata_commands
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|(pending_pg_id, pending_bucket), _| {
-                *pending_pg_id != pg_id || pending_bucket != bucket
-            });
+            .remove(&pg_id);
     }
 
     pub(crate) fn acquire_object_payload_lease(
@@ -4590,7 +4592,7 @@ mod tests {
     }
 
     #[test]
-    fn abandoned_put_object_stream_create_release_failure_leaves_pending_retry() {
+    fn abandoned_put_object_stream_create_release_failure_retries_to_terminal_cleanup() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let ec_shape = EcShape { k: 2, m: 1 };
@@ -4612,7 +4614,7 @@ mod tests {
         create_test_bucket(&cluster, &bucket);
         let pg_id = PgId::new(object_pg);
         let session_id = crate::SessionId::try_from("5a".repeat(16)).unwrap();
-        let generation_id = cluster
+        let _generation_id = cluster
             .reserve_put_object_generation(&bucket, &key, &session_id)
             .unwrap();
         let command = MetadataCommandEnvelope::new(
@@ -4676,51 +4678,10 @@ mod tests {
             },
         ));
 
-        let err = cluster
-            .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                crate::ObjectPgActionError::Store(StoreError::Io {
-                    context: "injected abandoned stream create release failure",
-                    ..
-                })
-            ),
-            "expected required release failure, got {err:?}"
-        );
-        let pending = map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, &bucket)
-            .expect("release cleanup must remain pending after failure");
-        assert!(matches!(
-            pending.payload(),
-            MetadataCommandPayload::ReleaseObjectGeneration(release)
-                if release.matches_request(&bucket, &key, &session_id)
-        ));
-        for node_id in node_ids {
-            let pg = map
-                .node(node_id)
-                .unwrap()
-                .storage_node()
-                .get_pg(object_pg)
-                .unwrap();
-            assert_eq!(
-                crate::PgMetadataStore::get_object_generation_reservation(
-                    &*pg,
-                    &bucket,
-                    &key,
-                    &session_id
-                )
-                .unwrap(),
-                generation_id
-            );
-        }
-
-        drop(hook_guard);
         cluster
             .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
             .unwrap();
+        drop(hook_guard);
         assert!(map
             .runtime_state()
             .pending_metadata_command_for_bucket(pg_id, &bucket)
@@ -6245,6 +6206,303 @@ mod tests {
                 ),
                 Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
             ));
+        }
+    }
+
+    #[test]
+    fn object_generation_reservation_drains_other_bucket_pending_reserve_without_stealing_it() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (first_bucket, first_key, second_bucket, second_key, object_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let first_bucket = bucket_for_pg(topology, 1, "pending-reserve-first-");
+            let second_bucket = bucket_for_pg(topology, 1, "pending-reserve-second-");
+            let object_pg = 2;
+            let first_key = key_for_object_pg(topology, &first_bucket, object_pg, "key-");
+            let second_key = key_for_object_pg(topology, &second_bucket, object_pg, "key-");
+            (
+                first_bucket,
+                first_key,
+                second_bucket,
+                second_key,
+                object_pg,
+            )
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &first_bucket);
+        create_test_bucket(&cluster, &second_bucket);
+
+        let pg_id = PgId::new(object_pg);
+        let first_reservation_id = crate::SessionId::try_from("65".repeat(16)).unwrap();
+        let second_reservation_id = crate::SessionId::try_from("66".repeat(16)).unwrap();
+        let pending = MetadataCommandEnvelope::new(
+            crate::metadata_command::MetadataCommandId::new(
+                cluster.operation_epoch(),
+                pg_id,
+                map.runtime_state().next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::ReserveObjectGeneration(
+                crate::metadata_command::ReserveObjectGenerationCommand::new(
+                    first_bucket.clone(),
+                    first_key.clone(),
+                    first_reservation_id.clone(),
+                    crate::GenerationId::MIN,
+                    123,
+                ),
+            ),
+        );
+        map.runtime_state()
+            .try_set_pending_metadata_command_for_bucket(pg_id, &first_bucket, pending)
+            .unwrap();
+
+        let second_generation = cluster
+            .reserve_put_object_generation(&second_bucket, &second_key, &second_reservation_id)
+            .unwrap();
+        assert_eq!(second_generation, crate::GenerationId::MIN);
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(pg_id, &second_bucket)
+            .is_none());
+        let retried_first_generation = cluster
+            .reserve_put_object_generation(&first_bucket, &first_key, &first_reservation_id)
+            .unwrap();
+        assert_eq!(
+            retried_first_generation,
+            crate::GenerationId::MIN,
+            "the original request must recover its applied reservation after another request drained its pending slot"
+        );
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &first_bucket,
+                    &first_key,
+                    &first_reservation_id,
+                )
+                .unwrap(),
+                crate::GenerationId::MIN
+            );
+            assert_eq!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &second_bucket,
+                    &second_key,
+                    &second_reservation_id,
+                )
+                .unwrap(),
+                second_generation
+            );
+        }
+    }
+
+    #[test]
+    fn release_object_generation_reservation_drains_intervening_pg_slot_without_stealing_it() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (first_bucket, first_key, second_bucket, second_key, object_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let first_bucket = bucket_for_pg(topology, 1, "release-drain-first-");
+            let second_bucket = bucket_for_pg(topology, 1, "release-drain-second-");
+            let object_pg = 2;
+            let first_key = key_for_object_pg(topology, &first_bucket, object_pg, "key-");
+            let second_key = key_for_object_pg(topology, &second_bucket, object_pg, "key-");
+            (
+                first_bucket,
+                first_key,
+                second_bucket,
+                second_key,
+                object_pg,
+            )
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &first_bucket);
+        create_test_bucket(&cluster, &second_bucket);
+
+        let pg_id = PgId::new(object_pg);
+        let first_reservation_id = crate::SessionId::try_from("67".repeat(16)).unwrap();
+        let second_reservation_id = crate::SessionId::try_from("68".repeat(16)).unwrap();
+        assert_eq!(
+            cluster
+                .reserve_put_object_generation(&first_bucket, &first_key, &first_reservation_id)
+                .unwrap(),
+            crate::GenerationId::MIN
+        );
+        let pending = MetadataCommandEnvelope::new(
+            crate::metadata_command::MetadataCommandId::new(
+                cluster.operation_epoch(),
+                pg_id,
+                map.runtime_state().next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::ReserveObjectGeneration(
+                crate::metadata_command::ReserveObjectGenerationCommand::new(
+                    second_bucket.clone(),
+                    second_key.clone(),
+                    second_reservation_id.clone(),
+                    crate::GenerationId::MIN,
+                    123,
+                ),
+            ),
+        );
+        map.runtime_state()
+            .try_set_pending_metadata_command_for_bucket(pg_id, &second_bucket, pending)
+            .unwrap();
+
+        cluster
+            .release_object_generation_reservation(&first_bucket, &first_key, &first_reservation_id)
+            .unwrap();
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(pg_id, &first_bucket)
+            .is_none());
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &first_bucket,
+                    &first_key,
+                    &first_reservation_id,
+                ),
+                Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+            ));
+            assert_eq!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &second_bucket,
+                    &second_key,
+                    &second_reservation_id,
+                )
+                .unwrap(),
+                crate::GenerationId::MIN
+            );
+        }
+    }
+
+    #[test]
+    fn required_reservation_release_drains_intervening_pg_slot_without_stealing_it() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (first_bucket, first_key, second_bucket, second_key, object_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let first_bucket = bucket_for_pg(topology, 1, "required-release-first-");
+            let second_bucket = bucket_for_pg(topology, 1, "required-release-second-");
+            let object_pg = 2;
+            let first_key = key_for_object_pg(topology, &first_bucket, object_pg, "key-");
+            let second_key = key_for_object_pg(topology, &second_bucket, object_pg, "key-");
+            (
+                first_bucket,
+                first_key,
+                second_bucket,
+                second_key,
+                object_pg,
+            )
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &first_bucket);
+        create_test_bucket(&cluster, &second_bucket);
+
+        let pg_id = PgId::new(object_pg);
+        let first_reservation_id = crate::SessionId::try_from("69".repeat(16)).unwrap();
+        let second_reservation_id = crate::SessionId::try_from("6a".repeat(16)).unwrap();
+        assert_eq!(
+            cluster
+                .reserve_put_object_generation(&first_bucket, &first_key, &first_reservation_id)
+                .unwrap(),
+            crate::GenerationId::MIN
+        );
+        let pending = MetadataCommandEnvelope::new(
+            crate::metadata_command::MetadataCommandId::new(
+                cluster.operation_epoch(),
+                pg_id,
+                map.runtime_state().next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::ReserveObjectGeneration(
+                crate::metadata_command::ReserveObjectGenerationCommand::new(
+                    second_bucket.clone(),
+                    second_key.clone(),
+                    second_reservation_id.clone(),
+                    crate::GenerationId::MIN,
+                    123,
+                ),
+            ),
+        );
+        map.runtime_state()
+            .try_set_pending_metadata_command_for_bucket(pg_id, &second_bucket, pending)
+            .unwrap();
+
+        cluster
+            .release_object_generation_reservation_command_required(
+                pg_id,
+                &first_bucket,
+                &first_key,
+                &first_reservation_id,
+            )
+            .unwrap();
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(pg_id, &first_bucket)
+            .is_none());
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &first_bucket,
+                    &first_key,
+                    &first_reservation_id,
+                ),
+                Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+            ));
+            assert_eq!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &second_bucket,
+                    &second_key,
+                    &second_reservation_id,
+                )
+                .unwrap(),
+                crate::GenerationId::MIN
+            );
         }
     }
 
@@ -8123,6 +8381,58 @@ mod tests {
                 .pending_metadata_command_for_bucket(pg_id, &bucket)
                 .unwrap(),
             command_one
+        );
+    }
+
+    #[test]
+    fn pending_metadata_command_slot_is_pg_scoped_not_bucket_scoped() {
+        let runtime_state = LocalClusterRuntimeState::new();
+        let pg_id = PgId::new(3);
+        let first_bucket = crate::BucketName::try_from("first-bucket".to_string()).unwrap();
+        let second_bucket = crate::BucketName::try_from("second-bucket".to_string()).unwrap();
+        let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+        let session_one = crate::SessionId::try_from("41".repeat(16)).unwrap();
+        let session_two = crate::SessionId::try_from("42".repeat(16)).unwrap();
+
+        let make_release_command = |bucket: crate::BucketName, session_id: crate::SessionId| {
+            let command_id = crate::metadata_command::MetadataCommandId::new(
+                crate::ClusterEpoch::INITIAL,
+                pg_id,
+                runtime_state.next_metadata_command_log_index(pg_id),
+            );
+            MetadataCommandEnvelope::new(
+                command_id,
+                MetadataCommandPayload::ReleaseObjectGeneration(
+                    crate::metadata_command::ReleaseObjectGenerationCommand::new(
+                        bucket,
+                        key.clone(),
+                        session_id,
+                    ),
+                ),
+            )
+        };
+        let first_command = make_release_command(first_bucket.clone(), session_one);
+        let second_command = make_release_command(second_bucket.clone(), session_two);
+
+        runtime_state
+            .try_set_pending_metadata_command_for_bucket(
+                pg_id,
+                &first_bucket,
+                first_command.clone(),
+            )
+            .unwrap();
+        let result = runtime_state.try_set_pending_metadata_command_for_bucket(
+            pg_id,
+            &second_bucket,
+            second_command,
+        );
+
+        assert_eq!(result, Err(PendingMetadataCommandConflict));
+        assert_eq!(
+            runtime_state
+                .pending_metadata_command_for_bucket(pg_id, &second_bucket)
+                .unwrap(),
+            first_command
         );
     }
 
@@ -12464,6 +12774,108 @@ mod tests {
     }
 
     #[test]
+    fn create_bucket_drains_different_bucket_pending_command_on_same_pg() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let first_bucket = bucket_for_pg(topology, 1, "partial-create-first-");
+        let second_bucket = bucket_for_pg(topology, 1, "partial-create-second-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let acl_grants = crate::AclGrants::default();
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let fail_once_hook = Arc::clone(&fail_once);
+        let first_bucket_for_hook = first_bucket.clone();
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::CreateBucket(create)
+                        if create.bucket.name == first_bucket_for_hook
+                            && node_id == NodeId::new(2)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected partial create bucket failure",
+                            source: std::io::Error::other("injected partial create bucket failure"),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+                name: first_bucket.as_str(),
+                owner_principal: "owner",
+                owner_canonical_id: &owner,
+                acl_grants: &acl_grants,
+                public_read: false,
+                public_write: false,
+                versioning: crate::BucketVersioningState::Disabled,
+                object_lock: crate::BucketObjectLockConfig::default(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Store(StoreError::Io {
+                    context: "injected partial create bucket failure",
+                    ..
+                })
+            ),
+            "expected injected partial create failure, got {err:?}"
+        );
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(1), &first_bucket)
+            .is_some());
+        drop(hook_guard);
+
+        let second = cluster
+            .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+                name: second_bucket.as_str(),
+                owner_principal: "owner",
+                owner_canonical_id: &owner,
+                acl_grants: &acl_grants,
+                public_read: false,
+                public_write: false,
+                versioning: crate::BucketVersioningState::Disabled,
+                object_lock: crate::BucketObjectLockConfig::default(),
+            })
+            .unwrap();
+        assert!(matches!(
+            second,
+            crate::BucketCreateAttemptOutcome::Created(info) if info.name == second_bucket
+        ));
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(1), &second_bucket)
+            .is_none());
+
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let first = crate::PgMetadataStore::head_bucket_raw(&*pg, &first_bucket).unwrap();
+            let second = crate::PgMetadataStore::head_bucket_raw(&*pg, &second_bucket).unwrap();
+            assert_eq!(first.name, first_bucket);
+            assert_eq!(second.name, second_bucket);
+        }
+    }
+
+    #[test]
     fn put_bucket_versioning_command_applies_to_all_acting_pg_nodes() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -12609,7 +13021,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_bucket_metadata_command_blocks_later_acl_until_versioning_retry_converges() {
+    fn same_bucket_pending_metadata_command_drains_before_later_acl() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let ec_shape = EcShape { k: 2, m: 1 };
@@ -12690,36 +13102,6 @@ mod tests {
         );
 
         let acl_grants = crate::AclGrants::default();
-        let acl_err = cluster
-            .put_bucket_acl_and_load_info(&bucket, &acl_grants, true, false)
-            .unwrap_err();
-        assert!(
-            matches!(
-                acl_err,
-                crate::BucketSnapshotLoadError::Store(StoreError::Io {
-                    context: "unexpected pending put bucket versioning command for bucket acl",
-                    ..
-                })
-            ),
-            "expected pending versioning command to block ACL update, got {acl_err:?}"
-        );
-        for node_id in node_ids {
-            let node = map.node(node_id).unwrap().storage_node();
-            let pg = node.get_pg(1).unwrap();
-            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
-            assert!(!info.public_read);
-            assert!(!info.public_write);
-        }
-
-        let retried = cluster
-            .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
-            .unwrap();
-        assert_eq!(retried.versioning, crate::BucketVersioningState::Enabled);
-        assert_eq!(
-            retried.bucket_execution_generation,
-            partial_info.bucket_execution_generation
-        );
-
         let acl_updated = cluster
             .put_bucket_acl_and_load_info(&bucket, &acl_grants, true, false)
             .unwrap();
@@ -12730,9 +13112,13 @@ mod tests {
         assert!(acl_updated.public_read);
         assert!(!acl_updated.public_write);
         assert!(
-            acl_updated.bucket_execution_generation > retried.bucket_execution_generation,
-            "later ACL command must reserve a newer execution generation after retry convergence"
+            acl_updated.bucket_execution_generation > partial_info.bucket_execution_generation,
+            "later ACL command must reserve a newer execution generation after draining the pending versioning command"
         );
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(1), &bucket)
+            .is_none());
 
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();

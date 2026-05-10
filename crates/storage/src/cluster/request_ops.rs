@@ -542,65 +542,20 @@ impl super::StorageCluster {
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
                 runtime_state.pending_metadata_command_for_bucket(pg_id, &bucket)
             {
+                if self
+                    .drain_unrelated_pending_metadata_command_for_bucket(pg_id, &bucket, &command)?
+                {
+                    continue;
+                }
                 match command.payload() {
                     MetadataCommandPayload::CreateBucket(create)
                         if create.matches_create_config(config) =>
                     {
                         (command, false)
                     }
-                    MetadataCommandPayload::CreateBucket(_) => {
-                        return Err(MetadataError::BucketAlreadyExists.into());
-                    }
-                    MetadataCommandPayload::PutBucketVersioning(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending put bucket versioning command for create bucket",
-                        ));
-                    }
-                    MetadataCommandPayload::PutBucketAcl(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending put bucket acl command for create bucket",
-                        ));
-                    }
-                    MetadataCommandPayload::PutBucketProperty(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending put bucket property command for create bucket",
-                        ));
-                    }
-                    MetadataCommandPayload::PutBucketSubresource(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending put bucket subresource command for create bucket",
-                        ));
-                    }
-                    MetadataCommandPayload::MarkBucketDeleting(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending mark bucket deleting command for create bucket",
-                        ));
-                    }
-                    MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
-                        self.drain_pending_completed_multipart_sequence_command(
-                            pg_id, &bucket, &command,
-                        )?;
+                    _ => {
+                        self.drain_pending_metadata_command_pg_slot(pg_id, &bucket, &command)?;
                         continue;
-                    }
-                    MetadataCommandPayload::ReserveObjectGeneration(_)
-                    | MetadataCommandPayload::ReleaseObjectGeneration(_)
-                    | MetadataCommandPayload::ReserveObjectVersion(_)
-                    | MetadataCommandPayload::CommitDirectPutObject(_)
-                    | MetadataCommandPayload::CommitMultipartObject(_)
-                    | MetadataCommandPayload::DeleteObjectVersion(_)
-                    | MetadataCommandPayload::InsertDeleteMarker(_)
-                    | MetadataCommandPayload::PutObjectMetadata(_)
-                    | MetadataCommandPayload::CreateStreamUpload(_)
-                    | MetadataCommandPayload::AppendStreamSegment(_)
-                    | MetadataCommandPayload::AbortStreamUpload(_)
-                    | MetadataCommandPayload::CommitStreamPart(_)
-                    | MetadataCommandPayload::CreateMultipartUpload(_)
-                    | MetadataCommandPayload::AbortMultipartUpload(_)
-                    | MetadataCommandPayload::DeleteObjectPayloadReclaim(_)
-                    | MetadataCommandPayload::DeleteCompletedMultipartUpload(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending object command for create bucket",
-                        ));
                     }
                 }
             } else {
@@ -862,6 +817,89 @@ impl super::StorageCluster {
         }
     }
 
+    fn metadata_command_bucket_name(command: &MetadataCommandEnvelope) -> &BucketName {
+        match command.payload() {
+            MetadataCommandPayload::CreateBucket(create) => &create.bucket.name,
+            MetadataCommandPayload::PutBucketVersioning(versioning) => versioning.bucket_name(),
+            MetadataCommandPayload::PutBucketAcl(acl) => acl.bucket_name(),
+            MetadataCommandPayload::PutBucketProperty(property) => property.bucket_name(),
+            MetadataCommandPayload::PutBucketSubresource(subresource) => &subresource.name,
+            MetadataCommandPayload::MarkBucketDeleting(mark) => mark.bucket_name(),
+            MetadataCommandPayload::ReserveObjectGeneration(reservation) => &reservation.bucket,
+            MetadataCommandPayload::ReleaseObjectGeneration(release) => &release.bucket,
+            MetadataCommandPayload::ReserveObjectVersion(reservation) => &reservation.bucket,
+            MetadataCommandPayload::CommitDirectPutObject(commit) => &commit.object.bucket,
+            MetadataCommandPayload::CommitMultipartObject(commit) => &commit.object.bucket,
+            MetadataCommandPayload::DeleteObjectVersion(delete) => &delete.bucket,
+            MetadataCommandPayload::InsertDeleteMarker(insert) => &insert.bucket,
+            MetadataCommandPayload::PutObjectMetadata(metadata) => &metadata.object.bucket,
+            MetadataCommandPayload::CreateStreamUpload(create) => &create.session.bucket,
+            MetadataCommandPayload::AppendStreamSegment(append) => &append.bucket,
+            MetadataCommandPayload::AbortStreamUpload(abort) => &abort.bucket,
+            MetadataCommandPayload::CommitStreamPart(commit) => &commit.bucket,
+            MetadataCommandPayload::CreateMultipartUpload(create) => &create.upload.bucket,
+            MetadataCommandPayload::AbortMultipartUpload(abort) => &abort.bucket,
+            MetadataCommandPayload::DeleteObjectPayloadReclaim(reclaim) => &reclaim.bucket,
+            MetadataCommandPayload::DeleteCompletedMultipartUpload(delete) => &delete.record.bucket,
+            MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(advance) => {
+                &advance.bucket
+            }
+        }
+    }
+
+    fn metadata_command_is_bucket_pg_command(command: &MetadataCommandEnvelope) -> bool {
+        matches!(
+            command.payload(),
+            MetadataCommandPayload::CreateBucket(_)
+                | MetadataCommandPayload::PutBucketVersioning(_)
+                | MetadataCommandPayload::PutBucketAcl(_)
+                | MetadataCommandPayload::PutBucketProperty(_)
+                | MetadataCommandPayload::PutBucketSubresource(_)
+                | MetadataCommandPayload::MarkBucketDeleting(_)
+                | MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
+                | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_)
+        )
+    }
+
+    fn drain_unrelated_pending_metadata_command_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        let pending_bucket = Self::metadata_command_bucket_name(command).clone();
+        if pending_bucket == *bucket {
+            return Ok(false);
+        }
+        self.drain_pending_metadata_command_pg_slot(pg_id, &pending_bucket, command)?;
+        Ok(true)
+    }
+
+    fn drain_pending_metadata_command_pg_slot(
+        &self,
+        pg_id: PgId,
+        pending_bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if Self::metadata_command_is_bucket_pg_command(command) {
+            let outcome = self.finish_pending_metadata_command_to_acting_set(
+                pg_id,
+                pending_bucket,
+                command,
+                false,
+            )?;
+            if outcome == super::PendingMetadataCommandOutcome::Applied {
+                self.local_map
+                    .runtime_state()
+                    .remove_pending_metadata_command_for_bucket(pg_id, pending_bucket);
+            }
+        } else {
+            self.finish_pending_object_metadata_command_for_bucket(pg_id, pending_bucket, command)
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+        }
+        Ok(())
+    }
+
     fn drain_pending_completed_multipart_sequence_command(
         &self,
         pg_id: PgId,
@@ -1070,6 +1108,12 @@ impl super::StorageCluster {
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
                 runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
             {
+                if self
+                    .drain_unrelated_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
+                {
+                    continue;
+                }
                 match command.payload() {
                     MetadataCommandPayload::MarkBucketDeleting(mark)
                         if mark.bucket_name() == bucket =>
@@ -1099,11 +1143,15 @@ impl super::StorageCluster {
                         (command, false)
                     }
                     MetadataCommandPayload::MarkBucketDeleting(_) => {
-                        return Err(bucket_snapshot_error_to_bucket_write_drain_error(
-                            conflicting_pending_metadata_command(
-                                "conflicting pending mark bucket deleting command",
-                            ),
-                        ));
+                        let outcome = self
+                            .finish_pending_metadata_command_to_acting_set(
+                                pg_id, bucket, &command, false,
+                            )
+                            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                        if outcome == super::PendingMetadataCommandOutcome::Applied {
+                            runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                        }
+                        continue;
                     }
                     MetadataCommandPayload::CreateBucket(_)
                     | MetadataCommandPayload::PutBucketVersioning(_)
@@ -1386,6 +1434,13 @@ impl super::StorageCluster {
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
                 runtime_state.pending_metadata_command_for_bucket(pg_id, &record.bucket)
             {
+                if self.drain_unrelated_pending_metadata_command_for_bucket(
+                    pg_id,
+                    &record.bucket,
+                    &command,
+                )? {
+                    continue;
+                }
                 match command.payload() {
                     MetadataCommandPayload::DeleteCompletedMultipartUpload(delete)
                         if delete.record == record =>
@@ -1415,9 +1470,12 @@ impl super::StorageCluster {
                         continue;
                     }
                     _ => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending command for completed multipart upload delete",
-                        ));
+                        self.drain_pending_metadata_command_pg_slot(
+                            pg_id,
+                            &record.bucket,
+                            &command,
+                        )?;
+                        continue;
                     }
                 }
             } else {
@@ -1518,12 +1576,18 @@ impl super::StorageCluster {
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
                 runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
             {
+                if self
+                    .drain_unrelated_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
+                {
+                    continue;
+                }
                 match command.payload() {
                     MetadataCommandPayload::PutBucketVersioning(versioning)
                         if versioning.bucket_name() == bucket =>
                     {
                         let bucket_pg = primary_node.get_pg(pg_id.get())?;
                         let current = bucket_pg.head_bucket_record_raw(bucket)?;
+                        let same_request = versioning.bucket.versioning == state;
                         if !Self::pending_bucket_command_matches_current(
                             current,
                             &versioning.bucket,
@@ -1546,41 +1610,15 @@ impl super::StorageCluster {
                                 .bucket)
                             },
                         )? {
-                            return Err(conflicting_pending_metadata_command(
-                                "conflicting pending put bucket versioning command",
-                            ));
+                            if same_request {
+                                return Err(conflicting_pending_metadata_command(
+                                    "conflicting pending put bucket versioning command",
+                                ));
+                            }
+                            self.drain_pending_metadata_command_pg_slot(pg_id, bucket, &command)?;
+                            continue;
                         }
                         (command, false)
-                    }
-                    MetadataCommandPayload::PutBucketVersioning(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "conflicting pending put bucket versioning command",
-                        ));
-                    }
-                    MetadataCommandPayload::CreateBucket(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending create bucket command for versioning",
-                        ));
-                    }
-                    MetadataCommandPayload::PutBucketAcl(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending put bucket acl command for versioning",
-                        ));
-                    }
-                    MetadataCommandPayload::PutBucketProperty(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending put bucket property command for versioning",
-                        ));
-                    }
-                    MetadataCommandPayload::PutBucketSubresource(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending put bucket subresource command for versioning",
-                        ));
-                    }
-                    MetadataCommandPayload::MarkBucketDeleting(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending mark bucket deleting command for versioning",
-                        ));
                     }
                     MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
                         self.drain_pending_completed_multipart_sequence_command(
@@ -1588,25 +1626,9 @@ impl super::StorageCluster {
                         )?;
                         continue;
                     }
-                    MetadataCommandPayload::ReserveObjectGeneration(_)
-                    | MetadataCommandPayload::ReleaseObjectGeneration(_)
-                    | MetadataCommandPayload::ReserveObjectVersion(_)
-                    | MetadataCommandPayload::CommitDirectPutObject(_)
-                    | MetadataCommandPayload::CommitMultipartObject(_)
-                    | MetadataCommandPayload::DeleteObjectVersion(_)
-                    | MetadataCommandPayload::InsertDeleteMarker(_)
-                    | MetadataCommandPayload::PutObjectMetadata(_)
-                    | MetadataCommandPayload::CreateStreamUpload(_)
-                    | MetadataCommandPayload::AppendStreamSegment(_)
-                    | MetadataCommandPayload::AbortStreamUpload(_)
-                    | MetadataCommandPayload::CommitStreamPart(_)
-                    | MetadataCommandPayload::CreateMultipartUpload(_)
-                    | MetadataCommandPayload::AbortMultipartUpload(_)
-                    | MetadataCommandPayload::DeleteObjectPayloadReclaim(_)
-                    | MetadataCommandPayload::DeleteCompletedMultipartUpload(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending object command for versioning",
-                        ));
+                    _ => {
+                        self.drain_pending_metadata_command_pg_slot(pg_id, bucket, &command)?;
+                        continue;
                     }
                 }
             } else {
@@ -1751,10 +1773,18 @@ impl super::StorageCluster {
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
                 runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
             {
+                if self
+                    .drain_unrelated_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
+                {
+                    continue;
+                }
                 match command.payload() {
                     MetadataCommandPayload::PutBucketAcl(acl) if acl.bucket_name() == bucket => {
                         let bucket_pg = primary_node.get_pg(pg_id.get())?;
                         let current = bucket_pg.head_bucket_record_raw(bucket)?;
+                        let same_request = acl.bucket.acl_grants == *acl_grants
+                            && acl.bucket.public_read == public_read
+                            && acl.bucket.public_write == public_write;
                         if !Self::pending_bucket_command_matches_current(
                             current,
                             &acl.bucket,
@@ -1770,41 +1800,15 @@ impl super::StorageCluster {
                                 .bucket)
                             },
                         )? {
-                            return Err(conflicting_pending_metadata_command(
-                                "conflicting pending put bucket acl command",
-                            ));
+                            if same_request {
+                                return Err(conflicting_pending_metadata_command(
+                                    "conflicting pending put bucket acl command",
+                                ));
+                            }
+                            self.drain_pending_metadata_command_pg_slot(pg_id, bucket, &command)?;
+                            continue;
                         }
                         (command, false)
-                    }
-                    MetadataCommandPayload::PutBucketAcl(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "conflicting pending put bucket acl command",
-                        ));
-                    }
-                    MetadataCommandPayload::CreateBucket(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending create bucket command for bucket acl",
-                        ));
-                    }
-                    MetadataCommandPayload::PutBucketVersioning(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending put bucket versioning command for bucket acl",
-                        ));
-                    }
-                    MetadataCommandPayload::PutBucketProperty(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending put bucket property command for bucket acl",
-                        ));
-                    }
-                    MetadataCommandPayload::PutBucketSubresource(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending put bucket subresource command for bucket acl",
-                        ));
-                    }
-                    MetadataCommandPayload::MarkBucketDeleting(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending mark bucket deleting command for bucket acl",
-                        ));
                     }
                     MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
                         self.drain_pending_completed_multipart_sequence_command(
@@ -1812,25 +1816,9 @@ impl super::StorageCluster {
                         )?;
                         continue;
                     }
-                    MetadataCommandPayload::ReserveObjectGeneration(_)
-                    | MetadataCommandPayload::ReleaseObjectGeneration(_)
-                    | MetadataCommandPayload::ReserveObjectVersion(_)
-                    | MetadataCommandPayload::CommitDirectPutObject(_)
-                    | MetadataCommandPayload::CommitMultipartObject(_)
-                    | MetadataCommandPayload::DeleteObjectVersion(_)
-                    | MetadataCommandPayload::InsertDeleteMarker(_)
-                    | MetadataCommandPayload::PutObjectMetadata(_)
-                    | MetadataCommandPayload::CreateStreamUpload(_)
-                    | MetadataCommandPayload::AppendStreamSegment(_)
-                    | MetadataCommandPayload::AbortStreamUpload(_)
-                    | MetadataCommandPayload::CommitStreamPart(_)
-                    | MetadataCommandPayload::CreateMultipartUpload(_)
-                    | MetadataCommandPayload::AbortMultipartUpload(_)
-                    | MetadataCommandPayload::DeleteObjectPayloadReclaim(_)
-                    | MetadataCommandPayload::DeleteCompletedMultipartUpload(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending object command for bucket acl",
-                        ));
+                    _ => {
+                        self.drain_pending_metadata_command_pg_slot(pg_id, bucket, &command)?;
+                        continue;
                     }
                 }
             } else {
@@ -1898,6 +1886,11 @@ impl super::StorageCluster {
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
                 runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
             {
+                if self
+                    .drain_unrelated_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
+                {
+                    continue;
+                }
                 match command.payload() {
                     MetadataCommandPayload::PutBucketProperty(property)
                         if property.bucket_name() == bucket
@@ -1918,41 +1911,10 @@ impl super::StorageCluster {
                                 .bucket)
                             },
                         )? {
-                            return Err(conflicting_pending_metadata_command(
-                                "conflicting pending put bucket property command",
-                            ));
+                            self.drain_pending_metadata_command_pg_slot(pg_id, bucket, &command)?;
+                            continue;
                         }
                         (command, false)
-                    }
-                    MetadataCommandPayload::PutBucketProperty(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "conflicting pending put bucket property command",
-                        ));
-                    }
-                    MetadataCommandPayload::CreateBucket(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending create bucket command for bucket property",
-                        ));
-                    }
-                    MetadataCommandPayload::PutBucketVersioning(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending put bucket versioning command for bucket property",
-                        ));
-                    }
-                    MetadataCommandPayload::PutBucketAcl(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending put bucket acl command for bucket property",
-                        ));
-                    }
-                    MetadataCommandPayload::PutBucketSubresource(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending put bucket subresource command for bucket property",
-                        ));
-                    }
-                    MetadataCommandPayload::MarkBucketDeleting(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending mark bucket deleting command for bucket property",
-                        ));
                     }
                     MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
                         self.drain_pending_completed_multipart_sequence_command(
@@ -1960,25 +1922,9 @@ impl super::StorageCluster {
                         )?;
                         continue;
                     }
-                    MetadataCommandPayload::ReserveObjectGeneration(_)
-                    | MetadataCommandPayload::ReleaseObjectGeneration(_)
-                    | MetadataCommandPayload::ReserveObjectVersion(_)
-                    | MetadataCommandPayload::CommitDirectPutObject(_)
-                    | MetadataCommandPayload::CommitMultipartObject(_)
-                    | MetadataCommandPayload::DeleteObjectVersion(_)
-                    | MetadataCommandPayload::InsertDeleteMarker(_)
-                    | MetadataCommandPayload::PutObjectMetadata(_)
-                    | MetadataCommandPayload::CreateStreamUpload(_)
-                    | MetadataCommandPayload::AppendStreamSegment(_)
-                    | MetadataCommandPayload::AbortStreamUpload(_)
-                    | MetadataCommandPayload::CommitStreamPart(_)
-                    | MetadataCommandPayload::CreateMultipartUpload(_)
-                    | MetadataCommandPayload::AbortMultipartUpload(_)
-                    | MetadataCommandPayload::DeleteObjectPayloadReclaim(_)
-                    | MetadataCommandPayload::DeleteCompletedMultipartUpload(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending object command for bucket property",
-                        ));
+                    _ => {
+                        self.drain_pending_metadata_command_pg_slot(pg_id, bucket, &command)?;
+                        continue;
                     }
                 }
             } else {
@@ -2071,41 +2017,16 @@ impl super::StorageCluster {
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
                 runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
             {
+                if self
+                    .drain_unrelated_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
+                {
+                    continue;
+                }
                 match command.payload() {
                     MetadataCommandPayload::PutBucketSubresource(subresource)
                         if subresource.matches_mutation(bucket, &mutation) =>
                     {
                         (command, false)
-                    }
-                    MetadataCommandPayload::PutBucketSubresource(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "conflicting pending put bucket subresource command",
-                        ));
-                    }
-                    MetadataCommandPayload::CreateBucket(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending create bucket command for bucket subresource",
-                        ));
-                    }
-                    MetadataCommandPayload::PutBucketVersioning(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending put bucket versioning command for bucket subresource",
-                        ));
-                    }
-                    MetadataCommandPayload::PutBucketAcl(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending put bucket acl command for bucket subresource",
-                        ));
-                    }
-                    MetadataCommandPayload::PutBucketProperty(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending put bucket property command for bucket subresource",
-                        ));
-                    }
-                    MetadataCommandPayload::MarkBucketDeleting(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending mark bucket deleting command for bucket subresource",
-                        ));
                     }
                     MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
                         self.drain_pending_completed_multipart_sequence_command(
@@ -2113,25 +2034,9 @@ impl super::StorageCluster {
                         )?;
                         continue;
                     }
-                    MetadataCommandPayload::ReserveObjectGeneration(_)
-                    | MetadataCommandPayload::ReleaseObjectGeneration(_)
-                    | MetadataCommandPayload::ReserveObjectVersion(_)
-                    | MetadataCommandPayload::CommitDirectPutObject(_)
-                    | MetadataCommandPayload::CommitMultipartObject(_)
-                    | MetadataCommandPayload::DeleteObjectVersion(_)
-                    | MetadataCommandPayload::InsertDeleteMarker(_)
-                    | MetadataCommandPayload::PutObjectMetadata(_)
-                    | MetadataCommandPayload::CreateStreamUpload(_)
-                    | MetadataCommandPayload::AppendStreamSegment(_)
-                    | MetadataCommandPayload::AbortStreamUpload(_)
-                    | MetadataCommandPayload::CommitStreamPart(_)
-                    | MetadataCommandPayload::CreateMultipartUpload(_)
-                    | MetadataCommandPayload::AbortMultipartUpload(_)
-                    | MetadataCommandPayload::DeleteObjectPayloadReclaim(_)
-                    | MetadataCommandPayload::DeleteCompletedMultipartUpload(_) => {
-                        return Err(conflicting_pending_metadata_command(
-                            "unexpected pending object command for bucket subresource",
-                        ));
+                    _ => {
+                        self.drain_pending_metadata_command_pg_slot(pg_id, bucket, &command)?;
+                        continue;
                     }
                 }
             } else {

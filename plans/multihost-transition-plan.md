@@ -2500,6 +2500,12 @@ Proposed subphases:
      allocation
    - replace process-local pending metadata command maps with durable pending
      command state or retry derivation from the durable command log
+     - current in-process retry cache is PG-scoped as a bridge; it must not
+       reintroduce `(PG, bucket)` pending slots while the durable slot is wired
+       into request paths
+     - draining a PG slot must preserve command-owned resources for the original
+       request; non-matching generation reservations are not released by the
+       drainer because they may belong to active concurrent work
    - replace the process-local metadata command apply lock with a durable
      compare-and-append serialization point
    - replace stream segment VID allocation with durable per-session allocation
