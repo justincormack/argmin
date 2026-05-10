@@ -758,6 +758,12 @@ struct MetadataCommandLogEntry {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct MetadataCommandRecordResult {
+    state: MetadataCommandReplicaState,
+    digest_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct MetadataTableDigestStats {
     row_count: u64,
     row_hash_xor: u64,
@@ -1622,11 +1628,21 @@ impl PgStore {
         self.metadata_command_log_entry_matches(node_id, command, &entry, true)
     }
 
+    #[cfg(test)]
     pub(crate) fn record_metadata_command_applied(
         &self,
         node_id: u32,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
+        self.record_metadata_command_applied_inner(node_id, command)
+            .map(|result| result.state)
+    }
+
+    fn record_metadata_command_applied_inner(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandRecordResult, StoreError> {
         if command.id().pg_id().get() != self.pg_id {
             return Err(StoreError::MetadataCommandWrongPg {
                 node_id,
@@ -1678,6 +1694,15 @@ impl PgStore {
         node_id: u32,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
+        self.record_metadata_command_abandoned_inner(node_id, command)
+            .map(|result| result.state)
+    }
+
+    fn record_metadata_command_abandoned_inner(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandRecordResult, StoreError> {
         if command.id().pg_id().get() != self.pg_id {
             return Err(StoreError::MetadataCommandWrongPg {
                 node_id,
@@ -1882,7 +1907,7 @@ impl PgStore {
         node_id: u32,
         cluster_epoch: ClusterEpoch,
         inserted_entry: Option<(MetadataCommandLogIndex, u64)>,
-    ) -> Result<MetadataCommandReplicaState, StoreError> {
+    ) -> Result<MetadataCommandRecordResult, StoreError> {
         let mut state = self.metadata_command_replica_state()?;
         if state.cluster_epoch != cluster_epoch {
             self.refresh_all_metadata_table_digests()?;
@@ -2056,8 +2081,8 @@ impl PgStore {
         cluster_epoch: ClusterEpoch,
         applied_log_index: u64,
         applied_log_hash: u64,
-    ) -> Result<MetadataCommandReplicaState, StoreError> {
-        let state_digest = self.cached_metadata_state_digest()?;
+    ) -> Result<MetadataCommandRecordResult, StoreError> {
+        let (state_digest, digest_revision) = self.cached_metadata_state_digest_with_revision()?;
         self.execute_cached(
             "UPDATE metadata_command_replica_state \
 			 SET cluster_epoch = ?1, applied_log_index = ?2, applied_log_hash = ?3, state_digest = ?4 \
@@ -2070,12 +2095,94 @@ impl PgStore {
             ],
             "update metadata command replica state",
         )?;
-        Ok(MetadataCommandReplicaState {
-            cluster_epoch,
-            applied_log_index,
-            applied_log_hash,
-            state_digest,
+        Ok(MetadataCommandRecordResult {
+            state: MetadataCommandReplicaState {
+                cluster_epoch,
+                applied_log_index,
+                applied_log_hash,
+                state_digest,
+            },
+            digest_revision,
         })
+    }
+
+    fn cached_metadata_state_digest_with_revision(&self) -> Result<(u64, u64), StoreError> {
+        let (mut table_digests, mut revision) =
+            self.cached_metadata_table_digests_with_revision()?;
+        if METADATA_DIGEST_TABLES
+            .iter()
+            .any(|table| !table_digests.contains_key(table.name))
+        {
+            self.refresh_all_metadata_table_digests()?;
+            (table_digests, revision) = self.cached_metadata_table_digests_with_revision()?;
+        }
+
+        let mut hasher = checksum::crc64::Hasher::new();
+        Self::digest_canonical_pg_state_header(&mut hasher);
+        for table in METADATA_DIGEST_TABLES {
+            let table_digest =
+                table_digests
+                    .get(table.name)
+                    .copied()
+                    .ok_or_else(|| StoreError::Db {
+                        context: "load initialized cached metadata table digest",
+                        source: rusqlite::Error::QueryReturnedNoRows,
+                    })?;
+            Self::digest_metadata_table_digest_entry(&mut hasher, table, table_digest);
+        }
+        Ok((hasher.finalize(), revision))
+    }
+
+    fn cached_metadata_table_digests_with_revision(
+        &self,
+    ) -> Result<(HashMap<String, u64>, u64), StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT d.table_name, d.table_digest, r.revision \
+                 FROM metadata_table_digests d, metadata_digest_revision r \
+                 WHERE r.singleton = 0",
+            )
+            .map_err(|source| StoreError::Db {
+                context: "prepare cached metadata table digests with revision",
+                source,
+            })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|source| StoreError::Db {
+                context: "load cached metadata table digests with revision",
+                source,
+            })?;
+        let mut digests = HashMap::new();
+        let mut revision = None;
+        for row in rows {
+            let (table_name, table_digest, raw_revision) =
+                row.map_err(|source| StoreError::Db {
+                    context: "decode cached metadata table digest with revision",
+                    source,
+                })?;
+            digests.insert(table_name, table_digest as u64);
+            revision = Some(decode_nonnegative_u64(
+                "decode metadata digest revision",
+                raw_revision,
+            )?);
+        }
+        let revision = revision.ok_or_else(|| StoreError::Db {
+            context: "load metadata digest revision with cached table digests",
+            source: rusqlite::Error::QueryReturnedNoRows,
+        })?;
+        Ok((digests, revision))
+    }
+
+    fn mark_metadata_state_digest_clean_at_revision(&self, revision: u64) {
+        self.clean_metadata_digest_revision
+            .store(revision, Ordering::Relaxed);
     }
 
     fn metadata_command_log_has_tail_after(
@@ -4763,12 +4870,12 @@ impl PgStore {
         let result = (|| {
             self.apply_metadata_command(command)
                 .map_err(BucketSnapshotLoadError::Metadata)?;
-            self.record_metadata_command_applied(node_id, command)
+            self.record_metadata_command_applied_inner(node_id, command)
                 .map_err(BucketSnapshotLoadError::Store)
         })();
 
         match result {
-            Ok(state) => {
+            Ok(record) => {
                 if let Err(source) = self.conn.execute_batch("COMMIT") {
                     let _ = self.conn.execute_batch("ROLLBACK");
                     self.invalidate_clean_metadata_digest_revision();
@@ -4777,9 +4884,8 @@ impl PgStore {
                         source,
                     }));
                 }
-                self.mark_metadata_state_digest_clean()
-                    .map_err(BucketSnapshotLoadError::Store)?;
-                Ok(state)
+                self.mark_metadata_state_digest_clean_at_revision(record.digest_revision);
+                Ok(record.state)
             }
             Err(error) => {
                 let _ = self.conn.execute_batch("ROLLBACK");

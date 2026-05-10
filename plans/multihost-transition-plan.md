@@ -2349,7 +2349,9 @@ Completed:
     - full-suite validation after the bucket/version/log changes was
       `cargo nextest run` passing 4528 tests in 112.784s; after the
       current-object bookkeeping rewrite, deterministic fast-path coverage, and
-      re-verification it was 4529 passing in 114.522s
+      re-verification it was 4529 passing in 114.522s; after the final
+      command-record digest-revision optimisation it was 4529 passing in
+      114.171s
     - collapsed current-object bookkeeping for object writes/deletes from
       select-then-update into indexed single-statement updates/lookups using
       `(bucket, key, write_sequence DESC)`; focused version-selection tests and
@@ -2362,6 +2364,17 @@ Completed:
       `metadata_table_digests`, replica-state loads/updates and digest
       revision reads), followed by bucket info loads, version allocation, and
       object insert/currentness statements
+    - a final small command-record optimisation now returns the digest revision
+      from the same transaction-local cached table-digest scan used to compute
+      the persisted metadata state digest, then marks the clean revision only
+      after `COMMIT`; this removes the extra post-commit
+      `SELECT revision FROM metadata_digest_revision` from successful command
+      apply while preserving rollback invalidation
+    - after that change, the same authz representative measured 15.107s
+      isolated without statement profiling; with profiling enabled it emitted
+      about 703k SQLite profile events, with 6 standalone revision reads, about
+      4.2k standalone `metadata_table_digests` scans, and about 44.5k combined
+      table-digest-plus-revision scans
     - listing representatives remain improved in isolated runs:
       `list_object_versions_clamps_oversized_max_keys` measured 5.164s and
       `test_versioning_list_object_versions_oversized_max_keys_returns_at_most_1000_entries`
