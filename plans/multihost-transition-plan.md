@@ -2416,26 +2416,16 @@ Exit criteria:
 Decide the policy for writes while one or more target nodes are temporarily
 unavailable.
 
-This is a design checkpoint before implementing degraded availability. The
-options are:
+The policy decision and future handoff model are recorded in
+[temporary-write-availability.md](../guides/temporary-write-availability.md).
+The summary is:
 
-1. strict writes
-   - require every target shard and metadata replica before acknowledging success
-   - simplest correctness model
-   - lower write availability during transient node failures
-2. degraded writes
-   - allow success with fewer than `k + m` shards written, but at least enough
-     durable shards to reconstruct
-   - requires per-shard present/missing metadata, urgent repair, and clear
-     durability policy for how much redundancy must exist before success
-   - increases availability but can acknowledge writes with reduced failure
-     tolerance
-3. handoff writes
-   - write temporarily unavailable shards to alternate eligible nodes
-   - requires placement exceptions, handoff metadata, and later migration back to
-     the intended acting set
-   - preserves shard count at commit time but makes placement and repair more
-     complex
+- keep strict writes as the implemented policy for now
+- allow degraded reads when EC reconstruction is safe
+- do not make degraded writes the default policy, because they lower effective
+  parity until repair completes
+- design future handoff writes as deterministic placement under a temporary
+  availability overlay, not arbitrary per-object shard-location exceptions
 
 Default policy until this phase is completed:
 
@@ -2444,15 +2434,21 @@ Default policy until this phase is completed:
   valid shards are reachable
 - do not acknowledge a write that leaves the committed generation below the full
   intended shard count
+- do not implement handoff writes until metadata can record the placement view
+  used by a payload generation and repair/reclaim can operate on that view
 
 Exit criteria:
 
 1. the chosen policy is documented with explicit success and failure conditions
-2. metadata can represent the chosen policy without ambiguity
-3. repair/backfill behavior is defined for every committed write state
-4. tests cover transient target-node outage during direct put, streaming put, and
+2. node availability states distinguish temporary down/planned unavailable from
+   durable `out`
+3. metadata requirements for future placement-view handoff writes are documented
+   without requiring implementation in this phase
+4. repair/backfill behavior is defined for every committed write state allowed
+   by the current strict policy
+5. tests cover transient target-node outage during direct put, streaming put, and
    multipart complete
-5. tests cover a second failure before repair for any policy that acknowledges
+6. tests cover a second failure before repair for any policy that acknowledges
    writes below full redundancy
 
 ## Phase 9: Replace Process-Local Coordination
