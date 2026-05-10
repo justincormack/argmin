@@ -2376,6 +2376,11 @@ Completed:
       comparison point in the latest clean run
     - current-path work recovered the main performance loss without changing
       request semantics or storage command granularity
+    - Phase 7.6.1 is closed. Remaining optimisation candidates are either
+      deeper command-log/validation design work, mostly test-harness bootstrap
+      cost, or semantic batching; do not continue current-path optimisation
+      here unless new production-shaped measurements show a concrete
+      regression.
     - `DeleteObjects` storage-level batching has been moved to
       [delete-objects-batch-command-plan.md](delete-objects-batch-command-plan.md)
       because it is a semantic API change that needs separate cost/benefit and
