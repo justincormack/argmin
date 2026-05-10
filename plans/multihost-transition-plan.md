@@ -2491,6 +2491,11 @@ Proposed subphases:
    - exit when the plan has an explicit checklist of process-local correctness
      mechanisms and their target durable or PG-primary replacement
 2. Phase 9.2 metadata command stream runtime state
+   - implement the target model in
+     [metadata-command-stream.md](../guides/metadata-command-stream.md):
+     a PG command stream is strictly single-writer and single-pending, with
+     concurrency coming from different PGs rather than concurrent mutation
+     inside one PG
    - replace process-local command log index allocation with durable PG-primary
      allocation
    - replace process-local pending metadata command maps with durable pending
@@ -2501,11 +2506,17 @@ Proposed subphases:
      or command-owned append IDs
    - exit when two processes cannot allocate conflicting command indexes,
      hide pending command convergence from each other, or allocate duplicate
-     stream segment VIDs
+     stream segment VIDs; required tests must cover two different buckets on
+     the same PG contending for one PG-scoped slot, zero-replica-apply
+     abandonment, nonzero-apply convergence, and replica rollback of
+     mutation-without-log or log-without-mutation failures
 3. Phase 9.3 multipart serialization
    - replace multipart completion, abort, UploadPart, and streamed UploadPart
      serialization that depends on local locks with PG-primary command
      serialization
+   - build on the Phase 9.2 PG-local command-slot primitive for multi-PG flows,
+     including completed-MPU order reservation on the bucket PG followed by
+     object commit on the object PG
    - cover races for one upload ID and for the same destination object:
      complete vs abort, stream part vs abort, stream part vs complete,
      duplicate part upload, and same-key MPU completion races

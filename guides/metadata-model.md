@@ -21,7 +21,9 @@ agree.
 
 Pending commands are unclosed log intents. They exist so an interrupted command
 can converge or be durably abandoned; they are not a separate source of serving
-state.
+state. The target runtime ownership model for allocating, pending, and applying
+these commands is described in
+[metadata-command-stream.md](metadata-command-stream.md).
 
 ## Payload Boundary
 
