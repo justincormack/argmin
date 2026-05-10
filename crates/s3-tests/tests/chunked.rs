@@ -301,7 +301,11 @@ async fn put_signed_chunked_with_content_encoding(
         extra_signed_headers: &[],
     });
     let wire = build_signed_chunked_body(&sign, data);
-    let agent = build_test_agent(&ctx.endpoint, None, std::time::Duration::from_secs(30));
+    let agent = build_test_agent(
+        &ctx.endpoint,
+        CTX.tls_ca_pem(),
+        std::time::Duration::from_secs(30),
+    );
     let url = format!("{}{}", ctx.endpoint, path);
     let mut resp = agent
         .put(&url)

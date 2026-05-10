@@ -291,6 +291,12 @@ Optional external endpoint support:
 - `S3_TEST_TLS_CA_CERT_PATH`
   - PEM CA certificate path for local HTTPS endpoints such as
     `./scripts/uat-s3-tests`.
+- `S3_TEST_SECOND_PRINCIPAL`
+  - Exact IAM-style principal ARN for the same-account constrained test
+    credential.
+  - This is normally only needed for non-AWS external endpoints, where tests
+    cannot discover the principal from AWS's AccessDenied message text. The
+    UAT wrapper sets it automatically.
 
 The dedicated privileged root-principal suite in
 `crates/s3-tests/tests/bucket_policy_root.rs` requires:

@@ -542,6 +542,13 @@ async fn same_account_exact_principal() -> String {
     if std::env::var_os("S3_TEST_ENDPOINT").is_none() {
         return format!("arn:aws:iam::{}:user/limited", CTX.account_id());
     }
+    if let Ok(principal) = std::env::var("S3_TEST_SECOND_PRINCIPAL") {
+        assert!(
+            principal.starts_with("arn:aws:iam::"),
+            "S3_TEST_SECOND_PRINCIPAL must be an IAM ARN"
+        );
+        return principal;
+    }
 
     let root_client = CTX.client();
     let constrained_client = CTX.require_second_client();

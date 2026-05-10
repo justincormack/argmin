@@ -95,6 +95,7 @@ impl TestContext {
     /// - `S3_TEST_ALT_ACCOUNT_ID`: alternate AWS account ID
     /// - `S3_TEST_SECOND_ACCESS_KEY`: optional same-account constrained access key
     /// - `S3_TEST_SECOND_SECRET_KEY`: optional same-account constrained secret key
+    /// - `S3_TEST_SECOND_PRINCIPAL`: optional exact principal ARN for non-AWS external endpoints
     /// - `S3_TEST_OWNER_ROOT_ACCESS_KEY`: optional owner-account root access key
     /// - `S3_TEST_OWNER_ROOT_SECRET_KEY`: optional owner-account root secret key
     /// - `S3_TEST_TLS_CA_CERT_PATH`: optional PEM CA bundle for local HTTPS endpoints

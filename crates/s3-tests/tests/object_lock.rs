@@ -121,7 +121,13 @@ async fn fresh_alt_client_for_policy_retry() -> aws_sdk_s3::Client {
             .expect("S3_TEST_ALT_ACCESS_KEY required for external policy retries");
         let secret_key = std::env::var("S3_TEST_ALT_SECRET_KEY")
             .expect("S3_TEST_ALT_SECRET_KEY required for external policy retries");
-        s3_tests::build_client_with_ca(CTX.endpoint(), &access_key, &secret_key, CTX.region(), None)
+        s3_tests::build_client_with_ca(
+            CTX.endpoint(),
+            &access_key,
+            &secret_key,
+            CTX.region(),
+            CTX.tls_ca_pem(),
+        )
     } else {
         CTX.alt_client().clone()
     }
