@@ -236,6 +236,12 @@ To run `s3-tests` as a UAT acceptance suite against the standalone
 ./scripts/uat-s3-tests
 ```
 
+To run the same suite against an already-built binary:
+
+```bash
+./scripts/uat-s3-tests --binary ./target/debug/argmin-s3
+```
+
 The UAT wrapper starts `argmin-s3` with a temporary data directory, repository
 test TLS certificate, and the UAT-only credentials listed above, then runs
 `s3-tests` against that process as an external endpoint.

@@ -148,7 +148,8 @@ instead of the embedded in-process test server.
 
 The wrapper:
 
-- starts `cargo run -p argmin-s3` with a temporary data directory
+- starts `cargo run -p argmin-s3` with a temporary data directory, or starts an
+  explicit binary path when `--binary PATH` is provided
 - enables HTTPS using the repository localhost test certificate
 - passes `S3_TEST_TLS_CA_CERT_PATH` so the external AWS SDK clients trust that
   local certificate
@@ -172,6 +173,12 @@ Example targeted run:
 
 ```bash
 ./scripts/uat-s3-tests --test bucket_crud -- --nocapture
+```
+
+Example run against an already-built binary:
+
+```bash
+./scripts/uat-s3-tests --binary ./target/debug/argmin-s3 --test bucket_crud
 ```
 
 Example full acceptance run:

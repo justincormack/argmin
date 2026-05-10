@@ -16,12 +16,14 @@ Options:
   --data-dir PATH        Server data directory (default: temporary directory)
   --bucket-prefix PREFIX Bucket prefix for s3-tests (default: argmin-s3-)
   --timeout-secs SECS    S3 client timeout (default: 30)
+  --binary PATH          Run an already-built argmin-s3-compatible binary
   --release              Run the release binary via cargo run --release
   --no-cleanup           Keep the temporary data directory after the run
   -h, --help             Show this help
 
 Examples:
   ./scripts/uat-s3-tests --test bucket_crud -- --nocapture
+  ./scripts/uat-s3-tests --binary ./target/debug/argmin-s3 --test bucket_crud
   ./scripts/uat-s3-tests --release
 EOF
 }
@@ -37,6 +39,7 @@ bucket_prefix="${S3_TEST_BUCKET_PREFIX:-argmin-s3-}"
 timeout_secs="${S3_TEST_TIMEOUT_SECS:-30}"
 release=0
 cleanup=1
+server_binary=""
 cargo_args=()
 
 while (($#)); do
@@ -60,6 +63,11 @@ while (($#)); do
         --timeout-secs)
             [[ $# -ge 2 ]] || die "--timeout-secs requires a value"
             timeout_secs="$2"
+            shift 2
+            ;;
+        --binary)
+            [[ $# -ge 2 ]] || die "--binary requires a value"
+            server_binary="$2"
             shift 2
             ;;
         --release)
@@ -86,6 +94,17 @@ while (($#)); do
 done
 
 cd "$ROOT"
+
+if [[ -n "$server_binary" && "$release" -eq 1 ]]; then
+    die "--binary cannot be combined with --release"
+fi
+if [[ -n "$server_binary" ]]; then
+    if [[ "$server_binary" == */* ]]; then
+        [[ -x "$server_binary" ]] || die "--binary path is not executable: $server_binary"
+    else
+        command -v "$server_binary" >/dev/null 2>&1 || die "--binary command not found: $server_binary"
+    fi
+fi
 
 if [[ -z "$data_dir" ]]; then
     data_dir="$(mktemp -d "${TMPDIR:-/tmp}/argmin-s3-uat.XXXXXX")"
@@ -138,11 +157,15 @@ export S3_TEST_BUCKET_PREFIX="$bucket_prefix"
 export S3_TEST_TIMEOUT_SECS="$timeout_secs"
 export S3_TEST_TLS_CA_CERT_PATH="${S3_TEST_TLS_CA_CERT_PATH:-$ca_path}"
 
-server_cmd=(cargo run -p argmin-s3)
-if ((release)); then
-    server_cmd+=(--release)
+if [[ -n "$server_binary" ]]; then
+    server_cmd=("$server_binary")
+else
+    server_cmd=(cargo run -p argmin-s3)
+    if ((release)); then
+        server_cmd+=(--release)
+    fi
+    server_cmd+=(--)
 fi
-server_cmd+=(--)
 
 echo "== argmin-s3 UAT server =="
 printf '+'
