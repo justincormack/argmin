@@ -2457,19 +2457,25 @@ Remove process-local mechanisms from logical correctness.
 
 Work items:
 
-1. replace multipart completion locks with PG-primary serialization
-2. replace bucket write drain waits with durable reservation or primary-owned
+1. replace metadata command index allocation, apply serialization, and pending
+   command convergence with durable PG-primary command stream state
+2. replace stream segment VID allocation with durable or command-owned stream
+   append allocation
+3. replace multipart completion locks with PG-primary serialization
+4. replace bucket write drain waits with durable reservation or primary-owned
    state
-3. replace object payload generation leases with cluster-visible read pins or a
+5. replace object payload generation leases with cluster-visible read pins or a
    durable expiring lease table
-4. make reclaim work claiming durable and idempotent
-5. add a physical shard scavenger for unreferenced shard files that can be left
+6. make reclaim work claiming durable and idempotent
+7. add a physical shard scavenger for unreferenced shard files that can be left
    by crashes or persistent delete failures after metadata has already stopped
    referencing a payload, including omitted multipart part shards cleaned up
    after CompleteMultipartUpload
-6. make bucket cache freshness depend on PG or cluster notifications rather than
+8. make lifecycle sweeping ownership and retry state cluster-visible before
+   multiple processes can sweep the same cluster
+9. make bucket cache freshness depend on PG or cluster notifications rather than
    local invalidation alone
-7. audit tests for hidden single-process assumptions
+10. audit tests for hidden single-process assumptions
 
 Proposed subphases:
 
@@ -2478,12 +2484,25 @@ Proposed subphases:
      variable, background worker flag, local cache invalidation path,
      in-memory lease/fence, and test helper that assumes one process
    - classify each item as performance/cache only, request serialization,
-     read/write lifetime protection, cleanup/reclaim ownership, or test-only
+     read/write lifetime protection, cleanup/reclaim ownership,
+     per-connection safety, integrity fast path, or test-only
    - record the replacement owner for every correctness item before changing
      behavior
    - exit when the plan has an explicit checklist of process-local correctness
      mechanisms and their target durable or PG-primary replacement
-2. Phase 9.2 multipart serialization
+2. Phase 9.2 metadata command stream runtime state
+   - replace process-local command log index allocation with durable PG-primary
+     allocation
+   - replace process-local pending metadata command maps with durable pending
+     command state or retry derivation from the durable command log
+   - replace the process-local metadata command apply lock with a durable
+     compare-and-append serialization point
+   - replace stream segment VID allocation with durable per-session allocation
+     or command-owned append IDs
+   - exit when two processes cannot allocate conflicting command indexes,
+     hide pending command convergence from each other, or allocate duplicate
+     stream segment VIDs
+3. Phase 9.3 multipart serialization
    - replace multipart completion, abort, UploadPart, and streamed UploadPart
      serialization that depends on local locks with PG-primary command
      serialization
@@ -2492,14 +2511,14 @@ Proposed subphases:
      duplicate part upload, and same-key MPU completion races
    - exit when these races are serialized by metadata command state rather than
      process-local locks
-3. Phase 9.3 bucket write drain
+4. Phase 9.4 bucket write drain
    - move bucket delete/write-drain state out of process-local waits into
      durable or primary-owned metadata
    - bucket deletion must block new writes, wait for existing write
      reservations, survive process restart, and resume finalization
    - exit when bucket delete does not require a local condition variable or
      same-process waiter to make progress
-4. Phase 9.4 cross-process read pins
+5. Phase 9.5 cross-process read pins
    - replace object payload generation leases with cluster-visible read pins or
      durable expiring leases
    - reclaim must not physically delete payload shards while another process is
@@ -2507,14 +2526,14 @@ Proposed subphases:
    - define stale-process expiry or recovery for abandoned read pins
    - exit when read-pin acquire/release is visible to the reclaim owner across
      process boundaries
-5. Phase 9.5 durable reclaim claiming
+6. Phase 9.6 durable reclaim claiming
    - make reclaim worker ownership durable and idempotent
    - multiple workers must not corrupt or double-finalize the same reclaim row
    - crash after claim must be retryable, and failed cleanup must remain
      observable and retryable
    - exit when reclaim can resume after process restart without local worker
      state
-6. Phase 9.6 physical shard scavenger
+7. Phase 9.7 physical shard scavenger
    - add the eventual cleanup process for shard files no longer referenced by
      metadata
    - cover crash leftovers and omitted multipart payload shards left by
@@ -2522,14 +2541,21 @@ Proposed subphases:
    - do not rely on request-path best-effort cleanup or process-local state to
      remove these files
    - exit when unreferenced shard files are eventually detected and removed
-7. Phase 9.7 cache freshness across processes
+8. Phase 9.8 lifecycle/background mutation ownership
+   - make lifecycle sweeper ownership, progress, and retry state durable or
+     otherwise cluster-visible
+   - multiple processes must not apply the same lifecycle mutation twice, and a
+     stopped process must not leave lifecycle work permanently abandoned
+   - exit when lifecycle expiry and transition work does not depend on a
+     process-local sweeper registry or local wakeup
+9. Phase 9.9 cache freshness across processes
    - make bucket/object fast-path cache invalidation depend on PG or cluster
      notifications, generation checks, or fail-closed reloads rather than local
      invalidation alone
    - a second process mutating bucket metadata must not leave this process
      serving stale policy, versioning, ownership, or public-access state
    - exit when correctness does not depend on same-process cache invalidation
-8. Phase 9.8 test harness de-single-process pass
+10. Phase 9.10 test harness de-single-process pass
    - audit tests and helpers that still use local constructors, raw hooks, or
      direct store access in ways that bypass the production cluster path
    - add targeted multi-handle or multi-process-simulated tests for the Phase 9
@@ -2537,14 +2563,185 @@ Proposed subphases:
    - exit when tests prove the coordination invariants without relying on
      shared local locks
 
+Phase 9.1 audit checklist:
+
+1. metadata command log index allocation
+   - current process-local mechanism:
+     `LocalClusterRuntimeState::metadata_command_indexes`
+   - classification: request serialization and command stream ordering
+   - risk: two processes can allocate conflicting or reordered log indexes for
+     the same PG if allocation remains outside durable PG-primary state
+   - replacement owner: Phase 9.2 PG-primary durable command stream allocator
+2. metadata command apply serialization
+   - current process-local mechanism:
+     `LocalClusterRuntimeState::metadata_command_apply_lock`
+   - classification: request serialization
+   - risk: only commands inside one process are serialized; another process can
+     apply a command concurrently unless the durable command append path becomes
+     the serialization point
+   - replacement owner: Phase 9.2 PG-primary compare-and-append command
+     application
+3. pending metadata command convergence
+   - current process-local mechanism:
+     `LocalClusterRuntimeState::pending_metadata_commands`
+   - classification: request serialization and retry convergence
+   - risk: partial apply state can be forgotten on process exit or invisible to
+     another process, so retries can allocate later commands before the earlier
+     command has converged
+   - replacement owner: Phase 9.2 durable pending command rows or retry
+     derivation from the durable command log and replica state
+4. stream segment VID allocation
+   - current process-local mechanism:
+     `LocalClusterRuntimeState::stream_segment_vids`
+   - classification: request serialization for staged payload identity
+   - risk: two processes appending to the same stream session can allocate the
+     same segment VID or clear each other's allocator assumptions
+   - replacement owner: durable per-session segment allocator, command-owned
+     segment ID allocation, or serialized stream append command state in
+     Phase 9.2
+5. per-PG store mutexes
+   - current process-local mechanism:
+     `SharedStorageNode::stores`, a `HashMap<u32, Mutex<PgStore>>`
+   - classification: per-connection safety and local request serialization
+   - risk: the mutex protects one process's PgStore handle and serializes local
+     access to a PG, but it is not a cross-process serialization primitive
+   - replacement owner: keep SQLite transactions for per-connection database
+     safety; move logical metadata ordering to Phase 9.2 durable command append
+     and PG-primary state before Phase 10
+6. multipart completion and upload lifecycle locks
+   - current process-local mechanism:
+     `SharedStorageNode::multipart_completion_locks`, bucket locks used around
+     multipart complete, abort, and UploadPart stream validation
+   - classification: request serialization
+   - risk: complete, abort, UploadPart, and streamed UploadPart races are only
+     serialized inside one process
+   - replacement owner: Phase 9.3 PG-primary metadata command serialization
+7. bucket operation locks
+   - current process-local mechanism:
+     `SharedStorageNode::bucket_locks`
+   - classification: request serialization and precondition stability
+   - risk: bucket property, delete, lifecycle, and object-operation decisions
+     can observe stable state only inside one process
+   - replacement owner: PG-primary command preconditions and durable bucket
+     state checks in Phase 9.3 and Phase 9.4
+8. bucket write drain waiters
+   - current process-local mechanism:
+     `SharedStorageNode::bucket_coordination` condition variables and local
+     wakeups in bucket write reservation/drain paths
+   - classification: request lifecycle and write-drain coordination
+   - risk: delete/finalize progress can depend on same-process waiters and
+     wakeups
+   - replacement owner: Phase 9.4 durable or PG-primary bucket write-drain
+     state, with restartable polling or notifications
+9. bucket write reservation counters
+   - current mechanism: durable bucket rows with reservation fields, currently
+     treated as runtime coordination state rather than command-owned metadata
+   - classification: write lifetime protection
+   - risk: reservation accounting must be made restart-safe and multi-process
+     visible before bucket delete can rely on it
+   - replacement owner: Phase 9.4 durable reservation table or command-owned
+     bucket-drain state
+10. cluster object payload leases and reclaim fences
+   - current process-local mechanism:
+     `LocalObjectPayloadLeaseState` lease counts, reclaim fences, and active
+     reclaim set
+   - classification: read/write lifetime protection
+   - risk: another process can reclaim payload shards without seeing active
+     readers or an in-progress reclaim fence
+   - replacement owner: Phase 9.5 cluster-visible read pins or durable expiring
+     leases
+11. node-local payload leases, reclaim queue, and bucket-finalize queue
+    - current process-local mechanism:
+      `SharedStorageNode::object_payload_leases`,
+      `SharedStorageNode::reclaim_queue`, and the node-level acquire/release,
+      reclaim enqueue, bucket-finalize enqueue, and worker wait paths
+    - classification: legacy read/write lifetime protection and
+      cleanup/reclaim ownership
+    - risk: any production path that still uses these node-local queues or
+      leases bypasses the cluster-level replacement work and cannot coordinate
+      with another process
+    - replacement owner: remove or test-gate remaining node-local paths, or
+      route them through Phase 9.5 read pins and Phase 9.6 durable reclaim
+      claiming
+12. cluster object and bucket reclaim queues
+    - current process-local mechanism:
+      `LocalReclaimQueueState` plus the `argmin-reclaim` worker wait queue
+    - classification: cleanup/reclaim ownership
+    - risk: reclaim work can be lost on process exit, duplicated between
+      workers, or missed by another process
+    - replacement owner: Phase 9.6 durable reclaim claiming and retry state
+13. reclaim worker lifecycle
+    - current process-local mechanism: coordinator-owned reclaim worker thread
+      and local wakeups
+    - classification: cleanup/reclaim ownership
+    - risk: correctness must not depend on one coordinator process owning the
+      only live worker or receiving a same-process wakeup
+    - replacement owner: Phase 9.6 durable worker claim loop
+14. physical shard cleanup after metadata stops referencing payloads
+    - current process-local mechanism: request-path best-effort cleanup plus
+      local reclaim worker follow-up
+    - classification: cleanup/reclaim ownership
+    - risk: crash or persistent delete failure can leave unreferenced shard
+      files that no later worker knows about
+    - replacement owner: Phase 9.7 physical shard scavenger
+15. bucket fast-path caches
+    - current process-local mechanism:
+      `CoordinatorSharedCaches`, `BucketFastPathCache`, local watcher thread,
+      and process-local cache registry
+    - classification: cache/freshness, with authorization correctness impact
+    - risk: one process can keep serving stale policy, public-access,
+      ownership, or versioning state after another process changes bucket
+      metadata
+    - replacement owner: Phase 9.9 PG or cluster notifications, generation
+      checks, or fail-closed reloads
+16. metadata digest clean-revision cache
+    - current process-local mechanism:
+      `PgStore::clean_metadata_digest_revision`
+    - classification: durability-guarded performance and integrity fast path
+    - risk: the cache may skip a digest comparison only when the durable digest
+      revision still matches; it must never become a logical freshness or
+      ordering source
+    - replacement owner: may remain process-local if every skip is guarded by a
+      durable revision check and restart validation remains fail-closed
+17. lifecycle sweeper registry and worker
+    - current process-local mechanism:
+      `LIFECYCLE_SWEEPER_REGISTRY`, one local lifecycle worker per cache key,
+      and local wakeups
+    - classification: background mutation owner
+    - risk: multiple processes can sweep the same lifecycle work or no process
+      may resume abandoned work after restart
+    - replacement owner: Phase 9.8 durable scheduled lifecycle ownership
+18. EC write-state cache
+    - current process-local mechanism: `SharedStorageNode::ec_write_states`
+    - classification: performance/cache only
+    - risk: no logical correctness dependency identified; it may remain
+      process-local if cached data is immutable or recomputable
+    - replacement owner: none, except normal cache invalidation if EC layout
+      parameters become dynamic
+19. process-global and per-instance test hooks plus raw helper paths
+    - current process-local mechanism: storage and coordinator `OnceLock` test
+      hook registries, `StorageCluster::test_hooks`,
+      `CoordinatorSharedCaches::stream_append_test_hooks`, direct PgStore test
+      seeders, and raw metadata/shard helper APIs
+    - classification: test-only
+    - risk: tests can keep proving a single-process shape or bypass production
+      command paths
+    - replacement owner: Phase 9.10 test harness de-single-process pass
+
 Exit criteria:
 
-1. a second process would not be required to see local mutexes or condition
+1. metadata command index allocation, pending command convergence, and command
+   apply serialization are owned by durable PG-primary state
+2. stream append segment identity allocation cannot collide across processes
+3. a second process would not be required to see local mutexes or condition
    variables to preserve correctness
-2. reclaim can resume after process restart from durable rows
-3. multipart complete remains serialized for one upload and one destination
-4. in-flight reads are protected from physical cleanup across process boundaries
-5. unreferenced shard files left by best-effort cleanup failures are eventually
+4. reclaim can resume after process restart from durable rows
+5. multipart complete remains serialized for one upload and one destination
+6. in-flight reads are protected from physical cleanup across process boundaries
+7. lifecycle work can be claimed, retried, and resumed without a process-local
+   sweeper registry
+8. correctness-relevant caches fail closed or refresh across process boundaries
+9. unreferenced shard files left by best-effort cleanup failures are eventually
    detected and removed without consulting process-local state
 
 ## Phase 10: Local Multi-Process RPC
