@@ -2471,6 +2471,72 @@ Work items:
    local invalidation alone
 7. audit tests for hidden single-process assumptions
 
+Proposed subphases:
+
+1. Phase 9.1 process-local coordination audit
+   - inventory every correctness-relevant `Mutex`, `RwLock`, condition
+     variable, background worker flag, local cache invalidation path,
+     in-memory lease/fence, and test helper that assumes one process
+   - classify each item as performance/cache only, request serialization,
+     read/write lifetime protection, cleanup/reclaim ownership, or test-only
+   - record the replacement owner for every correctness item before changing
+     behavior
+   - exit when the plan has an explicit checklist of process-local correctness
+     mechanisms and their target durable or PG-primary replacement
+2. Phase 9.2 multipart serialization
+   - replace multipart completion, abort, UploadPart, and streamed UploadPart
+     serialization that depends on local locks with PG-primary command
+     serialization
+   - cover races for one upload ID and for the same destination object:
+     complete vs abort, stream part vs abort, stream part vs complete,
+     duplicate part upload, and same-key MPU completion races
+   - exit when these races are serialized by metadata command state rather than
+     process-local locks
+3. Phase 9.3 bucket write drain
+   - move bucket delete/write-drain state out of process-local waits into
+     durable or primary-owned metadata
+   - bucket deletion must block new writes, wait for existing write
+     reservations, survive process restart, and resume finalization
+   - exit when bucket delete does not require a local condition variable or
+     same-process waiter to make progress
+4. Phase 9.4 cross-process read pins
+   - replace object payload generation leases with cluster-visible read pins or
+     durable expiring leases
+   - reclaim must not physically delete payload shards while another process is
+     reading them
+   - define stale-process expiry or recovery for abandoned read pins
+   - exit when read-pin acquire/release is visible to the reclaim owner across
+     process boundaries
+5. Phase 9.5 durable reclaim claiming
+   - make reclaim worker ownership durable and idempotent
+   - multiple workers must not corrupt or double-finalize the same reclaim row
+   - crash after claim must be retryable, and failed cleanup must remain
+     observable and retryable
+   - exit when reclaim can resume after process restart without local worker
+     state
+6. Phase 9.6 physical shard scavenger
+   - add the eventual cleanup process for shard files no longer referenced by
+     metadata
+   - cover crash leftovers and omitted multipart payload shards left by
+     post-commit best-effort cleanup failures
+   - do not rely on request-path best-effort cleanup or process-local state to
+     remove these files
+   - exit when unreferenced shard files are eventually detected and removed
+7. Phase 9.7 cache freshness across processes
+   - make bucket/object fast-path cache invalidation depend on PG or cluster
+     notifications, generation checks, or fail-closed reloads rather than local
+     invalidation alone
+   - a second process mutating bucket metadata must not leave this process
+     serving stale policy, versioning, ownership, or public-access state
+   - exit when correctness does not depend on same-process cache invalidation
+8. Phase 9.8 test harness de-single-process pass
+   - audit tests and helpers that still use local constructors, raw hooks, or
+     direct store access in ways that bypass the production cluster path
+   - add targeted multi-handle or multi-process-simulated tests for the Phase 9
+     primitives
+   - exit when tests prove the coordination invariants without relying on
+     shared local locks
+
 Exit criteria:
 
 1. a second process would not be required to see local mutexes or condition
