@@ -38,6 +38,9 @@ cargo test -p s3-local-tests
 # AWS-backed compatibility tests.
 ./scripts/aws-tests
 
+# Standalone binary UAT acceptance run.
+./scripts/uat-s3-tests --test bucket_crud
+
 # Differential AWS-vs-local response-shape tests.
 ./scripts/diff-tests --test response_shape
 ```
@@ -117,6 +120,12 @@ For external AWS-backed workflows, prefer the wrapper scripts under
   - loads AWS credentials from `.env`
   - sets the required `S3_TEST_*` variables
   - forwards extra arguments to `cargo test -p s3-tests`
+- `./scripts/uat-s3-tests`
+  - starts the standalone `argmin-s3` binary over HTTPS
+  - configures UAT-only primary, alternate, same-account constrained, and
+    owner-root credentials
+  - runs `s3-tests` against that process as an external endpoint
+  - forwards extra arguments to `cargo test -p s3-tests`
 - `./scripts/diff-tests`
   - runs the standalone AWS-vs-local `s3-diff-tests` suite
   - loads AWS credentials from `.env`
@@ -127,9 +136,53 @@ For external AWS-backed workflows, prefer the wrapper scripts under
   - loads the primary AWS credentials from `.env`
   - uses the same AWS user as `./scripts/aws-tests`
 
-All three accept `--region`, and `aws-tests` / `diff-tests` also accept
+The AWS-backed scripts accept `--region`, and `aws-tests` / `diff-tests` also accept
 additional `cargo test` selectors and `-- --nocapture` style test-binary
 arguments.
+
+## Standalone `argmin-s3` UAT `s3-tests`
+
+`./scripts/uat-s3-tests` is the acceptance route for running the same
+external-endpoint `s3-tests` harness against the real `argmin-s3` binary
+instead of the embedded in-process test server.
+
+The wrapper:
+
+- starts `cargo run -p argmin-s3` with a temporary data directory
+- enables HTTPS using the repository localhost test certificate
+- passes `S3_TEST_TLS_CA_CERT_PATH` so the external AWS SDK clients trust that
+  local certificate
+- configures the primary credential through the normal production variables
+  `ARGMIN_ACCOUNT_ID`, `ARGMIN_ACCESS_KEY_ID`, and
+  `ARGMIN_SECRET_ACCESS_KEY`
+- configures the extra identities needed by `s3-tests` through UAT-only
+  variables:
+  - `ARGMIN_UAT_ALT_ACCOUNT_ID`
+  - `ARGMIN_UAT_ALT_ACCESS_KEY_ID`
+  - `ARGMIN_UAT_ALT_SECRET_ACCESS_KEY`
+  - `ARGMIN_UAT_SECOND_ACCESS_KEY_ID`
+  - `ARGMIN_UAT_SECOND_SECRET_ACCESS_KEY`
+  - `ARGMIN_UAT_OWNER_ROOT_ACCESS_KEY_ID`
+  - `ARGMIN_UAT_OWNER_ROOT_SECRET_ACCESS_KEY`
+
+These UAT variables exist only to drive acceptance and conformance testing.
+They are deliberately not a production account-management API.
+
+Example targeted run:
+
+```bash
+./scripts/uat-s3-tests --test bucket_crud -- --nocapture
+```
+
+Example full acceptance run:
+
+```bash
+./scripts/uat-s3-tests --release
+```
+
+The wrapper provides deterministic default credentials. Override them with the
+same environment variables if a specific test setup needs stable names or
+secrets across runs.
 
 ### `.env` Naming
 
@@ -232,6 +285,12 @@ The external `s3-tests` harness hard-fails if any of these are missing:
 - `S3_TEST_BUCKET_PREFIX`
   - Required for external runs. The committed IAM policy below assumes
     `claude-s3-`.
+
+Optional external endpoint support:
+
+- `S3_TEST_TLS_CA_CERT_PATH`
+  - PEM CA certificate path for local HTTPS endpoints such as
+    `./scripts/uat-s3-tests`.
 
 The dedicated privileged root-principal suite in
 `crates/s3-tests/tests/bucket_policy_root.rs` requires:

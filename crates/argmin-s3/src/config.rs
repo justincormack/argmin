@@ -1,4 +1,21 @@
 use ec::EcConfig;
+use std::collections::HashSet;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfiguredCredentialProfile {
+    Standard,
+    OwnerAccountAdmin,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ConfiguredCredential {
+    pub(crate) access_key_id: String,
+    pub(crate) secret_access_key: String,
+    pub(crate) account_id: String,
+    pub(crate) principal: String,
+    pub(crate) display_name: String,
+    pub(crate) authorization_profile: ConfiguredCredentialProfile,
+}
 
 /// Server configuration, loaded from environment variables.
 /// Configuration for the S3 server.
@@ -15,6 +32,7 @@ pub(crate) struct ServerConfig {
     pub(crate) account_id: String,
     pub(crate) access_key_id: String,
     pub(crate) secret_access_key: String,
+    pub(crate) uat_credentials: Vec<ConfiguredCredential>,
     pub(crate) host_id: Option<String>,
     pub(crate) sse_c_validator_key_b64: Option<String>,
     pub(crate) sse_s3_wrapping_key_b64: String,
@@ -44,6 +62,16 @@ impl ServerConfig {
     ///   `ARGMIN_MAX_CONNECTIONS` (512)
     ///   `ARGMIN_MAX_INFLIGHT_REQUESTS` (32)
     ///   `ARGMIN_STREAM_READ_CHUNK_SIZE` (8388608)
+    ///
+    /// UAT-only optional credentials for running `s3-tests` against the
+    /// standalone binary:
+    ///   `ARGMIN_UAT_ALT_ACCOUNT_ID`
+    ///   `ARGMIN_UAT_ALT_ACCESS_KEY_ID`
+    ///   `ARGMIN_UAT_ALT_SECRET_ACCESS_KEY`
+    ///   `ARGMIN_UAT_SECOND_ACCESS_KEY_ID`
+    ///   `ARGMIN_UAT_SECOND_SECRET_ACCESS_KEY`
+    ///   `ARGMIN_UAT_OWNER_ROOT_ACCESS_KEY_ID`
+    ///   `ARGMIN_UAT_OWNER_ROOT_SECRET_ACCESS_KEY`
     pub(crate) fn from_env() -> Result<Self, String> {
         Self::from_lookup(|key| std::env::var(key).ok())
     }
@@ -60,6 +88,8 @@ impl ServerConfig {
             .ok_or_else(|| "ARGMIN_ACCESS_KEY_ID is required".to_string())?;
         let secret_access_key = get("ARGMIN_SECRET_ACCESS_KEY")
             .ok_or_else(|| "ARGMIN_SECRET_ACCESS_KEY is required".to_string())?;
+        let uat_credentials = read_uat_credentials(&get, &account_id)?;
+        reject_duplicate_access_keys(&access_key_id, &uat_credentials)?;
         let host_id = get("ARGMIN_HOST_ID");
         let sse_c_validator_key_b64 = get("ARGMIN_SSE_C_VALIDATOR_KEY");
         let sse_s3_wrapping_key_b64 = get("ARGMIN_SSE_S3_WRAPPING_KEY")
@@ -167,6 +197,7 @@ impl ServerConfig {
             account_id,
             access_key_id,
             secret_access_key,
+            uat_credentials,
             host_id,
             sse_c_validator_key_b64,
             sse_s3_wrapping_key_b64,
@@ -177,6 +208,117 @@ impl ServerConfig {
             stream_read_chunk_size,
         })
     }
+}
+
+fn validate_account_id(name: &str, value: &str) -> Result<(), String> {
+    if value.len() != 12 || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("{name} must be a 12-digit AWS account ID"));
+    }
+    Ok(())
+}
+
+fn optional_pair<F: Fn(&str) -> Option<String>>(
+    get: &F,
+    access_key_name: &str,
+    secret_key_name: &str,
+) -> Result<Option<(String, String)>, String> {
+    match (get(access_key_name), get(secret_key_name)) {
+        (Some(access_key_id), Some(secret_access_key)) => {
+            Ok(Some((access_key_id, secret_access_key)))
+        }
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(format!(
+            "{access_key_name} is required with {secret_key_name}"
+        )),
+        (Some(_), None) => Err(format!(
+            "{secret_key_name} is required with {access_key_name}"
+        )),
+    }
+}
+
+fn read_uat_credentials<F: Fn(&str) -> Option<String>>(
+    get: &F,
+    primary_account_id: &str,
+) -> Result<Vec<ConfiguredCredential>, String> {
+    let mut credentials = Vec::new();
+
+    match (
+        get("ARGMIN_UAT_ALT_ACCOUNT_ID"),
+        get("ARGMIN_UAT_ALT_ACCESS_KEY_ID"),
+        get("ARGMIN_UAT_ALT_SECRET_ACCESS_KEY"),
+    ) {
+        (Some(account_id), Some(access_key_id), Some(secret_access_key)) => {
+            validate_account_id("ARGMIN_UAT_ALT_ACCOUNT_ID", &account_id)?;
+            if account_id == primary_account_id {
+                return Err(
+                    "ARGMIN_UAT_ALT_ACCOUNT_ID must differ from ARGMIN_ACCOUNT_ID".to_string(),
+                );
+            }
+            credentials.push(ConfiguredCredential {
+                access_key_id,
+                secret_access_key,
+                account_id: account_id.clone(),
+                principal: account_id.clone(),
+                display_name: "argmin-uat-alt-account".to_string(),
+                authorization_profile: ConfiguredCredentialProfile::OwnerAccountAdmin,
+            });
+        }
+        (None, None, None) => {}
+        _ => {
+            return Err(
+                "ARGMIN_UAT_ALT_ACCOUNT_ID, ARGMIN_UAT_ALT_ACCESS_KEY_ID, and ARGMIN_UAT_ALT_SECRET_ACCESS_KEY must be set together".to_string(),
+            );
+        }
+    }
+
+    if let Some((access_key_id, secret_access_key)) = optional_pair(
+        get,
+        "ARGMIN_UAT_SECOND_ACCESS_KEY_ID",
+        "ARGMIN_UAT_SECOND_SECRET_ACCESS_KEY",
+    )? {
+        credentials.push(ConfiguredCredential {
+            access_key_id,
+            secret_access_key,
+            account_id: primary_account_id.to_string(),
+            principal: format!("arn:aws:iam::{primary_account_id}:user/limited"),
+            display_name: "argmin-uat-second-user".to_string(),
+            authorization_profile: ConfiguredCredentialProfile::Standard,
+        });
+    }
+
+    if let Some((access_key_id, secret_access_key)) = optional_pair(
+        get,
+        "ARGMIN_UAT_OWNER_ROOT_ACCESS_KEY_ID",
+        "ARGMIN_UAT_OWNER_ROOT_SECRET_ACCESS_KEY",
+    )? {
+        credentials.push(ConfiguredCredential {
+            access_key_id,
+            secret_access_key,
+            account_id: primary_account_id.to_string(),
+            principal: format!("arn:aws:iam::{primary_account_id}:root"),
+            display_name: "argmin-uat-owner-root".to_string(),
+            authorization_profile: ConfiguredCredentialProfile::OwnerAccountAdmin,
+        });
+    }
+
+    Ok(credentials)
+}
+
+fn reject_duplicate_access_keys(
+    primary_access_key_id: &str,
+    uat_credentials: &[ConfiguredCredential],
+) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    seen.insert(primary_access_key_id);
+    for credential in uat_credentials {
+        if !seen.insert(credential.access_key_id.as_str()) {
+            return Err(format!(
+                "duplicate access key ID in configured credentials: {}",
+                credential.access_key_id
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -274,6 +416,7 @@ mod tests {
         assert_eq!(cfg.ec_m, 2);
         assert_eq!(cfg.account_id, "111122223333");
         assert_eq!(cfg.region, "us-east-1");
+        assert!(cfg.uat_credentials.is_empty());
         assert_eq!(cfg.workers, 4);
         assert_eq!(cfg.max_connections, 512);
         assert_eq!(cfg.max_inflight_requests, 32);
@@ -332,6 +475,103 @@ mod tests {
         assert_eq!(cfg.host_id.as_deref(), Some("custom-host-id"));
         assert_eq!(cfg.sse_c_validator_key_b64, Some("Zm9v".to_string()));
         assert_eq!(cfg.sse_s3_wrapping_key_b64, "YmFy");
+    }
+
+    #[test]
+    fn uat_acceptance_credentials() {
+        let cfg = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_UAT_ALT_ACCOUNT_ID", "444455556666"),
+            ("ARGMIN_UAT_ALT_ACCESS_KEY_ID", "alt"),
+            ("ARGMIN_UAT_ALT_SECRET_ACCESS_KEY", "alt-secret"),
+            ("ARGMIN_UAT_SECOND_ACCESS_KEY_ID", "second"),
+            ("ARGMIN_UAT_SECOND_SECRET_ACCESS_KEY", "second-secret"),
+            ("ARGMIN_UAT_OWNER_ROOT_ACCESS_KEY_ID", "root"),
+            ("ARGMIN_UAT_OWNER_ROOT_SECRET_ACCESS_KEY", "root-secret"),
+        ]))
+        .unwrap();
+
+        assert_eq!(cfg.uat_credentials.len(), 3);
+        assert_eq!(cfg.uat_credentials[0].access_key_id, "alt");
+        assert_eq!(cfg.uat_credentials[0].secret_access_key, "alt-secret");
+        assert_eq!(cfg.uat_credentials[0].account_id, "444455556666");
+        assert_eq!(cfg.uat_credentials[0].principal, "444455556666");
+        assert_eq!(
+            cfg.uat_credentials[0].display_name,
+            "argmin-uat-alt-account"
+        );
+        assert_eq!(
+            cfg.uat_credentials[0].authorization_profile,
+            ConfiguredCredentialProfile::OwnerAccountAdmin
+        );
+
+        assert_eq!(cfg.uat_credentials[1].access_key_id, "second");
+        assert_eq!(cfg.uat_credentials[1].account_id, "111122223333");
+        assert_eq!(
+            cfg.uat_credentials[1].principal,
+            "arn:aws:iam::111122223333:user/limited"
+        );
+        assert_eq!(
+            cfg.uat_credentials[1].display_name,
+            "argmin-uat-second-user"
+        );
+        assert_eq!(
+            cfg.uat_credentials[1].authorization_profile,
+            ConfiguredCredentialProfile::Standard
+        );
+
+        assert_eq!(cfg.uat_credentials[2].access_key_id, "root");
+        assert_eq!(cfg.uat_credentials[2].account_id, "111122223333");
+        assert_eq!(
+            cfg.uat_credentials[2].principal,
+            "arn:aws:iam::111122223333:root"
+        );
+        assert_eq!(cfg.uat_credentials[2].display_name, "argmin-uat-owner-root");
+        assert_eq!(
+            cfg.uat_credentials[2].authorization_profile,
+            ConfiguredCredentialProfile::OwnerAccountAdmin
+        );
+    }
+
+    #[test]
+    fn uat_alt_credentials_must_be_complete() {
+        let err = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_UAT_ALT_ACCESS_KEY_ID",
+            "alt",
+        )]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_UAT_ALT_ACCOUNT_ID"));
+    }
+
+    #[test]
+    fn uat_alt_account_must_differ_from_primary() {
+        let err = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_UAT_ALT_ACCOUNT_ID", "111122223333"),
+            ("ARGMIN_UAT_ALT_ACCESS_KEY_ID", "alt"),
+            ("ARGMIN_UAT_ALT_SECRET_ACCESS_KEY", "alt-secret"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("must differ"));
+    }
+
+    #[test]
+    fn uat_second_credentials_must_be_complete() {
+        let err = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_UAT_SECOND_SECRET_ACCESS_KEY",
+            "second-secret",
+        )]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_UAT_SECOND_ACCESS_KEY_ID"));
+    }
+
+    #[test]
+    fn uat_access_keys_must_be_unique() {
+        let err = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_UAT_ALT_ACCOUNT_ID", "444455556666"),
+            ("ARGMIN_UAT_ALT_ACCESS_KEY_ID", "AKID"),
+            ("ARGMIN_UAT_ALT_SECRET_ACCESS_KEY", "alt-secret"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("duplicate access key ID"));
     }
 
     #[test]

@@ -76,6 +76,7 @@ pub struct TestContext {
     account_id: String,
     alt_account_id: String,
     region: String,
+    tls_ca_pem: Option<Vec<u8>>,
     _server: Option<TestServer>,
 }
 
@@ -96,6 +97,7 @@ impl TestContext {
     /// - `S3_TEST_SECOND_SECRET_KEY`: optional same-account constrained secret key
     /// - `S3_TEST_OWNER_ROOT_ACCESS_KEY`: optional owner-account root access key
     /// - `S3_TEST_OWNER_ROOT_SECRET_KEY`: optional owner-account root secret key
+    /// - `S3_TEST_TLS_CA_CERT_PATH`: optional PEM CA bundle for local HTTPS endpoints
     /// - `S3_TEST_BUCKET_PREFIX`: required prefix for external test buckets
     /// - `S3_TEST_REGION`: region (defaults to "us-east-1")
     ///
@@ -132,6 +134,13 @@ impl TestContext {
             );
             let region =
                 std::env::var("S3_TEST_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+            let tls_ca_pem = match std::env::var("S3_TEST_TLS_CA_CERT_PATH") {
+                Ok(path) => Some(std::fs::read(&path).unwrap_or_else(|err| {
+                    panic!("read S3_TEST_TLS_CA_CERT_PATH {path}: {err}");
+                })),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(err) => panic!("read S3_TEST_TLS_CA_CERT_PATH: {err}"),
+            };
             let second_client = match (
                 std::env::var("S3_TEST_SECOND_ACCESS_KEY"),
                 std::env::var("S3_TEST_SECOND_SECRET_KEY"),
@@ -141,6 +150,7 @@ impl TestContext {
                     &second_access_key,
                     &second_secret_key,
                     &region,
+                    tls_ca_pem.as_deref(),
                 )),
                 (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => None,
                 (Err(std::env::VarError::NotPresent), Ok(_)) => {
@@ -162,6 +172,7 @@ impl TestContext {
                     &owner_root_access_key,
                     &owner_root_secret_key,
                     &region,
+                    tls_ca_pem.as_deref(),
                 )),
                 (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => None,
                 (Err(std::env::VarError::NotPresent), Ok(_)) => {
@@ -182,8 +193,20 @@ impl TestContext {
                 "S3_TEST_BUCKET_PREFIX required with S3_TEST_ENDPOINT; use a dedicated prefix such as claude-s3- that matches the test IAM policy",
             );
 
-            let client = build_client(&endpoint, &access_key, &secret_key, &region);
-            let alt_client = build_client(&endpoint, &alt_access_key, &alt_secret_key, &region);
+            let client = build_client(
+                &endpoint,
+                &access_key,
+                &secret_key,
+                &region,
+                tls_ca_pem.as_deref(),
+            );
+            let alt_client = build_client(
+                &endpoint,
+                &alt_access_key,
+                &alt_secret_key,
+                &region,
+                tls_ca_pem.as_deref(),
+            );
             assert_distinct_external_s3_owners(
                 &client,
                 owner_root_client.as_ref(),
@@ -206,6 +229,7 @@ impl TestContext {
                 account_id,
                 alt_account_id,
                 region,
+                tls_ca_pem,
                 _server: None,
             }
         } else {
@@ -253,6 +277,7 @@ impl TestContext {
                 account_id: server::TEST_ACCOUNT_ID.to_string(),
                 alt_account_id: server::ALT_ACCOUNT_ID.to_string(),
                 region: server::TEST_REGION.to_string(),
+                tls_ca_pem: server.tls_ca_pem().map(<[u8]>::to_vec),
                 _server: Some(server),
             }
         }
@@ -302,8 +327,8 @@ impl TestContext {
     }
 
     /// The local test server CA, if running against the embedded HTTPS server.
-    pub fn tls_ca_pem(&self) -> Option<&'static [u8]> {
-        self._server.as_ref().and_then(TestServer::tls_ca_pem)
+    pub fn tls_ca_pem(&self) -> Option<&[u8]> {
+        self.tls_ca_pem.as_deref()
     }
 
     /// The access key ID.
@@ -342,8 +367,14 @@ impl TestContext {
     }
 }
 
-fn build_client(endpoint: &str, access_key: &str, secret_key: &str, region: &str) -> Client {
-    build_client_with_ca(endpoint, access_key, secret_key, region, None)
+fn build_client(
+    endpoint: &str,
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+    tls_ca_pem: Option<&[u8]>,
+) -> Client {
+    build_client_with_ca(endpoint, access_key, secret_key, region, tls_ca_pem)
 }
 
 fn external_test_mode() -> bool {

@@ -45,6 +45,16 @@ The server is configured via environment variables:
 | `ARGMIN_MAX_INFLIGHT_REQUESTS` | `32` | Max concurrent in-flight requests |
 | `ARGMIN_STREAM_READ_CHUNK_SIZE` | `8388608` | HTTP streaming read chunk size |
 
+The following variables are only for user-acceptance testing the standalone
+binary with `s3-tests`. They are not a production account-management API.
+
+| Variable | Description |
+|---|---|
+| `ARGMIN_UAT_ALT_ACCOUNT_ID` | Alternate 12-digit account ID for cross-account tests; must differ from `ARGMIN_ACCOUNT_ID` |
+| `ARGMIN_UAT_ALT_ACCESS_KEY_ID` / `ARGMIN_UAT_ALT_SECRET_ACCESS_KEY` | Alternate-account owner/admin credential pair |
+| `ARGMIN_UAT_SECOND_ACCESS_KEY_ID` / `ARGMIN_UAT_SECOND_SECRET_ACCESS_KEY` | Same-account constrained credential pair |
+| `ARGMIN_UAT_OWNER_ROOT_ACCESS_KEY_ID` / `ARGMIN_UAT_OWNER_ROOT_SECRET_ACCESS_KEY` | Same-account root/admin credential pair |
+
 If both `ARGMIN_TLS_CERT_PATH` and `ARGMIN_TLS_KEY_PATH` are set, the server
 accepts direct HTTPS on `ARGMIN_LISTEN_ADDR`. Both variables must be set
 together.
@@ -218,6 +228,17 @@ To run `s3-tests` against an external endpoint such as AWS S3:
 ```bash
 ./scripts/aws-tests
 ```
+
+To run `s3-tests` as a UAT acceptance suite against the standalone
+`argmin-s3` binary:
+
+```bash
+./scripts/uat-s3-tests
+```
+
+The UAT wrapper starts `argmin-s3` with a temporary data directory, repository
+test TLS certificate, and the UAT-only credentials listed above, then runs
+`s3-tests` against that process as an external endpoint.
 
 External `s3-tests` runs now fail fast if the alternate credentials, account
 IDs, or bucket prefix are missing. For AWS S3, the alternate credentials must

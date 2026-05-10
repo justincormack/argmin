@@ -23,7 +23,7 @@ use base64::Engine;
 use md5_legacy::Digest;
 use ring::hmac;
 
-use crate::{server::TestServer, CTX};
+use crate::CTX;
 
 static BUCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -497,7 +497,7 @@ where
             access_key: CTX.access_key(),
             secret_key: CTX.secret_key(),
             region: CTX.region(),
-            tls_ca_pem: CTX._server.as_ref().and_then(TestServer::tls_ca_pem),
+            tls_ca_pem: CTX.tls_ca_pem(),
         },
     )
 }
@@ -617,7 +617,7 @@ where
             access_key: CTX.access_key(),
             secret_key: CTX.secret_key(),
             region: CTX.region(),
-            tls_ca_pem: CTX._server.as_ref().and_then(TestServer::tls_ca_pem),
+            tls_ca_pem: CTX.tls_ca_pem(),
         },
     )
 }

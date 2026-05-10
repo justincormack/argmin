@@ -15,7 +15,7 @@ use storage::{CanonicalUserId, NodeId, StorageCluster};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-use config::ServerConfig;
+use config::{ConfiguredCredential, ConfiguredCredentialProfile, ServerConfig};
 use server_http::http::HttpFrontend;
 
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, String> {
@@ -47,6 +47,53 @@ fn build_tls_acceptor(config: &ServerConfig) -> Result<Option<TlsAcceptor>, Stri
         .map_err(|e| format!("failed to build TLS config: {e}"))?;
     server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Some(TlsAcceptor::from(Arc::new(server_config))))
+}
+
+fn authorization_profile(profile: ConfiguredCredentialProfile) -> auth::AuthorizationProfile {
+    match profile {
+        ConfiguredCredentialProfile::Standard => auth::AuthorizationProfile::Standard,
+        ConfiguredCredentialProfile::OwnerAccountAdmin => {
+            auth::AuthorizationProfile::OwnerAccountAdmin
+        }
+    }
+}
+
+fn add_configured_credential(credentials: &mut CredentialStore, credential: &ConfiguredCredential) {
+    credentials.add_record(CredentialRecord {
+        access_key_id: credential.access_key_id.clone(),
+        secret_key: SecretKey::new(credential.secret_access_key.clone()),
+        account: AccountIdentity::new(
+            credential.principal.clone(),
+            CanonicalUserId::from_principal(&credential.account_id),
+            credential.display_name.clone(),
+        ),
+        authorization_profile: authorization_profile(credential.authorization_profile),
+        session_token: None,
+        expires_at_epoch_secs: None,
+        enabled: true,
+    });
+}
+
+fn build_credential_store(config: &ServerConfig) -> CredentialStore {
+    let mut credentials = CredentialStore::new();
+    let account = AccountIdentity::new(
+        config.account_id.clone(),
+        CanonicalUserId::from_principal(&config.account_id),
+        config.account_id.clone(),
+    );
+    credentials.add_record(CredentialRecord {
+        access_key_id: config.access_key_id.clone(),
+        secret_key: SecretKey::new(config.secret_access_key.clone()),
+        account,
+        authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
+        session_token: None,
+        expires_at_epoch_secs: None,
+        enabled: true,
+    });
+    for credential in &config.uat_credentials {
+        add_configured_credential(&mut credentials, credential);
+    }
+    credentials
 }
 
 #[tokio::main]
@@ -127,24 +174,9 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        let mut credentials = CredentialStore::new();
-        let account = AccountIdentity::new(
-            config.account_id.clone(),
-            CanonicalUserId::from_principal(&config.account_id),
-            config.account_id.clone(),
-        );
-        credentials.add_record(CredentialRecord {
-            access_key_id: config.access_key_id.clone(),
-            secret_key: SecretKey::new(config.secret_access_key.clone()),
-            account,
-            authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
-            session_token: None,
-            expires_at_epoch_secs: None,
-            enabled: true,
-        });
         frontends.push(HttpFrontend {
             coordinator,
-            credentials,
+            credentials: build_credential_store(&config),
             host_id: Arc::<str>::from(host_id.clone()),
         });
     }
