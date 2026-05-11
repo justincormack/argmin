@@ -3098,6 +3098,7 @@ pub struct StreamUploadRecord {
     pub state: StreamUploadState,
     pub created_at: u64,
     pub encryption: ObjectEncryption,
+    pub next_segment_vid: GenerationId,
 }
 
 /// Request to create a streaming upload session.

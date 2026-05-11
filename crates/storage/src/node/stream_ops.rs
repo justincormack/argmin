@@ -155,7 +155,6 @@ impl SharedStorageNode {
         bucket: &BucketName,
         key: &ObjectKey,
         request: &PrepareStreamUploadSegmentAppendReq,
-        allocate_segment_vid: impl FnOnce() -> GenerationId,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
         let meta_pg_id = self.pg_topology.object_pg_for(bucket, key);
         let pg = self.get_pg(meta_pg_id)?;
@@ -170,7 +169,7 @@ impl SharedStorageNode {
             StreamUploadTarget::PutObject => {
                 let generation_id =
                     pg.get_object_generation_reservation(bucket, key, &request.session_id)?;
-                let segment_vid = allocate_segment_vid();
+                let segment_vid = pg.allocate_stream_segment_vid(&request.session_id)?;
                 (
                     crate::segment_key_hash(
                         bucket.as_str(),
@@ -196,7 +195,7 @@ impl SharedStorageNode {
                 let upload = Self::load_in_progress_multipart_upload_from_object_pg(
                     &pg, bucket, key, upload_id,
                 )?;
-                let segment_vid = allocate_segment_vid();
+                let segment_vid = pg.allocate_stream_segment_vid(&request.session_id)?;
                 (
                     request.segment_okh,
                     segment_vid,

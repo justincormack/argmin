@@ -622,8 +622,6 @@ impl super::StorageCluster {
         origin_node_id: NodeId,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), MetadataCommandApplyFailure> {
-        let runtime_state = self.local_map.runtime_state();
-        let _apply_guard = runtime_state.lock_metadata_command_apply();
         let pg_id = command.id().pg_id();
         let mut nodes = self
             .local_map
@@ -682,8 +680,6 @@ impl super::StorageCluster {
         &self,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), MetadataCommandApplyFailure> {
-        let runtime_state = self.local_map.runtime_state();
-        let _apply_guard = runtime_state.lock_metadata_command_apply();
         let pg_id = command.id().pg_id();
         let primary_node_id = self
             .local_map
@@ -2735,12 +2731,10 @@ impl super::StorageCluster {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let _bucket_guard = primary_node.lock_bucket(bucket);
-        let runtime_state = self.local_map.runtime_state();
         let mut action = Some(action);
 
         loop {
-            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
-            {
+            if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::PutObjectMetadata(update) = command.payload() {
                     if update.object.bucket == *bucket && update.object.key == *key {
                         let object_pg = primary_node.get_pg(pg_id.get())?;
@@ -3143,12 +3137,10 @@ impl super::StorageCluster {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let _bucket_guard = primary_node.lock_bucket(bucket);
-        let runtime_state = self.local_map.runtime_state();
         let mut action = Some(action);
 
         loop {
-            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
-            {
+            if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() {
                     if delete.matches_request(bucket, key, version_id) {
                         let object_pg = primary_node.get_pg(pg_id.get())?;
@@ -3231,12 +3223,10 @@ impl super::StorageCluster {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let _bucket_guard = primary_node.lock_bucket(bucket);
-        let runtime_state = self.local_map.runtime_state();
         let mut action = Some(action);
 
         loop {
-            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
-            {
+            if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() {
                     if delete.bucket == *bucket && delete.key == *key {
                         let object_pg = primary_node.get_pg(pg_id.get())?;
@@ -3330,12 +3320,10 @@ impl super::StorageCluster {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let _bucket_guard = primary_node.lock_bucket(bucket);
-        let runtime_state = self.local_map.runtime_state();
         let mut action = Some(action);
 
         loop {
-            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
-            {
+            if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::InsertDeleteMarker(marker) = command.payload() {
                     if marker.matches_request(bucket, key) {
                         let object_pg = primary_node.get_pg(pg_id.get())?;
@@ -3429,7 +3417,6 @@ impl super::StorageCluster {
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let _object_bucket_guard = (!std::ptr::eq(lifecycle_bucket_node, primary_node))
             .then(|| primary_node.lock_bucket(bucket));
-        let runtime_state = self.local_map.runtime_state();
         let owner = OwnerIdentity::new(
             bucket_info.owner_principal.clone(),
             bucket_info.owner_canonical_id.clone(),
@@ -3437,8 +3424,7 @@ impl super::StorageCluster {
         let mut should_expire = Some(should_expire);
 
         loop {
-            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
-            {
+            if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 match command.payload() {
                     MetadataCommandPayload::DeleteObjectVersion(delete)
                         if delete.matches_request(bucket, key, expected_version_id) =>
@@ -3664,12 +3650,10 @@ impl super::StorageCluster {
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let _object_bucket_guard = (!std::ptr::eq(lifecycle_bucket_node, primary_node))
             .then(|| primary_node.lock_bucket(bucket));
-        let runtime_state = self.local_map.runtime_state();
         let mut select_versions = Some(select_versions);
 
         loop {
-            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
-            {
+            if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() {
                     if delete.bucket == *bucket && delete.key == *key {
                         let object_pg = primary_node.get_pg(pg_id.get())?;
@@ -3801,12 +3785,10 @@ impl super::StorageCluster {
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let _object_bucket_guard = (!std::ptr::eq(lifecycle_bucket_node, primary_node))
             .then(|| primary_node.lock_bucket(bucket));
-        let runtime_state = self.local_map.runtime_state();
         let mut should_delete = Some(should_delete);
 
         loop {
-            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
-            {
+            if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() {
                     if delete.matches_request(bucket, key, expected_version_id)
                         && matches!(delete.target, DeleteObjectVersionTarget::DeleteMarker)
@@ -3895,8 +3877,8 @@ impl super::StorageCluster {
         self.object_metadata_primary_node(bucket, key)?;
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let runtime_state = self.local_map.runtime_state();
-        if runtime_state
-            .pending_metadata_command_for_bucket(pg_id, bucket)
+        if self
+            .pending_metadata_command_for_bucket(pg_id, bucket)?
             .is_some_and(|command| {
                 matches!(
                     command.payload(),
@@ -4002,7 +3984,7 @@ impl super::StorageCluster {
         }
 
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        while let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket) {
+        while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
             let matching_reclaim_delete = matches!(
                 command.payload(),
                 MetadataCommandPayload::DeleteObjectPayloadReclaim(delete)
@@ -4089,9 +4071,7 @@ impl super::StorageCluster {
 
             let _bucket_guard = node.lock_bucket(bucket);
             loop {
-                if let Some(command) =
-                    runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
-                {
+                if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                     let matching_reclaim_delete = matches!(
                         command.payload(),
                         MetadataCommandPayload::DeleteObjectPayloadReclaim(delete)
@@ -4165,11 +4145,6 @@ impl super::StorageCluster {
         self.delete_staged_stream_segment_payload_shards_best_effort(
             &cleanup.stream_upload_segments,
         );
-        for session in &cleanup.stream_uploads {
-            self.local_map
-                .runtime_state()
-                .clear_stream_segment_vid_allocator(&session.session_id);
-        }
     }
 
     pub(super) fn delete_finalize_upload_part_cleanup_best_effort(
@@ -4236,11 +4211,6 @@ impl super::StorageCluster {
         self.delete_staged_stream_segment_payload_shards_best_effort(
             &cleanup.stream_upload_segments,
         );
-        for session in &cleanup.stream_uploads {
-            self.local_map
-                .runtime_state()
-                .clear_stream_segment_vid_allocator(&session.session_id);
-        }
     }
 
     fn delete_multipart_part_segments_best_effort(&self, segments: &[MultipartPartSegmentRecord]) {
@@ -4362,9 +4332,7 @@ impl super::StorageCluster {
                         self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
                     {
                         if self
-                            .local_map
-                            .runtime_state()
-                            .pending_metadata_command_for_bucket(pg_id, bucket)
+                            .pending_metadata_command_for_bucket(pg_id, bucket)?
                             .is_none()
                         {
                             let _ = self.release_object_generation_reservation(
@@ -4400,9 +4368,8 @@ impl super::StorageCluster {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let _bucket_guard = primary_node.lock_bucket(bucket);
-        let runtime_state = self.local_map.runtime_state();
 
-        while let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket) {
+        while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
             let is_matching_stream_commit = matches!(
                 command.payload(),
                 MetadataCommandPayload::CommitDirectPutObject(commit)
@@ -4419,8 +4386,8 @@ impl super::StorageCluster {
             self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
         }
 
-        let pending_command = runtime_state
-            .pending_metadata_command_for_bucket(pg_id, bucket)
+        let pending_command = self
+            .pending_metadata_command_for_bucket(pg_id, bucket)?
             .filter(|command| {
                 matches!(
                     command.payload(),
@@ -5059,10 +5026,8 @@ impl super::StorageCluster {
     ) -> Result<u64, ObjectPgActionError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let primary_node = self.bucket_metadata_primary_node(bucket)?;
-        let runtime_state = self.local_map.runtime_state();
         loop {
-            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
-            {
+            if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(advance) =
                     command.payload()
                 {
@@ -5177,12 +5142,9 @@ impl super::StorageCluster {
         let _completion_guard = bucket_primary_node.lock_multipart_completion_bucket(&bucket);
         let primary_node = self.object_metadata_primary_node(&bucket, &key)?;
         let _bucket_guard = primary_node.lock_bucket(&bucket);
-        let runtime_state = self.local_map.runtime_state();
 
         'retry_after_pending_conflict: loop {
-            while let Some(command) =
-                runtime_state.pending_metadata_command_for_bucket(pg_id, &bucket)
-            {
+            while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, &bucket)? {
                 if let MetadataCommandPayload::CommitMultipartObject(commit) = command.payload() {
                     if commit.matches_request(
                         &bucket,
@@ -5447,9 +5409,8 @@ impl super::StorageCluster {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let _bucket_guard = primary_node.lock_bucket(bucket);
-        let runtime_state = self.local_map.runtime_state();
 
-        while let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket) {
+        while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
             let is_matching_stream_part_commit = matches!(
                 command.payload(),
                 MetadataCommandPayload::CommitStreamPart(commit)
@@ -5461,8 +5422,8 @@ impl super::StorageCluster {
             self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
         }
 
-        let pending_command = runtime_state
-            .pending_metadata_command_for_bucket(pg_id, bucket)
+        let pending_command = self
+            .pending_metadata_command_for_bucket(pg_id, bucket)?
             .filter(|command| {
                 matches!(
                     command.payload(),
@@ -5639,11 +5600,8 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<bool, ObjectPgActionError> {
-        let runtime_state = self.local_map.runtime_state();
         'retry_after_pending_conflict: loop {
-            while let Some(command) =
-                runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
-            {
+            while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 let matching_abort = matches!(
                     command.payload(),
                     MetadataCommandPayload::AbortMultipartUpload(abort)
@@ -5700,11 +5658,8 @@ impl super::StorageCluster {
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
         let upload_id = &authorized_upload.record().upload_id;
-        let runtime_state = self.local_map.runtime_state();
         'retry_after_pending_conflict: loop {
-            while let Some(command) =
-                runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
-            {
+            while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 let matching_abort = matches!(
                     command.payload(),
                     MetadataCommandPayload::AbortMultipartUpload(abort)
@@ -5819,11 +5774,7 @@ impl super::StorageCluster {
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let _object_bucket_guard = (!std::ptr::eq(lifecycle_bucket_node, primary_node))
             .then(|| primary_node.lock_bucket(bucket));
-        while let Some(command) = self
-            .local_map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, bucket)
-        {
+        while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
             let matching_abort = matches!(
                 command.payload(),
                 MetadataCommandPayload::AbortMultipartUpload(abort)
@@ -6062,8 +6013,6 @@ impl super::StorageCluster {
         reclaim: &ObjectSegmentsReclaimRecord,
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let runtime_state = self.local_map.runtime_state();
-        let _apply_guard = runtime_state.lock_metadata_command_apply();
         for node in self
             .local_map
             .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
@@ -6083,8 +6032,6 @@ impl super::StorageCluster {
         reclaim: &MultipartReclaimRecord,
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let runtime_state = self.local_map.runtime_state();
-        let _apply_guard = runtime_state.lock_metadata_command_apply();
         for node in self
             .local_map
             .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
@@ -6221,8 +6168,6 @@ impl super::StorageCluster {
         created_at: u64,
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let runtime_state = self.local_map.runtime_state();
-        let _apply_guard = runtime_state.lock_metadata_command_apply();
         for node in self
             .local_map
             .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?

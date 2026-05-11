@@ -588,6 +588,12 @@ pub(crate) trait PgMetadataStore {
         session_id: &SessionId,
     ) -> Result<StreamUploadRecord, MetadataError>;
 
+    /// Allocate a durable, per-session stream segment payload generation.
+    fn allocate_stream_segment_vid(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<GenerationId, MetadataError>;
+
     /// Test-only direct transition of a streaming upload session state.
     #[cfg(test)]
     fn set_stream_upload_state(

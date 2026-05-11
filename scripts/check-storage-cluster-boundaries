@@ -152,6 +152,7 @@ production_metadata_methods=$(
             || name == "list_object_versions_for_key" \
             || name == "next_version_id" \
             || name == "next_generation_id" \
+            || name == "allocate_stream_segment_vid" \
             || name == "get_object_generation_reservation" \
             || name == "get_object_segments_reclaim" \
             || name == "get_multipart_reclaim" \

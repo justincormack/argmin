@@ -1947,11 +1947,10 @@ Completed:
     for completed-MPU tombstone pruning and bucket-finalization cleanup; direct
     primary-local deletion is not valid now that completed tombstones are
     covered by the canonical metadata digest
-  - removed durable `stream_uploads.next_segment_vid`; stream segment payload
-    generation allocation is now local runtime state used only to keep
-    concurrent uncommitted appends on distinct placed shard keys, while the
-    command-owned `stream_upload_segments.segment_vid` value remains in the
-    canonical digest
+  - removed digest-covered `stream_uploads.next_segment_vid` from the Phase 7.3
+    command-owned metadata model; Phase 9.2 later reintroduces this as
+    non-digest durable PG-primary allocator state, while the command-owned
+    `stream_upload_segments.segment_vid` value remains in the canonical digest
   - moved `object_version_counters` behind object metadata command ownership:
     `next_version_id` is now a read-only candidate allocator, and versioned
     object writers apply an explicit `ReserveObjectVersion` command before
@@ -2490,7 +2489,8 @@ Proposed subphases:
      behavior
    - exit when the plan has an explicit checklist of process-local correctness
      mechanisms and their target durable or PG-primary replacement
-2. Phase 9.2 metadata command stream runtime state
+2. Phase 9.2 metadata command stream runtime state. Complete for the local
+   PG-primary command-stream runtime state.
    - implement the target model in
      [metadata-command-stream.md](../guides/metadata-command-stream.md):
      a PG command stream is strictly single-writer and single-pending, with
@@ -2501,10 +2501,9 @@ Proposed subphases:
      - status: production command creation now derives the next log index from
        the routed PG-primary's durable command log, including already-open
        handles after another handle has appended a command; unresolved durable
-       bucket-PG pending slots are loaded and converged rather than skipped;
-       object-PG slots still fail closed until their typed decoder is wired
-       into the request paths; the remaining `LocalClusterRuntimeState` index
-       helper is test-only fixture support for manually constructed commands
+       bucket-PG and object-PG pending slots are loaded and converged rather
+       than skipped; the remaining `LocalClusterRuntimeState` index helper is
+       test-only fixture support for manually constructed commands
    - replace process-local pending metadata command maps with durable pending
      command state or retry derivation from the durable command log
      - current in-process retry cache is PG-scoped as a bridge; it must not
@@ -2520,20 +2519,28 @@ Proposed subphases:
        zero-apply reissue computes a safe replacement first, rejects divergent
        non-primary-only histories, and then atomically replaces the exact stale
        durable slot on the primary
-     - status: bucket-PG pending slots now have typed command decoding and can
-       be rehydrated from the durable primary slot after reopen or when a
-       second handle has an empty runtime bridge; object-PG command slots still
-       fail closed until the object-command decoder/rehydration slice lands
-     - remaining: restart convergence needs typed decoding for object-PG
-       command payloads, and the in-process bridge remains the live
-       wakeup/cache layer for command classes that have not yet been rehydrated
+     - status: bucket-PG and object-PG pending slots now have typed command
+       decoding and can be rehydrated from the durable primary slot after
+       reopen or when a second handle has an empty runtime bridge; the
+       in-process bridge remains the live wakeup/cache layer, but request paths
+       must derive unresolved slot intent from durable storage when the bridge
+       is empty
      - draining a PG slot must preserve command-owned resources for the original
        request; non-matching generation reservations are not released by the
        drainer because they may belong to active concurrent work
    - replace the process-local metadata command apply lock with a durable
      compare-and-append serialization point
+     - status: `LocalClusterRuntimeState::metadata_command_apply_lock` has been
+       removed; command paths rely on durable PG-primary pending-slot
+       ownership, per-replica validate/apply/record transactions, and
+       fail-closed acting-set history checks rather than a process-local apply
+       mutex
    - replace stream segment VID allocation with durable per-session allocation
      or command-owned append IDs
+     - status: stream sessions now store a durable `next_segment_vid` allocator
+       on the PG primary; `LocalClusterRuntimeState` no longer owns stream VID
+       allocation, reopen preserves the next VID, and append command apply
+       advances replica allocator floors from committed segment records
    - exit when two processes cannot allocate conflicting command indexes,
      hide pending command convergence from each other, or allocate duplicate
      stream segment VIDs; required tests must cover two different buckets on
@@ -2614,14 +2621,15 @@ Phase 9.1 audit checklist:
      the same PG if allocation remains outside durable PG-primary state
    - replacement owner: Phase 9.2 PG-primary durable command stream allocator
 2. metadata command apply serialization
-   - current process-local mechanism:
-     `LocalClusterRuntimeState::metadata_command_apply_lock`
+   - former process-local mechanism:
+     `LocalClusterRuntimeState::metadata_command_apply_lock` (removed in
+     Phase 9.2)
    - classification: request serialization
    - risk: only commands inside one process are serialized; another process can
      apply a command concurrently unless the durable command append path becomes
      the serialization point
-   - replacement owner: Phase 9.2 PG-primary compare-and-append command
-     application
+   - replacement owner: PG-primary durable pending slot plus per-replica
+     validate/apply/record transactions and fail-closed replica history checks
 3. pending metadata command convergence
    - current process-local mechanism:
      `LocalClusterRuntimeState::pending_metadata_commands`
@@ -2632,14 +2640,13 @@ Phase 9.1 audit checklist:
    - replacement owner: Phase 9.2 durable pending command rows or retry
      derivation from the durable command log and replica state
 4. stream segment VID allocation
-   - current process-local mechanism:
-     `LocalClusterRuntimeState::stream_segment_vids`
+   - former process-local mechanism:
+     `LocalClusterRuntimeState::stream_segment_vids` (removed in Phase 9.2)
    - classification: request serialization for staged payload identity
    - risk: two processes appending to the same stream session can allocate the
      same segment VID or clear each other's allocator assumptions
-   - replacement owner: durable per-session segment allocator, command-owned
-     segment ID allocation, or serialized stream append command state in
-     Phase 9.2
+   - replacement owner: durable `stream_uploads.next_segment_vid` allocator on
+     the PG primary; append command apply advances replica allocator floors
 5. per-PG store mutexes
    - current process-local mechanism:
      `SharedStorageNode::stores`, a `HashMap<u32, Mutex<PgStore>>`

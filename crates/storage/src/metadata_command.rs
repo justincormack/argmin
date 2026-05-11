@@ -9,13 +9,16 @@ use s3_types::{
 use crate::types::{
     AbortMultipartUploadCleanup, BucketEncryptionConfig, BucketName, BucketObjectOwnership,
     BucketOwnershipControls, BucketState, BucketSubresourceAux, BucketSubresourceKind,
-    ClusterEpoch, CompletedMultipartUploadRecord, CreateBucketConfig, CreateMultipartUploadReq,
-    CreateStreamUploadReq, GenerationId, LiveObjectRecord, ManagedEncryptionAlgorithm,
+    ChecksumAlgorithm, ChecksumBytes, ChecksumType, ClusterEpoch, CompletedMultipartUploadRecord,
+    CreateBucketConfig, CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, EtagKind,
+    GenerationId, LiveObjectRecord, ManagedEncryptionAlgorithm, MultipartChecksumConfig,
     MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
-    MultipartReclaimRecord, MultipartUploadRecord, ObjectEncryption, ObjectEtag, ObjectKey,
-    ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
-    OwnerIdentity, PgId, PublicAccessBlockConfig, PutLiveObjectReq, SerializedTagSet, SessionId,
-    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId,
+    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadRecord,
+    ObjectEncryption, ObjectEncryptionType, ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord,
+    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
+    OwnerIdentity, PgId, PublicAccessBlockConfig, PutLiveObjectReq, SerializedMetadataBlob,
+    SerializedSystemMetadataBlob, SerializedTagSet, SessionId, StorageClass, StreamUploadRecord,
+    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
     VersionId,
 };
 
@@ -809,6 +812,7 @@ impl CreateStreamUploadCommand {
                 state: StreamUploadState::InProgress,
                 created_at: created_at_millis,
                 encryption: request.encryption,
+                next_segment_vid: GenerationId::MIN,
             },
         }
     }
@@ -1167,6 +1171,10 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         Ok(slice)
     }
 
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
+    }
+
     fn read_bytes(&mut self) -> Result<&'a [u8], String> {
         let len = self.read_u32()? as usize;
         self.read_exact(len)
@@ -1385,6 +1393,159 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                     bucket: self.read_bucket_record()?,
                 }),
             ),
+            METADATA_COMMAND_RESERVE_OBJECT_GENERATION => {
+                Ok(MetadataCommandPayload::ReserveObjectGeneration(
+                    ReserveObjectGenerationCommand::new(
+                        self.read_bucket_name()?,
+                        self.read_object_key()?,
+                        self.read_session_id()?,
+                        self.read_generation_id("reserved object generation")?,
+                        self.read_u64()?,
+                    ),
+                ))
+            }
+            METADATA_COMMAND_RELEASE_OBJECT_GENERATION => {
+                Ok(MetadataCommandPayload::ReleaseObjectGeneration(
+                    ReleaseObjectGenerationCommand::new(
+                        self.read_bucket_name()?,
+                        self.read_object_key()?,
+                        self.read_session_id()?,
+                    ),
+                ))
+            }
+            METADATA_COMMAND_RESERVE_OBJECT_VERSION => Ok(
+                MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+                    self.read_bucket_name()?,
+                    self.read_object_key()?,
+                    self.read_version_id()?,
+                )),
+            ),
+            METADATA_COMMAND_COMMIT_DIRECT_PUT_OBJECT => {
+                Ok(MetadataCommandPayload::CommitDirectPutObject(Box::new(
+                    CommitDirectPutObjectCommand {
+                        object: self.read_put_live_object()?,
+                        segments: self.read_repeated(Self::read_object_segment)?,
+                        generation_reservation_id: self.read_session_id()?,
+                        write_sequence: self.read_u64()?,
+                        last_modified_millis: self.read_u64()?,
+                        stale_payload: self.read_optional_stale_payload()?,
+                    },
+                )))
+            }
+            METADATA_COMMAND_COMMIT_MULTIPART_OBJECT => {
+                Ok(MetadataCommandPayload::CommitMultipartObject(Box::new(
+                    CommitMultipartObjectCommand {
+                        upload_id: self.read_upload_id()?,
+                        object: self.read_put_live_object()?,
+                        parts: self.read_repeated(Self::read_object_part)?,
+                        selected_streaming_segments: self
+                            .read_repeated(Self::read_multipart_part_segment)?,
+                        omitted_parts: self.read_repeated(Self::read_multipart_part)?,
+                        omitted_streaming_segments: self
+                            .read_repeated(Self::read_multipart_part_segment)?,
+                        stream_uploads: self.read_repeated(Self::read_stream_upload)?,
+                        stream_upload_segments: self
+                            .read_repeated(Self::read_stream_upload_segment)?,
+                        write_sequence: self.read_u64()?,
+                        completion_order: self.read_u64()?,
+                        completed_at_millis: self.read_u64()?,
+                        initiator: self.read_optional_owner_identity()?,
+                        last_modified_millis: self.read_u64()?,
+                        stale_payload: self.read_optional_stale_payload()?,
+                    },
+                )))
+            }
+            METADATA_COMMAND_DELETE_OBJECT_VERSION => Ok(
+                MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
+                    bucket: self.read_bucket_name()?,
+                    key: self.read_object_key()?,
+                    version_id: self.read_version_id()?,
+                    target: match self.read_u8()? {
+                        1 => DeleteObjectVersionTarget::DeleteMarker,
+                        2 => DeleteObjectVersionTarget::Live {
+                            generation_id: self.read_generation_id("deleted object generation")?,
+                            layout: self.read_object_layout()?,
+                            payload: self.read_live_payload_reclaim()?,
+                        },
+                        tag => return Err(format!("invalid delete object target tag {tag}")),
+                    },
+                })),
+            ),
+            METADATA_COMMAND_INSERT_DELETE_MARKER => Ok(
+                MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                    bucket: self.read_bucket_name()?,
+                    key: self.read_object_key()?,
+                    version_id: self.read_version_id()?,
+                    owner: self.read_owner_identity()?,
+                    write_sequence: self.read_u64()?,
+                    last_modified_millis: self.read_u64()?,
+                    stale_payload: self.read_optional_stale_payload()?,
+                }),
+            ),
+            METADATA_COMMAND_PUT_OBJECT_METADATA => Ok(MetadataCommandPayload::PutObjectMetadata(
+                Box::new(PutObjectMetadataCommand {
+                    object: self.read_live_object_record()?,
+                }),
+            )),
+            METADATA_COMMAND_CREATE_STREAM_UPLOAD => Ok(
+                MetadataCommandPayload::CreateStreamUpload(Box::new(CreateStreamUploadCommand {
+                    session: self.read_stream_upload()?,
+                })),
+            ),
+            METADATA_COMMAND_APPEND_STREAM_SEGMENT => Ok(
+                MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
+                    bucket: self.read_bucket_name()?,
+                    key: self.read_object_key()?,
+                    segment: self.read_stream_upload_segment()?,
+                })),
+            ),
+            METADATA_COMMAND_ABORT_STREAM_UPLOAD => Ok(MetadataCommandPayload::AbortStreamUpload(
+                Box::new(AbortStreamUploadCommand {
+                    bucket: self.read_bucket_name()?,
+                    key: self.read_object_key()?,
+                    session_id: self.read_session_id()?,
+                    staged_segments: self.read_repeated(Self::read_stream_upload_segment)?,
+                }),
+            )),
+            METADATA_COMMAND_COMMIT_STREAM_PART => Ok(MetadataCommandPayload::CommitStreamPart(
+                Box::new(CommitStreamPartCommand {
+                    bucket: self.read_bucket_name()?,
+                    key: self.read_object_key()?,
+                    session_id: self.read_session_id()?,
+                    upload: self.read_multipart_upload()?,
+                    part: self.read_multipart_part()?,
+                    segments: self.read_repeated(Self::read_multipart_part_segment)?,
+                    existing_part: self.read_optional(Self::read_multipart_part)?,
+                    displaced_segments: self.read_repeated(Self::read_multipart_part_segment)?,
+                }),
+            )),
+            METADATA_COMMAND_CREATE_MULTIPART_UPLOAD => {
+                Ok(MetadataCommandPayload::CreateMultipartUpload(Box::new(
+                    CreateMultipartUploadCommand {
+                        upload: self.read_multipart_upload()?,
+                    },
+                )))
+            }
+            METADATA_COMMAND_ABORT_MULTIPART_UPLOAD => {
+                Ok(MetadataCommandPayload::AbortMultipartUpload(Box::new(
+                    AbortMultipartUploadCommand {
+                        bucket: self.read_bucket_name()?,
+                        key: self.read_object_key()?,
+                        upload_id: self.read_upload_id()?,
+                        cleanup: self.read_abort_multipart_upload_cleanup()?,
+                    },
+                )))
+            }
+            METADATA_COMMAND_DELETE_OBJECT_PAYLOAD_RECLAIM => {
+                Ok(MetadataCommandPayload::DeleteObjectPayloadReclaim(
+                    Box::new(DeleteObjectPayloadReclaimCommand::new(
+                        self.read_bucket_name()?,
+                        self.read_object_key()?,
+                        self.read_generation_id("payload reclaim generation")?,
+                        self.read_object_payload_reclaim()?,
+                    )),
+                ))
+            }
             METADATA_COMMAND_DELETE_COMPLETED_MULTIPART_UPLOAD => {
                 Ok(MetadataCommandPayload::DeleteCompletedMultipartUpload(
                     Box::new(DeleteCompletedMultipartUploadCommand {
@@ -1406,11 +1567,35 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         }
     }
 
+    fn read_repeated<T>(
+        &mut self,
+        mut read_item: impl FnMut(&mut Self) -> Result<T, String>,
+    ) -> Result<Vec<T>, String> {
+        let count = self.read_u32()? as usize;
+        let remaining = self.remaining();
+        if count > remaining {
+            return Err(format!(
+                "metadata command repeated item count {count} exceeds remaining encoded bytes {remaining}"
+            ));
+        }
+        let mut items = Vec::with_capacity(count);
+        for _ in 0..count {
+            items.push(read_item(self)?);
+        }
+        Ok(items)
+    }
+
     fn skip_repeated(
         &mut self,
         mut skip_item: impl FnMut(&mut Self) -> Result<(), String>,
     ) -> Result<(), String> {
-        let count = self.read_u32()?;
+        let count = self.read_u32()? as usize;
+        let remaining = self.remaining();
+        if count > remaining {
+            return Err(format!(
+                "metadata command repeated item count {count} exceeds remaining encoded bytes {remaining}"
+            ));
+        }
         for _ in 0..count {
             skip_item(self)?;
         }
@@ -1424,6 +1609,17 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         match self.read_u8()? {
             0 => Ok(()),
             1 => skip_value(self),
+            tag => Err(format!("invalid optional tag {tag}")),
+        }
+    }
+
+    fn read_optional<T>(
+        &mut self,
+        read_value: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<Option<T>, String> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => read_value(self).map(Some),
             tag => Err(format!("invalid optional tag {tag}")),
         }
     }
@@ -1453,6 +1649,11 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             .map_err(|reason| format!("invalid upload id in metadata command: {reason}"))
     }
 
+    fn read_session_id(&mut self) -> Result<SessionId, String> {
+        SessionId::try_from(self.read_string("session id")?)
+            .map_err(|reason| format!("invalid session id in metadata command: {reason}"))
+    }
+
     fn read_canonical_user_id(&mut self) -> Result<CanonicalUserId, String> {
         let value = self.read_string("canonical user id")?;
         CanonicalUserId::parse_stored(&value)
@@ -1470,6 +1671,40 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             1 => Ok(true),
             tag => Err(format!("invalid bool value {tag}")),
         }
+    }
+
+    fn read_optional_string(&mut self, field: &'static str) -> Result<Option<String>, String> {
+        self.read_optional(|decoder| decoder.read_string(field))
+    }
+
+    fn read_optional_bytes_value(&mut self) -> Result<Option<Vec<u8>>, String> {
+        self.read_optional(|decoder| decoder.read_bytes().map(<[u8]>::to_vec))
+    }
+
+    fn read_optional_u64_value(&mut self) -> Result<Option<u64>, String> {
+        self.read_optional(Self::read_u64)
+    }
+
+    fn read_fixed_bytes<const N: usize>(&mut self, field: &'static str) -> Result<[u8; N], String> {
+        let bytes = self.read_bytes()?;
+        bytes
+            .try_into()
+            .map_err(|_| format!("{field} must be exactly {N} bytes"))
+    }
+
+    fn read_generation_id(&mut self, field: &'static str) -> Result<GenerationId, String> {
+        GenerationId::new(self.read_u64()?).ok_or_else(|| format!("{field} must be non-zero"))
+    }
+
+    fn read_version_id(&mut self) -> Result<VersionId, String> {
+        Ok(VersionId::from_u64(self.read_u64()?))
+    }
+
+    fn read_ec_shape(&mut self) -> Result<EcShape, String> {
+        Ok(EcShape {
+            k: self.read_u8()?,
+            m: self.read_u8()?,
+        })
     }
 
     fn skip_optional_str(&mut self) -> Result<(), String> {
@@ -1571,6 +1806,33 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         })
     }
 
+    fn read_put_live_object(&mut self) -> Result<PutLiveObjectReq, String> {
+        Ok(PutLiveObjectReq {
+            bucket: self.read_bucket_name()?,
+            key: self.read_object_key()?,
+            version_id: self.read_version_id()?,
+            owner: self.read_owner_identity()?,
+            acl_grants: self.read_acl_grants()?,
+            public_read: self.read_bool()?,
+            generation_id: self.read_generation_id("object generation")?,
+            size: self.read_u64()?,
+            etag: self.read_object_etag()?,
+            ec: self.read_ec_shape()?,
+            layout: self.read_object_layout()?,
+            tags: self
+                .read_optional_string("object tags")?
+                .map(SerializedTagSet::new),
+            metadata_blob: self
+                .read_optional_bytes_value()?
+                .map(SerializedMetadataBlob::new),
+            system_metadata_blob: self
+                .read_optional_bytes_value()?
+                .map(SerializedSystemMetadataBlob::new),
+            object_lock: self.read_object_lock_state()?,
+            encryption: self.read_object_encryption()?,
+        })
+    }
+
     fn skip_put_live_object(&mut self) -> Result<(), String> {
         self.skip_str()?;
         self.skip_str()?;
@@ -1589,6 +1851,37 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.skip_optional_bytes()?;
         self.skip_object_lock_state()?;
         self.skip_object_encryption()
+    }
+
+    fn read_live_object_record(&mut self) -> Result<LiveObjectRecord, String> {
+        Ok(LiveObjectRecord {
+            bucket: self.read_bucket_name()?,
+            key: self.read_object_key()?,
+            version_id: self.read_version_id()?,
+            owner: self.read_owner_identity()?,
+            acl_grants: self.read_acl_grants()?,
+            public_read: self.read_bool()?,
+            generation_id: self.read_generation_id("object generation")?,
+            size: self.read_u64()?,
+            etag: self.read_object_etag()?,
+            last_modified: self.read_u64()?,
+            became_noncurrent_at: self.read_optional_u64_value()?,
+            storage_class: StorageClass::from_u8(self.read_u8()?)
+                .ok_or_else(|| "invalid storage class".to_string())?,
+            ec: self.read_ec_shape()?,
+            layout: self.read_object_layout()?,
+            tags: self
+                .read_optional_string("object tags")?
+                .map(SerializedTagSet::new),
+            metadata_blob: self
+                .read_optional_bytes_value()?
+                .map(SerializedMetadataBlob::new),
+            system_metadata_blob: self
+                .read_optional_bytes_value()?
+                .map(SerializedSystemMetadataBlob::new),
+            object_lock: self.read_object_lock_state()?,
+            encryption: self.read_object_encryption()?,
+        })
     }
 
     fn skip_live_object_record(&mut self) -> Result<(), String> {
@@ -1629,6 +1922,22 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         Ok(())
     }
 
+    fn read_object_segment(&mut self) -> Result<ObjectSegmentRecord, String> {
+        Ok(ObjectSegmentRecord {
+            bucket: self.read_bucket_name()?,
+            key: self.read_object_key()?,
+            version_id: self.read_version_id()?,
+            segment_index: self.read_u32()?,
+            size: self.read_u64()?,
+            segment_crc64: self.read_optional_u64_value()?,
+            segment_okh: self.read_fixed_bytes("object segment OKH")?,
+            segment_vid: self.read_generation_id("object segment VID")?,
+            data_pg_id: self.read_u32()?,
+            ec_k: self.read_u8()?,
+            ec_m: self.read_u8()?,
+        })
+    }
+
     fn skip_object_part(&mut self) -> Result<(), String> {
         self.skip_str()?;
         self.skip_str()?;
@@ -1645,6 +1954,25 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.skip_optional_bytes()
     }
 
+    fn read_object_part(&mut self) -> Result<ObjectPartRecord, String> {
+        Ok(ObjectPartRecord {
+            bucket: self.read_bucket_name()?,
+            key: self.read_object_key()?,
+            version_id: self.read_version_id()?,
+            part_number: self.read_u32()?,
+            size: self.read_u64()?,
+            etag: self.read_bytes()?.to_vec(),
+            etag_kind: EtagKind::from_u8(self.read_u8()?)
+                .ok_or_else(|| "invalid etag kind".to_string())?,
+            part_okh: self.read_fixed_bytes("object part OKH")?,
+            part_vid: self.read_generation_id("object part VID")?,
+            ec_k: self.read_u8()?,
+            ec_m: self.read_u8()?,
+            data_pg_id: self.read_u32()?,
+            checksum: self.read_optional_checksum_bytes()?,
+        })
+    }
+
     fn skip_multipart_part(&mut self) -> Result<(), String> {
         self.skip_str()?;
         self.read_u32()?;
@@ -1658,6 +1986,24 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_u8()?;
         self.read_u64()?;
         self.skip_optional_bytes()
+    }
+
+    fn read_multipart_part(&mut self) -> Result<MultipartPartRecord, String> {
+        Ok(MultipartPartRecord {
+            upload_id: self.read_upload_id()?,
+            part_number: self.read_u32()?,
+            generation: self.read_u32()?,
+            size: self.read_u64()?,
+            etag: self.read_bytes()?.to_vec(),
+            etag_kind: EtagKind::from_u8(self.read_u8()?)
+                .ok_or_else(|| "invalid etag kind".to_string())?,
+            part_okh: self.read_fixed_bytes("multipart part OKH")?,
+            part_vid: self.read_generation_id("multipart part VID")?,
+            ec_k: self.read_u8()?,
+            ec_m: self.read_u8()?,
+            last_modified: self.read_u64()?,
+            checksum: self.read_optional_checksum_bytes()?,
+        })
     }
 
     fn skip_optional_multipart_part(&mut self) -> Result<(), String> {
@@ -1681,6 +2027,24 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         Ok(())
     }
 
+    fn read_multipart_part_segment(&mut self) -> Result<MultipartPartSegmentRecord, String> {
+        Ok(MultipartPartSegmentRecord {
+            bucket: self.read_bucket_name()?,
+            key: self.read_object_key()?,
+            upload_id: self.read_upload_id()?,
+            version_id: self.read_u64()?,
+            part_number: self.read_u32()?,
+            segment_index: self.read_u32()?,
+            size: self.read_u64()?,
+            segment_crc64: self.read_optional_u64_value()?,
+            segment_okh: self.read_fixed_bytes("multipart part segment OKH")?,
+            segment_vid: self.read_generation_id("multipart part segment VID")?,
+            data_pg_id: self.read_u32()?,
+            ec_k: self.read_u8()?,
+            ec_m: self.read_u8()?,
+        })
+    }
+
     fn skip_stream_upload(&mut self) -> Result<(), String> {
         self.skip_str()?;
         self.skip_str()?;
@@ -1688,7 +2052,22 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.skip_stream_upload_target()?;
         self.read_valid_u8("stream upload state", 0..=3)?;
         self.read_u64()?;
-        self.skip_object_encryption()
+        self.skip_object_encryption()?;
+        self.read_nonzero_u64("next stream segment VID")
+    }
+
+    fn read_stream_upload(&mut self) -> Result<StreamUploadRecord, String> {
+        Ok(StreamUploadRecord {
+            session_id: self.read_session_id()?,
+            bucket: self.read_bucket_name()?,
+            key: self.read_object_key()?,
+            target: self.read_stream_upload_target()?,
+            state: StreamUploadState::from_u8(self.read_u8()?)
+                .ok_or_else(|| "invalid stream upload state".to_string())?,
+            created_at: self.read_u64()?,
+            encryption: self.read_object_encryption()?,
+            next_segment_vid: self.read_generation_id("next stream segment VID")?,
+        })
     }
 
     fn skip_stream_upload_target(&mut self) -> Result<(), String> {
@@ -1699,6 +2078,17 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 self.read_u32()?;
                 Ok(())
             }
+            tag => Err(format!("invalid stream upload target tag {tag}")),
+        }
+    }
+
+    fn read_stream_upload_target(&mut self) -> Result<StreamUploadTarget, String> {
+        match self.read_u8()? {
+            0 => Ok(StreamUploadTarget::PutObject),
+            1 => Ok(StreamUploadTarget::UploadPart {
+                upload_id: self.read_upload_id()?,
+                part_number: self.read_u32()?,
+            }),
             tag => Err(format!("invalid stream upload target tag {tag}")),
         }
     }
@@ -1714,6 +2104,20 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_u8()?;
         self.read_u8()?;
         Ok(())
+    }
+
+    fn read_stream_upload_segment(&mut self) -> Result<StreamUploadSegmentRecord, String> {
+        Ok(StreamUploadSegmentRecord {
+            session_id: self.read_session_id()?,
+            segment_index: self.read_u32()?,
+            size: self.read_u64()?,
+            segment_crc64: self.read_optional_u64_value()?,
+            segment_okh: self.read_fixed_bytes("stream upload segment OKH")?,
+            segment_vid: self.read_generation_id("stream upload segment VID")?,
+            data_pg_id: self.read_u32()?,
+            ec_k: self.read_u8()?,
+            ec_m: self.read_u8()?,
+        })
     }
 
     fn skip_multipart_upload(&mut self) -> Result<(), String> {
@@ -1733,6 +2137,30 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.skip_object_lock_state()?;
         self.skip_optional_multipart_checksum_config()?;
         self.skip_object_encryption()
+    }
+
+    fn read_multipart_upload(&mut self) -> Result<MultipartUploadRecord, String> {
+        Ok(MultipartUploadRecord {
+            upload_id: self.read_upload_id()?,
+            bucket: self.read_bucket_name()?,
+            key: self.read_object_key()?,
+            initiated_at: self.read_u64()?,
+            state: UploadState::from_u8(self.read_u8()?)
+                .ok_or_else(|| "invalid multipart upload state".to_string())?,
+            tags: self
+                .read_optional_string("multipart upload tags")?
+                .map(SerializedTagSet::new),
+            metadata_blob: SerializedMetadataBlob::new(self.read_bytes()?.to_vec()),
+            system_metadata_blob: SerializedSystemMetadataBlob::new(self.read_bytes()?.to_vec()),
+            initiator: self.read_optional_owner_identity()?,
+            owner: self.read_owner_identity()?,
+            acl_grants: self.read_acl_grants()?,
+            public_read: self.read_bool()?,
+            object_generation_id: self.read_generation_id("multipart upload object generation")?,
+            object_lock: self.read_object_lock_state()?,
+            checksum: self.read_optional_multipart_checksum_config()?,
+            encryption: self.read_object_encryption()?,
+        })
     }
 
     fn skip_completed_multipart_upload(&mut self) -> Result<(), String> {
@@ -1767,10 +2195,34 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         }
     }
 
+    fn read_object_payload_reclaim(&mut self) -> Result<ObjectPayloadReclaimCommand, String> {
+        match self.read_u8()? {
+            0 => self
+                .read_object_segments_reclaim()
+                .map(ObjectPayloadReclaimCommand::Segments),
+            1 => self
+                .read_multipart_reclaim()
+                .map(ObjectPayloadReclaimCommand::Multipart),
+            tag => Err(format!("invalid object payload reclaim tag {tag}")),
+        }
+    }
+
     fn skip_live_payload_reclaim(&mut self) -> Result<(), String> {
         match self.read_u8()? {
             1 => self.skip_object_segments_reclaim(),
             2 => self.skip_multipart_reclaim(),
+            tag => Err(format!("invalid live payload reclaim tag {tag}")),
+        }
+    }
+
+    fn read_live_payload_reclaim(&mut self) -> Result<ObjectPayloadReclaimCommand, String> {
+        match self.read_u8()? {
+            1 => self
+                .read_object_segments_reclaim()
+                .map(ObjectPayloadReclaimCommand::Segments),
+            2 => self
+                .read_multipart_reclaim()
+                .map(ObjectPayloadReclaimCommand::Multipart),
             tag => Err(format!("invalid live payload reclaim tag {tag}")),
         }
     }
@@ -1780,6 +2232,23 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             0 => Ok(()),
             1 => self.skip_object_segments_reclaim(),
             2 => self.skip_multipart_reclaim(),
+            tag => Err(format!("invalid stale payload tag {tag}")),
+        }
+    }
+
+    fn read_optional_stale_payload(
+        &mut self,
+    ) -> Result<Option<ObjectPayloadReclaimCommand>, String> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => self
+                .read_object_segments_reclaim()
+                .map(ObjectPayloadReclaimCommand::Segments)
+                .map(Some),
+            2 => self
+                .read_multipart_reclaim()
+                .map(ObjectPayloadReclaimCommand::Multipart)
+                .map(Some),
             tag => Err(format!("invalid stale payload tag {tag}")),
         }
     }
@@ -1797,6 +2266,25 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             decoder.read_u8()?;
             decoder.read_u8()?;
             Ok(())
+        })
+    }
+
+    fn read_object_segments_reclaim(&mut self) -> Result<ObjectSegmentsReclaimRecord, String> {
+        Ok(ObjectSegmentsReclaimRecord {
+            bucket: self.read_bucket_name()?,
+            key: self.read_object_key()?,
+            generation_id: self.read_generation_id("object segments reclaim generation")?,
+            created_at: self.read_u64()?,
+            segments: self.read_repeated(|decoder| {
+                Ok(ObjectSegmentsReclaimSegmentRecord {
+                    segment_index: decoder.read_u32()?,
+                    segment_okh: decoder.read_fixed_bytes("object segments reclaim segment OKH")?,
+                    segment_vid: decoder
+                        .read_generation_id("object segments reclaim segment VID")?,
+                    data_pg_id: decoder.read_u32()?,
+                    ec: decoder.read_ec_shape()?,
+                })
+            })?,
         })
     }
 
@@ -1832,12 +2320,58 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         })
     }
 
+    fn read_multipart_reclaim(&mut self) -> Result<MultipartReclaimRecord, String> {
+        Ok(MultipartReclaimRecord {
+            bucket: self.read_bucket_name()?,
+            key: self.read_object_key()?,
+            generation_id: self.read_generation_id("multipart reclaim generation")?,
+            created_at: self.read_u64()?,
+            parts: self.read_repeated(|decoder| match decoder.read_u8()? {
+                1 => Ok(MultipartReclaimPartRecord::ShardSet {
+                    part_number: decoder.read_u32()?,
+                    part_okh: decoder.read_fixed_bytes("multipart reclaim part OKH")?,
+                    part_vid: decoder.read_generation_id("multipart reclaim part VID")?,
+                    data_pg_id: decoder.read_u32()?,
+                    ec: decoder.read_ec_shape()?,
+                }),
+                2 => Ok(MultipartReclaimPartRecord::Segments {
+                    part_number: decoder.read_u32()?,
+                    segments: decoder.read_repeated(|decoder| {
+                        Ok(MultipartReclaimPartSegmentRecord {
+                            part_number: decoder.read_u32()?,
+                            segment_index: decoder.read_u32()?,
+                            segment_okh: decoder
+                                .read_fixed_bytes("multipart reclaim segment OKH")?,
+                            segment_vid: decoder
+                                .read_generation_id("multipart reclaim segment VID")?,
+                            data_pg_id: decoder.read_u32()?,
+                            ec: decoder.read_ec_shape()?,
+                        })
+                    })?,
+                }),
+                tag => Err(format!("invalid multipart reclaim part tag {tag}")),
+            })?,
+        })
+    }
+
     fn skip_abort_multipart_upload_cleanup(&mut self) -> Result<(), String> {
         self.skip_multipart_upload()?;
         self.skip_repeated(Self::skip_multipart_part)?;
         self.skip_repeated(Self::skip_multipart_part_segment)?;
         self.skip_repeated(Self::skip_stream_upload)?;
         self.skip_repeated(Self::skip_stream_upload_segment)
+    }
+
+    fn read_abort_multipart_upload_cleanup(
+        &mut self,
+    ) -> Result<AbortMultipartUploadCleanup, String> {
+        Ok(AbortMultipartUploadCleanup {
+            upload: self.read_multipart_upload()?,
+            parts: self.read_repeated(Self::read_multipart_part)?,
+            streaming_segments: self.read_repeated(Self::read_multipart_part_segment)?,
+            stream_uploads: self.read_repeated(Self::read_stream_upload)?,
+            stream_upload_segments: self.read_repeated(Self::read_stream_upload_segment)?,
+        })
     }
 
     fn skip_object_etag(&mut self) -> Result<(), String> {
@@ -1854,6 +2388,20 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         }
     }
 
+    fn read_object_etag(&mut self) -> Result<ObjectEtag, String> {
+        match self.read_u8()? {
+            1 => Ok(ObjectEtag::SinglePart(
+                self.read_fixed_bytes("single-part etag CRC64")?,
+            )),
+            2 => Ok(ObjectEtag::MultipartComposite {
+                crc64: self.read_fixed_bytes("multipart etag CRC64")?,
+                parts: NonZeroU32::new(self.read_u32()?)
+                    .ok_or_else(|| "multipart etag parts count must be non-zero".to_string())?,
+            }),
+            tag => Err(format!("invalid object etag tag {tag}")),
+        }
+    }
+
     fn read_crc64_bytes(&mut self, field: &'static str) -> Result<(), String> {
         let bytes = self.read_bytes()?;
         if bytes.len() == 8 {
@@ -1863,10 +2411,28 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         }
     }
 
+    fn read_optional_checksum_bytes(&mut self) -> Result<Option<ChecksumBytes>, String> {
+        self.read_optional(|decoder| {
+            ChecksumBytes::new(decoder.read_bytes()?)
+                .map_err(|reason| format!("invalid checksum bytes: {reason}"))
+        })
+    }
+
     fn skip_object_layout(&mut self) -> Result<(), String> {
         match self.read_u8()? {
             1 => Ok(()),
             2 => self.read_nonzero_u32("multipart layout parts count"),
+            tag => Err(format!("invalid object layout tag {tag}")),
+        }
+    }
+
+    fn read_object_layout(&mut self) -> Result<ObjectLayout, String> {
+        match self.read_u8()? {
+            1 => Ok(ObjectLayout::Standard),
+            2 => Ok(ObjectLayout::MultipartManifest {
+                parts_count: NonZeroU32::new(self.read_u32()?)
+                    .ok_or_else(|| "multipart layout parts count must be non-zero".to_string())?,
+            }),
             tag => Err(format!("invalid object layout tag {tag}")),
         }
     }
@@ -1881,6 +2447,28 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             tag => return Err(format!("invalid object retention tag {tag}")),
         }
         self.read_valid_u8("stored legal hold status", 0..=2)
+    }
+
+    fn read_object_lock_state(&mut self) -> Result<ObjectLockState, String> {
+        let retention = match self.read_u8()? {
+            0 => None,
+            1 => {
+                let retain_until_unix_seconds = self.read_u64()?;
+                let mode = ObjectLockMode::from_u8(self.read_u8()?)
+                    .ok_or_else(|| "invalid object lock retention mode".to_string())?;
+                Some(ObjectRetention {
+                    mode,
+                    retain_until_unix_seconds,
+                })
+            }
+            tag => return Err(format!("invalid object retention tag {tag}")),
+        };
+        let legal_hold = StoredLegalHoldStatus::from_u8(self.read_u8()?)
+            .ok_or_else(|| "invalid stored legal hold status".to_string())?;
+        Ok(ObjectLockState {
+            retention,
+            legal_hold,
+        })
     }
 
     fn skip_object_encryption(&mut self) -> Result<(), String> {
@@ -1906,6 +2494,14 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             (1 | 2, false) => Err("encrypted object is missing encryption state".to_string()),
             _ => unreachable!("object encryption type was validated above"),
         }
+    }
+
+    fn read_object_encryption(&mut self) -> Result<ObjectEncryption, String> {
+        let encryption_type = ObjectEncryptionType::from_u8(self.read_u8()?)
+            .ok_or_else(|| "invalid object encryption type".to_string())?;
+        let state = self.read_optional_bytes_value()?;
+        ObjectEncryption::decode(encryption_type, state)
+            .map_err(|reason| format!("invalid object encryption state: {reason}"))
     }
 
     fn skip_owner_identity(&mut self) -> Result<(), String> {
@@ -1936,6 +2532,19 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.skip_optional(|decoder| {
             decoder.read_valid_u8("multipart checksum algorithm", 0..=4)?;
             decoder.read_valid_u8("multipart checksum type", 0..=1)
+        })
+    }
+
+    fn read_optional_multipart_checksum_config(
+        &mut self,
+    ) -> Result<Option<MultipartChecksumConfig>, String> {
+        self.read_optional(|decoder| {
+            let algorithm = ChecksumAlgorithm::from_u8(decoder.read_u8()?)
+                .ok_or_else(|| "invalid multipart checksum algorithm".to_string())?;
+            let checksum_type = ChecksumType::from_u8(decoder.read_u8()?)
+                .ok_or_else(|| "invalid multipart checksum type".to_string())?;
+            MultipartChecksumConfig::new(algorithm, Some(checksum_type))
+                .map_err(|error| format!("invalid multipart checksum config: {error}"))
         })
     }
 
@@ -2437,6 +3046,7 @@ fn encode_stream_upload(out: &mut Vec<u8>, session: &StreamUploadRecord) {
     put_u8(out, session.state as u8);
     put_u64(out, session.created_at);
     encode_object_encryption(out, &session.encryption);
+    put_u64(out, session.next_segment_vid.get());
 }
 
 fn encode_multipart_upload(out: &mut Vec<u8>, upload: &MultipartUploadRecord) {
@@ -3611,6 +4221,7 @@ mod tests {
                     state: StreamUploadState::InProgress,
                     created_at: 558,
                     encryption: ObjectEncryption::None,
+                    next_segment_vid: GenerationId::new(3).unwrap(),
                 }],
                 stream_upload_segments: vec![stream_segment.clone()],
                 write_sequence: 43,
@@ -3755,6 +4366,7 @@ mod tests {
                         state: StreamUploadState::InProgress,
                         created_at: 562,
                         encryption: ObjectEncryption::None,
+                        next_segment_vid: GenerationId::new(4).unwrap(),
                     }],
                     stream_upload_segments: vec![stream_segment.clone()],
                 },
@@ -3880,13 +4492,7 @@ mod tests {
             assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
             assert!(envelope.verify_checksum());
             assert_applied_log_decoder_accepts(&envelope);
-            if matches!(
-                envelope.payload(),
-                MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
-                    | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_)
-            ) {
-                assert_full_envelope_decoder_round_trips(&envelope);
-            }
+            assert_full_envelope_decoder_round_trips(&envelope);
             checksums.push(envelope.checksum_crc64());
         }
         assert_eq!(
@@ -3897,7 +4503,7 @@ mod tests {
                 0x3acf49df359790d4,
                 0xb5a8e642f639b9a8,
                 0x892df6c0f857bf33,
-                0x7920c33a006e1d68,
+                0x612189829da48d59,
                 0x53fdbf4c6f062d53,
                 0x6df04a5fc73e478a,
                 0x2a3c1d82cb08bbdd,
@@ -3910,10 +4516,10 @@ mod tests {
                 0xaaee1aa183a67da1,
                 0x423d5ce8ecc3f471,
                 0xa10946bfbddcbb08,
-                0x8f0590d0286f0dc4,
-                0x4c8d2ebe4cd0d8d4,
-                0x5dd9ac5f99954560,
-                0xf89fe8126b9974bf,
+                0x87261b7344847d5a,
+                0x06e8919990a39895,
+                0x924974de9db8c75c,
+                0xc6696fbaf6843082,
                 0x8d3e5d6cb995e021,
                 0x873424a13234f823,
                 0x7cf30e2471f346ae,

@@ -466,12 +466,9 @@ impl StorageCluster {
         command: &MetadataCommandEnvelope,
     ) -> Result<Option<MetadataCommandEnvelope>, BucketSnapshotLoadError> {
         let bucket = command.bucket_name().clone();
-        // The acting-set max scan must not observe the primary-last fanout of
-        // another command half way through. A durable non-primary-only tail is
-        // still a conflict, but an in-flight apply should finish before we
-        // decide whether reissue is safe.
-        let runtime_state = self.local_map.runtime_state();
-        let _apply_guard = runtime_state.lock_metadata_command_apply();
+        // If a non-primary has a higher durable log index than the primary,
+        // fail closed. A later recovery path must reconcile that history before
+        // this process can safely reissue the pending command.
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
@@ -1171,10 +1168,8 @@ impl StorageCluster {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let _bucket_guard = primary_node.lock_bucket(bucket);
-        let runtime_state = self.local_map.runtime_state();
         loop {
-            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
-            {
+            if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 match command.payload() {
                     MetadataCommandPayload::ReserveObjectGeneration(reservation)
                         if reservation.matches_request(bucket, key, reservation_id) =>
@@ -1283,10 +1278,8 @@ impl StorageCluster {
         key: &ObjectKey,
         _primary_node: &SharedStorageNode,
     ) -> Result<VersionId, ObjectPgActionError> {
-        let runtime_state = self.local_map.runtime_state();
         loop {
-            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
-            {
+            if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::ReserveObjectVersion(reservation) = command.payload()
                 {
                     let reserved_version_id = reservation.version_id;
@@ -1473,10 +1466,8 @@ impl StorageCluster {
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
-        let runtime_state = self.local_map.runtime_state();
         loop {
-            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
-            {
+            if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 match command.payload() {
                     MetadataCommandPayload::ReleaseObjectGeneration(reservation)
                         if reservation.matches_request(bucket, key, reservation_id) =>
@@ -1572,11 +1563,7 @@ impl StorageCluster {
         bucket: &BucketName,
     ) -> Result<Vec<MetadataCommandEnvelope>, ObjectPgActionError> {
         let mut applied = Vec::new();
-        while let Some(command) = self
-            .local_map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, bucket)
-        {
+        while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
             let outcome =
                 self.finish_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             if outcome == PendingMetadataCommandOutcome::Applied {
@@ -1592,13 +1579,12 @@ impl StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
-    ) -> bool {
-        self.local_map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, bucket)
+    ) -> Result<bool, ObjectPgActionError> {
+        Ok(self
+            .pending_metadata_command_for_bucket(pg_id, bucket)?
             .is_some_and(|command| {
                 pending_command_completes_stream_session(&command, bucket, key, session_id)
-            })
+            }))
     }
 
     fn next_object_metadata_command_id(
@@ -1760,9 +1746,6 @@ impl StorageCluster {
                         stale_generation_id,
                     );
                 }
-                self.local_map
-                    .runtime_state()
-                    .clear_stream_segment_vid_allocator(&commit.generation_reservation_id);
             }
             MetadataCommandPayload::CommitMultipartObject(commit) => {
                 if let Some(stale_generation_id) =
@@ -1807,9 +1790,6 @@ impl StorageCluster {
                 self.delete_staged_stream_segment_payload_shards_best_effort(
                     &abort.staged_segments,
                 );
-                self.local_map
-                    .runtime_state()
-                    .clear_stream_segment_vid_allocator(&abort.session_id);
             }
             MetadataCommandPayload::CommitStreamPart(commit) => {
                 self.delete_finalize_upload_part_cleanup_best_effort(
@@ -1819,9 +1799,6 @@ impl StorageCluster {
                         displaced_segments: commit.displaced_segments.clone(),
                     },
                 );
-                self.local_map
-                    .runtime_state()
-                    .clear_stream_segment_vid_allocator(&commit.session_id);
             }
             MetadataCommandPayload::AbortMultipartUpload(abort) => {
                 self.delete_abort_multipart_cleanup_best_effort(&abort.cleanup);
@@ -1854,10 +1831,8 @@ impl StorageCluster {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let _bucket_guard = primary_node.lock_bucket(bucket);
-        let runtime_state = self.local_map.runtime_state();
         loop {
-            if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
-            {
+            if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 match command.payload() {
                     MetadataCommandPayload::ReleaseObjectGeneration(reservation)
                         if reservation.matches_request(bucket, key, reservation_id) =>
@@ -1963,10 +1938,8 @@ impl StorageCluster {
             .collect();
 
         let _bucket_guard = object_node.lock_bucket(&req.bucket);
-        let runtime_state = self.local_map.runtime_state();
         let (command, new_pending_command) = loop {
-            let Some(command) =
-                runtime_state.pending_metadata_command_for_bucket(pg_id, &req.bucket)
+            let Some(command) = self.pending_metadata_command_for_bucket(pg_id, &req.bucket)?
             else {
                 let object_pg = object_node.get_pg(pg_id.get())?;
                 match self.validate_direct_put_commit_preconditions(&object_pg, req, action) {
@@ -2658,9 +2631,7 @@ impl StorageCluster {
                 self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
             {
                 if self
-                    .local_map
-                    .runtime_state()
-                    .pending_metadata_command_for_bucket(pg_id, bucket)
+                    .pending_metadata_command_for_bucket(pg_id, bucket)?
                     .is_none()
                 {
                     let _ = self.release_object_generation_reservation(bucket, key, session_id);
@@ -2691,10 +2662,7 @@ impl StorageCluster {
         let object_node = self.object_metadata_primary_node(bucket, key)?;
         let _bucket_guard = object_node.lock_bucket(bucket);
         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
-        let runtime_state = self.local_map.runtime_state();
-        object_node.prepare_stream_segment_append(bucket, key, request, || {
-            runtime_state.allocate_stream_segment_vid(&request.session_id)
-        })
+        object_node.prepare_stream_segment_append(bucket, key, request)
     }
 
     pub fn write_stream_segment_payload_shards(
@@ -2894,7 +2862,7 @@ impl StorageCluster {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let node = self.object_metadata_primary_node(bucket, key)?;
         let mut pending_completed_session =
-            self.pending_command_completes_stream_session(pg_id, bucket, key, session_id);
+            self.pending_command_completes_stream_session(pg_id, bucket, key, session_id)?;
         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
 
         {
@@ -2913,7 +2881,7 @@ impl StorageCluster {
 
         let _bucket_guard = node.lock_bucket(bucket);
         pending_completed_session =
-            self.pending_command_completes_stream_session(pg_id, bucket, key, session_id);
+            self.pending_command_completes_stream_session(pg_id, bucket, key, session_id)?;
         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
 
         let object_pg = node.get_pg(pg_id.get())?;

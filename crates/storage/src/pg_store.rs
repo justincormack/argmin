@@ -1459,6 +1459,17 @@ impl PgStore {
         let Some(slot) = self.pending_metadata_command_slot(node_id, cluster_epoch)? else {
             return Ok(None);
         };
+        let computed_checksum = checksum::crc64::checksum(&slot.command_bytes);
+        if computed_checksum != slot.command_checksum {
+            return Err(StoreError::MetadataCommandLogChecksumMismatch {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                log_index: slot.id.log_index().get(),
+                stored_checksum: slot.command_checksum,
+                computed_checksum,
+            });
+        }
         let command = decode_metadata_command_envelope(&slot.command_bytes).map_err(|_| {
             StoreError::MetadataCommandLogConflict {
                 node_id,
@@ -6325,8 +6336,8 @@ impl PgStore {
         self.conn
             .execute(
                 "INSERT INTO stream_uploads \
-                 (session_id, bucket, key, op_kind, upload_id, part_number, state, created_at, encryption_type, encryption_state) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (session_id, bucket, key, op_kind, upload_id, part_number, state, created_at, encryption_type, encryption_state, next_segment_vid) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     session.session_id,
                     session.bucket,
@@ -6338,6 +6349,7 @@ impl PgStore {
                     session.created_at as i64,
                     encryption_type,
                     encryption_state,
+                    session.next_segment_vid.get() as i64,
                 ],
             )
             .map_err(|e| MetadataError::Db {
@@ -6445,12 +6457,22 @@ impl PgStore {
                     .into_iter()
                     .find(|segment| segment.segment_index == command.segment.segment_index);
                 match existing {
-                    Some(existing) if existing == command.segment => Ok(()),
+                    Some(existing) if existing == command.segment => store
+                        .advance_stream_segment_vid_floor(
+                            &command.segment.session_id,
+                            command.segment.segment_vid,
+                        ),
                     Some(_) => Err(MetadataError::Db {
                         context: "append stream segment command existing segment mismatch",
                         source: rusqlite::Error::InvalidQuery,
                     }),
-                    None => store.append_stream_segment_direct(&command.segment),
+                    None => {
+                        store.append_stream_segment_direct(&command.segment)?;
+                        store.advance_stream_segment_vid_floor(
+                            &command.segment.session_id,
+                            command.segment.segment_vid,
+                        )
+                    }
                 }
             },
         )
@@ -6944,7 +6966,7 @@ impl PgStore {
             .conn
             .prepare_cached(
                 "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
-                 created_at, encryption_type, encryption_state FROM stream_uploads \
+                 created_at, encryption_type, encryption_state, next_segment_vid FROM stream_uploads \
                  WHERE op_kind = ?1 AND upload_id = ?2 ORDER BY session_id ASC",
             )
             .map_err(|e| MetadataError::Db {
@@ -6982,6 +7004,11 @@ impl PgStore {
                             row.get::<_, Option<Vec<u8>>>(9)?,
                             8,
                             9,
+                        )?,
+                        next_segment_vid: Self::parse_generation_id(
+                            row.get::<_, i64>(10)?,
+                            10,
+                            "next_segment_vid",
                         )?,
                     })
                 },
@@ -12151,7 +12178,7 @@ impl PgMetadataStore for PgStore {
         self.conn
             .query_row(
                 "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
-                 created_at, encryption_type, encryption_state FROM stream_uploads WHERE session_id = ?1",
+                 created_at, encryption_type, encryption_state, next_segment_vid FROM stream_uploads WHERE session_id = ?1",
                 params![session_id.as_str()],
                 |row| {
                     let op_kind_raw: u8 = row.get(3)?;
@@ -12182,6 +12209,11 @@ impl PgMetadataStore for PgStore {
                             8,
                             9,
                         )?,
+                        next_segment_vid: Self::parse_generation_id(
+                            row.get::<_, i64>(10)?,
+                            10,
+                            "next_segment_vid",
+                        )?,
                     })
                 },
             )
@@ -12193,6 +12225,36 @@ impl PgMetadataStore for PgStore {
             .ok_or_else(|| MetadataError::StreamSessionNotFound {
                 session_id: session_id.as_str().to_owned(),
             })
+    }
+
+    fn allocate_stream_segment_vid(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<GenerationId, MetadataError> {
+        let allocated = self
+            .conn
+            .query_row(
+                "UPDATE stream_uploads \
+                 SET next_segment_vid = next_segment_vid + 1 \
+                 WHERE session_id = ?1 AND state = ?2 \
+                 RETURNING next_segment_vid - 1",
+                params![session_id.as_str(), StreamUploadState::InProgress as u8],
+                |row| Self::parse_generation_id(row.get::<_, i64>(0)?, 0, "next_segment_vid"),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "allocate stream segment VID",
+                source: e,
+            })?;
+        match allocated {
+            Some(vid) => Ok(vid),
+            None => match self.get_stream_upload(session_id) {
+                Ok(session) => Err(MetadataError::StreamSessionNotInProgress {
+                    state: session.state as u8,
+                }),
+                Err(error) => Err(error),
+            },
+        }
     }
 
     #[cfg(test)]
@@ -12214,7 +12276,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare_cached(
                 "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
-                 created_at, encryption_type, encryption_state FROM stream_uploads",
+                 created_at, encryption_type, encryption_state, next_segment_vid FROM stream_uploads",
             )
             .map_err(|e| MetadataError::Db {
                 context: "list all stream uploads (prepare)",
@@ -12244,6 +12306,11 @@ impl PgMetadataStore for PgStore {
                         row.get::<_, Option<Vec<u8>>>(9)?,
                         8,
                         9,
+                    )?,
+                    next_segment_vid: Self::parse_generation_id(
+                        row.get::<_, i64>(10)?,
+                        10,
+                        "next_segment_vid",
                     )?,
                 })
             })
@@ -13433,6 +13500,35 @@ impl PgStore {
         Ok(())
     }
 
+    fn advance_stream_segment_vid_floor(
+        &self,
+        session_id: &SessionId,
+        segment_vid: GenerationId,
+    ) -> Result<(), MetadataError> {
+        let next_vid = segment_vid
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| MetadataError::Db {
+                context: "advance stream segment VID floor overflow",
+                source: rusqlite::Error::InvalidQuery,
+            })?;
+        self.conn
+            .execute(
+                "UPDATE stream_uploads \
+                 SET next_segment_vid = CASE \
+                     WHEN next_segment_vid < ?1 THEN ?1 \
+                     ELSE next_segment_vid \
+                 END \
+                 WHERE session_id = ?2",
+                params![next_vid as i64, session_id.as_str()],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "advance stream segment VID floor",
+                source: e,
+            })?;
+        Ok(())
+    }
+
     fn delete_object_segments_direct(
         &self,
         bucket: &BucketName,
@@ -14171,6 +14267,86 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "slot should be empty after exact removal"
+        );
+    }
+
+    #[test]
+    fn pending_metadata_command_slot_rejects_huge_repeated_count_before_allocation() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("pending-slot-huge-count");
+        let key = trusted_object_key("object");
+        let reservation_id = SessionId::try_from("52".repeat(16)).unwrap();
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
+                object: PutLiveObjectReq {
+                    bucket: bucket.clone(),
+                    key,
+                    version_id: VersionId::Null,
+                    owner: OwnerIdentity::from_principal("owner"),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    generation_id: GenerationId::MIN,
+                    size: 0,
+                    etag: ObjectEtag::single_part(0),
+                    ec: EcShape { k: 2, m: 1 },
+                    layout: ObjectLayout::Standard,
+                    tags: None,
+                    metadata_blob: Some(SerializedMetadataBlob::default()),
+                    system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
+                    object_lock: ObjectLockState::default(),
+                    encryption: ObjectEncryption::None,
+                },
+                segments: Vec::new(),
+                generation_reservation_id: reservation_id.clone(),
+                write_sequence: 1,
+                last_modified_millis: 2,
+                stale_payload: None,
+            })),
+        );
+        let mut malformed_bytes = command.command_bytes();
+        let reservation_id_bytes = reservation_id.as_str().as_bytes();
+        let mut empty_segments_then_reservation = Vec::new();
+        empty_segments_then_reservation.extend_from_slice(&0_u32.to_le_bytes());
+        empty_segments_then_reservation
+            .extend_from_slice(&(reservation_id_bytes.len() as u32).to_le_bytes());
+        empty_segments_then_reservation.extend_from_slice(reservation_id_bytes);
+        let segments_count_offset = malformed_bytes
+            .windows(empty_segments_then_reservation.len())
+            .position(|window| window == empty_segments_then_reservation)
+            .expect("direct PUT command should encode empty segments before reservation id");
+        malformed_bytes[segments_count_offset..segments_count_offset + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        let malformed_checksum = checksum::crc64::checksum(&malformed_bytes);
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO metadata_command_pending_slot \
+                 (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, scope_bucket) \
+                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    ClusterEpoch::INITIAL.get() as i64,
+                    1_i64,
+                    1_i64,
+                    malformed_checksum as i64,
+                    malformed_bytes,
+                    bucket.as_str(),
+                ],
+            )
+            .unwrap();
+
+        let err = store
+            .pending_metadata_command_envelope(0, ClusterEpoch::INITIAL)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::MetadataCommandLogConflict { .. }),
+            "malformed repeated count must fail closed as command conflict, got {err:?}"
         );
     }
 

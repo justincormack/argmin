@@ -64,9 +64,8 @@ Production command-id allocation is no longer process-local. New request-path
 commands derive the next log index from the routed PG primary's durable command
 log. If the PG primary has an unresolved durable pending slot, request paths
 must load and converge that slot before allocating later work. The current
-implementation can rehydrate bucket-PG command slots from durable command
-bytes; object-PG command slots still fail closed until the object-command
-decoder is wired in. It must never skip over an unresolved durable slot. This
+implementation can rehydrate bucket-PG and object-PG command slots from
+durable command bytes. It must never skip over an unresolved durable slot. This
 means an already-open coordinator handle must allocate after commands appended
 by another handle, but must not allocate after unresolved durable intent. Test
 fixtures may still use test-only helpers when they manually construct
@@ -168,19 +167,22 @@ Stream segment VID allocation is part of the metadata command stream model.
 It must not be owned by `LocalClusterRuntimeState` or any other process-local
 map.
 
-The target rule is:
+The implemented rule is:
 
-- an append command owns the allocated segment VID, or the stream session has a
-  durable allocator updated transactionally with command-slot creation
-- retries reuse the same pending append command and therefore the same segment
-  VID
-- a second append on the same PG cannot allocate another segment VID until the
-  first append command is terminal
-- terminal stream commands make remaining allocator state irrelevant or clear
-  it durably
+- the stream session row has a durable `next_segment_vid` allocator on the PG
+  primary, updated by SQLite before payload shards are written
+- the append command carries the allocated segment VID, and command apply
+  advances each replica's allocator floor to at least the committed VID plus
+  one
+- allocated but uncommitted VIDs are allowed gaps; they are allocator state, not
+  object metadata or object data in the command log
+- terminal stream commands delete or make irrelevant the stream session row, so
+  no process-local allocator cleanup is required
 
-The exact implementation can be command-owned IDs or a durable per-session
-allocator. It must be visible through the PG-primary command stream.
+The allocator column is not part of the canonical metadata command digest. The
+command-owned state is the append segment row and the payload CRC/hash carried
+by that row; the allocator is durable PG-primary coordination state used to
+avoid cross-process shard-key reuse before the append command exists.
 
 ## Local Locks And Caches
 

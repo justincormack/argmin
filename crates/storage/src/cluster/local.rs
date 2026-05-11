@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex};
 
 use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
 
@@ -14,7 +14,7 @@ use crate::metadata_command::{
 };
 use crate::{
     BucketName, ClusterEpoch, DataPgId, EcShape, GenerationId, ObjectKey, PgId, PgState,
-    ReclaimWorkItem, SessionId, ShardIndex, ShardKey, SharedStorageNode, WriteAck,
+    ReclaimWorkItem, ShardIndex, ShardKey, SharedStorageNode, WriteAck,
 };
 
 const PAYLOAD_SHARD_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin/payload-shard-placement/v1";
@@ -217,9 +217,7 @@ pub(crate) struct LocalClusterRuntimeState {
     reclaim_queue: (Mutex<LocalReclaimQueueState>, Condvar),
     #[cfg(test)]
     metadata_command_indexes: Mutex<HashMap<PgId, u64>>,
-    metadata_command_apply_lock: Mutex<()>,
     pending_metadata_commands: Mutex<HashMap<PgId, MetadataCommandEnvelope>>,
-    stream_segment_vids: Mutex<HashMap<SessionId, u64>>,
 }
 
 type LocalReclaimRoot = (BucketName, ObjectKey, GenerationId);
@@ -257,50 +255,8 @@ impl LocalClusterRuntimeState {
             ),
             #[cfg(test)]
             metadata_command_indexes: Mutex::new(HashMap::new()),
-            metadata_command_apply_lock: Mutex::new(()),
             pending_metadata_commands: Mutex::new(HashMap::new()),
-            stream_segment_vids: Mutex::new(HashMap::new()),
         }
-    }
-
-    pub(crate) fn allocate_stream_segment_vid(&self, session_id: &SessionId) -> GenerationId {
-        let mut stream_segment_vids = self
-            .stream_segment_vids
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let next_vid = stream_segment_vids
-            .entry(session_id.clone())
-            .or_insert(GenerationId::MIN.get());
-        let current_vid = *next_vid;
-        *next_vid = next_vid
-            .checked_add(1)
-            .expect("stream segment payload generation id overflow");
-        GenerationId::new(current_vid).expect("stream segment generation ids start at one")
-    }
-
-    pub(crate) fn clear_stream_segment_vid_allocator(&self, session_id: &SessionId) {
-        self.stream_segment_vids
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(session_id);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_stream_segment_vid_allocator_next(
-        &self,
-        session_id: &SessionId,
-    ) -> Option<u64> {
-        self.stream_segment_vids
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(session_id)
-            .copied()
-    }
-
-    pub(crate) fn lock_metadata_command_apply(&self) -> MutexGuard<'_, ()> {
-        self.metadata_command_apply_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
     }
 
     #[cfg(test)]
@@ -1476,7 +1432,7 @@ mod tests {
         AppendStreamSegmentCommand, BucketPropertyMutation, BucketSubresourceMutation,
         CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
         MetadataCommandPayload, PutBucketAclCommand, PutBucketVersioningCommand,
-        PutObjectMetadataCommand,
+        PutObjectMetadataCommand, ReserveObjectGenerationCommand,
     };
     use proptest::prelude::*;
     use proptest::test_runner::{TestCaseError, TestCaseResult};
@@ -1715,6 +1671,24 @@ mod tests {
                 object_lock: crate::BucketObjectLockConfig::default(),
             })
             .unwrap();
+    }
+
+    fn assert_stream_next_segment_vid(
+        map: &LocalClusterMap,
+        node_id: NodeId,
+        object_pg: u32,
+        session_id: &crate::SessionId,
+        expected: u64,
+    ) {
+        let node = map.node(node_id).unwrap().storage_node();
+        let pg = node.get_pg(object_pg).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::get_stream_upload(&*pg, session_id)
+                .unwrap()
+                .next_segment_vid
+                .get(),
+            expected
+        );
     }
 
     fn create_bucket_metadata_command(
@@ -3459,6 +3433,180 @@ mod tests {
                 .unwrap()
                 .is_none());
         }
+    }
+
+    #[test]
+    fn object_generation_reservation_rehydrates_durable_pending_slot_after_reopen() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap());
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "rehydrate-object-reserve-");
+        let key = key_for_object_pg(topology, &bucket, 2, "rehydrate-object-key-");
+        let pg_id = PgId::new(2);
+        let reservation_id = crate::SessionId::try_from("72".repeat(16)).unwrap();
+        let command = {
+            let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            create_test_bucket(&cluster, &bucket);
+            let primary_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(pg_id.get())
+                .unwrap();
+            let command = MetadataCommandEnvelope::new(
+                MetadataCommandId::new(
+                    ClusterEpoch::INITIAL,
+                    pg_id,
+                    MetadataCommandLogIndex::new(1).unwrap(),
+                ),
+                MetadataCommandPayload::ReserveObjectGeneration(
+                    ReserveObjectGenerationCommand::new(
+                        bucket.clone(),
+                        key.clone(),
+                        reservation_id.clone(),
+                        crate::GenerationId::MIN,
+                        123,
+                    ),
+                ),
+            );
+            primary_pg
+                .try_insert_pending_metadata_command_slot(0, &command, Some(&bucket))
+                .unwrap();
+            command
+        };
+        drop(map);
+
+        let map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap());
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(pg_id, &bucket)
+            .is_none());
+        {
+            let primary_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(pg_id.get())
+                .unwrap();
+            assert_eq!(
+                primary_pg
+                    .pending_metadata_command_envelope(0, ClusterEpoch::INITIAL)
+                    .unwrap()
+                    .unwrap(),
+                command
+            );
+        }
+
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        assert_eq!(
+            cluster
+                .reserve_put_object_generation(&bucket, &key, &reservation_id)
+                .unwrap(),
+            crate::GenerationId::MIN
+        );
+
+        for node_id in node_ids {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(pg_id.get())
+                .unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    &reservation_id,
+                )
+                .unwrap(),
+                crate::GenerationId::MIN
+            );
+            assert!(pg
+                .pending_metadata_command_slot(node_id.as_u32(), ClusterEpoch::INITIAL)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn stream_segment_vid_allocation_survives_reopen_without_runtime_state() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap());
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "stream-vid-bucket-");
+        let key = key_for_object_pg(topology, &bucket, 2, "stream-vid-key-");
+        let session_id = crate::SessionId::try_from("73".repeat(16)).unwrap();
+        {
+            let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            create_test_bucket(&cluster, &bucket);
+            cluster
+                .create_put_object_stream_session_record(
+                    &bucket,
+                    &key,
+                    &session_id,
+                    crate::ObjectEncryption::None,
+                )
+                .unwrap();
+            let (_target, first) = cluster
+                .prepare_stream_segment_append(
+                    &bucket,
+                    &key,
+                    &crate::PrepareStreamUploadSegmentAppendReq {
+                        session_id: session_id.clone(),
+                        segment_index: 0,
+                        size: 16,
+                        segment_crc64: Some(1),
+                        segment_okh: [0x73; 16],
+                    },
+                )
+                .unwrap();
+            assert_eq!(first.segment_vid, crate::GenerationId::MIN);
+            let primary = map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
+                .unwrap()
+                .node_id();
+            assert_stream_next_segment_vid(&map, primary, 2, &session_id, 2);
+        }
+        drop(map);
+
+        let map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap());
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let (_target, second) = cluster
+            .prepare_stream_segment_append(
+                &bucket,
+                &key,
+                &crate::PrepareStreamUploadSegmentAppendReq {
+                    session_id: session_id.clone(),
+                    segment_index: 1,
+                    size: 32,
+                    segment_crc64: Some(2),
+                    segment_okh: [0x74; 16],
+                },
+            )
+            .unwrap();
+        assert_eq!(second.segment_vid, crate::GenerationId::new(2).unwrap());
+        let primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
+            .unwrap()
+            .node_id();
+        assert_stream_next_segment_vid(&map, primary, 2, &session_id, 3);
     }
 
     #[test]
@@ -9422,7 +9570,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_abort_pending_drain_clears_runtime_vid_allocator() {
+    fn stream_abort_pending_drain_cleans_terminal_stream_session() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let ec_shape = EcShape { k: 2, m: 1 };
@@ -9466,11 +9614,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(
-            map.runtime_state()
-                .test_stream_segment_vid_allocator_next(&session_id),
-            Some(2)
-        );
+        assert_stream_next_segment_vid(&map, NodeId::new(1), object_pg, &session_id, 2);
         let written_shards = cluster
             .write_stream_segment_payload_shards(&segment, payload)
             .unwrap();
@@ -9534,11 +9678,7 @@ mod tests {
                 .is_some(),
             "partial abort command must remain pending"
         );
-        assert_eq!(
-            map.runtime_state()
-                .test_stream_segment_vid_allocator_next(&session_id),
-            Some(2)
-        );
+        assert_stream_next_segment_vid(&map, NodeId::new(1), object_pg, &session_id, 2);
 
         let next_reservation_id = crate::SessionId::try_from("46".repeat(16)).unwrap();
         cluster
@@ -9548,11 +9688,6 @@ mod tests {
             .runtime_state()
             .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
             .is_none());
-        assert_eq!(
-            map.runtime_state()
-                .test_stream_segment_vid_allocator_next(&session_id),
-            None
-        );
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(object_pg).unwrap();
@@ -9564,7 +9699,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_put_finalize_pending_drain_clears_runtime_vid_allocator() {
+    fn stream_put_finalize_pending_drain_cleans_terminal_stream_session() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let ec_shape = EcShape { k: 2, m: 1 };
@@ -9609,11 +9744,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(
-            map.runtime_state()
-                .test_stream_segment_vid_allocator_next(&session_id),
-            Some(2)
-        );
+        assert_stream_next_segment_vid(&map, NodeId::new(1), object_pg, &session_id, 2);
         let written_shards = cluster
             .write_stream_segment_payload_shards(&segment, payload)
             .unwrap();
@@ -9692,11 +9823,7 @@ mod tests {
                 .is_some(),
             "partial stream PUT finalize command must remain pending"
         );
-        assert_eq!(
-            map.runtime_state()
-                .test_stream_segment_vid_allocator_next(&session_id),
-            Some(2)
-        );
+        assert_stream_next_segment_vid(&map, NodeId::new(1), object_pg, &session_id, 2);
 
         let next_reservation_id = crate::SessionId::try_from("4a".repeat(16)).unwrap();
         cluster
@@ -9706,11 +9833,6 @@ mod tests {
             .runtime_state()
             .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
             .is_none());
-        assert_eq!(
-            map.runtime_state()
-                .test_stream_segment_vid_allocator_next(&session_id),
-            None
-        );
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(object_pg).unwrap();
@@ -9835,7 +9957,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_part_finalize_pending_drain_clears_runtime_vid_allocator() {
+    fn stream_part_finalize_pending_drain_cleans_terminal_stream_session() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let ec_shape = EcShape { k: 2, m: 1 };
@@ -9909,11 +10031,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(
-            map.runtime_state()
-                .test_stream_segment_vid_allocator_next(&session_id),
-            Some(2)
-        );
+        assert_stream_next_segment_vid(&map, NodeId::new(1), object_pg, &session_id, 2);
         let written_shards = cluster
             .write_stream_segment_payload_shards(&segment, payload)
             .unwrap();
@@ -10012,11 +10130,7 @@ mod tests {
                 .is_some(),
             "partial stream part command must remain pending"
         );
-        assert_eq!(
-            map.runtime_state()
-                .test_stream_segment_vid_allocator_next(&session_id),
-            Some(2)
-        );
+        assert_stream_next_segment_vid(&map, NodeId::new(1), object_pg, &session_id, 2);
 
         let next_reservation_id = crate::SessionId::try_from("48".repeat(16)).unwrap();
         cluster
@@ -10026,11 +10140,6 @@ mod tests {
             .runtime_state()
             .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
             .is_none());
-        assert_eq!(
-            map.runtime_state()
-                .test_stream_segment_vid_allocator_next(&session_id),
-            None
-        );
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(object_pg).unwrap();
@@ -10053,7 +10162,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_segment_prepare_uses_local_runtime_vid_allocator() {
+    fn stream_segment_prepare_uses_durable_session_vid_allocator() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let ec_shape = EcShape { k: 2, m: 1 };

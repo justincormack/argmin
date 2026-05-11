@@ -192,6 +192,7 @@ CREATE TABLE IF NOT EXISTS stream_uploads (
     created_at    INTEGER NOT NULL,
     encryption_type INTEGER NOT NULL DEFAULT 0 CHECK (encryption_type IN (0, 1, 2)),
     encryption_state BLOB,
+    next_segment_vid INTEGER NOT NULL DEFAULT 1 CHECK (next_segment_vid > 0),
     CHECK (op_kind IN (0, 1)),
     CHECK (state IN (0, 1, 2, 3)),
     CHECK (
