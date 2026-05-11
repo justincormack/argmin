@@ -1,0 +1,135 @@
+PG-scoped clear can drop unrelated pending metadata
+Link: https://chatgpt.com/codex/cloud/security/findings/0114a234dea081919f705a7795caca9b?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 513501e
+Author: justin@specialbusservice.com
+Created: 10/05/2026, 22:00:55
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced. The change to PG-scoped pending slots is not consistently reflected at the bucket-delete cleanup site: a function that previously removed only one bucket's pending command now removes the whole PG entry, and an existing caller still invokes it as if it were bucket-scoped.
+Pending metadata commands are the recovery mechanism used when a metadata command is partially applied or must be retried. This commit changes LocalClusterRuntimeState.pending_metadata_commands from a (PgId, BucketName) map to a PgId-only map, and clear_pending_metadata_command_for_bucket now ignores the bucket argument and removes the entire PG slot. However, delete_bucket_from_acting_set still calls clear_pending_metadata_command_for_bucket after deleting one finalized bucket, without checking whether the PG slot belongs to that bucket. If another bucket on the same PG has a pending metadata command at that time, the bucket-delete finalizer can erase that unrelated pending command. If the erased command represented a partial apply or an in-flight command that later fails and needs retry, the recovery path is lost, leaving replicas or metadata state inconsistent. Since metadata commands include bucket ACL/public-access settings, object commits/deletes, and multipart cleanup, this can lead to permanent metadata corruption or data loss under concurrency plus a partial-apply/failure condition.
+
+# Resolution
+Fixed in commit `580979d` (`Preserve unrelated pending metadata on bucket finalize`).
+
+The bucket finalization path no longer clears the PG-scoped in-memory pending metadata slot after deleting one finalized bucket. That clear was stale bucket-scoped cleanup from before the pending map became PG-scoped. The bucket's own `MarkBucketDeleting` command is already drained and removed by `begin_bucket_delete`; finalization is the explicit direct finalized-delete exception and must not remove unrelated PG pending work.
+
+Added regression coverage in `finalized_bucket_delete_preserves_unrelated_same_pg_pending_command`, which creates two buckets on the same metadata PG, installs a pending command for one bucket, finalizes deletion of the other, and asserts the unrelated pending command remains.
+
+Verification for the fix:
+- `cargo nextest run -p storage`: 521 passed
+- `cargo clippy --all-targets --all-features -- -D warnings`: passed
+- `./scripts/check-storage-cluster-boundaries`: passed
+- `git diff --check`: passed
+- `cargo nextest run`: 4547 passed
+
+# Validation
+## Rubric
+- [x] Confirm the commit made pending metadata command slots PG-scoped rather than `(PgId, BucketName)` scoped.
+- [x] Confirm `clear_pending_metadata_command_for_bucket` ignores the bucket and removes the entire PG slot.
+- [x] Confirm bucket-delete finalization still invokes the bucket-named clear routine after deleting only one bucket and does not verify pending-command ownership.
+- [x] Reproduce dynamically with two buckets on the same metadata PG where one bucket has an unrelated pending command while the other bucket is finalized for deletion.
+- [x] Attempt direct crash/failing PoC, Valgrind/ASan-style validation, and debugger tracing before final code-understanding conclusion.
+## Report
+Validated the finding with a targeted Rust unit-test PoC. Code evidence: `crates/storage/src/cluster/local.rs:219` stores `pending_metadata_commands` as `HashMap<PgId, MetadataCommandEnvelope>`, so slots are PG-scoped. `local.rs:365-374` implements `clear_pending_metadata_command_for_bucket` by ignoring `bucket` and calling `.remove(&pg_id)`. `crates/storage/src/cluster/request_ops.rs:956-989` finalizes deletion of one bucket and then unconditionally calls `clear_pending_metadata_command_for_bucket(pg_id, bucket)`, with no check that the PG-scoped pending command belongs to the deleted bucket. I added a PoC test that creates two buckets mapped to metadata PG 1, marks one bucket deleting, manually installs a pending `PutBucketVersioning` command for the other bucket in the same PG slot, finalizes deletion of the first bucket, and asserts the survivor bucket's pending command remains. On commit 513501e0ff209f922da7f9bee2dffb1c97811c65, the test panics because the pending command is gone: `left: None`, `right: Some(MetadataCommandEnvelope ... bucket: "pending-survivor-1" ...)`. This directly reproduces the suspected cross-bucket pending-command loss. I also attempted Valgrind; it is not installed in the container (`bash: command not found: valgrind`). I ran LLDB non-interactively and set a breakpoint at `request_ops.rs:986`; the backtrace showed `try_finalize_bucket_delete` -> `delete_bucket_from_acting_set` immediately before the unconditional call to `.clear_pending_metadata_command_for_bucket(pg_id, bucket)`, followed by the PoC assertion failure.
+
+# Evidence
+crates/storage/src/cluster/local.rs (L219 to 219)
+  Note: The pending command map is now keyed only by PgId, so all buckets sharing a PG share one pending slot.
+```
+    pending_metadata_commands: Mutex<HashMap<PgId, MetadataCommandEnvelope>>,
+```
+
+crates/storage/src/cluster/local.rs (L365 to 374)
+  Note: clear_pending_metadata_command_for_bucket ignores the bucket parameter and removes the entire PG entry, so it can clear another bucket's pending command.
+```
+    pub(crate) fn clear_pending_metadata_command_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) {
+        let _ = bucket;
+        self.pending_metadata_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&pg_id);
+```
+
+crates/storage/src/cluster/request_ops.rs (L971 to 989)
+  Note: Bucket delete finalization still calls the bucket-named clear routine unconditionally after deleting one bucket, which can now erase an unrelated pending command for the same PG.
+```
+        for node in nodes {
+            let pg = node.storage_node().get_pg(pg_id.get())?;
+            match PgMetadataStore::delete_finalized_bucket(&*pg, bucket) {
+                Ok(()) => {
+                    pg.refresh_metadata_command_state_digest()?;
+                }
+                Err(crate::error::MetadataError::BucketNotFound { .. })
+                    if node.node_id() == primary_node_id =>
+                {
+                    return Ok(BucketDeleteFinalizeOutcome::NotFound);
+                }
+                Err(crate::error::MetadataError::BucketNotFound { .. }) => {}
+                Err(other) => return Err(other.into()),
+            }
+        }
+        self.local_map
+            .runtime_state()
+            .clear_pending_metadata_command_for_bucket(pg_id, bucket);
+        Ok(BucketDeleteFinalizeOutcome::Finalized)
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Adjusted from high to medium. The code evidence and executable unit-test PoC make the bug real: PG-scoped pending metadata state can be cleared by a bucket-scoped delete finalizer. It is also in a production runtime path reachable from authenticated S3 DeleteBucket processing. However, high severity is not well supported for an external security rating because the path is admin/owner-authenticated, default deployment is single-account/single-service, the effect is integrity/availability rather than confidentiality or privilege escalation, and the damaging case depends on an unusual partial-apply/failure race. The likely security posture is a serious data-integrity defect with low exploit likelihood rather than an immediate high-severity compromise.
+## Likelihood
+low - The vulnerable code is in a reachable production path, but exploitability is constrained: the attacker needs valid privileged S3 credentials, same-PG bucket placement, asynchronous finalization timing, and a pending command caused by partial apply or failure. The validation PoC proves the state corruption but manually constructed the pending condition rather than demonstrating a simple HTTP-only exploit.
+## Impact
+medium - If the race aligns with a partial metadata apply or retry-needed operation, a recovery command for an unrelated bucket can be lost, risking durable metadata inconsistency and possible object/bucket data loss. The impact is materially important for an object store, but no confidentiality breach, code execution, authentication bypass, or verified cross-account boundary break is shown.
+## Assumptions
+- The deployed service is the argmin-s3 binary using the storage cluster implementation in crates/storage.
+- A realistic attacker has valid SigV4 credentials with bucket-owner or owner-account-admin authority; unauthenticated users cannot trigger the bucket delete path.
+- The damaging condition requires an in-flight or partially applied metadata command for one bucket while another bucket on the same metadata PG is finalized for deletion.
+- argmin-s3 HTTP service reachable on its configured listener
+- valid SigV4 credentials accepted by the configured CredentialStore
+- bucket-owner or OwnerAccountAdmin authorization for DeleteBucket
+- two buckets mapped to the same metadata placement group
+- one bucket deletion reaches asynchronous finalization while an unrelated metadata command for the other bucket is pending
+- a partial-apply or failure condition where the pending command is needed for retry/recovery
+## Path
+S3 client -> HTTP/SigV4 -> DeleteBucket authz -> enqueue finalize -> reclaim worker -> clear_pending_metadata_command_for_bucket(pg_id, bucket) -> remove PgId slot -> unrelated bucket recovery command lost -> metadata inconsistency/data loss
+## Path evidence
+- `crates/storage/src/cluster/local.rs:219` - pending_metadata_commands is keyed only by PgId, so all buckets sharing a metadata PG share one pending slot.
+- `crates/storage/src/cluster/local.rs:365-374` - clear_pending_metadata_command_for_bucket ignores the bucket parameter and removes the whole PgId entry.
+- `crates/storage/src/cluster/request_ops.rs:956-989` - delete_bucket_from_acting_set deletes one finalized bucket and then unconditionally clears the PG pending slot through the bucket-named clear API.
+- `crates/storage/src/cluster/request_ops.rs:1262-1311` - try_finalize_bucket_delete reaches delete_bucket_from_acting_set after checking the bucket is deleting and drained.
+- `crates/server-http/src/http/mod.rs:1272-1279` - The S3 DeleteBucket operation is routed from the HTTP frontend into Coordinator::delete_bucket.
+- `crates/server-core/src/coordinator/bucket.rs:299-305` - Coordinator::delete_bucket authorizes, begins bucket deletion, and enqueues bucket-delete finalization work.
+- `crates/server-core/src/coordinator/infra.rs:317-328` - The production reclaim worker processes BucketDelete work by calling try_finalize_bucket_delete_for.
+- `crates/server-core/src/coordinator/authz/bucket.rs:90-101` - DeleteBucket is protected by authorization requiring bucket-owner/account-admin style permission.
+- `crates/server-core/src/coordinator/authz.rs:400-406` - The relevant authorization helper accepts bucket owner principal or OwnerAccountAdmin for the bucket owner account.
+- `crates/argmin-s3/src/main.rs:136-143` - The default binary wires the configured credential as AuthorizationProfile::OwnerAccountAdmin.
+- `crates/argmin-s3/src/config.rs:59-68` - Credentials and listen address are environment configured; default listen address is localhost:9000.
+- `crates/storage/src/metadata_command.rs:242-265` - Pending metadata commands cover bucket ACL/versioning/properties and object commit/delete/multipart state, so losing one can affect integrity and availability of stored metadata/data.
+- `crates/storage/src/cluster.rs:981-1008` - Metadata commands are installed as pending before apply; on errors after some nodes have been applied, the pending command is not removed, showing why the pending slot is the recovery mechanism.
+## Narrative
+The finding is a real production-code bug. The pending metadata map is now keyed only by PgId, and clear_pending_metadata_command_for_bucket ignores the bucket argument and removes the entire PG slot. The bucket-delete finalizer still calls this routine after deleting only one finalized bucket, so an unrelated bucket's pending recovery command on the same PG can be erased. The normal entry path is the authenticated S3 DeleteBucket API, which enqueues asynchronous finalization. However, exploitation is not unauthenticated and is not a simple request-only attack: DeleteBucket requires bucket-owner/admin authority, and the harmful outcome also requires another pending metadata command plus a partial-apply/failure condition. Because the product is effectively single-tenant by default and the demonstrated impact is cross-bucket rather than cross-account, this should be treated as a serious integrity/reliability issue with security relevance, but not as a straightforward high-severity external compromise.
+## Controls
+- SigV4 authentication in server-http/auth
+- DeleteBucket authorization requires bucket owner or OwnerAccountAdmin
+- Default ARGMIN_LISTEN_ADDR is 127.0.0.1:9000
+- Optional TLS configured by ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- Max connections and max in-flight request limits are configurable
+- PG-scoped pending slot rejects conflicting concurrent metadata commands but does not protect the bucket-delete clear path
+## Blindspots
+- Static-only review did not run the full HTTP service or construct an end-to-end S3 request sequence that naturally creates the partial pending-command condition.
+- No deployment manifests, Kubernetes ingress, or load balancer configuration were present, so external exposure beyond the default localhost listener is unknown.
+- Repository supports richer authorization concepts in tests, but the main binary appears to configure a single OwnerAccountAdmin credential; alternate embedding/deployment models could change the cross-boundary assessment.
+- The exact probability of attacker-induced partial metadata apply failures depends on runtime filesystem/node failure modes that cannot be measured from static artifacts alone.
