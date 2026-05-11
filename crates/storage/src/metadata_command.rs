@@ -1,4 +1,4 @@
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 
 use s3_types::{
     AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId,
@@ -1037,6 +1037,33 @@ pub(crate) fn decode_metadata_command_log_entry_header(
     Err("unknown metadata command log entry magic".to_string())
 }
 
+pub(crate) fn decode_metadata_command_envelope(
+    bytes: &[u8],
+) -> Result<MetadataCommandEnvelope, String> {
+    let mut decoder = MetadataCommandLogEntryDecoder::new(bytes);
+    let magic = decoder.read_bytes()?;
+    if magic != METADATA_COMMAND_MAGIC {
+        return Err(
+            "pending metadata command slot does not contain an applied command".to_string(),
+        );
+    }
+    let version = decoder.read_u16()?;
+    if version != METADATA_COMMAND_ENCODING_VERSION {
+        return Err(format!(
+            "unsupported metadata command encoding version {version}"
+        ));
+    }
+    let id = decoder.read_command_id()?;
+    let payload_kind = decoder.read_u16()?;
+    let payload = decoder.read_metadata_command_payload(payload_kind)?;
+    decoder.finish()?;
+    let envelope = MetadataCommandEnvelope::new(id, payload);
+    if envelope.command_bytes() != bytes {
+        return Err("decoded metadata command did not round-trip canonical bytes".to_string());
+    }
+    Ok(envelope)
+}
+
 fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPayload) -> Vec<u8> {
     let mut out = Vec::new();
     put_bytes(&mut out, METADATA_COMMAND_MAGIC);
@@ -1312,6 +1339,73 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         }
     }
 
+    fn read_metadata_command_payload(
+        &mut self,
+        kind_id: u16,
+    ) -> Result<MetadataCommandPayload, String> {
+        match kind_id {
+            METADATA_COMMAND_CREATE_BUCKET => {
+                Ok(MetadataCommandPayload::CreateBucket(CreateBucketCommand {
+                    bucket: self.read_bucket_record()?,
+                }))
+            }
+            METADATA_COMMAND_PUT_BUCKET_VERSIONING => Ok(
+                MetadataCommandPayload::PutBucketVersioning(PutBucketVersioningCommand {
+                    bucket: self.read_bucket_record()?,
+                }),
+            ),
+            METADATA_COMMAND_PUT_BUCKET_ACL => {
+                Ok(MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand {
+                    bucket: self.read_bucket_record()?,
+                }))
+            }
+            METADATA_COMMAND_PUT_BUCKET_PROPERTY => {
+                let bucket = self.read_bucket_record()?;
+                let effect = match self.read_u8()? {
+                    0 => BucketPropertyEffect::ObjectLock,
+                    1 => BucketPropertyEffect::Encryption,
+                    2 => BucketPropertyEffect::PublicAccessBlock,
+                    3 => BucketPropertyEffect::OwnershipControls,
+                    4 => BucketPropertyEffect::AbacEnabled,
+                    effect => return Err(format!("invalid bucket property effect {effect}")),
+                };
+                Ok(MetadataCommandPayload::PutBucketProperty(
+                    PutBucketPropertyCommand { bucket, effect },
+                ))
+            }
+            METADATA_COMMAND_PUT_BUCKET_SUBRESOURCE => Ok(
+                MetadataCommandPayload::PutBucketSubresource(PutBucketSubresourceCommand {
+                    name: self.read_bucket_name()?,
+                    mutation: self.read_bucket_subresource_mutation()?,
+                    bucket_execution_generation: self.read_u64()?,
+                }),
+            ),
+            METADATA_COMMAND_MARK_BUCKET_DELETING => Ok(
+                MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand {
+                    bucket: self.read_bucket_record()?,
+                }),
+            ),
+            METADATA_COMMAND_DELETE_COMPLETED_MULTIPART_UPLOAD => {
+                Ok(MetadataCommandPayload::DeleteCompletedMultipartUpload(
+                    Box::new(DeleteCompletedMultipartUploadCommand {
+                        record: self.read_completed_multipart_upload()?,
+                    }),
+                ))
+            }
+            METADATA_COMMAND_ADVANCE_COMPLETED_MULTIPART_UPLOAD_SEQUENCE => Ok(
+                MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
+                    AdvanceCompletedMultipartUploadSequenceCommand {
+                        bucket: self.read_bucket_name()?,
+                        completion_order: self.read_u64()?,
+                    },
+                ),
+            ),
+            _ => Err(format!(
+                "pending metadata command payload kind {kind_id} does not have a typed decoder yet"
+            )),
+        }
+    }
+
     fn skip_repeated(
         &mut self,
         mut skip_item: impl FnMut(&mut Self) -> Result<(), String>,
@@ -1336,6 +1430,46 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
 
     fn skip_str(&mut self) -> Result<(), String> {
         self.read_bytes().map(|_| ())
+    }
+
+    fn read_string(&mut self, field: &'static str) -> Result<String, String> {
+        std::str::from_utf8(self.read_bytes()?)
+            .map(str::to_owned)
+            .map_err(|error| format!("{field} is not UTF-8: {error}"))
+    }
+
+    fn read_bucket_name(&mut self) -> Result<BucketName, String> {
+        BucketName::try_from(self.read_string("bucket name")?)
+            .map_err(|reason| format!("invalid bucket name in metadata command: {reason}"))
+    }
+
+    fn read_object_key(&mut self) -> Result<ObjectKey, String> {
+        ObjectKey::try_from(self.read_string("object key")?)
+            .map_err(|reason| format!("invalid object key in metadata command: {reason}"))
+    }
+
+    fn read_upload_id(&mut self) -> Result<UploadId, String> {
+        UploadId::try_from(self.read_string("upload id")?)
+            .map_err(|reason| format!("invalid upload id in metadata command: {reason}"))
+    }
+
+    fn read_canonical_user_id(&mut self) -> Result<CanonicalUserId, String> {
+        let value = self.read_string("canonical user id")?;
+        CanonicalUserId::parse_stored(&value)
+            .ok_or_else(|| format!("invalid canonical user id in metadata command: {value}"))
+    }
+
+    fn read_acl_grants(&mut self) -> Result<AclGrants, String> {
+        AclGrants::parse(&self.read_string("ACL grants")?)
+            .map_err(|reason| format!("invalid ACL grants in metadata command: {reason}"))
+    }
+
+    fn read_bool(&mut self) -> Result<bool, String> {
+        match self.read_u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            tag => Err(format!("invalid bool value {tag}")),
+        }
     }
 
     fn skip_optional_str(&mut self) -> Result<(), String> {
@@ -1403,8 +1537,38 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_u64()?;
         self.read_u64()?;
         self.read_u64()?;
+        self.read_u64()?;
         self.skip_bool()?;
         self.skip_bucket_encryption()
+    }
+
+    fn read_bucket_record(&mut self) -> Result<BucketRecord, String> {
+        Ok(BucketRecord {
+            name: self.read_bucket_name()?,
+            owner_principal: self.read_string("bucket owner principal")?,
+            owner_canonical_id: self.read_canonical_user_id()?,
+            created_at: self.read_u64()?,
+            region: self.read_u16()?,
+            state: BucketState::from_u8(self.read_u8()?)
+                .ok_or_else(|| "invalid bucket state in metadata command".to_string())?,
+            versioning: BucketVersioningState::from_u8(self.read_u8()?)
+                .ok_or_else(|| "invalid bucket versioning state in metadata command".to_string())?,
+            object_lock: self.read_bucket_object_lock()?,
+            acl_grants: self.read_acl_grants()?,
+            public_read: self.read_bool()?,
+            public_write: self.read_bool()?,
+            write_reservations_blocked: false,
+            active_write_reservations: 0,
+            public_access_block: self.read_public_access_block()?,
+            ownership_controls: self.read_ownership_controls()?,
+            bucket_policy_public: self.read_bool()?,
+            bucket_policy_generation: self.read_u64()?,
+            bucket_lifecycle_generation: self.read_u64()?,
+            bucket_execution_generation: self.read_u64()?,
+            completed_multipart_upload_sequence: self.read_u64()?,
+            bucket_abac_enabled: self.read_bool()?,
+            encryption: self.read_bucket_encryption()?,
+        })
     }
 
     fn skip_put_live_object(&mut self) -> Result<(), String> {
@@ -1581,6 +1745,20 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.skip_owner_identity()
     }
 
+    fn read_completed_multipart_upload(
+        &mut self,
+    ) -> Result<CompletedMultipartUploadRecord, String> {
+        Ok(CompletedMultipartUploadRecord {
+            upload_id: self.read_upload_id()?,
+            bucket: self.read_bucket_name()?,
+            key: self.read_object_key()?,
+            completion_order: self.read_u64()?,
+            completed_at: self.read_u64()?,
+            initiator: self.read_optional_owner_identity()?,
+            owner: self.read_owner_identity()?,
+        })
+    }
+
     fn skip_object_payload_reclaim(&mut self) -> Result<(), String> {
         match self.read_u8()? {
             0 => self.skip_object_segments_reclaim(),
@@ -1735,8 +1913,23 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.skip_str()
     }
 
+    fn read_owner_identity(&mut self) -> Result<OwnerIdentity, String> {
+        Ok(OwnerIdentity::new(
+            self.read_string("owner principal")?,
+            self.read_canonical_user_id()?,
+        ))
+    }
+
     fn skip_optional_owner_identity(&mut self) -> Result<(), String> {
         self.skip_optional(Self::skip_owner_identity)
+    }
+
+    fn read_optional_owner_identity(&mut self) -> Result<Option<OwnerIdentity>, String> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => self.read_owner_identity().map(Some),
+            tag => Err(format!("invalid optional owner identity tag {tag}")),
+        }
     }
 
     fn skip_optional_multipart_checksum_config(&mut self) -> Result<(), String> {
@@ -1761,21 +1954,63 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         }
     }
 
-    fn read_bucket_subresource_kind(&mut self) -> Result<u8, String> {
-        let kind = self.read_u8()?;
-        if matches!(kind, 0 | 1 | 4 | 5) {
-            Ok(kind)
-        } else {
-            Err(format!("invalid bucket subresource kind {kind}"))
+    fn read_bucket_subresource_mutation(&mut self) -> Result<BucketSubresourceMutation, String> {
+        match self.read_u8()? {
+            1 => {
+                let kind = self.read_bucket_subresource_kind()?;
+                let body = self.read_string("bucket subresource body")?;
+                let aux = self.read_bucket_subresource_aux(kind)?;
+                Ok(BucketSubresourceMutation::Put { kind, body, aux })
+            }
+            2 => Ok(BucketSubresourceMutation::Delete {
+                kind: self.read_bucket_subresource_kind()?,
+            }),
+            tag => Err(format!("invalid bucket subresource mutation tag {tag}")),
         }
     }
 
-    fn skip_bucket_subresource_aux(&mut self, kind: u8) -> Result<(), String> {
+    fn read_bucket_subresource_kind(&mut self) -> Result<BucketSubresourceKind, String> {
+        BucketSubresourceKind::from_u8(self.read_u8()?)
+            .ok_or_else(|| "invalid bucket subresource kind".to_string())
+    }
+
+    fn skip_bucket_subresource_aux(&mut self, kind: BucketSubresourceKind) -> Result<(), String> {
         match self.read_u8()? {
-            0 if matches!(kind, 0 | 1 | 5) => Ok(()),
-            1 if kind == 4 => self.skip_bool(),
+            0 if matches!(
+                kind,
+                BucketSubresourceKind::Cors
+                    | BucketSubresourceKind::Tagging
+                    | BucketSubresourceKind::Lifecycle
+            ) =>
+            {
+                Ok(())
+            }
+            1 if kind == BucketSubresourceKind::Policy => self.skip_bool(),
             tag => Err(format!(
-                "bucket subresource kind {kind} does not support aux tag {tag}"
+                "bucket subresource kind {kind:?} does not support aux tag {tag}"
+            )),
+        }
+    }
+
+    fn read_bucket_subresource_aux(
+        &mut self,
+        kind: BucketSubresourceKind,
+    ) -> Result<BucketSubresourceAux, String> {
+        match self.read_u8()? {
+            0 if matches!(
+                kind,
+                BucketSubresourceKind::Cors
+                    | BucketSubresourceKind::Tagging
+                    | BucketSubresourceKind::Lifecycle
+            ) =>
+            {
+                Ok(BucketSubresourceAux::None)
+            }
+            1 if kind == BucketSubresourceKind::Policy => {
+                Ok(BucketSubresourceAux::policy(self.read_bool()?))
+            }
+            tag => Err(format!(
+                "bucket subresource kind {kind:?} does not support aux tag {tag}"
             )),
         }
     }
@@ -1789,6 +2024,21 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.skip_bool()
     }
 
+    fn read_bucket_encryption(&mut self) -> Result<BucketEncryptionConfig, String> {
+        let default_encryption = match self.read_u8()? {
+            0 => None,
+            1 => Some(
+                ManagedEncryptionAlgorithm::from_u8(self.read_u8()?)
+                    .ok_or_else(|| "invalid managed encryption algorithm".to_string())?,
+            ),
+            tag => return Err(format!("invalid bucket encryption tag {tag}")),
+        };
+        Ok(BucketEncryptionConfig {
+            default_encryption,
+            sse_c_blocked: self.read_bool()?,
+        })
+    }
+
     fn skip_public_access_block(&mut self) -> Result<(), String> {
         self.skip_optional(|decoder| {
             decoder.skip_bool()?;
@@ -1798,8 +2048,32 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         })
     }
 
+    fn read_public_access_block(&mut self) -> Result<Option<PublicAccessBlockConfig>, String> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(PublicAccessBlockConfig {
+                block_public_acls: self.read_bool()?,
+                ignore_public_acls: self.read_bool()?,
+                block_public_policy: self.read_bool()?,
+                restrict_public_buckets: self.read_bool()?,
+            })),
+            tag => Err(format!("invalid public access block optional tag {tag}")),
+        }
+    }
+
     fn skip_ownership_controls(&mut self) -> Result<(), String> {
         self.skip_optional(|decoder| decoder.read_valid_u8("bucket object ownership", 0..=2))
+    }
+
+    fn read_ownership_controls(&mut self) -> Result<Option<BucketOwnershipControls>, String> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(BucketOwnershipControls {
+                object_ownership: BucketObjectOwnership::from_u8(self.read_u8()?)
+                    .ok_or_else(|| "invalid bucket object ownership".to_string())?,
+            })),
+            tag => Err(format!("invalid ownership controls optional tag {tag}")),
+        }
     }
 
     fn skip_bucket_object_lock(&mut self) -> Result<(), String> {
@@ -1817,6 +2091,37 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             }
             tag => Err(format!("invalid bucket object lock retention tag {tag}")),
         }
+    }
+
+    fn read_bucket_object_lock(&mut self) -> Result<BucketObjectLockConfig, String> {
+        let enabled = self.read_bool()?;
+        let default_retention = match self.read_u8()? {
+            0 => None,
+            1 => {
+                let mode = ObjectLockMode::from_u8(self.read_u8()?)
+                    .ok_or_else(|| "invalid object lock default retention mode".to_string())?;
+                let period =
+                    match self.read_u8()? {
+                        1 => RetentionPeriod::Days(NonZeroU32::new(self.read_u32()?).ok_or_else(
+                            || "object lock default days must be non-zero".to_string(),
+                        )?),
+                        2 => RetentionPeriod::Years(NonZeroU32::new(self.read_u32()?).ok_or_else(
+                            || "object lock default years must be non-zero".to_string(),
+                        )?),
+                        tag => {
+                            return Err(format!(
+                                "invalid object lock default retention period tag {tag}"
+                            ))
+                        }
+                    };
+                Some(ObjectLockDefaultRetention { mode, period })
+            }
+            tag => return Err(format!("invalid bucket object lock retention tag {tag}")),
+        };
+        Ok(BucketObjectLockConfig {
+            enabled,
+            default_retention,
+        })
     }
 
     fn finish(&self) -> Result<(), String> {
@@ -2233,6 +2538,7 @@ fn encode_bucket_record(out: &mut Vec<u8>, bucket: &BucketRecord) {
     put_u64(out, bucket.bucket_policy_generation);
     put_u64(out, bucket.bucket_lifecycle_generation);
     put_u64(out, bucket.bucket_execution_generation);
+    put_u64(out, bucket.completed_multipart_upload_sequence);
     put_bool(out, bucket.bucket_abac_enabled);
     encode_bucket_encryption(out, bucket.encryption);
 }
@@ -2671,6 +2977,12 @@ mod tests {
         );
     }
 
+    fn assert_full_envelope_decoder_round_trips(envelope: &MetadataCommandEnvelope) {
+        let decoded = decode_metadata_command_envelope(&envelope.command_bytes())
+            .expect("full metadata command envelope must decode");
+        assert_eq!(decoded, *envelope);
+    }
+
     #[test]
     fn metadata_command_canonical_encoding_is_stable() {
         let owner = CanonicalUserId::from_principal("owner");
@@ -2704,7 +3016,8 @@ mod tests {
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
-        assert_eq!(envelope.checksum_crc64(), 0x66809b9080b3d0ce);
+        assert_full_envelope_decoder_round_trips(&envelope);
+        assert_eq!(envelope.checksum_crc64(), 0xb946d8ee1f29e72d);
     }
 
     #[test]
@@ -2787,9 +3100,10 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x5b70f24232e19e41);
+        assert_eq!(envelope.checksum_crc64(), 0x0c1951d65edbd251);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
+        assert_full_envelope_decoder_round_trips(&envelope);
     }
 
     #[test]
@@ -2812,9 +3126,10 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0xef5303af8c76b99e);
+        assert_eq!(envelope.checksum_crc64(), 0x06ba0a6e63da3c40);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
+        assert_full_envelope_decoder_round_trips(&envelope);
     }
 
     #[test]
@@ -2852,6 +3167,7 @@ mod tests {
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
+        assert_full_envelope_decoder_round_trips(&envelope);
     }
 
     #[test]
@@ -2871,9 +3187,10 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0xaa6f66f9a614e924);
+        assert_eq!(envelope.checksum_crc64(), 0x8d2d435216256076);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
+        assert_full_envelope_decoder_round_trips(&envelope);
     }
 
     #[test]
@@ -2945,18 +3262,19 @@ mod tests {
             assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
             assert!(envelope.verify_checksum());
             assert_applied_log_decoder_accepts(&envelope);
+            assert_full_envelope_decoder_round_trips(&envelope);
             checksums.push(envelope.checksum_crc64());
         }
         assert_eq!(
             checksums,
             [
-                0xf27692e29e21bb1f,
-                0x80d40aaea5acf124,
-                0x1072c4f57d813743,
-                0x277b3c42b8d9d442,
-                0x00dc5a4ce204ff47,
-                0x316cb12d15f693df,
-                0xb3eb4da7c314e661,
+                0x095cf1d0417e611c,
+                0x4711437e605b526e,
+                0xe610caa6d4b779ba,
+                0x711d9104009568b9,
+                0x23c58b23008c3a11,
+                0xd6c41b2d75142020,
+                0xe1c94f024274c273,
             ]
         );
     }
@@ -3026,6 +3344,7 @@ mod tests {
             assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
             assert!(envelope.verify_checksum());
             assert_applied_log_decoder_accepts(&envelope);
+            assert_full_envelope_decoder_round_trips(&envelope);
             checksums.push(envelope.checksum_crc64());
         }
         assert_eq!(
@@ -3561,6 +3880,13 @@ mod tests {
             assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
             assert!(envelope.verify_checksum());
             assert_applied_log_decoder_accepts(&envelope);
+            if matches!(
+                envelope.payload(),
+                MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
+                    | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_)
+            ) {
+                assert_full_envelope_decoder_round_trips(&envelope);
+            }
             checksums.push(envelope.checksum_crc64());
         }
         assert_eq!(

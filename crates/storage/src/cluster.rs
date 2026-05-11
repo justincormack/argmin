@@ -466,6 +466,12 @@ impl StorageCluster {
         command: &MetadataCommandEnvelope,
     ) -> Result<Option<MetadataCommandEnvelope>, BucketSnapshotLoadError> {
         let bucket = command.bucket_name().clone();
+        // The acting-set max scan must not observe the primary-last fanout of
+        // another command half way through. A durable non-primary-only tail is
+        // still a conflict, but an in-flight apply should finish before we
+        // decide whether reissue is safe.
+        let runtime_state = self.local_map.runtime_state();
+        let _apply_guard = runtime_state.lock_metadata_command_apply();
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
@@ -752,6 +758,36 @@ impl StorageCluster {
             return Err(error);
         }
         Ok(Some(()))
+    }
+
+    fn pending_metadata_command_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
+        let runtime_state = self.local_map.runtime_state();
+        if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket) {
+            return Ok(Some(command));
+        }
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let pg = primary.storage_node().get_pg(pg_id.get())?;
+        let Some(command) = pg.pending_metadata_command_envelope(
+            primary.node_id().as_u32(),
+            self.operation_epoch(),
+        )?
+        else {
+            return Ok(None);
+        };
+        match runtime_state.try_set_pending_metadata_command_for_bucket(
+            pg_id,
+            command.bucket_name(),
+            command.clone(),
+        ) {
+            Ok(()) => Ok(Some(command)),
+            Err(_) => Ok(runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)),
+        }
     }
 
     fn remove_pending_metadata_command_for_bucket(

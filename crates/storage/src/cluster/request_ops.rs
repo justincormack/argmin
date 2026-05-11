@@ -536,52 +536,54 @@ impl super::StorageCluster {
         }
 
         let pg_id = PgId::new(pg_id);
-        let runtime_state = self.local_map.runtime_state();
         loop {
-            let (command, clear_pending_on_zero_apply) = if let Some(command) =
-                runtime_state.pending_metadata_command_for_bucket(pg_id, &bucket)
+            let (command, clear_pending_on_zero_apply) = match self
+                .pending_metadata_command_for_bucket(pg_id, &bucket)?
             {
-                if self
-                    .drain_unrelated_pending_metadata_command_for_bucket(pg_id, &bucket, &command)?
-                {
-                    continue;
-                }
-                match command.payload() {
-                    MetadataCommandPayload::CreateBucket(create)
-                        if create.matches_create_config(config) =>
-                    {
-                        (command, false)
-                    }
-                    _ => {
-                        self.drain_pending_metadata_command_pg_slot(pg_id, &bucket, &command)?;
+                Some(command) => {
+                    if self.drain_unrelated_pending_metadata_command_for_bucket(
+                        pg_id, &bucket, &command,
+                    )? {
                         continue;
                     }
+                    match command.payload() {
+                        MetadataCommandPayload::CreateBucket(create)
+                            if create.matches_create_config(config) =>
+                        {
+                            (command, false)
+                        }
+                        _ => {
+                            self.drain_pending_metadata_command_pg_slot(pg_id, &bucket, &command)?;
+                            continue;
+                        }
+                    }
                 }
-            } else {
-                let command_id = self.next_bucket_metadata_command_id(pg_id)?;
-                let bucket_pg = primary_node.get_pg(pg_id.get())?;
-                let bucket_execution_generation =
-                    bucket_pg.next_bucket_execution_generation_candidate()?;
-                drop(bucket_pg);
-                let command = CreateBucketCommand::from_config(
-                    config,
-                    crate::clock::current_time_millis(),
-                    bucket_execution_generation,
-                )
-                .map_err(|reason| MetadataError::InvalidBucketName {
-                    reason: reason.to_string(),
-                })?;
-                let command = MetadataCommandEnvelope::new(
-                    command_id,
-                    MetadataCommandPayload::CreateBucket(command),
-                );
-                if self
-                    .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, &command)?
-                    .is_none()
-                {
-                    continue;
+                None => {
+                    let command_id = self.next_bucket_metadata_command_id(pg_id)?;
+                    let bucket_pg = primary_node.get_pg(pg_id.get())?;
+                    let bucket_execution_generation =
+                        bucket_pg.next_bucket_execution_generation_candidate()?;
+                    drop(bucket_pg);
+                    let command = CreateBucketCommand::from_config(
+                        config,
+                        crate::clock::current_time_millis(),
+                        bucket_execution_generation,
+                    )
+                    .map_err(|reason| MetadataError::InvalidBucketName {
+                        reason: reason.to_string(),
+                    })?;
+                    let command = MetadataCommandEnvelope::new(
+                        command_id,
+                        MetadataCommandPayload::CreateBucket(command),
+                    );
+                    if self
+                        .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, &command)?
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    (command, true)
                 }
-                (command, true)
             };
             let outcome = self.finish_pending_metadata_command_to_acting_set(
                 pg_id,
@@ -1079,10 +1081,9 @@ impl super::StorageCluster {
         let drain = node.begin_bucket_write_drain(bucket)?;
         crate::node::maybe_run_after_begin_bucket_delete_drain_hook(bucket);
 
-        let runtime_state = self.local_map.runtime_state();
         loop {
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
-                runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+                self.pending_metadata_command_for_bucket(pg_id, bucket)?
             {
                 if self
                     .drain_unrelated_pending_metadata_command_for_bucket(pg_id, bucket, &command)
@@ -1173,8 +1174,8 @@ impl super::StorageCluster {
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
                     .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
                 }
-                if runtime_state
-                    .pending_metadata_command_for_bucket(pg_id, bucket)
+                if self
+                    .pending_metadata_command_for_bucket(pg_id, bucket)?
                     .is_some()
                 {
                     continue;
@@ -1395,10 +1396,9 @@ impl super::StorageCluster {
         pg_id: PgId,
         record: CompletedMultipartUploadRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
-        let runtime_state = self.local_map.runtime_state();
         loop {
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
-                runtime_state.pending_metadata_command_for_bucket(pg_id, &record.bucket)
+                self.pending_metadata_command_for_bucket(pg_id, &record.bucket)?
             {
                 if self.drain_unrelated_pending_metadata_command_for_bucket(
                     pg_id,
@@ -1523,10 +1523,9 @@ impl super::StorageCluster {
             }
         }
 
-        let runtime_state = self.local_map.runtime_state();
         loop {
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
-                runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+                self.pending_metadata_command_for_bucket(pg_id, bucket)?
             {
                 if self
                     .drain_unrelated_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
@@ -1713,10 +1712,9 @@ impl super::StorageCluster {
             PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
         }
 
-        let runtime_state = self.local_map.runtime_state();
         loop {
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
-                runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+                self.pending_metadata_command_for_bucket(pg_id, bucket)?
             {
                 if self
                     .drain_unrelated_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
@@ -1819,10 +1817,9 @@ impl super::StorageCluster {
             PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
         }
 
-        let runtime_state = self.local_map.runtime_state();
         loop {
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
-                runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+                self.pending_metadata_command_for_bucket(pg_id, bucket)?
             {
                 if self
                     .drain_unrelated_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
@@ -1955,10 +1952,9 @@ impl super::StorageCluster {
             let bucket_pg = primary_node.get_pg(pg_id.get())?;
             PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
         }
-        let runtime_state = self.local_map.runtime_state();
         loop {
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
-                runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)
+                self.pending_metadata_command_for_bucket(pg_id, bucket)?
             {
                 if self
                     .drain_unrelated_pending_metadata_command_for_bucket(pg_id, bucket, &command)?

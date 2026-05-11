@@ -2500,11 +2500,11 @@ Proposed subphases:
      allocation
      - status: production command creation now derives the next log index from
        the routed PG-primary's durable command log, including already-open
-       handles after another handle has appended a command; an unresolved
-       durable pending slot currently fails closed rather than being skipped,
-       until request paths can load and converge that slot; the remaining
-       `LocalClusterRuntimeState` index helper is test-only fixture support for
-       manually constructed commands
+       handles after another handle has appended a command; unresolved durable
+       bucket-PG pending slots are loaded and converged rather than skipped;
+       object-PG slots still fail closed until their typed decoder is wired
+       into the request paths; the remaining `LocalClusterRuntimeState` index
+       helper is test-only fixture support for manually constructed commands
    - replace process-local pending metadata command maps with durable pending
      command state or retry derivation from the durable command log
      - current in-process retry cache is PG-scoped as a bridge; it must not
@@ -2520,9 +2520,13 @@ Proposed subphases:
        zero-apply reissue computes a safe replacement first, rejects divergent
        non-primary-only histories, and then atomically replaces the exact stale
        durable slot on the primary
-     - remaining: restart convergence still needs full command decoding rather
-       than failing closed on unresolved durable intent, and the in-process
-       bridge remains the live wakeup/cache layer until restart rehydration lands
+     - status: bucket-PG pending slots now have typed command decoding and can
+       be rehydrated from the durable primary slot after reopen or when a
+       second handle has an empty runtime bridge; object-PG command slots still
+       fail closed until the object-command decoder/rehydration slice lands
+     - remaining: restart convergence needs typed decoding for object-PG
+       command payloads, and the in-process bridge remains the live
+       wakeup/cache layer for command classes that have not yet been rehydrated
      - draining a PG slot must preserve command-owned resources for the original
        request; non-matching generation reservations are not released by the
        drainer because they may belong to active concurrent work

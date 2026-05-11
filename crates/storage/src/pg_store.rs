@@ -28,8 +28,9 @@ use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 #[cfg(test)]
 use crate::metadata_command::BucketPropertyMutation;
 use crate::metadata_command::{
-    abandoned_command_log_bytes, decode_metadata_command_log_entry_header,
-    metadata_command_log_hash, AbortMultipartUploadCommand, AbortStreamUploadCommand,
+    abandoned_command_log_bytes, decode_metadata_command_envelope,
+    decode_metadata_command_log_entry_header, metadata_command_log_hash,
+    AbortMultipartUploadCommand, AbortStreamUploadCommand,
     AdvanceCompletedMultipartUploadSequenceCommand, AppendStreamSegmentCommand,
     BucketPropertyEffect, BucketRecord, BucketSubresourceMutation, CommitDirectPutObjectCommand,
     CommitMultipartObjectCommand, CommitStreamPartCommand, CreateBucketCommand,
@@ -1448,6 +1449,43 @@ impl PgStore {
             command_bytes,
             scope_bucket,
         }))
+    }
+
+    pub(crate) fn pending_metadata_command_envelope(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
+        let Some(slot) = self.pending_metadata_command_slot(node_id, cluster_epoch)? else {
+            return Ok(None);
+        };
+        let command = decode_metadata_command_envelope(&slot.command_bytes).map_err(|_| {
+            StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                log_index: slot.id.log_index().get(),
+            }
+        })?;
+        if command.id() != slot.id || command.checksum_crc64() != slot.command_checksum {
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                log_index: slot.id.log_index().get(),
+            });
+        }
+        if let Some(scope_bucket) = slot.scope_bucket {
+            if command.bucket_name() != &scope_bucket {
+                return Err(StoreError::MetadataCommandPendingConflict {
+                    pg_id: self.pg_id,
+                    cluster_epoch,
+                    existing_log_index: slot.id.log_index().get(),
+                    candidate_log_index: command.id().log_index().get(),
+                });
+            }
+        }
+        Ok(Some(command))
     }
 
     pub(crate) fn try_insert_pending_metadata_command_slot(

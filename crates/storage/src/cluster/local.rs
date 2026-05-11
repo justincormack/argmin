@@ -3277,6 +3277,191 @@ mod tests {
     }
 
     #[test]
+    fn create_bucket_rehydrates_durable_pending_slot_after_reopen() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "rehydrate-create-");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let acl_grants = crate::AclGrants::default();
+        let config = crate::CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: "owner",
+            owner_canonical_id: &owner,
+            acl_grants: &acl_grants,
+            public_read: false,
+            public_write: false,
+            versioning: crate::BucketVersioningState::Disabled,
+            object_lock: crate::BucketObjectLockConfig::default(),
+        };
+        let pg_id = PgId::new(1);
+        let command = {
+            let primary_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            let command = CreateBucketCommand::from_config(
+                &config,
+                123,
+                primary_pg
+                    .next_bucket_execution_generation_candidate()
+                    .unwrap(),
+            )
+            .unwrap();
+            let command = MetadataCommandEnvelope::new(
+                MetadataCommandId::new(
+                    ClusterEpoch::INITIAL,
+                    pg_id,
+                    MetadataCommandLogIndex::new(1).unwrap(),
+                ),
+                MetadataCommandPayload::CreateBucket(command),
+            );
+            primary_pg
+                .try_insert_pending_metadata_command_slot(0, &command, Some(&bucket))
+                .unwrap();
+            command
+        };
+        drop(map);
+
+        let map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(pg_id, &bucket)
+            .is_none());
+        {
+            let primary_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            assert_eq!(
+                primary_pg
+                    .pending_metadata_command_envelope(0, ClusterEpoch::INITIAL)
+                    .unwrap()
+                    .unwrap(),
+                command
+            );
+        }
+
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        cluster
+            .create_bucket_with_config_and_load_info(&config)
+            .unwrap();
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(pg_id, &bucket)
+            .is_none());
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            crate::PgMetadataStore::head_bucket(&*pg, &bucket).unwrap();
+            assert!(pg
+                .pending_metadata_command_slot(node_id.as_u32(), ClusterEpoch::INITIAL)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn bucket_acl_rehydration_preserves_completed_multipart_sequence_after_reopen() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "rehydrate-acl-sequence-");
+        let pg_id = PgId::new(1);
+        let acl_grants = crate::AclGrants::default();
+        {
+            let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            create_test_bucket(&cluster, &bucket);
+            assert_eq!(
+                cluster
+                    .test_reserve_completed_multipart_upload_order(&bucket)
+                    .unwrap(),
+                1
+            );
+            let primary_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            let current =
+                crate::traits::PgMetadataStore::head_bucket_record_raw(&*primary_pg, &bucket)
+                    .unwrap();
+            assert_eq!(current.completed_multipart_upload_sequence, 1);
+            let command_id = MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                MetadataCommandLogIndex::new(
+                    primary_pg
+                        .max_metadata_command_log_index(ClusterEpoch::INITIAL)
+                        .unwrap()
+                        + 1,
+                )
+                .unwrap(),
+            );
+            let target_generation = primary_pg
+                .next_bucket_execution_generation_candidate()
+                .unwrap();
+            let command = MetadataCommandEnvelope::new(
+                command_id,
+                MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
+                    current.with_execution_generation(target_generation),
+                    acl_grants.clone(),
+                    true,
+                    false,
+                )),
+            );
+            primary_pg
+                .try_insert_pending_metadata_command_slot(0, &command, Some(&bucket))
+                .unwrap();
+        }
+        drop(map);
+
+        let map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(pg_id, &bucket)
+            .is_none());
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let info = cluster
+            .put_bucket_acl_and_load_info(&bucket, &acl_grants, true, false)
+            .unwrap();
+        assert!(info.public_read);
+        assert!(!info.public_write);
+
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let row =
+                crate::traits::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket).unwrap();
+            assert_eq!(row.completed_multipart_upload_sequence, 1);
+            assert!(row.public_read);
+            assert!(!row.public_write);
+            assert!(pg
+                .pending_metadata_command_slot(node_id.as_u32(), ClusterEpoch::INITIAL)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
     fn metadata_command_replica_acceptance_rejects_invalid_route_context() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -4268,7 +4453,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_command_log_index_allocator_rejects_unresolved_durable_pending_slot() {
+    fn metadata_command_log_index_allocator_drains_unresolved_durable_pending_slot() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let ec_shape = EcShape { k: 2, m: 1 };
@@ -4303,7 +4488,7 @@ mod tests {
 
         let owner = crate::CanonicalUserId::from_principal("owner");
         let acl_grants = crate::AclGrants::default();
-        let err = cluster
+        cluster
             .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
                 name: blocked_bucket.as_str(),
                 owner_principal: "owner",
@@ -4314,37 +4499,23 @@ mod tests {
                 versioning: crate::BucketVersioningState::Disabled,
                 object_lock: crate::BucketObjectLockConfig::default(),
             })
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                crate::BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
-                    node_id: 1,
-                    pg_id: 1,
-                    cluster_epoch: ClusterEpoch::INITIAL,
-                    log_index: 1,
-                })
-            ),
-            "unresolved durable pending slot must block new command allocation, got {err:?}"
-        );
+            .unwrap();
 
         for node_id in node_ids {
             let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
             assert_eq!(
                 pg.max_metadata_command_log_index(ClusterEpoch::INITIAL)
                     .unwrap(),
-                0
+                2
             );
             assert_eq!(
                 pg.metadata_command_replica_state()
                     .unwrap()
                     .applied_log_index,
-                0
+                2
             );
-            assert!(matches!(
-                crate::PgMetadataStore::head_bucket(&*pg, &blocked_bucket),
-                Err(crate::MetadataError::BucketNotFound { .. })
-            ));
+            crate::PgMetadataStore::head_bucket(&*pg, &pending_bucket).unwrap();
+            crate::PgMetadataStore::head_bucket(&*pg, &blocked_bucket).unwrap();
         }
         let primary_pg = map
             .node(NodeId::new(1))
@@ -4352,14 +4523,10 @@ mod tests {
             .storage_node()
             .get_pg(1)
             .unwrap();
-        assert_eq!(
-            primary_pg
-                .pending_metadata_command_slot(NodeId::new(1).as_u32(), ClusterEpoch::INITIAL)
-                .unwrap()
-                .unwrap()
-                .id,
-            pending.id()
-        );
+        assert!(primary_pg
+            .pending_metadata_command_slot(NodeId::new(1).as_u32(), ClusterEpoch::INITIAL)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
