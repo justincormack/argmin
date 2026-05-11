@@ -191,6 +191,10 @@ The wrapper provides deterministic default credentials. Override them with the
 same environment variables if a specific test setup needs stable names or
 secrets across runs.
 
+By default the wrapper creates and removes a temporary data directory. A
+directory supplied with `--data-dir PATH` or `ARGMIN_UAT_DATA_DIR` is treated as
+caller-owned and is kept after the run.
+
 ### `.env` Naming
 
 The repository now uses role-based test configuration names in `.env`:

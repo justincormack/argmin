@@ -38,7 +38,7 @@ data_dir="${ARGMIN_UAT_DATA_DIR:-}"
 bucket_prefix="${S3_TEST_BUCKET_PREFIX:-argmin-s3-}"
 timeout_secs="${S3_TEST_TIMEOUT_SECS:-30}"
 release=0
-cleanup=1
+cleanup=0
 server_binary=""
 cargo_args=()
 
@@ -108,6 +108,7 @@ fi
 
 if [[ -z "$data_dir" ]]; then
     data_dir="$(mktemp -d "${TMPDIR:-/tmp}/argmin-s3-uat.XXXXXX")"
+    cleanup=1
 fi
 server_log="$data_dir/argmin-s3.log"
 
