@@ -1,0 +1,164 @@
+Racy metadata log allocation can wedge a PG
+Link: https://chatgpt.com/codex/cloud/security/findings/ad2fcae6293c8191ac903bf4acb69597?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 73c8762
+Author: justin@specialbusservice.com
+Created: 11/05/2026, 11:22:22
+Assignee: Unassigned
+Signals: Security, Validated
+
+# Resolution
+Fixed in commit `1b18e25` (`Handle duplicate metadata log index reissue`).
+
+The fix makes the in-process PG pending-slot bridge owner-aware, so cleanup for one bucket cannot erase another bucket's recovery state. It also handles the zero-replica-apply duplicate-index case consistently across bucket and object command publishers: when a pending command hits `MetadataCommandLogConflict` for its own log index before any replica accepts it, the command is removed from the pending slot, reissued with a fresh durable log index, and retried instead of trying to record an abandoned row at an already-occupied index.
+
+Coverage added:
+- bucket command duplicate-index reissue
+- direct PUT commit duplicate-index reissue
+- stream append duplicate-index reissue
+
+Verification completed before the fix commit:
+- `cargo test -p storage stale_duplicate_ -- --nocapture`
+- `cargo nextest run -p storage`
+- `cargo nextest run -p s3-tests`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `./scripts/check-storage-cluster-boundaries`
+
+# Summary
+Introduced: non-atomic durable metadata command index allocation can allocate duplicate log indexes under concurrency and poison the in-memory pending command slot.
+The new allocator derives the next MetadataCommandId from pg.max_metadata_command_log_index() and only later does each request try to install the command in the process-local pending_metadata_commands map. Because there is no lock covering both allocation and pending-slot insertion, two concurrent requests for different buckets/objects on the same metadata PG can both observe the same max log index and construct commands with the same next log index. If the first request installs, applies, and removes its pending command before the second request reaches try_set_pending_metadata_command_for_bucket(), the second request can successfully install a stale command using a log index already occupied by different command bytes. Applying it then fails with MetadataCommandLogConflict before any node is applied. The cleanup path tries to record the stale command as abandoned before removing it from the pending map; that abandoned-record attempt also conflicts with the existing applied log entry, so the remove call is skipped. The bad pending command remains in the runtime PG slot, and later operations attempting to drain it will repeatedly hit the same conflict. An authenticated remote client able to issue concurrent writes/control-plane operations can use this as a denial of service against the affected metadata PG until the process is restarted.
+
+# Validation
+## Rubric
+- [x] Confirm the allocator derives next MetadataCommandId from durable max log index without an atomic reservation covering pending-slot insertion.
+- [x] Confirm two pre-pending allocations for the same metadata PG can obtain the same log index.
+- [x] Confirm a different stale command with that duplicate log index can enter the process-local pending map once the slot is vacant.
+- [x] Confirm applying the stale command fails with MetadataCommandLogConflict before any node is applied and abandoned-record cleanup also conflicts, matching the removal-skipping cleanup path.
+- [x] Confirm a later operation on the same metadata PG is blocked by the poisoned pending command slot.
+## Report
+Validated the finding with a targeted Rust unit-test PoC plus an LLDB trace. Key code evidence: crates/storage/src/cluster.rs:651-671 reads max_metadata_command_log_index() and returns max+1 without reserving it; crates/storage/src/cluster/local.rs:332-349 only later claims a process-local pending slot when it is vacant; crates/storage/src/cluster/request_ops.rs:803-808 records abandoned before removing pending, so an error from record_abandoned_metadata_command_to_acting_set skips removal. I added a deterministic PoC test in crates/storage/src/cluster/local.rs that simulates the race interleaving. Test output shows: two allocator calls both returned MetadataCommandId { cluster_epoch: 1, pg_id: 1, log_index: 1 }; after a different command was applied at log index 1, the stale duplicate apply returned Store(MetadataCommandLogConflict { node_id: 0, pg_id: 1, log_index: 1 }) with applied_nodes=0; abandoned-record also returned the same conflict with applied_nodes=0; a later create_bucket on the same PG returned the same MetadataCommandLogConflict and the pending command remained present. Command run: CFLAGS='-O0 -g' CXXFLAGS='-O0 -g' cargo test -p storage poc_duplicate_metadata_command_index_poisoned_pending_slot -- --nocapture --test-threads=1. Result: test passed and printed the expected duplicate allocation/conflict/blocked-operation evidence. Crash/ASan-style memory reproduction is not applicable because this is a logical availability bug, not memory corruption; valgrind was not installed. LLDB was used non-interactively against the debug test binary and stopped at cluster.rs:651, showing the stack next_metadata_command_id_from_locked_pg -> next_metadata_command_id -> next_bucket_metadata_command_id -> PoC test, confirming the vulnerable allocation path.
+
+# Evidence
+crates/storage/src/cluster.rs (L635 to 671)
+  Note: The new allocator reads the durable max log index and returns max+1 without holding a lock or otherwise reserving that index atomically.
+```
+    fn next_metadata_command_id(&self, pg_id: PgId) -> Result<MetadataCommandId, StoreError> {
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let pg = primary.storage_node().get_pg(pg_id.get())?;
+        self.next_metadata_command_id_from_locked_pg(pg_id, &pg)
+    }
+
+    fn next_metadata_command_id_from_locked_pg(
+        &self,
+        pg_id: PgId,
+        pg: &crate::PgStore,
+    ) -> Result<MetadataCommandId, StoreError> {
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let max_log_index = pg.max_metadata_command_log_index(self.operation_epoch())?;
+        if let Some(slot) =
+            pg.pending_metadata_command_slot(primary.node_id().as_u32(), self.operation_epoch())?
+        {
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id: primary.node_id().as_u32(),
+                pg_id: pg_id.get(),
+                cluster_epoch: self.operation_epoch(),
+                log_index: slot.id.log_index().get(),
+            });
+        }
+        let next_log_index = max_log_index
+            .checked_add(1)
+            .and_then(MetadataCommandLogIndex::new)
+            .ok_or(StoreError::MetadataCommandLogConflict {
+                node_id: primary.node_id().as_u32(),
+                pg_id: pg_id.get(),
+                cluster_epoch: self.operation_epoch(),
+                log_index: u64::MAX,
+            })?;
+        Ok(MetadataCommandId::new(
+```
+
+crates/storage/src/cluster/local.rs (L332 to 349)
+  Note: The process-local pending command slot is claimed only after command ID allocation; another request may apply and remove its command before this insertion occurs.
+```
+    pub(crate) fn try_set_pending_metadata_command_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: MetadataCommandEnvelope,
+    ) -> Result<(), PendingMetadataCommandConflict> {
+        let mut pending_commands = self
+            .pending_metadata_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = bucket;
+        match pending_commands.entry(pg_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(command);
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(_) => Err(PendingMetadataCommandConflict),
+        }
+```
+
+crates/storage/src/cluster/request_ops.rs (L561 to 590)
+  Note: Create-bucket is one representative path where the command ID is allocated before the pending PG slot is claimed, leaving a race window between allocation and try_set_pending_metadata_command_for_bucket().
+```
+                let command_id = self.next_bucket_metadata_command_id(pg_id)?;
+                let bucket_pg = primary_node.get_pg(pg_id.get())?;
+                let bucket_execution_generation =
+                    bucket_pg.next_bucket_execution_generation_candidate()?;
+                drop(bucket_pg);
+                let command = CreateBucketCommand::from_config(
+                    config,
+                    crate::clock::current_time_millis(),
+                    bucket_execution_generation,
+                )
+                .map_err(|reason| MetadataError::InvalidBucketName {
+                    reason: reason.to_string(),
+                })?;
+                let command = MetadataCommandEnvelope::new(
+                    command_id,
+                    MetadataCommandPayload::CreateBucket(command),
+                );
+                if runtime_state
+                    .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone())
+                    .is_err()
+                {
+                    continue;
+                }
+                (command, true)
+            };
+            let outcome = self.finish_pending_metadata_command_to_acting_set(
+                pg_id,
+                &bucket,
+                &command,
+                clear_pending_on_zero_apply,
+```
+
+crates/storage/src/cluster/request_ops.rs (L796 to 810)
+  Note: When the stale duplicate command conflicts before any node is applied, cleanup records it as abandoned before removing it from the pending map; if abandoned recording also conflicts, the pending command is never removed.
+```
+        match self.apply_metadata_command_to_acting_set(command) {
+            Ok(()) => Ok(super::PendingMetadataCommandOutcome::Applied),
+            Err(error) => {
+                let MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source,
+                } = error;
+                if clear_pending_on_zero_apply && applied_nodes == 0 {
+                    self.record_abandoned_metadata_command_to_acting_set(command)
+                        .map_err(|error| error.source)?;
+                    self.local_map
+                        .runtime_state()
+                        .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                }
+                Err(source)
+```
