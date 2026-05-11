@@ -575,9 +575,9 @@ impl super::StorageCluster {
                     command_id,
                     MetadataCommandPayload::CreateBucket(command),
                 );
-                if runtime_state
-                    .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone())
-                    .is_err()
+                if self
+                    .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, &command)?
+                    .is_none()
                 {
                     continue;
                 }
@@ -595,9 +595,6 @@ impl super::StorageCluster {
 
             let bucket_pg = primary_node.get_pg(pg_id.get())?;
             let info = PgMetadataStore::head_bucket(&*bucket_pg, &bucket)?;
-            self.local_map
-                .runtime_state()
-                .remove_pending_metadata_command_for_bucket(pg_id, &bucket);
             return Ok(BucketCreateAttemptOutcome::Created(info));
         }
     }
@@ -791,13 +788,18 @@ impl super::StorageCluster {
             {
                 self.record_abandoned_metadata_command_to_acting_set(&command)
                     .map_err(|error| error.source)?;
-                self.local_map
-                    .runtime_state()
-                    .remove_pending_metadata_command_for_bucket(pg_id, command_bucket);
+                self.remove_pending_metadata_command_for_bucket(pg_id, command_bucket, &command)?;
                 return Ok(super::PendingMetadataCommandOutcome::Abandoned);
             }
             match self.apply_metadata_command_to_acting_set(&command) {
-                Ok(()) => return Ok(super::PendingMetadataCommandOutcome::Applied),
+                Ok(()) => {
+                    self.remove_pending_metadata_command_for_bucket(
+                        pg_id,
+                        command_bucket,
+                        &command,
+                    )?;
+                    return Ok(super::PendingMetadataCommandOutcome::Applied);
+                }
                 Err(error) => {
                     let MetadataCommandApplyFailure {
                         applied_nodes,
@@ -819,9 +821,11 @@ impl super::StorageCluster {
                     if clear_pending_on_zero_apply && applied_nodes == 0 {
                         self.record_abandoned_metadata_command_to_acting_set(&command)
                             .map_err(|error| error.source)?;
-                        self.local_map
-                            .runtime_state()
-                            .remove_pending_metadata_command_for_bucket(pg_id, command_bucket);
+                        self.remove_pending_metadata_command_for_bucket(
+                            pg_id,
+                            command_bucket,
+                            &command,
+                        )?;
                     }
                     return Err(source);
                 }
@@ -868,17 +872,12 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
     ) -> Result<(), BucketSnapshotLoadError> {
         if Self::metadata_command_is_bucket_pg_command(command) {
-            let outcome = self.finish_pending_metadata_command_to_acting_set(
+            self.finish_pending_metadata_command_to_acting_set(
                 pg_id,
                 pending_bucket,
                 command,
                 false,
             )?;
-            if outcome == super::PendingMetadataCommandOutcome::Applied {
-                self.local_map
-                    .runtime_state()
-                    .remove_pending_metadata_command_for_bucket(pg_id, pending_bucket);
-            }
         } else {
             self.finish_pending_object_metadata_command_for_bucket(pg_id, pending_bucket, command)
                 .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
@@ -892,13 +891,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), BucketSnapshotLoadError> {
-        let outcome =
-            self.finish_pending_metadata_command_to_acting_set(pg_id, bucket, command, false)?;
-        if outcome == super::PendingMetadataCommandOutcome::Applied {
-            self.local_map
-                .runtime_state()
-                .remove_pending_metadata_command_for_bucket(pg_id, bucket);
-        }
+        self.finish_pending_metadata_command_to_acting_set(pg_id, bucket, command, false)?;
         Ok(())
     }
 
@@ -1126,14 +1119,10 @@ impl super::StorageCluster {
                         (command, false)
                     }
                     MetadataCommandPayload::MarkBucketDeleting(_) => {
-                        let outcome = self
-                            .finish_pending_metadata_command_to_acting_set(
-                                pg_id, bucket, &command, false,
-                            )
-                            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
-                        if outcome == super::PendingMetadataCommandOutcome::Applied {
-                            runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
-                        }
+                        self.finish_pending_metadata_command_to_acting_set(
+                            pg_id, bucket, &command, false,
+                        )
+                        .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
                         continue;
                     }
                     MetadataCommandPayload::CreateBucket(_)
@@ -1143,14 +1132,10 @@ impl super::StorageCluster {
                     | MetadataCommandPayload::PutBucketSubresource(_)
                     | MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
                     | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
-                        let outcome = self
-                            .finish_pending_metadata_command_to_acting_set(
-                                pg_id, bucket, &command, false,
-                            )
-                            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
-                        if outcome == super::PendingMetadataCommandOutcome::Applied {
-                            runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
-                        }
+                        self.finish_pending_metadata_command_to_acting_set(
+                            pg_id, bucket, &command, false,
+                        )
+                        .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
                         continue;
                     }
                     MetadataCommandPayload::ReserveObjectGeneration(_)
@@ -1213,9 +1198,10 @@ impl super::StorageCluster {
                         ),
                     ),
                 );
-                if runtime_state
-                    .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
-                    .is_err()
+                if self
+                    .try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                    .map_err(BucketWriteDrainError::from)?
+                    .is_none()
                 {
                     continue;
                 }
@@ -1233,7 +1219,6 @@ impl super::StorageCluster {
                 continue;
             }
 
-            runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
             node.notify_bucket_coordination_change(bucket);
             drain.persist();
             return Ok(());
@@ -1429,17 +1414,12 @@ impl super::StorageCluster {
                         (command, false)
                     }
                     MetadataCommandPayload::DeleteCompletedMultipartUpload(_) => {
-                        let outcome = self.finish_pending_metadata_command_to_acting_set(
+                        self.finish_pending_metadata_command_to_acting_set(
                             pg_id,
                             &record.bucket,
                             &command,
                             false,
                         )?;
-                        if outcome == super::PendingMetadataCommandOutcome::Abandoned {
-                            continue;
-                        }
-                        runtime_state
-                            .remove_pending_metadata_command_for_bucket(pg_id, &record.bucket);
                         continue;
                     }
                     MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
@@ -1469,13 +1449,9 @@ impl super::StorageCluster {
                         },
                     )),
                 );
-                if runtime_state
-                    .try_set_pending_metadata_command_for_bucket(
-                        pg_id,
-                        &record.bucket,
-                        command.clone(),
-                    )
-                    .is_err()
+                if self
+                    .try_set_pending_metadata_command_for_bucket(pg_id, &record.bucket, &command)?
+                    .is_none()
                 {
                     continue;
                 }
@@ -1490,7 +1466,6 @@ impl super::StorageCluster {
             if outcome == super::PendingMetadataCommandOutcome::Abandoned {
                 continue;
             }
-            runtime_state.remove_pending_metadata_command_for_bucket(pg_id, &record.bucket);
             return Ok(());
         }
     }
@@ -1624,9 +1599,9 @@ impl super::StorageCluster {
                     ),
                 );
                 drop(bucket_pg);
-                if runtime_state
-                    .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
-                    .is_err()
+                if self
+                    .try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
+                    .is_none()
                 {
                     continue;
                 }
@@ -1644,9 +1619,6 @@ impl super::StorageCluster {
 
             let bucket_pg = primary_node.get_pg(pg_id.get())?;
             let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
-            self.local_map
-                .runtime_state()
-                .remove_pending_metadata_command_for_bucket(pg_id, bucket);
             return Ok(info);
         }
     }
@@ -1810,9 +1782,9 @@ impl super::StorageCluster {
                     )),
                 );
                 drop(bucket_pg);
-                if runtime_state
-                    .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
-                    .is_err()
+                if self
+                    .try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
+                    .is_none()
                 {
                     continue;
                 }
@@ -1830,9 +1802,6 @@ impl super::StorageCluster {
 
             let bucket_pg = primary_node.get_pg(pg_id.get())?;
             let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
-            self.local_map
-                .runtime_state()
-                .remove_pending_metadata_command_for_bucket(pg_id, bucket);
             return Ok(info);
         }
     }
@@ -1912,9 +1881,9 @@ impl super::StorageCluster {
                     ),
                 );
                 drop(bucket_pg);
-                if runtime_state
-                    .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
-                    .is_err()
+                if self
+                    .try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
+                    .is_none()
                 {
                     continue;
                 }
@@ -1932,9 +1901,6 @@ impl super::StorageCluster {
 
             let bucket_pg = primary_node.get_pg(pg_id.get())?;
             let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
-            self.local_map
-                .runtime_state()
-                .remove_pending_metadata_command_for_bucket(pg_id, bucket);
             return Ok(info);
         }
     }
@@ -1970,6 +1936,18 @@ impl super::StorageCluster {
         bucket: &BucketName,
         mutation: BucketSubresourceMutation,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        if let BucketSubresourceMutation::Put { kind, aux, .. } = &mutation {
+            if !kind.supports_aux(*aux) {
+                return Err(MetadataError::Db {
+                    context: "put bucket subresource",
+                    source: rusqlite::Error::InvalidParameterName(format!(
+                        "{kind:?} does not support aux {aux:?}"
+                    )),
+                }
+                .into());
+            }
+        }
+
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let primary_node = self.bucket_metadata_primary_node(bucket)?;
         let _bucket_guard = primary_node.lock_bucket(bucket);
@@ -2018,9 +1996,9 @@ impl super::StorageCluster {
                         bucket_execution_generation,
                     )),
                 );
-                if runtime_state
-                    .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
-                    .is_err()
+                if self
+                    .try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
+                    .is_none()
                 {
                     continue;
                 }
@@ -2038,9 +2016,6 @@ impl super::StorageCluster {
 
             let bucket_pg = primary_node.get_pg(pg_id.get())?;
             let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
-            self.local_map
-                .runtime_state()
-                .remove_pending_metadata_command_for_bucket(pg_id, bucket);
             return Ok(info);
         }
     }
@@ -3004,9 +2979,12 @@ impl super::StorageCluster {
         loop {
             match self.apply_metadata_command_to_acting_set(&command) {
                 Ok(()) => {
-                    self.local_map
-                        .runtime_state()
-                        .remove_pending_metadata_command_for_bucket(pg_id, command.bucket_name());
+                    self.remove_pending_metadata_command_for_bucket(
+                        pg_id,
+                        command.bucket_name(),
+                        &command,
+                    )
+                    .map_err(ObjectPgActionError::from)?;
                     self.after_object_metadata_command_applied(&command);
                     return Ok(());
                 }
@@ -3036,9 +3014,8 @@ impl super::StorageCluster {
                             .map_err(|error| {
                                 super::bucket_snapshot_error_to_object_pg_action_error(error.source)
                             })?;
-                        self.local_map
-                            .runtime_state()
-                            .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                        self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                            .map_err(ObjectPgActionError::from)?;
                     }
                     return Err(super::bucket_snapshot_error_to_object_pg_action_error(
                         source,
@@ -4583,6 +4560,7 @@ impl super::StorageCluster {
                         },
                     )),
                 );
+                drop(object_pg);
                 self.set_pending_metadata_command_for_bucket(
                     pg_id,
                     bucket,
@@ -5100,7 +5078,6 @@ impl super::StorageCluster {
                         .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
                     {
                         super::PendingMetadataCommandOutcome::Applied => {
-                            runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
                             return Ok(completion_order);
                         }
                         super::PendingMetadataCommandOutcome::Abandoned => continue,
@@ -5109,10 +5086,7 @@ impl super::StorageCluster {
                 match self
                     .finish_pending_command_for_completed_multipart_order(pg_id, bucket, &command)?
                 {
-                    super::PendingMetadataCommandOutcome::Applied => {
-                        runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
-                        continue;
-                    }
+                    super::PendingMetadataCommandOutcome::Applied => continue,
                     super::PendingMetadataCommandOutcome::Abandoned => continue,
                 }
             }
@@ -5146,18 +5120,16 @@ impl super::StorageCluster {
                     },
                 ),
             );
-            if runtime_state
-                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
-                .is_err()
+            if self
+                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                .map_err(ObjectPgActionError::from)?
+                .is_none()
             {
                 continue;
             }
             match self.finish_pending_metadata_command_to_acting_set(pg_id, bucket, &command, true)
             {
-                Ok(super::PendingMetadataCommandOutcome::Applied) => {
-                    runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
-                    return Ok(completion_order);
-                }
+                Ok(super::PendingMetadataCommandOutcome::Applied) => return Ok(completion_order),
                 Ok(super::PendingMetadataCommandOutcome::Abandoned) => continue,
                 Err(error) => {
                     return Err(super::bucket_snapshot_error_to_object_pg_action_error(
@@ -5184,9 +5156,8 @@ impl super::StorageCluster {
     ) -> Result<(), ObjectPgActionError> {
         match self.apply_metadata_command_to_acting_set(command) {
             Ok(()) => {
-                self.local_map
-                    .runtime_state()
-                    .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                self.remove_pending_metadata_command_for_bucket(pg_id, bucket, command)
+                    .map_err(ObjectPgActionError::from)?;
                 self.after_object_metadata_command_applied(command);
                 Ok(())
             }
@@ -5408,9 +5379,10 @@ impl super::StorageCluster {
                     },
                 )),
             );
-            if runtime_state
-                .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone())
-                .is_err()
+            if self
+                .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, &command)
+                .map_err(ObjectPgActionError::from)?
+                .is_none()
             {
                 continue 'retry_after_pending_conflict;
             }
@@ -5558,12 +5530,14 @@ impl super::StorageCluster {
                     reason: "pending stream part commit does not match retry".to_string(),
                 });
             }
+            drop(object_pg);
             command
         } else {
             let command = MetadataCommandEnvelope::new(
                 self.next_object_metadata_command_id_from_locked_pg(pg_id, &object_pg)?,
                 MetadataCommandPayload::CommitStreamPart(Box::new(command_payload)),
             );
+            drop(object_pg);
             self.set_pending_metadata_command_for_bucket(
                 pg_id,
                 bucket,
@@ -5572,7 +5546,6 @@ impl super::StorageCluster {
             )?;
             command
         };
-        drop(object_pg);
 
         let MetadataCommandPayload::CommitStreamPart(commit) = command.payload() else {
             unreachable!("stream part pending command kind changed");
@@ -5700,9 +5673,9 @@ impl super::StorageCluster {
             maybe_run_before_abort_multipart_pending_install_hook(
                 self.metadata_command_apply_test_hook_scope_id(),
             );
-            if runtime_state
-                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
-                .is_err()
+            if self
+                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
+                .is_none()
             {
                 continue 'retry_after_pending_conflict;
             }
@@ -5761,9 +5734,9 @@ impl super::StorageCluster {
             maybe_run_before_abort_multipart_pending_install_hook(
                 self.metadata_command_apply_test_hook_scope_id(),
             );
-            if runtime_state
-                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
-                .is_err()
+            if self
+                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
+                .is_none()
             {
                 continue 'retry_after_pending_conflict;
             }

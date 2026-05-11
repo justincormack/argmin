@@ -466,22 +466,75 @@ impl StorageCluster {
         command: &MetadataCommandEnvelope,
     ) -> Result<Option<MetadataCommandEnvelope>, BucketSnapshotLoadError> {
         let bucket = command.bucket_name().clone();
-        self.local_map
-            .runtime_state()
-            .remove_pending_metadata_command_for_bucket(pg_id, &bucket);
-        let command = MetadataCommandEnvelope::new(
-            self.next_metadata_command_id(pg_id)?,
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let primary_max_log_index = {
+            let pg = primary.storage_node().get_pg(pg_id.get())?;
+            pg.max_metadata_command_log_index(self.operation_epoch())?
+        };
+        let acting_set_max_log_index = self.max_metadata_command_log_index_on_acting_set(pg_id)?;
+        if acting_set_max_log_index > primary_max_log_index {
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id: primary.node_id().as_u32(),
+                pg_id: pg_id.get(),
+                cluster_epoch: self.operation_epoch(),
+                log_index: acting_set_max_log_index,
+            }
+            .into());
+        }
+        let next_log_index = primary_max_log_index
+            .max(command.id().log_index().get())
+            .checked_add(1)
+            .and_then(MetadataCommandLogIndex::new)
+            .ok_or(StoreError::MetadataCommandLogConflict {
+                node_id: primary.node_id().as_u32(),
+                pg_id: pg_id.get(),
+                cluster_epoch: self.operation_epoch(),
+                log_index: u64::MAX,
+            })?;
+        let replacement = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(self.operation_epoch(), pg_id, next_log_index),
             command.payload().clone(),
         );
+        {
+            let pg = primary.storage_node().get_pg(pg_id.get())?;
+            if !pg.replace_pending_metadata_command_slot_for_reissue(
+                primary.node_id().as_u32(),
+                command,
+                &replacement,
+                Some(&bucket),
+            )? {
+                return Ok(None);
+            }
+        }
         if self
             .local_map
             .runtime_state()
-            .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone())
+            .replace_pending_metadata_command_for_bucket(
+                pg_id,
+                &bucket,
+                command,
+                replacement.clone(),
+            )
             .is_err()
         {
             return Ok(None);
         }
-        Ok(Some(command))
+        Ok(Some(replacement))
+    }
+
+    fn max_metadata_command_log_index_on_acting_set(&self, pg_id: PgId) -> Result<u64, StoreError> {
+        let mut max_log_index = 0;
+        for node in self
+            .local_map
+            .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
+        {
+            let pg = node.storage_node().get_pg(pg_id.get())?;
+            max_log_index =
+                max_log_index.max(pg.max_metadata_command_log_index(self.operation_epoch())?);
+        }
+        Ok(max_log_index)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -667,24 +720,95 @@ impl StorageCluster {
         command: &MetadataCommandEnvelope,
         context: &'static str,
     ) -> Result<(), ObjectPgActionError> {
-        self.local_map
-            .runtime_state()
-            .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
-            .map_err(|_| conflicting_pending_object_metadata_command(context))
+        self.try_set_pending_metadata_command_for_bucket(pg_id, bucket, command)
+            .map_err(ObjectPgActionError::from)?
+            .ok_or_else(|| conflicting_pending_object_metadata_command(context))
+            .map(|_| ())
     }
 
-    fn next_metadata_command_id(&self, pg_id: PgId) -> Result<MetadataCommandId, StoreError> {
+    fn try_set_pending_metadata_command_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<Option<()>, StoreError> {
+        let runtime_state = self.local_map.runtime_state();
+        if runtime_state
+            .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
+            .is_err()
+        {
+            return Ok(None);
+        }
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         let pg = primary.storage_node().get_pg(pg_id.get())?;
-        self.next_metadata_command_id_from_locked_pg(pg_id, &pg)
+        if let Err(error) = pg.try_insert_pending_metadata_command_slot(
+            primary.node_id().as_u32(),
+            command,
+            Some(bucket),
+        ) {
+            runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
+            return Err(error);
+        }
+        Ok(Some(()))
+    }
+
+    fn remove_pending_metadata_command_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError> {
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let pg = primary.storage_node().get_pg(pg_id.get())?;
+        let durable_removed =
+            pg.remove_pending_metadata_command_slot(primary.node_id().as_u32(), command)?;
+        let runtime_removed = self
+            .local_map
+            .runtime_state()
+            .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+        Ok(durable_removed || runtime_removed)
+    }
+
+    fn next_metadata_command_id(&self, pg_id: PgId) -> Result<MetadataCommandId, StoreError> {
+        self.next_metadata_command_id_at_least(
+            pg_id,
+            MetadataCommandLogIndex::new(1).expect("metadata command log index starts at one"),
+        )
+    }
+
+    fn next_metadata_command_id_at_least(
+        &self,
+        pg_id: PgId,
+        min_log_index: MetadataCommandLogIndex,
+    ) -> Result<MetadataCommandId, StoreError> {
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let pg = primary.storage_node().get_pg(pg_id.get())?;
+        self.next_metadata_command_id_from_locked_pg_at_least(pg_id, &pg, min_log_index)
     }
 
     fn next_metadata_command_id_from_locked_pg(
         &self,
         pg_id: PgId,
         pg: &crate::PgStore,
+    ) -> Result<MetadataCommandId, StoreError> {
+        self.next_metadata_command_id_from_locked_pg_at_least(
+            pg_id,
+            pg,
+            MetadataCommandLogIndex::new(1).expect("metadata command log index starts at one"),
+        )
+    }
+
+    fn next_metadata_command_id_from_locked_pg_at_least(
+        &self,
+        pg_id: PgId,
+        pg: &crate::PgStore,
+        min_log_index: MetadataCommandLogIndex,
     ) -> Result<MetadataCommandId, StoreError> {
         let primary = self
             .local_map
@@ -702,6 +826,7 @@ impl StorageCluster {
         }
         let next_log_index = max_log_index
             .checked_add(1)
+            .map(|next| next.max(min_log_index.get()))
             .and_then(MetadataCommandLogIndex::new)
             .ok_or(StoreError::MetadataCommandLogConflict {
                 node_id: primary.node_id().as_u32(),
@@ -1057,9 +1182,9 @@ impl StorageCluster {
                     ),
                 ),
             );
-            if runtime_state
-                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
-                .is_err()
+            if self
+                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
+                .is_none()
             {
                 continue;
             }
@@ -1067,9 +1192,8 @@ impl StorageCluster {
             loop {
                 match self.apply_metadata_command_to_acting_set(&command) {
                     Ok(()) => {
-                        self.local_map
-                            .runtime_state()
-                            .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                        self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                            .map_err(ObjectPgActionError::from)?;
                         match command.payload() {
                             MetadataCommandPayload::ReserveObjectGeneration(reservation) => {
                                 return Ok(reservation.generation_id);
@@ -1102,9 +1226,10 @@ impl StorageCluster {
                                 .map_err(|error| {
                                     bucket_snapshot_error_to_object_pg_action_error(error.source)
                                 })?;
-                            self.local_map
-                                .runtime_state()
-                                .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                            self.remove_pending_metadata_command_for_bucket(
+                                pg_id, bucket, &command,
+                            )
+                            .map_err(ObjectPgActionError::from)?;
                         }
                         return Err(bucket_snapshot_error_to_object_pg_action_error(
                             error.source,
@@ -1153,9 +1278,9 @@ impl StorageCluster {
                     version_id,
                 )),
             );
-            if runtime_state
-                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
-                .is_err()
+            if self
+                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
+                .is_none()
             {
                 continue;
             }
@@ -1217,17 +1342,19 @@ impl StorageCluster {
                     .map_err(|error| {
                         bucket_snapshot_error_to_object_pg_action_error(error.source)
                     })?;
-                self.local_map
-                    .runtime_state()
-                    .remove_pending_metadata_command_for_bucket(pg_id, command_bucket);
+                self.remove_pending_metadata_command_for_bucket(pg_id, command_bucket, &command)
+                    .map_err(ObjectPgActionError::from)?;
                 self.after_object_metadata_command_abandoned(&command)?;
                 return Ok(PendingMetadataCommandOutcome::Abandoned);
             }
             match self.apply_metadata_command_to_acting_set(&command) {
                 Ok(()) => {
-                    self.local_map
-                        .runtime_state()
-                        .remove_pending_metadata_command_for_bucket(pg_id, command_bucket);
+                    self.remove_pending_metadata_command_for_bucket(
+                        pg_id,
+                        command_bucket,
+                        &command,
+                    )
+                    .map_err(ObjectPgActionError::from)?;
                     self.after_object_metadata_command_applied(&command);
                     return Ok(PendingMetadataCommandOutcome::Applied);
                 }
@@ -1344,9 +1471,9 @@ impl StorageCluster {
                     ),
                 ),
             );
-            if runtime_state
-                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
-                .is_err()
+            if self
+                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
+                .is_none()
             {
                 continue;
             }
@@ -1354,7 +1481,8 @@ impl StorageCluster {
             loop {
                 match self.apply_metadata_command_to_acting_set(&command) {
                     Ok(()) => {
-                        runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                        self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                            .map_err(ObjectPgActionError::from)?;
                         return Ok(());
                     }
                     Err(error)
@@ -1378,7 +1506,10 @@ impl StorageCluster {
                                 .map_err(|error| {
                                     bucket_snapshot_error_to_object_pg_action_error(error.source)
                                 })?;
-                            runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                            self.remove_pending_metadata_command_for_bucket(
+                                pg_id, bucket, &command,
+                            )
+                            .map_err(ObjectPgActionError::from)?;
                             break;
                         }
                         return Err(bucket_snapshot_error_to_object_pg_action_error(
@@ -1522,9 +1653,12 @@ impl StorageCluster {
         loop {
             match self.apply_metadata_command_to_acting_set(&command) {
                 Ok(()) => {
-                    self.local_map
-                        .runtime_state()
-                        .remove_pending_metadata_command_for_bucket(pg_id, command.bucket_name());
+                    self.remove_pending_metadata_command_for_bucket(
+                        pg_id,
+                        command.bucket_name(),
+                        &command,
+                    )
+                    .map_err(ObjectPgActionError::from)?;
                     return Ok(());
                 }
                 Err(error)
@@ -1557,9 +1691,8 @@ impl StorageCluster {
                             .map_err(|error| {
                                 bucket_snapshot_error_to_object_pg_action_error(error.source)
                             })?;
-                        self.local_map
-                            .runtime_state()
-                            .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                        self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                            .map_err(ObjectPgActionError::from)?;
                         self.delete_payload_shard_keys_best_effort(
                             segment_record.data_pg_id,
                             EcShape {
@@ -1718,9 +1851,9 @@ impl StorageCluster {
                     ),
                 ),
             );
-            if runtime_state
-                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
-                .is_err()
+            if self
+                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
+                .is_none()
             {
                 continue;
             }
@@ -1728,9 +1861,8 @@ impl StorageCluster {
             loop {
                 match self.apply_metadata_command_to_acting_set(&command) {
                     Ok(()) => {
-                        self.local_map
-                            .runtime_state()
-                            .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                        self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                            .map_err(ObjectPgActionError::from)?;
                         return Ok(());
                     }
                     Err(error)
@@ -1754,9 +1886,10 @@ impl StorageCluster {
                                 .map_err(|error| {
                                     bucket_snapshot_error_to_object_pg_action_error(error.source)
                                 })?;
-                            self.local_map
-                                .runtime_state()
-                                .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                            self.remove_pending_metadata_command_for_bucket(
+                                pg_id, bucket, &command,
+                            )
+                            .map_err(ObjectPgActionError::from)?;
                             break;
                         }
                         return Err(bucket_snapshot_error_to_object_pg_action_error(
@@ -2096,9 +2229,12 @@ impl StorageCluster {
                             .map_err(|error| {
                                 bucket_snapshot_error_to_object_pg_action_error(error.source)
                             })?;
-                        self.local_map
-                            .runtime_state()
-                            .remove_pending_metadata_command_for_bucket(pg_id, &req.bucket);
+                        self.remove_pending_metadata_command_for_bucket(
+                            pg_id,
+                            &req.bucket,
+                            &command,
+                        )
+                        .map_err(ObjectPgActionError::from)?;
                         drop(_bucket_guard);
                         self.release_object_generation_reservation_after_pending_drain_best_effort(
                             pg_id,
@@ -2121,9 +2257,8 @@ impl StorageCluster {
             }
         }
 
-        self.local_map
-            .runtime_state()
-            .remove_pending_metadata_command_for_bucket(pg_id, command.bucket_name());
+        self.remove_pending_metadata_command_for_bucket(pg_id, command.bucket_name(), &command)
+            .map_err(ObjectPgActionError::from)?;
 
         #[cfg(any(test, feature = "test-hooks"))]
         crate::node::maybe_run_after_direct_put_metadata_publish_hook(

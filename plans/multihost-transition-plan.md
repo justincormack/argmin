@@ -2514,6 +2514,15 @@ Proposed subphases:
        pending entry for one bucket does not clear another bucket's PG slot,
        and finalized bucket deletion no longer clears the PG slot as a
        side-effect
+     - status: bucket and object command publishers now install durable pending
+       slots on the routed PG primary and remove them only after an
+       applied/abandoned terminal log record is durable; duplicate-index
+       zero-apply reissue computes a safe replacement first, rejects divergent
+       non-primary-only histories, and then atomically replaces the exact stale
+       durable slot on the primary
+     - remaining: restart convergence still needs full command decoding rather
+       than failing closed on unresolved durable intent, and the in-process
+       bridge remains the live wakeup/cache layer until restart rehydration lands
      - draining a PG slot must preserve command-owned resources for the original
        request; non-matching generation reservations are not released by the
        drainer because they may belong to active concurrent work

@@ -370,6 +370,33 @@ impl LocalClusterRuntimeState {
         true
     }
 
+    pub(crate) fn replace_pending_metadata_command_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        expected: &MetadataCommandEnvelope,
+        replacement: MetadataCommandEnvelope,
+    ) -> Result<(), PendingMetadataCommandConflict> {
+        if expected.bucket_name() != bucket || replacement.bucket_name() != bucket {
+            return Err(PendingMetadataCommandConflict);
+        }
+        let mut pending_commands = self
+            .pending_metadata_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match pending_commands.get(&pg_id) {
+            Some(current) if current == expected || current == &replacement => {
+                pending_commands.insert(pg_id, replacement);
+                Ok(())
+            }
+            None => {
+                pending_commands.insert(pg_id, replacement);
+                Ok(())
+            }
+            Some(_) => Err(PendingMetadataCommandConflict),
+        }
+    }
+
     pub(crate) fn acquire_object_payload_lease(
         &self,
         bucket: &BucketName,
@@ -4358,8 +4385,9 @@ mod tests {
             .unwrap();
 
         let stale_duplicate = create_bucket_metadata_command(pg_id, 1, second_bucket.clone());
-        map.runtime_state()
-            .try_set_pending_metadata_command_for_bucket(pg_id, &second_bucket, stale_duplicate)
+        cluster
+            .try_set_pending_metadata_command_for_bucket(pg_id, &second_bucket, &stale_duplicate)
+            .unwrap()
             .unwrap();
 
         create_test_bucket(&cluster, &second_bucket);
@@ -4376,6 +4404,103 @@ mod tests {
                 pg.max_metadata_command_log_index(ClusterEpoch::INITIAL)
                     .unwrap(),
                 2
+            );
+        }
+    }
+
+    #[test]
+    fn stale_duplicate_metadata_command_index_on_non_primary_fails_closed_without_dropping_slot() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let first_bucket = bucket_for_pg(topology, 1, "duplicate-nonprimary-first-");
+        let second_bucket = bucket_for_pg(topology, 1, "duplicate-nonprimary-second-");
+        let occupant_bucket = bucket_for_pg(topology, 1, "duplicate-nonprimary-occupant-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let applied = create_bucket_metadata_command(pg_id, 1, first_bucket.clone());
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &applied)
+            .unwrap();
+
+        let stale_duplicate = create_bucket_metadata_command(pg_id, 2, second_bucket.clone());
+        cluster
+            .try_set_pending_metadata_command_for_bucket(pg_id, &second_bucket, &stale_duplicate)
+            .unwrap()
+            .unwrap();
+        let occupant = create_bucket_metadata_command(pg_id, 2, occupant_bucket.clone());
+        let non_primary = map.node(NodeId::new(0)).unwrap().storage_node();
+        non_primary
+            .get_pg(1)
+            .unwrap()
+            .apply_metadata_command_and_record(NodeId::new(0).as_u32(), &occupant)
+            .unwrap();
+
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let acl_grants = crate::AclGrants::default();
+        let err = cluster
+            .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+                name: second_bucket.as_str(),
+                owner_principal: "owner",
+                owner_canonical_id: &owner,
+                acl_grants: &acl_grants,
+                public_read: false,
+                public_write: false,
+                versioning: crate::BucketVersioningState::Disabled,
+                object_lock: crate::BucketObjectLockConfig::default(),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 2,
+                ..
+            })
+        ));
+
+        assert_eq!(
+            map.runtime_state()
+                .pending_metadata_command_for_bucket(pg_id, &second_bucket)
+                .as_ref()
+                .map(MetadataCommandEnvelope::id),
+            Some(stale_duplicate.id())
+        );
+        {
+            let primary_pg = map
+                .node(NodeId::new(1))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            let slot = primary_pg
+                .pending_metadata_command_slot(NodeId::new(1).as_u32(), ClusterEpoch::INITIAL)
+                .unwrap()
+                .unwrap();
+            assert_eq!(slot.id, stale_duplicate.id());
+        }
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            crate::PgMetadataStore::head_bucket(&*pg, &first_bucket).unwrap();
+            assert!(crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).is_err());
+            if node_id == NodeId::new(0) {
+                crate::PgMetadataStore::head_bucket(&*pg, &occupant_bucket).unwrap();
+            } else {
+                assert!(crate::PgMetadataStore::head_bucket(&*pg, &occupant_bucket).is_err());
+            }
+            assert_eq!(
+                pg.max_metadata_command_log_index(ClusterEpoch::INITIAL)
+                    .unwrap(),
+                if node_id == NodeId::new(0) { 2 } else { 1 }
             );
         }
     }
@@ -4443,12 +4568,13 @@ mod tests {
         cluster
             .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &occupant)
             .unwrap();
-        map.runtime_state()
+        cluster
             .try_set_pending_metadata_command_for_bucket(
                 PgId::new(object_pg),
                 &bucket,
-                stale_command,
+                &stale_command,
             )
+            .unwrap()
             .unwrap();
 
         let outcome = cluster
@@ -4556,12 +4682,13 @@ mod tests {
         cluster
             .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &occupant)
             .unwrap();
-        map.runtime_state()
+        cluster
             .try_set_pending_metadata_command_for_bucket(
                 PgId::new(object_pg),
                 &bucket,
-                stale_command.clone(),
+                &stale_command,
             )
+            .unwrap()
             .unwrap();
 
         cluster
@@ -6893,6 +7020,130 @@ mod tests {
                 .unwrap(),
                 crate::GenerationId::MIN
             );
+        }
+    }
+
+    #[test]
+    fn required_reservation_release_keeps_durable_slot_until_partial_apply_retry() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "required-release-partial-");
+            let object_pg = 2;
+            let key = key_for_object_pg(topology, &bucket, object_pg, "key-");
+            (bucket, key, object_pg)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let pg_id = PgId::new(object_pg);
+        let reservation_id = crate::SessionId::try_from("6b".repeat(16)).unwrap();
+        assert_eq!(
+            cluster
+                .reserve_put_object_generation(&bucket, &key, &reservation_id)
+                .unwrap(),
+            crate::GenerationId::MIN
+        );
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let hook_reservation_id = reservation_id.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let _hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                if matches!(
+                    command.payload(),
+                    MetadataCommandPayload::ReleaseObjectGeneration(release)
+                        if release.matches_request(
+                            &hook_bucket,
+                            &hook_key,
+                            &hook_reservation_id
+                        ) && node_id == NodeId::new(2)
+                            && fail_once_hook.swap(false, Ordering::SeqCst)
+                ) {
+                    return Err(StoreError::Io {
+                        context: "injected required release apply failure",
+                        source: std::io::Error::other("injected required release apply failure"),
+                    });
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .release_object_generation_reservation_command_required(
+                pg_id,
+                &bucket,
+                &key,
+                &reservation_id,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected required release apply failure",
+                    ..
+                })
+            ),
+            "expected injected release failure, got {err:?}"
+        );
+        assert!(!fail_once.load(Ordering::SeqCst));
+        {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = primary.get_pg(object_pg).unwrap();
+            let slot = pg
+                .pending_metadata_command_slot(NodeId::new(1).as_u32(), ClusterEpoch::INITIAL)
+                .unwrap()
+                .expect("partial required release should leave durable primary pending slot");
+            assert_eq!(slot.scope_bucket.as_ref(), Some(&bucket));
+        }
+
+        cluster
+            .release_object_generation_reservation_command_required(
+                pg_id,
+                &bucket,
+                &key,
+                &reservation_id,
+            )
+            .unwrap();
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(pg_id, &bucket)
+            .is_none());
+        {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = primary.get_pg(object_pg).unwrap();
+            assert!(pg
+                .pending_metadata_command_slot(NodeId::new(1).as_u32(), ClusterEpoch::INITIAL)
+                .unwrap()
+                .is_none());
+        }
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    &reservation_id,
+                ),
+                Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+            ));
         }
     }
 
@@ -9836,6 +10087,15 @@ mod tests {
                 .is_some(),
             "partial direct PUT metadata command must remain pending"
         );
+        {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = primary.get_pg(object_pg).unwrap();
+            let slot = pg
+                .pending_metadata_command_slot(NodeId::new(1).as_u32(), ClusterEpoch::INITIAL)
+                .unwrap()
+                .expect("partial direct PUT should leave durable primary pending slot");
+            assert_eq!(slot.scope_bucket.as_ref(), Some(&bucket));
+        }
         for node_id in [NodeId::new(0), NodeId::new(2)] {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(object_pg).unwrap();
@@ -9864,6 +10124,14 @@ mod tests {
             .runtime_state()
             .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
             .is_none());
+        {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = primary.get_pg(object_pg).unwrap();
+            assert!(pg
+                .pending_metadata_command_slot(NodeId::new(1).as_u32(), ClusterEpoch::INITIAL)
+                .unwrap()
+                .is_none());
+        }
         assert_direct_put_metadata_on_acting_nodes(
             &map,
             &node_ids,
@@ -13151,6 +13419,15 @@ mod tests {
             "expected injected replica failure, got {err:?}"
         );
         assert!(!fail_once.load(Ordering::SeqCst));
+        {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = primary.get_pg(1).unwrap();
+            let slot = pg
+                .pending_metadata_command_slot(NodeId::new(1).as_u32(), ClusterEpoch::INITIAL)
+                .unwrap()
+                .expect("partial create bucket should leave durable primary pending slot");
+            assert_eq!(slot.scope_bucket.as_ref(), Some(&bucket));
+        }
 
         let partial_info = {
             let applied_replica = map.node(NodeId::new(0)).unwrap().storage_node();
@@ -13196,6 +13473,14 @@ mod tests {
                 info.bucket_execution_generation,
                 partial_info.bucket_execution_generation
             );
+        }
+        {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = primary.get_pg(1).unwrap();
+            assert!(pg
+                .pending_metadata_command_slot(NodeId::new(1).as_u32(), ClusterEpoch::INITIAL)
+                .unwrap()
+                .is_none());
         }
     }
 
@@ -13403,6 +13688,15 @@ mod tests {
             "expected injected replica failure, got {err:?}"
         );
         assert!(!fail_once.load(Ordering::SeqCst));
+        {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = primary.get_pg(1).unwrap();
+            let slot = pg
+                .pending_metadata_command_slot(NodeId::new(1).as_u32(), ClusterEpoch::INITIAL)
+                .unwrap()
+                .expect("partial bucket versioning should leave durable primary pending slot");
+            assert_eq!(slot.scope_bucket.as_ref(), Some(&bucket));
+        }
 
         let partial_info = {
             let applied_replica = map.node(NodeId::new(0)).unwrap().storage_node();
@@ -13443,6 +13737,14 @@ mod tests {
                 info.bucket_execution_generation,
                 partial_info.bucket_execution_generation
             );
+        }
+        {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = primary.get_pg(1).unwrap();
+            assert!(pg
+                .pending_metadata_command_slot(NodeId::new(1).as_u32(), ClusterEpoch::INITIAL)
+                .unwrap()
+                .is_none());
         }
     }
 

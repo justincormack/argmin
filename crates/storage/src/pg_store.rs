@@ -1450,9 +1450,6 @@ impl PgStore {
         }))
     }
 
-    // Wired into the cluster request paths in the later Phase 9.2 slices; the
-    // durable primitive is tested here before replacing the process-local map.
-    #[allow(dead_code)]
     pub(crate) fn try_insert_pending_metadata_command_slot(
         &self,
         node_id: u32,
@@ -1507,8 +1504,6 @@ impl PgStore {
         })
     }
 
-    // See `try_insert_pending_metadata_command_slot`.
-    #[allow(dead_code)]
     pub(crate) fn remove_pending_metadata_command_slot(
         &self,
         node_id: u32,
@@ -1557,6 +1552,76 @@ impl PgStore {
         }
         self.remove_pending_metadata_command_slot_exact(node_id, &slot)?;
         Ok(true)
+    }
+
+    pub(crate) fn replace_pending_metadata_command_slot_for_reissue(
+        &self,
+        node_id: u32,
+        expected: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        scope_bucket: Option<&BucketName>,
+    ) -> Result<bool, StoreError> {
+        if expected.id().pg_id().get() != self.pg_id {
+            return Err(StoreError::MetadataCommandWrongPg {
+                node_id,
+                command_pg_id: expected.id().pg_id().get(),
+                target_pg_id: self.pg_id,
+                cluster_epoch: expected.id().cluster_epoch(),
+            });
+        }
+        if replacement.id().pg_id().get() != self.pg_id {
+            return Err(StoreError::MetadataCommandWrongPg {
+                node_id,
+                command_pg_id: replacement.id().pg_id().get(),
+                target_pg_id: self.pg_id,
+                cluster_epoch: replacement.id().cluster_epoch(),
+            });
+        }
+        let Some(slot) =
+            self.pending_metadata_command_slot(node_id, expected.id().cluster_epoch())?
+        else {
+            return Ok(false);
+        };
+        if slot.id == replacement.id()
+            && slot.command_checksum == replacement.checksum_crc64()
+            && slot.command_bytes == replacement.command_bytes()
+        {
+            return Ok(true);
+        }
+        if slot.id != expected.id()
+            || slot.command_checksum != expected.checksum_crc64()
+            || slot.command_bytes != expected.command_bytes()
+        {
+            return Ok(false);
+        }
+        let expected_bytes = expected.command_bytes();
+        let replacement_bytes = replacement.command_bytes();
+        let updated = self.execute_cached(
+            "UPDATE metadata_command_pending_slot \
+             SET cluster_epoch = ?1, pg_id = ?2, log_index = ?3, \
+                 command_checksum = ?4, command_bytes = ?5, scope_bucket = ?6 \
+             WHERE singleton = 0 \
+               AND cluster_epoch = ?7 \
+               AND pg_id = ?8 \
+               AND log_index = ?9 \
+               AND command_checksum = ?10 \
+               AND command_bytes = ?11",
+            params![
+                replacement.id().cluster_epoch().get() as i64,
+                replacement.id().pg_id().get() as i64,
+                replacement.id().log_index().get() as i64,
+                replacement.checksum_crc64() as i64,
+                replacement_bytes,
+                scope_bucket.map(BucketName::as_str),
+                expected.id().cluster_epoch().get() as i64,
+                expected.id().pg_id().get() as i64,
+                expected.id().log_index().get() as i64,
+                expected.checksum_crc64() as i64,
+                expected_bytes,
+            ],
+            "replace metadata command pending slot for reissue",
+        )?;
+        Ok(updated == 1)
     }
 
     pub(crate) fn validate_metadata_command_replay_state(
