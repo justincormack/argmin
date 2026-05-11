@@ -1,0 +1,140 @@
+Metadata reissue can spin on replica-only log conflicts
+Link: https://chatgpt.com/codex/cloud/security/findings/f71a3870cd80819181119e455d3e183f?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 1b18e25
+Author: justin@specialbusservice.com
+Created: 11/05/2026, 12:43:17
+Assignee: Unassigned
+Signals: Security
+
+# Summary
+Introduced: the new conflict reissue loops do not verify that reissue made forward progress or account for conflicting log indexes present only on non-primary replicas.
+The new reissue path handles a zero-applied MetadataCommandLogConflict by removing the process-local pending command, constructing a replacement command with next_metadata_command_id(), and continuing the apply loop. However, next_metadata_command_id() reads only the current primary PG's max log index. apply_metadata_command_to_acting_set_from_origin() validates/applies non-primary acting nodes before the primary. Therefore, after a partial apply/crash or replica divergence where the first non-primary already has a different command at the primary's next index, apply returns a zero-applied conflict for that non-primary. Reissue then asks the primary for the next index, gets the same still-conflicting index, reinstalls an equivalent command, and loops indefinitely. This can tie up the request worker and bucket lock; repeated triggering can deny service for metadata writes on the affected PG.
+
+# Evidence
+crates/storage/src/cluster.rs (L463 to 484)
+  Note: The new reissue helper removes the pending command and creates a replacement, but does not check that the new command id/log index differs from the conflicting one.
+```
+    fn reissue_pending_metadata_command(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<Option<MetadataCommandEnvelope>, BucketSnapshotLoadError> {
+        let bucket = command.bucket_name().clone();
+        self.local_map
+            .runtime_state()
+            .remove_pending_metadata_command_for_bucket(pg_id, &bucket);
+        let command = MetadataCommandEnvelope::new(
+            self.next_metadata_command_id(pg_id)?,
+            command.payload().clone(),
+        );
+        if self
+            .local_map
+            .runtime_state()
+            .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone())
+            .is_err()
+        {
+            return Ok(None);
+        }
+        Ok(Some(command))
+```
+
+crates/storage/src/cluster.rs (L676 to 715)
+  Note: The replacement id is computed from the primary node's max metadata log index only, so it can repeat an index that conflicts on a non-primary replica but is absent from the primary.
+```
+    fn next_metadata_command_id(&self, pg_id: PgId) -> Result<MetadataCommandId, StoreError> {
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let pg = primary.storage_node().get_pg(pg_id.get())?;
+        self.next_metadata_command_id_from_locked_pg(pg_id, &pg)
+    }
+
+    fn next_metadata_command_id_from_locked_pg(
+        &self,
+        pg_id: PgId,
+        pg: &crate::PgStore,
+    ) -> Result<MetadataCommandId, StoreError> {
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let max_log_index = pg.max_metadata_command_log_index(self.operation_epoch())?;
+        if let Some(slot) =
+            pg.pending_metadata_command_slot(primary.node_id().as_u32(), self.operation_epoch())?
+        {
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id: primary.node_id().as_u32(),
+                pg_id: pg_id.get(),
+                cluster_epoch: self.operation_epoch(),
+                log_index: slot.id.log_index().get(),
+            });
+        }
+        let next_log_index = max_log_index
+            .checked_add(1)
+            .and_then(MetadataCommandLogIndex::new)
+            .ok_or(StoreError::MetadataCommandLogConflict {
+                node_id: primary.node_id().as_u32(),
+                pg_id: pg_id.get(),
+                cluster_epoch: self.operation_epoch(),
+                log_index: u64::MAX,
+            })?;
+        Ok(MetadataCommandId::new(
+            self.operation_epoch(),
+            pg_id,
+            next_log_index,
+```
+
+crates/storage/src/cluster/request_ops.rs (L636 to 642)
+  Note: The acting set is sorted so the primary is processed last; a conflict on the first non-primary can be reported with applied_nodes == 0 while the primary has not advanced.
+```
+        let primary_node_id = self
+            .local_map
+            .pg_route(pg_id)
+            .expect("validated metadata PG command route must exist")
+            .primary_node_id();
+        nodes.sort_by_key(|node| node.node_id() == primary_node_id);
+        for (applied_nodes, node) in nodes.into_iter().enumerate() {
+```
+
+crates/storage/src/cluster/request_ops.rs (L799 to 817)
+  Note: On a zero-applied matching log conflict, the new loop blindly reissues and continues; if reissue returns the same index, the loop never terminates.
+```
+            match self.apply_metadata_command_to_acting_set(&command) {
+                Ok(()) => return Ok(super::PendingMetadataCommandOutcome::Applied),
+                Err(error) => {
+                    let MetadataCommandApplyFailure {
+                        applied_nodes,
+                        source,
+                    } = error;
+                    if applied_nodes == 0
+                        && super::StorageCluster::metadata_command_log_conflict_matches(
+                            &command, &source,
+                        )
+                    {
+                        let Some(reissued) =
+                            self.reissue_pending_metadata_command(pg_id, &command)?
+                        else {
+                            return Ok(super::PendingMetadataCommandOutcome::Abandoned);
+                        };
+                        command = reissued;
+                        continue;
+```
+
+# Resolution
+Fixed by `f78304b Make metadata pending slots durable for phase 9.2`.
+
+The reissue path no longer removes the pending command and blindly calls
+`next_metadata_command_id()` from the primary only. It now reads the primary max
+metadata log index, scans the acting set max, and fails closed with
+`MetadataCommandLogConflict` if a non-primary replica is ahead of the primary.
+When reissue is safe, it computes the replacement command before mutating durable
+state and replaces the exact primary `metadata_command_pending_slot` atomically.
+
+Regression coverage was added with
+`stale_duplicate_metadata_command_index_on_non_primary_fails_closed_without_dropping_slot`,
+which proves replica-only duplicate log divergence does not spin and does not
+drop the durable pending intent.
