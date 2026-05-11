@@ -215,9 +215,6 @@ impl LocalPgRoute {
 pub(crate) struct LocalClusterRuntimeState {
     object_payload_leases: Mutex<LocalObjectPayloadLeaseState>,
     reclaim_queue: (Mutex<LocalReclaimQueueState>, Condvar),
-    #[cfg(test)]
-    metadata_command_indexes: Mutex<HashMap<PgId, u64>>,
-    pending_metadata_commands: Mutex<HashMap<PgId, MetadataCommandEnvelope>>,
 }
 
 type LocalReclaimRoot = (BucketName, ObjectKey, GenerationId);
@@ -237,9 +234,6 @@ struct LocalReclaimQueueState {
     queued_bucket_deletes: HashSet<BucketName>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PendingMetadataCommandConflict;
-
 impl LocalClusterRuntimeState {
     fn new() -> Self {
         Self {
@@ -253,103 +247,6 @@ impl LocalClusterRuntimeState {
                 }),
                 Condvar::new(),
             ),
-            #[cfg(test)]
-            metadata_command_indexes: Mutex::new(HashMap::new()),
-            pending_metadata_commands: Mutex::new(HashMap::new()),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn next_metadata_command_log_index(&self, pg_id: PgId) -> MetadataCommandLogIndex {
-        let mut indexes = self
-            .metadata_command_indexes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let index = indexes.entry(pg_id).or_insert(0);
-        *index = index
-            .checked_add(1)
-            .expect("metadata command log index overflow");
-        MetadataCommandLogIndex::new(*index).expect("metadata command log index starts at one")
-    }
-
-    pub(crate) fn pending_metadata_command_for_bucket(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-    ) -> Option<MetadataCommandEnvelope> {
-        let _ = bucket;
-        self.pending_metadata_commands
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&pg_id)
-            .cloned()
-    }
-
-    pub(crate) fn try_set_pending_metadata_command_for_bucket(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        command: MetadataCommandEnvelope,
-    ) -> Result<(), PendingMetadataCommandConflict> {
-        if command.bucket_name() != bucket {
-            return Err(PendingMetadataCommandConflict);
-        }
-        let mut pending_commands = self
-            .pending_metadata_commands
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        match pending_commands.entry(pg_id) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(command);
-                Ok(())
-            }
-            std::collections::hash_map::Entry::Occupied(_) => Err(PendingMetadataCommandConflict),
-        }
-    }
-
-    pub(crate) fn remove_pending_metadata_command_for_bucket(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-    ) -> bool {
-        let mut pending_commands = self
-            .pending_metadata_commands
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let Some(command) = pending_commands.get(&pg_id) else {
-            return false;
-        };
-        if command.bucket_name() != bucket {
-            return false;
-        }
-        pending_commands.remove(&pg_id);
-        true
-    }
-
-    pub(crate) fn replace_pending_metadata_command_for_bucket(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        expected: &MetadataCommandEnvelope,
-        replacement: MetadataCommandEnvelope,
-    ) -> Result<(), PendingMetadataCommandConflict> {
-        if expected.bucket_name() != bucket || replacement.bucket_name() != bucket {
-            return Err(PendingMetadataCommandConflict);
-        }
-        let mut pending_commands = self
-            .pending_metadata_commands
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        match pending_commands.get(&pg_id) {
-            Some(current) if current == expected || current == &replacement => {
-                pending_commands.insert(pg_id, replacement);
-                Ok(())
-            }
-            None => {
-                pending_commands.insert(pg_id, replacement);
-                Ok(())
-            }
-            Some(_) => Err(PendingMetadataCommandConflict),
         }
     }
 
@@ -1689,6 +1586,42 @@ mod tests {
                 .get(),
             expected
         );
+    }
+
+    fn pending_metadata_command_for_test(
+        map: &LocalClusterMap,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Option<MetadataCommandEnvelope> {
+        let primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+            .unwrap();
+        let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+        let command = pg
+            .pending_metadata_command_envelope(primary.node_id().as_u32(), ClusterEpoch::INITIAL)
+            .unwrap();
+        if let Some(command) = &command {
+            assert_eq!(command.bucket_name(), bucket);
+        }
+        command
+    }
+
+    fn insert_pending_metadata_command_for_test(
+        map: &LocalClusterMap,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) {
+        let primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+            .unwrap();
+        let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+        pg.try_insert_pending_metadata_command_slot(
+            primary.node_id().as_u32(),
+            command,
+            Some(bucket),
+        )
+        .unwrap();
     }
 
     fn create_bucket_metadata_command(
@@ -3213,9 +3146,7 @@ mod tests {
             })
         ));
         assert!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(PgId::new(1), &bucket)
-                .is_some(),
+            pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_some(),
             "failed strict write should keep the command pending for replica recovery"
         );
         for node_id in node_ids {
@@ -3239,10 +3170,7 @@ mod tests {
         cluster
             .create_bucket_with_config_and_load_info(&config)
             .unwrap();
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(1), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none());
         for node_id in node_ids {
             let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
             let info = crate::PgMetadataStore::head_bucket(&*pg, &bucket).unwrap();
@@ -3307,10 +3235,6 @@ mod tests {
 
         let map =
             Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, &bucket)
-            .is_none());
         {
             let primary_pg = map
                 .node(NodeId::new(0))
@@ -3331,10 +3255,7 @@ mod tests {
         cluster
             .create_bucket_with_config_and_load_info(&config)
             .unwrap();
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
         for node_id in node_ids {
             let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
             crate::PgMetadataStore::head_bucket(&*pg, &bucket).unwrap();
@@ -3410,10 +3331,6 @@ mod tests {
 
         let map =
             Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, &bucket)
-            .is_none());
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
         let info = cluster
             .put_bucket_acl_and_load_info(&bucket, &acl_grants, true, false)
@@ -3485,10 +3402,6 @@ mod tests {
 
         let map =
             Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap());
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, &bucket)
-            .is_none());
         {
             let primary_pg = map
                 .node(NodeId::new(0))
@@ -4707,10 +4620,7 @@ mod tests {
 
         create_test_bucket(&cluster, &second_bucket);
 
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, &second_bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, pg_id, &second_bucket).is_none());
         for node_id in node_ids {
             let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
             crate::PgMetadataStore::head_bucket(&*pg, &first_bucket).unwrap();
@@ -4784,8 +4694,7 @@ mod tests {
         ));
 
         assert_eq!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(pg_id, &second_bucket)
+            pending_metadata_command_for_test(&map, pg_id, &second_bucket)
                 .as_ref()
                 .map(MetadataCommandEnvelope::id),
             Some(stale_duplicate.id())
@@ -4816,6 +4725,76 @@ mod tests {
                 pg.max_metadata_command_log_index(ClusterEpoch::INITIAL)
                     .unwrap(),
                 if node_id == NodeId::new(0) { 2 } else { 1 }
+            );
+        }
+    }
+
+    #[test]
+    fn stale_duplicate_reissue_reloads_replaced_slot_during_primary_last_fanout() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let first_bucket = bucket_for_pg(topology, 1, "duplicate-race-first-");
+        let second_bucket = bucket_for_pg(topology, 1, "duplicate-race-second-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let applied = create_bucket_metadata_command(pg_id, 1, first_bucket.clone());
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &applied)
+            .unwrap();
+
+        let stale = create_bucket_metadata_command(pg_id, 1, second_bucket.clone());
+        let replacement = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            stale.payload().clone(),
+        );
+        insert_pending_metadata_command_for_test(&map, pg_id, &second_bucket, &replacement);
+        {
+            let non_primary = map.node(NodeId::new(0)).unwrap().storage_node();
+            non_primary
+                .get_pg(1)
+                .unwrap()
+                .apply_metadata_command_and_record(NodeId::new(0).as_u32(), &replacement)
+                .unwrap();
+        }
+
+        let reissued = cluster
+            .test_reissue_pending_metadata_command(pg_id, &stale)
+            .unwrap()
+            .expect("reissue should reload the replacement pending slot");
+        assert_eq!(reissued, replacement);
+
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &reissued)
+            .unwrap();
+        {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = primary.get_pg(1).unwrap();
+            assert!(pg
+                .remove_pending_metadata_command_slot(NodeId::new(1).as_u32(), &reissued)
+                .unwrap());
+        }
+
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            crate::PgMetadataStore::head_bucket(&*pg, &first_bucket).unwrap();
+            crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).unwrap();
+            assert_eq!(
+                pg.max_metadata_command_log_index(ClusterEpoch::INITIAL)
+                    .unwrap(),
+                2
             );
         }
     }
@@ -4901,10 +4880,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         assert_direct_put_metadata_on_acting_nodes(
             &map,
             &node_ids,
@@ -5016,10 +4992,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         for node_id in node_ids {
             let pg = map
                 .node(node_id)
@@ -5106,10 +5079,7 @@ mod tests {
             "expected injected zero-apply failure, got {err:?}"
         );
         drop(hook_guard);
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(1), &first_bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(1), &first_bucket).is_none());
         for node_id in node_ids {
             let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
             let state = pg.metadata_command_replica_state().unwrap();
@@ -5130,10 +5100,7 @@ mod tests {
         }
 
         create_test_bucket(&cluster, &first_bucket);
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(1), &first_bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(1), &first_bucket).is_none());
         for node_id in node_ids {
             let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
             let state = pg.metadata_command_replica_state().unwrap();
@@ -5210,9 +5177,7 @@ mod tests {
         let pg_id = PgId::new(1);
         let abandoned_index = map.test_next_metadata_command_log_index(pg_id).get();
         let command = create_bucket_metadata_command(pg_id, abandoned_index, bucket.clone());
-        map.runtime_state()
-            .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone())
-            .unwrap();
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
         {
             let node_zero_pg = map
                 .node(NodeId::new(0))
@@ -5292,9 +5257,7 @@ mod tests {
                 ),
             ),
         );
-        map.runtime_state()
-            .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone())
-            .unwrap();
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
         {
             let node_zero_pg = map
                 .node(NodeId::new(0))
@@ -5311,10 +5274,7 @@ mod tests {
             .reserve_put_object_generation(&bucket, &key, &reservation_id)
             .unwrap();
         assert_eq!(generation_id, skipped_generation_id);
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
         for node_id in node_ids {
             let pg = map
                 .node(node_id)
@@ -5382,9 +5342,7 @@ mod tests {
                 ),
             )),
         );
-        map.runtime_state()
-            .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone())
-            .unwrap();
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
         {
             let node_zero_pg = map
                 .node(NodeId::new(0))
@@ -5400,10 +5358,7 @@ mod tests {
         cluster
             .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
             .unwrap();
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
         for node_id in node_ids {
             let pg = map
                 .node(node_id)
@@ -5468,9 +5423,7 @@ mod tests {
                 ),
             )),
         );
-        map.runtime_state()
-            .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone())
-            .unwrap();
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
         {
             let node_zero_pg = map
                 .node(NodeId::new(0))
@@ -5514,10 +5467,7 @@ mod tests {
             .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
             .unwrap();
         drop(hook_guard);
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
         for node_id in node_ids {
             let pg = map
                 .node(node_id)
@@ -5610,10 +5560,7 @@ mod tests {
             "expected injected zero-apply reservation failure, got {err:?}"
         );
         drop(hook_guard);
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         for node_id in node_ids {
             let pg = map
                 .node(node_id)
@@ -5762,10 +5709,7 @@ mod tests {
             "expected injected zero-apply direct PUT commit failure, got {err:?}"
         );
         drop(hook_guard);
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
 
         for node_id in node_ids {
             let pg = map
@@ -5861,13 +5805,7 @@ mod tests {
             .register_payload_shard_acks(data_pg, &abandoned_shard_batch)
             .unwrap();
 
-        map.runtime_state()
-            .try_set_pending_metadata_command_for_bucket(
-                PgId::new(object_pg),
-                &bucket,
-                command.clone(),
-            )
-            .unwrap();
+        insert_pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket, &command);
         {
             let node_zero_pg = map
                 .node(NodeId::new(0))
@@ -5941,10 +5879,7 @@ mod tests {
             "expected abandoned direct PUT conflict, got {err:?}"
         );
 
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(object_pg).unwrap();
@@ -6078,9 +6013,7 @@ mod tests {
         );
         drop(hook_guard);
         assert!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-                .is_some(),
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
             "unrelated object metadata command must remain pending"
         );
 
@@ -6120,10 +6053,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(outcome.live_size, payload.len() as u64);
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         assert_direct_put_metadata_on_acting_nodes(
             &map,
             &node_ids,
@@ -6218,9 +6148,7 @@ mod tests {
         );
         drop(hook_guard);
 
-        let pending = map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, &bucket)
+        let pending = pending_metadata_command_for_test(&map, pg_id, &bucket)
             .expect("partial version reservation must remain pending");
         let MetadataCommandPayload::ReserveObjectVersion(reservation) = pending.payload() else {
             panic!("expected pending ReserveObjectVersion, got {pending:?}");
@@ -6249,10 +6177,7 @@ mod tests {
             .reserve_next_object_version(pg_id, &bucket, &key, primary_node)
             .unwrap();
         assert_eq!(reserved, crate::VersionId::from_u64(1));
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
         assert_object_version_counter_on_acting_nodes(&map, &node_ids, object_pg, &bucket, &key, 2);
     }
 
@@ -6423,10 +6348,7 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(err, "conditional write rejected");
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         assert_object_version_counter_on_acting_nodes(&map, &node_ids, object_pg, &bucket, &key, 0);
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
@@ -6999,10 +6921,7 @@ mod tests {
             .reserve_put_object_generation(&bucket, &key, &reservation_id)
             .unwrap();
         assert_eq!(generation_id, crate::GenerationId::MIN);
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
 
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
@@ -7022,10 +6941,7 @@ mod tests {
         cluster
             .release_object_generation_reservation(&bucket, &key, &reservation_id)
             .unwrap();
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(object_pg).unwrap();
@@ -7094,18 +7010,13 @@ mod tests {
                 ),
             ),
         );
-        map.runtime_state()
-            .try_set_pending_metadata_command_for_bucket(pg_id, &first_bucket, pending)
-            .unwrap();
+        insert_pending_metadata_command_for_test(&map, pg_id, &first_bucket, &pending);
 
         let second_generation = cluster
             .reserve_put_object_generation(&second_bucket, &second_key, &second_reservation_id)
             .unwrap();
         assert_eq!(second_generation, crate::GenerationId::MIN);
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, &second_bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, pg_id, &second_bucket).is_none());
         let retried_first_generation = cluster
             .reserve_put_object_generation(&first_bucket, &first_key, &first_reservation_id)
             .unwrap();
@@ -7200,17 +7111,12 @@ mod tests {
                 ),
             ),
         );
-        map.runtime_state()
-            .try_set_pending_metadata_command_for_bucket(pg_id, &second_bucket, pending)
-            .unwrap();
+        insert_pending_metadata_command_for_test(&map, pg_id, &second_bucket, &pending);
 
         cluster
             .release_object_generation_reservation(&first_bucket, &first_key, &first_reservation_id)
             .unwrap();
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, &first_bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, pg_id, &first_bucket).is_none());
 
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
@@ -7296,9 +7202,7 @@ mod tests {
                 ),
             ),
         );
-        map.runtime_state()
-            .try_set_pending_metadata_command_for_bucket(pg_id, &second_bucket, pending)
-            .unwrap();
+        insert_pending_metadata_command_for_test(&map, pg_id, &second_bucket, &pending);
 
         cluster
             .release_object_generation_reservation_command_required(
@@ -7308,10 +7212,7 @@ mod tests {
                 &first_reservation_id,
             )
             .unwrap();
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, &first_bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, pg_id, &first_bucket).is_none());
 
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
@@ -7435,10 +7336,7 @@ mod tests {
                 &reservation_id,
             )
             .unwrap();
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
         {
             let primary = map.node(NodeId::new(1)).unwrap().storage_node();
             let pg = primary.get_pg(object_pg).unwrap();
@@ -7519,10 +7417,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         assert_direct_put_metadata_on_acting_nodes(
             &map,
             &node_ids,
@@ -7616,10 +7511,7 @@ mod tests {
                 &shard_batch,
             )
             .unwrap();
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
 
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
@@ -7633,10 +7525,7 @@ mod tests {
         cluster
             .abort_stream_upload_session(&bucket, &key, &session_id)
             .unwrap();
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
 
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
@@ -7722,10 +7611,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(outcome.value, 11);
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
 
         let mut generation_id = None;
         for node_id in node_ids {
@@ -7840,9 +7726,7 @@ mod tests {
         drop(hook_guard);
 
         assert!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-                .is_some(),
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
             "partial multipart create command must remain pending"
         );
         let replica_upload = {
@@ -7873,10 +7757,7 @@ mod tests {
             .unwrap();
         assert_eq!(retry.value, 7);
         assert_eq!(retry.initiated_at, replica_upload.initiated_at);
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
 
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
@@ -8189,9 +8070,7 @@ mod tests {
         drop(hook_guard);
 
         assert!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-                .is_some(),
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
             "partial multipart abort command must remain pending with cleanup refs"
         );
         {
@@ -8221,10 +8100,7 @@ mod tests {
         assert!(cluster
             .abort_multipart_upload(&bucket, &key, &upload_id)
             .unwrap());
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(object_pg).unwrap();
@@ -8332,10 +8208,12 @@ mod tests {
                         ),
                     )),
                 );
-                map_for_hook
-                    .runtime_state()
-                    .try_set_pending_metadata_command_for_bucket(pg_id, &bucket_for_hook, command)
-                    .expect("abort pending-install hook should win the empty pending slot");
+                insert_pending_metadata_command_for_test(
+                    &map_for_hook,
+                    pg_id,
+                    &bucket_for_hook,
+                    &command,
+                );
             }));
 
         assert!(cluster
@@ -8345,10 +8223,7 @@ mod tests {
             injected.load(Ordering::SeqCst),
             "test hook must exercise the abort pending-install conflict window"
         );
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
 
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
@@ -8452,10 +8327,12 @@ mod tests {
                         ),
                     )),
                 );
-                map_for_hook
-                    .runtime_state()
-                    .try_set_pending_metadata_command_for_bucket(pg_id, &bucket_for_hook, command)
-                    .expect("abort pending-install hook should win the empty pending slot");
+                insert_pending_metadata_command_for_test(
+                    &map_for_hook,
+                    pg_id,
+                    &bucket_for_hook,
+                    &command,
+                );
             }));
 
         assert!(cluster
@@ -8465,10 +8342,7 @@ mod tests {
             injected.load(Ordering::SeqCst),
             "test hook must exercise the UploadPart stream creation conflict window"
         );
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
 
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
@@ -8617,10 +8491,7 @@ mod tests {
             "expected injected zero-apply failure, got {err:?}"
         );
         drop(hook_guard);
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         {
             let primary = map.node(NodeId::new(1)).unwrap().storage_node();
             let pg = primary.get_pg(object_pg).unwrap();
@@ -8647,10 +8518,7 @@ mod tests {
         assert!(cluster
             .abort_multipart_upload(&bucket, &key, &upload_id)
             .unwrap());
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(object_pg).unwrap();
@@ -8754,10 +8622,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(aborted);
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(object_pg).unwrap();
@@ -8861,9 +8726,7 @@ mod tests {
         drop(hook_guard);
 
         assert!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-                .is_some(),
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
             "partial stream create command must remain pending"
         );
         let replica_created_at = {
@@ -8895,10 +8758,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(retry_value, 7);
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
 
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
@@ -9079,9 +8939,7 @@ mod tests {
         drop(hook_guard);
 
         assert!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-                .is_some(),
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
             "partial first stream create command must remain pending"
         );
 
@@ -9098,10 +8956,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(value, 9);
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
 
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
@@ -9176,10 +9031,12 @@ mod tests {
                         ),
                     )),
                 );
-                map_for_hook
-                    .runtime_state()
-                    .try_set_pending_metadata_command_for_bucket(pg_id, &bucket_for_hook, command)
-                    .expect("stream create pending-install hook should win the empty pending slot");
+                insert_pending_metadata_command_for_test(
+                    &map_for_hook,
+                    pg_id,
+                    &bucket_for_hook,
+                    &command,
+                );
             }),
         );
 
@@ -9200,10 +9057,7 @@ mod tests {
         assert_eq!(value, 13);
         assert!(injected.load(Ordering::SeqCst));
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
 
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
@@ -9259,9 +9113,7 @@ mod tests {
                 ),
             )),
         );
-        map.runtime_state()
-            .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command)
-            .unwrap();
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
 
         let error = cluster
             .abort_stream_upload_session(&bucket, &key, &missing_session_id)
@@ -9275,10 +9127,7 @@ mod tests {
             ),
             "unrelated pending command must not make missing stream abort idempotent: {error:?}"
         );
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
 
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
@@ -9288,119 +9137,6 @@ mod tests {
             assert_eq!(session.bucket, bucket);
             assert_eq!(session.key, key);
         }
-    }
-
-    #[test]
-    fn pending_metadata_command_insert_rejects_existing_without_overwrite() {
-        let runtime_state = LocalClusterRuntimeState::new();
-        let pg_id = PgId::new(3);
-        let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
-        let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
-        let session_one = crate::SessionId::try_from("41".repeat(16)).unwrap();
-        let session_two = crate::SessionId::try_from("42".repeat(16)).unwrap();
-
-        let make_release_command = |session_id: crate::SessionId| {
-            let command_id = crate::metadata_command::MetadataCommandId::new(
-                crate::ClusterEpoch::INITIAL,
-                pg_id,
-                runtime_state.next_metadata_command_log_index(pg_id),
-            );
-            MetadataCommandEnvelope::new(
-                command_id,
-                MetadataCommandPayload::ReleaseObjectGeneration(
-                    crate::metadata_command::ReleaseObjectGenerationCommand::new(
-                        bucket.clone(),
-                        key.clone(),
-                        session_id,
-                    ),
-                ),
-            )
-        };
-        let command_one = make_release_command(session_one);
-        let command_two = make_release_command(session_two);
-
-        runtime_state
-            .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command_one.clone())
-            .unwrap();
-        let result =
-            runtime_state.try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command_two);
-
-        assert_eq!(result, Err(PendingMetadataCommandConflict));
-        assert_eq!(
-            runtime_state
-                .pending_metadata_command_for_bucket(pg_id, &bucket)
-                .unwrap(),
-            command_one
-        );
-    }
-
-    #[test]
-    fn pending_metadata_command_slot_is_pg_scoped_not_bucket_scoped() {
-        let runtime_state = LocalClusterRuntimeState::new();
-        let pg_id = PgId::new(3);
-        let first_bucket = crate::BucketName::try_from("first-bucket".to_string()).unwrap();
-        let second_bucket = crate::BucketName::try_from("second-bucket".to_string()).unwrap();
-        let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
-        let session_one = crate::SessionId::try_from("41".repeat(16)).unwrap();
-        let session_two = crate::SessionId::try_from("42".repeat(16)).unwrap();
-
-        let make_release_command = |bucket: crate::BucketName, session_id: crate::SessionId| {
-            let command_id = crate::metadata_command::MetadataCommandId::new(
-                crate::ClusterEpoch::INITIAL,
-                pg_id,
-                runtime_state.next_metadata_command_log_index(pg_id),
-            );
-            MetadataCommandEnvelope::new(
-                command_id,
-                MetadataCommandPayload::ReleaseObjectGeneration(
-                    crate::metadata_command::ReleaseObjectGenerationCommand::new(
-                        bucket,
-                        key.clone(),
-                        session_id,
-                    ),
-                ),
-            )
-        };
-        let first_command = make_release_command(first_bucket.clone(), session_one);
-        let second_command = make_release_command(second_bucket.clone(), session_two);
-
-        runtime_state
-            .try_set_pending_metadata_command_for_bucket(
-                pg_id,
-                &first_bucket,
-                first_command.clone(),
-            )
-            .unwrap();
-        let result = runtime_state.try_set_pending_metadata_command_for_bucket(
-            pg_id,
-            &second_bucket,
-            second_command,
-        );
-
-        assert_eq!(result, Err(PendingMetadataCommandConflict));
-        assert_eq!(
-            runtime_state
-                .pending_metadata_command_for_bucket(pg_id, &second_bucket)
-                .unwrap(),
-            first_command
-        );
-        assert!(
-            !runtime_state.remove_pending_metadata_command_for_bucket(pg_id, &second_bucket),
-            "bucket-scoped removal must not clear another bucket's PG slot"
-        );
-        assert_eq!(
-            runtime_state
-                .pending_metadata_command_for_bucket(pg_id, &second_bucket)
-                .unwrap(),
-            first_command
-        );
-        assert!(
-            runtime_state.remove_pending_metadata_command_for_bucket(pg_id, &first_bucket),
-            "owner bucket should clear its PG slot"
-        );
-        assert!(runtime_state
-            .pending_metadata_command_for_bucket(pg_id, &first_bucket)
-            .is_none());
     }
 
     #[test]
@@ -9503,9 +9239,7 @@ mod tests {
         );
         drop(hook_guard);
         assert!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-                .is_some(),
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
             "partial stream append command must remain pending"
         );
         {
@@ -9555,10 +9289,7 @@ mod tests {
                 &shard_batch,
             )
             .unwrap();
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(object_pg).unwrap();
@@ -9673,9 +9404,7 @@ mod tests {
         );
         drop(hook_guard);
         assert!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-                .is_some(),
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
             "partial abort command must remain pending"
         );
         assert_stream_next_segment_vid(&map, NodeId::new(1), object_pg, &session_id, 2);
@@ -9684,10 +9413,7 @@ mod tests {
         cluster
             .reserve_put_object_generation(&bucket, &key, &next_reservation_id)
             .unwrap();
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(object_pg).unwrap();
@@ -9818,9 +9544,7 @@ mod tests {
         );
         drop(hook_guard);
         assert!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-                .is_some(),
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
             "partial stream PUT finalize command must remain pending"
         );
         assert_stream_next_segment_vid(&map, NodeId::new(1), object_pg, &session_id, 2);
@@ -9829,10 +9553,7 @@ mod tests {
         cluster
             .reserve_put_object_generation(&bucket, &key, &next_reservation_id)
             .unwrap();
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(object_pg).unwrap();
@@ -10125,9 +9846,7 @@ mod tests {
         );
         drop(hook_guard);
         assert!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-                .is_some(),
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
             "partial stream part command must remain pending"
         );
         assert_stream_next_segment_vid(&map, NodeId::new(1), object_pg, &session_id, 2);
@@ -10136,10 +9855,7 @@ mod tests {
         cluster
             .reserve_put_object_generation(&bucket, &key, &next_reservation_id)
             .unwrap();
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(object_pg).unwrap();
@@ -10358,9 +10074,7 @@ mod tests {
         drop(hook_guard);
         assert!(!fail_once.load(Ordering::SeqCst));
         assert!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-                .is_some(),
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
             "partial direct PUT metadata command must remain pending"
         );
         {
@@ -10396,10 +10110,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         {
             let primary = map.node(NodeId::new(1)).unwrap().storage_node();
             let pg = primary.get_pg(object_pg).unwrap();
@@ -10518,9 +10229,7 @@ mod tests {
         );
         drop(hook_guard);
         assert!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-                .is_some(),
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
             "partial direct PUT metadata command must remain pending"
         );
 
@@ -10529,10 +10238,7 @@ mod tests {
             .reserve_put_object_generation(&bucket, &key, &next_reservation_id)
             .unwrap();
         assert!(next_generation_id.get() > generation_id.get());
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
 
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
@@ -10649,9 +10355,7 @@ mod tests {
         );
         drop(hook_guard);
         assert!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-                .is_some(),
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
             "partial direct PUT metadata command must remain pending"
         );
         {
@@ -10682,10 +10386,7 @@ mod tests {
                 ..
             } if deleted_generation_id == generation_id
         ));
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
 
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
@@ -10701,10 +10402,7 @@ mod tests {
             .reserve_put_object_generation(&bucket, &key, &next_reservation_id)
             .unwrap();
         assert!(next_generation_id.get() > generation_id.get());
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
 
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
@@ -10814,10 +10512,7 @@ mod tests {
             .unwrap();
         expected_segment.version_id = outcome.version_id.to_u64();
 
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         assert_streamed_multipart_completion_on_acting_nodes(
             &map,
             &node_ids,
@@ -11270,10 +10965,7 @@ mod tests {
             .unwrap()
             .value;
 
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         let expected_segments = vec![crate::MultipartPartSegmentRecord {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -11418,10 +11110,7 @@ mod tests {
             "expected raced upload state to reject stream session creation, got {err:?}"
         );
         assert!(did_flip.load(Ordering::SeqCst));
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(object_pg).unwrap();
@@ -11656,9 +11345,7 @@ mod tests {
         drop(hook_guard);
         assert!(!fail_once.load(Ordering::SeqCst));
         assert!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-                .is_some(),
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
             "zero-apply multipart completion failure must keep its pending command"
         );
         for node_id in node_ids {
@@ -11673,10 +11360,7 @@ mod tests {
         let outcome = cluster
             .complete_multipart_upload_commit_serialized(req.clone(), 16)
             .unwrap();
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         assert_streamed_multipart_completion_on_acting_nodes(
             &map,
             &node_ids,
@@ -11725,10 +11409,7 @@ mod tests {
             } if generation_id == committed.generation_id
         ));
 
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(object_pg).unwrap();
@@ -11816,9 +11497,7 @@ mod tests {
         drop(hook_guard);
         assert!(!fail_once.load(Ordering::SeqCst));
         assert!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-                .is_some(),
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
             "partial object delete metadata command must remain pending"
         );
         for node_id in [NodeId::new(0), NodeId::new(2)] {
@@ -11853,10 +11532,7 @@ mod tests {
                 ..
             } if generation_id == committed.generation_id
         ));
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(object_pg).unwrap();
@@ -11947,20 +11623,14 @@ mod tests {
         );
         drop(hook_guard);
         assert!(!fail_once.load(Ordering::SeqCst));
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(pg_id), &bucket)
-            .is_some());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(pg_id), &bucket).is_some());
         assert!(cluster.try_take_reclaim_work().is_none());
 
         let completion_order = cluster
             .test_reserve_completed_multipart_upload_order(&bucket)
             .unwrap();
         assert_eq!(completion_order, 1);
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(pg_id), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(pg_id), &bucket).is_none());
         assert!(matches!(
             cluster.try_take_reclaim_work(),
             Some(crate::ReclaimWorkItem::ObjectPayload((
@@ -12173,9 +11843,7 @@ mod tests {
         );
         drop(hook_guard);
         assert!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-                .is_some(),
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
             "partial object metadata command must remain pending"
         );
         for node_id in [NodeId::new(0), NodeId::new(2)] {
@@ -12212,10 +11880,7 @@ mod tests {
             .put_object_tags_if(&bucket, &key, None, tags, require_tags_absent)
             .unwrap()
             .unwrap();
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
 
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
@@ -12280,9 +11945,7 @@ mod tests {
                 object: mismatched_post_image,
             })),
         );
-        map.runtime_state()
-            .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command)
-            .unwrap();
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
 
         let err = cluster
             .put_object_tags_if(&bucket, &key, None, tags, |stored| {
@@ -12302,10 +11965,8 @@ mod tests {
         let pg = primary.get_pg(object_pg).unwrap();
         let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
         assert_eq!(stored.as_live().unwrap().tags, None);
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, &bucket)
-            .is_some());
+        drop(pg);
+        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_some());
     }
 
     #[test]
@@ -12772,10 +12433,7 @@ mod tests {
             .unwrap();
         assert_eq!(marker.version_id, crate::VersionId::from_u64(1));
 
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(object_pg).unwrap();
@@ -13150,9 +12808,7 @@ mod tests {
         ));
         assert!(failed_ack_delete.load(Ordering::SeqCst));
         assert!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-                .is_none(),
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none(),
             "ack cleanup failure happens before the reclaim metadata delete command is installed"
         );
         assert!(cluster
@@ -13187,10 +12843,7 @@ mod tests {
         assert!(cluster
             .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
             .unwrap());
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         assert!(!cluster
             .payload_reclaim_exists(&bucket, &key, committed.generation_id)
             .unwrap());
@@ -13244,10 +12897,7 @@ mod tests {
         assert!(cluster
             .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
             .unwrap());
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(object_pg).unwrap();
@@ -13334,9 +12984,7 @@ mod tests {
                 ..
             })
         ));
-        let pending = map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+        let pending = pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket)
             .expect("partial reclaim metadata delete must keep pending command");
         assert!(matches!(
             pending.payload(),
@@ -13376,10 +13024,7 @@ mod tests {
         assert!(cluster
             .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
             .unwrap());
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(object_pg).unwrap();
@@ -13826,10 +13471,7 @@ mod tests {
             ),
             "expected injected partial create failure, got {err:?}"
         );
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(1), &first_bucket)
-            .is_some());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(1), &first_bucket).is_some());
         drop(hook_guard);
 
         let second = cluster
@@ -13848,10 +13490,7 @@ mod tests {
             second,
             crate::BucketCreateAttemptOutcome::Created(info) if info.name == second_bucket
         ));
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(1), &second_bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(1), &second_bucket).is_none());
 
         for node_id in node_ids {
             let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
@@ -14085,9 +13724,7 @@ mod tests {
         drop(hook_guard);
         assert!(!fail_once.load(Ordering::SeqCst));
 
-        let pending = map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(1), &bucket)
+        let pending = pending_metadata_command_for_test(&map, PgId::new(1), &bucket)
             .expect("failed versioning command should remain pending");
         assert!(matches!(
             pending.payload(),
@@ -14119,10 +13756,7 @@ mod tests {
             acl_updated.bucket_execution_generation > partial_info.bucket_execution_generation,
             "later ACL command must reserve a newer execution generation after draining the pending versioning command"
         );
-        assert!(map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(1), &bucket)
-            .is_none());
+        assert!(pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none());
 
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
@@ -14324,9 +13958,7 @@ mod tests {
                 },
             ),
         );
-        map.runtime_state()
-            .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone())
-            .unwrap();
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
 
         let _serial = lock_metadata_command_apply_hook_test();
         let apply_count = Arc::new(AtomicUsize::new(0));
@@ -14447,9 +14079,7 @@ mod tests {
         );
         assert!(!fail_once.load(Ordering::SeqCst));
 
-        let pending_before = map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(1), &bucket)
+        let pending_before = pending_metadata_command_for_test(&map, PgId::new(1), &bucket)
             .expect("failed ACL command should remain pending");
         assert!(matches!(
             pending_before.payload(),
@@ -14492,9 +14122,7 @@ mod tests {
                         == crate::CanonicalUserId::from_principal("owner")
         ));
 
-        let pending_after = map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(PgId::new(1), &bucket)
+        let pending_after = pending_metadata_command_for_test(&map, PgId::new(1), &bucket)
             .expect("existing CreateBucket must not drop the pending ACL command");
         assert_eq!(pending_after.id(), pending_before.id());
         assert_eq!(pending_after.payload(), pending_before.payload());
@@ -14562,9 +14190,7 @@ mod tests {
             ),
             MetadataCommandPayload::PutBucketAcl(update),
         );
-        map.runtime_state()
-            .try_set_pending_metadata_command_for_bucket(PgId::new(1), &bucket, command)
-            .unwrap();
+        insert_pending_metadata_command_for_test(&map, PgId::new(1), &bucket, &command);
 
         let err = cluster
             .put_bucket_acl_and_load_info(&bucket, &acl_grants, true, false)
@@ -14881,9 +14507,7 @@ mod tests {
             other => panic!("expected object-lock storage validation error, got {other:?}"),
         }
         assert!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(PgId::new(1), &bucket)
-                .is_none(),
+            pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none(),
             "deterministic validation failures must not leave pending commands"
         );
         for node_id in node_ids {
@@ -15329,9 +14953,7 @@ mod tests {
             other => panic!("expected subresource storage validation error, got {other:?}"),
         }
         assert!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(PgId::new(1), &bucket)
-                .is_none(),
+            pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none(),
             "deterministic validation failures must not leave pending commands"
         );
         for node_id in node_ids {
@@ -15440,9 +15062,7 @@ mod tests {
         );
         drop(hook_guard);
         assert!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(PgId::new(1), &bucket)
-                .is_some(),
+            pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_some(),
             "failed versioning command should remain pending before delete"
         );
         let old_partial_generation = {
@@ -15459,9 +15079,7 @@ mod tests {
             crate::BucketDeleteFinalizeOutcome::Finalized
         );
         assert!(
-            map.runtime_state()
-                .pending_metadata_command_for_bucket(PgId::new(1), &bucket)
-                .is_none(),
+            pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none(),
             "finalized delete must clear stale pending commands for the old bucket incarnation"
         );
 
@@ -15657,13 +15275,7 @@ mod tests {
                 ),
             )
         };
-        map.runtime_state()
-            .try_set_pending_metadata_command_for_bucket(
-                pg_id,
-                &pending_bucket,
-                pending_command.clone(),
-            )
-            .unwrap();
+        insert_pending_metadata_command_for_test(&map, pg_id, &pending_bucket, &pending_command);
 
         assert_eq!(
             cluster
@@ -15672,9 +15284,7 @@ mod tests {
             crate::BucketDeleteFinalizeOutcome::Finalized
         );
 
-        let retained = map
-            .runtime_state()
-            .pending_metadata_command_for_bucket(pg_id, &pending_bucket)
+        let retained = pending_metadata_command_for_test(&map, pg_id, &pending_bucket)
             .expect("unrelated same-PG pending command must survive bucket finalization");
         assert_eq!(retained.id(), pending_command.id());
         assert_eq!(

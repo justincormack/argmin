@@ -2502,29 +2502,30 @@ Proposed subphases:
        the routed PG-primary's durable command log, including already-open
        handles after another handle has appended a command; unresolved durable
        bucket-PG and object-PG pending slots are loaded and converged rather
-       than skipped; the remaining `LocalClusterRuntimeState` index helper is
-       test-only fixture support for manually constructed commands
+       than skipped; the old `LocalClusterRuntimeState` index helper has been
+       removed and tests that need hand-built commands now allocate from the
+       durable PG-primary state
    - replace process-local pending metadata command maps with durable pending
      command state or retry derivation from the durable command log
-     - current in-process retry cache is PG-scoped as a bridge; it must not
-       reintroduce `(PG, bucket)` pending slots while the durable slot is wired
-       into request paths
-     - status: bucket-named bridge cleanup is now owner-aware; removing a
-       pending entry for one bucket does not clear another bucket's PG slot,
-       and finalized bucket deletion no longer clears the PG slot as a
-       side-effect
      - status: bucket and object command publishers now install durable pending
        slots on the routed PG primary and remove them only after an
        applied/abandoned terminal log record is durable; duplicate-index
        zero-apply reissue computes a safe replacement first, rejects divergent
        non-primary-only histories, and then atomically replaces the exact stale
        durable slot on the primary
+     - status: duplicate-index reissue reloads the durable primary pending slot
+       before treating a higher non-primary log index as durable divergence, so
+       a second drainer can converge an already-reissued command during the
+       normal primary-last fanout window rather than surfacing a false conflict
      - status: bucket-PG and object-PG pending slots now have typed command
        decoding and can be rehydrated from the durable primary slot after
-       reopen or when a second handle has an empty runtime bridge; the
-       in-process bridge remains the live wakeup/cache layer, but request paths
-       must derive unresolved slot intent from durable storage when the bridge
-       is empty
+       reopen or when a second handle sees the same PG; production request
+       paths now read, install, reissue, and remove the durable slot directly
+       rather than consulting an in-memory pending-command map
+     - status: `LocalClusterRuntimeState::pending_metadata_commands` and its
+       test-only helpers have been removed; local-cluster tests now inject and
+       inspect pending commands through the durable PG-primary slot so the test
+       surface exercises the production recovery primitive
      - draining a PG slot must preserve command-owned resources for the original
        request; non-matching generation reservations are not released by the
        drainer because they may belong to active concurrent work
@@ -2614,8 +2615,9 @@ Proposed subphases:
 Phase 9.1 audit checklist:
 
 1. metadata command log index allocation
-   - current process-local mechanism:
-     `LocalClusterRuntimeState::metadata_command_indexes`
+   - former process-local mechanism:
+     `LocalClusterRuntimeState::metadata_command_indexes` (removed in Phase
+     9.2)
    - classification: request serialization and command stream ordering
    - risk: two processes can allocate conflicting or reordered log indexes for
      the same PG if allocation remains outside durable PG-primary state
@@ -2631,8 +2633,9 @@ Phase 9.1 audit checklist:
    - replacement owner: PG-primary durable pending slot plus per-replica
      validate/apply/record transactions and fail-closed replica history checks
 3. pending metadata command convergence
-   - current process-local mechanism:
-     `LocalClusterRuntimeState::pending_metadata_commands`
+   - former process-local mechanism:
+     `LocalClusterRuntimeState::pending_metadata_commands` (removed in Phase
+     9.2)
    - classification: request serialization and retry convergence
    - risk: partial apply state can be forgotten on process exit or invisible to
      another process, so retries can allocate later commands before the earlier

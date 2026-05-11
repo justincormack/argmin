@@ -466,18 +466,34 @@ impl StorageCluster {
         command: &MetadataCommandEnvelope,
     ) -> Result<Option<MetadataCommandEnvelope>, BucketSnapshotLoadError> {
         let bucket = command.bucket_name().clone();
-        // If a non-primary has a higher durable log index than the primary,
-        // fail closed. A later recovery path must reconcile that history before
-        // this process can safely reissue the pending command.
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let primary_max_log_index = {
-            let pg = primary.storage_node().get_pg(pg_id.get())?;
-            pg.max_metadata_command_log_index(self.operation_epoch())?
-        };
+        let pg = primary.storage_node().get_pg(pg_id.get())?;
+        if let Some(current) = pg
+            .pending_metadata_command_envelope(primary.node_id().as_u32(), self.operation_epoch())?
+        {
+            if current != *command {
+                return Ok((current.payload() == command.payload()).then_some(current));
+            }
+        } else {
+            return Ok(None);
+        }
+        let primary_max_log_index = pg.max_metadata_command_log_index(self.operation_epoch())?;
+        drop(pg);
         let acting_set_max_log_index = self.max_metadata_command_log_index_on_acting_set(pg_id)?;
         if acting_set_max_log_index > primary_max_log_index {
+            let pg = primary.storage_node().get_pg(pg_id.get())?;
+            if let Some(current) = pg.pending_metadata_command_envelope(
+                primary.node_id().as_u32(),
+                self.operation_epoch(),
+            )? {
+                if current != *command {
+                    return Ok((current.payload() == command.payload()).then_some(current));
+                }
+            } else {
+                return Ok(None);
+            }
             return Err(StoreError::MetadataCommandLogConflict {
                 node_id: primary.node_id().as_u32(),
                 pg_id: pg_id.get(),
@@ -508,23 +524,29 @@ impl StorageCluster {
                 &replacement,
                 Some(&bucket),
             )? {
-                return Ok(None);
+                return pg
+                    .pending_metadata_command_envelope(
+                        primary.node_id().as_u32(),
+                        self.operation_epoch(),
+                    )
+                    .map(|current| {
+                        current.and_then(|current| {
+                            (current.payload() == command.payload()).then_some(current)
+                        })
+                    })
+                    .map_err(BucketSnapshotLoadError::from);
             }
         }
-        if self
-            .local_map
-            .runtime_state()
-            .replace_pending_metadata_command_for_bucket(
-                pg_id,
-                &bucket,
-                command,
-                replacement.clone(),
-            )
-            .is_err()
-        {
-            return Ok(None);
-        }
         Ok(Some(replacement))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_reissue_pending_metadata_command(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<Option<MetadataCommandEnvelope>, BucketSnapshotLoadError> {
+        self.reissue_pending_metadata_command(pg_id, command)
     }
 
     fn max_metadata_command_log_index_on_acting_set(&self, pg_id: PgId) -> Result<u64, StoreError> {
@@ -735,26 +757,19 @@ impl StorageCluster {
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
     ) -> Result<Option<()>, StoreError> {
-        let runtime_state = self.local_map.runtime_state();
-        if runtime_state
-            .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command.clone())
-            .is_err()
-        {
-            return Ok(None);
-        }
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         let pg = primary.storage_node().get_pg(pg_id.get())?;
-        if let Err(error) = pg.try_insert_pending_metadata_command_slot(
+        match pg.try_insert_pending_metadata_command_slot(
             primary.node_id().as_u32(),
             command,
             Some(bucket),
         ) {
-            runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
-            return Err(error);
+            Ok(()) => Ok(Some(())),
+            Err(StoreError::MetadataCommandPendingConflict { .. }) => Ok(None),
+            Err(error) => Err(error),
         }
-        Ok(Some(()))
     }
 
     fn pending_metadata_command_for_bucket(
@@ -762,29 +777,12 @@ impl StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
-        let runtime_state = self.local_map.runtime_state();
-        if let Some(command) = runtime_state.pending_metadata_command_for_bucket(pg_id, bucket) {
-            return Ok(Some(command));
-        }
+        let _ = bucket;
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         let pg = primary.storage_node().get_pg(pg_id.get())?;
-        let Some(command) = pg.pending_metadata_command_envelope(
-            primary.node_id().as_u32(),
-            self.operation_epoch(),
-        )?
-        else {
-            return Ok(None);
-        };
-        match runtime_state.try_set_pending_metadata_command_for_bucket(
-            pg_id,
-            command.bucket_name(),
-            command.clone(),
-        ) {
-            Ok(()) => Ok(Some(command)),
-            Err(_) => Ok(runtime_state.pending_metadata_command_for_bucket(pg_id, bucket)),
-        }
+        pg.pending_metadata_command_envelope(primary.node_id().as_u32(), self.operation_epoch())
     }
 
     fn remove_pending_metadata_command_for_bucket(
@@ -797,13 +795,8 @@ impl StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         let pg = primary.storage_node().get_pg(pg_id.get())?;
-        let durable_removed =
-            pg.remove_pending_metadata_command_slot(primary.node_id().as_u32(), command)?;
-        let runtime_removed = self
-            .local_map
-            .runtime_state()
-            .remove_pending_metadata_command_for_bucket(pg_id, bucket);
-        Ok(durable_removed || runtime_removed)
+        let _ = bucket;
+        pg.remove_pending_metadata_command_slot(primary.node_id().as_u32(), command)
     }
 
     fn next_metadata_command_id(&self, pg_id: PgId) -> Result<MetadataCommandId, StoreError> {
