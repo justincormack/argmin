@@ -20,10 +20,9 @@ use crate::metadata_command::{
     CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteCompletedMultipartUploadCommand,
     DeleteObjectPayloadReclaimCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
     InsertDeleteMarkerCommand, MarkBucketDeletingCommand, MetadataCommandAcceptance,
-    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
-    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
-    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
-    PutObjectMetadataMutation,
+    MetadataCommandEnvelope, MetadataCommandPayload, ObjectPayloadReclaimCommand,
+    PutBucketAclCommand, PutBucketPropertyCommand, PutBucketSubresourceCommand,
+    PutBucketVersioningCommand, PutObjectMetadataCommand, PutObjectMetadataMutation,
 };
 use crate::traits::PgMetadataStore;
 use crate::*;
@@ -559,11 +558,7 @@ impl super::StorageCluster {
                     }
                 }
             } else {
-                let command_id = MetadataCommandId::new(
-                    self.operation_epoch(),
-                    pg_id,
-                    runtime_state.next_metadata_command_log_index(pg_id),
-                );
+                let command_id = self.next_bucket_metadata_command_id(pg_id)?;
                 let bucket_pg = primary_node.get_pg(pg_id.get())?;
                 let bucket_execution_generation =
                     bucket_pg.next_bucket_execution_generation_candidate()?;
@@ -1214,11 +1209,9 @@ impl super::StorageCluster {
                 if self.bucket_has_visible_data(bucket, true)? {
                     return Err(crate::error::MetadataError::BucketNotEmpty.into());
                 }
-                let command_id = MetadataCommandId::new(
-                    self.operation_epoch(),
-                    pg_id,
-                    runtime_state.next_metadata_command_log_index(pg_id),
-                );
+                let command_id = self
+                    .next_metadata_command_id(pg_id)
+                    .map_err(BucketWriteDrainError::from)?;
                 let bucket_pg = node.get_pg(pg_id.get())?;
                 let current = bucket_pg.head_bucket_record_raw(bucket)?;
                 let bucket_execution_generation =
@@ -1479,11 +1472,7 @@ impl super::StorageCluster {
                     }
                 }
             } else {
-                let command_id = MetadataCommandId::new(
-                    self.operation_epoch(),
-                    pg_id,
-                    runtime_state.next_metadata_command_log_index(pg_id),
-                );
+                let command_id = self.next_bucket_metadata_command_id(pg_id)?;
                 let command = MetadataCommandEnvelope::new(
                     command_id,
                     MetadataCommandPayload::DeleteCompletedMultipartUpload(Box::new(
@@ -1632,11 +1621,7 @@ impl super::StorageCluster {
                     }
                 }
             } else {
-                let command_id = MetadataCommandId::new(
-                    self.operation_epoch(),
-                    pg_id,
-                    runtime_state.next_metadata_command_log_index(pg_id),
-                );
+                let command_id = self.next_bucket_metadata_command_id(pg_id)?;
                 let bucket_pg = primary_node.get_pg(pg_id.get())?;
                 let current = bucket_pg.head_bucket_record_raw(bucket)?;
                 let bucket_execution_generation =
@@ -1822,11 +1807,7 @@ impl super::StorageCluster {
                     }
                 }
             } else {
-                let command_id = MetadataCommandId::new(
-                    self.operation_epoch(),
-                    pg_id,
-                    runtime_state.next_metadata_command_log_index(pg_id),
-                );
+                let command_id = self.next_bucket_metadata_command_id(pg_id)?;
                 let bucket_pg = primary_node.get_pg(pg_id.get())?;
                 let current = bucket_pg.head_bucket_record_raw(bucket)?;
                 let bucket_execution_generation =
@@ -1928,11 +1909,7 @@ impl super::StorageCluster {
                     }
                 }
             } else {
-                let command_id = MetadataCommandId::new(
-                    self.operation_epoch(),
-                    pg_id,
-                    runtime_state.next_metadata_command_log_index(pg_id),
-                );
+                let command_id = self.next_bucket_metadata_command_id(pg_id)?;
                 let bucket_pg = primary_node.get_pg(pg_id.get())?;
                 let current = bucket_pg.head_bucket_record_raw(bucket)?;
                 let bucket_execution_generation =
@@ -2040,11 +2017,7 @@ impl super::StorageCluster {
                     }
                 }
             } else {
-                let command_id = MetadataCommandId::new(
-                    self.operation_epoch(),
-                    pg_id,
-                    runtime_state.next_metadata_command_log_index(pg_id),
-                );
+                let command_id = self.next_bucket_metadata_command_id(pg_id)?;
                 let bucket_pg = primary_node.get_pg(pg_id.get())?;
                 let bucket_execution_generation =
                     bucket_pg.next_bucket_execution_generation_candidate()?;
@@ -2759,21 +2732,15 @@ impl super::StorageCluster {
     fn new_put_object_metadata_command(
         &self,
         pg_id: PgId,
+        object_pg: &crate::PgStore,
         object: LiveObjectRecord,
-    ) -> MetadataCommandEnvelope {
-        let command_id = MetadataCommandId::new(
-            self.operation_epoch(),
-            pg_id,
-            self.local_map
-                .runtime_state()
-                .next_metadata_command_log_index(pg_id),
-        );
-        MetadataCommandEnvelope::new(
-            command_id,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        Ok(MetadataCommandEnvelope::new(
+            self.next_object_metadata_command_id_from_locked_pg(pg_id, object_pg)?,
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
                 object,
             })),
-        )
+        ))
     }
 
     fn put_object_metadata_command_from_stored(
@@ -2887,7 +2854,7 @@ impl super::StorageCluster {
                 };
             let update =
                 Self::put_object_metadata_command_from_stored(&stored, version_id, mutation)?;
-            let command = self.new_put_object_metadata_command(pg_id, update.object);
+            let command = self.new_put_object_metadata_command(pg_id, &object_pg, update.object)?;
             drop(object_pg);
             self.set_pending_metadata_command_for_bucket(
                 pg_id,
@@ -3116,27 +3083,21 @@ impl super::StorageCluster {
     fn new_delete_object_version_command(
         &self,
         pg_id: PgId,
+        object_pg: &crate::PgStore,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
         target: DeleteObjectVersionTarget,
-    ) -> MetadataCommandEnvelope {
-        let command_id = MetadataCommandId::new(
-            self.operation_epoch(),
-            pg_id,
-            self.local_map
-                .runtime_state()
-                .next_metadata_command_log_index(pg_id),
-        );
-        MetadataCommandEnvelope::new(
-            command_id,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        Ok(MetadataCommandEnvelope::new(
+            self.next_object_metadata_command_id_from_locked_pg(pg_id, object_pg)?,
             MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id,
                 target,
             })),
-        )
+        ))
     }
 
     fn new_insert_delete_marker_command(
@@ -3145,15 +3106,8 @@ impl super::StorageCluster {
         object_pg: &crate::PgStore,
         draft: InsertDeleteMarkerDraft<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        let command_id = MetadataCommandId::new(
-            self.operation_epoch(),
-            pg_id,
-            self.local_map
-                .runtime_state()
-                .next_metadata_command_log_index(pg_id),
-        );
         Ok(MetadataCommandEnvelope::new(
-            command_id,
+            self.next_object_metadata_command_id_from_locked_pg(pg_id, object_pg)?,
             MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
                 bucket: draft.bucket.clone(),
                 key: draft.key.clone(),
@@ -3267,8 +3221,9 @@ impl super::StorageCluster {
                     deleted: DeletedSpecificObjectVersion::Missing,
                 }));
             };
-            let command =
-                self.new_delete_object_version_command(pg_id, bucket, key, version_id, target);
+            let command = self.new_delete_object_version_command(
+                pg_id, &object_pg, bucket, key, version_id, target,
+            )?;
             drop(object_pg);
             self.set_pending_metadata_command_for_bucket(
                 pg_id,
@@ -3361,11 +3316,12 @@ impl super::StorageCluster {
             let target = self.live_delete_command_target(&object_pg, bucket, key, record)?;
             let command = self.new_delete_object_version_command(
                 pg_id,
+                &object_pg,
                 bucket,
                 key,
                 record.version_id,
                 target,
-            );
+            )?;
             drop(object_pg);
             self.set_pending_metadata_command_for_bucket(
                 pg_id,
@@ -3640,11 +3596,12 @@ impl super::StorageCluster {
                         super::delete_object_version_reclaim_generation(&target);
                     let command = self.new_delete_object_version_command(
                         pg_id,
+                        &object_pg,
                         bucket,
                         key,
                         record.version_id,
                         target,
-                    );
+                    )?;
                     drop(object_pg);
                     (command, reclaim_generation_id)
                 }
@@ -3797,7 +3754,7 @@ impl super::StorageCluster {
                 return Ok(Ok(Vec::new()));
             }
 
-            let mut commands = Vec::new();
+            let mut delete_targets = Vec::new();
             let mut reclaimed_generation_ids = Vec::new();
             for stored in &versions {
                 let Some(record) = stored.as_live() else {
@@ -3812,17 +3769,22 @@ impl super::StorageCluster {
                 {
                     reclaimed_generation_ids.push(generation_id);
                 }
-                commands.push(self.new_delete_object_version_command(
-                    pg_id,
-                    bucket,
-                    key,
-                    record.version_id,
-                    target,
-                ));
+                delete_targets.push((record.version_id, target));
             }
             drop(object_pg);
 
-            for command in commands {
+            for (version_id, target) in delete_targets {
+                let command = MetadataCommandEnvelope::new(
+                    self.next_object_metadata_command_id(pg_id)?,
+                    MetadataCommandPayload::DeleteObjectVersion(Box::new(
+                        DeleteObjectVersionCommand {
+                            bucket: bucket.clone(),
+                            key: key.clone(),
+                            version_id,
+                            target,
+                        },
+                    )),
+                );
                 self.set_pending_metadata_command_for_bucket(
                     pg_id,
                     bucket,
@@ -3926,11 +3888,12 @@ impl super::StorageCluster {
             }
             let command = self.new_delete_object_version_command(
                 pg_id,
+                &object_pg,
                 bucket,
                 key,
                 expected_version_id,
                 DeleteObjectVersionTarget::DeleteMarker,
-            );
+            )?;
             drop(object_pg);
             self.set_pending_metadata_command_for_bucket(
                 pg_id,
@@ -4162,7 +4125,7 @@ impl super::StorageCluster {
                 }
 
                 let command = MetadataCommandEnvelope::new(
-                    self.next_object_metadata_command_id(pg_id),
+                    self.next_object_metadata_command_id(pg_id)?,
                     MetadataCommandPayload::DeleteObjectPayloadReclaim(Box::new(
                         DeleteObjectPayloadReclaimCommand::new(
                             bucket.clone(),
@@ -4377,7 +4340,8 @@ impl super::StorageCluster {
                         .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
 
                     let command = MetadataCommandEnvelope::new(
-                        self.next_object_metadata_command_id(pg_id),
+                        self.next_object_metadata_command_id(pg_id)
+                            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?,
                         MetadataCommandPayload::CreateStreamUpload(Box::new(
                             CreateStreamUploadCommand::from_request(
                                 create.clone(),
@@ -4600,11 +4564,7 @@ impl super::StorageCluster {
                     encryption: prepared.encryption.clone(),
                 };
                 let command = MetadataCommandEnvelope::new(
-                    MetadataCommandId::new(
-                        self.operation_epoch(),
-                        pg_id,
-                        runtime_state.next_metadata_command_log_index(pg_id),
-                    ),
+                    self.next_object_metadata_command_id_from_locked_pg(pg_id, &object_pg)?,
                     MetadataCommandPayload::CommitDirectPutObject(Box::new(
                         CommitDirectPutObjectCommand {
                             object,
@@ -4699,7 +4659,8 @@ impl super::StorageCluster {
                 PgMetadataStore::next_generation_id(&*object_pg, bucket, key)?
             };
             let command = MetadataCommandEnvelope::new(
-                self.next_object_metadata_command_id(pg_id),
+                self.next_object_metadata_command_id(pg_id)
+                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?,
                 MetadataCommandPayload::CreateMultipartUpload(Box::new(
                     CreateMultipartUploadCommand::from_request(
                         create.clone(),
@@ -4802,7 +4763,8 @@ impl super::StorageCluster {
             return Ok(Ok(result));
         }
         let command = MetadataCommandEnvelope::new(
-            self.next_object_metadata_command_id(pg_id),
+            self.next_object_metadata_command_id(pg_id)
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?,
             MetadataCommandPayload::CreateStreamUpload(Box::new(
                 CreateStreamUploadCommand::from_request(
                     create,
@@ -4864,7 +4826,7 @@ impl super::StorageCluster {
                 return Ok(session_id.clone());
             }
             let command = MetadataCommandEnvelope::new(
-                self.next_object_metadata_command_id(pg_id),
+                self.next_object_metadata_command_id(pg_id)?,
                 MetadataCommandPayload::CreateStreamUpload(Box::new(
                     CreateStreamUploadCommand::from_request(
                         create,
@@ -5168,11 +5130,8 @@ impl super::StorageCluster {
             drop(bucket_pg);
 
             let command = MetadataCommandEnvelope::new(
-                MetadataCommandId::new(
-                    self.operation_epoch(),
-                    pg_id,
-                    runtime_state.next_metadata_command_log_index(pg_id),
-                ),
+                self.next_metadata_command_id(pg_id)
+                    .map_err(ObjectPgActionError::from)?,
                 MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
                     AdvanceCompletedMultipartUploadSequenceCommand {
                         bucket: bucket.clone(),
@@ -5402,11 +5361,7 @@ impl super::StorageCluster {
             drop(object_pg);
             let completion_order = self.reserve_completed_multipart_upload_order(&bucket)?;
             let command = MetadataCommandEnvelope::new(
-                MetadataCommandId::new(
-                    self.operation_epoch(),
-                    pg_id,
-                    runtime_state.next_metadata_command_log_index(pg_id),
-                ),
+                self.next_object_metadata_command_id(pg_id)?,
                 MetadataCommandPayload::CommitMultipartObject(Box::new(
                     CommitMultipartObjectCommand {
                         upload_id: upload_id.clone(),
@@ -5599,7 +5554,7 @@ impl super::StorageCluster {
             command
         } else {
             let command = MetadataCommandEnvelope::new(
-                self.next_object_metadata_command_id(pg_id),
+                self.next_object_metadata_command_id_from_locked_pg(pg_id, &object_pg)?,
                 MetadataCommandPayload::CommitStreamPart(Box::new(command_payload)),
             );
             self.set_pending_metadata_command_for_bucket(
@@ -5828,7 +5783,7 @@ impl super::StorageCluster {
         };
 
         Ok(Some(MetadataCommandEnvelope::new(
-            self.next_object_metadata_command_id(pg_id),
+            self.next_object_metadata_command_id(pg_id)?,
             MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
                 bucket: bucket.clone(),
                 key: key.clone(),
@@ -5857,7 +5812,7 @@ impl super::StorageCluster {
         };
 
         Ok(Some(MetadataCommandEnvelope::new(
-            self.next_object_metadata_command_id(pg_id),
+            self.next_object_metadata_command_id(pg_id)?,
             MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
                 bucket: authorized_upload.record().bucket.clone(),
                 key: authorized_upload.record().key.clone(),

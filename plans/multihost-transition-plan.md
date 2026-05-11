@@ -2498,6 +2498,13 @@ Proposed subphases:
      inside one PG
    - replace process-local command log index allocation with durable PG-primary
      allocation
+     - status: production command creation now derives the next log index from
+       the routed PG-primary's durable command log, including already-open
+       handles after another handle has appended a command; an unresolved
+       durable pending slot currently fails closed rather than being skipped,
+       until request paths can load and converge that slot; the remaining
+       `LocalClusterRuntimeState` index helper is test-only fixture support for
+       manually constructed commands
    - replace process-local pending metadata command maps with durable pending
      command state or retry derivation from the durable command log
      - current in-process retry cache is PG-scoped as a bridge; it must not

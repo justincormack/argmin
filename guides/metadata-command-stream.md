@@ -55,6 +55,16 @@ Older helper names may still mention buckets because callers use a bucket to
 derive the routed metadata PG, but a pending command for any bucket on that PG
 occupies the single stream slot.
 
+Production command-id allocation is no longer process-local. New request-path
+commands derive the next log index from the routed PG primary's durable command
+log. If the PG primary has an unresolved durable pending slot, allocation fails
+closed until a later Phase 9.2 slice can load and converge that slot through the
+request path; it must not skip over the slot. This means an already-open
+coordinator handle must allocate after commands appended by another handle, but
+must not allocate after unresolved durable intent. Test fixtures may still use
+test-only helpers when they manually construct artificial command envelopes;
+those helpers are not production ordering authorities.
+
 Finishing another request's pending slot must not steal ownership of resources
 created by that command. In particular, draining a non-matching
 `ReserveObjectGeneration` command applies the reservation and leaves it owned by

@@ -7,9 +7,10 @@ use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
 
 use super::ShardLocation;
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
+#[cfg(test)]
+use crate::metadata_command::MetadataCommandLogIndex;
 use crate::metadata_command::{
-    MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandLogIndex,
-    MetadataCommandReplicaState,
+    MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandReplicaState,
 };
 use crate::{
     BucketName, ClusterEpoch, DataPgId, EcShape, GenerationId, ObjectKey, PgId, PgState,
@@ -214,6 +215,7 @@ impl LocalPgRoute {
 pub(crate) struct LocalClusterRuntimeState {
     object_payload_leases: Mutex<LocalObjectPayloadLeaseState>,
     reclaim_queue: (Mutex<LocalReclaimQueueState>, Condvar),
+    #[cfg(test)]
     metadata_command_indexes: Mutex<HashMap<PgId, u64>>,
     metadata_command_apply_lock: Mutex<()>,
     pending_metadata_commands: Mutex<HashMap<PgId, MetadataCommandEnvelope>>,
@@ -241,12 +243,7 @@ struct LocalReclaimQueueState {
 pub(crate) struct PendingMetadataCommandConflict;
 
 impl LocalClusterRuntimeState {
-    #[cfg(test)]
     fn new() -> Self {
-        Self::with_metadata_command_indexes(HashMap::new())
-    }
-
-    fn with_metadata_command_indexes(metadata_command_indexes: HashMap<PgId, u64>) -> Self {
         Self {
             object_payload_leases: Mutex::new(LocalObjectPayloadLeaseState::default()),
             reclaim_queue: (
@@ -258,7 +255,8 @@ impl LocalClusterRuntimeState {
                 }),
                 Condvar::new(),
             ),
-            metadata_command_indexes: Mutex::new(metadata_command_indexes),
+            #[cfg(test)]
+            metadata_command_indexes: Mutex::new(HashMap::new()),
             metadata_command_apply_lock: Mutex::new(()),
             pending_metadata_commands: Mutex::new(HashMap::new()),
             stream_segment_vids: Mutex::new(HashMap::new()),
@@ -305,6 +303,7 @@ impl LocalClusterRuntimeState {
             .unwrap_or_else(|e| e.into_inner())
     }
 
+    #[cfg(test)]
     pub(crate) fn next_metadata_command_log_index(&self, pg_id: PgId) -> MetadataCommandLogIndex {
         let mut indexes = self
             .metadata_command_indexes
@@ -675,17 +674,13 @@ impl LocalClusterMap {
         let metadata_primary = nodes
             .get(&metadata_primary_node_id)
             .expect("validated metadata primary should have been opened");
-        let metadata_command_indexes =
-            seed_metadata_command_indexes(&nodes, &pg_ids, ClusterEpoch::INITIAL)?;
 
         Ok(Self {
             epoch: ClusterEpoch::INITIAL,
             metadata_primary_node_id,
             pg_routes,
             placement_map,
-            runtime_state: Arc::new(LocalClusterRuntimeState::with_metadata_command_indexes(
-                metadata_command_indexes,
-            )),
+            runtime_state: Arc::new(LocalClusterRuntimeState::new()),
             process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
             nodes,
         })
@@ -731,6 +726,30 @@ impl LocalClusterMap {
 
     pub(crate) fn runtime_state(&self) -> Arc<LocalClusterRuntimeState> {
         Arc::clone(&self.runtime_state)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_next_metadata_command_log_index(
+        &self,
+        pg_id: PgId,
+    ) -> MetadataCommandLogIndex {
+        let primary = self
+            .metadata_pg_primary_node(self.epoch, pg_id)
+            .expect("test PG primary should be routable");
+        let pg = primary
+            .storage_node()
+            .get_pg(pg_id.get())
+            .expect("test PG primary should have the PG");
+        let max_log_index = pg
+            .max_metadata_command_log_index(self.epoch)
+            .expect("test PG should load max metadata command log index");
+        let max_pending_index = pg
+            .pending_metadata_command_slot(primary.node_id().as_u32(), self.epoch)
+            .expect("test PG should load pending metadata command slot")
+            .map(|slot| slot.id.log_index().get())
+            .unwrap_or_default();
+        MetadataCommandLogIndex::new(max_log_index.max(max_pending_index) + 1)
+            .expect("test metadata command log index should not overflow")
     }
 
     pub(crate) fn metadata_pg_primary_node(
@@ -1235,35 +1254,6 @@ fn build_static_pg_routes(
             )
         })
         .collect()
-}
-
-fn seed_metadata_command_indexes(
-    nodes: &BTreeMap<NodeId, LocalNodeStore>,
-    pg_ids: &[PgId],
-    cluster_epoch: ClusterEpoch,
-) -> Result<HashMap<PgId, u64>, ClusterBuildError> {
-    let mut indexes = HashMap::new();
-    for &pg_id in pg_ids {
-        let mut max_index = 0_u64;
-        for node in nodes.values() {
-            let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
-                ClusterBuildError::OpenLocalNode {
-                    node_id: node.node_id().as_u32(),
-                    source,
-                }
-            })?;
-            max_index = max_index.max(pg.max_metadata_command_log_index(cluster_epoch).map_err(
-                |source| ClusterBuildError::OpenLocalNode {
-                    node_id: node.node_id().as_u32(),
-                    source,
-                },
-            )?);
-        }
-        if max_index != 0 {
-            indexes.insert(pg_id, max_index);
-        }
-    }
-    Ok(indexes)
 }
 
 fn validate_metadata_command_replay_state(
@@ -4205,6 +4195,149 @@ mod tests {
     }
 
     #[test]
+    fn metadata_command_log_index_allocator_reads_durable_log_from_already_open_handle() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut first_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = first_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let first_bucket = bucket_for_pg(topology, 1, "open-index-first-");
+        let second_bucket = bucket_for_pg(topology, 1, "open-index-second-");
+        set_route_primary(&mut first_map, 1, NodeId::new(1));
+
+        let mut second_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        set_route_primary(&mut second_map, 1, NodeId::new(1));
+
+        let first_map = Arc::new(first_map);
+        let second_map = Arc::new(second_map);
+        let first_cluster = crate::StorageCluster::from_local_map(Arc::clone(&first_map)).unwrap();
+        let second_cluster =
+            crate::StorageCluster::from_local_map(Arc::clone(&second_map)).unwrap();
+
+        create_test_bucket(&first_cluster, &first_bucket);
+        create_test_bucket(&second_cluster, &second_bucket);
+
+        for node_id in node_ids {
+            let pg = second_map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            let state = pg.metadata_command_replica_state().unwrap();
+            assert_eq!(
+                state.applied_log_index, 2,
+                "already-open second handle must allocate after the durable log entry from the first handle"
+            );
+            let first = crate::PgMetadataStore::head_bucket(&*pg, &first_bucket).unwrap();
+            assert_eq!(first.name, first_bucket);
+            let second = crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).unwrap();
+            assert_eq!(second.name, second_bucket);
+        }
+    }
+
+    #[test]
+    fn metadata_command_log_index_allocator_rejects_unresolved_durable_pending_slot() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let pending_bucket = bucket_for_pg(topology, 1, "durable-pending-first-");
+        let blocked_bucket = bucket_for_pg(topology, 1, "durable-pending-second-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let pending = create_bucket_metadata_command(pg_id, 1, pending_bucket.clone());
+        {
+            let primary_pg = map
+                .node(NodeId::new(1))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            primary_pg
+                .try_insert_pending_metadata_command_slot(
+                    NodeId::new(1).as_u32(),
+                    &pending,
+                    Some(&pending_bucket),
+                )
+                .unwrap();
+        }
+
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let acl_grants = crate::AclGrants::default();
+        let err = cluster
+            .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+                name: blocked_bucket.as_str(),
+                owner_principal: "owner",
+                owner_canonical_id: &owner,
+                acl_grants: &acl_grants,
+                public_read: false,
+                public_write: false,
+                versioning: crate::BucketVersioningState::Disabled,
+                object_lock: crate::BucketObjectLockConfig::default(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+                    node_id: 1,
+                    pg_id: 1,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    log_index: 1,
+                })
+            ),
+            "unresolved durable pending slot must block new command allocation, got {err:?}"
+        );
+
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            assert_eq!(
+                pg.max_metadata_command_log_index(ClusterEpoch::INITIAL)
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                pg.metadata_command_replica_state()
+                    .unwrap()
+                    .applied_log_index,
+                0
+            );
+            assert!(matches!(
+                crate::PgMetadataStore::head_bucket(&*pg, &blocked_bucket),
+                Err(crate::MetadataError::BucketNotFound { .. })
+            ));
+        }
+        let primary_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        assert_eq!(
+            primary_pg
+                .pending_metadata_command_slot(NodeId::new(1).as_u32(), ClusterEpoch::INITIAL)
+                .unwrap()
+                .unwrap()
+                .id,
+            pending.id()
+        );
+    }
+
+    #[test]
     fn zero_apply_command_failure_records_tombstone_for_later_hash_chain_convergence() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -4373,10 +4506,7 @@ mod tests {
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
         let pg_id = PgId::new(1);
-        let abandoned_index = map
-            .runtime_state()
-            .next_metadata_command_log_index(pg_id)
-            .get();
+        let abandoned_index = map.test_next_metadata_command_log_index(pg_id).get();
         let command = create_bucket_metadata_command(pg_id, abandoned_index, bucket.clone());
         map.runtime_state()
             .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone())
@@ -4448,7 +4578,7 @@ mod tests {
             crate::metadata_command::MetadataCommandId::new(
                 cluster.operation_epoch(),
                 pg_id,
-                map.runtime_state().next_metadata_command_log_index(pg_id),
+                map.test_next_metadata_command_log_index(pg_id),
             ),
             MetadataCommandPayload::ReserveObjectGeneration(
                 crate::metadata_command::ReserveObjectGenerationCommand::new(
@@ -4535,7 +4665,7 @@ mod tests {
             crate::metadata_command::MetadataCommandId::new(
                 cluster.operation_epoch(),
                 pg_id,
-                map.runtime_state().next_metadata_command_log_index(pg_id),
+                map.test_next_metadata_command_log_index(pg_id),
             ),
             MetadataCommandPayload::CreateStreamUpload(Box::new(
                 crate::metadata_command::CreateStreamUploadCommand::from_request(
@@ -4621,7 +4751,7 @@ mod tests {
             crate::metadata_command::MetadataCommandId::new(
                 cluster.operation_epoch(),
                 pg_id,
-                map.runtime_state().next_metadata_command_log_index(pg_id),
+                map.test_next_metadata_command_log_index(pg_id),
             ),
             MetadataCommandPayload::CreateStreamUpload(Box::new(
                 crate::metadata_command::CreateStreamUploadCommand::from_request(
@@ -6250,7 +6380,7 @@ mod tests {
             crate::metadata_command::MetadataCommandId::new(
                 cluster.operation_epoch(),
                 pg_id,
-                map.runtime_state().next_metadata_command_log_index(pg_id),
+                map.test_next_metadata_command_log_index(pg_id),
             ),
             MetadataCommandPayload::ReserveObjectGeneration(
                 crate::metadata_command::ReserveObjectGenerationCommand::new(
@@ -6356,7 +6486,7 @@ mod tests {
             crate::metadata_command::MetadataCommandId::new(
                 cluster.operation_epoch(),
                 pg_id,
-                map.runtime_state().next_metadata_command_log_index(pg_id),
+                map.test_next_metadata_command_log_index(pg_id),
             ),
             MetadataCommandPayload::ReserveObjectGeneration(
                 crate::metadata_command::ReserveObjectGenerationCommand::new(
@@ -6452,7 +6582,7 @@ mod tests {
             crate::metadata_command::MetadataCommandId::new(
                 cluster.operation_epoch(),
                 pg_id,
-                map.runtime_state().next_metadata_command_log_index(pg_id),
+                map.test_next_metadata_command_log_index(pg_id),
             ),
             MetadataCommandPayload::ReserveObjectGeneration(
                 crate::metadata_command::ReserveObjectGenerationCommand::new(
@@ -7361,9 +7491,7 @@ mod tests {
                     crate::metadata_command::MetadataCommandId::new(
                         command_epoch,
                         pg_id,
-                        map_for_hook
-                            .runtime_state()
-                            .next_metadata_command_log_index(pg_id),
+                        map_for_hook.test_next_metadata_command_log_index(pg_id),
                     ),
                     MetadataCommandPayload::CreateStreamUpload(Box::new(
                         crate::metadata_command::CreateStreamUploadCommand::from_request(
@@ -7480,9 +7608,7 @@ mod tests {
                     crate::metadata_command::MetadataCommandId::new(
                         command_epoch,
                         pg_id,
-                        map_for_hook
-                            .runtime_state()
-                            .next_metadata_command_log_index(pg_id),
+                        map_for_hook.test_next_metadata_command_log_index(pg_id),
                     ),
                     MetadataCommandPayload::CreateStreamUpload(Box::new(
                         crate::metadata_command::CreateStreamUploadCommand::from_request(
@@ -8209,9 +8335,7 @@ mod tests {
                     crate::metadata_command::MetadataCommandId::new(
                         command_epoch,
                         pg_id,
-                        map_for_hook
-                            .runtime_state()
-                            .next_metadata_command_log_index(pg_id),
+                        map_for_hook.test_next_metadata_command_log_index(pg_id),
                     ),
                     MetadataCommandPayload::CreateStreamUpload(Box::new(
                         crate::metadata_command::CreateStreamUploadCommand::from_request(
@@ -8294,7 +8418,7 @@ mod tests {
             crate::metadata_command::MetadataCommandId::new(
                 cluster.operation_epoch(),
                 pg_id,
-                map.runtime_state().next_metadata_command_log_index(pg_id),
+                map.test_next_metadata_command_log_index(pg_id),
             ),
             MetadataCommandPayload::CreateStreamUpload(Box::new(
                 crate::metadata_command::CreateStreamUploadCommand::from_request(
@@ -11329,7 +11453,7 @@ mod tests {
             MetadataCommandId::new(
                 ClusterEpoch::INITIAL,
                 pg_id,
-                map.runtime_state().next_metadata_command_log_index(pg_id),
+                map.test_next_metadata_command_log_index(pg_id),
             ),
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
                 object: mismatched_post_image,
@@ -11402,7 +11526,7 @@ mod tests {
             MetadataCommandId::new(
                 ClusterEpoch::INITIAL,
                 pg_id,
-                map.runtime_state().next_metadata_command_log_index(pg_id),
+                map.test_next_metadata_command_log_index(pg_id),
             ),
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
                 object: post_image,
@@ -11698,6 +11822,15 @@ mod tests {
             [51; 16],
             b"older version",
         );
+        let middle = write_committed_direct_segment_for_with_versioning(
+            &cluster,
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Enabled,
+            [13; 16],
+            [53; 16],
+            b"middle version",
+        );
         let current = write_committed_direct_segment_for_with_versioning(
             &cluster,
             &bucket,
@@ -11714,11 +11847,16 @@ mod tests {
                 assert!(versions
                     .iter()
                     .any(|stored| stored.version_id() == older.version_id));
-                Ok::<_, ()>(HashSet::from([older.version_id]))
+                assert!(versions
+                    .iter()
+                    .any(|stored| stored.version_id() == middle.version_id));
+                Ok::<_, ()>(HashSet::from([older.version_id, middle.version_id]))
             })
             .unwrap()
             .unwrap();
-        assert_eq!(reclaimed, vec![older.generation_id]);
+        assert_eq!(reclaimed.len(), 2);
+        assert!(reclaimed.contains(&older.generation_id));
+        assert!(reclaimed.contains(&middle.generation_id));
 
         let marker = cluster
             .insert_current_delete_marker_if(
@@ -11755,11 +11893,22 @@ mod tests {
                 crate::PgMetadataStore::get_object_version(&*pg, &bucket, &key, older.version_id,),
                 Err(crate::MetadataError::ObjectNotFound)
             ));
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_version(&*pg, &bucket, &key, middle.version_id,),
+                Err(crate::MetadataError::ObjectNotFound)
+            ));
             assert!(crate::PgMetadataStore::payload_reclaim_exists(
                 &*pg,
                 &bucket,
                 &key,
                 older.generation_id
+            )
+            .unwrap());
+            assert!(crate::PgMetadataStore::payload_reclaim_exists(
+                &*pg,
+                &bucket,
+                &key,
+                middle.generation_id
             )
             .unwrap());
             assert!(matches!(
@@ -13311,7 +13460,7 @@ mod tests {
             MetadataCommandId::new(
                 crate::ClusterEpoch::INITIAL,
                 pg_id,
-                map.runtime_state().next_metadata_command_log_index(pg_id),
+                map.test_next_metadata_command_log_index(pg_id),
             ),
             MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
                 AdvanceCompletedMultipartUploadSequenceCommand {

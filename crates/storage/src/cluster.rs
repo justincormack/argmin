@@ -12,7 +12,7 @@ use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 use crate::metadata_command::{
     AbortStreamUploadCommand, AppendStreamSegmentCommand, CommitDirectPutObjectCommand,
     CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteObjectVersionTarget,
-    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
+    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
     ObjectPayloadReclaimCommand, ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
     ReserveObjectVersionCommand,
 };
@@ -632,6 +632,49 @@ impl StorageCluster {
             .map_err(|_| conflicting_pending_object_metadata_command(context))
     }
 
+    fn next_metadata_command_id(&self, pg_id: PgId) -> Result<MetadataCommandId, StoreError> {
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let pg = primary.storage_node().get_pg(pg_id.get())?;
+        self.next_metadata_command_id_from_locked_pg(pg_id, &pg)
+    }
+
+    fn next_metadata_command_id_from_locked_pg(
+        &self,
+        pg_id: PgId,
+        pg: &crate::PgStore,
+    ) -> Result<MetadataCommandId, StoreError> {
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let max_log_index = pg.max_metadata_command_log_index(self.operation_epoch())?;
+        if let Some(slot) =
+            pg.pending_metadata_command_slot(primary.node_id().as_u32(), self.operation_epoch())?
+        {
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id: primary.node_id().as_u32(),
+                pg_id: pg_id.get(),
+                cluster_epoch: self.operation_epoch(),
+                log_index: slot.id.log_index().get(),
+            });
+        }
+        let next_log_index = max_log_index
+            .checked_add(1)
+            .and_then(MetadataCommandLogIndex::new)
+            .ok_or(StoreError::MetadataCommandLogConflict {
+                node_id: primary.node_id().as_u32(),
+                pg_id: pg_id.get(),
+                cluster_epoch: self.operation_epoch(),
+                log_index: u64::MAX,
+            })?;
+        Ok(MetadataCommandId::new(
+            self.operation_epoch(),
+            pg_id,
+            next_log_index,
+        ))
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     fn metadata_primary_test_hook_node(&self) -> &SharedStorageNode {
         self.metadata_primary_bridge_node()
@@ -961,13 +1004,8 @@ impl StorageCluster {
             }
             let generation_id = object_pg.next_generation_id(bucket, key)?;
             drop(object_pg);
-            let command_id = MetadataCommandId::new(
-                self.operation_epoch(),
-                pg_id,
-                runtime_state.next_metadata_command_log_index(pg_id),
-            );
             let command = MetadataCommandEnvelope::new(
-                command_id,
+                self.next_object_metadata_command_id(pg_id)?,
                 MetadataCommandPayload::ReserveObjectGeneration(
                     ReserveObjectGenerationCommand::new(
                         bucket.clone(),
@@ -1045,7 +1083,7 @@ impl StorageCluster {
 
             let version_id = self.max_next_object_version_id_on_acting_set(pg_id, bucket, key)?;
             let command = MetadataCommandEnvelope::new(
-                self.next_object_metadata_command_id(pg_id),
+                self.next_object_metadata_command_id(pg_id)?,
                 MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
                     bucket.clone(),
                     key.clone(),
@@ -1214,7 +1252,7 @@ impl StorageCluster {
             }
 
             let command = MetadataCommandEnvelope::new(
-                self.next_object_metadata_command_id(pg_id),
+                self.next_object_metadata_command_id(pg_id)?,
                 MetadataCommandPayload::ReleaseObjectGeneration(
                     ReleaseObjectGenerationCommand::new(
                         bucket.clone(),
@@ -1295,14 +1333,29 @@ impl StorageCluster {
             })
     }
 
-    fn next_object_metadata_command_id(&self, pg_id: PgId) -> MetadataCommandId {
-        MetadataCommandId::new(
-            self.operation_epoch(),
-            pg_id,
-            self.local_map
-                .runtime_state()
-                .next_metadata_command_log_index(pg_id),
-        )
+    fn next_object_metadata_command_id(
+        &self,
+        pg_id: PgId,
+    ) -> Result<MetadataCommandId, ObjectPgActionError> {
+        self.next_metadata_command_id(pg_id)
+            .map_err(ObjectPgActionError::from)
+    }
+
+    fn next_object_metadata_command_id_from_locked_pg(
+        &self,
+        pg_id: PgId,
+        pg: &crate::PgStore,
+    ) -> Result<MetadataCommandId, ObjectPgActionError> {
+        self.next_metadata_command_id_from_locked_pg(pg_id, pg)
+            .map_err(ObjectPgActionError::from)
+    }
+
+    fn next_bucket_metadata_command_id(
+        &self,
+        pg_id: PgId,
+    ) -> Result<MetadataCommandId, BucketSnapshotLoadError> {
+        self.next_metadata_command_id(pg_id)
+            .map_err(BucketSnapshotLoadError::from)
     }
 
     fn matching_stream_upload_exists(
@@ -1527,13 +1580,8 @@ impl StorageCluster {
                     }
                 }
             }
-            let command_id = MetadataCommandId::new(
-                self.operation_epoch(),
-                pg_id,
-                runtime_state.next_metadata_command_log_index(pg_id),
-            );
             let command = MetadataCommandEnvelope::new(
-                command_id,
+                self.next_object_metadata_command_id(pg_id)?,
                 MetadataCommandPayload::ReleaseObjectGeneration(
                     ReleaseObjectGenerationCommand::new(
                         bucket.clone(),
@@ -2037,15 +2085,8 @@ impl StorageCluster {
             last_modified_millis,
             stale_payload,
         };
-        let command_id = MetadataCommandId::new(
-            self.operation_epoch(),
-            pg_id,
-            self.local_map
-                .runtime_state()
-                .next_metadata_command_log_index(pg_id),
-        );
         Ok(MetadataCommandEnvelope::new(
-            command_id,
+            self.next_object_metadata_command_id_from_locked_pg(pg_id, object_pg)?,
             MetadataCommandPayload::CommitDirectPutObject(Box::new(command)),
         ))
     }
@@ -2235,7 +2276,7 @@ impl StorageCluster {
             }
             self.reserve_put_object_generation(bucket, key, session_id)?;
             let command = MetadataCommandEnvelope::new(
-                self.next_object_metadata_command_id(pg_id),
+                self.next_object_metadata_command_id(pg_id)?,
                 MetadataCommandPayload::CreateStreamUpload(Box::new(
                     CreateStreamUploadCommand::from_request(
                         request.clone(),
@@ -2451,7 +2492,7 @@ impl StorageCluster {
         }
 
         let command = MetadataCommandEnvelope::new(
-            self.next_object_metadata_command_id(pg_id),
+            self.next_object_metadata_command_id(pg_id)?,
             MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
                 bucket: bucket.clone(),
                 key: key.clone(),
@@ -2534,7 +2575,7 @@ impl StorageCluster {
         let staged_segments = object_pg.list_stream_segments(session_id)?;
         drop(object_pg);
         let command = MetadataCommandEnvelope::new(
-            self.next_object_metadata_command_id(pg_id),
+            self.next_object_metadata_command_id(pg_id)?,
             MetadataCommandPayload::AbortStreamUpload(Box::new(AbortStreamUploadCommand {
                 bucket: bucket.clone(),
                 key: key.clone(),
