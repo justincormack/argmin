@@ -361,18 +361,6 @@ impl LocalClusterRuntimeState {
             .remove(&pg_id);
     }
 
-    pub(crate) fn clear_pending_metadata_command_for_bucket(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-    ) {
-        let _ = bucket;
-        self.pending_metadata_commands
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&pg_id);
-    }
-
     pub(crate) fn acquire_object_payload_lease(
         &self,
         bucket: &BucketName,
@@ -1451,7 +1439,8 @@ mod tests {
         metadata_command_log_hash, AdvanceCompletedMultipartUploadSequenceCommand,
         BucketPropertyMutation, BucketSubresourceMutation, CreateBucketCommand,
         MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
-        MetadataCommandPayload, PutBucketAclCommand, PutObjectMetadataCommand,
+        MetadataCommandPayload, PutBucketAclCommand, PutBucketVersioningCommand,
+        PutObjectMetadataCommand,
     };
     use proptest::prelude::*;
     use proptest::test_runner::{TestCaseError, TestCaseResult};
@@ -14747,6 +14736,95 @@ mod tests {
                 bucket
             );
         }
+    }
+
+    #[test]
+    fn finalized_bucket_delete_preserves_unrelated_same_pg_pending_command() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let (deleting_bucket, pending_bucket) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            (
+                bucket_for_pg(topology, 1, "delete-pending-target-"),
+                bucket_for_pg(topology, 1, "delete-pending-survivor-"),
+            )
+        };
+        assert_ne!(deleting_bucket, pending_bucket);
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &deleting_bucket);
+        create_test_bucket(&cluster, &pending_bucket);
+        cluster.begin_bucket_delete(&deleting_bucket).unwrap();
+
+        let pg_id = PgId::new(1);
+        let pending_log_index = map.test_next_metadata_command_log_index(pg_id);
+        let pending_command = {
+            let primary_pg = map
+                .node(NodeId::new(1))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            let current =
+                crate::PgMetadataStore::head_bucket_record_raw(&*primary_pg, &pending_bucket)
+                    .unwrap();
+            MetadataCommandEnvelope::new(
+                MetadataCommandId::new(ClusterEpoch::INITIAL, pg_id, pending_log_index),
+                MetadataCommandPayload::PutBucketVersioning(
+                    PutBucketVersioningCommand::from_bucket(
+                        current.with_execution_generation(
+                            primary_pg
+                                .next_bucket_execution_generation_candidate()
+                                .unwrap(),
+                        ),
+                        crate::BucketVersioningState::Enabled,
+                    ),
+                ),
+            )
+        };
+        map.runtime_state()
+            .try_set_pending_metadata_command_for_bucket(
+                pg_id,
+                &pending_bucket,
+                pending_command.clone(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            cluster
+                .try_finalize_bucket_delete(&deleting_bucket)
+                .unwrap(),
+            crate::BucketDeleteFinalizeOutcome::Finalized
+        );
+
+        let retained = map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(pg_id, &pending_bucket)
+            .expect("unrelated same-PG pending command must survive bucket finalization");
+        assert_eq!(retained.id(), pending_command.id());
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_raw(
+                &*map
+                    .node(NodeId::new(1))
+                    .unwrap()
+                    .storage_node()
+                    .get_pg(1)
+                    .unwrap(),
+                &pending_bucket,
+            )
+            .unwrap()
+            .versioning,
+            crate::BucketVersioningState::Disabled
+        );
     }
 
     #[test]

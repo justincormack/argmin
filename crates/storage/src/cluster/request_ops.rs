@@ -978,9 +978,6 @@ impl super::StorageCluster {
                 Err(other) => return Err(other.into()),
             }
         }
-        self.local_map
-            .runtime_state()
-            .clear_pending_metadata_command_for_bucket(pg_id, bucket);
         Ok(BucketDeleteFinalizeOutcome::Finalized)
     }
 
