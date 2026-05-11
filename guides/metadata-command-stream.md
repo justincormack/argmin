@@ -55,6 +55,11 @@ Older helper names may still mention buckets because callers use a bucket to
 derive the routed metadata PG, but a pending command for any bucket on that PG
 occupies the single stream slot.
 
+While that bridge exists, any bucket-named cleanup helper must still prove slot
+ownership before removing it. A cleanup path for bucket `A` may observe that
+bucket `B` owns the PG slot so it can drain or wait for that command, but it
+must not erase bucket `B`'s recovery state.
+
 Production command-id allocation is no longer process-local. New request-path
 commands derive the next log index from the routed PG primary's durable command
 log. If the PG primary has an unresolved durable pending slot, allocation fails

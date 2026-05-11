@@ -778,68 +778,59 @@ impl super::StorageCluster {
     fn finish_pending_metadata_command_to_acting_set(
         &self,
         pg_id: PgId,
-        bucket: &BucketName,
+        _bucket: &BucketName,
         command: &MetadataCommandEnvelope,
         clear_pending_on_zero_apply: bool,
     ) -> Result<super::PendingMetadataCommandOutcome, BucketSnapshotLoadError> {
-        if self
-            .metadata_command_has_abandoned_log_on_acting_set(command)
-            .map_err(|error| error.source)?
-        {
-            self.record_abandoned_metadata_command_to_acting_set(command)
-                .map_err(|error| error.source)?;
-            self.local_map
-                .runtime_state()
-                .remove_pending_metadata_command_for_bucket(pg_id, bucket);
-            return Ok(super::PendingMetadataCommandOutcome::Abandoned);
-        }
-        match self.apply_metadata_command_to_acting_set(command) {
-            Ok(()) => Ok(super::PendingMetadataCommandOutcome::Applied),
-            Err(error) => {
-                let MetadataCommandApplyFailure {
-                    applied_nodes,
-                    source,
-                } = error;
-                if clear_pending_on_zero_apply && applied_nodes == 0 {
-                    self.record_abandoned_metadata_command_to_acting_set(command)
-                        .map_err(|error| error.source)?;
-                    self.local_map
-                        .runtime_state()
-                        .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+        let mut command = command.clone();
+        loop {
+            let command_bucket = command.bucket_name();
+            if self
+                .metadata_command_has_abandoned_log_on_acting_set(&command)
+                .map_err(|error| error.source)?
+            {
+                self.record_abandoned_metadata_command_to_acting_set(&command)
+                    .map_err(|error| error.source)?;
+                self.local_map
+                    .runtime_state()
+                    .remove_pending_metadata_command_for_bucket(pg_id, command_bucket);
+                return Ok(super::PendingMetadataCommandOutcome::Abandoned);
+            }
+            match self.apply_metadata_command_to_acting_set(&command) {
+                Ok(()) => return Ok(super::PendingMetadataCommandOutcome::Applied),
+                Err(error) => {
+                    let MetadataCommandApplyFailure {
+                        applied_nodes,
+                        source,
+                    } = error;
+                    if applied_nodes == 0
+                        && super::StorageCluster::metadata_command_log_conflict_matches(
+                            &command, &source,
+                        )
+                    {
+                        let Some(reissued) =
+                            self.reissue_pending_metadata_command(pg_id, &command)?
+                        else {
+                            return Ok(super::PendingMetadataCommandOutcome::Abandoned);
+                        };
+                        command = reissued;
+                        continue;
+                    }
+                    if clear_pending_on_zero_apply && applied_nodes == 0 {
+                        self.record_abandoned_metadata_command_to_acting_set(&command)
+                            .map_err(|error| error.source)?;
+                        self.local_map
+                            .runtime_state()
+                            .remove_pending_metadata_command_for_bucket(pg_id, command_bucket);
+                    }
+                    return Err(source);
                 }
-                Err(source)
             }
         }
     }
 
     fn metadata_command_bucket_name(command: &MetadataCommandEnvelope) -> &BucketName {
-        match command.payload() {
-            MetadataCommandPayload::CreateBucket(create) => &create.bucket.name,
-            MetadataCommandPayload::PutBucketVersioning(versioning) => versioning.bucket_name(),
-            MetadataCommandPayload::PutBucketAcl(acl) => acl.bucket_name(),
-            MetadataCommandPayload::PutBucketProperty(property) => property.bucket_name(),
-            MetadataCommandPayload::PutBucketSubresource(subresource) => &subresource.name,
-            MetadataCommandPayload::MarkBucketDeleting(mark) => mark.bucket_name(),
-            MetadataCommandPayload::ReserveObjectGeneration(reservation) => &reservation.bucket,
-            MetadataCommandPayload::ReleaseObjectGeneration(release) => &release.bucket,
-            MetadataCommandPayload::ReserveObjectVersion(reservation) => &reservation.bucket,
-            MetadataCommandPayload::CommitDirectPutObject(commit) => &commit.object.bucket,
-            MetadataCommandPayload::CommitMultipartObject(commit) => &commit.object.bucket,
-            MetadataCommandPayload::DeleteObjectVersion(delete) => &delete.bucket,
-            MetadataCommandPayload::InsertDeleteMarker(insert) => &insert.bucket,
-            MetadataCommandPayload::PutObjectMetadata(metadata) => &metadata.object.bucket,
-            MetadataCommandPayload::CreateStreamUpload(create) => &create.session.bucket,
-            MetadataCommandPayload::AppendStreamSegment(append) => &append.bucket,
-            MetadataCommandPayload::AbortStreamUpload(abort) => &abort.bucket,
-            MetadataCommandPayload::CommitStreamPart(commit) => &commit.bucket,
-            MetadataCommandPayload::CreateMultipartUpload(create) => &create.upload.bucket,
-            MetadataCommandPayload::AbortMultipartUpload(abort) => &abort.bucket,
-            MetadataCommandPayload::DeleteObjectPayloadReclaim(reclaim) => &reclaim.bucket,
-            MetadataCommandPayload::DeleteCompletedMultipartUpload(delete) => &delete.record.bucket,
-            MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(advance) => {
-                &advance.bucket
-            }
-        }
+        command.bucket_name()
     }
 
     fn metadata_command_is_bucket_pg_command(command: &MetadataCommandEnvelope) -> bool {
@@ -3009,31 +3000,50 @@ impl super::StorageCluster {
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), ObjectPgActionError> {
-        match self.apply_metadata_command_to_acting_set(command) {
-            Ok(()) => {
-                self.local_map
-                    .runtime_state()
-                    .remove_pending_metadata_command_for_bucket(pg_id, bucket);
-                self.after_object_metadata_command_applied(command);
-                Ok(())
-            }
-            Err(error) => {
-                let MetadataCommandApplyFailure {
-                    applied_nodes,
-                    source,
-                } = error;
-                if applied_nodes == 0 {
-                    self.record_abandoned_metadata_command_to_acting_set(command)
-                        .map_err(|error| {
-                            super::bucket_snapshot_error_to_object_pg_action_error(error.source)
-                        })?;
+        let mut command = command.clone();
+        loop {
+            match self.apply_metadata_command_to_acting_set(&command) {
+                Ok(()) => {
                     self.local_map
                         .runtime_state()
-                        .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                        .remove_pending_metadata_command_for_bucket(pg_id, command.bucket_name());
+                    self.after_object_metadata_command_applied(&command);
+                    return Ok(());
                 }
-                Err(super::bucket_snapshot_error_to_object_pg_action_error(
-                    source,
-                ))
+                Err(error) => {
+                    let MetadataCommandApplyFailure {
+                        applied_nodes,
+                        source,
+                    } = error;
+                    if applied_nodes == 0
+                        && super::StorageCluster::metadata_command_log_conflict_matches(
+                            &command, &source,
+                        )
+                    {
+                        let Some(reissued) = self
+                            .reissue_pending_metadata_command(pg_id, &command)
+                            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
+                        else {
+                            return Err(super::conflicting_pending_object_metadata_command(
+                                "pending object metadata command was displaced during reissue",
+                            ));
+                        };
+                        command = reissued;
+                        continue;
+                    }
+                    if applied_nodes == 0 {
+                        self.record_abandoned_metadata_command_to_acting_set(&command)
+                            .map_err(|error| {
+                                super::bucket_snapshot_error_to_object_pg_action_error(error.source)
+                            })?;
+                        self.local_map
+                            .runtime_state()
+                            .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                    }
+                    return Err(super::bucket_snapshot_error_to_object_pg_action_error(
+                        source,
+                    ));
+                }
             }
         }
     }

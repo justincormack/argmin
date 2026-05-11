@@ -335,11 +335,13 @@ impl LocalClusterRuntimeState {
         bucket: &BucketName,
         command: MetadataCommandEnvelope,
     ) -> Result<(), PendingMetadataCommandConflict> {
+        if command.bucket_name() != bucket {
+            return Err(PendingMetadataCommandConflict);
+        }
         let mut pending_commands = self
             .pending_metadata_commands
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _ = bucket;
         match pending_commands.entry(pg_id) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(command);
@@ -353,12 +355,19 @@ impl LocalClusterRuntimeState {
         &self,
         pg_id: PgId,
         bucket: &BucketName,
-    ) {
-        let _ = bucket;
-        self.pending_metadata_commands
+    ) -> bool {
+        let mut pending_commands = self
+            .pending_metadata_commands
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&pg_id);
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(command) = pending_commands.get(&pg_id) else {
+            return false;
+        };
+        if command.bucket_name() != bucket {
+            return false;
+        }
+        pending_commands.remove(&pg_id);
+        true
     }
 
     pub(crate) fn acquire_object_payload_lease(
@@ -1437,8 +1446,8 @@ mod tests {
     use super::*;
     use crate::metadata_command::{
         metadata_command_log_hash, AdvanceCompletedMultipartUploadSequenceCommand,
-        BucketPropertyMutation, BucketSubresourceMutation, CreateBucketCommand,
-        MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
+        AppendStreamSegmentCommand, BucketPropertyMutation, BucketSubresourceMutation,
+        CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
         MetadataCommandPayload, PutBucketAclCommand, PutBucketVersioningCommand,
         PutObjectMetadataCommand,
     };
@@ -4324,6 +4333,268 @@ mod tests {
                 .id,
             pending.id()
         );
+    }
+
+    #[test]
+    fn stale_duplicate_metadata_command_index_is_reissued_before_apply() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let first_bucket = bucket_for_pg(topology, 1, "duplicate-index-first-");
+        let second_bucket = bucket_for_pg(topology, 1, "duplicate-index-second-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let applied = create_bucket_metadata_command(pg_id, 1, first_bucket.clone());
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &applied)
+            .unwrap();
+
+        let stale_duplicate = create_bucket_metadata_command(pg_id, 1, second_bucket.clone());
+        map.runtime_state()
+            .try_set_pending_metadata_command_for_bucket(pg_id, &second_bucket, stale_duplicate)
+            .unwrap();
+
+        create_test_bucket(&cluster, &second_bucket);
+
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(pg_id, &second_bucket)
+            .is_none());
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            crate::PgMetadataStore::head_bucket(&*pg, &first_bucket).unwrap();
+            crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).unwrap();
+            assert_eq!(
+                pg.max_metadata_command_log_index(ClusterEpoch::INITIAL)
+                    .unwrap(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn stale_duplicate_direct_put_commit_index_is_reissued_before_apply() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let (bucket, key, object_pg, data_pg) =
+            bucket_key_with_distinct_object_and_data_pg(topology);
+        let occupant_bucket = bucket_for_pg(topology, object_pg, "duplicate-direct-occupant-");
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let reservation_id = crate::SessionId::try_from("64".repeat(16)).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        let payload = b"direct put duplicate index reissue";
+        let segment_okh = [0x64; 16];
+        let written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                payload,
+            )
+            .unwrap();
+        let commit_req = direct_put_commit_req(
+            &bucket,
+            &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            &written,
+        );
+        let object_node = cluster.object_metadata_primary_node(&bucket, &key).unwrap();
+        let object_pg_store = object_node.get_pg(object_pg).unwrap();
+        let stale_command = cluster
+            .prepare_commit_direct_put_object_command(
+                PgId::new(object_pg),
+                &object_pg_store,
+                &commit_req,
+                crate::VersionId::Null,
+            )
+            .unwrap();
+        drop(object_pg_store);
+        let duplicate_index = stale_command.id().log_index().get();
+        let occupant =
+            create_bucket_metadata_command(PgId::new(object_pg), duplicate_index, occupant_bucket);
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &occupant)
+            .unwrap();
+        map.runtime_state()
+            .try_set_pending_metadata_command_for_bucket(
+                PgId::new(object_pg),
+                &bucket,
+                stale_command,
+            )
+            .unwrap();
+
+        let outcome = cluster
+            .commit_direct_put_object_from_payload_shards(
+                &commit_req,
+                &written.written_shards,
+                |_| Ok::<(), ()>(()),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+        assert_direct_put_metadata_on_acting_nodes(
+            &map,
+            &node_ids,
+            object_pg,
+            &commit_req,
+            &outcome,
+        );
+        for node_id in node_ids {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            assert_eq!(
+                pg.max_metadata_command_log_index(ClusterEpoch::INITIAL)
+                    .unwrap(),
+                duplicate_index + 1
+            );
+        }
+    }
+
+    #[test]
+    fn stale_duplicate_stream_append_index_is_reissued_before_apply() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let (bucket, key, object_pg, data_pg) =
+            bucket_key_with_distinct_object_and_data_pg(topology);
+        let occupant_bucket = bucket_for_pg(topology, object_pg, "duplicate-stream-occupant-");
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let session_id = crate::SessionId::try_from("65".repeat(16)).unwrap();
+        cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                &session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap();
+        let payload = b"stream append duplicate index reissue";
+        let (_target, segment) = cluster
+            .prepare_stream_segment_append(
+                &bucket,
+                &key,
+                &crate::PrepareStreamUploadSegmentAppendReq {
+                    session_id: session_id.clone(),
+                    segment_index: 0,
+                    size: payload.len() as u64,
+                    segment_crc64: Some(checksum::crc64::checksum(payload)),
+                    segment_okh: [0x65; 16],
+                },
+            )
+            .unwrap();
+        let written_shards = cluster
+            .write_stream_segment_payload_shards(&segment, payload)
+            .unwrap();
+        let shard_batch: Vec<(&crate::ShardKey, crate::WriteAck)> = written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect();
+        cluster
+            .register_payload_shard_acks(segment.data_pg_id, &shard_batch)
+            .unwrap();
+        let stale_command = MetadataCommandEnvelope::new(
+            cluster
+                .next_object_metadata_command_id(PgId::new(object_pg))
+                .unwrap(),
+            MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                segment: segment.clone(),
+            })),
+        );
+        let duplicate_index = stale_command.id().log_index().get();
+        let occupant =
+            create_bucket_metadata_command(PgId::new(object_pg), duplicate_index, occupant_bucket);
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &occupant)
+            .unwrap();
+        map.runtime_state()
+            .try_set_pending_metadata_command_for_bucket(
+                PgId::new(object_pg),
+                &bucket,
+                stale_command.clone(),
+            )
+            .unwrap();
+
+        cluster
+            .apply_new_stream_append_command(
+                PgId::new(object_pg),
+                &bucket,
+                &stale_command,
+                &segment,
+                &shard_batch,
+            )
+            .unwrap();
+
+        assert!(map
+            .runtime_state()
+            .pending_metadata_command_for_bucket(PgId::new(object_pg), &bucket)
+            .is_none());
+        for node_id in node_ids {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::list_stream_segments(&*pg, &session_id).unwrap(),
+                vec![segment.clone()]
+            );
+            assert_eq!(
+                pg.max_metadata_command_log_index(ClusterEpoch::INITIAL)
+                    .unwrap(),
+                duplicate_index + 1
+            );
+        }
     }
 
     #[test]
@@ -8547,6 +8818,23 @@ mod tests {
                 .unwrap(),
             first_command
         );
+        assert!(
+            !runtime_state.remove_pending_metadata_command_for_bucket(pg_id, &second_bucket),
+            "bucket-scoped removal must not clear another bucket's PG slot"
+        );
+        assert_eq!(
+            runtime_state
+                .pending_metadata_command_for_bucket(pg_id, &second_bucket)
+                .unwrap(),
+            first_command
+        );
+        assert!(
+            runtime_state.remove_pending_metadata_command_for_bucket(pg_id, &first_bucket),
+            "owner bucket should clear its PG slot"
+        );
+        assert!(runtime_state
+            .pending_metadata_command_for_bucket(pg_id, &first_bucket)
+            .is_none());
     }
 
     #[test]

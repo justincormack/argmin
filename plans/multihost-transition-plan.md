@@ -2510,6 +2510,10 @@ Proposed subphases:
      - current in-process retry cache is PG-scoped as a bridge; it must not
        reintroduce `(PG, bucket)` pending slots while the durable slot is wired
        into request paths
+     - status: bucket-named bridge cleanup is now owner-aware; removing a
+       pending entry for one bucket does not clear another bucket's PG slot,
+       and finalized bucket deletion no longer clears the PG slot as a
+       side-effect
      - draining a PG slot must preserve command-owned resources for the original
        request; non-matching generation reservations are not released by the
        drainer because they may belong to active concurrent work

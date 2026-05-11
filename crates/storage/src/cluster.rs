@@ -443,6 +443,47 @@ pub struct StorageCluster {
 }
 
 impl StorageCluster {
+    fn metadata_command_log_conflict_matches(
+        command: &MetadataCommandEnvelope,
+        error: &BucketSnapshotLoadError,
+    ) -> bool {
+        matches!(
+            error,
+            BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+                pg_id,
+                cluster_epoch,
+                log_index,
+                ..
+            }) if *pg_id == command.id().pg_id().get()
+                && *cluster_epoch == command.id().cluster_epoch()
+                && *log_index == command.id().log_index().get()
+        )
+    }
+
+    fn reissue_pending_metadata_command(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<Option<MetadataCommandEnvelope>, BucketSnapshotLoadError> {
+        let bucket = command.bucket_name().clone();
+        self.local_map
+            .runtime_state()
+            .remove_pending_metadata_command_for_bucket(pg_id, &bucket);
+        let command = MetadataCommandEnvelope::new(
+            self.next_metadata_command_id(pg_id)?,
+            command.payload().clone(),
+        );
+        if self
+            .local_map
+            .runtime_state()
+            .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, command.clone())
+            .is_err()
+        {
+            return Ok(None);
+        }
+        Ok(Some(command))
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     fn maybe_run_before_stream_abort_storage_hook(&self) {
         let hook = self
@@ -1022,31 +1063,53 @@ impl StorageCluster {
             {
                 continue;
             }
-            match self.apply_metadata_command_to_acting_set(&command) {
-                Ok(()) => {
-                    self.local_map
-                        .runtime_state()
-                        .remove_pending_metadata_command_for_bucket(pg_id, bucket);
-                    match command.payload() {
-                        MetadataCommandPayload::ReserveObjectGeneration(reservation) => {
-                            return Ok(reservation.generation_id);
-                        }
-                        _ => unreachable!("reserve object generation pending command kind changed"),
-                    }
-                }
-                Err(error) => {
-                    if error.applied_nodes == 0 {
-                        self.record_abandoned_metadata_command_to_acting_set(&command)
-                            .map_err(|error| {
-                                bucket_snapshot_error_to_object_pg_action_error(error.source)
-                            })?;
+            let mut command = command;
+            loop {
+                match self.apply_metadata_command_to_acting_set(&command) {
+                    Ok(()) => {
                         self.local_map
                             .runtime_state()
                             .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                        match command.payload() {
+                            MetadataCommandPayload::ReserveObjectGeneration(reservation) => {
+                                return Ok(reservation.generation_id);
+                            }
+                            _ => {
+                                unreachable!(
+                                    "reserve object generation pending command kind changed"
+                                )
+                            }
+                        }
                     }
-                    return Err(bucket_snapshot_error_to_object_pg_action_error(
-                        error.source,
-                    ));
+                    Err(error)
+                        if error.applied_nodes == 0
+                            && Self::metadata_command_log_conflict_matches(
+                                &command,
+                                &error.source,
+                            ) =>
+                    {
+                        let Some(reissued) = self
+                            .reissue_pending_metadata_command(pg_id, &command)
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+                        else {
+                            break;
+                        };
+                        command = reissued;
+                    }
+                    Err(error) => {
+                        if error.applied_nodes == 0 {
+                            self.record_abandoned_metadata_command_to_acting_set(&command)
+                                .map_err(|error| {
+                                    bucket_snapshot_error_to_object_pg_action_error(error.source)
+                                })?;
+                            self.local_map
+                                .runtime_state()
+                                .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                        }
+                        return Err(bucket_snapshot_error_to_object_pg_action_error(
+                            error.source,
+                        ));
+                    }
                 }
             }
         }
@@ -1140,32 +1203,52 @@ impl StorageCluster {
     fn finish_pending_object_metadata_command_for_bucket(
         &self,
         pg_id: PgId,
-        bucket: &BucketName,
+        _bucket: &BucketName,
         command: &MetadataCommandEnvelope,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
-        if self
-            .metadata_command_has_abandoned_log_on_acting_set(command)
-            .map_err(|error| bucket_snapshot_error_to_object_pg_action_error(error.source))?
-        {
-            self.record_abandoned_metadata_command_to_acting_set(command)
-                .map_err(|error| bucket_snapshot_error_to_object_pg_action_error(error.source))?;
-            self.local_map
-                .runtime_state()
-                .remove_pending_metadata_command_for_bucket(pg_id, bucket);
-            self.after_object_metadata_command_abandoned(command)?;
-            return Ok(PendingMetadataCommandOutcome::Abandoned);
-        }
-        match self.apply_metadata_command_to_acting_set(command) {
-            Ok(()) => {
+        let mut command = command.clone();
+        loop {
+            let command_bucket = command.bucket_name();
+            if self
+                .metadata_command_has_abandoned_log_on_acting_set(&command)
+                .map_err(|error| bucket_snapshot_error_to_object_pg_action_error(error.source))?
+            {
+                self.record_abandoned_metadata_command_to_acting_set(&command)
+                    .map_err(|error| {
+                        bucket_snapshot_error_to_object_pg_action_error(error.source)
+                    })?;
                 self.local_map
                     .runtime_state()
-                    .remove_pending_metadata_command_for_bucket(pg_id, bucket);
-                self.after_object_metadata_command_applied(command);
-                Ok(PendingMetadataCommandOutcome::Applied)
+                    .remove_pending_metadata_command_for_bucket(pg_id, command_bucket);
+                self.after_object_metadata_command_abandoned(&command)?;
+                return Ok(PendingMetadataCommandOutcome::Abandoned);
             }
-            Err(error) => Err(bucket_snapshot_error_to_object_pg_action_error(
-                error.source,
-            )),
+            match self.apply_metadata_command_to_acting_set(&command) {
+                Ok(()) => {
+                    self.local_map
+                        .runtime_state()
+                        .remove_pending_metadata_command_for_bucket(pg_id, command_bucket);
+                    self.after_object_metadata_command_applied(&command);
+                    return Ok(PendingMetadataCommandOutcome::Applied);
+                }
+                Err(error)
+                    if error.applied_nodes == 0
+                        && Self::metadata_command_log_conflict_matches(&command, &error.source) =>
+                {
+                    let Some(reissued) = self
+                        .reissue_pending_metadata_command(pg_id, &command)
+                        .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+                    else {
+                        return Ok(PendingMetadataCommandOutcome::Abandoned);
+                    };
+                    command = reissued;
+                }
+                Err(error) => {
+                    return Err(bucket_snapshot_error_to_object_pg_action_error(
+                        error.source,
+                    ));
+                }
+            }
         }
     }
 
@@ -1267,23 +1350,41 @@ impl StorageCluster {
             {
                 continue;
             }
-            match self.apply_metadata_command_to_acting_set(&command) {
-                Ok(()) => {
-                    runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
-                    return Ok(());
-                }
-                Err(error) => {
-                    if error.applied_nodes == 0 {
-                        self.record_abandoned_metadata_command_to_acting_set(&command)
-                            .map_err(|error| {
-                                bucket_snapshot_error_to_object_pg_action_error(error.source)
-                            })?;
+            let mut command = command;
+            loop {
+                match self.apply_metadata_command_to_acting_set(&command) {
+                    Ok(()) => {
                         runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
-                        continue;
+                        return Ok(());
                     }
-                    return Err(bucket_snapshot_error_to_object_pg_action_error(
-                        error.source,
-                    ));
+                    Err(error)
+                        if error.applied_nodes == 0
+                            && Self::metadata_command_log_conflict_matches(
+                                &command,
+                                &error.source,
+                            ) =>
+                    {
+                        let Some(reissued) = self
+                            .reissue_pending_metadata_command(pg_id, &command)
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+                        else {
+                            break;
+                        };
+                        command = reissued;
+                    }
+                    Err(error) => {
+                        if error.applied_nodes == 0 {
+                            self.record_abandoned_metadata_command_to_acting_set(&command)
+                                .map_err(|error| {
+                                    bucket_snapshot_error_to_object_pg_action_error(error.source)
+                                })?;
+                            runtime_state.remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                            break;
+                        }
+                        return Err(bucket_snapshot_error_to_object_pg_action_error(
+                            error.source,
+                        ));
+                    }
                 }
             }
         }
@@ -1417,36 +1518,63 @@ impl StorageCluster {
         segment_record: &StreamUploadSegmentRecord,
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), ObjectPgActionError> {
-        match self.apply_metadata_command_to_acting_set(command) {
-            Ok(()) => {
-                self.local_map
-                    .runtime_state()
-                    .remove_pending_metadata_command_for_bucket(pg_id, bucket);
-                Ok(())
-            }
-            Err(error) => {
-                if error.applied_nodes == 0 {
-                    self.record_abandoned_metadata_command_to_acting_set(command)
-                        .map_err(|error| {
-                            bucket_snapshot_error_to_object_pg_action_error(error.source)
-                        })?;
+        let mut command = command.clone();
+        loop {
+            match self.apply_metadata_command_to_acting_set(&command) {
+                Ok(()) => {
                     self.local_map
                         .runtime_state()
-                        .remove_pending_metadata_command_for_bucket(pg_id, bucket);
-                    self.delete_payload_shard_keys_best_effort(
-                        segment_record.data_pg_id,
-                        EcShape {
-                            k: segment_record.ec_k,
-                            m: segment_record.ec_m,
-                        },
-                        &segment_record.segment_okh,
-                        segment_record.segment_vid,
-                        shard_batch.iter().map(|(key, _)| (*key).clone()),
-                    );
+                        .remove_pending_metadata_command_for_bucket(pg_id, command.bucket_name());
+                    return Ok(());
                 }
-                Err(bucket_snapshot_error_to_object_pg_action_error(
-                    error.source,
-                ))
+                Err(error)
+                    if error.applied_nodes == 0
+                        && Self::metadata_command_log_conflict_matches(&command, &error.source) =>
+                {
+                    let Some(reissued) = self
+                        .reissue_pending_metadata_command(pg_id, &command)
+                        .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+                    else {
+                        self.delete_payload_shard_keys_best_effort(
+                            segment_record.data_pg_id,
+                            EcShape {
+                                k: segment_record.ec_k,
+                                m: segment_record.ec_m,
+                            },
+                            &segment_record.segment_okh,
+                            segment_record.segment_vid,
+                            shard_batch.iter().map(|(key, _)| (*key).clone()),
+                        );
+                        return Err(conflicting_pending_object_metadata_command(
+                            "pending stream append command was displaced during reissue",
+                        ));
+                    };
+                    command = reissued;
+                }
+                Err(error) => {
+                    if error.applied_nodes == 0 {
+                        self.record_abandoned_metadata_command_to_acting_set(&command)
+                            .map_err(|error| {
+                                bucket_snapshot_error_to_object_pg_action_error(error.source)
+                            })?;
+                        self.local_map
+                            .runtime_state()
+                            .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                        self.delete_payload_shard_keys_best_effort(
+                            segment_record.data_pg_id,
+                            EcShape {
+                                k: segment_record.ec_k,
+                                m: segment_record.ec_m,
+                            },
+                            &segment_record.segment_okh,
+                            segment_record.segment_vid,
+                            shard_batch.iter().map(|(key, _)| (*key).clone()),
+                        );
+                    }
+                    return Err(bucket_snapshot_error_to_object_pg_action_error(
+                        error.source,
+                    ));
+                }
             }
         }
     }
@@ -1596,27 +1724,45 @@ impl StorageCluster {
             {
                 continue;
             }
-            match self.apply_metadata_command_to_acting_set(&command) {
-                Ok(()) => {
-                    self.local_map
-                        .runtime_state()
-                        .remove_pending_metadata_command_for_bucket(pg_id, bucket);
-                    return Ok(());
-                }
-                Err(error) => {
-                    if error.applied_nodes == 0 {
-                        self.record_abandoned_metadata_command_to_acting_set(&command)
-                            .map_err(|error| {
-                                bucket_snapshot_error_to_object_pg_action_error(error.source)
-                            })?;
+            let mut command = command;
+            loop {
+                match self.apply_metadata_command_to_acting_set(&command) {
+                    Ok(()) => {
                         self.local_map
                             .runtime_state()
                             .remove_pending_metadata_command_for_bucket(pg_id, bucket);
-                        continue;
+                        return Ok(());
                     }
-                    return Err(bucket_snapshot_error_to_object_pg_action_error(
-                        error.source,
-                    ));
+                    Err(error)
+                        if error.applied_nodes == 0
+                            && Self::metadata_command_log_conflict_matches(
+                                &command,
+                                &error.source,
+                            ) =>
+                    {
+                        let Some(reissued) = self
+                            .reissue_pending_metadata_command(pg_id, &command)
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+                        else {
+                            break;
+                        };
+                        command = reissued;
+                    }
+                    Err(error) => {
+                        if error.applied_nodes == 0 {
+                            self.record_abandoned_metadata_command_to_acting_set(&command)
+                                .map_err(|error| {
+                                    bucket_snapshot_error_to_object_pg_action_error(error.source)
+                                })?;
+                            self.local_map
+                                .runtime_state()
+                                .remove_pending_metadata_command_for_bucket(pg_id, bucket);
+                            break;
+                        }
+                        return Err(bucket_snapshot_error_to_object_pg_action_error(
+                            error.source,
+                        ));
+                    }
                 }
             }
         }
@@ -1910,38 +2056,74 @@ impl StorageCluster {
             }
         }
 
-        if let Err(error) = self.apply_metadata_command_to_acting_set(&command) {
-            if new_pending_command && error.applied_nodes == 0 {
-                self.record_abandoned_metadata_command_to_acting_set(&command)
-                    .map_err(|error| {
-                        bucket_snapshot_error_to_object_pg_action_error(error.source)
-                    })?;
-                self.local_map
-                    .runtime_state()
-                    .remove_pending_metadata_command_for_bucket(pg_id, &req.bucket);
-                drop(_bucket_guard);
-                self.release_object_generation_reservation_after_pending_drain_best_effort(
-                    pg_id,
-                    &req.bucket,
-                    &req.key,
-                    &req.generation_reservation_id,
-                );
-                self.delete_direct_put_segment_payload_shards(
-                    req.data_pg_id,
-                    req.ec,
-                    &req.segment_okh,
-                    req.segment_vid,
-                    written_shards,
-                );
+        let mut command = command;
+        loop {
+            match self.apply_metadata_command_to_acting_set(&command) {
+                Ok(()) => break,
+                Err(error)
+                    if error.applied_nodes == 0
+                        && Self::metadata_command_log_conflict_matches(&command, &error.source) =>
+                {
+                    let Some(reissued) = self
+                        .reissue_pending_metadata_command(pg_id, &command)
+                        .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+                    else {
+                        drop(_bucket_guard);
+                        if new_pending_command {
+                            self.release_object_generation_reservation_after_pending_drain_best_effort(
+                                pg_id,
+                                &req.bucket,
+                                &req.key,
+                                &req.generation_reservation_id,
+                            );
+                            self.delete_direct_put_segment_payload_shards(
+                                req.data_pg_id,
+                                req.ec,
+                                &req.segment_okh,
+                                req.segment_vid,
+                                written_shards,
+                            );
+                        }
+                        return Err(conflicting_pending_object_metadata_command(
+                            "pending direct PUT command was displaced during reissue",
+                        ));
+                    };
+                    command = reissued;
+                }
+                Err(error) => {
+                    if new_pending_command && error.applied_nodes == 0 {
+                        self.record_abandoned_metadata_command_to_acting_set(&command)
+                            .map_err(|error| {
+                                bucket_snapshot_error_to_object_pg_action_error(error.source)
+                            })?;
+                        self.local_map
+                            .runtime_state()
+                            .remove_pending_metadata_command_for_bucket(pg_id, &req.bucket);
+                        drop(_bucket_guard);
+                        self.release_object_generation_reservation_after_pending_drain_best_effort(
+                            pg_id,
+                            &req.bucket,
+                            &req.key,
+                            &req.generation_reservation_id,
+                        );
+                        self.delete_direct_put_segment_payload_shards(
+                            req.data_pg_id,
+                            req.ec,
+                            &req.segment_okh,
+                            req.segment_vid,
+                            written_shards,
+                        );
+                    }
+                    return Err(bucket_snapshot_error_to_object_pg_action_error(
+                        error.source,
+                    ));
+                }
             }
-            return Err(bucket_snapshot_error_to_object_pg_action_error(
-                error.source,
-            ));
         }
 
         self.local_map
             .runtime_state()
-            .remove_pending_metadata_command_for_bucket(pg_id, &req.bucket);
+            .remove_pending_metadata_command_for_bucket(pg_id, command.bucket_name());
 
         #[cfg(any(test, feature = "test-hooks"))]
         crate::node::maybe_run_after_direct_put_metadata_publish_hook(

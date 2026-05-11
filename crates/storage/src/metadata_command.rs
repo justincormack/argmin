@@ -297,6 +297,34 @@ impl MetadataCommandPayload {
             }
         }
     }
+
+    pub(crate) fn bucket_name(&self) -> &BucketName {
+        match self {
+            Self::CreateBucket(create) => &create.bucket.name,
+            Self::PutBucketVersioning(versioning) => versioning.bucket_name(),
+            Self::PutBucketAcl(acl) => acl.bucket_name(),
+            Self::PutBucketProperty(property) => property.bucket_name(),
+            Self::PutBucketSubresource(subresource) => &subresource.name,
+            Self::MarkBucketDeleting(mark) => mark.bucket_name(),
+            Self::ReserveObjectGeneration(reservation) => &reservation.bucket,
+            Self::ReleaseObjectGeneration(release) => &release.bucket,
+            Self::ReserveObjectVersion(reservation) => &reservation.bucket,
+            Self::CommitDirectPutObject(commit) => &commit.object.bucket,
+            Self::CommitMultipartObject(commit) => &commit.object.bucket,
+            Self::DeleteObjectVersion(delete) => &delete.bucket,
+            Self::InsertDeleteMarker(insert) => &insert.bucket,
+            Self::PutObjectMetadata(metadata) => &metadata.object.bucket,
+            Self::CreateStreamUpload(create) => &create.session.bucket,
+            Self::AppendStreamSegment(append) => &append.bucket,
+            Self::AbortStreamUpload(abort) => &abort.bucket,
+            Self::CommitStreamPart(commit) => &commit.bucket,
+            Self::CreateMultipartUpload(create) => &create.upload.bucket,
+            Self::AbortMultipartUpload(abort) => &abort.bucket,
+            Self::DeleteObjectPayloadReclaim(reclaim) => &reclaim.bucket,
+            Self::DeleteCompletedMultipartUpload(delete) => &delete.record.bucket,
+            Self::AdvanceCompletedMultipartUploadSequence(advance) => &advance.bucket,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -906,6 +934,10 @@ impl MetadataCommandEnvelope {
 
     pub(crate) fn payload(&self) -> &MetadataCommandPayload {
         &self.payload
+    }
+
+    pub(crate) fn bucket_name(&self) -> &BucketName {
+        self.payload.bucket_name()
     }
 
     pub(crate) fn checksum_crc64(&self) -> u64 {
