@@ -243,6 +243,9 @@ fn pending_command_completes_stream_session(
 type StreamAbortHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
+type MetadataCommandPendingInstallHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
 pub type PayloadShardCleanupTestHook =
     Arc<dyn Fn(&ShardKey) -> Result<(), StoreError> + Send + Sync>;
 
@@ -253,6 +256,7 @@ pub type PayloadCleanupErrorTestHook = Arc<dyn Fn(&'static str, &StoreError) + S
 #[derive(Default)]
 struct StorageClusterTestHooks {
     before_stream_abort_storage: Option<StreamAbortHook>,
+    before_metadata_command_pending_install: Option<MetadataCommandPendingInstallHook>,
     before_placed_payload_shard_delete: Option<PayloadShardCleanupTestHook>,
     before_metadata_primary_payload_ack_delete: Option<PayloadShardCleanupTestHook>,
     best_effort_payload_cleanup_error: Option<PayloadCleanupErrorTestHook>,
@@ -260,6 +264,11 @@ struct StorageClusterTestHooks {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct StreamAbortTestHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct MetadataCommandPendingInstallHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -280,6 +289,16 @@ pub struct PayloadCleanupTestHookGuard {
 impl Drop for StreamAbortTestHookGuard {
     fn drop(&mut self) {
         self.hooks.lock().unwrap().before_stream_abort_storage = None;
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for MetadataCommandPendingInstallHookGuard {
+    fn drop(&mut self) {
+        self.hooks
+            .lock()
+            .unwrap()
+            .before_metadata_command_pending_install = None;
     }
 }
 
@@ -576,6 +595,22 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    fn maybe_run_before_metadata_command_pending_install_hook(&self) {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .before_metadata_command_pending_install
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    fn maybe_run_before_metadata_command_pending_install_hook(&self) {}
+
+    #[cfg(any(test, feature = "test-hooks"))]
     fn maybe_run_before_placed_payload_shard_delete_hook(
         &self,
         shard_key: &ShardKey,
@@ -743,12 +778,27 @@ impl StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
-        context: &'static str,
+        _context: &'static str,
     ) -> Result<(), ObjectPgActionError> {
-        self.try_set_pending_metadata_command_for_bucket(pg_id, bucket, command)
+        loop {
+            if self.try_install_pending_metadata_command_for_bucket(pg_id, bucket, command)? {
+                return Ok(());
+            }
+            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+        }
+    }
+
+    fn try_install_pending_metadata_command_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, ObjectPgActionError> {
+        self.maybe_run_before_metadata_command_pending_install_hook();
+        Ok(self
+            .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command)
             .map_err(ObjectPgActionError::from)?
-            .ok_or_else(|| conflicting_pending_object_metadata_command(context))
-            .map(|_| ())
+            .is_some())
     }
 
     fn try_set_pending_metadata_command_for_bucket(
@@ -946,6 +996,20 @@ impl StorageCluster {
     ) -> StreamAbortTestHookGuard {
         self.test_hooks.lock().unwrap().before_stream_abort_storage = Some(hook);
         StreamAbortTestHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_before_metadata_command_pending_install_hook(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> MetadataCommandPendingInstallHookGuard {
+        self.test_hooks
+            .lock()
+            .unwrap()
+            .before_metadata_command_pending_install = Some(hook);
+        MetadataCommandPendingInstallHookGuard {
             hooks: Arc::clone(&self.test_hooks),
         }
     }
@@ -1909,7 +1973,7 @@ impl StorageCluster {
         &self,
         req: &CommitDirectPutObjectReq,
         written_shards: &[WrittenShardAck],
-        action: impl FnOnce(DirectPutCommitSnapshot) -> Result<(), E>,
+        mut action: impl FnMut(DirectPutCommitSnapshot) -> Result<(), E>,
     ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(&req.bucket, &req.key));
         let object_node = match self.object_metadata_primary_node(&req.bucket, &req.key) {
@@ -1932,59 +1996,36 @@ impl StorageCluster {
 
         let _bucket_guard = object_node.lock_bucket(&req.bucket);
         let (command, new_pending_command) = loop {
-            let Some(command) = self.pending_metadata_command_for_bucket(pg_id, &req.bucket)?
-            else {
-                let object_pg = object_node.get_pg(pg_id.get())?;
-                match self.validate_direct_put_commit_preconditions(&object_pg, req, action) {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        drop(object_pg);
-                        drop(_bucket_guard);
-                        self.release_object_generation_reservation_after_pending_drain_best_effort(
-                            pg_id,
-                            &req.bucket,
-                            &req.key,
-                            &req.generation_reservation_id,
-                        );
-                        self.delete_direct_put_segment_payload_shards(
-                            req.data_pg_id,
-                            req.ec,
-                            &req.segment_okh,
-                            req.segment_vid,
-                            written_shards,
-                        );
-                        return Ok(Err(error));
-                    }
-                    Err(error) => {
-                        drop(object_pg);
-                        drop(_bucket_guard);
-                        self.release_object_generation_reservation_after_pending_drain_best_effort(
-                            pg_id,
-                            &req.bucket,
-                            &req.key,
-                            &req.generation_reservation_id,
-                        );
-                        self.delete_direct_put_segment_payload_shards(
-                            req.data_pg_id,
-                            req.ec,
-                            &req.segment_okh,
-                            req.segment_vid,
-                            written_shards,
-                        );
-                        return Err(error);
-                    }
-                }
-                drop(object_pg);
-
-                let version_id = if req.versioning == crate::BucketVersioningState::Enabled {
-                    match self.reserve_next_object_version(
-                        pg_id,
-                        &req.bucket,
-                        &req.key,
-                        object_node,
+            let (command, new_pending_command) = loop {
+                let Some(command) = self.pending_metadata_command_for_bucket(pg_id, &req.bucket)?
+                else {
+                    let object_pg = object_node.get_pg(pg_id.get())?;
+                    match self.validate_direct_put_commit_preconditions(
+                        &object_pg,
+                        req,
+                        &mut action,
                     ) {
-                        Ok(version_id) => version_id,
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            drop(object_pg);
+                            drop(_bucket_guard);
+                            self.release_object_generation_reservation_after_pending_drain_best_effort(
+                                pg_id,
+                                &req.bucket,
+                                &req.key,
+                                &req.generation_reservation_id,
+                            );
+                            self.delete_direct_put_segment_payload_shards(
+                                req.data_pg_id,
+                                req.ec,
+                                &req.segment_okh,
+                                req.segment_vid,
+                                written_shards,
+                            );
+                            return Ok(Err(error));
+                        }
                         Err(error) => {
+                            drop(object_pg);
                             drop(_bucket_guard);
                             self.release_object_generation_reservation_after_pending_drain_best_effort(
                                 pg_id,
@@ -2002,49 +2043,78 @@ impl StorageCluster {
                             return Err(error);
                         }
                     }
-                } else {
-                    VersionId::Null
-                };
-                let object_pg = object_node.get_pg(pg_id.get())?;
-                let command = match self
-                    .prepare_commit_direct_put_object_command(pg_id, &object_pg, req, version_id)
-                {
-                    Ok(command) => command,
-                    Err(error) => {
-                        drop(object_pg);
-                        drop(_bucket_guard);
-                        self.release_object_generation_reservation_after_pending_drain_best_effort(
+                    drop(object_pg);
+
+                    let version_id = if req.versioning == crate::BucketVersioningState::Enabled {
+                        match self.reserve_next_object_version(
                             pg_id,
                             &req.bucket,
                             &req.key,
-                            &req.generation_reservation_id,
-                        );
-                        self.delete_direct_put_segment_payload_shards(
-                            req.data_pg_id,
-                            req.ec,
-                            &req.segment_okh,
-                            req.segment_vid,
-                            written_shards,
-                        );
-                        return Err(error);
-                    }
+                            object_node,
+                        ) {
+                            Ok(version_id) => version_id,
+                            Err(error) => {
+                                drop(_bucket_guard);
+                                self.release_object_generation_reservation_after_pending_drain_best_effort(
+                                    pg_id,
+                                    &req.bucket,
+                                    &req.key,
+                                    &req.generation_reservation_id,
+                                );
+                                self.delete_direct_put_segment_payload_shards(
+                                    req.data_pg_id,
+                                    req.ec,
+                                    &req.segment_okh,
+                                    req.segment_vid,
+                                    written_shards,
+                                );
+                                return Err(error);
+                            }
+                        }
+                    } else {
+                        VersionId::Null
+                    };
+                    let object_pg = object_node.get_pg(pg_id.get())?;
+                    let command = match self.prepare_commit_direct_put_object_command(
+                        pg_id, &object_pg, req, version_id,
+                    ) {
+                        Ok(command) => command,
+                        Err(error) => {
+                            drop(object_pg);
+                            drop(_bucket_guard);
+                            self.release_object_generation_reservation_after_pending_drain_best_effort(
+                                pg_id,
+                                &req.bucket,
+                                &req.key,
+                                &req.generation_reservation_id,
+                            );
+                            self.delete_direct_put_segment_payload_shards(
+                                req.data_pg_id,
+                                req.ec,
+                                &req.segment_okh,
+                                req.segment_vid,
+                                written_shards,
+                            );
+                            return Err(error);
+                        }
+                    };
+                    drop(object_pg);
+                    break (command, true);
                 };
-                drop(object_pg);
-                break (command, true);
-            };
 
-            let is_matching_direct_put = matches!(
-                command.payload(),
-                MetadataCommandPayload::CommitDirectPutObject(commit)
-                    if commit.matches_request(
-                        &req.bucket,
-                        &req.key,
-                        &req.generation_reservation_id,
-                        req.generation_id,
-                    )
-            );
-            let has_abandoned_log =
-                match self.metadata_command_has_abandoned_log_on_acting_set(&command) {
+                let is_matching_direct_put = matches!(
+                    command.payload(),
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                        if commit.matches_request(
+                            &req.bucket,
+                            &req.key,
+                            &req.generation_reservation_id,
+                            req.generation_id,
+                        )
+                );
+                let has_abandoned_log = match self
+                    .metadata_command_has_abandoned_log_on_acting_set(&command)
+                {
                     Ok(has_abandoned_log) => has_abandoned_log,
                     Err(error) => {
                         let error = bucket_snapshot_error_to_object_pg_action_error(error.source);
@@ -2065,52 +2135,26 @@ impl StorageCluster {
                         return Err(error);
                     }
                 };
-            if has_abandoned_log {
-                if is_matching_direct_put {
-                    let error = match self.finish_pending_object_metadata_command_for_bucket(
-                        pg_id,
-                        &req.bucket,
-                        &command,
-                    ) {
-                        Ok(PendingMetadataCommandOutcome::Applied) => {
-                            unreachable!(
-                                "already-classified abandoned metadata command was applied"
-                            )
-                        }
-                        Ok(PendingMetadataCommandOutcome::Abandoned) => {
-                            conflicting_pending_object_metadata_command(
-                                "abandoned pending command for direct put commit",
-                            )
-                        }
-                        Err(error) => error,
-                    };
-                    drop(_bucket_guard);
-                    self.delete_direct_put_segment_payload_shards(
-                        req.data_pg_id,
-                        req.ec,
-                        &req.segment_okh,
-                        req.segment_vid,
-                        written_shards,
-                    );
-                    return Err(error);
-                }
-                match self.finish_pending_object_metadata_command_for_bucket(
-                    pg_id,
-                    &req.bucket,
-                    &command,
-                ) {
-                    Ok(PendingMetadataCommandOutcome::Applied) => {
-                        unreachable!("already-classified abandoned metadata command was applied")
-                    }
-                    Ok(PendingMetadataCommandOutcome::Abandoned) => {}
-                    Err(error) => {
-                        drop(_bucket_guard);
-                        self.release_object_generation_reservation_after_pending_drain_best_effort(
+                if has_abandoned_log {
+                    if is_matching_direct_put {
+                        let error = match self.finish_pending_object_metadata_command_for_bucket(
                             pg_id,
                             &req.bucket,
-                            &req.key,
-                            &req.generation_reservation_id,
-                        );
+                            &command,
+                        ) {
+                            Ok(PendingMetadataCommandOutcome::Applied) => {
+                                unreachable!(
+                                    "already-classified abandoned metadata command was applied"
+                                )
+                            }
+                            Ok(PendingMetadataCommandOutcome::Abandoned) => {
+                                conflicting_pending_object_metadata_command(
+                                    "abandoned pending command for direct put commit",
+                                )
+                            }
+                            Err(error) => error,
+                        };
+                        drop(_bucket_guard);
                         self.delete_direct_put_segment_payload_shards(
                             req.data_pg_id,
                             req.ec,
@@ -2120,76 +2164,94 @@ impl StorageCluster {
                         );
                         return Err(error);
                     }
+                    match self.finish_pending_object_metadata_command_for_bucket(
+                        pg_id,
+                        &req.bucket,
+                        &command,
+                    ) {
+                        Ok(PendingMetadataCommandOutcome::Applied) => {
+                            unreachable!(
+                                "already-classified abandoned metadata command was applied"
+                            )
+                        }
+                        Ok(PendingMetadataCommandOutcome::Abandoned) => {}
+                        Err(error) => {
+                            drop(_bucket_guard);
+                            self.release_object_generation_reservation_after_pending_drain_best_effort(
+                                pg_id,
+                                &req.bucket,
+                                &req.key,
+                                &req.generation_reservation_id,
+                            );
+                            self.delete_direct_put_segment_payload_shards(
+                                req.data_pg_id,
+                                req.ec,
+                                &req.segment_okh,
+                                req.segment_vid,
+                                written_shards,
+                            );
+                            return Err(error);
+                        }
+                    }
+                    continue;
                 }
+                if is_matching_direct_put {
+                    break (command, false);
+                }
+                if let Err(error) = self.apply_pending_object_metadata_command_for_bucket(
+                    pg_id,
+                    &req.bucket,
+                    &command,
+                ) {
+                    drop(_bucket_guard);
+                    self.release_object_generation_reservation_after_pending_drain_best_effort(
+                        pg_id,
+                        &req.bucket,
+                        &req.key,
+                        &req.generation_reservation_id,
+                    );
+                    self.delete_direct_put_segment_payload_shards(
+                        req.data_pg_id,
+                        req.ec,
+                        &req.segment_okh,
+                        req.segment_vid,
+                        written_shards,
+                    );
+                    return Err(error);
+                }
+            };
+
+            if let Err(error) = self.register_payload_shard_acks(req.data_pg_id, &shard_batch) {
+                if new_pending_command {
+                    drop(_bucket_guard);
+                    self.release_object_generation_reservation_after_pending_drain_best_effort(
+                        pg_id,
+                        &req.bucket,
+                        &req.key,
+                        &req.generation_reservation_id,
+                    );
+                    self.delete_direct_put_segment_payload_shards(
+                        req.data_pg_id,
+                        req.ec,
+                        &req.segment_okh,
+                        req.segment_vid,
+                        written_shards,
+                    );
+                }
+                return Err(error);
+            }
+            if new_pending_command
+                && !self.try_install_pending_metadata_command_for_bucket(
+                    pg_id,
+                    &req.bucket,
+                    &command,
+                )?
+            {
+                self.drain_pending_object_metadata_commands_for_bucket(pg_id, &req.bucket)?;
                 continue;
             }
-            if is_matching_direct_put {
-                break (command, false);
-            }
-            if let Err(error) =
-                self.apply_pending_object_metadata_command_for_bucket(pg_id, &req.bucket, &command)
-            {
-                drop(_bucket_guard);
-                self.release_object_generation_reservation_after_pending_drain_best_effort(
-                    pg_id,
-                    &req.bucket,
-                    &req.key,
-                    &req.generation_reservation_id,
-                );
-                self.delete_direct_put_segment_payload_shards(
-                    req.data_pg_id,
-                    req.ec,
-                    &req.segment_okh,
-                    req.segment_vid,
-                    written_shards,
-                );
-                return Err(error);
-            }
+            break (command, new_pending_command);
         };
-
-        if let Err(error) = self.register_payload_shard_acks(req.data_pg_id, &shard_batch) {
-            if new_pending_command {
-                drop(_bucket_guard);
-                self.release_object_generation_reservation_after_pending_drain_best_effort(
-                    pg_id,
-                    &req.bucket,
-                    &req.key,
-                    &req.generation_reservation_id,
-                );
-                self.delete_direct_put_segment_payload_shards(
-                    req.data_pg_id,
-                    req.ec,
-                    &req.segment_okh,
-                    req.segment_vid,
-                    written_shards,
-                );
-            }
-            return Err(error);
-        }
-        if new_pending_command {
-            if let Err(error) = self.set_pending_metadata_command_for_bucket(
-                pg_id,
-                &req.bucket,
-                &command,
-                "conflicting pending command for direct PUT object commit",
-            ) {
-                drop(_bucket_guard);
-                self.release_object_generation_reservation_after_pending_drain_best_effort(
-                    pg_id,
-                    &req.bucket,
-                    &req.key,
-                    &req.generation_reservation_id,
-                );
-                self.delete_direct_put_segment_payload_shards(
-                    req.data_pg_id,
-                    req.ec,
-                    &req.segment_okh,
-                    req.segment_vid,
-                    written_shards,
-                );
-                return Err(error);
-            }
-        }
 
         let mut command = command;
         loop {
@@ -2300,7 +2362,7 @@ impl StorageCluster {
         &self,
         object_pg: &crate::PgStore,
         req: &CommitDirectPutObjectReq,
-        action: impl FnOnce(DirectPutCommitSnapshot) -> Result<(), E>,
+        action: &mut impl FnMut(DirectPutCommitSnapshot) -> Result<(), E>,
     ) -> Result<Result<(), E>, ObjectPgActionError> {
         let reserved_generation = object_pg.get_object_generation_reservation(
             &req.bucket,
@@ -2873,38 +2935,38 @@ impl StorageCluster {
         self.maybe_run_before_stream_abort_storage_hook();
 
         let _bucket_guard = node.lock_bucket(bucket);
-        pending_completed_session =
-            self.pending_command_completes_stream_session(pg_id, bucket, key, session_id)?;
-        self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+        loop {
+            pending_completed_session =
+                self.pending_command_completes_stream_session(pg_id, bucket, key, session_id)?;
+            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
 
-        let object_pg = node.get_pg(pg_id.get())?;
-        let session = match object_pg.get_stream_upload(session_id) {
-            Ok(session) => session,
-            Err(MetadataError::StreamSessionNotFound { .. }) if pending_completed_session => {
-                return Ok(());
+            let object_pg = node.get_pg(pg_id.get())?;
+            let session = match object_pg.get_stream_upload(session_id) {
+                Ok(session) => session,
+                Err(MetadataError::StreamSessionNotFound { .. }) if pending_completed_session => {
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let _ = session;
+            let staged_segments = object_pg.list_stream_segments(session_id)?;
+            drop(object_pg);
+            let command = MetadataCommandEnvelope::new(
+                self.next_object_metadata_command_id(pg_id)?,
+                MetadataCommandPayload::AbortStreamUpload(Box::new(AbortStreamUploadCommand {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    session_id: session_id.clone(),
+                    staged_segments,
+                })),
+            );
+            if !self.try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)? {
+                self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                continue;
             }
-            Err(error) => return Err(error.into()),
-        };
-        let _ = session;
-        let staged_segments = object_pg.list_stream_segments(session_id)?;
-        drop(object_pg);
-        let command = MetadataCommandEnvelope::new(
-            self.next_object_metadata_command_id(pg_id)?,
-            MetadataCommandPayload::AbortStreamUpload(Box::new(AbortStreamUploadCommand {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                session_id: session_id.clone(),
-                staged_segments,
-            })),
-        );
-        self.set_pending_metadata_command_for_bucket(
-            pg_id,
-            bucket,
-            &command,
-            "conflicting pending command for stream upload abort",
-        )?;
-        self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
-        Ok(())
+            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            return Ok(());
+        }
     }
 
     pub fn list_stream_upload_sessions_best_effort(&self) -> Vec<StreamUploadRecord> {

@@ -5386,11 +5386,19 @@ impl PgStore {
                 })
             })?;
 
-        let result = (|| {
-            self.apply_metadata_command(command)
-                .map_err(BucketSnapshotLoadError::Metadata)?;
-            self.record_metadata_command_applied_inner(node_id, command)
-                .map_err(BucketSnapshotLoadError::Store)
+        let result = (|| match self
+            .metadata_command_acceptance(node_id, command)
+            .map_err(BucketSnapshotLoadError::Store)?
+        {
+            MetadataCommandAcceptance::Apply => {
+                self.apply_metadata_command(command)
+                    .map_err(BucketSnapshotLoadError::Metadata)?;
+                self.record_metadata_command_applied_inner(node_id, command)
+                    .map_err(BucketSnapshotLoadError::Store)
+            }
+            MetadataCommandAcceptance::AlreadyApplied => self
+                .record_metadata_command_applied_inner(node_id, command)
+                .map_err(BucketSnapshotLoadError::Store),
         })();
 
         match result {
@@ -14158,6 +14166,42 @@ mod tests {
     }
 
     #[test]
+    fn metadata_command_apply_and_record_rolls_back_log_on_metadata_failure() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("rollback-log-bucket");
+        let first = create_bucket_probe_command(1, 1, bucket.clone(), 1);
+        let conflicting_create = create_bucket_probe_command(1, 2, bucket, 2);
+
+        store.apply_metadata_command_and_record(0, &first).unwrap();
+        let err = store
+            .apply_metadata_command_and_record(0, &conflicting_create)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BucketSnapshotLoadError::Metadata(MetadataError::BucketAlreadyExists)
+            ),
+            "expected metadata conflict, got {err:?}"
+        );
+
+        let log_entry_count: u64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM metadata_command_log WHERE log_index = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            log_entry_count, 0,
+            "failed metadata mutation must not leave a command-log record"
+        );
+        let state = store.metadata_command_replica_state().unwrap();
+        assert_eq!(state.applied_log_index, 1);
+    }
+
+    #[test]
     fn metadata_command_log_contiguous_insert_uses_prefix_fast_path() {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
@@ -15455,6 +15499,40 @@ mod tests {
             ),
             "expected null version reservation rejection, got {err:?}"
         );
+    }
+
+    #[test]
+    fn apply_metadata_command_and_record_rechecks_already_applied_before_mutation() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("already-applied-version-bucket");
+        let key = trusted_object_key("object");
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+                bucket.clone(),
+                key.clone(),
+                VersionId::from_u64(1),
+            )),
+        );
+
+        store
+            .apply_metadata_command_and_record(0, &command)
+            .unwrap();
+        store
+            .apply_metadata_command_and_record(0, &command)
+            .unwrap();
+
+        assert_eq!(
+            PgMetadataStore::next_version_id(&store, &bucket, &key).unwrap(),
+            VersionId::from_u64(2)
+        );
+        let state = store.metadata_command_replica_state().unwrap();
+        assert_eq!(state.applied_log_index, 1);
     }
 
     #[test]

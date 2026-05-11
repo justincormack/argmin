@@ -2517,6 +2517,29 @@ Proposed subphases:
        before treating a higher non-primary log index as durable divergence, so
        a second drainer can converge an already-reissued command during the
        normal primary-last fanout window rather than surfacing a false conflict
+     - status: new command publishers treat a durable PG-slot install race as
+       normal contention: the losing publisher drains/converges the winner and
+       either retries its pending-slot install or, for request paths whose
+       preconditions are not fully encoded in command apply, restarts from a
+       fresh metadata snapshot before rebuilding the command. This restart
+       shape is used for object metadata mutation, conditional object delete,
+       delete-marker insertion, direct PUT finalization, stream PUT
+       session creation, stream PUT abort, stream PUT finalization, multipart
+       upload creation, lifecycle current-object expiry, lifecycle noncurrent
+       expiry, and expired delete-marker removal. Tests cover both an
+       unrelated-object retry
+       (`object_metadata_pending_install_race_drains_winner_and_retries`) and a
+       same-key race where the winner changes the losing request's object-tag
+       precondition
+       (`object_metadata_pending_install_race_reruns_precondition_action`).
+       `direct_put_pending_install_race_reruns_precondition_action`,
+       `stream_abort_pending_install_race_rebuilds_staged_segments`,
+       `stream_put_finalize_pending_install_race_reruns_precondition_action`,
+       `stream_put_create_pending_install_race_reruns_authorization_action`,
+       `multipart_create_pending_install_race_reruns_authorization_action`,
+       and `lifecycle_noncurrent_pending_install_race_reruns_selector` pin the
+       equivalent payload creation/finalization, MPU creation, and lifecycle
+       selector cases.
      - status: bucket-PG and object-PG pending slots now have typed command
        decoding and can be rehydrated from the durable primary slot after
        reopen or when a second handle sees the same PG; production request
@@ -2531,11 +2554,18 @@ Proposed subphases:
        drainer because they may belong to active concurrent work
    - replace the process-local metadata command apply lock with a durable
      compare-and-append serialization point
-     - status: `LocalClusterRuntimeState::metadata_command_apply_lock` has been
-       removed; command paths rely on durable PG-primary pending-slot
-       ownership, per-replica validate/apply/record transactions, and
-       fail-closed acting-set history checks rather than a process-local apply
-       mutex
+     - status: the old global metadata command apply lock has been removed.
+       Local command fanout now uses a PG-scoped runtime apply mutex as a
+       temporary local-cluster serialization point, so one PG does not expose
+       the primary-last non-primary/primary window to a concurrent drainer
+       while still allowing different PGs to progress independently. This is
+       not the remote-process durability mechanism; the Phase 9 target remains
+       a durable PG-primary compare-and-append point.
+     - status: replica apply now rechecks command acceptance inside the same
+       SQLite transaction that applies the metadata mutation and records the
+       log entry. This closes the in-flight double-apply window where a second
+       drainer could validate before the first drainer committed, then replay
+       a non-idempotent mutation such as `ReserveObjectVersion`.
    - replace stream segment VID allocation with durable per-session allocation
      or command-owned append IDs
      - status: stream sessions now store a durable `next_segment_vid` allocator
@@ -2548,6 +2578,46 @@ Proposed subphases:
      the same PG contending for one PG-scoped slot, zero-replica-apply
      abandonment, nonzero-apply convergence, and replica rollback of
      mutation-without-log or log-without-mutation failures
+   - closeout proof matrix:
+     - durable PG-primary log-index allocation:
+       `metadata_command_log_index_allocator_reads_durable_log_from_already_open_handle`
+       and
+       `metadata_command_log_index_allocator_drains_unresolved_durable_pending_slot`
+     - one unresolved durable PG slot, not one slot per bucket:
+       `pending_metadata_command_slot_is_pg_scoped_and_persistent` and
+       `create_bucket_drains_different_bucket_pending_command_on_same_pg`
+     - pending-slot convergence after restart or from another handle:
+       `create_bucket_rehydrates_durable_pending_slot_after_reopen`,
+       `object_generation_reservation_rehydrates_durable_pending_slot_after_reopen`,
+       and the durable-slot lookup/reissue tests around bucket and object
+       command publishers
+     - no process-local command apply lock:
+       `LocalClusterRuntimeState::metadata_command_apply_lock` has been
+       removed; the local cluster uses PG-scoped apply serialization to avoid
+       transient primary-last fanout conflicts inside one process, while
+       command ordering is enforced by PG-primary pending-slot ownership plus
+       per-replica validate/apply/record transactions
+     - stream segment VID allocation:
+       `stream_segment_vid_allocation_survives_reopen_without_runtime_state`
+       and
+       `stream_segment_vid_allocation_is_visible_to_already_open_handle`
+     - zero-apply abandon and nonzero-apply convergence:
+       `zero_apply_command_failure_records_tombstone_for_later_hash_chain_convergence`,
+       `zero_apply_generation_reservation_records_tombstone_and_later_reserves`,
+       `required_reservation_release_keeps_durable_slot_until_partial_apply_retry`,
+       and the partial-apply retry tests for create bucket, bucket properties,
+       object generation reservation, direct PUT, stream append, MPU create,
+       abort, and completion
+     - mutation/log atomicity:
+       `metadata_command_apply_and_record_rolls_back_metadata_on_record_conflict`
+       and
+       `metadata_command_apply_and_record_rolls_back_log_on_metadata_failure`;
+       `apply_metadata_command_and_record_rechecks_already_applied_before_mutation`
+       pins the duplicate in-flight apply case for non-idempotent allocator
+       commands
+   - status: Phase 9.2 is complete for the local PG-primary command-stream
+     runtime model. Later phases may add remote RPC, repair, and compaction,
+     but the remaining multipart serialization work moves to Phase 9.3.
 3. Phase 9.3 multipart serialization
    - replace multipart completion, abort, UploadPart, and streamed UploadPart
      serialization that depends on local locks with PG-primary command
