@@ -1,0 +1,359 @@
+Streaming part race can wedge multipart metadata
+Link: https://chatgpt.com/codex/cloud/security/findings/3223ce6b2a748191b4d355fdfb015234?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 05a0abb
+Author: justin@specialbusservice.com
+Created: 11/05/2026, 17:28:38
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced bug: durable stream segment VID runtime state is included in metadata command equality/cleanup snapshots even though it can legitimately differ between the primary and replicas before an append command has completed. This creates a remotely reachable authenticated denial-of-service race through multipart streaming uploads.
+Stream segment preparation now durably increments next_segment_vid on the primary before shard writes and before the AppendStreamSegment metadata command is applied to replicas. Multipart completion snapshots StreamUploadRecord values from the primary, including next_segment_vid, embeds them in CommitMultipartObject, and replica application rejects the command if its local stream_uploads list is not exactly equal. Replicas only advance next_segment_vid when the AppendStreamSegment command is applied. Therefore, if CompleteMultipartUpload races after prepare_stream_segment_append has incremented the primary but before the append metadata command has reached replicas, the completion command contains a higher next_segment_vid than replicas have. The first non-primary replica returns a stream uploads mismatch. The pending CommitMultipartObject command has already been installed, and later operations will keep retrying the same unapplyable command, effectively wedging metadata progress for the affected bucket/placement group until manual intervention.
+
+# Resolution
+Fixed in commit `d94b77d` (`Harden metadata command reissue validation`).
+
+Terminal multipart cleanup matching now treats `stream_uploads.next_segment_vid` as allocator floor state rather than command-owned terminal cleanup identity. `PgStore::stream_upload_cleanup_records_match` compares the stable stream-session fields required to identify the sessions being cleaned up, while intentionally ignoring legitimate primary/replica allocator-floor differences. Both multipart completion and multipart abort command application use this matcher before deleting active UploadPart stream sessions.
+
+Added regression coverage for:
+- cleanup matching accepting a lagging replica allocator floor while still rejecting real session-state mismatches;
+- aborting an MPU when the replica stream session has a lower `next_segment_vid` than the primary snapshot.
+
+Verification for the fix:
+- `cargo nextest run -p storage`: 545 passed
+- `cargo clippy --all-targets --all-features -- -D warnings`: passed
+- `./scripts/check-storage-cluster-boundaries`: passed
+- `git diff --check`: passed
+
+# Validation
+## Rubric
+- [x] Confirm `StreamUploadRecord` equality includes `next_segment_vid`, making allocator runtime state part of snapshot equality.
+- [x] Confirm the primary can durably increment `next_segment_vid` during stream segment preparation before replicas apply `AppendStreamSegment`.
+- [x] Confirm multipart completion snapshots `stream_uploads` including `next_segment_vid` into `CommitMultipartObject`.
+- [x] Confirm replica application performs exact `stream_uploads` equality and returns `stream uploads mismatch` on divergence.
+- [x] Dynamically reproduce the race state with primary `next_segment_vid=2` and replica `next_segment_vid=1`, and trace the real rejection branch with a debugger.
+## Report
+Validated the suspected logic vulnerability with a targeted Rust unit-test PoC plus a non-interactive LLDB trace. Crash validation was not applicable because the failure mode is a persistent metadata-command rejection/DoS rather than memory corruption or a process crash. I built the storage crate in debug mode with `cargo test -p storage --no-run`; the build succeeded. Valgrind was attempted but is not installed in the container.
+
+Evidence from code: `StreamUploadRecord` derives `PartialEq, Eq` and includes `next_segment_vid` at `crates/storage/src/types.rs:3092-3101`, so equality includes allocator runtime state. `prepare_stream_segment_append` allocates a stream segment VID for UploadPart sessions before the append metadata command path completes at `crates/storage/src/node/stream_ops.rs:191-198`. The allocator durably increments `stream_uploads.next_segment_vid` immediately via `UPDATE stream_uploads SET next_segment_vid = next_segment_vid + 1 ... RETURNING next_segment_vid - 1` at `crates/storage/src/pg_store.rs:12230-12243`. Replicas only advance this value during `AppendStreamSegment` application at `crates/storage/src/pg_store.rs:6455-6475`. Multipart completion snapshots stream uploads including `next_segment_vid` at `crates/storage/src/pg_store.rs:6961-7013`, embeds that snapshot in `CommitMultipartObject` at `crates/storage/src/cluster/request_ops.rs:5282-5330`, and replica application rejects if local `stream_uploads != command.stream_uploads` at `crates/storage/src/pg_store.rs:5650-5655`.
+
+Dynamic PoC: I added `poc_commit_multipart_rejects_replica_with_lagging_stream_vid` to `crates/storage/src/pg_store.rs`. It creates separate primary and replica `PgStore` instances with identical UploadPart stream sessions, calls `primary.allocate_stream_segment_vid(&session_id)` only on the primary to model the race window, snapshots the primary stream uploads into a `CommitMultipartObjectCommand`, and applies that command to the replica. The test output confirms the exact mismatch: `primary next_segment_vid=2, replica next_segment_vid=1` followed by `replica apply error: Db { context: "commit multipart object command (stream uploads mismatch)", source: InvalidQuery }`.
+
+Debugger evidence: LLDB was run non-interactively with a breakpoint at `pg_store.rs:5653`. The breakpoint hit at the mismatch-return branch inside `PgStore::apply_commit_multipart_object_command`, with the call stack showing the PoC test calling `apply_commit_multipart_object_command`; continuing the process produced the same mismatch error and the test passed. This confirms the rejection is reached through the real metadata command application code, not merely by comparing values in the test.
+
+# Evidence
+crates/storage/src/cluster/request_ops.rs (L5282 to 5330)
+  Note: CompleteMultipartUpload embeds the primary's stream_uploads snapshot, including next_segment_vid, into the CommitMultipartObject command.
+```
+            let (stream_uploads, stream_upload_segments) =
+                Self::snapshot_upload_part_stream_cleanup(&object_pg, &upload_id)?;
+
+            let last_modified_millis = crate::clock::current_time_millis();
+            let completed_at_millis = last_modified_millis;
+            let write_sequence =
+                object_pg.next_object_write_sequence(bucket.as_str(), key.as_str())?;
+            let stale_payload_command = stale_payload.as_ref().map(|payload| {
+                Self::completed_multipart_stale_payload_to_reclaim_command(
+                    &bucket,
+                    &key,
+                    last_modified_millis,
+                    payload,
+                )
+            });
+            drop(object_pg);
+            let completion_order = self.reserve_completed_multipart_upload_order(&bucket)?;
+            let command = MetadataCommandEnvelope::new(
+                self.next_object_metadata_command_id(pg_id)?,
+                MetadataCommandPayload::CommitMultipartObject(Box::new(
+                    CommitMultipartObjectCommand {
+                        upload_id: upload_id.clone(),
+                        object: PutLiveObjectReq {
+                            bucket: bucket.clone(),
+                            key: key.clone(),
+                            version_id,
+                            owner: req.owner.clone(),
+                            acl_grants: req.acl_grants.clone(),
+                            public_read: req.public_read,
+                            generation_id,
+                            size: req.size,
+                            etag: ObjectEtag::MultipartComposite {
+                                crc64: req.etag_crc64,
+                                parts: parts_count,
+                            },
+                            ec: EcShape { k: 0, m: 0 },
+                            layout: ObjectLayout::MultipartManifest { parts_count },
+                            tags: req.tags.clone(),
+                            metadata_blob: req.metadata_blob.clone(),
+                            system_metadata_blob: req.system_metadata_blob.clone(),
+                            object_lock: req.object_lock,
+                            encryption: req.encryption.clone(),
+                        },
+                        parts: object_parts,
+                        selected_streaming_segments,
+                        omitted_parts,
+                        omitted_streaming_segments,
+                        stream_uploads,
+                        stream_upload_segments,
+```
+
+crates/storage/src/node/stream_ops.rs (L153 to 198)
+  Note: Preparing a stream segment allocates and increments the durable segment VID on the primary before the append metadata command is committed to replicas.
+```
+    pub fn prepare_stream_segment_append(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: &PrepareStreamUploadSegmentAppendReq,
+    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
+        let meta_pg_id = self.pg_topology.object_pg_for(bucket, key);
+        let pg = self.get_pg(meta_pg_id)?;
+        let session = pg.get_stream_upload(&request.session_id)?;
+        Self::validate_stream_upload_session_binding(&session, bucket, key)?;
+        Self::reject_duplicate_stream_segment_index(
+            &pg,
+            &request.session_id,
+            request.segment_index,
+        )?;
+        let (segment_okh, segment_vid, data_pg_id) = match session.target {
+            StreamUploadTarget::PutObject => {
+                let generation_id =
+                    pg.get_object_generation_reservation(bucket, key, &request.session_id)?;
+                let segment_vid = pg.allocate_stream_segment_vid(&request.session_id)?;
+                (
+                    crate::segment_key_hash(
+                        bucket.as_str(),
+                        key.as_str(),
+                        generation_id,
+                        request.segment_index,
+                    ),
+                    segment_vid,
+                    self.pg_topology
+                        .object_generation_segment_data_pg(
+                            bucket,
+                            key,
+                            generation_id,
+                            request.segment_index,
+                        )
+                        .get(),
+                )
+            }
+            StreamUploadTarget::UploadPart {
+                ref upload_id,
+                part_number,
+            } => {
+                let upload = Self::load_in_progress_multipart_upload_from_object_pg(
+                    &pg, bucket, key, upload_id,
+                )?;
+                let segment_vid = pg.allocate_stream_segment_vid(&request.session_id)?;
+```
+
+crates/storage/src/pg_store.rs (L12230 to 12243)
+  Note: The allocator updates stream_uploads.next_segment_vid immediately and returns the old value.
+```
+    fn allocate_stream_segment_vid(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<GenerationId, MetadataError> {
+        let allocated = self
+            .conn
+            .query_row(
+                "UPDATE stream_uploads \
+                 SET next_segment_vid = next_segment_vid + 1 \
+                 WHERE session_id = ?1 AND state = ?2 \
+                 RETURNING next_segment_vid - 1",
+                params![session_id.as_str(), StreamUploadState::InProgress as u8],
+                |row| Self::parse_generation_id(row.get::<_, i64>(0)?, 0, "next_segment_vid"),
+            )
+```
+
+crates/storage/src/pg_store.rs (L5646 to 5657)
+  Note: Replica application rejects the multipart commit if its local stream_uploads list does not exactly match the command snapshot.
+```
+        self.with_immediate_txn(
+            "commit multipart object command (begin txn)",
+            "commit multipart object command (commit txn)",
+            |store| {
+                let stream_uploads =
+                    store.list_stream_uploads_for_multipart_upload(&command.upload_id)?;
+                if stream_uploads != command.stream_uploads {
+                    return Err(MetadataError::Db {
+                        context: "commit multipart object command (stream uploads mismatch)",
+                        source: rusqlite::Error::InvalidQuery,
+                    });
+                }
+```
+
+crates/storage/src/pg_store.rs (L6440 to 6475)
+  Note: Replicas only advance next_segment_vid when an AppendStreamSegment command is applied, leaving a race window where the primary is ahead.
+```
+                        state: session.state as u8,
+                    });
+                }
+                if let StreamUploadTarget::UploadPart { upload_id, .. } = &session.target {
+                    let upload = store.get_multipart_upload(upload_id)?;
+                    if upload.bucket != command.bucket
+                        || upload.key != command.key
+                        || upload.state != UploadState::InProgress
+                    {
+                        return Err(MetadataError::NoSuchUpload {
+                            upload_id: upload_id.to_string(),
+                        });
+                    }
+                }
+
+                let existing = store
+                    .list_stream_segments(&command.segment.session_id)?
+                    .into_iter()
+                    .find(|segment| segment.segment_index == command.segment.segment_index);
+                match existing {
+                    Some(existing) if existing == command.segment => store
+                        .advance_stream_segment_vid_floor(
+                            &command.segment.session_id,
+                            command.segment.segment_vid,
+                        ),
+                    Some(_) => Err(MetadataError::Db {
+                        context: "append stream segment command existing segment mismatch",
+                        source: rusqlite::Error::InvalidQuery,
+                    }),
+                    None => {
+                        store.append_stream_segment_direct(&command.segment)?;
+                        store.advance_stream_segment_vid_floor(
+                            &command.segment.session_id,
+                            command.segment.segment_vid,
+                        )
+                    }
+```
+
+crates/storage/src/pg_store.rs (L6961 to 7016)
+  Note: Multipart cleanup snapshots include next_segment_vid in StreamUploadRecord values used for later equality validation.
+```
+    fn list_stream_uploads_for_multipart_upload(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<Vec<StreamUploadRecord>, MetadataError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
+                 created_at, encryption_type, encryption_state, next_segment_vid FROM stream_uploads \
+                 WHERE op_kind = ?1 AND upload_id = ?2 ORDER BY session_id ASC",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "list stream uploads for multipart upload (prepare)",
+                source: e,
+            })?;
+        let rows = stmt
+            .query_map(
+                params![StreamUploadKind::UploadPart as u8, upload_id.as_str()],
+                |row| {
+                    let op_kind_raw: u8 = row.get(3)?;
+                    let state_raw: u8 = row.get(6)?;
+                    let upload_id: Option<UploadId> = row.get(4)?;
+                    let part_number: Option<i64> = row.get(5)?;
+                    Ok(StreamUploadRecord {
+                        session_id: row.get(0)?,
+                        bucket: row.get(1)?,
+                        key: row.get(2)?,
+                        target: PgStore::parse_stream_target(
+                            op_kind_raw,
+                            upload_id,
+                            part_number,
+                            3,
+                        )?,
+                        state: StreamUploadState::from_u8(state_raw).ok_or_else(|| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                6,
+                                rusqlite::types::Type::Integer,
+                                Box::from(format!("invalid stream state: {state_raw}")),
+                            )
+                        })?,
+                        created_at: row.get::<_, i64>(7)? as u64,
+                        encryption: Self::parse_object_encryption(
+                            row.get::<_, u8>(8)?,
+                            row.get::<_, Option<Vec<u8>>>(9)?,
+                            8,
+                            9,
+                        )?,
+                        next_segment_vid: Self::parse_generation_id(
+                            row.get::<_, i64>(10)?,
+                            10,
+                            "next_segment_vid",
+                        )?,
+                    })
+                },
+            )
+            .map_err(|e| MetadataError::Db {
+```
+
+crates/storage/src/types.rs (L3091 to 3102)
+  Note: StreamUploadRecord derives PartialEq/Eq and now includes next_segment_vid, so equality comparisons include allocator runtime state.
+```
+/// In-progress streaming upload session record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamUploadRecord {
+    pub session_id: SessionId,
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub target: StreamUploadTarget,
+    pub state: StreamUploadState,
+    pub created_at: u64,
+    pub encryption: ObjectEncryption,
+    pub next_segment_vid: GenerationId,
+}
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Kept at medium. The code evidence and executable validation PoC support that the bug is real: next_segment_vid is included in StreamUploadRecord equality, primary streaming append allocation increments it before replicas necessarily advance, CompleteMultipartUpload snapshots and embeds it, and replica CommitMultipartObject application rejects exact mismatches. The path is in the main product HTTP/storage runtime and reachable through authenticated multipart S3 operations. It should not be high or critical because the attacker needs write/multipart permission and race timing, default exposure is localhost unless configured otherwise, and the demonstrated impact is availability of an affected bucket/placement group rather than confidentiality loss, integrity compromise, auth bypass, RCE, or identity takeover.
+## Likelihood
+high - The vulnerable operations are normal S3 HTTP APIs and an authenticated writer can intentionally issue concurrent streaming UploadPart and CompleteMultipartUpload requests. However, exploitation requires valid write permission, a specific race window, and reachable deployment exposure; the repository default listener is localhost-only. | Remote network vector
+## Impact
+medium - Successful exploitation can cause a CommitMultipartObject metadata command to be rejected by replicas and potentially leave metadata progress for the affected bucket/placement group stuck behind an unapplyable pending command. This is persistent availability impact, but not data exfiltration, privilege escalation, code execution, or broad system compromise.
+## Assumptions
+- The argmin-s3 HTTP service is reachable by the attacker, either locally on the default 127.0.0.1:9000 listener or because ARGMIN_LISTEN_ADDR is configured to a reachable interface or exposed behind a proxy.
+- The attacker has valid S3 credentials or otherwise has write permission for the target bucket/upload sufficient to initiate multipart upload, stream an UploadPart, and call CompleteMultipartUpload.
+- The deployment uses the normal storage cluster metadata command path with more than one local/acting storage node, as configured by the argmin-s3 binary's local multihost storage setup.
+- The attacker can issue concurrent requests and repeat the race until CompleteMultipartUpload snapshots a primary-side next_segment_vid increment before the corresponding AppendStreamSegment metadata command has advanced replicas.
+- reachable argmin-s3 S3 HTTP endpoint
+- S3 write/multipart permission for the target bucket/upload
+- concurrent streaming UploadPart append and CompleteMultipartUpload
+- replica/acting-node metadata lag window before AppendStreamSegment applies
+## Path
+Authenticated writer -> streaming UploadPart append -> primary next_segment_vid++
+                  \-> concurrent CompleteMultipartUpload -> CommitMultipartObject snapshot -> replica equality check -> mismatch -> pending metadata command blocks progress
+## Path evidence
+- `crates/argmin-s3/src/config.rs:88-99` - Runtime credentials and listen address are environment-configured; default listener is 127.0.0.1:9000, so exposure is deployment-dependent.
+- `crates/argmin-s3/src/main.rs:184-245` - Main product binary binds the configured TCP listener and starts the HTTP or HTTPS S3 frontend.
+- `crates/server-http/src/http/serve.rs:808-838` - PUT UploadPart with uploadId and partNumber is routed to the streaming write path, making the vulnerable stream append reachable from normal HTTP S3 requests.
+- `crates/server-http/src/http/mod.rs:4047-4105` - Streaming UploadPart preparation authenticates the request, parses attacker-controlled bucket/key/uploadId/partNumber, and calls Coordinator::begin_stream_part.
+- `crates/server-http/src/http/mod.rs:2778-2820` - CompleteMultipartUpload is reachable through the HTTP S3 API and dispatches attacker-supplied uploadId and XML part list to the coordinator.
+- `crates/server-core/src/coordinator/authz/acl.rs:600-624` - Beginning a streaming UploadPart validates upload state and requires write authorization, confirming the realistic attacker is an authenticated/authorized writer.
+- `crates/server-core/src/coordinator/authz/acl.rs:664-712` - CompleteMultipartUpload also loads the in-progress upload and requires multipart write authorization before reaching vulnerable storage logic.
+- `crates/storage/src/types.rs:3091-3102` - StreamUploadRecord derives PartialEq/Eq and includes next_segment_vid, so equality validation treats allocator runtime state as replicated semantic state.
+- `crates/storage/src/node/stream_ops.rs:191-199` - For UploadPart stream sessions, segment preparation allocates a stream segment VID before the append metadata command has necessarily propagated.
+- `crates/storage/src/pg_store.rs:12230-12243` - allocate_stream_segment_vid durably increments stream_uploads.next_segment_vid immediately on the primary.
+- `crates/storage/src/pg_store.rs:6455-6475` - Replicas advance the stream segment VID floor only while applying AppendStreamSegment, leaving a legitimate lag window relative to the primary.
+- `crates/storage/src/pg_store.rs:6961-7013` - Multipart cleanup snapshot reads next_segment_vid into StreamUploadRecord values used by completion.
+- `crates/storage/src/cluster/request_ops.rs:5282-5330` - CompleteMultipartUpload embeds the primary's stream_uploads snapshot into CommitMultipartObject.
+- `crates/storage/src/pg_store.rs:5646-5657` - Replica application rejects CommitMultipartObject when local stream_uploads is not exactly equal to the command snapshot.
+- `crates/storage/src/cluster/request_ops.rs:2736-2793` - Object metadata actions first attempt to drain/apply pending metadata commands, supporting the availability concern if an installed pending command is unapplyable.
+## Narrative
+This is a real, in-scope security-relevant availability bug rather than a false positive. The main HTTP server exposes normal S3 multipart operations, and the storage code persists next_segment_vid on the primary during streaming UploadPart segment preparation before replicas necessarily apply AppendStreamSegment. CompleteMultipartUpload snapshots StreamUploadRecord values including next_segment_vid and CommitMultipartObject replica application requires exact equality. A replica lagging by one VID therefore rejects the command with a stream uploads mismatch. Earlier validation also exercised this path with a Rust unit-test PoC and LLDB breakpoint, showing primary next_segment_vid=2 versus replica next_segment_vid=1 and the real apply_commit_multipart_object_command mismatch branch. Severity remains medium: the effect can be persistent availability loss for the affected bucket/placement group, but it requires authenticated write access, a timing race, and does not expose data, bypass auth, execute code, or escalate privileges.
+## Controls
+- AWS SigV4 request authentication for normal private S3 operations
+- Bucket/object authorization checks before streaming UploadPart and CompleteMultipartUpload
+- Default listener is localhost-only at 127.0.0.1:9000 unless ARGMIN_LISTEN_ADDR is changed
+- Optional direct TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- Connection and in-flight request semaphores plus timeouts in the HTTP server
+- No executable sink involved; impact is metadata availability
+## Blindspots
+- Static repository artifacts did not include deployment manifests, so public versus internal exposure cannot be proven beyond the default localhost listener and configurable ARGMIN_LISTEN_ADDR.
+- The prior PoC exercised the storage command path with unit-test-created primary/replica stores rather than a full end-to-end HTTP race harness.
+- The exact blast radius of a wedged pending command may depend on placement-group topology, acting-set size, and operational recovery tooling not fully represented in static code.
+- No cloud APIs were called and no live deployment configuration was inspected.

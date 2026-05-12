@@ -1,0 +1,207 @@
+Reissue bypasses divergent metadata log check
+Link: https://chatgpt.com/codex/cloud/security/findings/68ffbc31db388191b07453b02c79a762?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: a139d61
+Author: justin@specialbusservice.com
+Created: 11/05/2026, 18:24:17
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+A bug was introduced. The new reissue logic intended to converge an already-replaced durable pending slot, but it returns a same-payload replacement before proving that higher acting-set log entries match that replacement. This weakens the previous fail-closed behavior for non-primary-only durable histories.
+Previously, reissuing a pending metadata command always compared the maximum durable metadata log index across the acting set with the primary's maximum log index before creating or accepting a replacement. The new code first reloads the primary pending slot and, if it differs from the stale command but has the same payload, returns it immediately. The same bypass exists after detecting that the acting set has a higher log index. This is safe for the intended primary-last fanout race only if the higher non-primary history is the same replacement command, but the code does not verify that. If a non-primary has a divergent higher/lower intervening log entry and the primary pending slot has already been reissued to a later index with the same payload, this path can return the replacement instead of failing closed. The apply path can then attempt to apply that later command even though the acting-set history is not reconciled; acceptance only checks for a conflict at the command's exact log index, and the record path applies metadata before advancing the contiguous command-log state. This can leave metadata applied with a non-contiguous or divergent log history, causing metadata inconsistency or durable corruption.
+
+# Resolution
+Fixed in commit `d94b77d` (`Harden metadata command reissue validation`).
+
+The reissue path now only accepts an already-replaced same-payload primary pending slot after proving the replacement is safe across the acting set. The proof rejects skipped indexes, requires the primary replica state to be exactly at the expected prefix, and verifies every acting-set replica at or beyond the replacement index has the matching replacement command chained from the same `previous_log_hash` with the expected resulting log hash. Matching command bytes alone are no longer enough.
+
+Added regression coverage for:
+- same-payload replacement over a divergent acting-set gap;
+- same-payload replacement at the same replacement index but chained after a divergent prior prefix;
+- the intended primary-last fanout race where reissue reloads a safe replacement slot.
+
+Verification for the fix:
+- `cargo nextest run -p storage`: 545 passed
+- `cargo clippy --all-targets --all-features -- -D warnings`: passed
+- `./scripts/check-storage-cluster-boundaries`: passed
+- `git diff --check`: passed
+
+# Validation
+## Rubric
+- [x] Build a minimal three-node local metadata acting set with a controlled primary and a common durable log prefix.
+- [x] Create the suspected race state: primary pending slot already replaced with same payload at a later log index, while a non-primary has a divergent intervening durable log entry.
+- [x] Verify `reissue_pending_metadata_command` returns the same-payload replacement instead of failing closed with `MetadataCommandLogConflict`.
+- [x] Verify replica acceptance/application allows the later command on nodes that lack the intervening log entry.
+- [x] Verify durable postconditions show metadata applied with non-contiguous/divergent command-log state.
+## Report
+Validated the finding with a targeted Rust unit-test PoC plus LLDB trace. Direct crash attempt: `cargo test -p storage poc_reissue_same_payload_replacement_bypasses_divergent_non_primary_history -- --nocapture` completed successfully, which is expected for this logical integrity bug rather than a memory-safety crash. Valgrind was attempted but unavailable (`valgrind: command not found`); ASan was not usable because the installed Rust toolchain is stable and rejects `-Z` sanitizer flags. Debugger validation used LLDB with a breakpoint at `crates/storage/src/cluster.rs:477`, and execution stopped exactly on `return Ok((current.payload() == command.payload()).then_some(current));` from `StorageCluster::reissue_pending_metadata_command`, called by the PoC test.
+
+Evidence: the PoC constructs a three-node metadata PG with a common durable prefix at log index 1, inserts a primary pending replacement at log index 3 with the same payload as a stale command, and applies a divergent non-primary-only command at log index 2. The call at the PoC lines `crates/storage/src/cluster/local.rs:4851-4855` returns the index-3 replacement instead of a `MetadataCommandLogConflict`. Applying that returned command succeeds at `local.rs:4860-4862`. The postconditions at `local.rs:4868-4882` prove corruption/non-contiguity: every node has max durable metadata command log index 3 and the second bucket metadata is present, but nodes 1 and 2 do not have the intervening occupant bucket and their contiguous `metadata_command_replica_state.applied_log_index` remains 1.
+
+This matches the suspected vulnerable chain: `cluster.rs:473-477` returns a same-payload current primary pending slot before checking acting-set max history; `cluster.rs:484-497` has the same bypass even after detecting a higher acting-set index; `pg_store.rs:2051-2058` accepts a command when there is no entry at that exact log index; `pg_store.rs:5389-5393` applies metadata before recording/advancing; and the advancement loop around `pg_store.rs:2492-2538` breaks on a missing next contiguous log entry, allowing metadata from a later command to persist while the replica state remains behind.
+
+# Evidence
+crates/storage/src/cluster.rs (L473 to 477)
+  Note: The introduced early return accepts any current primary pending slot with the same payload before checking whether non-primary replicas have a higher or divergent durable log history.
+```
+        if let Some(current) = pg
+            .pending_metadata_command_envelope(primary.node_id().as_u32(), self.operation_epoch())?
+        {
+            if current != *command {
+                return Ok((current.payload() == command.payload()).then_some(current));
+```
+
+crates/storage/src/cluster.rs (L484 to 497)
+  Note: Even after detecting that the acting set has a higher log index than the primary, the code returns a changed same-payload pending slot instead of failing closed unless it proves the higher history is that same command.
+```
+        let acting_set_max_log_index = self.max_metadata_command_log_index_on_acting_set(pg_id)?;
+        if acting_set_max_log_index > primary_max_log_index {
+            let pg = primary.storage_node().get_pg(pg_id.get())?;
+            if let Some(current) = pg.pending_metadata_command_envelope(
+                primary.node_id().as_u32(),
+                self.operation_epoch(),
+            )? {
+                if current != *command {
+                    return Ok((current.payload() == command.payload()).then_some(current));
+                }
+            } else {
+                return Ok(None);
+            }
+            return Err(StoreError::MetadataCommandLogConflict {
+```
+
+crates/storage/src/pg_store.rs (L2051 to 2058)
+  Note: Replica acceptance only checks for an existing entry at the candidate command's exact log index; a divergent intervening lower log entry does not prevent applying a later reissued command.
+```
+        let Some(entry) = self.load_metadata_command_log_entry(
+            "load metadata command log entry",
+            command.id().cluster_epoch(),
+            command.id().pg_id(),
+            command.id().log_index(),
+        )?
+        else {
+            return Ok(MetadataCommandAcceptance::Apply);
+```
+
+crates/storage/src/pg_store.rs (L2492 to 2538)
+  Note: The log advancement loop stops when the next contiguous log entry is missing, demonstrating how a later inserted command can remain beyond a gap while metadata changes have already been applied.
+```
+        while let Some(next_log_index) = applied_log_index.checked_add(1) {
+            let log_index = MetadataCommandLogIndex::new(next_log_index)
+                .expect("metadata command log index is non-zero");
+
+            let expected_log_hash = if let Some((inserted_log_index, command_checksum)) =
+                inserted_entry.filter(|(inserted_log_index, _)| *inserted_log_index == log_index)
+            {
+                let expected_log_hash = metadata_command_log_hash(
+                    cluster_epoch,
+                    pg_id,
+                    inserted_log_index,
+                    applied_log_hash,
+                    command_checksum,
+                );
+                let updated = self.execute_cached(
+                    "UPDATE metadata_command_log \
+                     SET previous_log_hash = ?1, log_hash = ?2 \
+                     WHERE cluster_epoch = ?3 AND pg_id = ?4 AND log_index = ?5 \
+                       AND previous_log_hash IS NULL AND log_hash IS NULL",
+                    params![
+                        applied_log_hash as i64,
+                        expected_log_hash as i64,
+                        cluster_epoch.get() as i64,
+                        self.pg_id as i64,
+                        next_log_index as i64,
+                    ],
+                    "update inserted metadata command log hash",
+                )?;
+                if updated != 1 {
+                    return Err(StoreError::MetadataCommandLogConflict {
+                        node_id,
+                        pg_id: self.pg_id,
+                        cluster_epoch,
+                        log_index: next_log_index,
+                    });
+                }
+                expected_log_hash
+            } else {
+                let Some(entry) = self.load_metadata_command_log_entry(
+                    "load next metadata command log entry",
+                    cluster_epoch,
+                    pg_id,
+                    log_index,
+                )?
+                else {
+                    break;
+                };
+```
+
+crates/storage/src/pg_store.rs (L5389 to 5393)
+  Note: The metadata mutation is applied before command-log recording/advancement, so accepting a later command with an unreconciled gap can persist metadata changes even if the contiguous log state cannot advance cleanly.
+```
+        let result = (|| {
+            self.apply_metadata_command(command)
+                .map_err(BucketSnapshotLoadError::Metadata)?;
+            self.record_metadata_command_applied_inner(node_id, command)
+                .map_err(BucketSnapshotLoadError::Store)
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Adjusted from high to medium. The core bug is real and in-scope: production argmin-s3 uses StorageCluster, and repository code shows the same-payload reissue bypass plus later PgStore behavior that can apply metadata past a log gap. The provided executable validation strengthens confidence in the corruption mechanism. But high severity requires a clear, realistic attacker path to major compromise. Here, the attacker needs valid metadata-write access and a rare crash/recovery or replica-divergence condition that is not directly controllable through the HTTP API shown in repository artifacts. The impact is serious for integrity/availability if the state is reached, but exploitation likelihood is low and cross-tenant or unauthenticated impact is not demonstrated.
+## Likelihood
+low - The vulnerable code is reachable in the production storage path, and authenticated S3 clients can initiate metadata-changing commands. However, exploitation requires a difficult internal state: divergent non-primary durable history plus same-payload reissue timing. The validation PoC constructs this with low-level/test facilities rather than through a normal HTTP-only exploit.
+## Impact
+high - If triggered, the bug can persist metadata changes despite a non-contiguous or divergent durable command log. That can corrupt bucket/object metadata and cause integrity loss or service availability failures. It does not expose credentials, provide code execution, or prove cross-tenant compromise.
+## Assumptions
+- The production component is the argmin-s3 S3-compatible server binary.
+- A realistic attacker has valid S3 credentials or access to a public-write path that reaches metadata-changing storage operations.
+- The divergent acting-set metadata log state requires an unusual crash, recovery, storage fault, or race window; direct construction of that state is not exposed over the HTTP API in the repository artifacts reviewed.
+- No Kubernetes, Terraform, Docker, or cloud deployment manifests were present in the checked repository, so exposure is inferred from code and README defaults.
+- argmin-s3 server running with configured S3 credentials
+- attacker can perform authenticated metadata-changing S3 operations such as bucket/object writes
+- primary and non-primary metadata replicas reach a divergent durable command-log state
+- primary pending slot is reissued to a same-payload replacement before acting-set history is reconciled
+## Path
+S3 client
+  -> argmin-s3 HTTP/SigV4
+  -> server-core metadata mutation
+  -> StorageCluster reissue_pending_metadata_command
+  -> same-payload replacement bypass
+  -> PgStore applies metadata before contiguous log reconciliation
+  -> durable metadata inconsistency/corruption
+## Path evidence
+- `README.md:3-4` - Project is a production S3-compatible object storage service with a single-process local cluster.
+- `README.md:28-35` - Runtime exposure and credentials are environment-configured; default listen address is 127.0.0.1:9000.
+- `crates/argmin-s3/src/config.rs:87-98` - Access key, secret key, SSE key, and listen address are read from environment; default listen address is localhost:9000.
+- `crates/argmin-s3/src/main.rs:77-88` - Configured credential is installed with OwnerAccountAdmin authorization profile.
+- `crates/argmin-s3/src/main.rs:153-155` - Production server opens the StorageCluster local nodes, placing the affected storage code in runtime scope.
+- `crates/argmin-s3/src/main.rs:185-189` - Server binds a TCP listener on the configured listen address.
+- `crates/argmin-s3/src/main.rs:224-243` - The listener is served over HTTP or HTTPS depending on TLS configuration.
+- `crates/server-http/src/http/mod.rs:3046-3069` - S3 requests pass through SigV4 authentication using the configured credential store.
+- `crates/server-core/src/coordinator/authz/bucket.rs:4-10` - CreateBucket authorization rejects anonymous requesters, establishing the metadata-write precondition.
+- `crates/storage/src/cluster.rs:473-477` - Introduced early return accepts a changed current primary pending command if payloads match before acting-set history comparison.
+- `crates/storage/src/cluster.rs:484-497` - Even after detecting acting-set max log index is higher than primary, the code can return a same-payload replacement instead of fail-closed conflict.
+- `crates/storage/src/pg_store.rs:2051-2058` - Replica acceptance returns Apply when no command exists at the candidate exact log index, without checking intervening gaps.
+- `crates/storage/src/pg_store.rs:5389-5393` - Metadata mutation is applied before command-log recording/advancement.
+- `crates/storage/src/pg_store.rs:2492-2538` - Contiguous log advancement breaks when the next log entry is missing, allowing later applied metadata to remain beyond a gap.
+- `crates/server-http/src/http/serve.rs:350-360` - Controls include connection and in-flight request admission limits, but these do not mitigate the metadata-log logic flaw.
+## Narrative
+The finding is a real runtime data-integrity bug in the storage layer used by argmin-s3. The code returns a current primary pending command with the same payload before validating that non-primary replicas with higher durable log indexes contain the same history. PgStore then accepts a command when there is no entry at that exact log index, applies the metadata mutation before recording/advancing the command log, and stops advancement at a missing contiguous entry. The supplied validation report demonstrates this chain with an executable Rust test and debugger breakpoint. Reachability from the important threat-model surface is plausible because authenticated S3 operations create bucket/object metadata commands, but a realistic exploit also needs an uncommon divergent replica state caused by crash/recovery/fault timing; direct arbitrary log manipulation is not exposed over HTTP. Therefore the issue is in scope and security-relevant for integrity/availability, but high severity is not fully justified from repository evidence alone.
+## Controls
+- AWS SigV4 request authentication
+- bucket/object authorization in server-core
+- default localhost listen address
+- optional direct TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- connection semaphore and max in-flight request semaphore
+- per-PG SQLite metadata and metadata command log checks
+## Blindspots
+- Static repository review only; no cloud APIs or live deployment inspection were performed.
+- No Kubernetes, Terraform, Docker, ingress, or load-balancer manifests were found, so public exposure could differ in downstream deployments.
+- The validation PoC is strong for the internal storage invariant violation but uses test/low-level hooks to create divergent history; a pure external HTTP exploit was not demonstrated.
+- Multi-host behavior is referenced by planning documents and local-node abstractions, but the README describes a single-process local cluster; deployment maturity may affect real-world reachability.
