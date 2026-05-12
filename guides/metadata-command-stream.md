@@ -184,6 +184,28 @@ command-owned state is the append segment row and the payload CRC/hash carried
 by that row; the allocator is durable PG-primary coordination state used to
 avoid cross-process shard-key reuse before the append command exists.
 
+This split is intentionally a little different from ordinary command-owned
+metadata. `stream_upload_segments.segment_vid` is semantic metadata: it is the
+payload shard identity for a staged segment, so the exact value is encoded in
+`AppendStreamSegment` and replicated through command apply. By contrast,
+`stream_uploads.next_segment_vid` is only an allocator floor. It may be ahead
+on the primary while append commands are still in flight, and replicas may
+advance to the same or a lower floor until those commands apply.
+
+We considered replacing the allocator floor with non-state allocation. A
+random `u64` segment VID is not strong enough to treat collisions as
+impossible, and checking for collisions by scanning existing segment rows would
+be more expensive and less direct than using SQLite's counter update. Deriving
+the VID from the command id/log index would be exact, but it requires creating
+or reserving the append command before payload shards are written. That would
+need a larger protocol change so a pending append command cannot be applied by
+another drainer before payload acks exist.
+
+For now, keep the SQLite allocator floor. If this is revisited, prefer either a
+larger collision-resistant opaque segment identity or a command-protocol change
+that makes command-derived VIDs safe before payload write. Do not switch to
+best-effort random `u64` allocation without an explicit collision model.
+
 ## Local Locks And Caches
 
 Process-local locks may still protect Rust object safety, SQLite connection
