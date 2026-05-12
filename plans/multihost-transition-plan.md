@@ -2651,6 +2651,11 @@ Proposed subphases:
      `try_install_pending_metadata_command_for_bucket`, and
      `set_pending_metadata_command_for_bucket`; each call site must be covered
      by the publisher/path classification above
+     - status: initial publisher/path classification is documented in
+       [metadata-command-stream.md](../guides/metadata-command-stream.md), and
+       `scripts/check-storage-cluster-boundaries` now fails if the production
+       pending-command install call-site inventory changes without updating the
+       documented classification and script allowlist
    - add or consolidate a generic snapshot-sensitive command-publish wrapper:
      - load fresh snapshot
      - run request preconditions/action

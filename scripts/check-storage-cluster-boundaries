@@ -211,6 +211,105 @@ fail_with_matches \
     "Ungated production PgMetadataStore method outside the explicit allowlist" \
     "$production_metadata_methods"
 
+pending_command_publishers=$(
+    awk '
+    function update_function_context() {
+        if ($0 ~ /^    (pub(\([^)]*\))? |pub\(crate\) |pub\(super\) )?fn [A-Za-z0-9_]+/) {
+            current_fn = $0
+            sub(/^.*fn /, "", current_fn)
+            sub(/\(.*/, "", current_fn)
+        }
+    }
+    FNR == 1 {
+        current_fn = ""
+        pending_test_cfg = 0
+        in_test_module = 0
+    }
+    /^#\[cfg\(test\)\]/ || /^#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ {
+        pending_test_cfg = 1
+        next
+    }
+    /^mod tests[[:space:]]*\{/ && pending_test_cfg {
+        in_test_module = 1
+        pending_test_cfg = 0
+        next
+    }
+    pending_test_cfg && $0 !~ /^[[:space:]]*$/ && $0 !~ /^#\[/ {
+        pending_test_cfg = 0
+    }
+    in_test_module {
+        next
+    }
+    {
+        update_function_context()
+        helper = ""
+        if ($0 ~ /try_set_pending_metadata_command_for_bucket\(/) {
+            helper = "try_set_pending_metadata_command_for_bucket"
+        } else if ($0 ~ /try_install_pending_metadata_command_for_bucket\(/) {
+            helper = "try_install_pending_metadata_command_for_bucket"
+        } else if ($0 ~ /set_pending_metadata_command_for_bucket\(/) {
+            helper = "set_pending_metadata_command_for_bucket"
+        }
+        if (helper == "") {
+            next
+        }
+        if (current_fn == "set_pending_metadata_command_for_bucket" \
+            || current_fn == "try_install_pending_metadata_command_for_bucket" \
+            || current_fn == "try_set_pending_metadata_command_for_bucket") {
+            next
+        }
+        print FILENAME ":" current_fn ":" helper
+    }
+    ' $(find crates/storage/src -type f -name '*.rs' \
+        ! -path 'crates/storage/src/tests/*' \
+        ! -name '*_tests.rs' \
+        | sort) \
+        | sort \
+        | uniq -c \
+        | sed 's/^ *//'
+)
+expected_pending_command_publishers=$(cat <<'EOF'
+1 crates/storage/src/cluster.rs:abort_stream_upload_session:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards<E>:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster.rs:commit_stream_segment_append:set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster.rs:create_put_object_stream_session_record:set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster.rs:release_object_generation_reservation:try_set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster.rs:release_object_generation_reservation_command_required:try_set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster.rs:reserve_next_object_version:try_set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster.rs:reserve_put_object_generation:try_set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:abort_authorized_multipart_upload_locked:try_set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:abort_multipart_upload_locked:try_set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:begin_bucket_delete:try_set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:begin_upload_part_stream_session<T, E>:set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:complete_multipart_upload_commit_serialized:try_set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:create_bucket_with_config_and_load_info:try_set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:create_multipart_upload<T, E>:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:create_put_object_stream_session<T, E>:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:create_upload_part_stream_session:set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:delete_completed_multipart_upload_record_with_command:try_set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:delete_current_object_if<T, E>:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:delete_expired_delete_marker_if_due<E>:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:delete_noncurrent_live_versions_if_due<E>:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:delete_specific_object_version_if<T, E>:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:expire_current_object_if_due<E>:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:finalize_put_object_stream<T, E>:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:finalize_upload_part_stream<T, E>:set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:insert_current_delete_marker_if<T, E>:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:put_bucket_acl_and_load_info:try_set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:put_bucket_property_command_and_load_info:try_set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:put_bucket_subresource_command_and_load_info:try_set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:put_bucket_versioning_and_load_info:try_set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:put_object_metadata_if<T, E>:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:reclaim_object_payload_if_unleased:set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:reserve_completed_multipart_upload_order:try_set_pending_metadata_command_for_bucket
+EOF
+)
+if [[ "$pending_command_publishers" != "$expected_pending_command_publishers" ]]; then
+    fail_with_matches \
+        "Pending metadata command publisher inventory changed; update guides/metadata-command-stream.md classification and this allowlist" \
+        "$pending_command_publishers"
+fi
+
 generic_route_io_matches=$(
     rg -n --color=never \
         'std::io::Error::other\((error|other)\.to_string\(\)\)|StoreError::Io[[:space:]]*\{[[:space:]]*context:[^}]*route|StoreError::Io[[:space:]]*\{[[:space:]]*context:[^}]*PG' \
