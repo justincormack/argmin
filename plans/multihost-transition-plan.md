@@ -2684,6 +2684,11 @@ Proposed subphases:
        index/hash
      - same-index accepted commands have identical bytes and hash-chain fields
      - materialized command-owned rows match the canonical state digest
+     - status: initial `assert_clean_metadata_command_stream` helper validates
+       post-operation unresolved pending slots and accepted-prefix/tail
+       agreement before running replay validation, so terminal pending-slot
+       cleanup cannot be hidden by the validation path; broader property trace
+       integration remains in this hardening phase
    - extract the reissue safety decision into a pure model over compact
      summaries, then proptest gaps, divergent prefixes, same-payload
      replacements, missing log rows, abandoned rows, stale primary state, and

@@ -1408,6 +1408,46 @@ mod tests {
         snapshot
     }
 
+    fn assert_clean_metadata_command_stream(map: &LocalClusterMap, pg_ids: &[u32]) {
+        let pg_ids: Vec<PgId> = pg_ids.iter().copied().map(PgId::new).collect();
+        for &pg_id in &pg_ids {
+            for node_id in map.node_ids() {
+                let pg = map
+                    .node(node_id)
+                    .unwrap()
+                    .storage_node()
+                    .get_pg(pg_id.get())
+                    .unwrap();
+                assert!(
+                    pg.pending_metadata_command_slot(node_id.as_u32(), ClusterEpoch::INITIAL)
+                        .unwrap()
+                        .is_none(),
+                    "node {} PG {} should not have an unresolved pending command slot",
+                    node_id.as_u32(),
+                    pg_id.get()
+                );
+                let state = pg.metadata_command_replica_state().unwrap();
+                let max_log_index = pg
+                    .max_metadata_command_log_index(ClusterEpoch::INITIAL)
+                    .unwrap();
+                assert_eq!(
+                    state.applied_log_index,
+                    max_log_index,
+                    "node {} PG {} has unapplied metadata command log tail",
+                    node_id.as_u32(),
+                    pg_id.get()
+                );
+            }
+        }
+        validate_metadata_command_replay_state(
+            &map.nodes,
+            &map.pg_routes,
+            &pg_ids,
+            ClusterEpoch::INITIAL,
+        )
+        .expect("metadata command stream should validate");
+    }
+
     fn write_committed_direct_segment(
         cluster: &crate::StorageCluster,
         payload: &[u8],
@@ -5646,6 +5686,7 @@ mod tests {
                 2
             );
         }
+        assert_clean_metadata_command_stream(&map, &[1]);
     }
 
     #[test]
@@ -5812,6 +5853,7 @@ mod tests {
                 2
             );
         }
+        assert_clean_metadata_command_stream(&map, &[1]);
     }
 
     #[test]
@@ -6076,6 +6118,7 @@ mod tests {
                 duplicate_index + 1
             );
         }
+        assert_clean_metadata_command_stream(&map, &[object_pg]);
     }
 
     #[test]
@@ -6185,6 +6228,7 @@ mod tests {
                 duplicate_index + 1
             );
         }
+        assert_clean_metadata_command_stream(&map, &[object_pg]);
     }
 
     #[test]
