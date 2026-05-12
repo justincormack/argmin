@@ -2777,8 +2777,9 @@ Proposed subphases:
        fields
        - status: terminal MPU cleanup commands now carry
          `TerminalStreamCleanupRecord`, which excludes `next_segment_vid`;
-         `CreateStreamUpload` remains row-shaped because it creates the durable
-         allocator row
+         `CreateStreamUpload` carries a command-owned stream session projection
+         plus an explicit initial allocator floor, so retry matching validates
+         allocator state deliberately instead of comparing a broad runtime row
      - invariant checker and boundary checks run in the normal verification
        path
      - targeted reissue and crash-step model coverage exists for the recent

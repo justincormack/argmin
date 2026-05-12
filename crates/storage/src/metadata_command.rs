@@ -17,9 +17,9 @@ use crate::types::{
     ObjectEncryption, ObjectEncryptionType, ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord,
     ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
     OwnerIdentity, PgId, PublicAccessBlockConfig, PutLiveObjectReq, SerializedMetadataBlob,
-    SerializedSystemMetadataBlob, SerializedTagSet, SessionId, StorageClass, StreamUploadRecord,
-    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord,
-    UploadId, UploadState, VersionId,
+    SerializedSystemMetadataBlob, SerializedTagSet, SessionId, StorageClass,
+    StreamUploadCommandRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
+    TerminalStreamCleanupRecord, UploadId, UploadState, VersionId,
 };
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
@@ -798,13 +798,14 @@ impl PutObjectMetadataCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CreateStreamUploadCommand {
-    pub(crate) session: StreamUploadRecord,
+    pub(crate) session: StreamUploadCommandRecord,
+    pub(crate) initial_next_segment_vid: GenerationId,
 }
 
 impl CreateStreamUploadCommand {
     pub(crate) fn from_request(request: CreateStreamUploadReq, created_at_millis: u64) -> Self {
         Self {
-            session: StreamUploadRecord {
+            session: StreamUploadCommandRecord {
                 session_id: request.session_id,
                 bucket: request.bucket,
                 key: request.key,
@@ -812,8 +813,8 @@ impl CreateStreamUploadCommand {
                 state: StreamUploadState::InProgress,
                 created_at: created_at_millis,
                 encryption: request.encryption,
-                next_segment_vid: GenerationId::MIN,
             },
+            initial_next_segment_vid: GenerationId::MIN,
         }
     }
 }
@@ -1300,7 +1301,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 self.skip_optional_stale_payload()
             }
             METADATA_COMMAND_PUT_OBJECT_METADATA => self.skip_live_object_record(),
-            METADATA_COMMAND_CREATE_STREAM_UPLOAD => self.skip_stream_upload(),
+            METADATA_COMMAND_CREATE_STREAM_UPLOAD => self.skip_create_stream_upload(),
             METADATA_COMMAND_APPEND_STREAM_SEGMENT => {
                 self.skip_str()?;
                 self.skip_str()?;
@@ -1489,7 +1490,9 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             )),
             METADATA_COMMAND_CREATE_STREAM_UPLOAD => Ok(
                 MetadataCommandPayload::CreateStreamUpload(Box::new(CreateStreamUploadCommand {
-                    session: self.read_stream_upload()?,
+                    session: self.read_stream_upload_command_record()?,
+                    initial_next_segment_vid: self
+                        .read_generation_id("initial next stream segment VID")?,
                 })),
             ),
             METADATA_COMMAND_APPEND_STREAM_SEGMENT => Ok(
@@ -2045,7 +2048,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         })
     }
 
-    fn skip_stream_upload(&mut self) -> Result<(), String> {
+    fn skip_create_stream_upload(&mut self) -> Result<(), String> {
         self.skip_str()?;
         self.skip_str()?;
         self.skip_str()?;
@@ -2066,8 +2069,8 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.skip_object_encryption()
     }
 
-    fn read_stream_upload(&mut self) -> Result<StreamUploadRecord, String> {
-        Ok(StreamUploadRecord {
+    fn read_stream_upload_command_record(&mut self) -> Result<StreamUploadCommandRecord, String> {
+        Ok(StreamUploadCommandRecord {
             session_id: self.read_session_id()?,
             bucket: self.read_bucket_name()?,
             key: self.read_object_key()?,
@@ -2076,7 +2079,6 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 .ok_or_else(|| "invalid stream upload state".to_string())?,
             created_at: self.read_u64()?,
             encryption: self.read_object_encryption()?,
-            next_segment_vid: self.read_generation_id("next stream segment VID")?,
         })
     }
 
@@ -2940,7 +2942,8 @@ fn encode_put_object_metadata(out: &mut Vec<u8>, command: &PutObjectMetadataComm
 }
 
 fn encode_create_stream_upload(out: &mut Vec<u8>, command: &CreateStreamUploadCommand) {
-    encode_stream_upload(out, &command.session);
+    encode_stream_upload_command_record(out, &command.session);
+    put_u64(out, command.initial_next_segment_vid.get());
 }
 
 fn encode_append_stream_segment(out: &mut Vec<u8>, command: &AppendStreamSegmentCommand) {
@@ -3061,7 +3064,7 @@ fn encode_abort_multipart_upload_cleanup(out: &mut Vec<u8>, cleanup: &AbortMulti
     }
 }
 
-fn encode_stream_upload(out: &mut Vec<u8>, session: &StreamUploadRecord) {
+fn encode_stream_upload_command_record(out: &mut Vec<u8>, session: &StreamUploadCommandRecord) {
     put_str(out, session.session_id.as_str());
     put_str(out, session.bucket.as_str());
     put_str(out, session.key.as_str());
@@ -3069,7 +3072,6 @@ fn encode_stream_upload(out: &mut Vec<u8>, session: &StreamUploadRecord) {
     put_u8(out, session.state as u8);
     put_u64(out, session.created_at);
     encode_object_encryption(out, &session.encryption);
-    put_u64(out, session.next_segment_vid.get());
 }
 
 fn encode_terminal_stream_cleanup(out: &mut Vec<u8>, session: &TerminalStreamCleanupRecord) {

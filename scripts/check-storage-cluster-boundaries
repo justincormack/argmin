@@ -324,6 +324,16 @@ fail_with_matches \
     "Terminal stream cleanup payloads must use TerminalStreamCleanupRecord, not StreamUploadRecord" \
     "$mixed_stream_upload_cleanup_records"
 
+stream_create_runtime_record_payloads=$(
+    rg -n --color=never \
+        'session:[[:space:]]*StreamUploadRecord' \
+        crates/storage/src/metadata_command.rs \
+        || true
+)
+fail_with_matches \
+    "CreateStreamUploadCommand must use StreamUploadCommandRecord plus an explicit allocator floor, not StreamUploadRecord" \
+    "$stream_create_runtime_record_payloads"
+
 raw_stream_upload_vector_comparisons=$(
     awk '
     FNR == 1 {

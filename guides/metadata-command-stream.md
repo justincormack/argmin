@@ -286,6 +286,14 @@ the command-owned cleanup state separate from the durable runtime allocator
 floor, and avoids equality checks that have to remember to ignore allocator
 progress.
 
+`CreateStreamUpload` also avoids carrying a broad `StreamUploadRecord`. Its
+payload contains the command-owned session projection plus an explicit initial
+`next_segment_vid` floor. Retry matching must compare both pieces: session
+identity/state/encryption proves the command-owned row, while the initial floor
+proves the allocator started from the expected value. Later allocator progress
+belongs to append allocation and append commands, not to generic stream-session
+equality.
+
 We considered replacing the allocator floor with non-state allocation. A
 random `u64` segment VID is not strong enough to treat collisions as
 impossible, and checking for collisions by scanning existing segment rows would

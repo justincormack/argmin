@@ -3101,6 +3101,36 @@ pub struct StreamUploadRecord {
     pub next_segment_vid: GenerationId,
 }
 
+/// Command-owned stream session fields used by `CreateStreamUpload`.
+///
+/// The initial stream segment VID allocator floor is stored separately on the
+/// command so retry matching must handle allocator state explicitly instead of
+/// accidentally comparing broad runtime records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamUploadCommandRecord {
+    pub session_id: SessionId,
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub target: StreamUploadTarget,
+    pub state: StreamUploadState,
+    pub created_at: u64,
+    pub encryption: ObjectEncryption,
+}
+
+impl From<&StreamUploadRecord> for StreamUploadCommandRecord {
+    fn from(record: &StreamUploadRecord) -> Self {
+        Self {
+            session_id: record.session_id.clone(),
+            bucket: record.bucket.clone(),
+            key: record.key.clone(),
+            target: record.target.clone(),
+            state: record.state,
+            created_at: record.created_at,
+            encryption: record.encryption.clone(),
+        }
+    }
+}
+
 /// Command-owned stream session fields required by terminal MPU cleanup.
 ///
 /// Runtime allocator state such as `next_segment_vid` is intentionally not part

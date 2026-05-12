@@ -6540,7 +6540,8 @@ impl PgStore {
 
     fn create_stream_upload_explicit(
         &self,
-        session: &StreamUploadRecord,
+        session: &StreamUploadCommandRecord,
+        initial_next_segment_vid: GenerationId,
     ) -> Result<(), MetadataError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -6572,7 +6573,7 @@ impl PgStore {
                     session.created_at as i64,
                     encryption_type,
                     encryption_state,
-                    session.next_segment_vid.get() as i64,
+                    initial_next_segment_vid.get() as i64,
                 ],
             )
             .map_err(|e| MetadataError::Db {
@@ -6588,14 +6589,18 @@ impl PgStore {
     ) -> Result<(), MetadataError> {
         self.validate_create_stream_upload_command_target(command)?;
         match self.get_stream_upload(&command.session.session_id) {
-            Ok(existing) if existing == command.session => Ok(()),
+            Ok(existing)
+                if StreamUploadCommandRecord::from(&existing) == command.session
+                    && existing.next_segment_vid == command.initial_next_segment_vid =>
+            {
+                Ok(())
+            }
             Ok(_) => Err(MetadataError::Db {
                 context: "create stream upload command existing session mismatch",
                 source: rusqlite::Error::InvalidQuery,
             }),
-            Err(MetadataError::StreamSessionNotFound { .. }) => {
-                self.create_stream_upload_explicit(&command.session)
-            }
+            Err(MetadataError::StreamSessionNotFound { .. }) => self
+                .create_stream_upload_explicit(&command.session, command.initial_next_segment_vid),
             Err(error) => Err(error),
         }
     }
@@ -12402,7 +12407,7 @@ impl PgMetadataStore for PgStore {
             req.key.as_str()
         );
         let command = CreateStreamUploadCommand::from_request(req.clone(), PgStore::now_millis());
-        self.create_stream_upload_explicit(&command.session)
+        self.create_stream_upload_explicit(&command.session, command.initial_next_segment_vid)
     }
 
     fn get_stream_upload(
@@ -15410,7 +15415,12 @@ mod tests {
             encryption: ObjectEncryption::None,
             next_segment_vid: GenerationId::MIN,
         };
-        store.create_stream_upload_explicit(&session).unwrap();
+        store
+            .create_stream_upload_explicit(
+                &StreamUploadCommandRecord::from(&session),
+                session.next_segment_vid,
+            )
+            .unwrap();
 
         let command = AbortMultipartUploadCommand {
             bucket: upload.bucket.clone(),

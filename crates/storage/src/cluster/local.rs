@@ -10580,6 +10580,80 @@ mod tests {
     }
 
     #[test]
+    fn stream_put_create_retry_rejects_same_request_with_mismatched_allocator_floor() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let session_id = crate::SessionId::try_from("7b".repeat(16)).unwrap();
+        let create = crate::CreateStreamUploadReq {
+            session_id: session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: crate::StreamUploadTarget::PutObject,
+            encryption: crate::ObjectEncryption::None,
+        };
+
+        cluster
+            .create_put_object_stream_session(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), create.clone()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+        {
+            let primary = map.node(NodeId::new(0)).unwrap().storage_node();
+            let pg = primary.get_pg(object_pg).unwrap();
+            pg.connection()
+                .execute(
+                    "UPDATE stream_uploads SET next_segment_vid = ?1 WHERE session_id = ?2",
+                    rusqlite::params![2_i64, session_id.as_str()],
+                )
+                .unwrap();
+        }
+
+        let err = cluster
+            .create_put_object_stream_session(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), create.clone()))
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::Db {
+                    context: "create stream upload existing session mismatch",
+                    ..
+                })
+            ),
+            "expected explicit initial allocator floor mismatch, got {err:?}"
+        );
+    }
+
+    #[test]
     fn stream_put_create_drains_unrelated_pending_create_before_new_session() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

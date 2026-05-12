@@ -26,8 +26,8 @@ use crate::types::{
     ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
     ObjectSegmentsReclaimSegmentRecord, PgId, PrepareStreamUploadSegmentAppendReq,
     PutLiveObjectReq, SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey,
-    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
-    VersionId, WriteAck, WrittenShardAck,
+    StreamUploadCommandRecord, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
+    StreamUploadTarget, VersionId, WriteAck, WrittenShardAck,
 };
 use crate::{BucketSnapshotLoadError, MetadataError, ObjectEtag, ObjectPgActionError};
 
@@ -139,7 +139,7 @@ fn object_pg_action_error_to_bucket_snapshot_error(
 }
 
 fn stream_create_request_matches_session(
-    session: &StreamUploadRecord,
+    session: &StreamUploadCommandRecord,
     create: &CreateStreamUploadReq,
 ) -> bool {
     session.session_id == create.session_id
@@ -154,7 +154,8 @@ fn stream_upload_matches_command(
     existing: &StreamUploadRecord,
     create: &CreateStreamUploadCommand,
 ) -> bool {
-    *existing == create.session
+    StreamUploadCommandRecord::from(existing) == create.session
+        && existing.next_segment_vid == create.initial_next_segment_vid
 }
 
 fn applied_stream_create_command<'a>(
@@ -2880,8 +2881,22 @@ impl StorageCluster {
                 return Ok(());
             }
             self.reserve_put_object_generation(bucket, key, session_id)?;
+            let command_id = match self.next_object_metadata_command_id(pg_id) {
+                Ok(command_id) => command_id,
+                Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                    ..
+                })) => {
+                    self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                    self.release_object_generation_reservation(bucket, key, session_id)?;
+                    continue;
+                }
+                Err(error) => {
+                    let _ = self.release_object_generation_reservation(bucket, key, session_id);
+                    return Err(error);
+                }
+            };
             let command = MetadataCommandEnvelope::new(
-                self.next_object_metadata_command_id(pg_id)?,
+                command_id,
                 MetadataCommandPayload::CreateStreamUpload(Box::new(
                     CreateStreamUploadCommand::from_request(
                         request.clone(),
