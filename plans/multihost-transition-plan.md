@@ -2668,8 +2668,13 @@ Proposed subphases:
      work, rather than another one-off retry loop.
      - status: introduced `install_snapshot_sensitive_metadata_command_or_drain`
        and converted representative object metadata and specific-version
-       delete publishers so contention drains the winning slot and returns to
-       their fresh-snapshot loop through a named result
+       delete publishers, then expanded it to the straightforward current
+       delete, delete-marker insertion, lifecycle expiry, stream abort,
+       stream finalization, and MPU create publishers so contention drains the
+       winning slot and returns to their fresh-snapshot loop through a named
+       result. Versioned stream-finalize contention now pins the intentional
+       `ReserveObjectVersion` allocator-gap behavior when a fresh retry fails
+       after a durable version reservation
    - split command-owned records from runtime/local fields where equality has
      been risky:
      - start with stream upload records, separating command-owned session
@@ -2717,6 +2722,13 @@ Proposed subphases:
    - expand the local-cluster stateful model to include two handles,
      pending-slot contention, reissue, zero-apply abandon, partial
      primary-last apply, restart/open validation, and stale-handle attempts
+     - status: randomized local-cluster traces now assert that generated
+       operation traces leave no unresolved pending slots. Traces that remain
+       in the initial command epoch also run the clean command-stream
+       invariant checker, so unapplied log tails and replay validation
+       failures are caught where the trace has not used synthetic epoch
+       mutation. Explicit two-handle contention and restart/reissue trace
+       actions remain to be added
    - extend mechanical boundary checks for unsafe command-stream patterns:
      - direct pending-slot installation in snapshot-sensitive paths that does
        not restart from a fresh snapshot after contention

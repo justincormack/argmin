@@ -1408,8 +1408,13 @@ mod tests {
         snapshot
     }
 
-    fn assert_clean_metadata_command_stream(map: &LocalClusterMap, pg_ids: &[u32]) {
+    fn assert_clean_metadata_command_stream_at_epoch(
+        map: &LocalClusterMap,
+        pg_ids: &[u32],
+        cluster_epoch: ClusterEpoch,
+    ) {
         let pg_ids: Vec<PgId> = pg_ids.iter().copied().map(PgId::new).collect();
+        assert_no_pending_metadata_command_slots_at_epoch(map, &pg_ids, cluster_epoch);
         for &pg_id in &pg_ids {
             for node_id in map.node_ids() {
                 let pg = map
@@ -1418,18 +1423,8 @@ mod tests {
                     .storage_node()
                     .get_pg(pg_id.get())
                     .unwrap();
-                assert!(
-                    pg.pending_metadata_command_slot(node_id.as_u32(), ClusterEpoch::INITIAL)
-                        .unwrap()
-                        .is_none(),
-                    "node {} PG {} should not have an unresolved pending command slot",
-                    node_id.as_u32(),
-                    pg_id.get()
-                );
                 let state = pg.metadata_command_replica_state().unwrap();
-                let max_log_index = pg
-                    .max_metadata_command_log_index(ClusterEpoch::INITIAL)
-                    .unwrap();
+                let max_log_index = pg.max_metadata_command_log_index(cluster_epoch).unwrap();
                 assert_eq!(
                     state.applied_log_index,
                     max_log_index,
@@ -1439,13 +1434,37 @@ mod tests {
                 );
             }
         }
-        validate_metadata_command_replay_state(
-            &map.nodes,
-            &map.pg_routes,
-            &pg_ids,
-            ClusterEpoch::INITIAL,
-        )
-        .expect("metadata command stream should validate");
+        validate_metadata_command_replay_state(&map.nodes, &map.pg_routes, &pg_ids, cluster_epoch)
+            .expect("metadata command stream should validate");
+    }
+
+    fn assert_no_pending_metadata_command_slots_at_epoch(
+        map: &LocalClusterMap,
+        pg_ids: &[PgId],
+        cluster_epoch: ClusterEpoch,
+    ) {
+        for &pg_id in pg_ids {
+            for node_id in map.node_ids() {
+                let pg = map
+                    .node(node_id)
+                    .unwrap()
+                    .storage_node()
+                    .get_pg(pg_id.get())
+                    .unwrap();
+                assert!(
+                    pg.pending_metadata_command_slot(node_id.as_u32(), cluster_epoch)
+                        .unwrap()
+                        .is_none(),
+                    "node {} PG {} should not have an unresolved pending command slot",
+                    node_id.as_u32(),
+                    pg_id.get()
+                );
+            }
+        }
+    }
+
+    fn assert_clean_metadata_command_stream(map: &LocalClusterMap, pg_ids: &[u32]) {
+        assert_clean_metadata_command_stream_at_epoch(map, pg_ids, ClusterEpoch::INITIAL);
     }
 
     fn write_committed_direct_segment(
@@ -2568,6 +2587,7 @@ mod tests {
         let mut map =
             Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
         let mut current_epoch = ClusterEpoch::INITIAL;
+        let mut visited_epochs = BTreeSet::from([current_epoch]);
         let mut pg_state = PgState::Active;
         let mut written = None::<TraceWrittenShard>;
 
@@ -2575,6 +2595,7 @@ mod tests {
             match op {
                 LocalClusterTraceOp::AdvanceEpoch => {
                     current_epoch = ClusterEpoch::new(current_epoch.get() + 1).unwrap();
+                    visited_epochs.insert(current_epoch);
                     set_trace_epoch(&mut map, current_epoch);
                 }
                 LocalClusterTraceOp::SetPgState(state) => {
@@ -2856,6 +2877,7 @@ mod tests {
                     drop(cluster);
 
                     current_epoch = ClusterEpoch::new(current_epoch.get() + 1).unwrap();
+                    visited_epochs.insert(current_epoch);
                     set_trace_epoch(&mut map, current_epoch);
                     let cluster = current_cluster(&map);
                     prop_assert_eq!(
@@ -2906,6 +2928,13 @@ mod tests {
             }
         }
 
+        let trace_pg_ids = [PgId::new(0)];
+        for epoch in visited_epochs.iter().copied() {
+            assert_no_pending_metadata_command_slots_at_epoch(&map, &trace_pg_ids, epoch);
+        }
+        if visited_epochs.len() == 1 {
+            assert_clean_metadata_command_stream(&map, &[0]);
+        }
         Ok(())
     }
 
@@ -5210,7 +5239,11 @@ mod tests {
         let first_cluster = crate::StorageCluster::from_local_map(Arc::clone(&first_map)).unwrap();
         let second_cluster =
             crate::StorageCluster::from_local_map(Arc::clone(&second_map)).unwrap();
-        create_test_bucket(&first_cluster, &bucket);
+        create_test_bucket_with_versioning(
+            &first_cluster,
+            &bucket,
+            crate::BucketVersioningState::Enabled,
+        );
 
         let session_id =
             crate::SessionId::try_from("33333333333333333333333333333333".to_string()).unwrap();
@@ -5280,12 +5313,15 @@ mod tests {
             [0x94; 16],
             &winner_written,
         );
+        let mut winner_req = winner_req;
+        winner_req.versioning = crate::BucketVersioningState::Enabled;
 
         let hook_ran = Arc::new(AtomicBool::new(false));
         let action_calls = Arc::new(AtomicUsize::new(0));
         let hook_cluster = Arc::clone(&second_cluster);
         let hook_map = Arc::clone(&second_map);
         let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
         let hook_req = winner_req.clone();
         let hook_written_shards = winner_written.written_shards.clone();
         let hook_ran_for_closure = Arc::clone(&hook_ran);
@@ -5305,14 +5341,17 @@ mod tests {
                 let primary = hook_map
                     .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
                     .unwrap();
+                let version_id = hook_cluster
+                    .reserve_next_object_version(
+                        pg_id,
+                        &hook_bucket,
+                        &hook_key,
+                        primary.storage_node().as_ref(),
+                    )
+                    .unwrap();
                 let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
                 let command = hook_cluster
-                    .prepare_commit_direct_put_object_command(
-                        pg_id,
-                        &pg,
-                        &hook_req,
-                        crate::VersionId::Null,
-                    )
+                    .prepare_commit_direct_put_object_command(pg_id, &pg, &hook_req, version_id)
                     .unwrap();
                 pg.try_insert_pending_metadata_command_slot(
                     primary.node_id().as_u32(),
@@ -5337,7 +5376,7 @@ mod tests {
                     } else {
                         Ok(crate::PreparedStreamPutCommit {
                             value: (),
-                            versioning: crate::BucketVersioningState::Disabled,
+                            versioning: crate::BucketVersioningState::Enabled,
                             owner: crate::OwnerIdentity::from_principal("owner"),
                             acl_grants: crate::AclGrants::default(),
                             public_read: false,
@@ -5361,6 +5400,9 @@ mod tests {
             "stream PUT finalization precondition must be rerun after slot contention changes object state"
         );
         assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_none());
+        let losing_reserved_version = crate::VersionId::from_u64(1);
+        let winning_version = crate::VersionId::from_u64(2);
+        assert_object_version_counter_on_acting_nodes(&first_map, &node_ids, 2, &bucket, &key, 3);
 
         for node_id in node_ids {
             let pg = first_map
@@ -5371,8 +5413,18 @@ mod tests {
                 .unwrap();
             let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
             let live = stored.as_live().expect("winner object is live");
+            assert_eq!(live.version_id, winning_version);
             assert_eq!(live.generation_id, winner_generation_id);
             assert_eq!(live.size, winner_payload.len() as u64);
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_version(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    losing_reserved_version,
+                ),
+                Err(crate::MetadataError::ObjectNotFound)
+            ));
         }
     }
 

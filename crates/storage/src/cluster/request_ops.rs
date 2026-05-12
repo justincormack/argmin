@@ -3293,9 +3293,11 @@ impl super::StorageCluster {
                 target,
             )?;
             drop(object_pg);
-            if !self.try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)? {
-                self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
-                continue;
+            match self
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
+            {
+                super::SnapshotSensitiveCommandInstall::Installed => {}
+                super::SnapshotSensitiveCommandInstall::ContenderDrained => continue,
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() else {
@@ -3373,9 +3375,11 @@ impl super::StorageCluster {
                 },
             )?;
             drop(object_pg);
-            if !self.try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)? {
-                self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
-                continue;
+            match self
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
+            {
+                super::SnapshotSensitiveCommandInstall::Installed => {}
+                super::SnapshotSensitiveCommandInstall::ContenderDrained => continue,
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             return Ok(Ok(InsertCurrentDeleteMarkerOutcome {
@@ -3590,9 +3594,11 @@ impl super::StorageCluster {
                     (command, reclaim_generation_id)
                 }
             };
-            if !self.try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)? {
-                self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
-                continue;
+            match self
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
+            {
+                super::SnapshotSensitiveCommandInstall::Installed => {}
+                super::SnapshotSensitiveCommandInstall::ContenderDrained => continue,
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             return Ok(Ok(Some(ExpireCurrentObjectOutcome {
@@ -3710,9 +3716,11 @@ impl super::StorageCluster {
                         },
                     )),
                 );
-                if !self.try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)? {
-                    self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
-                    continue 'retry;
+                match self
+                    .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
+                {
+                    super::SnapshotSensitiveCommandInstall::Installed => {}
+                    super::SnapshotSensitiveCommandInstall::ContenderDrained => continue 'retry,
                 }
                 self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
                 if let Some(generation_id) = reclaim_generation_id {
@@ -3808,9 +3816,11 @@ impl super::StorageCluster {
                 DeleteObjectVersionTarget::DeleteMarker,
             )?;
             drop(object_pg);
-            if !self.try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)? {
-                self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
-                continue;
+            match self
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
+            {
+                super::SnapshotSensitiveCommandInstall::Installed => {}
+                super::SnapshotSensitiveCommandInstall::ContenderDrained => continue,
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             return Ok(Ok(true));
@@ -4469,11 +4479,11 @@ impl super::StorageCluster {
                         )),
                     );
                     drop(object_pg);
-                    if !self
-                        .try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
-                    {
-                        self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
-                        continue;
+                    match self.install_snapshot_sensitive_metadata_command_or_drain(
+                        pg_id, bucket, &command,
+                    )? {
+                        super::SnapshotSensitiveCommandInstall::Installed => {}
+                        super::SnapshotSensitiveCommandInstall::ContenderDrained => continue,
                     }
                     (command, true)
                 }
@@ -4575,13 +4585,16 @@ impl super::StorageCluster {
                             ),
                         )),
                     );
-                    if !self
-                        .try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                    match self
+                        .install_snapshot_sensitive_metadata_command_or_drain(
+                            pg_id, bucket, &command,
+                        )
                         .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
                     {
-                        self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
-                            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-                        return Ok(Ok(Attempt::Retry));
+                        super::SnapshotSensitiveCommandInstall::Installed => {}
+                        super::SnapshotSensitiveCommandInstall::ContenderDrained => {
+                            return Ok(Ok(Attempt::Retry));
+                        }
                     }
                     if let Err(error) =
                         self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)

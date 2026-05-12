@@ -175,6 +175,22 @@ Snapshot-sensitive publishers should prefer
 `install_snapshot_sensitive_metadata_command_or_drain` so slot contention
 drains the winner and returns to the caller's fresh-snapshot loop.
 
+## Object Version Reservations
+
+Object version IDs are allocated by the `ReserveObjectVersion` metadata
+command before some terminal object commands are installed. Once that
+reservation command has applied, losing the later terminal command's pending
+slot race may leave an unused version ID if the fresh retry no longer passes
+request preconditions. That gap is allowed: object version IDs are opaque
+allocator outputs, and the reserved value is not published as an object version
+unless the terminal object command applies.
+
+Tests should distinguish this from precondition failures that happen before
+reservation. A request rejected before `ReserveObjectVersion` must not advance
+`object_version_counters`; a request that has already durably reserved a
+version may advance the counter even if later pending-slot contention causes a
+fresh retry to fail.
+
 ## Recovery
 
 Before accepting new work on a PG, recovery must inspect durable command-stream

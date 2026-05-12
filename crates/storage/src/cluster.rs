@@ -3184,9 +3184,11 @@ impl StorageCluster {
                     staged_segments,
                 })),
             );
-            if !self.try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)? {
-                self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
-                continue;
+            match self
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
+            {
+                SnapshotSensitiveCommandInstall::Installed => {}
+                SnapshotSensitiveCommandInstall::ContenderDrained => continue,
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             return Ok(());

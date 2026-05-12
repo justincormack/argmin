@@ -272,7 +272,7 @@ pending_command_publishers=$(
         | sed 's/^ *//'
 )
 expected_pending_command_publishers=$(cat <<'EOF'
-1 crates/storage/src/cluster.rs:abort_stream_upload_session:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster.rs:abort_stream_upload_session:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards<E>:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster.rs:commit_stream_segment_append:set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster.rs:create_put_object_stream_session_record:set_pending_metadata_command_for_bucket
@@ -286,18 +286,18 @@ expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster/request_ops.rs:begin_upload_part_stream_session<T, E>:set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:complete_multipart_upload_commit_serialized:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:create_bucket_with_config_and_load_info:try_set_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster/request_ops.rs:create_multipart_upload<T, E>:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:create_multipart_upload<T, E>:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:create_put_object_stream_session<T, E>:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:create_upload_part_stream_session:set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:delete_completed_multipart_upload_record_with_command:try_set_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster/request_ops.rs:delete_current_object_if<T, E>:try_install_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster/request_ops.rs:delete_expired_delete_marker_if_due<E>:try_install_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster/request_ops.rs:delete_noncurrent_live_versions_if_due<E>:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:delete_current_object_if<T, E>:install_snapshot_sensitive_metadata_command_or_drain
+1 crates/storage/src/cluster/request_ops.rs:delete_expired_delete_marker_if_due<E>:install_snapshot_sensitive_metadata_command_or_drain
+1 crates/storage/src/cluster/request_ops.rs:delete_noncurrent_live_versions_if_due<E>:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:delete_specific_object_version_if<T, E>:install_snapshot_sensitive_metadata_command_or_drain
-1 crates/storage/src/cluster/request_ops.rs:expire_current_object_if_due<E>:try_install_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster/request_ops.rs:finalize_put_object_stream<T, E>:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:expire_current_object_if_due<E>:install_snapshot_sensitive_metadata_command_or_drain
+1 crates/storage/src/cluster/request_ops.rs:finalize_put_object_stream<T, E>:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:finalize_upload_part_stream<T, E>:set_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster/request_ops.rs:insert_current_delete_marker_if<T, E>:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:insert_current_delete_marker_if<T, E>:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:put_bucket_acl_and_load_info:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:put_bucket_property_command_and_load_info:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:put_bucket_subresource_command_and_load_info:try_set_pending_metadata_command_for_bucket
