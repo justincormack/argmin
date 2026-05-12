@@ -2400,6 +2400,7 @@ mod tests {
         QueueStale(u8),
         LeaseReleaseAcrossEpoch(u8),
         RecoverAfterPhysicalShardLoss(u8),
+        DrainPendingCreateBucketFromSecondHandle(u8),
     }
 
     #[derive(Debug, Clone)]
@@ -2428,6 +2429,7 @@ mod tests {
                 2 => any::<u8>().prop_map(LocalClusterTraceOp::QueueStale),
                 2 => any::<u8>().prop_map(LocalClusterTraceOp::LeaseReleaseAcrossEpoch),
                 1 => any::<u8>().prop_map(LocalClusterTraceOp::RecoverAfterPhysicalShardLoss),
+                1 => any::<u8>().prop_map(LocalClusterTraceOp::DrainPendingCreateBucketFromSecondHandle),
             ],
             1..=40,
         )
@@ -2508,6 +2510,19 @@ mod tests {
 
     fn trace_shard_key(step: usize, seed: u8) -> ShardKey {
         ShardKey::new(&[seed.wrapping_add(1); 16], 10_000 + step as u64, 0)
+    }
+
+    fn trace_bucket_for_pg(
+        map: &LocalClusterMap,
+        target_pg_id: u32,
+        prefix: &str,
+    ) -> crate::BucketName {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, target_pg_id, prefix)
     }
 
     fn trace_placement_key(step: usize, seed: u8) -> Vec<u8> {
@@ -2924,6 +2939,63 @@ mod tests {
                         )
                         .unwrap();
                     prop_assert_eq!(recovered, segment.payload);
+                }
+                LocalClusterTraceOp::DrainPendingCreateBucketFromSecondHandle(seed) => {
+                    if pg_state != PgState::Active || current_epoch != ClusterEpoch::INITIAL {
+                        continue;
+                    }
+                    let pg_id = PgId::new(0);
+                    let pending_bucket = trace_bucket_for_pg(
+                        &map,
+                        pg_id.get(),
+                        &format!("trace-pending-create-{step}-{seed}-"),
+                    );
+                    let requested_bucket = trace_bucket_for_pg(
+                        &map,
+                        pg_id.get(),
+                        &format!("trace-request-create-{step}-{seed}-"),
+                    );
+                    let primary = map
+                        .metadata_pg_primary_node(current_epoch, pg_id)
+                        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                    let primary_pg = primary
+                        .storage_node()
+                        .get_pg(pg_id.get())
+                        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                    if primary_pg
+                        .pending_metadata_command_slot(primary.node_id().as_u32(), current_epoch)
+                        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    let log_index = primary_pg
+                        .max_metadata_command_log_index(current_epoch)
+                        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?
+                        + 1;
+                    let pending_command =
+                        create_bucket_metadata_command(pg_id, log_index, pending_bucket.clone());
+                    primary_pg
+                        .try_insert_pending_metadata_command_slot(
+                            primary.node_id().as_u32(),
+                            &pending_command,
+                            Some(&pending_bucket),
+                        )
+                        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                    drop(primary_pg);
+
+                    let second_handle = current_cluster(&map);
+                    create_test_bucket(&second_handle, &requested_bucket);
+                    for node_id in trace_node_ids() {
+                        let pg = map
+                            .node(node_id)
+                            .unwrap()
+                            .storage_node()
+                            .get_pg(pg_id.get())
+                            .unwrap();
+                        crate::PgMetadataStore::head_bucket(&*pg, &pending_bucket).unwrap();
+                        crate::PgMetadataStore::head_bucket(&*pg, &requested_bucket).unwrap();
+                    }
                 }
             }
         }
@@ -4176,6 +4248,127 @@ mod tests {
                 .get_pg(1)
                 .unwrap();
             crate::PgMetadataStore::head_bucket(&*pg, &bucket).unwrap();
+            assert!(pg
+                .pending_metadata_command_slot(node_id.as_u32(), ClusterEpoch::INITIAL)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn local_cluster_reopen_rejects_nonprimary_applied_primary_pending_slot() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        {
+            let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+            let topology = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "nonprimary-applied-primary-pending-");
+            let command = create_bucket_metadata_command(PgId::new(1), 1, bucket.clone());
+            let primary_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            primary_pg
+                .try_insert_pending_metadata_command_slot(
+                    NodeId::new(0).as_u32(),
+                    &command,
+                    Some(&bucket),
+                )
+                .unwrap();
+            let nonprimary_pg = map
+                .node(NodeId::new(1))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            nonprimary_pg
+                .apply_metadata_command_and_record(NodeId::new(1).as_u32(), &command)
+                .unwrap();
+        }
+
+        let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClusterBuildError::OpenLocalNode {
+                    node_id: 1,
+                    source: StoreError::MetadataCommandReplicaStateDiverged {
+                        pg_id: 1,
+                        reference_node_id: 0,
+                        applied_log_index: 1,
+                        reference_applied_log_index: 0,
+                        ..
+                    }
+                }
+            ),
+            "unexpected reopen error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn local_cluster_reopen_recovers_abandoned_log_tail_without_nonprimary_pending_slots() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let bucket = {
+            let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+            let topology = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "abandoned-tail-reopen-");
+            let command = create_bucket_metadata_command(PgId::new(1), 1, bucket.clone());
+            for node_id in node_ids {
+                let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+                if node_id == NodeId::new(0) {
+                    pg.try_insert_pending_metadata_command_slot(
+                        node_id.as_u32(),
+                        &command,
+                        Some(&bucket),
+                    )
+                    .unwrap();
+                }
+                pg.connection()
+                    .execute(
+                        "INSERT INTO metadata_command_log \
+                         (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL, NULL)",
+                        rusqlite::params![
+                            ClusterEpoch::INITIAL.get() as i64,
+                            1_i64,
+                            1_i64,
+                            command.abandoned_log_checksum_crc64() as i64,
+                            command.abandoned_log_bytes(),
+                        ],
+                    )
+                    .unwrap();
+            }
+            bucket
+        };
+
+        let reopened = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        assert_clean_metadata_command_stream(&reopened, &[1]);
+        for node_id in node_ids {
+            let pg = reopened
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            let state = pg.metadata_command_replica_state().unwrap();
+            assert_eq!(state.applied_log_index, 1);
+            assert!(matches!(
+                crate::PgMetadataStore::head_bucket(&*pg, &bucket),
+                Err(crate::MetadataError::BucketNotFound { .. })
+            ));
             assert!(pg
                 .pending_metadata_command_slot(node_id.as_u32(), ClusterEpoch::INITIAL)
                 .unwrap()

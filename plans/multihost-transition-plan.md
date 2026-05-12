@@ -2710,15 +2710,35 @@ Proposed subphases:
        prefix differs from the primary
    - add reusable crash-step tests around the durable pending-command lifecycle:
      - slot installed, no replica applied
+       - status: create-bucket and object-generation reservation reopen tests
+         cover durable primary slots that have not yet applied to any replica;
+         retry rehydrates the slot and converges it instead of allocating a new
+         command
      - non-primary applied, primary not applied
+       - status: local-cluster reopen now has an explicit fail-closed
+         regression for a non-primary replica with a terminal applied command
+         while the primary still has the unresolved pending slot; until repair
+         exists, this shape is rejected as replica-state divergence
      - primary applied, pending slot still present
        - status: local-cluster reopen now covers the crash shape where the
          command is terminal on the acting set and the primary durable pending
          slot survived; replay validation must clean the slot and preserve the
          applied metadata
      - abandoned row written, replica state not advanced
+       - status: replay validation now advances contiguous abandoned log tails
+         even when a non-primary replica has no pending slot, but preserves the
+         previous materialized-state digest so abandoned rows cannot bless
+         unexpected metadata mutations; it fails closed for unadvanced applied
+         log tails; PgStore and local-cluster reopen tests cover this crash
+         shape
      - terminal row present, slot not removed
+       - status: primary terminal pending-slot cleanup is covered by the same
+         local-cluster reopen test and by PgStore validation tests for applied
+         and abandoned terminal rows
      - reopen after each state
+       - status: the crash-step cases above now all have PgStore-level,
+         local-cluster reopen, or retry-after-reopen coverage; automatic
+         repair is still deliberately narrower than fail-closed detection
    - expand the local-cluster stateful model to include two handles,
      pending-slot contention, reissue, zero-apply abandon, partial
      primary-last apply, restart/open validation, and stale-handle attempts
@@ -2727,8 +2747,10 @@ Proposed subphases:
        in the initial command epoch also run the clean command-stream
        invariant checker, so unapplied log tails and replay validation
        failures are caught where the trace has not used synthetic epoch
-       mutation. Explicit two-handle contention and restart/reissue trace
-       actions remain to be added
+       mutation. The trace model now also injects an unresolved durable
+       create-bucket slot and uses a second cluster handle to drain that PG-slot
+       contender before creating another bucket on the same PG. Explicit
+       restart/reissue trace actions remain to be added
    - extend mechanical boundary checks for unsafe command-stream patterns:
      - direct pending-slot installation in snapshot-sensitive paths that does
        not restart from a fresh snapshot after contention

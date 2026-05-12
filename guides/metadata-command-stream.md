@@ -203,6 +203,12 @@ state:
   must converge that same command to a terminal durable record; it must not
   abandon the command and issue a later replacement
 - if a terminal log record exists for the slot, finish slot cleanup
+- if a replica has a contiguous abandoned log tail but no pending slot,
+  advance the replica index/hash across that abandoned tail while preserving
+  the previous materialized-state digest; an abandoned tail must not bless any
+  bucket/object rows that the abandoned command should not have changed
+- an unadvanced applied log tail without matching materialized state is not
+  recoverable and must fail closed
 - if the materialized metadata digest disagrees with the accepted log prefix,
   fail closed and require repair
 - if command-log prefix state is incomplete, do not allocate a later command

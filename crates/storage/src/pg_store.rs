@@ -1724,17 +1724,16 @@ impl PgStore {
                     self.remove_pending_metadata_command_slot_exact(node_id, &slot)?;
                 }
                 PendingMetadataCommandSlotAction::AdvanceAbandonedThenClean => {
-                    let record = self.advance_metadata_command_log_state_with_inserted(
+                    state = self.advance_abandoned_metadata_command_log_tail(
                         node_id,
                         cluster_epoch,
-                        None,
+                        state,
                     )?;
-                    self.mark_metadata_state_digest_clean_at_revision(record.digest_revision);
-                    state = record.state;
                     self.remove_pending_metadata_command_slot_exact(node_id, &slot)?;
                 }
             }
         }
+        state = self.advance_abandoned_metadata_command_log_tail(node_id, cluster_epoch, state)?;
         let mut applied_log_hash = 0_u64;
         for raw_log_index in 1..=state.applied_log_index {
             let log_index = MetadataCommandLogIndex::new(raw_log_index)
@@ -1809,6 +1808,111 @@ impl PgStore {
         }
         self.mark_metadata_state_digest_clean()?;
         Ok(state)
+    }
+
+    fn advance_abandoned_metadata_command_log_tail(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+        state: MetadataCommandReplicaState,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let pg_id = PgId::new(self.pg_id);
+        let mut applied_log_index = state.applied_log_index;
+        let mut applied_log_hash = state.applied_log_hash;
+        let mut advanced = false;
+
+        while let Some(next_log_index) = applied_log_index.checked_add(1) {
+            let log_index = MetadataCommandLogIndex::new(next_log_index)
+                .expect("metadata command log index is non-zero");
+            let Some(entry) = self.load_metadata_command_log_entry(
+                "load next abandoned metadata command log entry during replay validation",
+                cluster_epoch,
+                pg_id,
+                log_index,
+            )?
+            else {
+                break;
+            };
+            self.verify_metadata_command_log_entry(
+                node_id,
+                cluster_epoch,
+                pg_id,
+                log_index,
+                &entry,
+            )?;
+            if !entry.abandoned {
+                return Err(StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id: self.pg_id,
+                    cluster_epoch,
+                    log_index: next_log_index,
+                });
+            }
+
+            let expected_log_hash = metadata_command_log_hash(
+                cluster_epoch,
+                pg_id,
+                log_index,
+                applied_log_hash,
+                entry.command_checksum,
+            );
+            match (entry.previous_log_hash, entry.log_hash) {
+                (None, None) => {
+                    let updated = self.execute_cached(
+                        "UPDATE metadata_command_log \
+                         SET previous_log_hash = ?1, log_hash = ?2 \
+                         WHERE cluster_epoch = ?3 AND pg_id = ?4 AND log_index = ?5 \
+                           AND previous_log_hash IS NULL AND log_hash IS NULL",
+                        params![
+                            applied_log_hash as i64,
+                            expected_log_hash as i64,
+                            cluster_epoch.get() as i64,
+                            self.pg_id as i64,
+                            next_log_index as i64,
+                        ],
+                        "recover abandoned metadata command log hash",
+                    )?;
+                    if updated != 1 {
+                        return Err(StoreError::MetadataCommandLogConflict {
+                            node_id,
+                            pg_id: self.pg_id,
+                            cluster_epoch,
+                            log_index: next_log_index,
+                        });
+                    }
+                }
+                (Some(previous_log_hash), Some(log_hash))
+                    if previous_log_hash == applied_log_hash && log_hash == expected_log_hash => {}
+                (previous_log_hash, log_hash) => {
+                    return Err(StoreError::MetadataCommandLogHashMismatch {
+                        node_id,
+                        pg_id: self.pg_id,
+                        cluster_epoch,
+                        log_index: next_log_index,
+                        expected_previous_log_hash: applied_log_hash,
+                        actual_previous_log_hash: previous_log_hash.unwrap_or_default(),
+                        expected_log_hash,
+                        actual_log_hash: log_hash.unwrap_or_default(),
+                    });
+                }
+            }
+
+            applied_log_index = next_log_index;
+            applied_log_hash = expected_log_hash;
+            advanced = true;
+        }
+
+        if !advanced {
+            return Ok(state);
+        }
+        Ok(self
+            .update_metadata_command_replica_state_preserving_digest(
+                cluster_epoch,
+                applied_log_index,
+                applied_log_hash,
+                state.state_digest,
+            )?
+            .state)
     }
 
     fn load_metadata_command_log_entry(
@@ -2204,7 +2308,7 @@ impl PgStore {
             }
         }
         let inserted_entry =
-            (inserted > 0).then_some((command.id().log_index(), command.checksum_crc64()));
+            (inserted > 0).then_some((command.id().log_index(), command.checksum_crc64(), false));
         self.advance_metadata_command_log_state_with_inserted(
             node_id,
             command.id().cluster_epoch(),
@@ -2235,7 +2339,7 @@ impl PgStore {
                         source,
                     });
                 }
-                self.mark_metadata_state_digest_clean_at_revision(record.digest_revision);
+                self.invalidate_clean_metadata_digest_revision();
                 Ok(record.state)
             }
             Err(error) => {
@@ -2289,7 +2393,8 @@ impl PgStore {
                 return Err(self.metadata_command_log_conflict(node_id, command));
             }
         }
-        let inserted_entry = (inserted > 0).then_some((command.id().log_index(), command_checksum));
+        let inserted_entry =
+            (inserted > 0).then_some((command.id().log_index(), command_checksum, true));
         self.advance_metadata_command_log_state_with_inserted(
             node_id,
             command.id().cluster_epoch(),
@@ -2454,7 +2559,7 @@ impl PgStore {
         &self,
         node_id: u32,
         cluster_epoch: ClusterEpoch,
-        inserted_entry: Option<(MetadataCommandLogIndex, u64)>,
+        inserted_entry: Option<(MetadataCommandLogIndex, u64, bool)>,
     ) -> Result<MetadataCommandRecordResult, StoreError> {
         let mut state = self.metadata_command_replica_state()?;
         if state.cluster_epoch != cluster_epoch {
@@ -2470,7 +2575,9 @@ impl PgStore {
         let pg_id = PgId::new(self.pg_id);
         let mut applied_log_index = state.applied_log_index;
         let mut applied_log_hash = state.applied_log_hash;
-        if let Some((inserted_log_index, command_checksum)) = inserted_entry {
+        let mut advanced = false;
+        let mut advanced_materialized_state = false;
+        if let Some((inserted_log_index, command_checksum, inserted_abandoned)) = inserted_entry {
             if applied_log_index
                 .checked_add(1)
                 .is_some_and(|next| inserted_log_index.get() == next)
@@ -2510,11 +2617,20 @@ impl PgStore {
                 #[cfg(test)]
                 self.metadata_command_log_prefix_fast_path_hits
                     .fetch_add(1, Ordering::Relaxed);
-                return self.update_metadata_command_replica_state(
-                    cluster_epoch,
-                    applied_log_index,
-                    applied_log_hash,
-                );
+                return if inserted_abandoned {
+                    self.update_metadata_command_replica_state_preserving_digest(
+                        cluster_epoch,
+                        applied_log_index,
+                        applied_log_hash,
+                        state.state_digest,
+                    )
+                } else {
+                    self.update_metadata_command_replica_state(
+                        cluster_epoch,
+                        applied_log_index,
+                        applied_log_hash,
+                    )
+                };
             }
         }
 
@@ -2522,106 +2638,127 @@ impl PgStore {
             let log_index = MetadataCommandLogIndex::new(next_log_index)
                 .expect("metadata command log index is non-zero");
 
-            let expected_log_hash = if let Some((inserted_log_index, command_checksum)) =
-                inserted_entry.filter(|(inserted_log_index, _)| *inserted_log_index == log_index)
-            {
-                let expected_log_hash = metadata_command_log_hash(
-                    cluster_epoch,
-                    pg_id,
-                    inserted_log_index,
-                    applied_log_hash,
-                    command_checksum,
-                );
-                let updated = self.execute_cached(
-                    "UPDATE metadata_command_log \
+            let (expected_log_hash, entry_abandoned) =
+                if let Some((inserted_log_index, command_checksum, inserted_abandoned)) =
+                    inserted_entry
+                        .filter(|(inserted_log_index, _, _)| *inserted_log_index == log_index)
+                {
+                    let expected_log_hash = metadata_command_log_hash(
+                        cluster_epoch,
+                        pg_id,
+                        inserted_log_index,
+                        applied_log_hash,
+                        command_checksum,
+                    );
+                    let updated = self.execute_cached(
+                        "UPDATE metadata_command_log \
                      SET previous_log_hash = ?1, log_hash = ?2 \
                      WHERE cluster_epoch = ?3 AND pg_id = ?4 AND log_index = ?5 \
                        AND previous_log_hash IS NULL AND log_hash IS NULL",
-                    params![
-                        applied_log_hash as i64,
-                        expected_log_hash as i64,
-                        cluster_epoch.get() as i64,
-                        self.pg_id as i64,
-                        next_log_index as i64,
-                    ],
-                    "update inserted metadata command log hash",
-                )?;
-                if updated != 1 {
-                    return Err(StoreError::MetadataCommandLogConflict {
-                        node_id,
-                        pg_id: self.pg_id,
-                        cluster_epoch,
-                        log_index: next_log_index,
-                    });
-                }
-                expected_log_hash
-            } else {
-                let Some(entry) = self.load_metadata_command_log_entry(
-                    "load next metadata command log entry",
-                    cluster_epoch,
-                    pg_id,
-                    log_index,
-                )?
-                else {
-                    break;
-                };
-                self.verify_metadata_command_log_entry(
-                    node_id,
-                    cluster_epoch,
-                    pg_id,
-                    log_index,
-                    &entry,
-                )?;
-                let expected_log_hash = metadata_command_log_hash(
-                    cluster_epoch,
-                    pg_id,
-                    log_index,
-                    applied_log_hash,
-                    entry.command_checksum,
-                );
-                match (entry.previous_log_hash, entry.log_hash) {
-                    (None, None) => {
-                        self.execute_cached(
-                            "UPDATE metadata_command_log \
-                             SET previous_log_hash = ?1, log_hash = ?2 \
-                             WHERE cluster_epoch = ?3 AND pg_id = ?4 AND log_index = ?5",
-                            params![
-                                applied_log_hash as i64,
-                                expected_log_hash as i64,
-                                cluster_epoch.get() as i64,
-                                self.pg_id as i64,
-                                next_log_index as i64,
-                            ],
-                            "update metadata command log hash",
-                        )?;
-                    }
-                    (Some(previous_log_hash), Some(log_hash))
-                        if previous_log_hash == applied_log_hash
-                            && log_hash == expected_log_hash => {}
-                    (previous_log_hash, log_hash) => {
-                        return Err(StoreError::MetadataCommandLogHashMismatch {
+                        params![
+                            applied_log_hash as i64,
+                            expected_log_hash as i64,
+                            cluster_epoch.get() as i64,
+                            self.pg_id as i64,
+                            next_log_index as i64,
+                        ],
+                        "update inserted metadata command log hash",
+                    )?;
+                    if updated != 1 {
+                        return Err(StoreError::MetadataCommandLogConflict {
                             node_id,
                             pg_id: self.pg_id,
                             cluster_epoch,
                             log_index: next_log_index,
-                            expected_previous_log_hash: applied_log_hash,
-                            actual_previous_log_hash: previous_log_hash.unwrap_or_default(),
-                            expected_log_hash,
-                            actual_log_hash: log_hash.unwrap_or_default(),
                         });
                     }
-                }
-                expected_log_hash
-            };
+                    (expected_log_hash, inserted_abandoned)
+                } else {
+                    let Some(entry) = self.load_metadata_command_log_entry(
+                        "load next metadata command log entry",
+                        cluster_epoch,
+                        pg_id,
+                        log_index,
+                    )?
+                    else {
+                        break;
+                    };
+                    self.verify_metadata_command_log_entry(
+                        node_id,
+                        cluster_epoch,
+                        pg_id,
+                        log_index,
+                        &entry,
+                    )?;
+                    let expected_log_hash = metadata_command_log_hash(
+                        cluster_epoch,
+                        pg_id,
+                        log_index,
+                        applied_log_hash,
+                        entry.command_checksum,
+                    );
+                    match (entry.previous_log_hash, entry.log_hash) {
+                        (None, None) => {
+                            self.execute_cached(
+                                "UPDATE metadata_command_log \
+                             SET previous_log_hash = ?1, log_hash = ?2 \
+                             WHERE cluster_epoch = ?3 AND pg_id = ?4 AND log_index = ?5",
+                                params![
+                                    applied_log_hash as i64,
+                                    expected_log_hash as i64,
+                                    cluster_epoch.get() as i64,
+                                    self.pg_id as i64,
+                                    next_log_index as i64,
+                                ],
+                                "update metadata command log hash",
+                            )?;
+                        }
+                        (Some(previous_log_hash), Some(log_hash))
+                            if previous_log_hash == applied_log_hash
+                                && log_hash == expected_log_hash => {}
+                        (previous_log_hash, log_hash) => {
+                            return Err(StoreError::MetadataCommandLogHashMismatch {
+                                node_id,
+                                pg_id: self.pg_id,
+                                cluster_epoch,
+                                log_index: next_log_index,
+                                expected_previous_log_hash: applied_log_hash,
+                                actual_previous_log_hash: previous_log_hash.unwrap_or_default(),
+                                expected_log_hash,
+                                actual_log_hash: log_hash.unwrap_or_default(),
+                            });
+                        }
+                    }
+                    (expected_log_hash, entry.abandoned)
+                };
+            if !entry_abandoned {
+                advanced_materialized_state = true;
+            }
             applied_log_index = next_log_index;
             applied_log_hash = expected_log_hash;
+            advanced = true;
         }
 
-        self.update_metadata_command_replica_state(
-            cluster_epoch,
-            applied_log_index,
-            applied_log_hash,
-        )
+        if !advanced {
+            return Ok(MetadataCommandRecordResult {
+                state,
+                digest_revision: self.metadata_digest_revision()?,
+            });
+        }
+        if advanced_materialized_state {
+            self.update_metadata_command_replica_state(
+                cluster_epoch,
+                applied_log_index,
+                applied_log_hash,
+            )
+        } else {
+            self.update_metadata_command_replica_state_preserving_digest(
+                cluster_epoch,
+                applied_log_index,
+                applied_log_hash,
+                state.state_digest,
+            )
+        }
     }
 
     fn update_metadata_command_replica_state(
@@ -2651,6 +2788,36 @@ impl PgStore {
                 state_digest,
             },
             digest_revision,
+        })
+    }
+
+    fn update_metadata_command_replica_state_preserving_digest(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        applied_log_index: u64,
+        applied_log_hash: u64,
+        state_digest: u64,
+    ) -> Result<MetadataCommandRecordResult, StoreError> {
+        self.execute_cached(
+            "UPDATE metadata_command_replica_state \
+			 SET cluster_epoch = ?1, applied_log_index = ?2, applied_log_hash = ?3, state_digest = ?4 \
+             WHERE singleton = 0",
+            params![
+                cluster_epoch.get() as i64,
+                applied_log_index as i64,
+                applied_log_hash as i64,
+                state_digest as i64,
+            ],
+            "update metadata command replica state preserving digest",
+        )?;
+        Ok(MetadataCommandRecordResult {
+            state: MetadataCommandReplicaState {
+                cluster_epoch,
+                applied_log_index,
+                applied_log_hash,
+                state_digest,
+            },
+            digest_revision: self.metadata_digest_revision()?,
         })
     }
 
@@ -13702,6 +13869,22 @@ mod tests {
         )
     }
 
+    fn create_probe_bucket_direct(store: &PgStore, bucket: &BucketName) {
+        let owner = test_owner();
+        store
+            .create_bucket_with_config(&CreateBucketConfig {
+                name: bucket.as_str(),
+                owner_principal: &owner.principal,
+                owner_canonical_id: &owner.canonical_id,
+                acl_grants: &AclGrants::default(),
+                public_read: false,
+                public_write: false,
+                versioning: BucketVersioningState::Disabled,
+                object_lock: BucketObjectLockConfig::default(),
+            })
+            .unwrap();
+    }
+
     fn assert_metadata_state_digest_mismatch(err: StoreError) {
         assert!(
             matches!(err, StoreError::MetadataStateDigestMismatch { .. }),
@@ -14534,6 +14717,134 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "validation should advance matching abandoned row and clean the pending slot"
+        );
+    }
+
+    #[test]
+    fn abandoned_log_tail_without_pending_slot_recovers_on_validation() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let command = create_bucket_probe_command(
+            1,
+            1,
+            trusted_bucket_name("abandoned-tail-without-slot"),
+            1,
+        );
+        store
+            .conn
+            .execute(
+                "INSERT INTO metadata_command_log \
+                 (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL, NULL)",
+                params![
+                    ClusterEpoch::INITIAL.get() as i64,
+                    1_i64,
+                    1_i64,
+                    command.abandoned_log_checksum_crc64() as i64,
+                    command.abandoned_log_bytes(),
+                ],
+            )
+            .unwrap();
+
+        let before = store.metadata_command_replica_state().unwrap();
+        assert_eq!(before.applied_log_index, 0);
+        let recovered = store
+            .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
+            .unwrap();
+        let expected_log_hash = metadata_command_log_hash(
+            ClusterEpoch::INITIAL,
+            PgId::new(1),
+            MetadataCommandLogIndex::new(1).unwrap(),
+            0,
+            command.abandoned_log_checksum_crc64(),
+        );
+        assert_eq!(recovered.applied_log_index, 1);
+        assert_eq!(recovered.applied_log_hash, expected_log_hash);
+    }
+
+    #[test]
+    fn abandoned_log_tail_preserves_digest_and_rejects_materialized_mutation() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("abandoned-tail-materialized-mutation");
+        let command = create_bucket_probe_command(1, 1, bucket.clone(), 1);
+        create_probe_bucket_direct(&store, &bucket);
+        store
+            .conn
+            .execute(
+                "INSERT INTO metadata_command_log \
+                 (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL, NULL)",
+                params![
+                    ClusterEpoch::INITIAL.get() as i64,
+                    1_i64,
+                    1_i64,
+                    command.abandoned_log_checksum_crc64() as i64,
+                    command.abandoned_log_bytes(),
+                ],
+            )
+            .unwrap();
+
+        let err = store
+            .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
+            .unwrap_err();
+        assert_metadata_state_digest_mismatch(err);
+        let state = store.metadata_command_replica_state().unwrap();
+        assert_eq!(state.applied_log_index, 1);
+        assert_ne!(state.state_digest, store.metadata_state_digest().unwrap());
+    }
+
+    #[test]
+    fn abandoned_pending_slot_preserves_digest_and_rejects_materialized_mutation() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("abandoned-pending-materialized-mutation");
+        let command = create_bucket_probe_command(1, 1, bucket.clone(), 1);
+        store
+            .try_insert_pending_metadata_command_slot(0, &command, Some(&bucket))
+            .unwrap();
+        create_probe_bucket_direct(&store, &bucket);
+        store
+            .record_metadata_command_abandoned(0, &command)
+            .unwrap();
+
+        let err = store
+            .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
+            .unwrap_err();
+        assert_metadata_state_digest_mismatch(err);
+        let state = store.metadata_command_replica_state().unwrap();
+        assert_eq!(state.applied_log_index, 1);
+        assert_ne!(state.state_digest, store.metadata_state_digest().unwrap());
+    }
+
+    #[test]
+    fn applied_log_tail_without_advanced_state_fails_validation() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let command =
+            create_bucket_probe_command(1, 1, trusted_bucket_name("applied-tail-without-state"), 1);
+        store
+            .conn
+            .execute(
+                "INSERT INTO metadata_command_log \
+                 (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, NULL, NULL)",
+                params![
+                    ClusterEpoch::INITIAL.get() as i64,
+                    1_i64,
+                    1_i64,
+                    command.checksum_crc64() as i64,
+                    command.command_bytes(),
+                ],
+            )
+            .unwrap();
+
+        let err = store
+            .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::MetadataCommandLogConflict { .. }),
+            "unadvanced applied log tail must fail closed, got {err:?}"
         );
     }
 
