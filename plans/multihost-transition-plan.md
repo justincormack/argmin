@@ -2617,8 +2617,105 @@ Proposed subphases:
        commands
    - status: Phase 9.2 is complete for the local PG-primary command-stream
      runtime model. Later phases may add remote RPC, repair, and compaction,
-     but the remaining multipart serialization work moves to Phase 9.3.
-3. Phase 9.3 multipart serialization
+     but a Phase 9.2H hardening gate comes before the remaining multipart
+     serialization work in Phase 9.3.
+3. Phase 9.2H command stream hardening
+   - goal: turn the recent command construction, pending-slot contention,
+     reissue, and replica convergence review findings into reusable
+     guardrails before adding more multipart command complexity
+   - freeze Phase 9.2 semantics in
+     [metadata-command-stream.md](../guides/metadata-command-stream.md) as
+     invariants rather than implementation notes:
+     - a PG command stream has one primary-owned durable pending slot
+     - stale snapshot commands must rebuild after pending-slot contention
+     - reissue requires matching payload, next safe index, matching
+       `previous_log_hash`, and matching resulting log hash
+     - terminal cleanup validates command-owned cleanup state, not runtime
+       allocator state
+   - classify every metadata command publisher/path, not only every command
+     kind, as one of:
+     - `SnapshotSensitive`: this publisher builds the command from a
+       request-specific metadata snapshot, authorization result, or
+       precondition decision outside command apply and must restart from a
+       fresh snapshot after slot contention
+     - `ApplyValidated`: command apply fully validates every precondition this
+       publisher depends on against current materialized state, so the same
+       command may be reused after draining a competing slot
+     The command kind matrix is still useful as a summary, but it is not the
+     authority. The same command kind can be safe in one publisher and
+     snapshot-sensitive in another if the surrounding request path performs
+     different precondition or authorization work before pending-slot install.
+   - inventory every production call site that creates or installs a pending
+     metadata command, with special attention to direct users of
+     `try_set_pending_metadata_command_for_bucket`,
+     `try_install_pending_metadata_command_for_bucket`, and
+     `set_pending_metadata_command_for_bucket`; each call site must be covered
+     by the publisher/path classification above
+   - add or consolidate a generic snapshot-sensitive command-publish wrapper:
+     - load fresh snapshot
+     - run request preconditions/action
+     - build command
+     - try to install the durable pending slot
+     - on slot contention, drain/converge the winner and restart from the
+       snapshot step
+     - apply/record the installed command
+     This should make the safe shape the convenient API for new Phase 9.3
+     work, rather than another one-off retry loop.
+   - split command-owned records from runtime/local fields where equality has
+     been risky:
+     - start with stream upload records, separating command-owned session
+       identity/state/encryption fields from allocator-floor/runtime state such
+       as `next_segment_vid`
+     - define terminal cleanup records that contain exactly the fields terminal
+       cleanup validates
+     - avoid raw `==` over structs that mix command-owned state with runtime
+       allocator/progress fields
+   - add a local command-stream invariant checker for tests and property
+     traces:
+     - at most one durable pending slot per PG primary
+     - unresolved slots exist only on the current primary
+     - no sparse accepted prefix is treated as clean
+     - successful public operations leave acting replicas agreeing on applied
+       index/hash
+     - same-index accepted commands have identical bytes and hash-chain fields
+     - materialized command-owned rows match the canonical state digest
+   - extract the reissue safety decision into a pure model over compact
+     summaries, then proptest gaps, divergent prefixes, same-payload
+     replacements, missing log rows, abandoned rows, stale primary state, and
+     primary-last fanout windows
+   - add reusable crash-step tests around the durable pending-command lifecycle:
+     - slot installed, no replica applied
+     - non-primary applied, primary not applied
+     - primary applied, pending slot still present
+     - abandoned row written, replica state not advanced
+     - terminal row present, slot not removed
+     - reopen after each state
+   - expand the local-cluster stateful model to include two handles,
+     pending-slot contention, reissue, zero-apply abandon, partial
+     primary-last apply, restart/open validation, and stale-handle attempts
+   - extend mechanical boundary checks for unsafe command-stream patterns:
+     - direct pending-slot installation in snapshot-sensitive paths that does
+       not restart from a fresh snapshot after contention
+     - raw equality on records known to contain runtime allocator fields
+     - production use of direct `PgStore` mutators for command-owned tables
+     - command apply paths that bypass apply+record transaction handling
+     - reissue paths that compare command bytes without hash-chain validation
+   - minimum exit criteria before Phase 9.3:
+     - Phase 9.2 invariants are documented
+     - all current metadata command publisher paths are classified, with a
+       secondary command-kind summary
+     - all production pending-command install call sites are inventoried and
+       tied to that publisher/path classification
+     - snapshot-sensitive publishers use the common restart-on-contention shape
+       or are explicitly documented as already covered
+     - stream upload command-owned records are separated from runtime allocator
+       fields, or the remaining mixed records are guarded by tests and boundary
+       checks
+     - invariant checker and boundary checks run in the normal verification
+       path
+     - targeted reissue and crash-step model coverage exists for the recent
+       bug classes
+4. Phase 9.3 multipart serialization
    - replace multipart completion, abort, UploadPart, and streamed UploadPart
      serialization that depends on local locks with PG-primary command
      serialization
@@ -2630,14 +2727,14 @@ Proposed subphases:
      duplicate part upload, and same-key MPU completion races
    - exit when these races are serialized by metadata command state rather than
      process-local locks
-4. Phase 9.4 bucket write drain
+5. Phase 9.4 bucket write drain
    - move bucket delete/write-drain state out of process-local waits into
      durable or primary-owned metadata
    - bucket deletion must block new writes, wait for existing write
      reservations, survive process restart, and resume finalization
    - exit when bucket delete does not require a local condition variable or
      same-process waiter to make progress
-5. Phase 9.5 cross-process read pins
+6. Phase 9.5 cross-process read pins
    - replace object payload generation leases with cluster-visible read pins or
      durable expiring leases
    - reclaim must not physically delete payload shards while another process is
@@ -2645,14 +2742,14 @@ Proposed subphases:
    - define stale-process expiry or recovery for abandoned read pins
    - exit when read-pin acquire/release is visible to the reclaim owner across
      process boundaries
-6. Phase 9.6 durable reclaim claiming
+7. Phase 9.6 durable reclaim claiming
    - make reclaim worker ownership durable and idempotent
    - multiple workers must not corrupt or double-finalize the same reclaim row
    - crash after claim must be retryable, and failed cleanup must remain
      observable and retryable
    - exit when reclaim can resume after process restart without local worker
      state
-7. Phase 9.7 physical shard scavenger
+8. Phase 9.7 physical shard scavenger
    - add the eventual cleanup process for shard files no longer referenced by
      metadata
    - cover crash leftovers and omitted multipart payload shards left by
@@ -2660,21 +2757,21 @@ Proposed subphases:
    - do not rely on request-path best-effort cleanup or process-local state to
      remove these files
    - exit when unreferenced shard files are eventually detected and removed
-8. Phase 9.8 lifecycle/background mutation ownership
+9. Phase 9.8 lifecycle/background mutation ownership
    - make lifecycle sweeper ownership, progress, and retry state durable or
      otherwise cluster-visible
    - multiple processes must not apply the same lifecycle mutation twice, and a
      stopped process must not leave lifecycle work permanently abandoned
    - exit when lifecycle expiry and transition work does not depend on a
      process-local sweeper registry or local wakeup
-9. Phase 9.9 cache freshness across processes
+10. Phase 9.9 cache freshness across processes
    - make bucket/object fast-path cache invalidation depend on PG or cluster
      notifications, generation checks, or fail-closed reloads rather than local
      invalidation alone
    - a second process mutating bucket metadata must not leave this process
      serving stale policy, versioning, ownership, or public-access state
    - exit when correctness does not depend on same-process cache invalidation
-10. Phase 9.10 test harness de-single-process pass
+11. Phase 9.10 test harness de-single-process pass
    - audit tests and helpers that still use local constructors, raw hooks, or
      direct store access in ways that bypass the production cluster path
    - add targeted multi-handle or multi-process-simulated tests for the Phase 9
