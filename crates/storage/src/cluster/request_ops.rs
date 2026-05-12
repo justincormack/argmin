@@ -5244,6 +5244,10 @@ impl super::StorageCluster {
             }
             let (stream_uploads, stream_upload_segments) =
                 Self::snapshot_upload_part_stream_cleanup(&object_pg, &upload_id)?;
+            let stream_uploads = stream_uploads
+                .iter()
+                .map(TerminalStreamCleanupRecord::from)
+                .collect();
 
             let last_modified_millis = crate::clock::current_time_millis();
             let completed_at_millis = last_modified_millis;

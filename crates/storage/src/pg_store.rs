@@ -5674,7 +5674,7 @@ impl PgStore {
 
     fn stream_upload_cleanup_records_match(
         actual: &[StreamUploadRecord],
-        expected: &[StreamUploadRecord],
+        expected: &[TerminalStreamCleanupRecord],
     ) -> bool {
         actual.len() == expected.len()
             && actual.iter().zip(expected).all(|(actual, expected)| {
@@ -7132,6 +7132,10 @@ impl PgStore {
                 let stream_uploads = store.list_stream_uploads_for_multipart_upload(upload_id)?;
                 let stream_upload_segments =
                     store.list_stream_segments_for_sessions(&stream_uploads)?;
+                let stream_uploads = stream_uploads
+                    .iter()
+                    .map(TerminalStreamCleanupRecord::from)
+                    .collect();
 
                 Ok(Some(AbortMultipartUploadCleanup {
                     upload,
@@ -7181,6 +7185,10 @@ impl PgStore {
                     store.list_stream_uploads_for_multipart_upload(&upload.upload_id)?;
                 let stream_upload_segments =
                     store.list_stream_segments_for_sessions(&stream_uploads)?;
+                let stream_uploads = stream_uploads
+                    .iter()
+                    .map(TerminalStreamCleanupRecord::from)
+                    .collect();
 
                 Ok(Some(AbortMultipartUploadCleanup {
                     upload,
@@ -15041,7 +15049,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_stream_upload_cleanup_match_ignores_allocator_floor() {
+    fn terminal_stream_upload_cleanup_record_excludes_allocator_floor() {
         let upload_id = UploadId::new("u".repeat(UPLOAD_ID_LEN)).unwrap();
         let session = StreamUploadRecord {
             session_id: SessionId::try_from("ab".repeat(16)).unwrap(),
@@ -15056,17 +15064,18 @@ mod tests {
             encryption: ObjectEncryption::None,
             next_segment_vid: GenerationId::new(2).unwrap(),
         };
+        let expected = TerminalStreamCleanupRecord::from(&session);
         let mut replica = session.clone();
         replica.next_segment_vid = GenerationId::MIN;
         assert!(PgStore::stream_upload_cleanup_records_match(
             &[replica.clone()],
-            std::slice::from_ref(&session),
+            std::slice::from_ref(&expected),
         ));
 
         replica.state = StreamUploadState::Completing;
         assert!(!PgStore::stream_upload_cleanup_records_match(
             &[replica],
-            &[session],
+            &[expected],
         ));
     }
 
@@ -15092,8 +15101,6 @@ mod tests {
         };
         store.create_stream_upload_explicit(&session).unwrap();
 
-        let mut primary_snapshot = session.clone();
-        primary_snapshot.next_segment_vid = GenerationId::new(2).unwrap();
         let command = AbortMultipartUploadCommand {
             bucket: upload.bucket.clone(),
             key: upload.key.clone(),
@@ -15102,7 +15109,7 @@ mod tests {
                 upload,
                 parts: Vec::new(),
                 streaming_segments: Vec::new(),
-                stream_uploads: vec![primary_snapshot],
+                stream_uploads: vec![TerminalStreamCleanupRecord::from(&session)],
                 stream_upload_segments: Vec::new(),
             },
         };

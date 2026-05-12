@@ -2896,7 +2896,7 @@ pub struct CompleteMultipartCommitRequest {
 pub struct CompleteMultipartCommitCleanup {
     pub omitted_parts: Vec<MultipartPartRecord>,
     pub omitted_streaming_segments: Vec<MultipartPartSegmentRecord>,
-    pub stream_uploads: Vec<StreamUploadRecord>,
+    pub stream_uploads: Vec<TerminalStreamCleanupRecord>,
     pub stream_upload_segments: Vec<StreamUploadSegmentRecord>,
 }
 
@@ -3101,6 +3101,36 @@ pub struct StreamUploadRecord {
     pub next_segment_vid: GenerationId,
 }
 
+/// Command-owned stream session fields required by terminal MPU cleanup.
+///
+/// Runtime allocator state such as `next_segment_vid` is intentionally not part
+/// of this record. Terminal MPU commands validate and delete the session, but
+/// do not own the stream segment VID floor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalStreamCleanupRecord {
+    pub session_id: SessionId,
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub target: StreamUploadTarget,
+    pub state: StreamUploadState,
+    pub created_at: u64,
+    pub encryption: ObjectEncryption,
+}
+
+impl From<&StreamUploadRecord> for TerminalStreamCleanupRecord {
+    fn from(record: &StreamUploadRecord) -> Self {
+        Self {
+            session_id: record.session_id.clone(),
+            bucket: record.bucket.clone(),
+            key: record.key.clone(),
+            target: record.target.clone(),
+            state: record.state,
+            created_at: record.created_at,
+            encryption: record.encryption.clone(),
+        }
+    }
+}
+
 /// Request to create a streaming upload session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateStreamUploadReq {
@@ -3174,7 +3204,7 @@ pub struct AbortMultipartUploadCleanup {
     pub upload: MultipartUploadRecord,
     pub parts: Vec<MultipartPartRecord>,
     pub streaming_segments: Vec<MultipartPartSegmentRecord>,
-    pub stream_uploads: Vec<StreamUploadRecord>,
+    pub stream_uploads: Vec<TerminalStreamCleanupRecord>,
     pub stream_upload_segments: Vec<StreamUploadSegmentRecord>,
 }
 

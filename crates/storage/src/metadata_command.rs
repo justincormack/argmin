@@ -18,8 +18,8 @@ use crate::types::{
     ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
     OwnerIdentity, PgId, PublicAccessBlockConfig, PutLiveObjectReq, SerializedMetadataBlob,
     SerializedSystemMetadataBlob, SerializedTagSet, SessionId, StorageClass, StreamUploadRecord,
-    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
-    VersionId,
+    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord,
+    UploadId, UploadState, VersionId,
 };
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
@@ -618,7 +618,7 @@ pub(crate) struct CommitMultipartObjectCommand {
     pub(crate) selected_streaming_segments: Vec<MultipartPartSegmentRecord>,
     pub(crate) omitted_parts: Vec<MultipartPartRecord>,
     pub(crate) omitted_streaming_segments: Vec<MultipartPartSegmentRecord>,
-    pub(crate) stream_uploads: Vec<StreamUploadRecord>,
+    pub(crate) stream_uploads: Vec<TerminalStreamCleanupRecord>,
     pub(crate) stream_upload_segments: Vec<StreamUploadSegmentRecord>,
     pub(crate) write_sequence: u64,
     pub(crate) completion_order: u64,
@@ -1267,7 +1267,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 self.skip_repeated(Self::skip_multipart_part_segment)?;
                 self.skip_repeated(Self::skip_multipart_part)?;
                 self.skip_repeated(Self::skip_multipart_part_segment)?;
-                self.skip_repeated(Self::skip_stream_upload)?;
+                self.skip_repeated(Self::skip_terminal_stream_cleanup)?;
                 self.skip_repeated(Self::skip_stream_upload_segment)?;
                 self.read_u64()?;
                 self.read_u64()?;
@@ -1443,7 +1443,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                         omitted_parts: self.read_repeated(Self::read_multipart_part)?,
                         omitted_streaming_segments: self
                             .read_repeated(Self::read_multipart_part_segment)?,
-                        stream_uploads: self.read_repeated(Self::read_stream_upload)?,
+                        stream_uploads: self.read_repeated(Self::read_terminal_stream_cleanup)?,
                         stream_upload_segments: self
                             .read_repeated(Self::read_stream_upload_segment)?,
                         write_sequence: self.read_u64()?,
@@ -2056,6 +2056,16 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_nonzero_u64("next stream segment VID")
     }
 
+    fn skip_terminal_stream_cleanup(&mut self) -> Result<(), String> {
+        self.skip_str()?;
+        self.skip_str()?;
+        self.skip_str()?;
+        self.skip_stream_upload_target()?;
+        self.read_valid_u8("stream upload state", 0..=3)?;
+        self.read_u64()?;
+        self.skip_object_encryption()
+    }
+
     fn read_stream_upload(&mut self) -> Result<StreamUploadRecord, String> {
         Ok(StreamUploadRecord {
             session_id: self.read_session_id()?,
@@ -2067,6 +2077,19 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             created_at: self.read_u64()?,
             encryption: self.read_object_encryption()?,
             next_segment_vid: self.read_generation_id("next stream segment VID")?,
+        })
+    }
+
+    fn read_terminal_stream_cleanup(&mut self) -> Result<TerminalStreamCleanupRecord, String> {
+        Ok(TerminalStreamCleanupRecord {
+            session_id: self.read_session_id()?,
+            bucket: self.read_bucket_name()?,
+            key: self.read_object_key()?,
+            target: self.read_stream_upload_target()?,
+            state: StreamUploadState::from_u8(self.read_u8()?)
+                .ok_or_else(|| "invalid stream upload state".to_string())?,
+            created_at: self.read_u64()?,
+            encryption: self.read_object_encryption()?,
         })
     }
 
@@ -2358,7 +2381,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.skip_multipart_upload()?;
         self.skip_repeated(Self::skip_multipart_part)?;
         self.skip_repeated(Self::skip_multipart_part_segment)?;
-        self.skip_repeated(Self::skip_stream_upload)?;
+        self.skip_repeated(Self::skip_terminal_stream_cleanup)?;
         self.skip_repeated(Self::skip_stream_upload_segment)
     }
 
@@ -2369,7 +2392,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             upload: self.read_multipart_upload()?,
             parts: self.read_repeated(Self::read_multipart_part)?,
             streaming_segments: self.read_repeated(Self::read_multipart_part_segment)?,
-            stream_uploads: self.read_repeated(Self::read_stream_upload)?,
+            stream_uploads: self.read_repeated(Self::read_terminal_stream_cleanup)?,
             stream_upload_segments: self.read_repeated(Self::read_stream_upload_segment)?,
         })
     }
@@ -2832,7 +2855,7 @@ fn encode_commit_multipart_object(out: &mut Vec<u8>, command: &CommitMultipartOb
     }
     put_u32(out, command.stream_uploads.len() as u32);
     for session in &command.stream_uploads {
-        encode_stream_upload(out, session);
+        encode_terminal_stream_cleanup(out, session);
     }
     put_u32(out, command.stream_upload_segments.len() as u32);
     for segment in &command.stream_upload_segments {
@@ -3030,7 +3053,7 @@ fn encode_abort_multipart_upload_cleanup(out: &mut Vec<u8>, cleanup: &AbortMulti
     }
     put_u32(out, cleanup.stream_uploads.len() as u32);
     for session in &cleanup.stream_uploads {
-        encode_stream_upload(out, session);
+        encode_terminal_stream_cleanup(out, session);
     }
     put_u32(out, cleanup.stream_upload_segments.len() as u32);
     for segment in &cleanup.stream_upload_segments {
@@ -3047,6 +3070,16 @@ fn encode_stream_upload(out: &mut Vec<u8>, session: &StreamUploadRecord) {
     put_u64(out, session.created_at);
     encode_object_encryption(out, &session.encryption);
     put_u64(out, session.next_segment_vid.get());
+}
+
+fn encode_terminal_stream_cleanup(out: &mut Vec<u8>, session: &TerminalStreamCleanupRecord) {
+    put_str(out, session.session_id.as_str());
+    put_str(out, session.bucket.as_str());
+    put_str(out, session.key.as_str());
+    encode_stream_upload_target(out, &session.target);
+    put_u8(out, session.state as u8);
+    put_u64(out, session.created_at);
+    encode_object_encryption(out, &session.encryption);
 }
 
 fn encode_multipart_upload(out: &mut Vec<u8>, upload: &MultipartUploadRecord) {
@@ -4210,7 +4243,7 @@ mod tests {
                 selected_streaming_segments: vec![selected_streaming_segment.clone()],
                 omitted_parts: vec![uploaded_part.clone()],
                 omitted_streaming_segments: vec![omitted_streaming_segment.clone()],
-                stream_uploads: vec![StreamUploadRecord {
+                stream_uploads: vec![TerminalStreamCleanupRecord {
                     session_id: stream_session_id.clone(),
                     bucket: bucket.clone(),
                     key: key.clone(),
@@ -4221,7 +4254,6 @@ mod tests {
                     state: StreamUploadState::InProgress,
                     created_at: 558,
                     encryption: ObjectEncryption::None,
-                    next_segment_vid: GenerationId::new(3).unwrap(),
                 }],
                 stream_upload_segments: vec![stream_segment.clone()],
                 write_sequence: 43,
@@ -4355,7 +4387,7 @@ mod tests {
                     upload: multipart_upload.clone(),
                     parts: vec![uploaded_part.clone()],
                     streaming_segments: vec![omitted_streaming_segment.clone()],
-                    stream_uploads: vec![StreamUploadRecord {
+                    stream_uploads: vec![TerminalStreamCleanupRecord {
                         session_id: stream_session_id.clone(),
                         bucket: bucket.clone(),
                         key: key.clone(),
@@ -4366,7 +4398,6 @@ mod tests {
                         state: StreamUploadState::InProgress,
                         created_at: 562,
                         encryption: ObjectEncryption::None,
-                        next_segment_vid: GenerationId::new(4).unwrap(),
                     }],
                     stream_upload_segments: vec![stream_segment.clone()],
                 },
@@ -4503,7 +4534,7 @@ mod tests {
                 0x3acf49df359790d4,
                 0xb5a8e642f639b9a8,
                 0x892df6c0f857bf33,
-                0x612189829da48d59,
+                0x7920c33a006e1d68,
                 0x53fdbf4c6f062d53,
                 0x6df04a5fc73e478a,
                 0x2a3c1d82cb08bbdd,
@@ -4516,7 +4547,7 @@ mod tests {
                 0xaaee1aa183a67da1,
                 0x423d5ce8ecc3f471,
                 0xa10946bfbddcbb08,
-                0x87261b7344847d5a,
+                0x8f0590d0286f0dc4,
                 0x06e8919990a39895,
                 0x924974de9db8c75c,
                 0xc6696fbaf6843082,

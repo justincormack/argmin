@@ -254,6 +254,13 @@ payload shard identity for a staged segment, so the exact value is encoded in
 on the primary while append commands are still in flight, and replicas may
 advance to the same or a lower floor until those commands apply.
 
+Terminal MPU commands do not encode full `StreamUploadRecord` rows. They use a
+terminal cleanup record containing the stream session identity, target, state,
+creation time, and encryption state, but not `next_segment_vid`. That keeps
+the command-owned cleanup state separate from the durable runtime allocator
+floor, and avoids equality checks that have to remember to ignore allocator
+progress.
+
 We considered replacing the allocator floor with non-state allocation. A
 random `u64` segment VID is not strong enough to treat collisions as
 impossible, and checking for collisions by scanning existing segment rows would

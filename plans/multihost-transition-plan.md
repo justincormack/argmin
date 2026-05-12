@@ -2719,8 +2719,11 @@ Proposed subphases:
      - snapshot-sensitive publishers use the common restart-on-contention shape
        or are explicitly documented as already covered
      - stream upload command-owned records are separated from runtime allocator
-       fields, or the remaining mixed records are guarded by tests and boundary
-       checks
+       fields
+       - status: terminal MPU cleanup commands now carry
+         `TerminalStreamCleanupRecord`, which excludes `next_segment_vid`;
+         `CreateStreamUpload` remains row-shaped because it creates the durable
+         allocator row
      - invariant checker and boundary checks run in the normal verification
        path
      - targeted reissue and crash-step model coverage exists for the recent
