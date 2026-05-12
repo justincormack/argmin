@@ -5815,6 +5815,166 @@ mod tests {
     }
 
     #[test]
+    fn stale_duplicate_reissue_rejects_same_payload_replacement_over_divergent_gap() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let first_bucket = bucket_for_pg(topology, 1, "duplicate-gap-first-");
+        let second_bucket = bucket_for_pg(topology, 1, "duplicate-gap-second-");
+        let occupant_bucket = bucket_for_pg(topology, 1, "duplicate-gap-occupant-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let applied = create_bucket_metadata_command(pg_id, 1, first_bucket.clone());
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &applied)
+            .unwrap();
+
+        let stale = create_bucket_metadata_command(pg_id, 2, second_bucket.clone());
+        let replacement = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                MetadataCommandLogIndex::new(3).unwrap(),
+            ),
+            stale.payload().clone(),
+        );
+        insert_pending_metadata_command_for_test(&map, pg_id, &second_bucket, &replacement);
+        let divergent = create_bucket_metadata_command(pg_id, 2, occupant_bucket.clone());
+        let non_primary = map.node(NodeId::new(0)).unwrap().storage_node();
+        non_primary
+            .get_pg(1)
+            .unwrap()
+            .apply_metadata_command_and_record(NodeId::new(0).as_u32(), &divergent)
+            .unwrap();
+
+        let err = cluster
+            .test_reissue_pending_metadata_command(pg_id, &stale)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 3,
+                ..
+            })
+        ));
+
+        assert_eq!(
+            pending_metadata_command_for_test(&map, pg_id, &second_bucket)
+                .as_ref()
+                .map(MetadataCommandEnvelope::id),
+            Some(replacement.id())
+        );
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            crate::PgMetadataStore::head_bucket(&*pg, &first_bucket).unwrap();
+            assert!(crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).is_err());
+            if node_id == NodeId::new(0) {
+                crate::PgMetadataStore::head_bucket(&*pg, &occupant_bucket).unwrap();
+            } else {
+                assert!(crate::PgMetadataStore::head_bucket(&*pg, &occupant_bucket).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn stale_duplicate_reissue_rejects_same_payload_replacement_on_divergent_prefix() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let primary_bucket = bucket_for_pg(topology, 1, "duplicate-prefix-primary-");
+        let replacement_bucket = bucket_for_pg(topology, 1, "duplicate-prefix-replacement-");
+        let divergent_bucket = bucket_for_pg(topology, 1, "duplicate-prefix-divergent-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+
+        let primary_prefix = create_bucket_metadata_command(pg_id, 1, primary_bucket.clone());
+        let primary_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        primary_pg
+            .apply_metadata_command_and_record(NodeId::new(1).as_u32(), &primary_prefix)
+            .unwrap();
+        drop(primary_pg);
+
+        let stale = create_bucket_metadata_command(pg_id, 1, replacement_bucket.clone());
+        let replacement = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            stale.payload().clone(),
+        );
+        insert_pending_metadata_command_for_test(&map, pg_id, &replacement_bucket, &replacement);
+
+        let divergent_prefix = create_bucket_metadata_command(pg_id, 1, divergent_bucket.clone());
+        let non_primary_pg = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        non_primary_pg
+            .apply_metadata_command_and_record(NodeId::new(0).as_u32(), &divergent_prefix)
+            .unwrap();
+        non_primary_pg
+            .apply_metadata_command_and_record(NodeId::new(0).as_u32(), &replacement)
+            .unwrap();
+        drop(non_primary_pg);
+
+        let err = cluster
+            .test_reissue_pending_metadata_command(pg_id, &stale)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 2,
+                ..
+            })
+        ));
+
+        let primary_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        crate::PgMetadataStore::head_bucket(&*primary_pg, &primary_bucket).unwrap();
+        assert!(crate::PgMetadataStore::head_bucket(&*primary_pg, &replacement_bucket).is_err());
+        let non_primary_pg = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        crate::PgMetadataStore::head_bucket(&*non_primary_pg, &divergent_bucket).unwrap();
+        crate::PgMetadataStore::head_bucket(&*non_primary_pg, &replacement_bucket).unwrap();
+    }
+
+    #[test]
     fn stale_duplicate_direct_put_commit_index_is_reissued_before_apply() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

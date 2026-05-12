@@ -1338,6 +1338,35 @@ impl PgStore {
             })
     }
 
+    pub(crate) fn has_matching_applied_metadata_command_log_entry(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+        expected_previous_log_hash: u64,
+    ) -> Result<bool, StoreError> {
+        let Some(entry) = self.load_metadata_command_log_entry(
+            "load metadata command log entry for acting-set validation",
+            command.id().cluster_epoch(),
+            command.id().pg_id(),
+            command.id().log_index(),
+        )?
+        else {
+            return Ok(false);
+        };
+        if !self.metadata_command_log_entry_matches(node_id, command, &entry, false)? {
+            return Ok(false);
+        }
+        let expected_log_hash = metadata_command_log_hash(
+            command.id().cluster_epoch(),
+            command.id().pg_id(),
+            command.id().log_index(),
+            expected_previous_log_hash,
+            command.checksum_crc64(),
+        );
+        Ok(entry.previous_log_hash == Some(expected_previous_log_hash)
+            && entry.log_hash == Some(expected_log_hash))
+    }
+
     pub(crate) fn pending_metadata_command_slot(
         &self,
         node_id: u32,
@@ -5643,6 +5672,22 @@ impl PgStore {
         Ok(segments == command.segments)
     }
 
+    fn stream_upload_cleanup_records_match(
+        actual: &[StreamUploadRecord],
+        expected: &[StreamUploadRecord],
+    ) -> bool {
+        actual.len() == expected.len()
+            && actual.iter().zip(expected).all(|(actual, expected)| {
+                actual.session_id == expected.session_id
+                    && actual.bucket == expected.bucket
+                    && actual.key == expected.key
+                    && actual.target == expected.target
+                    && actual.state == expected.state
+                    && actual.created_at == expected.created_at
+                    && actual.encryption == expected.encryption
+            })
+    }
+
     fn apply_commit_multipart_object_command(
         &self,
         command: &CommitMultipartObjectCommand,
@@ -5657,7 +5702,10 @@ impl PgStore {
             |store| {
                 let stream_uploads =
                     store.list_stream_uploads_for_multipart_upload(&command.upload_id)?;
-                if stream_uploads != command.stream_uploads {
+                if !Self::stream_upload_cleanup_records_match(
+                    &stream_uploads,
+                    &command.stream_uploads,
+                ) {
                     return Err(MetadataError::Db {
                         context: "commit multipart object command (stream uploads mismatch)",
                         source: rusqlite::Error::InvalidQuery,
@@ -7175,7 +7223,10 @@ impl PgStore {
                 if upload_present {
                     let stream_uploads =
                         store.list_stream_uploads_for_multipart_upload(&command.upload_id)?;
-                    if stream_uploads != command.cleanup.stream_uploads {
+                    if !Self::stream_upload_cleanup_records_match(
+                        &stream_uploads,
+                        &command.cleanup.stream_uploads,
+                    ) {
                         return Err(MetadataError::Db {
                             context: "abort multipart upload command (stream uploads mismatch)",
                             source: rusqlite::Error::InvalidQuery,
@@ -14987,6 +15038,85 @@ mod tests {
                     .unwrap();
             },
         );
+    }
+
+    #[test]
+    fn terminal_stream_upload_cleanup_match_ignores_allocator_floor() {
+        let upload_id = UploadId::new("u".repeat(UPLOAD_ID_LEN)).unwrap();
+        let session = StreamUploadRecord {
+            session_id: SessionId::try_from("ab".repeat(16)).unwrap(),
+            bucket: trusted_bucket_name("cleanup-bucket"),
+            key: trusted_object_key("cleanup-key"),
+            target: StreamUploadTarget::UploadPart {
+                upload_id,
+                part_number: 1,
+            },
+            state: StreamUploadState::InProgress,
+            created_at: 123,
+            encryption: ObjectEncryption::None,
+            next_segment_vid: GenerationId::new(2).unwrap(),
+        };
+        let mut replica = session.clone();
+        replica.next_segment_vid = GenerationId::MIN;
+        assert!(PgStore::stream_upload_cleanup_records_match(
+            &[replica.clone()],
+            std::slice::from_ref(&session),
+        ));
+
+        replica.state = StreamUploadState::Completing;
+        assert!(!PgStore::stream_upload_cleanup_records_match(
+            &[replica],
+            &[session],
+        ));
+    }
+
+    #[test]
+    fn abort_multipart_command_accepts_lagging_stream_allocator_floor() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let upload_id = UploadId::new("v".repeat(UPLOAD_ID_LEN)).unwrap();
+        insert_digest_multipart_upload(&store, &upload_id);
+        let upload = store.get_multipart_upload(&upload_id).unwrap();
+        let session = StreamUploadRecord {
+            session_id: SessionId::try_from("ac".repeat(16)).unwrap(),
+            bucket: upload.bucket.clone(),
+            key: upload.key.clone(),
+            target: StreamUploadTarget::UploadPart {
+                upload_id: upload_id.clone(),
+                part_number: 1,
+            },
+            state: StreamUploadState::InProgress,
+            created_at: 456,
+            encryption: ObjectEncryption::None,
+            next_segment_vid: GenerationId::MIN,
+        };
+        store.create_stream_upload_explicit(&session).unwrap();
+
+        let mut primary_snapshot = session.clone();
+        primary_snapshot.next_segment_vid = GenerationId::new(2).unwrap();
+        let command = AbortMultipartUploadCommand {
+            bucket: upload.bucket.clone(),
+            key: upload.key.clone(),
+            upload_id: upload_id.clone(),
+            cleanup: AbortMultipartUploadCleanup {
+                upload,
+                parts: Vec::new(),
+                streaming_segments: Vec::new(),
+                stream_uploads: vec![primary_snapshot],
+                stream_upload_segments: Vec::new(),
+            },
+        };
+        store
+            .apply_abort_multipart_upload_command(&command)
+            .unwrap();
+        assert!(matches!(
+            store.get_stream_upload(&session.session_id),
+            Err(MetadataError::StreamSessionNotFound { .. })
+        ));
+        assert!(matches!(
+            store.get_multipart_upload(&upload_id),
+            Err(MetadataError::NoSuchUpload { .. })
+        ));
     }
 
     #[test]

@@ -462,6 +462,20 @@ pub struct StorageCluster {
 }
 
 impl StorageCluster {
+    fn metadata_command_conflict(
+        &self,
+        node_id: NodeId,
+        pg_id: PgId,
+        log_index: u64,
+    ) -> StoreError {
+        StoreError::MetadataCommandLogConflict {
+            node_id: node_id.as_u32(),
+            pg_id: pg_id.get(),
+            cluster_epoch: self.operation_epoch(),
+            log_index,
+        }
+    }
+
     fn metadata_command_log_conflict_matches(
         command: &MetadataCommandEnvelope,
         error: &BucketSnapshotLoadError,
@@ -479,6 +493,66 @@ impl StorageCluster {
         )
     }
 
+    fn matching_reissued_pending_command_if_safe(
+        &self,
+        pg_id: PgId,
+        primary_node_id: NodeId,
+        primary_max_log_index: u64,
+        acting_set_max_log_index: u64,
+        stale_command: &MetadataCommandEnvelope,
+        current: MetadataCommandEnvelope,
+    ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
+        if current.payload() != stale_command.payload() {
+            return Ok(None);
+        }
+        let current_log_index = current.id().log_index().get();
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let primary_pg = primary.storage_node().get_pg(pg_id.get())?;
+        let primary_state = primary_pg.metadata_command_replica_state()?;
+        if primary_state.applied_log_index != primary_max_log_index {
+            return Err(self.metadata_command_conflict(
+                primary_node_id,
+                pg_id,
+                primary_max_log_index,
+            ));
+        }
+        drop(primary_pg);
+        let expected_log_index = primary_max_log_index
+            .checked_add(1)
+            .ok_or_else(|| self.metadata_command_conflict(primary_node_id, pg_id, u64::MAX))?;
+        if current_log_index != expected_log_index || acting_set_max_log_index > current_log_index {
+            return Err(self.metadata_command_conflict(
+                primary_node_id,
+                pg_id,
+                acting_set_max_log_index.max(current_log_index),
+            ));
+        }
+        for node in self
+            .local_map
+            .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
+        {
+            let pg = node.storage_node().get_pg(pg_id.get())?;
+            let node_max_log_index = pg.max_metadata_command_log_index(self.operation_epoch())?;
+            if node_max_log_index < current_log_index {
+                continue;
+            }
+            if !pg.has_matching_applied_metadata_command_log_entry(
+                node.node_id().as_u32(),
+                &current,
+                primary_state.applied_log_hash,
+            )? {
+                return Err(self.metadata_command_conflict(
+                    node.node_id(),
+                    pg_id,
+                    current_log_index,
+                ));
+            }
+        }
+        Ok(Some(current))
+    }
+
     fn reissue_pending_metadata_command(
         &self,
         pg_id: PgId,
@@ -489,18 +563,30 @@ impl StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         let pg = primary.storage_node().get_pg(pg_id.get())?;
+        let primary_max_log_index = pg.max_metadata_command_log_index(self.operation_epoch())?;
+        drop(pg);
+        let acting_set_max_log_index = self.max_metadata_command_log_index_on_acting_set(pg_id)?;
+        let pg = primary.storage_node().get_pg(pg_id.get())?;
         if let Some(current) = pg
             .pending_metadata_command_envelope(primary.node_id().as_u32(), self.operation_epoch())?
         {
             if current != *command {
-                return Ok((current.payload() == command.payload()).then_some(current));
+                drop(pg);
+                return self
+                    .matching_reissued_pending_command_if_safe(
+                        pg_id,
+                        primary.node_id(),
+                        primary_max_log_index,
+                        acting_set_max_log_index,
+                        command,
+                        current,
+                    )
+                    .map_err(BucketSnapshotLoadError::from);
             }
         } else {
             return Ok(None);
         }
-        let primary_max_log_index = pg.max_metadata_command_log_index(self.operation_epoch())?;
         drop(pg);
-        let acting_set_max_log_index = self.max_metadata_command_log_index_on_acting_set(pg_id)?;
         if acting_set_max_log_index > primary_max_log_index {
             let pg = primary.storage_node().get_pg(pg_id.get())?;
             if let Some(current) = pg.pending_metadata_command_envelope(
@@ -508,18 +594,24 @@ impl StorageCluster {
                 self.operation_epoch(),
             )? {
                 if current != *command {
-                    return Ok((current.payload() == command.payload()).then_some(current));
+                    drop(pg);
+                    return self
+                        .matching_reissued_pending_command_if_safe(
+                            pg_id,
+                            primary.node_id(),
+                            primary_max_log_index,
+                            acting_set_max_log_index,
+                            command,
+                            current,
+                        )
+                        .map_err(BucketSnapshotLoadError::from);
                 }
             } else {
                 return Ok(None);
             }
-            return Err(StoreError::MetadataCommandLogConflict {
-                node_id: primary.node_id().as_u32(),
-                pg_id: pg_id.get(),
-                cluster_epoch: self.operation_epoch(),
-                log_index: acting_set_max_log_index,
-            }
-            .into());
+            return Err(self
+                .metadata_command_conflict(primary.node_id(), pg_id, acting_set_max_log_index)
+                .into());
         }
         let next_log_index = primary_max_log_index
             .max(command.id().log_index().get())
@@ -543,16 +635,27 @@ impl StorageCluster {
                 &replacement,
                 Some(&bucket),
             )? {
-                return pg
-                    .pending_metadata_command_envelope(
-                        primary.node_id().as_u32(),
-                        self.operation_epoch(),
+                let current = pg.pending_metadata_command_envelope(
+                    primary.node_id().as_u32(),
+                    self.operation_epoch(),
+                )?;
+                let primary_max_log_index =
+                    pg.max_metadata_command_log_index(self.operation_epoch())?;
+                drop(pg);
+                let Some(current) = current else {
+                    return Ok(None);
+                };
+                let acting_set_max_log_index =
+                    self.max_metadata_command_log_index_on_acting_set(pg_id)?;
+                return self
+                    .matching_reissued_pending_command_if_safe(
+                        pg_id,
+                        primary.node_id(),
+                        primary_max_log_index,
+                        acting_set_max_log_index,
+                        command,
+                        current,
                     )
-                    .map(|current| {
-                        current.and_then(|current| {
-                            (current.payload() == command.payload()).then_some(current)
-                        })
-                    })
                     .map_err(BucketSnapshotLoadError::from);
             }
         }
