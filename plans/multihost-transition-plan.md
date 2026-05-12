@@ -2713,6 +2713,9 @@ Proposed subphases:
      - direct pending-slot installation in snapshot-sensitive paths that does
        not restart from a fresh snapshot after contention
      - raw equality on records known to contain runtime allocator fields
+       - status: boundary checks reject terminal stream cleanup payloads that
+         reintroduce `Vec<StreamUploadRecord>` and production direct
+         `stream_uploads` vector comparisons
      - production use of direct `PgStore` mutators for command-owned tables
      - command apply paths that bypass apply+record transaction handling
      - reissue paths that compare command bytes without hash-chain validation

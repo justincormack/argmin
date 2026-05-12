@@ -310,6 +310,51 @@ if [[ "$pending_command_publishers" != "$expected_pending_command_publishers" ]]
         "$pending_command_publishers"
 fi
 
+mixed_stream_upload_cleanup_records=$(
+    rg -n --color=never \
+        'stream_uploads:[[:space:]]*Vec<StreamUploadRecord>' \
+        crates/storage/src/types.rs \
+        crates/storage/src/metadata_command.rs \
+        || true
+)
+fail_with_matches \
+    "Terminal stream cleanup payloads must use TerminalStreamCleanupRecord, not StreamUploadRecord" \
+    "$mixed_stream_upload_cleanup_records"
+
+raw_stream_upload_vector_comparisons=$(
+    awk '
+    FNR == 1 {
+        pending_test_cfg = 0
+        in_test_module = 0
+    }
+    /^#\[cfg\(test\)\]/ {
+        pending_test_cfg = 1
+        next
+    }
+    /^mod tests[[:space:]]*\{/ && pending_test_cfg {
+        in_test_module = 1
+        pending_test_cfg = 0
+        next
+    }
+    pending_test_cfg && $0 !~ /^[[:space:]]*$/ && $0 !~ /^#\[/ {
+        pending_test_cfg = 0
+    }
+    in_test_module {
+        next
+    }
+    $0 ~ /([A-Za-z_][A-Za-z0-9_]*\.)*stream_uploads[[:space:]]*(!=|==)/ \
+        || $0 ~ /(!=|==)[[:space:]]*([A-Za-z_][A-Za-z0-9_]*\.)*stream_uploads/ {
+        print FILENAME ":" FNR ":" $0
+    }
+    ' $(find crates/storage/src -type f -name '*.rs' \
+        ! -path 'crates/storage/src/tests/*' \
+        ! -path 'crates/storage/src/cluster/local.rs' \
+        | sort)
+)
+fail_with_matches \
+    "Production code compares stream_uploads vectors directly instead of command-owned cleanup records" \
+    "$raw_stream_upload_vector_comparisons"
+
 generic_route_io_matches=$(
     rg -n --color=never \
         'std::io::Error::other\((error|other)\.to_string\(\)\)|StoreError::Io[[:space:]]*\{[[:space:]]*context:[^}]*route|StoreError::Io[[:space:]]*\{[[:space:]]*context:[^}]*PG' \
