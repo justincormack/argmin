@@ -461,6 +461,88 @@ pub struct StorageCluster {
     test_hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReissuedPendingCommandReplicaMatch {
+    BelowReplacement,
+    MatchesHashChain,
+    MissingOrMismatched,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReissuedPendingCommandPrimarySummary {
+    node_id: NodeId,
+    max_log_index: u64,
+    applied_log_index: u64,
+    applied_log_hash: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReissuedPendingCommandReplicaSummary {
+    node_id: NodeId,
+    max_log_index: u64,
+    applied_log_index: u64,
+    applied_log_hash: u64,
+    replacement_match: ReissuedPendingCommandReplicaMatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReissuedPendingCommandDecision {
+    StaleCommandDisplaced,
+    ReloadCurrent,
+    Conflict { node_id: NodeId, log_index: u64 },
+}
+
+fn decide_reissued_pending_command(
+    primary: ReissuedPendingCommandPrimarySummary,
+    acting_set_max_log_index: u64,
+    current_log_index: u64,
+    payload_matches: bool,
+    replicas: &[ReissuedPendingCommandReplicaSummary],
+) -> ReissuedPendingCommandDecision {
+    if !payload_matches {
+        return ReissuedPendingCommandDecision::StaleCommandDisplaced;
+    }
+    if primary.applied_log_index != primary.max_log_index {
+        return ReissuedPendingCommandDecision::Conflict {
+            node_id: primary.node_id,
+            log_index: primary.max_log_index,
+        };
+    }
+    let Some(expected_log_index) = primary.max_log_index.checked_add(1) else {
+        return ReissuedPendingCommandDecision::Conflict {
+            node_id: primary.node_id,
+            log_index: u64::MAX,
+        };
+    };
+    if current_log_index != expected_log_index || acting_set_max_log_index > current_log_index {
+        return ReissuedPendingCommandDecision::Conflict {
+            node_id: primary.node_id,
+            log_index: acting_set_max_log_index.max(current_log_index),
+        };
+    }
+    for replica in replicas {
+        if replica.max_log_index < current_log_index {
+            if replica.max_log_index != primary.applied_log_index
+                || replica.applied_log_index != primary.applied_log_index
+                || replica.applied_log_hash != primary.applied_log_hash
+            {
+                return ReissuedPendingCommandDecision::Conflict {
+                    node_id: replica.node_id,
+                    log_index: primary.applied_log_index.max(replica.max_log_index),
+                };
+            }
+            continue;
+        }
+        if replica.replacement_match != ReissuedPendingCommandReplicaMatch::MatchesHashChain {
+            return ReissuedPendingCommandDecision::Conflict {
+                node_id: replica.node_id,
+                log_index: current_log_index,
+            };
+        }
+    }
+    ReissuedPendingCommandDecision::ReloadCurrent
+}
+
 impl StorageCluster {
     fn metadata_command_conflict(
         &self,
@@ -502,55 +584,73 @@ impl StorageCluster {
         stale_command: &MetadataCommandEnvelope,
         current: MetadataCommandEnvelope,
     ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
-        if current.payload() != stale_command.payload() {
-            return Ok(None);
-        }
+        let payload_matches = current.payload() == stale_command.payload();
         let current_log_index = current.id().log_index().get();
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         let primary_pg = primary.storage_node().get_pg(pg_id.get())?;
         let primary_state = primary_pg.metadata_command_replica_state()?;
-        if primary_state.applied_log_index != primary_max_log_index {
-            return Err(self.metadata_command_conflict(
-                primary_node_id,
-                pg_id,
-                primary_max_log_index,
-            ));
+        let primary_summary = ReissuedPendingCommandPrimarySummary {
+            node_id: primary_node_id,
+            max_log_index: primary_max_log_index,
+            applied_log_index: primary_state.applied_log_index,
+            applied_log_hash: primary_state.applied_log_hash,
+        };
+        match decide_reissued_pending_command(
+            primary_summary,
+            acting_set_max_log_index,
+            current_log_index,
+            payload_matches,
+            &[],
+        ) {
+            ReissuedPendingCommandDecision::StaleCommandDisplaced => return Ok(None),
+            ReissuedPendingCommandDecision::Conflict { node_id, log_index } => {
+                return Err(self.metadata_command_conflict(node_id, pg_id, log_index));
+            }
+            ReissuedPendingCommandDecision::ReloadCurrent => {}
         }
         drop(primary_pg);
-        let expected_log_index = primary_max_log_index
-            .checked_add(1)
-            .ok_or_else(|| self.metadata_command_conflict(primary_node_id, pg_id, u64::MAX))?;
-        if current_log_index != expected_log_index || acting_set_max_log_index > current_log_index {
-            return Err(self.metadata_command_conflict(
-                primary_node_id,
-                pg_id,
-                acting_set_max_log_index.max(current_log_index),
-            ));
-        }
+        let mut replicas = Vec::new();
         for node in self
             .local_map
             .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
         {
             let pg = node.storage_node().get_pg(pg_id.get())?;
             let node_max_log_index = pg.max_metadata_command_log_index(self.operation_epoch())?;
-            if node_max_log_index < current_log_index {
-                continue;
-            }
-            if !pg.has_matching_applied_metadata_command_log_entry(
+            let node_state = pg.metadata_command_replica_state()?;
+            let replacement_match = if node_max_log_index < current_log_index {
+                ReissuedPendingCommandReplicaMatch::BelowReplacement
+            } else if pg.has_matching_applied_metadata_command_log_entry(
                 node.node_id().as_u32(),
                 &current,
                 primary_state.applied_log_hash,
             )? {
-                return Err(self.metadata_command_conflict(
-                    node.node_id(),
-                    pg_id,
-                    current_log_index,
-                ));
+                ReissuedPendingCommandReplicaMatch::MatchesHashChain
+            } else {
+                ReissuedPendingCommandReplicaMatch::MissingOrMismatched
+            };
+            replicas.push(ReissuedPendingCommandReplicaSummary {
+                node_id: node.node_id(),
+                max_log_index: node_max_log_index,
+                applied_log_index: node_state.applied_log_index,
+                applied_log_hash: node_state.applied_log_hash,
+                replacement_match,
+            });
+        }
+        match decide_reissued_pending_command(
+            primary_summary,
+            acting_set_max_log_index,
+            current_log_index,
+            payload_matches,
+            &replicas,
+        ) {
+            ReissuedPendingCommandDecision::StaleCommandDisplaced => Ok(None),
+            ReissuedPendingCommandDecision::ReloadCurrent => Ok(Some(current)),
+            ReissuedPendingCommandDecision::Conflict { node_id, log_index } => {
+                Err(self.metadata_command_conflict(node_id, pg_id, log_index))
             }
         }
-        Ok(Some(current))
     }
 
     fn reissue_pending_metadata_command(
@@ -3794,4 +3894,209 @@ fn is_recoverable_physical_shard_io_error(context: &'static str, kind: std::io::
             std::io::ErrorKind::InvalidData
         ) | ("read shard file", std::io::ErrorKind::UnexpectedEof)
     )
+}
+
+#[cfg(test)]
+mod reissue_decision_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn replica_match(code: u8) -> ReissuedPendingCommandReplicaMatch {
+        match code % 3 {
+            0 => ReissuedPendingCommandReplicaMatch::BelowReplacement,
+            1 => ReissuedPendingCommandReplicaMatch::MatchesHashChain,
+            _ => ReissuedPendingCommandReplicaMatch::MissingOrMismatched,
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_reissued_pending_command_decision_is_fail_closed(
+            payload_matches in any::<bool>(),
+            primary_max_log_index in 0_u64..64,
+            primary_applied_log_index in 0_u64..64,
+            primary_applied_log_hash in any::<u64>(),
+            acting_set_max_log_index in 0_u64..66,
+            current_log_index in 0_u64..66,
+            replica_inputs in proptest::collection::vec(
+                (0_u32..6, 0_u64..66, 0_u64..66, any::<u64>(), 0_u8..3),
+                0..8,
+            ),
+        ) {
+            let primary_node_id = NodeId::new(1);
+            let replicas = replica_inputs
+                .into_iter()
+                .map(|(node_id, max_log_index, applied_log_index, applied_log_hash, match_code)| {
+                    ReissuedPendingCommandReplicaSummary {
+                        node_id: NodeId::new(node_id),
+                        max_log_index,
+                        applied_log_index,
+                        applied_log_hash,
+                        replacement_match: replica_match(match_code),
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let decision = decide_reissued_pending_command(
+                ReissuedPendingCommandPrimarySummary {
+                    node_id: primary_node_id,
+                    max_log_index: primary_max_log_index,
+                    applied_log_index: primary_applied_log_index,
+                    applied_log_hash: primary_applied_log_hash,
+                },
+                acting_set_max_log_index,
+                current_log_index,
+                payload_matches,
+                &replicas,
+            );
+
+            if !payload_matches {
+                prop_assert_eq!(decision, ReissuedPendingCommandDecision::StaleCommandDisplaced);
+                return Ok(());
+            }
+            if primary_applied_log_index != primary_max_log_index {
+                prop_assert_eq!(
+                    decision,
+                    ReissuedPendingCommandDecision::Conflict {
+                        node_id: primary_node_id,
+                        log_index: primary_max_log_index,
+                    }
+                );
+                return Ok(());
+            }
+            let expected_log_index = primary_max_log_index + 1;
+            if current_log_index != expected_log_index
+                || acting_set_max_log_index > current_log_index
+            {
+                prop_assert_eq!(
+                    decision,
+                    ReissuedPendingCommandDecision::Conflict {
+                        node_id: primary_node_id,
+                        log_index: acting_set_max_log_index.max(current_log_index),
+                    }
+                );
+                return Ok(());
+            }
+            if let Some(replica) = replicas.iter().find(|replica| {
+                replica.max_log_index < current_log_index
+                    && (replica.max_log_index != primary_applied_log_index
+                        || replica.applied_log_index != primary_applied_log_index
+                        || replica.applied_log_hash != primary_applied_log_hash)
+            }) {
+                prop_assert_eq!(
+                    decision,
+                    ReissuedPendingCommandDecision::Conflict {
+                        node_id: replica.node_id,
+                        log_index: primary_applied_log_index.max(replica.max_log_index),
+                    }
+                );
+                return Ok(());
+            }
+            if let Some(replica) = replicas.iter().find(|replica| {
+                replica.max_log_index >= current_log_index
+                    && replica.replacement_match
+                        != ReissuedPendingCommandReplicaMatch::MatchesHashChain
+            }) {
+                prop_assert_eq!(
+                    decision,
+                    ReissuedPendingCommandDecision::Conflict {
+                        node_id: replica.node_id,
+                        log_index: current_log_index,
+                    }
+                );
+                return Ok(());
+            }
+            prop_assert_eq!(decision, ReissuedPendingCommandDecision::ReloadCurrent);
+        }
+    }
+
+    #[test]
+    fn reissued_pending_command_decision_allows_primary_last_window() {
+        let decision = decide_reissued_pending_command(
+            ReissuedPendingCommandPrimarySummary {
+                node_id: NodeId::new(1),
+                max_log_index: 1,
+                applied_log_index: 1,
+                applied_log_hash: 100,
+            },
+            2,
+            2,
+            true,
+            &[
+                ReissuedPendingCommandReplicaSummary {
+                    node_id: NodeId::new(1),
+                    max_log_index: 1,
+                    applied_log_index: 1,
+                    applied_log_hash: 100,
+                    replacement_match: ReissuedPendingCommandReplicaMatch::BelowReplacement,
+                },
+                ReissuedPendingCommandReplicaSummary {
+                    node_id: NodeId::new(0),
+                    max_log_index: 2,
+                    applied_log_index: 2,
+                    applied_log_hash: 200,
+                    replacement_match: ReissuedPendingCommandReplicaMatch::MatchesHashChain,
+                },
+            ],
+        );
+        assert_eq!(decision, ReissuedPendingCommandDecision::ReloadCurrent);
+    }
+
+    #[test]
+    fn reissued_pending_command_decision_rejects_divergent_prefix() {
+        let decision = decide_reissued_pending_command(
+            ReissuedPendingCommandPrimarySummary {
+                node_id: NodeId::new(1),
+                max_log_index: 1,
+                applied_log_index: 1,
+                applied_log_hash: 100,
+            },
+            2,
+            2,
+            true,
+            &[ReissuedPendingCommandReplicaSummary {
+                node_id: NodeId::new(0),
+                max_log_index: 2,
+                applied_log_index: 2,
+                applied_log_hash: 200,
+                replacement_match: ReissuedPendingCommandReplicaMatch::MissingOrMismatched,
+            }],
+        );
+        assert_eq!(
+            decision,
+            ReissuedPendingCommandDecision::Conflict {
+                node_id: NodeId::new(0),
+                log_index: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn reissued_pending_command_decision_rejects_below_replacement_divergent_prefix() {
+        let decision = decide_reissued_pending_command(
+            ReissuedPendingCommandPrimarySummary {
+                node_id: NodeId::new(1),
+                max_log_index: 1,
+                applied_log_index: 1,
+                applied_log_hash: 100,
+            },
+            1,
+            2,
+            true,
+            &[ReissuedPendingCommandReplicaSummary {
+                node_id: NodeId::new(0),
+                max_log_index: 1,
+                applied_log_index: 1,
+                applied_log_hash: 999,
+                replacement_match: ReissuedPendingCommandReplicaMatch::BelowReplacement,
+            }],
+        );
+        assert_eq!(
+            decision,
+            ReissuedPendingCommandDecision::Conflict {
+                node_id: NodeId::new(0),
+                log_index: 1,
+            }
+        );
+    }
 }

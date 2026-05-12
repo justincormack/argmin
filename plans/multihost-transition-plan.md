@@ -2693,6 +2693,12 @@ Proposed subphases:
      summaries, then proptest gaps, divergent prefixes, same-payload
      replacements, missing log rows, abandoned rows, stale primary state, and
      primary-last fanout windows
+     - status: reissue now uses a pure decision helper over primary state,
+       acting-set max index, current pending command index, and per-replica
+       prefix/hash-chain match summaries; property coverage exercises
+       fail-closed behavior, with targeted cases for primary-last fanout,
+       divergent prefixes, and below-replacement replicas whose accepted
+       prefix differs from the primary
    - add reusable crash-step tests around the durable pending-command lifecycle:
      - slot installed, no replica applied
      - non-primary applied, primary not applied
