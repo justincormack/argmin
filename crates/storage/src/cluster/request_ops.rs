@@ -2815,9 +2815,11 @@ impl super::StorageCluster {
                 Self::put_object_metadata_command_from_stored(&stored, version_id, mutation)?;
             let command = self.new_put_object_metadata_command(pg_id, &object_pg, update.object)?;
             drop(object_pg);
-            if !self.try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)? {
-                self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
-                continue;
+            match self
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
+            {
+                super::SnapshotSensitiveCommandInstall::Installed => {}
+                super::SnapshotSensitiveCommandInstall::ContenderDrained => continue,
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             return Ok(Ok(value));
@@ -3198,9 +3200,11 @@ impl super::StorageCluster {
                 pg_id, &object_pg, bucket, key, version_id, target,
             )?;
             drop(object_pg);
-            if !self.try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)? {
-                self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
-                continue;
+            match self
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
+            {
+                super::SnapshotSensitiveCommandInstall::Installed => {}
+                super::SnapshotSensitiveCommandInstall::ContenderDrained => continue,
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() else {

@@ -2666,6 +2666,10 @@ Proposed subphases:
      - apply/record the installed command
      This should make the safe shape the convenient API for new Phase 9.3
      work, rather than another one-off retry loop.
+     - status: introduced `install_snapshot_sensitive_metadata_command_or_drain`
+       and converted representative object metadata and specific-version
+       delete publishers so contention drains the winning slot and returns to
+       their fresh-snapshot loop through a named result
    - split command-owned records from runtime/local fields where equality has
      been risky:
      - start with stream upload records, separating command-owned session

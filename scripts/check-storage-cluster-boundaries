@@ -247,6 +247,8 @@ pending_command_publishers=$(
             helper = "try_set_pending_metadata_command_for_bucket"
         } else if ($0 ~ /try_install_pending_metadata_command_for_bucket\(/) {
             helper = "try_install_pending_metadata_command_for_bucket"
+        } else if ($0 ~ /install_snapshot_sensitive_metadata_command_or_drain\(/) {
+            helper = "install_snapshot_sensitive_metadata_command_or_drain"
         } else if ($0 ~ /set_pending_metadata_command_for_bucket\(/) {
             helper = "set_pending_metadata_command_for_bucket"
         }
@@ -255,6 +257,7 @@ pending_command_publishers=$(
         }
         if (current_fn == "set_pending_metadata_command_for_bucket" \
             || current_fn == "try_install_pending_metadata_command_for_bucket" \
+            || current_fn == "install_snapshot_sensitive_metadata_command_or_drain" \
             || current_fn == "try_set_pending_metadata_command_for_bucket") {
             next
         }
@@ -290,7 +293,7 @@ expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster/request_ops.rs:delete_current_object_if<T, E>:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:delete_expired_delete_marker_if_due<E>:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:delete_noncurrent_live_versions_if_due<E>:try_install_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster/request_ops.rs:delete_specific_object_version_if<T, E>:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:delete_specific_object_version_if<T, E>:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:expire_current_object_if_due<E>:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:finalize_put_object_stream<T, E>:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:finalize_upload_part_stream<T, E>:set_pending_metadata_command_for_bucket
@@ -299,7 +302,7 @@ expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster/request_ops.rs:put_bucket_property_command_and_load_info:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:put_bucket_subresource_command_and_load_info:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:put_bucket_versioning_and_load_info:try_set_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster/request_ops.rs:put_object_metadata_if<T, E>:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:put_object_metadata_if<T, E>:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:reclaim_object_payload_if_unleased:set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:reserve_completed_multipart_upload_order:try_set_pending_metadata_command_for_bucket
 EOF

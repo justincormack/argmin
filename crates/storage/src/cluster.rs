@@ -492,6 +492,13 @@ enum ReissuedPendingCommandDecision {
     Conflict { node_id: NodeId, log_index: u64 },
 }
 
+#[must_use = "ContenderDrained must restart from a fresh snapshot"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotSensitiveCommandInstall {
+    Installed,
+    ContenderDrained,
+}
+
 fn decide_reissued_pending_command(
     primary: ReissuedPendingCommandPrimarySummary,
     acting_set_max_log_index: u64,
@@ -1022,6 +1029,20 @@ impl StorageCluster {
             Ok(()) => Ok(Some(())),
             Err(StoreError::MetadataCommandPendingConflict { .. }) => Ok(None),
             Err(error) => Err(error),
+        }
+    }
+
+    fn install_snapshot_sensitive_metadata_command_or_drain(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<SnapshotSensitiveCommandInstall, ObjectPgActionError> {
+        if self.try_install_pending_metadata_command_for_bucket(pg_id, bucket, command)? {
+            Ok(SnapshotSensitiveCommandInstall::Installed)
+        } else {
+            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+            Ok(SnapshotSensitiveCommandInstall::ContenderDrained)
         }
     }
 

@@ -171,6 +171,9 @@ command requires updating this table and the boundary check allowlist. Direct
 uses of `try_set_pending_metadata_command_for_bucket`,
 `try_install_pending_metadata_command_for_bucket`, and
 `set_pending_metadata_command_for_bucket` are intentionally tracked.
+Snapshot-sensitive publishers should prefer
+`install_snapshot_sensitive_metadata_command_or_drain` so slot contention
+drains the winner and returns to the caller's fresh-snapshot loop.
 
 ## Recovery
 
