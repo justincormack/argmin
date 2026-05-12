@@ -271,11 +271,14 @@ pending_command_publishers=$(
         | uniq -c \
         | sed 's/^ *//'
 )
+# Multipart and UploadPart publishers that still use set_pending.../try_set...
+# are intentional Phase 9.3 deferrals. The allowlist keeps them visible so
+# Phase 9.2H closeout cannot be mistaken for full multipart serialization.
 expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:abort_stream_upload_session:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards<E>:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster.rs:commit_stream_segment_append:set_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster.rs:create_put_object_stream_session_record:set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster.rs:create_put_object_stream_session_record:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster.rs:release_object_generation_reservation:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster.rs:release_object_generation_reservation_command_required:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster.rs:reserve_next_object_version:try_set_pending_metadata_command_for_bucket

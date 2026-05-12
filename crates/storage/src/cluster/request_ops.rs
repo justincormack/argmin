@@ -55,6 +55,9 @@ type AbortMultipartPendingInstallTestHook = Arc<dyn Fn() + Send + Sync>;
 type StreamPutCreatePendingInstallTestHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
+type StreamPutCreateCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
 static BEFORE_METADATA_COMMAND_APPLY_HOOKS: OnceLock<
     Mutex<HashMap<usize, MetadataCommandApplyTestHook>>,
 > = OnceLock::new();
@@ -67,6 +70,11 @@ static BEFORE_ABORT_MULTIPART_PENDING_INSTALL_HOOKS: OnceLock<
 #[cfg(test)]
 static BEFORE_STREAM_PUT_CREATE_PENDING_INSTALL_HOOKS: OnceLock<
     Mutex<HashMap<usize, StreamPutCreatePendingInstallTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static BEFORE_STREAM_PUT_CREATE_COMMAND_ID_HOOKS: OnceLock<
+    Mutex<HashMap<usize, StreamPutCreateCommandIdTestHook>>,
 > = OnceLock::new();
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -86,6 +94,11 @@ pub(crate) struct AbortMultipartPendingInstallTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct StreamPutCreatePendingInstallTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct StreamPutCreateCommandIdTestHookGuard {
     scope_id: usize,
 }
 
@@ -117,6 +130,18 @@ impl Drop for StreamPutCreatePendingInstallTestHookGuard {
     fn drop(&mut self) {
         let hooks = BEFORE_STREAM_PUT_CREATE_PENDING_INSTALL_HOOKS
             .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for StreamPutCreateCommandIdTestHookGuard {
+    fn drop(&mut self) {
+        let hooks =
+            BEFORE_STREAM_PUT_CREATE_COMMAND_ID_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -184,6 +209,19 @@ fn maybe_run_before_abort_multipart_pending_install_hook(_scope_id: usize) {
 #[cfg(test)]
 fn maybe_run_before_stream_put_create_pending_install_hook(_scope_id: usize) {
     let hook = BEFORE_STREAM_PUT_CREATE_PENDING_INSTALL_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&_scope_id)
+        .cloned();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn maybe_run_before_stream_put_create_command_id_hook(_scope_id: usize) {
+    let hook = BEFORE_STREAM_PUT_CREATE_COMMAND_ID_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -460,6 +498,20 @@ impl super::StorageCluster {
             .unwrap_or_else(|e| e.into_inner())
             .insert(scope_id, hook);
         StreamPutCreatePendingInstallTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_before_stream_put_create_command_id_hook(
+        &self,
+        hook: StreamPutCreateCommandIdTestHook,
+    ) -> StreamPutCreateCommandIdTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot =
+            BEFORE_STREAM_PUT_CREATE_COMMAND_ID_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        StreamPutCreateCommandIdTestHookGuard { scope_id }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -4248,9 +4300,46 @@ impl super::StorageCluster {
                     self.reserve_put_object_generation(bucket, key, &create.session_id)
                         .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
 
+                    #[cfg(test)]
+                    maybe_run_before_stream_put_create_command_id_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                    );
+                    let command_id = match self.next_object_metadata_command_id(pg_id) {
+                        Ok(command_id) => command_id,
+                        Err(ObjectPgActionError::Store(
+                            StoreError::MetadataCommandLogConflict { .. },
+                        )) => {
+                            let cleanup = self
+                                .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+                                .and_then(|_| {
+                                    self.release_object_generation_reservation(
+                                        bucket,
+                                        key,
+                                        &create.session_id,
+                                    )
+                                });
+                            if let Err(cleanup_error) = cleanup {
+                                return Err(
+                                    super::object_pg_action_error_to_bucket_snapshot_error(
+                                        cleanup_error,
+                                    ),
+                                );
+                            }
+                            return Ok(Ok(Attempt::Retry));
+                        }
+                        Err(error) => {
+                            let _ = self.release_object_generation_reservation(
+                                bucket,
+                                key,
+                                &create.session_id,
+                            );
+                            return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                                error,
+                            ));
+                        }
+                    };
                     let command = MetadataCommandEnvelope::new(
-                        self.next_object_metadata_command_id(pg_id)
-                            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?,
+                        command_id,
                         MetadataCommandPayload::CreateStreamUpload(Box::new(
                             CreateStreamUploadCommand::from_request(
                                 create.clone(),

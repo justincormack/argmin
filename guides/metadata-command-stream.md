@@ -158,13 +158,13 @@ Current production pending-command publishers:
 | `create_put_object_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Rerun authorization/object snapshot after contention. |
 | `finalize_put_object_stream` | `CommitDirectPutObject` | `SnapshotSensitive` | Rebuild commit from current object preconditions and stream-session snapshot after contention. |
 | `create_multipart_upload` | `CreateMultipartUpload` | `SnapshotSensitive` | Rerun authorization/object snapshot after contention. |
-| `begin_upload_part_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Revalidate MPU/session target after contention. |
-| `create_upload_part_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Revalidate MPU/session target after contention. |
+| `begin_upload_part_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Revalidate MPU/session target after contention; Phase 9.3 deferral, still allowed to use the multipart-specific pending-slot shape. |
+| `create_upload_part_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Revalidate MPU/session target after contention; Phase 9.3 deferral, still allowed to use the multipart-specific pending-slot shape. |
 | `reserve_completed_multipart_upload_order` | `AdvanceCompletedMultipartUploadSequence` | `AllocatorCleanup` | Serialize through the bucket-PG slot; a later object-PG command must be derived from a terminal reservation. |
-| `complete_multipart_upload_commit_serialized` | `CommitMultipartObject` | `SnapshotSensitive` | Rebuild completion parts, cleanup snapshot, stale payload, and bucket-PG order after contention. |
-| `finalize_upload_part_stream` | `CommitStreamPart` | `SnapshotSensitive` | Rebuild stream-session and staged-segment snapshot after contention. |
-| `abort_multipart_upload_locked` | `AbortMultipartUpload` | `SnapshotSensitive` | Rebuild upload/part/active stream cleanup snapshot after contention. |
-| `abort_authorized_multipart_upload_locked` | `AbortMultipartUpload` | `SnapshotSensitive` | Rebuild authorized upload cleanup snapshot after contention. |
+| `complete_multipart_upload_commit_serialized` | `CommitMultipartObject` | `SnapshotSensitive` | Rebuild completion parts, cleanup snapshot, stale payload, and bucket-PG order after contention; Phase 9.3 deferral. |
+| `finalize_upload_part_stream` | `CommitStreamPart` | `SnapshotSensitive` | Rebuild stream-session and staged-segment snapshot after contention; Phase 9.3 deferral, still allowed to use the multipart-specific pending-slot shape. |
+| `abort_multipart_upload_locked` | `AbortMultipartUpload` | `SnapshotSensitive` | Rebuild upload/part/active stream cleanup snapshot after contention; Phase 9.3 deferral. |
+| `abort_authorized_multipart_upload_locked` | `AbortMultipartUpload` | `SnapshotSensitive` | Rebuild authorized upload cleanup snapshot after contention; Phase 9.3 deferral. |
 
 Adding a production call site that creates or installs a pending metadata
 command requires updating this table and the boundary check allowlist. Direct
@@ -174,6 +174,13 @@ uses of `try_set_pending_metadata_command_for_bucket`,
 Snapshot-sensitive publishers should prefer
 `install_snapshot_sensitive_metadata_command_or_drain` so slot contention
 drains the winner and returns to the caller's fresh-snapshot loop.
+
+The multipart and UploadPart publishers marked as Phase 9.3 deferrals are not
+claimed as fully hardened by Phase 9.2H. They are inventoried here and in
+`scripts/check-storage-cluster-boundaries` so the remaining `set_pending...` and
+`try_set...` shapes cannot be mistaken for unreviewed omissions. Phase 9.3 owns
+converting those paths to multipart-aware PG-primary serialization and
+fresh-snapshot restart rules.
 
 ## Object Version Reservations
 

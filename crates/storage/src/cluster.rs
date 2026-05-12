@@ -2904,15 +2904,7 @@ impl StorageCluster {
                     ),
                 )),
             );
-            if self
-                .set_pending_metadata_command_for_bucket(
-                    pg_id,
-                    bucket,
-                    &command,
-                    "conflicting pending command for stream upload creation",
-                )
-                .is_err()
-            {
+            if !self.try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)? {
                 let cleanup = self
                     .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
                     .and_then(|_| {

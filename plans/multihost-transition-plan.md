@@ -2623,6 +2623,16 @@ Proposed subphases:
    - goal: turn the recent command construction, pending-slot contention,
      reissue, and replica convergence review findings into reusable
      guardrails before adding more multipart command complexity
+   - status: complete for the Phase 9.2H hardening scope. The
+     publisher/path inventory, non-multipart snapshot-sensitive retry shape,
+     stream upload command/runtime split, reissue model, crash-step coverage,
+     stateful trace coverage, and mechanical boundary checks are in place.
+     Multipart and UploadPart publishers are explicitly inventoried as Phase
+     9.3 deferrals where they still use multipart-specific `set_pending...` or
+     `try_set...` shapes. Closeout verification passed with
+     `./scripts/check-storage-cluster-boundaries`,
+     `cargo clippy --all-targets --all-features -- -D warnings`, and
+     `cargo nextest run`
    - freeze Phase 9.2 semantics in
      [metadata-command-stream.md](../guides/metadata-command-stream.md) as
      invariants rather than implementation notes:
@@ -2674,7 +2684,16 @@ Proposed subphases:
        winning slot and returns to their fresh-snapshot loop through a named
        result. Versioned stream-finalize contention now pins the intentional
        `ReserveObjectVersion` allocator-gap behavior when a fresh retry fails
-       after a durable version reservation
+       after a durable version reservation. Stream PUT creation now also covers
+       the post-generation-reservation command-id race: if another same-PG
+       command wins the durable slot before the create command id is allocated,
+       the path drains the winner, releases the reservation, and restarts from
+       a fresh request snapshot. The lower-level stream PUT session-record
+       publisher also treats pending-slot install contention as a retry signal
+       instead of draining and reusing a prebuilt command. Multipart/UploadPart
+       publishers remain classified and allowlisted, but their conversion is a
+       Phase 9.3 multipart serialization task because they need upload-wide and
+       multi-PG ordering rules rather than the simple object-path wrapper alone
    - split command-owned records from runtime/local fields where equality has
      been risky:
      - start with stream upload records, separating command-owned session
@@ -2696,8 +2715,9 @@ Proposed subphases:
      - status: initial `assert_clean_metadata_command_stream` helper validates
        post-operation unresolved pending slots and accepted-prefix/tail
        agreement before running replay validation, so terminal pending-slot
-       cleanup cannot be hidden by the validation path; broader property trace
-       integration remains in this hardening phase
+       cleanup cannot be hidden by the validation path; randomized
+       local-cluster traces now run the clean command-stream invariant whenever
+       the generated route/epoch state is representable on disk
    - extract the reissue safety decision into a pure model over compact
      summaries, then proptest gaps, divergent prefixes, same-payload
      replacements, missing log rows, abandoned rows, stale primary state, and
@@ -2768,11 +2788,14 @@ Proposed subphases:
    - minimum exit criteria before Phase 9.3:
      - Phase 9.2 invariants are documented
      - all current metadata command publisher paths are classified, with a
-       secondary command-kind summary
+       secondary command-kind summary and explicit Phase 9.3 deferrals where
+       the multipart-specific pending-slot shape remains
      - all production pending-command install call sites are inventoried and
        tied to that publisher/path classification
-     - snapshot-sensitive publishers use the common restart-on-contention shape
-       or are explicitly documented as already covered
+     - non-multipart snapshot-sensitive publishers use the common
+       restart-on-contention shape or are explicitly documented as already
+       covered; multipart/UploadPart publishers are explicitly deferred to
+       Phase 9.3
      - stream upload command-owned records are separated from runtime allocator
        fields
        - status: terminal MPU cleanup commands now carry
