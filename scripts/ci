@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+usage() {
+    cat <<'EOF'
+Usage: ./scripts/ci [-- cargo-nextest-args...]
+
+Run the standard local CI checks:
+
+  1. cargo fmt --all --check
+  2. cargo clippy --workspace --all-targets --all-features -- -D warnings
+  3. cargo build --workspace --all-targets --all-features
+  4. cargo +nightly build --manifest-path fuzz/Cargo.toml --bins
+  5. cargo nextest run --workspace
+
+Arguments after `--` are appended to `cargo nextest run --workspace`.
+
+Examples:
+  ./scripts/ci
+  ./scripts/ci -- --no-fail-fast
+  ./scripts/ci -- --test-threads 1
+EOF
+}
+
+run_cmd() {
+    local label="$1"
+    shift
+
+    echo
+    echo "== $label =="
+    printf '+'
+    printf ' %q' "$@"
+    printf '\n'
+    "$@"
+}
+
+nextest_args=()
+
+while (($# > 0)); do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            nextest_args=("$@")
+            break
+            ;;
+        *)
+            echo "unknown option: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+run_cmd "format" cargo fmt --all --check
+run_cmd "clippy" cargo clippy --workspace --all-targets --all-features -- -D warnings
+run_cmd "workspace compile" cargo build --workspace --all-targets --all-features
+run_cmd "fuzz target compile" cargo +nightly build --manifest-path fuzz/Cargo.toml --bins
+run_cmd "nextest" cargo nextest run --workspace "${nextest_args[@]}"
