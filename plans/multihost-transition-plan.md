@@ -2749,8 +2749,12 @@ Proposed subphases:
        failures are caught where the trace has not used synthetic epoch
        mutation. The trace model now also injects an unresolved durable
        create-bucket slot and uses a second cluster handle to drain that PG-slot
-       contender before creating another bucket on the same PG. Explicit
-       restart/reissue trace actions remain to be added
+       contender before creating another bucket on the same PG. It can also
+       reopen the local cluster mid-trace and run the command-stream invariant
+       immediately when the generated route/epoch state is representable on
+       disk, and it injects a duplicate-index pending create-bucket command so
+       normal request retry must reissue the command to the next safe log
+       index
    - extend mechanical boundary checks for unsafe command-stream patterns:
      - direct pending-slot installation in snapshot-sensitive paths that does
        not restart from a fresh snapshot after contention

@@ -2401,6 +2401,8 @@ mod tests {
         LeaseReleaseAcrossEpoch(u8),
         RecoverAfterPhysicalShardLoss(u8),
         DrainPendingCreateBucketFromSecondHandle(u8),
+        RestartAndValidate,
+        ReissueDuplicateCreateBucketIndex(u8),
     }
 
     #[derive(Debug, Clone)]
@@ -2430,6 +2432,8 @@ mod tests {
                 2 => any::<u8>().prop_map(LocalClusterTraceOp::LeaseReleaseAcrossEpoch),
                 1 => any::<u8>().prop_map(LocalClusterTraceOp::RecoverAfterPhysicalShardLoss),
                 1 => any::<u8>().prop_map(LocalClusterTraceOp::DrainPendingCreateBucketFromSecondHandle),
+                1 => Just(LocalClusterTraceOp::RestartAndValidate),
+                1 => any::<u8>().prop_map(LocalClusterTraceOp::ReissueDuplicateCreateBucketIndex),
             ],
             1..=40,
         )
@@ -2996,6 +3000,116 @@ mod tests {
                         crate::PgMetadataStore::head_bucket(&*pg, &pending_bucket).unwrap();
                         crate::PgMetadataStore::head_bucket(&*pg, &requested_bucket).unwrap();
                     }
+                }
+                LocalClusterTraceOp::RestartAndValidate => {
+                    if pg_state != PgState::Active || current_epoch != ClusterEpoch::INITIAL {
+                        continue;
+                    }
+                    map = Arc::new(
+                        LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape)
+                            .map_err(|err| TestCaseError::fail(format!("{err:?}")))?,
+                    );
+                    assert_clean_metadata_command_stream(&map, &[0]);
+                }
+                LocalClusterTraceOp::ReissueDuplicateCreateBucketIndex(seed) => {
+                    if pg_state != PgState::Active || current_epoch != ClusterEpoch::INITIAL {
+                        continue;
+                    }
+                    let pg_id = PgId::new(0);
+                    let first_bucket = trace_bucket_for_pg(
+                        &map,
+                        pg_id.get(),
+                        &format!("trace-reissue-first-{step}-{seed}-"),
+                    );
+                    let second_bucket = trace_bucket_for_pg(
+                        &map,
+                        pg_id.get(),
+                        &format!("trace-reissue-second-{step}-{seed}-"),
+                    );
+                    let cluster = current_cluster(&map);
+                    let primary = map
+                        .metadata_pg_primary_node(current_epoch, pg_id)
+                        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                    let primary_pg = primary
+                        .storage_node()
+                        .get_pg(pg_id.get())
+                        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                    if primary_pg
+                        .pending_metadata_command_slot(primary.node_id().as_u32(), current_epoch)
+                        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    let duplicate_index = primary_pg
+                        .max_metadata_command_log_index(current_epoch)
+                        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?
+                        + 1;
+                    drop(primary_pg);
+
+                    let applied = create_bucket_metadata_command(
+                        pg_id,
+                        duplicate_index,
+                        first_bucket.clone(),
+                    );
+                    cluster
+                        .test_apply_metadata_command_to_acting_set_from_origin(
+                            primary.node_id(),
+                            &applied,
+                        )
+                        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                    let stale_duplicate = create_bucket_metadata_command(
+                        pg_id,
+                        duplicate_index,
+                        second_bucket.clone(),
+                    );
+                    let reissued = MetadataCommandEnvelope::new(
+                        MetadataCommandId::new(
+                            current_epoch,
+                            pg_id,
+                            MetadataCommandLogIndex::new(duplicate_index + 1)
+                                .expect("trace duplicate index should not overflow"),
+                        ),
+                        stale_duplicate.payload().clone(),
+                    );
+                    cluster
+                        .try_set_pending_metadata_command_for_bucket(
+                            pg_id,
+                            &second_bucket,
+                            &stale_duplicate,
+                        )
+                        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?
+                        .expect("trace duplicate pending install should not race");
+
+                    create_test_bucket(&cluster, &second_bucket);
+                    for node_id in trace_node_ids() {
+                        let pg = map
+                            .node(node_id)
+                            .unwrap()
+                            .storage_node()
+                            .get_pg(pg_id.get())
+                            .unwrap();
+                        crate::PgMetadataStore::head_bucket(&*pg, &first_bucket).unwrap();
+                        crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).unwrap();
+                        let (command_checksum, command_bytes, abandoned): (i64, Vec<u8>, i64) = pg
+                            .connection()
+                            .query_row(
+                                "SELECT command_checksum, command_bytes, abandoned \
+                                 FROM metadata_command_log \
+                                 WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+                                rusqlite::params![
+                                    current_epoch.get() as i64,
+                                    pg_id.get() as i64,
+                                    duplicate_index as i64 + 1,
+                                ],
+                                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                            )
+                            .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                        prop_assert_eq!(abandoned, 0);
+                        prop_assert_eq!(command_checksum as u64, reissued.checksum_crc64());
+                        prop_assert_eq!(command_bytes, reissued.command_bytes());
+                    }
+                    assert_clean_metadata_command_stream(&map, &[0]);
                 }
             }
         }
