@@ -58,6 +58,9 @@ type StreamPutCreatePendingInstallTestHook = Arc<dyn Fn() + Send + Sync>;
 type StreamPutCreateCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
+type BucketDeleteCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
 static BEFORE_METADATA_COMMAND_APPLY_HOOKS: OnceLock<
     Mutex<HashMap<usize, MetadataCommandApplyTestHook>>,
 > = OnceLock::new();
@@ -75,6 +78,11 @@ static BEFORE_STREAM_PUT_CREATE_PENDING_INSTALL_HOOKS: OnceLock<
 #[cfg(test)]
 static BEFORE_STREAM_PUT_CREATE_COMMAND_ID_HOOKS: OnceLock<
     Mutex<HashMap<usize, StreamPutCreateCommandIdTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static BEFORE_BUCKET_DELETE_COMMAND_ID_HOOKS: OnceLock<
+    Mutex<HashMap<usize, BucketDeleteCommandIdTestHook>>,
 > = OnceLock::new();
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -99,6 +107,11 @@ pub(crate) struct StreamPutCreatePendingInstallTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct StreamPutCreateCommandIdTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct BucketDeleteCommandIdTestHookGuard {
     scope_id: usize,
 }
 
@@ -142,6 +155,18 @@ impl Drop for StreamPutCreateCommandIdTestHookGuard {
     fn drop(&mut self) {
         let hooks =
             BEFORE_STREAM_PUT_CREATE_COMMAND_ID_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for BucketDeleteCommandIdTestHookGuard {
+    fn drop(&mut self) {
+        let hooks =
+            BEFORE_BUCKET_DELETE_COMMAND_ID_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -222,6 +247,19 @@ fn maybe_run_before_stream_put_create_pending_install_hook(_scope_id: usize) {
 #[cfg(test)]
 fn maybe_run_before_stream_put_create_command_id_hook(_scope_id: usize) {
     let hook = BEFORE_STREAM_PUT_CREATE_COMMAND_ID_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&_scope_id)
+        .cloned();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn maybe_run_before_bucket_delete_command_id_hook(_scope_id: usize) {
+    let hook = BEFORE_BUCKET_DELETE_COMMAND_ID_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -512,6 +550,19 @@ impl super::StorageCluster {
             .unwrap_or_else(|e| e.into_inner())
             .insert(scope_id, hook);
         StreamPutCreateCommandIdTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_before_bucket_delete_command_id_hook(
+        &self,
+        hook: BucketDeleteCommandIdTestHook,
+    ) -> BucketDeleteCommandIdTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = BEFORE_BUCKET_DELETE_COMMAND_ID_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        BucketDeleteCommandIdTestHookGuard { scope_id }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1241,9 +1292,15 @@ impl super::StorageCluster {
                 if self.bucket_has_visible_data(bucket, true)? {
                     return Err(crate::error::MetadataError::BucketNotEmpty.into());
                 }
-                let command_id = self
-                    .next_metadata_command_id(pg_id)
-                    .map_err(BucketWriteDrainError::from)?;
+                #[cfg(test)]
+                maybe_run_before_bucket_delete_command_id_hook(
+                    self.metadata_command_apply_test_hook_scope_id(),
+                );
+                let command_id = match self.next_metadata_command_id(pg_id) {
+                    Ok(command_id) => command_id,
+                    Err(StoreError::MetadataCommandLogConflict { .. }) => continue,
+                    Err(error) => return Err(BucketWriteDrainError::from(error)),
+                };
                 let bucket_pg = node.get_pg(pg_id.get())?;
                 let current = bucket_pg.head_bucket_record_raw(bucket)?;
                 let bucket_execution_generation =
