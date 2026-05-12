@@ -2703,6 +2703,10 @@ Proposed subphases:
      - slot installed, no replica applied
      - non-primary applied, primary not applied
      - primary applied, pending slot still present
+       - status: local-cluster reopen now covers the crash shape where the
+         command is terminal on the acting set and the primary durable pending
+         slot survived; replay validation must clean the slot and preserve the
+         applied metadata
      - abandoned row written, replica state not advanced
      - terminal row present, slot not removed
      - reopen after each state

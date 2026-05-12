@@ -4103,6 +4103,58 @@ mod tests {
     }
 
     #[test]
+    fn local_cluster_reopen_cleans_terminal_primary_pending_slot() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let bucket = {
+            let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+            let topology = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "terminal-primary-pending-slot-");
+            let map = Arc::new(map);
+            let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            let command = create_bucket_metadata_command(PgId::new(1), 1, bucket.clone());
+            cluster
+                .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(0), &command)
+                .unwrap();
+            let primary_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            primary_pg
+                .try_insert_pending_metadata_command_slot(
+                    NodeId::new(0).as_u32(),
+                    &command,
+                    Some(&bucket),
+                )
+                .unwrap();
+            bucket
+        };
+
+        let reopened = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        assert_clean_metadata_command_stream(&reopened, &[1]);
+        for node_id in node_ids {
+            let pg = reopened
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            crate::PgMetadataStore::head_bucket(&*pg, &bucket).unwrap();
+            assert!(pg
+                .pending_metadata_command_slot(node_id.as_u32(), ClusterEpoch::INITIAL)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
     fn local_cluster_reopen_rejects_reordered_applied_command_log_entry() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
