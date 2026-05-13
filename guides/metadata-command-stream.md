@@ -117,7 +117,11 @@ log index where every advanced replica has accepted exactly that command,
 chained from the primary's current log hash, all unadvanced replicas match the
 primary's current replica state, and all advanced replicas agree on the full
 post-command replica state including the materialized-state digest. Any other
-prefix or digest disagreement remains a fail-closed divergence.
+prefix or digest disagreement remains a fail-closed divergence. When the
+in-flight exception is accepted, open-time recovery must converge that command
+and remove the primary pending slot before returning the cluster map; read-only
+paths must never serve stale primary materialized rows while relying on the
+advanced replicas' command log state.
 
 ## Publisher Classification
 
@@ -311,6 +315,14 @@ state:
 - if any acting-set replica accepted, mutated, or logged the command, recovery
   must converge that same command to a terminal durable record; it must not
   abandon the command and issue a later replacement
+- recovery convergence must use the same primary-last apply ordering as normal
+  command fanout. A terminal primary log row is not sufficient reason to clean
+  the primary pending slot until all required replicas have either converged or
+  the PG has failed closed for repair.
+- open-time command convergence only proves metadata convergence. Any
+  post-commit best-effort physical payload cleanup that would normally run
+  after the command commits can still require the later scavenger path, just as
+  it would after a crash between metadata commit and cleanup.
 - if a terminal log record exists for the slot, finish slot cleanup
 - if a replica has a contiguous abandoned log tail but no pending slot,
   advance the replica index/hash across that abandoned tail while preserving

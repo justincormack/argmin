@@ -773,6 +773,12 @@ enum PendingMetadataCommandSlotAction {
     AdvanceAbandonedThenClean,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingMetadataCommandSlotCleanup {
+    CleanTerminal,
+    PreserveTerminal,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MetadataCommandRecordResult {
     state: MetadataCommandReplicaState,
@@ -1748,6 +1754,31 @@ impl PgStore {
         node_id: u32,
         cluster_epoch: ClusterEpoch,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
+        self.validate_metadata_command_replay_state_with_pending_cleanup(
+            node_id,
+            cluster_epoch,
+            PendingMetadataCommandSlotCleanup::CleanTerminal,
+        )
+    }
+
+    pub(crate) fn validate_metadata_command_replay_state_preserving_pending_slot(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        self.validate_metadata_command_replay_state_with_pending_cleanup(
+            node_id,
+            cluster_epoch,
+            PendingMetadataCommandSlotCleanup::PreserveTerminal,
+        )
+    }
+
+    fn validate_metadata_command_replay_state_with_pending_cleanup(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+        pending_cleanup: PendingMetadataCommandSlotCleanup,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
         let mut state = self.metadata_command_replica_state()?;
         let pg_id = PgId::new(self.pg_id);
         if state.cluster_epoch != cluster_epoch {
@@ -1762,7 +1793,9 @@ impl PgStore {
             match self.validate_pending_metadata_command_slot_relation(node_id, &state, &slot)? {
                 PendingMetadataCommandSlotAction::Unresolved => {}
                 PendingMetadataCommandSlotAction::CleanTerminal => {
-                    self.remove_pending_metadata_command_slot_exact(node_id, &slot)?;
+                    if pending_cleanup == PendingMetadataCommandSlotCleanup::CleanTerminal {
+                        self.remove_pending_metadata_command_slot_exact(node_id, &slot)?;
+                    }
                 }
                 PendingMetadataCommandSlotAction::AdvanceAbandonedThenClean => {
                     state = self.advance_abandoned_metadata_command_log_tail(
