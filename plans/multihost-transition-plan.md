@@ -2958,7 +2958,12 @@ Proposed subphases:
       - status: in progress. `finalize_upload_part_stream` now uses the
         snapshot-sensitive install/drain loop and reloads stream session, MPU,
         existing part, staged segment, and displaced-part state after
-        contention before rebuilding `CommitStreamPart`.
+        contention before rebuilding `CommitStreamPart`. Coverage now includes
+        duplicate finalize retry through a matching pending command, same-part
+        replacement with displaced payload cleanup, and finalize losing the
+        object-PG slot to both abort and complete terminal commands. It also
+        covers the crash shape where a matching terminal `CommitStreamPart`
+        command applied but the durable pending slot survived.
       - convert `finalize_upload_part_stream` to the snapshot-sensitive
         install-or-drain shape:
         - reload the stream session, MPU row, existing part row, staged segment

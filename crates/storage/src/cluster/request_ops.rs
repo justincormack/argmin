@@ -3079,6 +3079,10 @@ impl super::StorageCluster {
                                     self.apply_pending_object_metadata_command_for_bucket(
                                         pg_id, bucket, &command,
                                     )?;
+                                    self.remove_pending_metadata_command_for_bucket(
+                                        pg_id, bucket, &command,
+                                    )
+                                    .map_err(ObjectPgActionError::from)?;
                                     continue;
                                 }
                                 PgMetadataStore::get_object_version(
@@ -4719,7 +4723,17 @@ impl super::StorageCluster {
                 });
 
             let object_pg = primary_node.get_pg(pg_id.get())?;
-            let session = object_pg.get_stream_upload(session_id)?;
+            let session = match object_pg.get_stream_upload(session_id) {
+                Ok(session) => session,
+                Err(MetadataError::StreamSessionNotFound { .. })
+                    if let Some(command) = pending_command.clone() =>
+                {
+                    drop(object_pg);
+                    self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             if session.state != StreamUploadState::InProgress {
                 return Err(ObjectPgActionError::InvalidRequest {
                     reason: "stream session is not in progress".to_string(),
@@ -5780,6 +5794,7 @@ impl super::StorageCluster {
         let _bucket_guard = primary_node.lock_bucket(bucket);
 
         loop {
+            let mut pending_command = None;
             while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 let is_matching_stream_part_commit = matches!(
                     command.payload(),
@@ -5787,29 +5802,26 @@ impl super::StorageCluster {
                         if commit.matches_request(bucket, key, upload_id, session_id, part_number)
                 );
                 if is_matching_stream_part_commit {
+                    pending_command = Some(command);
                     break;
                 }
                 self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             }
 
-            let pending_command = self
-                .pending_metadata_command_for_bucket(pg_id, bucket)?
-                .filter(|command| {
-                    matches!(
-                        command.payload(),
-                        MetadataCommandPayload::CommitStreamPart(commit)
-                            if commit.matches_request(
-                                bucket,
-                                key,
-                                upload_id,
-                                session_id,
-                                part_number
-                            )
-                    )
-                });
-
             let object_pg = primary_node.get_pg(pg_id.get())?;
-            let session = object_pg.get_stream_upload(session_id)?;
+            let session = match object_pg.get_stream_upload(session_id) {
+                Ok(session) => session,
+                Err(MetadataError::StreamSessionNotFound { .. })
+                    if let Some(command) = pending_command.clone() =>
+                {
+                    drop(object_pg);
+                    self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                    self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                        .map_err(ObjectPgActionError::from)?;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             Self::validate_upload_part_stream_session(
                 &session,
                 bucket,
