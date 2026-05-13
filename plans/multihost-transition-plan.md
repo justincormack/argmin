@@ -2623,17 +2623,19 @@ Proposed subphases:
    - goal: turn the recent command construction, pending-slot contention,
      reissue, and replica convergence review findings into reusable
      guardrails before adding more multipart command complexity
-   - status: reopened for finish/convergence hardening before Phase 9.3. The
+   - status: complete for the Phase 9.2H hardening scope. The
      publisher/path inventory, non-multipart snapshot-sensitive retry shape,
      stream upload command/runtime split, reissue model, crash-step coverage,
      stateful trace coverage, and mechanical boundary checks are in place.
      Multipart and UploadPart publishers are explicitly inventoried as Phase
      9.3 deferrals where they still use multipart-specific `set_pending...` or
-     `try_set...` shapes. A later bucket-delete race showed that Phase 9.2H
-     also needs an explicit finish/convergence pass: a command can partially
-     apply and then surface a command-log conflict while the request is
-     finishing, which is a different class from stale snapshot or pending-slot
-     install contention.
+     `try_set...` shapes. The follow-up finish/convergence pass is also in
+     place: command-log conflicts surfaced while finishing a partially applied
+     command are classified separately from pending-slot install contention,
+     broad conflict matching is mechanically inventoried, and tests cover
+     partial exact-command retry, divergent same-index fail-closed behavior,
+     normal pending-command retry, and terminal pending-slot cleanup before a
+     later command.
    - freeze Phase 9.2 semantics in
      [metadata-command-stream.md](../guides/metadata-command-stream.md) as
      invariants rather than implementation notes:
@@ -2791,6 +2793,13 @@ Proposed subphases:
        variant directly is allowed only in named helpers that prove command
        identity and hash-chain state, or in allocation paths that immediately
        restart before publishing state.
+     - status: finish/convergence paths are documented in
+       [metadata-command-stream.md](../guides/metadata-command-stream.md), the
+       boundary script inventories every production command-log conflict
+       match, and local-cluster tests cover partial exact `MarkBucketDeleting`
+       retry, divergent same-index bucket-delete and bucket-update
+       fail-closed behavior, ordinary partial bucket-command retry, and
+       terminal pending-slot cleanup before a later bucket command.
    - expand the local-cluster stateful model to include two handles,
      pending-slot contention, reissue, zero-apply abandon, partial
      primary-last apply, restart/open validation, and stale-handle attempts

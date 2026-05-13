@@ -3533,6 +3533,7 @@ mod tests {
                 .unwrap()
                 .is_none());
         }
+        assert_clean_metadata_command_stream(&map, &[1]);
     }
 
     #[test]
@@ -16212,6 +16213,59 @@ mod tests {
                 acl_updated.bucket_execution_generation
             );
         }
+        assert_clean_metadata_command_stream(&map, &[1]);
+    }
+
+    #[test]
+    fn bucket_update_cleans_terminal_pending_slot_before_new_command() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "terminal-pending-next-op-");
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let command = create_bucket_metadata_command(pg_id, 1, bucket.clone());
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(0), &command)
+            .unwrap();
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+        assert!(
+            pending_metadata_command_for_test(&map, pg_id, &bucket).is_some(),
+            "test setup should leave a terminal durable pending slot"
+        );
+
+        let updated = cluster
+            .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+            .unwrap();
+
+        assert_eq!(updated.versioning, crate::BucketVersioningState::Enabled);
+        assert!(updated.bucket_execution_generation > 1);
+        assert!(
+            pending_metadata_command_for_test(&map, pg_id, &bucket).is_none(),
+            "later bucket operation should clean the terminal slot before publishing its command"
+        );
+        for node_id in node_ids {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(pg_id.get())
+                .unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.versioning, crate::BucketVersioningState::Enabled);
+            assert_eq!(
+                info.bucket_execution_generation,
+                updated.bucket_execution_generation
+            );
+        }
+        assert_clean_metadata_command_stream(&map, &[pg_id.get()]);
     }
 
     #[test]
