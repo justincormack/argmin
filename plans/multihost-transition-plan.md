@@ -3108,9 +3108,13 @@ Proposed subphases:
         part segment rows that are backed by a live multipart object manifest.
         It also verifies the expected completed-upload idempotence record shape
         across acting nodes. The initial trace model drives real
-        `StorageCluster` create/upload-part/complete/abort/reopen APIs for one
-        bucket/key and checks terminal invariants after generated terminal
-        outcomes.
+        `StorageCluster` create/upload-part/complete/abort/reopen APIs. It now
+        covers multiple concurrent uploads in one bucket, keys on two object
+        PGs with different primaries, repeated streamed parts, and
+        UploadPartCopy-shaped copied parts represented as multi-segment
+        UploadPart stream state before finalization. Terminal abort/complete
+        outcomes check the lifecycle invariants after generated operations and
+        across reopen.
       - add a multipart command-stream invariant checker that extends the Phase
         9.2 clean-stream helper with upload lifecycle checks:
         - no active `stream_uploads` or `stream_upload_segments` remain for a
