@@ -5,6 +5,7 @@ Thumbs.db
 *.swp
 .vscode/
 .codex
+nohup.out
 # ignore tmp and build directories
 tmp/
 /target/
