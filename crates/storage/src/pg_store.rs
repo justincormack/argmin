@@ -8856,6 +8856,11 @@ impl PgMetadataStore for PgStore {
                     source,
                 })?;
             let Some(state) = state else {
+                let _ = observability::event(
+                    TRACE_TARGET,
+                    "pg_delete_finalized_bucket_missing",
+                    Some(format_args!("pg_id={} bucket={:?}", self.pg_id, name)),
+                );
                 return Ok(0);
             };
             let state = BucketState::from_u8(state).ok_or_else(|| MetadataError::Db {
@@ -8863,6 +8868,14 @@ impl PgMetadataStore for PgStore {
                 source: rusqlite::Error::InvalidQuery,
             })?;
             if state != BucketState::Deleting {
+                let _ = observability::event(
+                    TRACE_TARGET,
+                    "pg_delete_finalized_bucket_wrong_state",
+                    Some(format_args!(
+                        "pg_id={} bucket={:?} state={:?}",
+                        self.pg_id, name, state
+                    )),
+                );
                 return Err(MetadataError::BucketNotFinalizedForDelete { state });
             }
             let deleted = self
@@ -8915,6 +8928,14 @@ impl PgMetadataStore for PgStore {
         if deleted == 0 {
             return Err(bucket_not_found(name.as_str()));
         }
+        let _ = observability::event(
+            TRACE_TARGET,
+            "pg_delete_finalized_bucket_deleted",
+            Some(format_args!(
+                "pg_id={} bucket={:?} deleted={}",
+                self.pg_id, name, deleted
+            )),
+        );
         Ok(())
     }
 

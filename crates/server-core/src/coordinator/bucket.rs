@@ -73,6 +73,14 @@ impl Coordinator {
             authorized.acl_grants,
             authorized.object_lock_enabled,
         )?;
+        let _ = observability::event(
+            TRACE_TARGET,
+            "bucket_create_storage_outcome",
+            Some(format_args!(
+                "bucket={:?} outcome={:?}",
+                authorized.name, create_outcome
+            )),
+        );
         match create_outcome {
             BucketCreateOutcome::Created => {
                 self.put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
@@ -297,12 +305,32 @@ impl Coordinator {
             req.name
         );
         let AuthorizedDeleteBucket { name } = self.authorize_delete_bucket(req)?;
-        self.storage_node
-            .begin_bucket_delete(&name)
-            .map_err(Self::map_bucket_write_drain_error)?;
+        let _ = observability::event(
+            TRACE_TARGET,
+            "bucket_delete_authorized",
+            Some(format_args!("bucket={:?}", name)),
+        );
+        if let Err(err) = self.storage_node.begin_bucket_delete(&name) {
+            let _ = observability::event(
+                TRACE_TARGET,
+                "bucket_delete_begin_failed",
+                Some(format_args!("bucket={:?} error={:?}", name, err)),
+            );
+            return Err(Self::map_bucket_write_drain_error(err));
+        }
+        let _ = observability::event(
+            TRACE_TARGET,
+            "bucket_delete_marked",
+            Some(format_args!("bucket={:?}", name)),
+        );
         self.remove_bucket_fast_path(&name);
         self.read_runtime()
             .enqueue_bucket_delete_finalize_for(&name);
+        let _ = observability::event(
+            TRACE_TARGET,
+            "bucket_delete_finalize_enqueued",
+            Some(format_args!("bucket={:?}", name)),
+        );
         Ok(())
     }
 

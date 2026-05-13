@@ -1048,6 +1048,11 @@ impl super::StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
+        let _ = observability::event(
+            super::TRACE_TARGET,
+            "bucket_finalize_delete_start",
+            Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
+        );
         let mut nodes = self
             .local_map
             .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?;
@@ -1059,20 +1064,70 @@ impl super::StorageCluster {
         nodes.sort_by_key(|node| node.node_id() == primary_node_id);
 
         for node in nodes {
+            let node_id = node.node_id();
             let pg = node.storage_node().get_pg(pg_id.get())?;
             match PgMetadataStore::delete_finalized_bucket(&*pg, bucket) {
                 Ok(()) => {
                     pg.refresh_metadata_command_state_digest()?;
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "bucket_finalize_delete_node_ok",
+                        Some(format_args!(
+                            "bucket={:?} pg_id={} node_id={:?}",
+                            bucket,
+                            pg_id.get(),
+                            node_id
+                        )),
+                    );
                 }
                 Err(crate::error::MetadataError::BucketNotFound { .. })
-                    if node.node_id() == primary_node_id =>
+                    if node_id == primary_node_id =>
                 {
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "bucket_finalize_delete_primary_missing",
+                        Some(format_args!(
+                            "bucket={:?} pg_id={} node_id={:?}",
+                            bucket,
+                            pg_id.get(),
+                            node_id
+                        )),
+                    );
                     return Ok(BucketDeleteFinalizeOutcome::NotFound);
                 }
-                Err(crate::error::MetadataError::BucketNotFound { .. }) => {}
-                Err(other) => return Err(other.into()),
+                Err(crate::error::MetadataError::BucketNotFound { .. }) => {
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "bucket_finalize_delete_replica_missing",
+                        Some(format_args!(
+                            "bucket={:?} pg_id={} node_id={:?}",
+                            bucket,
+                            pg_id.get(),
+                            node_id
+                        )),
+                    );
+                }
+                Err(other) => {
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "bucket_finalize_delete_node_error",
+                        Some(format_args!(
+                            "bucket={:?} pg_id={} node_id={:?} error={:?}",
+                            bucket,
+                            pg_id.get(),
+                            node_id,
+                            other
+                        )),
+                    );
+                    return Err(other.into());
+                }
             }
         }
+        let _ = observability::event(
+            super::TRACE_TARGET,
+            "bucket_finalize_delete_done",
+            Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
+        );
         Ok(BucketDeleteFinalizeOutcome::Finalized)
     }
 
@@ -1187,6 +1242,11 @@ impl super::StorageCluster {
     pub fn begin_bucket_delete(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let node = self.bucket_metadata_primary_node(bucket)?;
+        let _ = observability::event(
+            super::TRACE_TARGET,
+            "bucket_delete_begin_start",
+            Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
+        );
         let drain = node.begin_bucket_write_drain(bucket)?;
         crate::node::maybe_run_after_begin_bucket_delete_drain_hook(bucket);
 
@@ -1290,6 +1350,11 @@ impl super::StorageCluster {
                     continue;
                 }
                 if self.bucket_has_visible_data(bucket, true)? {
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "bucket_delete_begin_not_empty",
+                        Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
+                    );
                     return Err(crate::error::MetadataError::BucketNotEmpty.into());
                 }
                 #[cfg(test)]
@@ -1337,6 +1402,11 @@ impl super::StorageCluster {
 
             node.notify_bucket_coordination_change(bucket);
             drain.persist();
+            let _ = observability::event(
+                super::TRACE_TARGET,
+                "bucket_delete_begin_done",
+                Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
+            );
             return Ok(());
         }
     }
@@ -1346,6 +1416,15 @@ impl super::StorageCluster {
         bucket: &BucketName,
     ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
         let bucket_node = self.bucket_metadata_primary_node(bucket)?;
+        let _ = observability::event(
+            super::TRACE_TARGET,
+            "bucket_finalize_start",
+            Some(format_args!(
+                "bucket={:?} bucket_pg_id={}",
+                bucket,
+                self.bucket_metadata_pg_id(bucket)
+            )),
+        );
         let _bucket_guard = bucket_node.lock_bucket(bucket);
         let bucket_pg_id = self.bucket_metadata_pg_id(bucket);
         {
@@ -1353,16 +1432,34 @@ impl super::StorageCluster {
             let info = match PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket) {
                 Ok(info) => info,
                 Err(crate::error::MetadataError::BucketNotFound { .. }) => {
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "bucket_finalize_not_found",
+                        Some(format_args!("bucket={:?} pg_id={}", bucket, bucket_pg_id)),
+                    );
                     return Ok(BucketDeleteFinalizeOutcome::NotFound);
                 }
                 Err(other) => return Err(other.into()),
             };
             if info.state != BucketState::Deleting {
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "bucket_finalize_not_deleting",
+                    Some(format_args!(
+                        "bucket={:?} pg_id={} state={:?}",
+                        bucket, bucket_pg_id, info.state
+                    )),
+                );
                 return Ok(BucketDeleteFinalizeOutcome::NotDeleting);
             }
         }
 
         if self.bucket_has_visible_data(bucket, false)? {
+            let _ = observability::event(
+                super::TRACE_TARGET,
+                "bucket_finalize_pending_visible_data",
+                Some(format_args!("bucket={:?} pg_id={}", bucket, bucket_pg_id)),
+            );
             return Ok(BucketDeleteFinalizeOutcome::Pending);
         }
 
@@ -1385,6 +1482,19 @@ impl super::StorageCluster {
                 .bucket_object_payload_lease_count(bucket)
                 != 0
         {
+            let _ = observability::event(
+                super::TRACE_TARGET,
+                "bucket_finalize_pending_reclaim",
+                Some(format_args!(
+                    "bucket={:?} pg_id={} reclaim_roots={} lease_count={}",
+                    bucket,
+                    bucket_pg_id,
+                    reclaim_roots.len(),
+                    self.local_map
+                        .runtime_state()
+                        .bucket_object_payload_lease_count(bucket)
+                )),
+            );
             return Ok(BucketDeleteFinalizeOutcome::Pending);
         }
 

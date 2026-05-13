@@ -46,6 +46,7 @@ struct LocalTraceConfig {
     enabled: bool,
     filter: Option<String>,
     file: Option<String>,
+    sync_file: bool,
 }
 
 struct LocalTraceEnvInputs {
@@ -56,6 +57,8 @@ struct LocalTraceEnvInputs {
     s3_test_trace_filter: Option<std::ffi::OsString>,
     s3_test_trace_file: Option<std::ffi::OsString>,
     s3_test_trace_dir: Option<std::ffi::OsString>,
+    argmin_trace_sync: Option<std::ffi::OsString>,
+    s3_test_trace_sync: Option<std::ffi::OsString>,
     binary_name: String,
 }
 
@@ -306,19 +309,25 @@ fn configure_local_tracing() {
         s3_test_trace_filter: std::env::var_os("S3_TEST_TRACE_FILTER"),
         s3_test_trace_file: std::env::var_os("S3_TEST_TRACE_FILE"),
         s3_test_trace_dir: std::env::var_os("S3_TEST_TRACE_DIR"),
+        argmin_trace_sync: std::env::var_os("ARGMIN_TRACE_SYNC"),
+        s3_test_trace_sync: std::env::var_os("S3_TEST_TRACE_SYNC"),
         binary_name: current_test_binary_name(),
     });
-    let _ = observability::configure(
+    let _ = observability::configure_with_options(
         config.enabled,
         config.filter.as_deref(),
         config.file.as_deref(),
+        config.sync_file,
     );
 }
 
 fn resolve_local_trace_config(inputs: LocalTraceEnvInputs) -> LocalTraceConfig {
-    let enabled = normalize_env_value(inputs.argmin_trace)
-        .or_else(|| normalize_env_value(inputs.s3_test_trace))
-        .is_some_and(|value| trace_enabled(&value));
+    let argmin_trace = normalize_env_value(inputs.argmin_trace);
+    let s3_test_trace = normalize_env_value(inputs.s3_test_trace);
+    let enabled = argmin_trace
+        .as_deref()
+        .or(s3_test_trace.as_deref())
+        .is_some_and(trace_enabled);
     let filter = normalize_env_value(inputs.argmin_trace_filter)
         .or_else(|| normalize_env_value(inputs.s3_test_trace_filter));
     let file = normalize_env_value(inputs.argmin_trace_file)
@@ -330,11 +339,18 @@ fn resolve_local_trace_config(inputs: LocalTraceEnvInputs) -> LocalTraceConfig {
                     .to_string()
             })
         });
+    let sync_file = normalize_env_value(inputs.argmin_trace_sync)
+        .or_else(|| normalize_env_value(inputs.s3_test_trace_sync))
+        .map(|value| trace_enabled(&value))
+        .unwrap_or_else(|| {
+            enabled && argmin_trace.is_none() && s3_test_trace.is_some() && file.is_some()
+        });
 
     LocalTraceConfig {
         enabled,
         filter,
         file,
+        sync_file,
     }
 }
 
@@ -404,6 +420,8 @@ mod tests {
             s3_test_trace_filter: Some("server_http".into()),
             s3_test_trace_file: Some("/tmp/ignored.trace".into()),
             s3_test_trace_dir: Some("/tmp/ignored-dir".into()),
+            argmin_trace_sync: None,
+            s3_test_trace_sync: None,
             binary_name: "copy_object-test".to_string(),
         });
         assert_eq!(
@@ -412,6 +430,7 @@ mod tests {
                 enabled: true,
                 filter: Some("server_core".to_string()),
                 file: Some("/tmp/already-set.trace".to_string()),
+                sync_file: false,
             }
         );
     }
@@ -426,6 +445,8 @@ mod tests {
             s3_test_trace_filter: Some("server_http,server_core".into()),
             s3_test_trace_file: Some("/tmp/test.trace".into()),
             s3_test_trace_dir: Some("/tmp/trace-dir".into()),
+            argmin_trace_sync: None,
+            s3_test_trace_sync: None,
             binary_name: "copy_object-test".to_string(),
         });
         assert_eq!(
@@ -434,6 +455,7 @@ mod tests {
                 enabled: true,
                 filter: Some("server_http,server_core".to_string()),
                 file: Some("/tmp/test.trace".to_string()),
+                sync_file: true,
             }
         );
     }
@@ -448,6 +470,8 @@ mod tests {
             s3_test_trace_filter: None,
             s3_test_trace_file: None,
             s3_test_trace_dir: Some("/tmp/trace-dir".into()),
+            argmin_trace_sync: None,
+            s3_test_trace_sync: None,
             binary_name: "copy_object-test".to_string(),
         });
         assert_eq!(
@@ -456,6 +480,7 @@ mod tests {
                 enabled: true,
                 filter: None,
                 file: Some("/tmp/trace-dir/copy_object-test.trace".to_string()),
+                sync_file: true,
             }
         );
     }
@@ -470,6 +495,8 @@ mod tests {
             s3_test_trace_filter: Some("server_core".into()),
             s3_test_trace_file: Some("/tmp/test.trace".into()),
             s3_test_trace_dir: None,
+            argmin_trace_sync: None,
+            s3_test_trace_sync: None,
             binary_name: "copy_object-test".to_string(),
         });
         assert_eq!(
@@ -478,6 +505,32 @@ mod tests {
                 enabled: false,
                 filter: Some("server_core".to_string()),
                 file: Some("/tmp/test.trace".to_string()),
+                sync_file: false,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_local_trace_config_respects_explicit_sync_override() {
+        let config = resolve_local_trace_config(LocalTraceEnvInputs {
+            argmin_trace: None,
+            argmin_trace_filter: None,
+            argmin_trace_file: None,
+            s3_test_trace: Some("true".into()),
+            s3_test_trace_filter: None,
+            s3_test_trace_file: Some("/tmp/test.trace".into()),
+            s3_test_trace_dir: None,
+            argmin_trace_sync: None,
+            s3_test_trace_sync: Some("false".into()),
+            binary_name: "copy_object-test".to_string(),
+        });
+        assert_eq!(
+            config,
+            LocalTraceConfig {
+                enabled: true,
+                filter: None,
+                file: Some("/tmp/test.trace".to_string()),
+                sync_file: false,
             }
         );
     }

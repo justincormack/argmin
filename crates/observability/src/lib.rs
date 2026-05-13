@@ -69,6 +69,7 @@ struct TraceConfig {
     enabled: bool,
     filters: Box<[Box<str>]>,
     file_path: Option<Box<str>>,
+    sync_file: bool,
 }
 
 static TRACE_CONFIG: OnceLock<TraceConfig> = OnceLock::new();
@@ -192,6 +193,7 @@ fn init_trace_sink(config: &TraceConfig) -> TraceSink {
     }
 
     match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(file) if config.sync_file => TraceSink::SyncFile(Mutex::new(BufWriter::new(file))),
         Ok(file) => match AsyncTraceSink::new(file) {
             Ok(sink) => TraceSink::AsyncFile(sink),
             Err(err) => {
@@ -237,6 +239,9 @@ fn parse_trace_config_from_env() -> TraceConfig {
         enabled,
         filters,
         file_path,
+        sync_file: std::env::var("ARGMIN_TRACE_SYNC")
+            .ok()
+            .is_some_and(|value| matches_enabled(value.trim())),
     }
 }
 
@@ -552,11 +557,21 @@ pub fn emit_multipart_completion_bucket_lock_wait_exceeded<T: fmt::Debug>(
 }
 
 pub fn configure(enabled: bool, filter: Option<&str>, file_path: Option<&str>) -> bool {
+    configure_with_options(enabled, filter, file_path, false)
+}
+
+pub fn configure_with_options(
+    enabled: bool,
+    filter: Option<&str>,
+    file_path: Option<&str>,
+    sync_file: bool,
+) -> bool {
     TRACE_CONFIG_OVERRIDE
         .set(TraceConfig {
             enabled,
             filters: parse_filters(filter),
             file_path: normalize_file_path(file_path),
+            sync_file,
         })
         .is_ok()
 }
@@ -568,6 +583,7 @@ fn write_trace_line(args: fmt::Arguments<'_>) {
         TraceSink::SyncFile(file) => {
             let mut file = file.lock().unwrap_or_else(|err| err.into_inner());
             let _ = writeln!(file, "{args}");
+            let _ = file.flush();
         }
     }
 }
@@ -745,6 +761,41 @@ impl Drop for TraceScope {
             self.start.elapsed().as_micros()
         ));
     }
+}
+
+#[must_use]
+pub fn event(target: &'static str, name: &'static str, fields: Option<fmt::Arguments<'_>>) -> bool {
+    if !tracing_enabled_for(target) {
+        return false;
+    }
+
+    let current = TRACE_STATE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|state| (state.context.trace_id().to_owned(), state.depth))
+    });
+    let (trace_id, depth) = current.unwrap_or_else(|| ("background".to_string(), 0));
+    if let Some(fields) = fields {
+        write_trace_line(format_args!(
+            "trace ts_us={} trace_id={} depth={} event={} target={} {}",
+            unix_micros(),
+            trace_id,
+            depth,
+            name,
+            target,
+            fields
+        ));
+    } else {
+        write_trace_line(format_args!(
+            "trace ts_us={} trace_id={} depth={} event={} target={}",
+            unix_micros(),
+            trace_id,
+            depth,
+            name,
+            target
+        ));
+    }
+    true
 }
 
 #[must_use]
