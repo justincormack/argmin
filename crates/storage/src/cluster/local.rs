@@ -3799,6 +3799,7 @@ mod tests {
         UploadCopiedPart { slot_seed: u8, payload_seed: u8 },
         Complete { slot_seed: u8 },
         Abort { slot_seed: u8 },
+        DeleteRecreateBucket,
         Reopen,
     }
 
@@ -3825,6 +3826,7 @@ mod tests {
                 }),
                 2 => any::<u8>().prop_map(|slot_seed| MultipartTraceOp::Complete { slot_seed }),
                 2 => any::<u8>().prop_map(|slot_seed| MultipartTraceOp::Abort { slot_seed }),
+                1 => Just(MultipartTraceOp::DeleteRecreateBucket),
                 1 => Just(MultipartTraceOp::Reopen),
             ],
             1..=16,
@@ -4073,6 +4075,24 @@ mod tests {
         Ok(())
     }
 
+    fn delete_recreate_multipart_trace_bucket(
+        cluster: &crate::StorageCluster,
+        map: &LocalClusterMap,
+        bucket: &crate::BucketName,
+    ) -> TestCaseResult {
+        cluster
+            .begin_bucket_delete(bucket)
+            .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+        let outcome = cluster
+            .try_finalize_bucket_delete(bucket)
+            .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+        prop_assert_eq!(outcome, crate::BucketDeleteFinalizeOutcome::Finalized);
+        assert_clean_metadata_command_stream(map, &[1]);
+        create_test_bucket(cluster, bucket);
+        assert_clean_metadata_command_stream(map, &[1]);
+        Ok(())
+    }
+
     fn run_multipart_trace(ops: &[MultipartTraceOp]) -> TestCaseResult {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -4100,6 +4120,7 @@ mod tests {
         create_test_bucket(&cluster, &bucket);
 
         let mut active_uploads: [Option<MultipartTraceUpload>; 3] = [None, None, None];
+        let mut completed_object_exists = false;
         for (step, op) in ops.iter().enumerate() {
             match op {
                 MultipartTraceOp::Create {
@@ -4181,6 +4202,7 @@ mod tests {
                         continue;
                     }
                     complete_multipart_trace_upload(&cluster, &map, &node_ids, &bucket, &upload)?;
+                    completed_object_exists = true;
                 }
                 MultipartTraceOp::Abort { slot_seed } => {
                     let slot = multipart_trace_slot(*slot_seed);
@@ -4188,6 +4210,12 @@ mod tests {
                         continue;
                     };
                     abort_multipart_trace_upload(&cluster, &map, &node_ids, &bucket, &upload)?;
+                }
+                MultipartTraceOp::DeleteRecreateBucket => {
+                    if completed_object_exists || active_uploads.iter().any(Option::is_some) {
+                        continue;
+                    }
+                    delete_recreate_multipart_trace_bucket(&cluster, &map, &bucket)?;
                 }
                 MultipartTraceOp::Reopen => {
                     drop(cluster);
@@ -4225,6 +4253,30 @@ mod tests {
         ) {
             run_multipart_trace(&ops)?;
         }
+    }
+
+    #[test]
+    fn multipart_trace_exercises_bucket_delete_recreate() {
+        run_multipart_trace(&[
+            MultipartTraceOp::DeleteRecreateBucket,
+            MultipartTraceOp::Create {
+                slot_seed: 0,
+                key_seed: 0,
+            },
+            MultipartTraceOp::Abort { slot_seed: 0 },
+            MultipartTraceOp::DeleteRecreateBucket,
+            MultipartTraceOp::Reopen,
+            MultipartTraceOp::Create {
+                slot_seed: 1,
+                key_seed: 1,
+            },
+            MultipartTraceOp::UploadCopiedPart {
+                slot_seed: 1,
+                payload_seed: 9,
+            },
+            MultipartTraceOp::Complete { slot_seed: 1 },
+        ])
+        .unwrap();
     }
 
     #[test]
