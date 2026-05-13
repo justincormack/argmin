@@ -1158,7 +1158,8 @@ fn validate_metadata_command_replay_state(
             .get(&pg_id)
             .expect("validated PG id should have a route")
             .primary_node_id();
-        let mut reference: Option<(NodeId, MetadataCommandReplicaState)> = None;
+        let mut replica_states = Vec::new();
+        let mut primary_pending_command = None;
         for node in nodes.values() {
             let node_id = node.node_id();
             let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
@@ -1173,28 +1174,6 @@ fn validate_metadata_command_replay_state(
                     node_id: node_id.as_u32(),
                     source,
                 })?;
-            if let Some((reference_node_id, reference_state)) = reference {
-                if state != reference_state {
-                    return Err(ClusterBuildError::OpenLocalNode {
-                        node_id: node_id.as_u32(),
-                        source: StoreError::MetadataCommandReplicaStateDiverged {
-                            node_id: node_id.as_u32(),
-                            reference_node_id: reference_node_id.as_u32(),
-                            pg_id: pg_id.get(),
-                            cluster_epoch: state.cluster_epoch,
-                            reference_cluster_epoch: reference_state.cluster_epoch,
-                            applied_log_index: state.applied_log_index,
-                            reference_applied_log_index: reference_state.applied_log_index,
-                            applied_log_hash: state.applied_log_hash,
-                            reference_applied_log_hash: reference_state.applied_log_hash,
-                            state_digest: state.state_digest,
-                            reference_state_digest: reference_state.state_digest,
-                        },
-                    });
-                }
-            } else {
-                reference = Some((node_id, state));
-            }
             let pending_slot = pg
                 .pending_metadata_command_slot(node_id.as_u32(), cluster_epoch)
                 .map_err(|source| ClusterBuildError::OpenLocalNode {
@@ -1212,9 +1191,184 @@ fn validate_metadata_command_replay_state(
                     },
                 });
             }
+            if pending_slot.is_some() && node_id == primary_node_id {
+                primary_pending_command = pg
+                    .pending_metadata_command_envelope(node_id.as_u32(), cluster_epoch)
+                    .map_err(|source| ClusterBuildError::OpenLocalNode {
+                        node_id: node_id.as_u32(),
+                        source,
+                    })?;
+            }
+            replica_states.push((node_id, state));
+        }
+        validate_metadata_command_replica_agreement_or_in_flight_recovery(
+            nodes,
+            pg_id,
+            primary_node_id,
+            cluster_epoch,
+            &replica_states,
+            primary_pending_command.as_ref(),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_metadata_command_replica_agreement_or_in_flight_recovery(
+    nodes: &BTreeMap<NodeId, LocalNodeStore>,
+    pg_id: PgId,
+    primary_node_id: NodeId,
+    cluster_epoch: ClusterEpoch,
+    replica_states: &[(NodeId, MetadataCommandReplicaState)],
+    primary_pending_command: Option<&MetadataCommandEnvelope>,
+) -> Result<(), ClusterBuildError> {
+    let Some((reference_node_id, reference_state)) = replica_states.first() else {
+        return Ok(());
+    };
+    if replica_states
+        .iter()
+        .all(|(_node_id, state)| state == reference_state)
+    {
+        return Ok(());
+    }
+
+    let primary_state = replica_states
+        .iter()
+        .find_map(|(node_id, state)| (*node_id == primary_node_id).then_some(state))
+        .expect("validated route primary must be in local node set");
+    let Some(command) = primary_pending_command else {
+        let (node_id, state) = first_divergent_replica(replica_states, *reference_node_id);
+        return Err(metadata_command_replica_state_diverged_error(
+            pg_id,
+            node_id,
+            *reference_node_id,
+            state,
+            reference_state,
+        ));
+    };
+    let next_index = primary_state
+        .applied_log_index
+        .checked_add(1)
+        .ok_or_else(|| {
+            metadata_command_replica_state_diverged_error(
+                pg_id,
+                primary_node_id,
+                *reference_node_id,
+                primary_state,
+                reference_state,
+            )
+        })?;
+    if command.id().cluster_epoch() != cluster_epoch
+        || command.id().pg_id() != pg_id
+        || command.id().log_index().get() != next_index
+    {
+        return Err(metadata_command_replica_state_diverged_error(
+            pg_id,
+            primary_node_id,
+            *reference_node_id,
+            primary_state,
+            reference_state,
+        ));
+    }
+
+    let mut advanced_reference: Option<(NodeId, &MetadataCommandReplicaState)> = None;
+    for (node_id, state) in replica_states {
+        if state == primary_state {
+            continue;
+        }
+        if state.cluster_epoch != primary_state.cluster_epoch
+            || state.applied_log_index != next_index
+        {
+            return Err(metadata_command_replica_state_diverged_error(
+                pg_id,
+                *node_id,
+                primary_node_id,
+                state,
+                primary_state,
+            ));
+        }
+        let node = nodes
+            .get(node_id)
+            .expect("replica state node must exist in local node set");
+        let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
+            ClusterBuildError::OpenLocalNode {
+                node_id: node_id.as_u32(),
+                source,
+            }
+        })?;
+        let matches_pending = pg
+            .has_matching_applied_metadata_command_log_entry(
+                node_id.as_u32(),
+                command,
+                primary_state.applied_log_hash,
+            )
+            .map_err(|source| ClusterBuildError::OpenLocalNode {
+                node_id: node_id.as_u32(),
+                source,
+            })?;
+        if !matches_pending {
+            return Err(metadata_command_replica_state_diverged_error(
+                pg_id,
+                *node_id,
+                primary_node_id,
+                state,
+                primary_state,
+            ));
+        }
+        if let Some((advanced_reference_node_id, advanced_reference_state)) = advanced_reference {
+            if state != advanced_reference_state {
+                return Err(metadata_command_replica_state_diverged_error(
+                    pg_id,
+                    *node_id,
+                    advanced_reference_node_id,
+                    state,
+                    advanced_reference_state,
+                ));
+            }
+        } else {
+            advanced_reference = Some((*node_id, state));
         }
     }
     Ok(())
+}
+
+fn first_divergent_replica(
+    replica_states: &[(NodeId, MetadataCommandReplicaState)],
+    reference_node_id: NodeId,
+) -> (NodeId, &MetadataCommandReplicaState) {
+    let reference_state = replica_states
+        .iter()
+        .find_map(|(node_id, state)| (*node_id == reference_node_id).then_some(state))
+        .expect("reference node must be present");
+    replica_states
+        .iter()
+        .find(|(_node_id, state)| *state != *reference_state)
+        .map(|(node_id, state)| (*node_id, state))
+        .expect("caller must provide divergent replica states")
+}
+
+fn metadata_command_replica_state_diverged_error(
+    pg_id: PgId,
+    node_id: NodeId,
+    reference_node_id: NodeId,
+    state: &MetadataCommandReplicaState,
+    reference_state: &MetadataCommandReplicaState,
+) -> ClusterBuildError {
+    ClusterBuildError::OpenLocalNode {
+        node_id: node_id.as_u32(),
+        source: StoreError::MetadataCommandReplicaStateDiverged {
+            node_id: node_id.as_u32(),
+            reference_node_id: reference_node_id.as_u32(),
+            pg_id: pg_id.get(),
+            cluster_epoch: state.cluster_epoch,
+            reference_cluster_epoch: reference_state.cluster_epoch,
+            applied_log_index: state.applied_log_index,
+            reference_applied_log_index: reference_state.applied_log_index,
+            applied_log_hash: state.applied_log_hash,
+            reference_applied_log_hash: reference_state.applied_log_hash,
+            state_digest: state.state_digest,
+            reference_state_digest: reference_state.state_digest,
+        },
+    }
 }
 
 fn validate_local_pg_ids(pg_ids: &[u32]) -> Result<Vec<PgId>, ClusterBuildError> {
@@ -4373,7 +4527,7 @@ mod tests {
     }
 
     #[test]
-    fn local_cluster_reopen_rejects_nonprimary_applied_primary_pending_slot() {
+    fn local_cluster_reopen_rejects_nonprimary_applied_mismatched_primary_pending_slot() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let ec_shape = EcShape { k: 2, m: 1 };
@@ -4384,8 +4538,11 @@ mod tests {
                 .unwrap()
                 .storage_node()
                 .pg_topology();
-            let bucket = bucket_for_pg(topology, 1, "nonprimary-applied-primary-pending-");
+            let bucket = bucket_for_pg(topology, 1, "nonprimary-primary-pending-");
+            let divergent_bucket = bucket_for_pg(topology, 1, "nonprimary-divergent-applied-");
             let command = create_bucket_metadata_command(PgId::new(1), 1, bucket.clone());
+            let divergent_command =
+                create_bucket_metadata_command(PgId::new(1), 1, divergent_bucket);
             let primary_pg = map
                 .node(NodeId::new(0))
                 .unwrap()
@@ -4406,7 +4563,7 @@ mod tests {
                 .get_pg(1)
                 .unwrap();
             nonprimary_pg
-                .apply_metadata_command_and_record(NodeId::new(1).as_u32(), &command)
+                .apply_metadata_command_and_record(NodeId::new(1).as_u32(), &divergent_command)
                 .unwrap();
         }
 
@@ -4421,6 +4578,75 @@ mod tests {
                         reference_node_id: 0,
                         applied_log_index: 1,
                         reference_applied_log_index: 0,
+                        ..
+                    }
+                }
+            ),
+            "unexpected reopen error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn local_cluster_reopen_rejects_inflight_matching_log_with_divergent_advanced_digest() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        {
+            let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+            let topology = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "inflight-divergent-digest-");
+            let command = create_bucket_metadata_command(PgId::new(1), 1, bucket.clone());
+            let primary_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            primary_pg
+                .try_insert_pending_metadata_command_slot(
+                    NodeId::new(0).as_u32(),
+                    &command,
+                    Some(&bucket),
+                )
+                .unwrap();
+            for node_id in [NodeId::new(1), NodeId::new(2)] {
+                let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+                pg.apply_metadata_command_and_record(node_id.as_u32(), &command)
+                    .unwrap();
+            }
+            let divergent_pg = map
+                .node(NodeId::new(2))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            divergent_pg
+                .connection()
+                .execute(
+                    "UPDATE buckets SET public_read = 1 WHERE name = ?1",
+                    rusqlite::params![bucket.as_str()],
+                )
+                .unwrap();
+            divergent_pg
+                .refresh_metadata_command_state_digest()
+                .unwrap();
+        }
+
+        let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClusterBuildError::OpenLocalNode {
+                    node_id: 2,
+                    source: StoreError::MetadataCommandReplicaStateDiverged {
+                        pg_id: 1,
+                        reference_node_id: 1,
+                        applied_log_index: 1,
+                        reference_applied_log_index: 1,
                         ..
                     }
                 }
@@ -6839,7 +7065,7 @@ mod tests {
         let (bucket, key, object_pg, data_pg) =
             bucket_key_with_distinct_object_and_data_pg(topology);
         let occupant_bucket = bucket_for_pg(topology, object_pg, "duplicate-direct-occupant-");
-        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, object_pg, NodeId::new(0));
         set_route_primary(&mut map, data_pg, NodeId::new(2));
 
         let map = Arc::new(map);
@@ -6885,7 +7111,7 @@ mod tests {
         let occupant =
             create_bucket_metadata_command(PgId::new(object_pg), duplicate_index, occupant_bucket);
         cluster
-            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &occupant)
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(0), &occupant)
             .unwrap();
         cluster
             .try_set_pending_metadata_command_for_bucket(
@@ -8209,7 +8435,7 @@ mod tests {
     }
 
     #[test]
-    fn reserve_object_version_partial_apply_after_reopen_fails_closed() {
+    fn reserve_object_version_partial_apply_after_reopen_converges() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let ec_shape = EcShape { k: 2, m: 1 };
@@ -8224,7 +8450,7 @@ mod tests {
                 .pg_topology();
             bucket_key_with_distinct_object_and_data_pg(topology)
         };
-        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, object_pg, NodeId::new(0));
 
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
@@ -8242,7 +8468,7 @@ mod tests {
                     MetadataCommandPayload::ReserveObjectVersion(reservation)
                         if reservation.bucket == hook_bucket
                             && reservation.key == hook_key
-                            && node_id == NodeId::new(1)
+                            && node_id == NodeId::new(0)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -8275,7 +8501,7 @@ mod tests {
 
         assert_object_version_counter_on_acting_nodes(
             &map,
-            &[NodeId::new(0), NodeId::new(2)],
+            &[NodeId::new(1), NodeId::new(2)],
             object_pg,
             &bucket,
             &key,
@@ -8283,7 +8509,7 @@ mod tests {
         );
         assert_object_version_counter_on_acting_nodes(
             &map,
-            &[NodeId::new(1)],
+            &[NodeId::new(0)],
             object_pg,
             &bucket,
             &key,
@@ -8293,24 +8519,33 @@ mod tests {
         drop(cluster);
         drop(map);
 
-        let err =
-            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap_err();
-        match err {
-            ClusterBuildError::OpenLocalNode {
-                source:
-                    StoreError::MetadataCommandReplicaStateDiverged {
-                        pg_id,
-                        applied_log_index,
-                        reference_applied_log_index,
-                        ..
-                    },
-                ..
-            } => {
-                assert_eq!(pg_id, object_pg);
-                assert_ne!(applied_log_index, reference_applied_log_index);
-            }
-            other => panic!("expected divergent replica state on reopen, got {other:?}"),
-        }
+        let mut reopened_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        set_route_primary(&mut reopened_map, object_pg, NodeId::new(0));
+        let reopened_map = Arc::new(reopened_map);
+        let reopened_cluster =
+            crate::StorageCluster::from_local_map(Arc::clone(&reopened_map)).unwrap();
+        assert!(
+            pending_metadata_command_for_test(&reopened_map, pg_id, &bucket).is_some(),
+            "partial version reservation must rehydrate its primary pending slot"
+        );
+        let primary_node = reopened_cluster
+            .object_metadata_primary_node(&bucket, &key)
+            .unwrap();
+        let reserved = reopened_cluster
+            .reserve_next_object_version(pg_id, &bucket, &key, primary_node)
+            .unwrap();
+        assert_eq!(reserved, crate::VersionId::from_u64(1));
+        assert!(pending_metadata_command_for_test(&reopened_map, pg_id, &bucket).is_none());
+        assert_object_version_counter_on_acting_nodes(
+            &reopened_map,
+            &node_ids,
+            object_pg,
+            &bucket,
+            &key,
+            2,
+        );
+        assert_clean_metadata_command_stream(&reopened_map, &[object_pg]);
     }
 
     #[test]
@@ -12766,6 +13001,230 @@ mod tests {
     }
 
     #[test]
+    fn upload_part_stream_finalize_partial_apply_reopens_and_converges() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape)
+            .expect("open local map");
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(0));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let upload_id = upload_id_from_label("partfinalizereopen");
+        let create = crate::CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
+        cluster
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), create.clone()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let session_id = crate::SessionId::try_from("4e".repeat(16)).unwrap();
+        let upload = cluster
+            .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
+            .unwrap();
+        cluster
+            .create_upload_part_stream_session(
+                &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+                1,
+                &session_id,
+            )
+            .unwrap();
+        let payload = b"stream part finalize partial apply survives reopen";
+        let (_target, segment) = cluster
+            .prepare_stream_segment_append(
+                &bucket,
+                &key,
+                &crate::PrepareStreamUploadSegmentAppendReq {
+                    session_id: session_id.clone(),
+                    segment_index: 0,
+                    size: payload.len() as u64,
+                    segment_crc64: Some(checksum::crc64::checksum(payload)),
+                    segment_okh: [0x4e; 16],
+                },
+            )
+            .unwrap();
+        let written_shards = cluster
+            .write_stream_segment_payload_shards(&segment, payload)
+            .unwrap();
+        let shard_batch = written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect::<Vec<_>>();
+        cluster
+            .commit_stream_segment_append(
+                &bucket,
+                &key,
+                &session_id,
+                segment.segment_index,
+                &segment,
+                &shard_batch,
+            )
+            .unwrap();
+
+        let expected_part = crate::MultipartPartRecord {
+            upload_id: upload_id.clone(),
+            part_number: 1,
+            generation: 0,
+            size: payload.len() as u64,
+            etag: vec![0x4e; 8],
+            etag_kind: crate::EtagKind::Crc64,
+            part_okh: [0u8; 16],
+            part_vid: crate::GenerationId::MIN,
+            ec_k: segment.ec_k,
+            ec_m: segment.ec_m,
+            last_modified: 123_459,
+            checksum: None,
+        };
+        let expected_segments = vec![crate::MultipartPartSegmentRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id: upload_id.clone(),
+            version_id: crate::MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
+            part_number: 1,
+            segment_index: segment.segment_index,
+            size: segment.size,
+            segment_crc64: segment.segment_crc64,
+            segment_okh: segment.segment_okh,
+            segment_vid: segment.segment_vid,
+            data_pg_id: segment.data_pg_id,
+            ec_k: segment.ec_k,
+            ec_m: segment.ec_m,
+        }];
+
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_session_id = session_id.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::CommitStreamPart(commit)
+                        if commit.session_id == hook_session_id
+                            && node_id == NodeId::new(0)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected stream part reopen apply failure",
+                            source: std::io::Error::other(
+                                "injected stream part reopen apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+        let err = cluster
+            .finalize_upload_part_stream(&bucket, &key, &upload_id, &session_id, 1, |_| {
+                Ok::<_, ()>(crate::PreparedStreamPartCommit {
+                    value: (),
+                    part: expected_part.clone(),
+                    segments: expected_segments.clone(),
+                })
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected stream part reopen apply failure",
+                    ..
+                })
+            ),
+            "expected injected primary failure, got {err:?}"
+        );
+        drop(hook_guard);
+        assert!(
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
+            "partial stream part command must remain durable before reopen"
+        );
+        drop(cluster);
+        drop(map);
+
+        let mut reopened_map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape)
+            .expect("reopen local map");
+        set_route_primary(&mut reopened_map, object_pg, NodeId::new(0));
+        set_route_primary(&mut reopened_map, data_pg, NodeId::new(2));
+        let reopened_map = Arc::new(reopened_map);
+        let reopened_cluster =
+            crate::StorageCluster::from_local_map(Arc::clone(&reopened_map)).unwrap();
+        assert!(
+            pending_metadata_command_for_test(&reopened_map, PgId::new(object_pg), &bucket)
+                .is_some(),
+            "pending command must be rehydrated after reopen"
+        );
+
+        reopened_cluster
+            .finalize_upload_part_stream(&bucket, &key, &upload_id, &session_id, 1, |_| {
+                Ok::<_, ()>(crate::PreparedStreamPartCommit {
+                    value: (),
+                    part: expected_part.clone(),
+                    segments: expected_segments.clone(),
+                })
+            })
+            .unwrap()
+            .unwrap();
+        assert!(
+            pending_metadata_command_for_test(&reopened_map, PgId::new(object_pg), &bucket)
+                .is_none()
+        );
+        for node_id in node_ids {
+            let node = reopened_map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_stream_upload(&*pg, &session_id),
+                Err(crate::MetadataError::StreamSessionNotFound { .. })
+            ));
+            assert_eq!(
+                crate::PgMetadataStore::get_multipart_part(&*pg, &upload_id, 1).unwrap(),
+                expected_part
+            );
+            assert_eq!(
+                crate::PgMetadataStore::get_multipart_part_segments_for_upload_part(
+                    &*pg, &bucket, &key, &upload_id, 1
+                )
+                .unwrap(),
+                expected_segments
+            );
+        }
+        assert_clean_metadata_command_stream(&reopened_map, &[object_pg]);
+    }
+
+    #[test]
     fn upload_part_stream_finalize_finishes_terminal_pending_slot() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -13220,7 +13679,7 @@ mod tests {
     }
 
     #[test]
-    fn upload_part_stream_finalize_pending_install_race_reloads_after_complete() {
+    fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot() {
         let _serial = lock_metadata_command_apply_hook_test();
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -13259,22 +13718,25 @@ mod tests {
                 &session_id,
             )
             .unwrap();
-        let payload = b"stream part finalize loses the pending slot to complete";
-        let (_target, segment) = cluster
+        // UploadPartCopy stores copied source bytes as ordinary UploadPart stream
+        // segments. Use two staged segments so terminal MPU cleanup proves it
+        // removes every copied segment payload when completion wins the slot.
+        let first_payload = b"copied source segment one";
+        let (_target, first_segment) = cluster
             .prepare_stream_segment_append(
                 &bucket,
                 &key,
                 &crate::PrepareStreamUploadSegmentAppendReq {
                     session_id: session_id.clone(),
                     segment_index: 0,
-                    size: payload.len() as u64,
-                    segment_crc64: Some(checksum::crc64::checksum(payload)),
+                    size: first_payload.len() as u64,
+                    segment_crc64: Some(checksum::crc64::checksum(first_payload)),
                     segment_okh: [0x5a; 16],
                 },
             )
             .unwrap();
         let written_shards = cluster
-            .write_stream_segment_payload_shards(&segment, payload)
+            .write_stream_segment_payload_shards(&first_segment, first_payload)
             .unwrap();
         let shard_batch = written_shards
             .iter()
@@ -13285,8 +13747,39 @@ mod tests {
                 &bucket,
                 &key,
                 &session_id,
-                segment.segment_index,
-                &segment,
+                first_segment.segment_index,
+                &first_segment,
+                &shard_batch,
+            )
+            .unwrap();
+        let second_payload = b"copied source segment two";
+        let (_target, second_segment) = cluster
+            .prepare_stream_segment_append(
+                &bucket,
+                &key,
+                &crate::PrepareStreamUploadSegmentAppendReq {
+                    session_id: session_id.clone(),
+                    segment_index: 1,
+                    size: second_payload.len() as u64,
+                    segment_crc64: Some(checksum::crc64::checksum(second_payload)),
+                    segment_okh: [0x5d; 16],
+                },
+            )
+            .unwrap();
+        let written_shards = cluster
+            .write_stream_segment_payload_shards(&second_segment, second_payload)
+            .unwrap();
+        let shard_batch = written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect::<Vec<_>>();
+        cluster
+            .commit_stream_segment_append(
+                &bucket,
+                &key,
+                &session_id,
+                second_segment.segment_index,
+                &second_segment,
                 &shard_batch,
             )
             .unwrap();
@@ -13440,13 +13933,17 @@ mod tests {
                         generation: snapshot
                             .existing_part_generation
                             .map_or(0, |generation| generation + 1),
-                        size: payload.len() as u64,
+                        size: snapshot
+                            .staging_segments
+                            .iter()
+                            .map(|segment| segment.size)
+                            .sum(),
                         etag: vec![0x5a; 8],
                         etag_kind: crate::EtagKind::Crc64,
                         part_okh: [0u8; 16],
                         part_vid: crate::GenerationId::MIN,
-                        ec_k: segment.ec_k,
-                        ec_m: segment.ec_m,
+                        ec_k: first_segment.ec_k,
+                        ec_m: first_segment.ec_m,
                         last_modified: 123_457,
                         checksum: None,
                     };
@@ -13521,27 +14018,32 @@ mod tests {
             ));
         }
 
-        let mut readback = Vec::new();
-        let error = cluster
-            .read_segment_payload_stored_bytes_into(
-                crate::SegmentStoredBytesRequest {
-                    data_pg_id: segment.data_pg_id,
-                    segment_okh: segment.segment_okh,
-                    segment_vid: segment.segment_vid,
-                    stored_size: payload.len(),
-                    segment_crc64: Some(checksum::crc64::checksum(payload)),
-                    ec: EcShape {
-                        k: segment.ec_k,
-                        m: segment.ec_m,
+        for (segment, payload) in [
+            (&first_segment, first_payload.as_slice()),
+            (&second_segment, second_payload.as_slice()),
+        ] {
+            let mut readback = Vec::new();
+            let error = cluster
+                .read_segment_payload_stored_bytes_into(
+                    crate::SegmentStoredBytesRequest {
+                        data_pg_id: segment.data_pg_id,
+                        segment_okh: segment.segment_okh,
+                        segment_vid: segment.segment_vid,
+                        stored_size: payload.len(),
+                        segment_crc64: Some(checksum::crc64::checksum(payload)),
+                        ec: EcShape {
+                            k: segment.ec_k,
+                            m: segment.ec_m,
+                        },
                     },
-                },
-                &mut readback,
-            )
-            .unwrap_err();
-        assert!(
-            matches!(error, StoreError::NotFound),
-            "complete winner must clean staged payload after finalize contention: {error:?}"
-        );
+                    &mut readback,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(error, StoreError::NotFound),
+                "complete winner must clean copied staged payload after finalize contention: {error:?}"
+            );
+        }
         assert_clean_metadata_command_stream(&map, &[pg_id.get()]);
     }
 

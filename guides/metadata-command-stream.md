@@ -110,6 +110,15 @@ commit a command-log record that claims a mutation occurred without the
 matching materialized metadata mutation. Failure injection must cover rollback
 of both directions.
 
+On restart, acting-set replicas normally must agree on the accepted command
+prefix and materialized-state digest before the PG is considered clean. The
+only accepted in-flight exception is a primary-owned pending slot for the next
+log index where every advanced replica has accepted exactly that command,
+chained from the primary's current log hash, all unadvanced replicas match the
+primary's current replica state, and all advanced replicas agree on the full
+post-command replica state including the materialized-state digest. Any other
+prefix or digest disagreement remains a fail-closed divergence.
+
 ## Publisher Classification
 
 Command safety is classified at the publisher path, not just by command kind.
