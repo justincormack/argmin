@@ -2852,17 +2852,231 @@ Proposed subphases:
        conflicts and divergent same-index command-log conflicts, and broad
        `MetadataCommandLogConflict` matching is mechanically guarded
 4. Phase 9.3 multipart serialization
-   - replace multipart completion, abort, UploadPart, and streamed UploadPart
-     serialization that depends on local locks with PG-primary command
-     serialization
-   - build on the Phase 9.2 PG-local command-slot primitive for multi-PG flows,
-     including completed-MPU order reservation on the bucket PG followed by
-     object commit on the object PG
-   - cover races for one upload ID and for the same destination object:
-     complete vs abort, stream part vs abort, stream part vs complete,
-     duplicate part upload, and same-key MPU completion races
-   - exit when these races are serialized by metadata command state rather than
-     process-local locks
+   - goal: replace multipart completion, abort, UploadPart, and streamed
+     UploadPart serialization that still depends on local locks or
+     multipart-specific pending-slot loops with PG-primary command
+     serialization and fresh-snapshot retry rules
+   - scope:
+     - convert the Phase 9.2H deferrals from
+       [metadata-command-stream.md](../guides/metadata-command-stream.md):
+       `begin_upload_part_stream_session`,
+       `create_upload_part_stream_session`, `finalize_upload_part_stream`,
+       `complete_multipart_upload_commit_serialized`,
+       `abort_multipart_upload_locked`, and
+       `abort_authorized_multipart_upload_locked`
+     - include UploadPartCopy explicitly. It uses the UploadPart stream-session
+       path, appends copied source segments, finalizes the destination part, and
+       aborts the stream session on copy/source failure, so it must be covered
+       by the same serialization and cleanup rules rather than treated as plain
+       UploadPart
+     - keep the Phase 9.2 rule that command streams are PG-local; this phase
+       does not introduce a cross-PG transaction protocol
+     - make every multi-PG multipart flow derive later commands only from
+       terminal earlier commands. In particular, completed-MPU order allocation
+       on the bucket PG must be terminal before the object-PG completion command
+       uses that order
+     - local locks may remain as short in-process contention reducers while this
+       is still a single process, but correctness must not depend on them
+   - non-goals:
+     - durable bucket write-drain state remains Phase 9.4
+     - cross-process read pins remain Phase 9.5
+     - durable reclaim worker claiming and physical shard scavenging remain
+       Phases 9.6 and 9.7
+     - broad test-harness de-single-process cleanup remains Phase 9.10, except
+       for tests directly needed to prove the multipart command-stream
+       invariants here
+
+   Proposed subphases:
+
+   1. Phase 9.3.1: multipart command-stream audit and invariants
+      - inventory every multipart publisher, finisher, cleanup path, and helper
+        that touches:
+        - `multipart_uploads`, `multipart_parts`,
+          `multipart_part_segments`, `stream_uploads`,
+          `stream_upload_segments`, `completed_multipart_uploads`, and
+          `buckets.completed_multipart_upload_sequence`
+        - uploaded-part payload cleanup refs and active UploadPart stream
+          cleanup refs
+        - local locks such as `lock_multipart_completion_bucket` and
+          `lock_bucket`
+      - classify each publisher path as `SnapshotSensitive`,
+        `ApplyValidated`, or `AllocatorCleanup`, matching the Phase 9.2H
+        publisher table
+      - document the multipart-specific invariants:
+        - one upload ID has one terminal lifecycle outcome: in-progress,
+          completed, or aborted
+        - a terminal command owns cleanup of all active UploadPart stream
+          sessions and staged segments for that upload
+        - part replacement is command-owned and idempotent; displaced staged
+          segment cleanup is carried by the command, not inferred from current
+          rows after publication
+        - complete and abort must rebuild their snapshots after PG-slot
+          contention
+        - duplicate UploadPart/finalize retries are accepted only when the
+          command-owned row image and cleanup refs match exactly
+      - update the boundary script so the remaining multipart deferrals are
+        expected only while this phase is in progress, and so newly introduced
+        multipart pending-slot publishers fail loudly unless documented
+      - exit when the audit table, guide text, and boundary allowlist agree
+
+   2. Phase 9.3.2: UploadPart stream session creation
+      - convert `begin_upload_part_stream_session` and
+        `create_upload_part_stream_session` to the snapshot-sensitive
+        install-or-drain shape:
+        - load a fresh in-progress MPU row and run caller authorization/action
+        - build the `CreateStreamUpload` command from that row
+        - try to install the object-PG pending slot
+        - on contention, drain the winning slot and restart from a fresh MPU
+          snapshot and authorization/action result
+      - ensure command apply revalidates the `UploadPart` target against the
+        current in-progress MPU row on every acting-set replica
+      - preserve exact retry matching for session id, upload id, part number,
+        encryption, created-at row fields, and the initial allocator floor
+      - add deterministic two-handle tests for:
+        - create session vs abort of the same upload
+        - create session vs complete of the same upload
+        - create session losing a PG-slot race to an unrelated same-PG command
+          and rerunning authorization/action
+        - retry after partial create apply and reopen
+      - exit when active UploadPart sessions cannot be created for an upload
+        that has been aborted or completed by a command that wins the slot
+
+   3. Phase 9.3.3: streamed UploadPart finalization
+      - convert `finalize_upload_part_stream` to the snapshot-sensitive
+        install-or-drain shape:
+        - reload the stream session, MPU row, existing part row, staged segment
+          list, and displaced segment refs after every contention event
+        - rerun caller action on the fresh `StreamUploadPartSnapshot`
+        - build `CommitStreamPart` only from the fresh command-owned snapshot
+      - tighten retry matching so pending `CommitStreamPart` acceptance compares
+        command-owned rows and cleanup refs exactly, with only intentional
+        timestamp/idempotence fields normalized
+      - ensure terminal session cleanup clears command-owned rows and local
+        runtime allocator state through the same post-apply hook whether the
+        command is applied directly or by a later pending-slot drain
+      - add deterministic tests for:
+        - duplicate finalize for the same session/part
+        - two sessions finalizing the same part number, where one replaces the
+          other and displaced payload cleanup is carried by the terminal command
+        - UploadPartCopy finalization using copied source segments, including
+          cleanup of staged copied segments when the destination MPU becomes
+          terminal before finalize
+        - finalize losing the slot to abort and returning the AWS-compatible
+          missing/invalid upload result
+        - finalize losing the slot to complete and not staging a part after the
+          upload is terminal
+        - partial `CommitStreamPart` apply, reopen, rehydrate, and converge
+      - exit when streamed UploadPart finalization has no correctness
+        dependency on same-process upload locks
+
+   4. Phase 9.3.4: multipart abort serialization
+      - convert `abort_multipart_upload_locked` and
+        `abort_authorized_multipart_upload_locked` to the same
+        snapshot-sensitive shape, or narrow existing loops until they are
+        equivalent:
+        - drain unrelated pending slots
+        - rebuild upload, part, active stream session, staged segment, and
+          payload cleanup snapshots after contention
+        - install `AbortMultipartUpload`
+        - apply through the acting set
+      - make authorization-bound abort retry compare the current upload row to
+        the authorized row after every contention event; if the row changed,
+        fail with the normal S3-visible outcome instead of applying stale auth
+      - keep best-effort payload cleanup cluster-owned, but make command-owned
+        cleanup refs sufficient for retry after restart
+      - add tests for:
+        - abort vs UploadPart session create
+        - abort vs stream append/finalize
+        - abort vs UploadPartCopy after stream session creation and after copied
+          segment append
+        - abort vs complete
+        - abort after one or more replicas accepted the command, then reopen
+          and converge
+        - terminal pending-slot cleanup before later multipart work
+      - exit when abort is a single terminal upload-lifecycle command and active
+        UploadPart streams cannot survive it as valid sessions
+
+   5. Phase 9.3.5: multipart completion and bucket-PG order flow
+      - split `complete_multipart_upload_commit_serialized` into explicit
+        phases:
+        - validate upload and requested parts from the object PG
+        - reserve completed-MPU order through a terminal bucket-PG
+          `AdvanceCompletedMultipartUploadSequence` command
+        - reload the object-PG completion snapshot after the bucket-PG command
+          is terminal
+        - build and install the object-PG `CommitMultipartObject`
+        - prune completed-upload idempotence rows only after the object-PG
+          command is terminal
+      - on object-PG contention after order reservation, restart from a fresh
+        object-PG snapshot while either reusing the terminal reserved order when
+        it belongs to the same request or issuing a safe follow-up order command
+        if the request must be rebuilt
+      - verify `CommitMultipartObject` carries all command-owned rows needed for
+        deterministic replica apply:
+        - live object row, object parts, selected streamed part segment rows,
+          omitted part cleanup refs, active UploadPart stream cleanup refs,
+          write sequence, completion order, completed-upload idempotence row,
+          and stale-payload reclaim refs
+      - add tests for:
+        - complete vs abort of the same upload
+        - complete vs streamed UploadPart finalize
+        - complete vs UploadPartCopy session create/finalize, including source
+          read or copy failure after the destination stream session exists
+        - complete vs complete of the same upload
+        - two completions for different uploads to the same destination key
+        - same bucket completions on different object PGs allocating unique
+          completed-MPU order through the bucket PG
+        - partial bucket-PG order apply, partial object-PG commit apply, reopen,
+          and convergence
+      - exit when MPU completion is deterministic across acting-set replicas and
+        does not depend on `lock_multipart_completion_bucket` for correctness
+
+   6. Phase 9.3.6: race matrix and model coverage
+      - add a multipart command-stream invariant checker that extends the Phase
+        9.2 clean-stream helper with upload lifecycle checks:
+        - no active `stream_uploads` or `stream_upload_segments` remain for a
+          terminal upload
+        - an upload has at most one terminal command outcome
+        - selected parts and streamed part segments are referenced by the
+          completed object or cleaned by abort/complete cleanup refs
+        - UploadPartCopy staged copied segments are either committed as selected
+          destination part segments or covered by terminal stream/abort cleanup
+          refs
+        - omitted parts and displaced part payloads are either cleaned or have
+          explicit retry/scavenger records
+      - add a focused stateful trace model for one bucket with multiple keys and
+        uploads:
+        - create MPU, create UploadPart stream session, append stream segment,
+          UploadPartCopy session create/source-copy append, finalize part,
+          abort, complete, delete/recreate bucket, reopen
+        - inject PG-slot contention, zero-apply abandon, primary-last partial
+          apply, terminal pending-slot leftover, and stale handle attempts
+      - include two-handle tests for the race classes found in review, not just
+        single-handle hooks
+      - exit when every public multipart mutating request has at least one
+        contention/retry test and one partial-apply/reopen test, including
+        CreateMultipartUpload, UploadPart, UploadPartCopy,
+        CompleteMultipartUpload, and AbortMultipartUpload
+
+   7. Phase 9.3.7: remove local-lock authority and clean up deferrals
+      - remove Phase 9.3 deferral wording from
+        [metadata-command-stream.md](../guides/metadata-command-stream.md) once
+        each publisher has been converted
+      - update `scripts/check-storage-cluster-boundaries` so multipart
+        publishers are no longer exempt from snapshot-sensitive install rules
+      - make any remaining local multipart locks clearly performance-only, or
+        remove them if they no longer reduce useful contention
+      - remove or gate any remaining direct/test-only multipart mutators that
+        can bypass the command stream
+      - run:
+        - `cargo fmt`
+        - `./scripts/check-storage-cluster-boundaries`
+        - targeted storage multipart command-stream tests
+        - targeted server-core and s3-tests multipart suites
+        - `cargo clippy --all-targets --all-features -- -D warnings`
+        - full `cargo nextest run`
+      - exit when the Phase 9.2H publisher table has no Phase 9.3 deferrals,
+        the boundary script enforces that state, and the race matrix passes
 5. Phase 9.4 bucket write drain
    - move bucket delete/write-drain state out of process-local waits into
      durable or primary-owned metadata
