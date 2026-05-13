@@ -316,6 +316,53 @@ if [[ "$pending_command_publishers" != "$expected_pending_command_publishers" ]]
         "$pending_command_publishers"
 fi
 
+metadata_command_conflict_uses=$(
+    awk '
+    function update_function_context() {
+        if ($0 ~ /^    (pub(\([^)]*\))? )?fn [A-Za-z0-9_]+/ || $0 ~ /^fn [A-Za-z0-9_]+/) {
+            current_fn = $0
+            sub(/^.*fn /, "", current_fn)
+            sub(/\(.*/, "", current_fn)
+        }
+    }
+    {
+        update_function_context()
+        if ($0 ~ /metadata_command_log_conflict_matches\(/) {
+            print FILENAME ":" current_fn ":exact-command-match"
+        } else if ($0 ~ /MetadataCommandLogConflict/) {
+            print FILENAME ":" current_fn ":metadata-command-log-conflict"
+        }
+    }
+    ' crates/storage/src/cluster.rs crates/storage/src/cluster/request_ops.rs \
+        | sort \
+        | uniq -c \
+        | sed 's/^ *//'
+)
+expected_metadata_command_conflict_uses=$(cat <<'EOF'
+1 crates/storage/src/cluster.rs:apply_new_stream_append_command:exact-command-match
+1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards<E>:exact-command-match
+1 crates/storage/src/cluster.rs:create_put_object_stream_session_record:metadata-command-log-conflict
+1 crates/storage/src/cluster.rs:finish_pending_object_metadata_command_for_bucket:exact-command-match
+1 crates/storage/src/cluster.rs:metadata_command_conflict:metadata-command-log-conflict
+1 crates/storage/src/cluster.rs:metadata_command_log_conflict_matches:exact-command-match
+1 crates/storage/src/cluster.rs:metadata_command_log_conflict_matches:metadata-command-log-conflict
+2 crates/storage/src/cluster.rs:next_metadata_command_id_from_locked_pg_at_least:metadata-command-log-conflict
+1 crates/storage/src/cluster.rs:reissue_pending_metadata_command:metadata-command-log-conflict
+1 crates/storage/src/cluster.rs:release_object_generation_reservation:exact-command-match
+1 crates/storage/src/cluster.rs:release_object_generation_reservation_command_required:exact-command-match
+1 crates/storage/src/cluster.rs:reserve_put_object_generation:exact-command-match
+1 crates/storage/src/cluster/request_ops.rs:apply_new_object_metadata_command_for_bucket:exact-command-match
+1 crates/storage/src/cluster/request_ops.rs:begin_bucket_delete:metadata-command-log-conflict
+1 crates/storage/src/cluster/request_ops.rs:create_put_object_stream_session<T, E>:metadata-command-log-conflict
+2 crates/storage/src/cluster/request_ops.rs:finish_pending_metadata_command_to_acting_set_inner:exact-command-match
+EOF
+)
+if [[ "$metadata_command_conflict_uses" != "$expected_metadata_command_conflict_uses" ]]; then
+    fail_with_matches \
+        "MetadataCommandLogConflict handling changed; update guides/metadata-command-stream.md finish/convergence classification and this allowlist" \
+        "$metadata_command_conflict_uses"
+fi
+
 mixed_stream_upload_cleanup_records=$(
     rg -n --color=never \
         'stream_uploads:[[:space:]]*Vec<StreamUploadRecord>' \

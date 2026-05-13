@@ -2623,16 +2623,17 @@ Proposed subphases:
    - goal: turn the recent command construction, pending-slot contention,
      reissue, and replica convergence review findings into reusable
      guardrails before adding more multipart command complexity
-   - status: complete for the Phase 9.2H hardening scope. The
+   - status: reopened for finish/convergence hardening before Phase 9.3. The
      publisher/path inventory, non-multipart snapshot-sensitive retry shape,
      stream upload command/runtime split, reissue model, crash-step coverage,
      stateful trace coverage, and mechanical boundary checks are in place.
      Multipart and UploadPart publishers are explicitly inventoried as Phase
      9.3 deferrals where they still use multipart-specific `set_pending...` or
-     `try_set...` shapes. Closeout verification passed with
-     `./scripts/check-storage-cluster-boundaries`,
-     `cargo clippy --all-targets --all-features -- -D warnings`, and
-     `cargo nextest run`
+     `try_set...` shapes. A later bucket-delete race showed that Phase 9.2H
+     also needs an explicit finish/convergence pass: a command can partially
+     apply and then surface a command-log conflict while the request is
+     finishing, which is a different class from stale snapshot or pending-slot
+     install contention.
    - freeze Phase 9.2 semantics in
      [metadata-command-stream.md](../guides/metadata-command-stream.md) as
      invariants rather than implementation notes:
@@ -2759,6 +2760,37 @@ Proposed subphases:
        - status: the crash-step cases above now all have PgStore-level,
          local-cluster reopen, or retry-after-reopen coverage; automatic
          repair is still deliberately narrower than fail-closed detection
+   - add finish/convergence hardening for every
+     `finish_pending_metadata_command_to_acting_set` caller:
+     - classify each caller's finish errors as one of:
+       - pre-publish failure: may return the request error or abandon only if
+         zero acting-set replicas accepted/mutated/logged the command
+       - partial exact-command apply: may retry/converge only with proof that
+         already-applied replicas recorded the exact command bytes/checksum and
+         matching `previous_log_hash`/`log_hash`
+       - divergent command-log state: must fail closed and must not be
+         swallowed as ordinary contention
+       - post-publish cleanup failure: must not turn an externally visible
+         successful mutation into a 500 without a convergence path
+     - inventory every production finish-helper call site, including bucket-PG
+       commands (`CreateBucket`, bucket ACL/versioning/property/subresources,
+       `MarkBucketDeleting`, completed-MPU order/deletion) and object/MPU
+       paths that drain bucket-PG commands as part of multi-PG flows
+     - add a reusable fault matrix for the finish helper:
+       - zero replicas applied
+       - one non-primary applied and primary rejects the same command
+       - one non-primary applied and another replica has a divergent
+         same-index row
+       - all replicas applied while the primary pending slot remains
+       - terminal row exists but pending-slot cleanup is interrupted
+     - require request-level behavior tests where external state is visible:
+       a request must not return an internal command conflict after making the
+       mutation observable unless a retry/convergence path is guaranteed
+     - add a mechanical boundary check for broad
+       `MetadataCommandLogConflict` matching in request paths. Matching the
+       variant directly is allowed only in named helpers that prove command
+       identity and hash-chain state, or in allocation paths that immediately
+       restart before publishing state.
    - expand the local-cluster stateful model to include two handles,
      pending-slot contention, reissue, zero-apply abandon, partial
      primary-last apply, restart/open validation, and stale-handle attempts
@@ -2807,6 +2839,9 @@ Proposed subphases:
        path
      - targeted reissue and crash-step model coverage exists for the recent
        bug classes
+     - targeted finish/convergence coverage exists for partial exact-command
+       conflicts and divergent same-index command-log conflicts, and broad
+       `MetadataCommandLogConflict` matching is mechanically guarded
 4. Phase 9.3 multipart serialization
    - replace multipart completion, abort, UploadPart, and streamed UploadPart
      serialization that depends on local locks with PG-primary command

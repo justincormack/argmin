@@ -182,6 +182,36 @@ claimed as fully hardened by Phase 9.2H. They are inventoried here and in
 converting those paths to multipart-aware PG-primary serialization and
 fresh-snapshot restart rules.
 
+## Finish And Convergence Paths
+
+Publishing a pending command is only the first boundary. A request can also
+fail while finishing a pending command after one or more acting-set replicas
+have already accepted, mutated, or logged it. Those finish errors must be
+classified separately from pending-slot install contention.
+
+The general rule is fail closed unless the caller has a positive proof that
+the conflict belongs to the exact same command and hash-chain state. A broad
+`MetadataCommandLogConflict` match is not enough: the same PG, epoch, and log
+index can also describe a divergent command-log row.
+
+| Finish caller/path | Command scope | Finish classification | Notes |
+| --- | --- | --- | --- |
+| `create_bucket_with_config_and_load_info` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | Create is not reported successful until the command converges and the primary row is reloaded. |
+| `put_bucket_versioning_and_load_info` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | Request retries re-enter the bucket snapshot path. |
+| `put_bucket_acl_and_load_info` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | Request retries re-enter the bucket snapshot path. |
+| `put_bucket_property_command_and_load_info` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | Request retries re-enter the bucket snapshot path. |
+| `put_bucket_subresource_command_and_load_info` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | Request retries re-enter the bucket snapshot path. |
+| `begin_bucket_delete` | bucket PG | Partial exact-command conflicts are retryable only after validating exact command bytes plus matching `previous_log_hash` and `log_hash` across applied rows. Divergent same-index rows fail closed. | Bucket deletion is special because a failed finish can make the bucket visible as `Deleting` and allow a queued finalizer to remove it before an SDK retry. |
+| `delete_completed_multipart_upload_record_with_command` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | Used as cleanup after completed MPU retention decisions. |
+| `reserve_completed_multipart_upload_order` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | The returned order must come from a terminal bucket-PG command. |
+| `drain_pending_metadata_command_pg_slot` and `drain_pending_completed_multipart_sequence_command` | bucket PG drain | Fail closed on unsafe finish conflicts. | These are generic drain helpers; they must not hide divergent command-log state from the caller. |
+| `finish_pending_command_for_completed_multipart_order` | bucket/object PG drain | Follows the command family finisher. | Multi-PG MPU completion must not hold ambiguous pending state across PGs; Phase 9.3 owns the remaining multipart serialization work. |
+
+The boundary script inventories production uses of
+`MetadataCommandLogConflict` and `metadata_command_log_conflict_matches`.
+Adding a new broad match must update that inventory and document why it is
+pre-publish retry, exact-command convergence, or fail-closed validation.
+
 ## Object Version Reservations
 
 Object version IDs are allocated by the `ReserveObjectVersion` metadata

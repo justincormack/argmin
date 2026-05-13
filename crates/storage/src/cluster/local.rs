@@ -17973,6 +17973,96 @@ mod tests {
     }
 
     #[test]
+    fn bucket_update_fails_closed_on_divergent_same_index_after_partial_apply() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "bucket-update-divergent-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let pg_id = PgId::new(1);
+        let injected = Arc::new(AtomicBool::new(false));
+        let hook_map = Arc::clone(&map);
+        let hook_bucket = bucket.clone();
+        let injected_for_closure = Arc::clone(&injected);
+        let _hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                if node_id != NodeId::new(1) || injected_for_closure.swap(true, Ordering::SeqCst) {
+                    return Ok(());
+                }
+                match command.payload() {
+                    MetadataCommandPayload::PutBucketVersioning(versioning)
+                        if versioning.bucket_name() == &hook_bucket =>
+                    {
+                        let primary = hook_map
+                            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+                            .unwrap();
+                        let primary_pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+                        let current = crate::PgMetadataStore::head_bucket_record_raw(
+                            &*primary_pg,
+                            &hook_bucket,
+                        )
+                        .unwrap();
+                        let divergent = MetadataCommandEnvelope::new(
+                            command.id(),
+                            MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
+                                current.with_execution_generation(
+                                    primary_pg
+                                        .next_bucket_execution_generation_candidate()
+                                        .unwrap(),
+                                ),
+                                crate::AclGrants::default(),
+                                false,
+                                false,
+                            )),
+                        );
+                        primary_pg
+                            .apply_metadata_command_and_record(
+                                primary.node_id().as_u32(),
+                                &divergent,
+                            )
+                            .unwrap();
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+            .unwrap_err();
+
+        assert!(
+            injected.load(Ordering::SeqCst),
+            "test hook should inject a divergent same-index command on the primary"
+        );
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Store(
+                    StoreError::MetadataCommandLogConflict { .. }
+                )
+            ),
+            "ordinary bucket-PG finish conflicts must fail closed, got {err:?}"
+        );
+    }
+
+    #[test]
     fn finalized_bucket_delete_fails_closed_on_active_replica() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
