@@ -261,7 +261,9 @@ Multipart publisher rules:
 - `complete_multipart_upload_commit_serialized` must reserve completed-MPU
   order through a terminal bucket-PG command before constructing the object-PG
   commit, then reload the object-PG completion snapshot after that order is
-  terminal.
+  terminal. If another object-PG command wins the pending slot before the
+  completion command id is allocated, completion drains the winner and restarts
+  from a fresh object-PG snapshot so stale-payload and cleanup refs are rebuilt.
 - A retry of a duplicate UploadPart or finalize request is accepted only when
   the command-owned row image and cleanup refs match exactly, except for
   explicitly documented idempotence fields such as normalized timestamps.

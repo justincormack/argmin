@@ -3042,6 +3042,11 @@ Proposed subphases:
         UploadPart streams cannot survive it as valid sessions
 
    5. Phase 9.3.5: multipart completion and bucket-PG order flow
+      - status: in progress. The completion path now handles object-PG
+        pre-publish command-id contention after the bucket-PG order reservation
+        by draining the winning command and restarting from a fresh object-PG
+        snapshot. Coverage pins that a winner published in that window is
+        included in the retried completion's stale-payload reclaim snapshot.
       - split `complete_multipart_upload_commit_serialized` into explicit
         phases:
         - validate upload and requested parts from the object PG

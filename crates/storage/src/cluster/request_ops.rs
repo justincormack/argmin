@@ -5860,8 +5860,18 @@ impl super::StorageCluster {
             });
             drop(object_pg);
             let completion_order = self.reserve_completed_multipart_upload_order(&bucket)?;
+            let command_id = match self.next_object_metadata_command_id(pg_id) {
+                Ok(command_id) => command_id,
+                Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                    ..
+                })) => {
+                    self.drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)?;
+                    continue 'retry_after_pending_conflict;
+                }
+                Err(error) => return Err(error),
+            };
             let command = MetadataCommandEnvelope::new(
-                self.next_object_metadata_command_id(pg_id)?,
+                command_id,
                 MetadataCommandPayload::CommitMultipartObject(Box::new(
                     CommitMultipartObjectCommand {
                         upload_id: upload_id.clone(),

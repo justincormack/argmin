@@ -17154,6 +17154,145 @@ mod tests {
     }
 
     #[test]
+    fn multipart_completion_command_id_race_drains_winner_and_resnapshots_stale_payload() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut first_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = first_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "mpu-complete-id-race-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut first_map, 1, NodeId::new(1));
+        set_route_primary(&mut first_map, 2, NodeId::new(1));
+
+        let mut second_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        set_route_primary(&mut second_map, 1, NodeId::new(1));
+        set_route_primary(&mut second_map, 2, NodeId::new(1));
+
+        let first_map = Arc::new(first_map);
+        let second_map = Arc::new(second_map);
+        let first_cluster = crate::StorageCluster::from_local_map(Arc::clone(&first_map)).unwrap();
+        let second_cluster =
+            crate::StorageCluster::from_local_map(Arc::clone(&second_map)).unwrap();
+        create_test_bucket(&first_cluster, &bucket);
+        let (req, expected_segment) =
+            seed_streamed_multipart_completion(&first_cluster, &bucket, &key, "completeidrace");
+
+        let winner_payload = b"winner before multipart completion command id";
+        let winner_reservation_id =
+            crate::SessionId::try_from("8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a".to_string()).unwrap();
+        let winner_generation_id = second_cluster
+            .reserve_put_object_generation(&bucket, &key, &winner_reservation_id)
+            .unwrap();
+        let winner_written = second_cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                winner_generation_id,
+                0,
+                &[0x8a; 16],
+                winner_payload,
+            )
+            .unwrap();
+        let winner_req = direct_put_commit_req(
+            &bucket,
+            &key,
+            winner_reservation_id,
+            winner_generation_id,
+            winner_payload,
+            [0x8a; 16],
+            &winner_written,
+        );
+        let winner_shard_batch: Vec<(&ShardKey, WriteAck)> = winner_written
+            .written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect();
+        second_cluster
+            .register_payload_shard_acks(winner_req.data_pg_id, &winner_shard_batch)
+            .unwrap();
+        let winner_command = {
+            let primary = second_map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
+                .unwrap();
+            let pg = primary.storage_node().get_pg(2).unwrap();
+            second_cluster
+                .prepare_commit_direct_put_object_command(
+                    PgId::new(2),
+                    &pg,
+                    &winner_req,
+                    crate::VersionId::Null,
+                )
+                .unwrap()
+        };
+
+        let slot_installed = Arc::new(AtomicBool::new(false));
+        let hook_map = Arc::clone(&second_map);
+        let hook_bucket = bucket.clone();
+        let hook_command = winner_command.clone();
+        let hook_slot_installed = Arc::clone(&slot_installed);
+        let hook_guard = first_cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |_node_id, command| {
+                let MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(advance) =
+                    command.payload()
+                else {
+                    return Ok(());
+                };
+                if advance.bucket == hook_bucket
+                    && !hook_slot_installed.swap(true, Ordering::SeqCst)
+                {
+                    let pg_id = PgId::new(2);
+                    let primary = hook_map
+                        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+                        .unwrap();
+                    let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+                    pg.try_insert_pending_metadata_command_slot(
+                        primary.node_id().as_u32(),
+                        &hook_command,
+                        Some(&hook_bucket),
+                    )
+                    .unwrap();
+                }
+                Ok(())
+            },
+        ));
+
+        let outcome = first_cluster
+            .complete_multipart_upload_commit_serialized(req.clone(), 16)
+            .unwrap();
+        drop(hook_guard);
+
+        assert!(slot_installed.load(Ordering::SeqCst));
+        assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_none());
+        assert!(
+            matches!(
+                outcome.stale_payload,
+                Some(crate::CompletedMultipartStalePayload::Segments { generation_id, .. })
+                    if generation_id == winner_generation_id
+            ),
+            "completion must resnapshot stale payload after draining the winning object command"
+        );
+        assert_streamed_multipart_completion_on_acting_nodes_with_write_sequence(
+            &first_map,
+            &node_ids,
+            2,
+            &req,
+            &expected_segment,
+            &outcome,
+            2,
+        );
+        assert_clean_metadata_command_stream(&first_map, &[1, 2]);
+    }
+
+    #[test]
     fn object_delete_metadata_command_applies_to_all_acting_object_pg_nodes() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
