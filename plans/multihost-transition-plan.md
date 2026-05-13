@@ -3047,6 +3047,12 @@ Proposed subphases:
         by draining the winning command and restarting from a fresh object-PG
         snapshot. Coverage pins that a winner published in that window is
         included in the retried completion's stale-payload reclaim snapshot.
+        Completion-vs-abort coverage now exists in both directions: abort
+        drains a pending completion, and completion drains a partial pending
+        abort before returning the normal missing-upload result and applying
+        abort cleanup. Partial bucket-PG order apply is also covered: retrying
+        completion finishes the pending order command before publishing the
+        object-PG completion command.
       - split `complete_multipart_upload_commit_serialized` into explicit
         phases:
         - validate upload and requested parts from the object PG
