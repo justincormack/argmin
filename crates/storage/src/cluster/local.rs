@@ -1339,9 +1339,10 @@ fn prepare_local_node_data_dir(
 mod tests {
     use super::*;
     use crate::metadata_command::{
-        metadata_command_log_hash, AdvanceCompletedMultipartUploadSequenceCommand,
-        AppendStreamSegmentCommand, BucketPropertyMutation, BucketSubresourceMutation,
-        CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
+        metadata_command_log_hash, AbortMultipartUploadCommand,
+        AdvanceCompletedMultipartUploadSequenceCommand, AppendStreamSegmentCommand,
+        BucketPropertyMutation, BucketSubresourceMutation, CreateBucketCommand,
+        MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
         MetadataCommandPayload, PutBucketAclCommand, PutBucketVersioningCommand,
         PutObjectMetadataCommand, PutObjectMetadataMutation, ReserveObjectGenerationCommand,
     };
@@ -10381,6 +10382,137 @@ mod tests {
                 Err(crate::MetadataError::StreamSessionNotFound { .. })
             ));
         }
+    }
+
+    #[test]
+    fn upload_part_stream_create_pending_install_race_reloads_after_abort() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut first_map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape)
+            .expect("open first local map");
+        let topology = first_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "upload-part-create-race-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut first_map, 1, NodeId::new(1));
+        set_route_primary(&mut first_map, 2, NodeId::new(1));
+
+        let mut second_map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape)
+            .expect("open second local map");
+        set_route_primary(&mut second_map, 1, NodeId::new(1));
+        set_route_primary(&mut second_map, 2, NodeId::new(1));
+
+        let first_map = Arc::new(first_map);
+        let second_map = Arc::new(second_map);
+        let first_cluster = crate::StorageCluster::from_local_map(Arc::clone(&first_map)).unwrap();
+        create_test_bucket(&first_cluster, &bucket);
+        let upload_id = upload_id_from_label("partcreateabort");
+        let create = crate::CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
+        first_cluster
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), create.clone()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let upload = first_cluster
+            .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
+            .unwrap();
+
+        let pg_id = PgId::new(2);
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let hook_ran_for_closure = Arc::clone(&hook_ran);
+        let hook_map = Arc::clone(&second_map);
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let hook_upload = upload.clone();
+        let hook_upload_id = upload_id.clone();
+        let _hook_guard = first_cluster.test_install_before_metadata_command_pending_install_hook(
+            Arc::new(move || {
+                if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let command = MetadataCommandEnvelope::new(
+                    MetadataCommandId::new(
+                        ClusterEpoch::INITIAL,
+                        pg_id,
+                        hook_map.test_next_metadata_command_log_index(pg_id),
+                    ),
+                    MetadataCommandPayload::AbortMultipartUpload(Box::new(
+                        AbortMultipartUploadCommand {
+                            bucket: hook_bucket.clone(),
+                            key: hook_key.clone(),
+                            upload_id: hook_upload_id.clone(),
+                            cleanup: crate::AbortMultipartUploadCleanup {
+                                upload: hook_upload.clone(),
+                                parts: Vec::new(),
+                                streaming_segments: Vec::new(),
+                                stream_uploads: Vec::new(),
+                                stream_upload_segments: Vec::new(),
+                            },
+                        },
+                    )),
+                );
+                insert_pending_metadata_command_for_test(&hook_map, pg_id, &hook_bucket, &command);
+            }),
+        );
+
+        let session_id = crate::SessionId::try_from("52".repeat(16)).unwrap();
+        let err = first_cluster
+            .create_upload_part_stream_session(
+                &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+                1,
+                &session_id,
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Metadata(crate::MetadataError::NoSuchUpload { .. })
+            ),
+            "expected upload-part session create to reload after abort, got {err:?}"
+        );
+        assert!(hook_ran.load(Ordering::SeqCst));
+        assert!(pending_metadata_command_for_test(&first_map, pg_id, &bucket).is_none());
+        for node_id in node_ids {
+            let node = first_map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(pg_id.get()).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id),
+                Err(crate::MetadataError::NoSuchUpload { .. })
+            ));
+            assert!(matches!(
+                crate::PgMetadataStore::get_stream_upload(&*pg, &session_id),
+                Err(crate::MetadataError::StreamSessionNotFound { .. })
+            ));
+        }
+        assert_clean_metadata_command_stream(&first_map, &[pg_id.get()]);
     }
 
     #[test]

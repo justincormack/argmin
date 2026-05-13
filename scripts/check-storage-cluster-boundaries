@@ -286,12 +286,12 @@ expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster/request_ops.rs:abort_authorized_multipart_upload_locked:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:abort_multipart_upload_locked:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:begin_bucket_delete:try_set_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster/request_ops.rs:begin_upload_part_stream_session<T, E>:set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:begin_upload_part_stream_session<T, E>:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:complete_multipart_upload_commit_serialized:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:create_bucket_with_config_and_load_info:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:create_multipart_upload<T, E>:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:create_put_object_stream_session<T, E>:try_install_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster/request_ops.rs:create_upload_part_stream_session:set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:create_upload_part_stream_session:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:delete_completed_multipart_upload_record_with_command:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:delete_current_object_if<T, E>:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:delete_expired_delete_marker_if_due<E>:install_snapshot_sensitive_metadata_command_or_drain
@@ -353,7 +353,9 @@ expected_metadata_command_conflict_uses=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:reserve_put_object_generation:exact-command-match
 1 crates/storage/src/cluster/request_ops.rs:apply_new_object_metadata_command_for_bucket:exact-command-match
 1 crates/storage/src/cluster/request_ops.rs:begin_bucket_delete:metadata-command-log-conflict
+1 crates/storage/src/cluster/request_ops.rs:begin_upload_part_stream_session<T, E>:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:create_put_object_stream_session<T, E>:metadata-command-log-conflict
+1 crates/storage/src/cluster/request_ops.rs:create_upload_part_stream_session:metadata-command-log-conflict
 2 crates/storage/src/cluster/request_ops.rs:finish_pending_metadata_command_to_acting_set_inner:exact-command-match
 EOF
 )

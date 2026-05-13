@@ -2889,6 +2889,12 @@ Proposed subphases:
    Proposed subphases:
 
    1. Phase 9.3.1: multipart command-stream audit and invariants
+      - status: in progress. The multipart command-stream invariants are now
+        documented in
+        [metadata-command-stream.md](../guides/metadata-command-stream.md),
+        and the boundary script inventory remains the source of truth for the
+        still-deferred multipart pending-slot publishers while the following
+        subphases convert them.
       - inventory every multipart publisher, finisher, cleanup path, and helper
         that touches:
         - `multipart_uploads`, `multipart_parts`,
@@ -2920,6 +2926,11 @@ Proposed subphases:
       - exit when the audit table, guide text, and boundary allowlist agree
 
    2. Phase 9.3.2: UploadPart stream session creation
+      - status: in progress. `begin_upload_part_stream_session` and
+        `create_upload_part_stream_session` now use explicit pending-slot
+        install attempts and restart from fresh MPU state after command-id or
+        slot contention; targeted contention/reopen coverage still needs to be
+        completed before this subphase is closed.
       - convert `begin_upload_part_stream_session` and
         `create_upload_part_stream_session` to the snapshot-sensitive
         install-or-drain shape:

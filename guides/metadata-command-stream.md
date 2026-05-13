@@ -158,8 +158,8 @@ Current production pending-command publishers:
 | `create_put_object_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Rerun authorization/object snapshot after contention. |
 | `finalize_put_object_stream` | `CommitDirectPutObject` | `SnapshotSensitive` | Rebuild commit from current object preconditions and stream-session snapshot after contention. |
 | `create_multipart_upload` | `CreateMultipartUpload` | `SnapshotSensitive` | Rerun authorization/object snapshot after contention. |
-| `begin_upload_part_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Revalidate MPU/session target after contention; Phase 9.3 deferral, still allowed to use the multipart-specific pending-slot shape. |
-| `create_upload_part_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Revalidate MPU/session target after contention; Phase 9.3 deferral, still allowed to use the multipart-specific pending-slot shape. |
+| `begin_upload_part_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Revalidate MPU/session target and rerun the caller action against fresh MPU state using the request-entry authorization snapshot/capability after contention. |
+| `create_upload_part_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Revalidate MPU/session target after contention. |
 | `reserve_completed_multipart_upload_order` | `AdvanceCompletedMultipartUploadSequence` | `AllocatorCleanup` | Serialize through the bucket-PG slot; a later object-PG command must be derived from a terminal reservation. |
 | `complete_multipart_upload_commit_serialized` | `CommitMultipartObject` | `SnapshotSensitive` | Rebuild completion parts, cleanup snapshot, stale payload, and bucket-PG order after contention; Phase 9.3 deferral. |
 | `finalize_upload_part_stream` | `CommitStreamPart` | `SnapshotSensitive` | Rebuild stream-session and staged-segment snapshot after contention; Phase 9.3 deferral, still allowed to use the multipart-specific pending-slot shape. |
@@ -175,12 +175,75 @@ Snapshot-sensitive publishers should prefer
 `install_snapshot_sensitive_metadata_command_or_drain` so slot contention
 drains the winner and returns to the caller's fresh-snapshot loop.
 
-The multipart and UploadPart publishers marked as Phase 9.3 deferrals are not
+The multipart publishers marked as Phase 9.3 deferrals are not
 claimed as fully hardened by Phase 9.2H. They are inventoried here and in
 `scripts/check-storage-cluster-boundaries` so the remaining `set_pending...` and
 `try_set...` shapes cannot be mistaken for unreviewed omissions. Phase 9.3 owns
 converting those paths to multipart-aware PG-primary serialization and
 fresh-snapshot restart rules.
+
+## Multipart Command-Stream Invariants
+
+Phase 9.3 owns multipart upload lifecycle serialization. Multipart commands are
+still PG-local commands: the bucket PG can own completed-upload order
+allocation, while the object PG owns upload, part, stream session, object
+publication, and terminal cleanup rows. Multi-PG multipart flows must derive
+later commands only from terminal earlier commands; they must not leave two PGs
+with ambiguous pending slots where either PG cannot determine whether the
+request should converge or restart.
+
+Command-owned multipart metadata includes:
+
+- `multipart_uploads`
+- `multipart_parts`
+- `multipart_part_segments`
+- `stream_uploads`
+- `stream_upload_segments`
+- `completed_multipart_uploads`
+- `buckets.completed_multipart_upload_sequence`
+
+For one upload id, the command stream must make exactly one terminal lifecycle
+outcome visible: the upload is still in progress, completed, or aborted. Once a
+complete or abort command is terminal, no active UploadPart stream session or
+staged stream segment for that upload may remain valid. Cleanup of active
+UploadPart stream sessions, staged stream segments, omitted parts, displaced
+part segments, and UploadPartCopy staged copied segments must be carried by the
+terminal command or by explicit retry/scavenger records. Later cleanup must not
+infer those refs from current rows after the terminal command has already
+published.
+
+UploadPartCopy is part of the same surface as streamed UploadPart. It creates a
+destination UploadPart stream session, appends copied source segments, finalizes
+the destination part, and aborts the session if source read/copy work fails.
+Phase 9.3 tests must therefore cover UploadPartCopy races with destination MPU
+abort and complete, plus cleanup of copied staged segments when the destination
+upload becomes terminal before finalize.
+
+Local multipart locks such as `lock_multipart_completion_bucket` and
+`lock_bucket` may remain as in-process contention reducers while the server is
+still single-process. They are not command-stream authorities. Correctness must
+come from durable PG-primary pending slots, command apply validation, and
+fresh-snapshot restart after contention.
+
+Multipart publisher rules:
+
+- `begin_upload_part_stream_session` and
+  `create_upload_part_stream_session` must reload the in-progress MPU row and
+  rerun the caller action against fresh MPU state after object-PG slot
+  contention. This uses the request-entry authorization snapshot/capability; it
+  does not mean storage reauthorizes against current bucket policy.
+- `finalize_upload_part_stream` must reload the stream session, MPU row,
+  existing part row, staged segments, and displaced part refs after contention.
+- `abort_multipart_upload_locked` and
+  `abort_authorized_multipart_upload_locked` must rebuild upload, part, active
+  stream session, staged segment, and cleanup snapshots after contention.
+- `complete_multipart_upload_commit_serialized` must reserve completed-MPU
+  order through a terminal bucket-PG command before constructing the object-PG
+  commit, then reload the object-PG completion snapshot after that order is
+  terminal.
+- A retry of a duplicate UploadPart or finalize request is accepted only when
+  the command-owned row image and cleanup refs match exactly, except for
+  explicitly documented idempotence fields such as normalized timestamps.
 
 ## Finish And Convergence Paths
 

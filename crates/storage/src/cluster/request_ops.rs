@@ -5002,76 +5002,97 @@ impl super::StorageCluster {
         upload_id: &UploadId,
         part_number: u32,
         session_id: &SessionId,
-        action: impl FnOnce(&MultipartUploadRecord) -> Result<(AuthorizedMultipartUploadRecord, T), E>,
+        mut action: impl FnMut(
+            &MultipartUploadRecord,
+        ) -> Result<(AuthorizedMultipartUploadRecord, T), E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let _bucket_guard = primary_node.lock_bucket(bucket);
-        let applied_commands = self
-            .drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)
-            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-        let object_pg = primary_node.get_pg(pg_id.get())?;
-        let upload = PgMetadataStore::get_multipart_upload(&*object_pg, upload_id)?;
-        if upload.bucket != *bucket || upload.key != *key || upload.state != UploadState::InProgress
-        {
-            return Err(BucketSnapshotLoadError::Metadata(
-                MetadataError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
+        loop {
+            let applied_commands = self
+                .drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let upload = PgMetadataStore::get_multipart_upload(&*object_pg, upload_id)?;
+            if upload.bucket != *bucket
+                || upload.key != *key
+                || upload.state != UploadState::InProgress
+            {
+                return Err(BucketSnapshotLoadError::Metadata(
+                    MetadataError::NoSuchUpload {
+                        upload_id: upload_id.to_string(),
+                    },
+                ));
+            }
+            let (authorized_upload, result) = match action(&upload) {
+                Ok((authorized_upload, result)) => (authorized_upload, result),
+                Err(error) => return Ok(Err(error)),
+            };
+            if authorized_upload.record() != &upload {
+                return Err(BucketSnapshotLoadError::Metadata(
+                    MetadataError::NoSuchUpload {
+                        upload_id: upload_id.to_string(),
+                    },
+                ));
+            }
+            let create = CreateStreamUploadReq {
+                session_id: session_id.clone(),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                target: StreamUploadTarget::UploadPart {
+                    upload_id: upload_id.clone(),
+                    part_number,
                 },
-            ));
-        }
-        let (authorized_upload, result) = match action(&upload) {
-            Ok((authorized_upload, result)) => (authorized_upload, result),
-            Err(error) => return Ok(Err(error)),
-        };
-        if authorized_upload.record() != &upload {
-            return Err(BucketSnapshotLoadError::Metadata(
-                MetadataError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
-                },
-            ));
-        }
-        let create = CreateStreamUploadReq {
-            session_id: session_id.clone(),
-            bucket: bucket.clone(),
-            key: key.clone(),
-            target: StreamUploadTarget::UploadPart {
-                upload_id: upload_id.clone(),
-                part_number,
-            },
-            encryption: upload.encryption.clone(),
-        };
-        drop(object_pg);
-        if self
-            .matching_stream_upload_exists(
-                pg_id,
-                &create,
-                super::applied_stream_create_command(&applied_commands, &create),
-            )
-            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
-        {
+                encryption: upload.encryption.clone(),
+            };
+            drop(object_pg);
+            if self
+                .matching_stream_upload_exists(
+                    pg_id,
+                    &create,
+                    super::applied_stream_create_command(&applied_commands, &create),
+                )
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
+            {
+                return Ok(Ok(result));
+            }
+            let command_id = match self.next_object_metadata_command_id(pg_id) {
+                Ok(command_id) => command_id,
+                Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                    ..
+                })) => {
+                    self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+                        .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                        error,
+                    ));
+                }
+            };
+            let command = MetadataCommandEnvelope::new(
+                command_id,
+                MetadataCommandPayload::CreateStreamUpload(Box::new(
+                    CreateStreamUploadCommand::from_request(
+                        create,
+                        crate::clock::current_time_millis(),
+                    ),
+                )),
+            );
+            if !self
+                .try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
+            {
+                self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                continue;
+            }
+            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
             return Ok(Ok(result));
         }
-        let command = MetadataCommandEnvelope::new(
-            self.next_object_metadata_command_id(pg_id)
-                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?,
-            MetadataCommandPayload::CreateStreamUpload(Box::new(
-                CreateStreamUploadCommand::from_request(
-                    create,
-                    crate::clock::current_time_millis(),
-                ),
-            )),
-        );
-        self.set_pending_metadata_command_for_bucket(
-            pg_id,
-            bucket,
-            &command,
-            "conflicting pending command for upload part stream creation",
-        )
-        .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-        self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
-            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-        Ok(Ok(result))
     }
 
     pub fn create_upload_part_stream_session(
@@ -5115,8 +5136,18 @@ impl super::StorageCluster {
             )? {
                 return Ok(session_id.clone());
             }
+            let command_id = match self.next_object_metadata_command_id(pg_id) {
+                Ok(command_id) => command_id,
+                Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                    ..
+                })) => {
+                    self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let command = MetadataCommandEnvelope::new(
-                self.next_object_metadata_command_id(pg_id)?,
+                command_id,
                 MetadataCommandPayload::CreateStreamUpload(Box::new(
                     CreateStreamUploadCommand::from_request(
                         create,
@@ -5124,15 +5155,7 @@ impl super::StorageCluster {
                     ),
                 )),
             );
-            if self
-                .set_pending_metadata_command_for_bucket(
-                    pg_id,
-                    bucket,
-                    &command,
-                    "conflicting pending command for upload part stream creation",
-                )
-                .is_err()
-            {
+            if !self.try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)? {
                 self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
                 continue;
             }
