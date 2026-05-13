@@ -1,0 +1,286 @@
+In-flight recovery can serve stale authorization metadata
+Link: https://chatgpt.com/codex/cloud/security/findings/8de75f2516b0819195f91f3d967a9fb5?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: ae34427
+Author: justin@specialbusservice.com
+Created: 13/05/2026, 16:50:17
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: the new restart validation permits mixed primary-pending/replica-applied metadata state, but the read/authorization path was not updated to force convergence before serving snapshots from the stale primary.
+Metadata commands are applied to non-primary replicas before the primary. After a crash or primary-side apply failure, the primary can retain a pending command at the next log index while other replicas have advanced. This commit changes LocalClusterMap::open to accept that mixed state as an in-flight recovery case. The problem is that opening the cluster does not immediately replay the pending command, and read-only paths such as load_bucket_snapshot read directly from the bucket metadata primary. Server authorization then derives public-read/public-write decisions from that snapshot. If the in-flight command is an access-control or public-access-block revocation, the restarted server can continue using the primary's older, more permissive bucket state until some later write path drains the pending command.
+
+# Resolution
+Fixed in `2e607a3` (`Converge in-flight metadata commands on open`).
+
+The fix changes local-cluster open-time recovery so an accepted in-flight metadata command is converged before `LocalClusterMap::open` returns. The primary pending slot is preserved during the cluster-wide agreement check, recovery applies the command in primary-last order to match normal fanout, and the primary slot is cleaned only after required replicas have converged or the PG fails closed. This prevents read-only bucket snapshot and authorization paths from serving stale primary materialized metadata after restart.
+
+The fix also covers the crash-step shape where the primary already has the terminal log row while a non-primary replica is still behind: reopen now keeps the pending slot as recovery intent, converges the lagging replica, and only then removes the slot. Regression coverage was added for stale snapshot prevention and terminal-primary-pending convergence. Verified with `cargo nextest run -p storage --no-fail-fast`, `./scripts/check-storage-cluster-boundaries`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+
+# Validation
+## Rubric
+- [x] Confirm the metadata command apply order can leave replicas advanced while the primary is behind/pending.
+- [x] Confirm LocalClusterMap::open accepts that mixed in-flight recovery state instead of failing closed.
+- [x] Confirm reopen does not immediately replay/drain the pending command.
+- [x] Confirm read-only bucket snapshot loading uses the primary materialized state and can return stale public_read/public ACL data.
+- [x] Confirm the stale field is authorization-relevant via effective_public_read/public access block logic.
+## Report
+Validated the suspected stale-primary metadata exposure with a targeted Rust integration PoC and an LLDB trace. Rubric checklist:
+- [x] Mixed state is reachable because metadata commands apply to non-primary replicas before the primary: crates/storage/src/cluster/request_ops.rs:741-754 sorts the primary last.
+- [x] Restart accepts a primary-pending/replica-applied state: crates/storage/src/cluster/local.rs:1150-1211 collects a primary pending command, and crates/storage/src/cluster/local.rs:1216-1331 returns Ok when advanced replicas match that pending command.
+- [x] Open/restart does not force convergence before serving reads: the PoC reopens LocalClusterMap successfully after the injected partial apply and immediately performs a read.
+- [x] Read-only bucket snapshot path reads the metadata primary directly: crates/storage/src/cluster/request_ops.rs:1229-1236 calls bucket_metadata_primary_node(...).load_bucket_snapshot, and crates/storage/src/node/bucket_ops.rs:50-57 reads the PG materialized bucket state.
+- [x] Authorization-relevant state depends on that snapshot/public flag: crates/server-core/src/coordinator/authz.rs:792-794 computes effective_public_read from bucket.public_read and public_access_block.
+
+PoC behavior: crates/storage/tests/stale_snapshot_recovery.rs creates a public-read bucket, injects StoreError::NotFound before applying a PutBucketAcl(public_read=false) command on primary node 0, leaving replicas applied and the primary with the pending slot. After dropping handles, LocalClusterMap::open succeeds. Immediately after reopen, StorageCluster::load_bucket_snapshot returns public_read=true from the stale primary. A later write path drains the pending command and public_read becomes false.
+
+Key command output from cargo test:
+`injected primary-side apply failure: Store(NotFound)`
+`snapshot after reopen before drain: public_read=true`
+`after write drain: public_read=false`
+`test ... ok`
+
+Debugger evidence: LLDB breakpoint at crates/storage/src/cluster/request_ops.rs:1234 after reopening showed the read-only path in StorageCluster::load_bucket_snapshot, with backtrace frame #1 at stale_snapshot_recovery.rs:53 (the post-reopen stale snapshot load). Continuing printed `snapshot after reopen before drain: public_read=true` and later `after write drain: public_read=false`.
+
+Crash/Valgrind/Debugger attempts: this is a logic flaw, not a memory-safety crash; the targeted reproduction is non-crashing. valgrind and gdb were not installed in the container. LLDB was available and used non-interactively to trace the vulnerable read path.
+
+# Evidence
+crates/server-core/src/coordinator/authz.rs (L792 to 794)
+  Note: Authorization decisions depend on the bucket summary's public_read/public-access-block values, which can come from the stale snapshot.
+```
+    pub(super) fn effective_public_read(bucket: &BucketSummary) -> bool {
+        bucket.public_read && !Self::ignores_public_acls(bucket.public_access_block.as_ref())
+    }
+```
+
+crates/storage/src/cluster/local.rs (L1216 to 1331)
+  Note: New validation accepts a divergent restart state when the primary has a pending command and advanced replicas match that command, returning Ok without forcing immediate replay/convergence.
+```
+fn validate_metadata_command_replica_agreement_or_in_flight_recovery(
+    nodes: &BTreeMap<NodeId, LocalNodeStore>,
+    pg_id: PgId,
+    primary_node_id: NodeId,
+    cluster_epoch: ClusterEpoch,
+    replica_states: &[(NodeId, MetadataCommandReplicaState)],
+    primary_pending_command: Option<&MetadataCommandEnvelope>,
+) -> Result<(), ClusterBuildError> {
+    let Some((reference_node_id, reference_state)) = replica_states.first() else {
+        return Ok(());
+    };
+    if replica_states
+        .iter()
+        .all(|(_node_id, state)| state == reference_state)
+    {
+        return Ok(());
+    }
+
+    let primary_state = replica_states
+        .iter()
+        .find_map(|(node_id, state)| (*node_id == primary_node_id).then_some(state))
+        .expect("validated route primary must be in local node set");
+    let Some(command) = primary_pending_command else {
+        let (node_id, state) = first_divergent_replica(replica_states, *reference_node_id);
+        return Err(metadata_command_replica_state_diverged_error(
+            pg_id,
+            node_id,
+            *reference_node_id,
+            state,
+            reference_state,
+        ));
+    };
+    let next_index = primary_state
+        .applied_log_index
+        .checked_add(1)
+        .ok_or_else(|| {
+            metadata_command_replica_state_diverged_error(
+                pg_id,
+                primary_node_id,
+                *reference_node_id,
+                primary_state,
+                reference_state,
+            )
+        })?;
+    if command.id().cluster_epoch() != cluster_epoch
+        || command.id().pg_id() != pg_id
+        || command.id().log_index().get() != next_index
+    {
+        return Err(metadata_command_replica_state_diverged_error(
+            pg_id,
+            primary_node_id,
+            *reference_node_id,
+            primary_state,
+            reference_state,
+        ));
+    }
+
+    let mut advanced_reference: Option<(NodeId, &MetadataCommandReplicaState)> = None;
+    for (node_id, state) in replica_states {
+        if state == primary_state {
+            continue;
+        }
+        if state.cluster_epoch != primary_state.cluster_epoch
+            || state.applied_log_index != next_index
+        {
+            return Err(metadata_command_replica_state_diverged_error(
+                pg_id,
+                *node_id,
+                primary_node_id,
+                state,
+                primary_state,
+            ));
+        }
+        let node = nodes
+            .get(node_id)
+            .expect("replica state node must exist in local node set");
+        let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
+            ClusterBuildError::OpenLocalNode {
+                node_id: node_id.as_u32(),
+                source,
+            }
+        })?;
+        let matches_pending = pg
+            .has_matching_applied_metadata_command_log_entry(
+                node_id.as_u32(),
+                command,
+                primary_state.applied_log_hash,
+            )
+            .map_err(|source| ClusterBuildError::OpenLocalNode {
+                node_id: node_id.as_u32(),
+                source,
+            })?;
+        if !matches_pending {
+            return Err(metadata_command_replica_state_diverged_error(
+                pg_id,
+                *node_id,
+                primary_node_id,
+                state,
+                primary_state,
+            ));
+        }
+        if let Some((advanced_reference_node_id, advanced_reference_state)) = advanced_reference {
+            if state != advanced_reference_state {
+                return Err(metadata_command_replica_state_diverged_error(
+                    pg_id,
+                    *node_id,
+                    advanced_reference_node_id,
+                    state,
+                    advanced_reference_state,
+                ));
+            }
+        } else {
+            advanced_reference = Some((*node_id, state));
+        }
+    }
+    Ok(())
+```
+
+crates/storage/src/cluster/request_ops.rs (L1229 to 1236)
+  Note: Read-only bucket snapshot loading goes straight to the bucket metadata primary and does not check or drain the pending metadata command accepted during restart.
+```
+    pub fn load_bucket_snapshot(
+        &self,
+        bucket: &BucketName,
+        request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
+        self.bucket_metadata_primary_node(bucket)?
+            .load_bucket_snapshot(bucket, request)
+    }
+```
+
+crates/storage/src/cluster/request_ops.rs (L735 to 754)
+  Note: Metadata command application orders the primary last, making the newly accepted state reachable: non-primary replicas may apply the command while the primary remains behind with a pending slot.
+```
+        let pg_id = command.id().pg_id();
+        let pg_lock = self
+            .local_map
+            .runtime_state()
+            .metadata_command_pg_lock(pg_id);
+        let _pg_guard = pg_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut nodes = self
+            .local_map
+            .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id)
+            .map_err(|source| MetadataCommandApplyFailure {
+                applied_nodes: 0,
+                source: source.into(),
+            })?;
+        let primary_node_id = self
+            .local_map
+            .pg_route(pg_id)
+            .expect("validated metadata PG command route must exist")
+            .primary_node_id();
+        nodes.sort_by_key(|node| node.node_id() == primary_node_id);
+        for (applied_nodes, node) in nodes.into_iter().enumerate() {
+```
+
+crates/storage/src/node/bucket_ops.rs (L50 to 57)
+  Note: The primary node snapshot path reads the PG's current materialized bucket metadata directly, so it can return the stale pre-command state.
+```
+    pub fn load_bucket_snapshot(
+        &self,
+        bucket: &BucketName,
+        request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
+        let pg_id = self.pg_topology.bucket_pg_for(bucket);
+        let bucket_pg = self.get_pg(pg_id)?;
+        Self::load_bucket_snapshot_from_pg(&bucket_pg, bucket, request)
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: high | Policy adjusted: high
+## Rationale
+Keep medium. Static evidence and the provided executable integration PoC support that the bug is real and in the main runtime path: primary-last metadata application makes the mixed state reachable, restart validation accepts it, snapshot loading reads the stale primary, and authorization uses the stale public ACL/PAB fields. The potential impact is meaningful unauthorized data exposure or a stale public-write window. However, the exploitation probability is substantially reduced by high-complexity preconditions: a crash or primary apply failure at a precise point during an authorization-revoking metadata command, service restart, and attacker action before convergence. This does not meet high/critical standards because it is not a trivial auth bypass, not persistent after drain, and no public ingress is evident in repository artifacts.
+## Likelihood
+high - The HTTP request itself is straightforward once the bad state exists, but creating the state requires a crash or primary-side metadata apply failure during a security-relevant metadata mutation and exploitation must occur before a later write drains the pending command. No repository deployment manifest showed public internet exposure, and the default bind address is localhost. | Remote network vector
+## Impact
+high - If the stale command revoked public ACLs or enabled public-access-block behavior, authorization can continue to treat a bucket/object as public. That can expose bucket listings or object data to anonymous clients, and stale public_write could allow a temporary unauthorized write window. The issue does not provide code execution or credential theft and is bounded to the affected service/bucket state.
+## Assumptions
+- The argmin-s3 HTTP service is deployed so that an attacker can reach ARGMIN_LISTEN_ADDR; the repository default is 127.0.0.1:9000 and no public ingress/IaC was present.
+- A bucket or object was previously public, and an owner/admin metadata command revoking public ACLs or enabling public-access-block semantics is the command left pending on the primary.
+- A crash or primary-side apply failure occurs after non-primary replicas apply the metadata command but before the primary applies it, and the service is restarted before another write drains the pending command.
+- The attacker can act before a later write path converges/drains the pending metadata command.
+- argmin-s3 runtime using local storage cluster metadata replication
+- metadata command that tightens authorization state, such as PutBucketAcl(public_read=false) or PublicAccessBlock changes
+- partial metadata-command application where non-primary replicas advance and the primary retains the pending command
+- service restart/open while that mixed state exists
+- read/authorization request reaches the service before a later write drains the pending command
+## Path
+Attacker HTTP request
+  -> argmin-s3 listener
+  -> anonymous/requester auth context
+  -> coordinator load_bucket_snapshot
+  -> stale primary bucket metadata accepted after restart
+  -> effective_public_read/write and public-access-block checks use old state
+  -> unauthorized read/list/write window
+## Path evidence
+- `crates/argmin-s3/src/main.rs:184-238` - Main product binary binds the configured TCP listener and starts plain HTTP or TLS serving with server_http::http::serve.
+- `crates/argmin-s3/src/config.rs:87-100` - Runtime credentials and listen address are environment-driven; default listen address is 127.0.0.1:9000.
+- `README.md:28-36` - Repository documentation identifies argmin-s3 as an S3-compatible service configured by access keys, secret keys, optional TLS, and a listen address.
+- `crates/server-http/src/http/mod.rs:3074-3077` - HTTP request handling maps missing authentication to an anonymous AuthContext, so public-bucket authorization decisions are reachable by unauthenticated network clients.
+- `crates/storage/src/cluster/request_ops.rs:741-754` - Metadata command application sorts the primary node last, so non-primary replicas can apply a command before the primary.
+- `crates/storage/src/cluster/local.rs:1177-1211` - Cluster open collects a pending metadata command on the primary and passes it to the new in-flight recovery validation.
+- `crates/storage/src/cluster/local.rs:1216-1331` - Validation returns Ok for a divergent in-flight state when advanced replicas match the primary pending command, without forcing immediate replay.
+- `crates/storage/src/cluster/request_ops.rs:1229-1236` - Read-only bucket snapshot loading reads directly from the bucket metadata primary and does not check or drain the pending metadata command.
+- `crates/storage/src/node/bucket_ops.rs:50-57` - The node-level snapshot path reads the placement group's current materialized bucket metadata, which can be stale on the primary.
+- `crates/server-core/src/coordinator/authz.rs:457-472` - Bucket-read authorization allows access when the bucket summary indicates public_read.
+- `crates/server-core/src/coordinator/authz.rs:792-797` - Effective public-read/public-write decisions are computed directly from bucket.public_read/public_write and public_access_block fields from the snapshot.
+- `crates/server-core/src/coordinator/authz.rs:475-498` - Object-read authorization honors object public_read unless the bucket public-access-block says to ignore public ACLs, so stale public_access_block metadata can expose object data.
+## Narrative
+The finding is a real in-scope security issue. The commit allows LocalClusterMap startup to accept a mixed metadata state where the primary has a pending command at the next log index while advanced replicas have already applied that command. The write path orders primary last, making this state reachable after a primary-side apply failure or crash. After restart, read-only bucket snapshot loading goes directly to the bucket metadata primary and does not drain the pending command. Server authorization then computes public-read/public-write/public-access-block behavior from that bucket summary. If the pending command was a revocation of public access, a network requester can be authorized under the old, more permissive state until a later write converges the metadata. Severity remains medium: the impact can include unauthorized access to object/bucket data or a stale public-write window, but exploitation requires a high-complexity crash/apply-failure timing and the exposure window is transient.
+## Controls
+- SigV4 authentication for authenticated S3 operations
+- Anonymous AuthContext is intentionally allowed for public bucket/object access
+- Bucket ACLs and public-access-block flags govern public-read/public-write behavior
+- Default listener is 127.0.0.1:9000, but ARGMIN_LISTEN_ADDR can expose the service on other interfaces
+- Optional direct TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- Connection and request concurrency controls via ARGMIN_MAX_CONNECTIONS and ARGMIN_MAX_INFLIGHT_REQUESTS
+- HTTP header/body idle timeouts in server-http serve layer
+## Blindspots
+- Static-only review of repository artifacts; no cloud APIs or runtime deployment inspection was performed.
+- No Kubernetes, Terraform, Docker Compose, or load balancer manifests were found to prove public exposure; default listener is localhost but deployments can override it.
+- Validation evidence exercised storage-level recovery and snapshot behavior; the HTTP authorization path is supported by static code evidence rather than an end-to-end HTTP PoC in this pass.
+- The exact practical window depends on operational crash/failure rates and write traffic that may drain the pending command.
