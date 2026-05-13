@@ -1016,7 +1016,7 @@ impl Coordinator {
                         (None, None) => None,
                     };
 
-                    let checksum = if let Some(cksum) = computed_checksum {
+                    let checksum = if let Some(cksum) = computed_checksum.clone() {
                         let algo = cksum.algorithm();
                         let bytes = cksum.bytes();
                         if let Some(ea) = effective_algo {

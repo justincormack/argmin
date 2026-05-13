@@ -162,7 +162,7 @@ Current production pending-command publishers:
 | `create_upload_part_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Revalidate MPU/session target after contention. |
 | `reserve_completed_multipart_upload_order` | `AdvanceCompletedMultipartUploadSequence` | `AllocatorCleanup` | Serialize through the bucket-PG slot; a later object-PG command must be derived from a terminal reservation. |
 | `complete_multipart_upload_commit_serialized` | `CommitMultipartObject` | `SnapshotSensitive` | Rebuild completion parts, cleanup snapshot, stale payload, and bucket-PG order after contention; Phase 9.3 deferral. |
-| `finalize_upload_part_stream` | `CommitStreamPart` | `SnapshotSensitive` | Rebuild stream-session and staged-segment snapshot after contention; Phase 9.3 deferral, still allowed to use the multipart-specific pending-slot shape. |
+| `finalize_upload_part_stream` | `CommitStreamPart` | `SnapshotSensitive` | Rebuild stream session, MPU row, staged segments, and displaced part refs after contention. |
 | `abort_multipart_upload_locked` | `AbortMultipartUpload` | `SnapshotSensitive` | Rebuild upload/part/active stream cleanup snapshot after contention; Phase 9.3 deferral. |
 | `abort_authorized_multipart_upload_locked` | `AbortMultipartUpload` | `SnapshotSensitive` | Rebuild authorized upload cleanup snapshot after contention; Phase 9.3 deferral. |
 
@@ -175,8 +175,8 @@ Snapshot-sensitive publishers should prefer
 `install_snapshot_sensitive_metadata_command_or_drain` so slot contention
 drains the winner and returns to the caller's fresh-snapshot loop.
 
-The multipart publishers marked as Phase 9.3 deferrals are not
-claimed as fully hardened by Phase 9.2H. They are inventoried here and in
+The multipart publishers still marked as Phase 9.3 deferrals are not claimed as
+fully hardened by Phase 9.2H. They are inventoried here and in
 `scripts/check-storage-cluster-boundaries` so the remaining `set_pending...` and
 `try_set...` shapes cannot be mistaken for unreviewed omissions. Phase 9.3 owns
 converting those paths to multipart-aware PG-primary serialization and

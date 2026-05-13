@@ -299,7 +299,7 @@ expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster/request_ops.rs:delete_specific_object_version_if<T, E>:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:expire_current_object_if_due<E>:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:finalize_put_object_stream<T, E>:install_snapshot_sensitive_metadata_command_or_drain
-1 crates/storage/src/cluster/request_ops.rs:finalize_upload_part_stream<T, E>:set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:finalize_upload_part_stream<T, E>:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:insert_current_delete_marker_if<T, E>:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:put_bucket_acl_and_load_info:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:put_bucket_property_command_and_load_info:try_set_pending_metadata_command_for_bucket
@@ -356,6 +356,7 @@ expected_metadata_command_conflict_uses=$(cat <<'EOF'
 1 crates/storage/src/cluster/request_ops.rs:begin_upload_part_stream_session<T, E>:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:create_put_object_stream_session<T, E>:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:create_upload_part_stream_session:metadata-command-log-conflict
+1 crates/storage/src/cluster/request_ops.rs:finalize_upload_part_stream<T, E>:metadata-command-log-conflict
 2 crates/storage/src/cluster/request_ops.rs:finish_pending_metadata_command_to_acting_set_inner:exact-command-match
 EOF
 )

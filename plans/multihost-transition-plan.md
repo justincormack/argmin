@@ -2955,6 +2955,10 @@ Proposed subphases:
         that has been aborted or completed by a command that wins the slot
 
    3. Phase 9.3.3: streamed UploadPart finalization
+      - status: in progress. `finalize_upload_part_stream` now uses the
+        snapshot-sensitive install/drain loop and reloads stream session, MPU,
+        existing part, staged segment, and displaced-part state after
+        contention before rebuilding `CommitStreamPart`.
       - convert `finalize_upload_part_stream` to the snapshot-sensitive
         install-or-drain shape:
         - reload the stream session, MPU row, existing part row, staged segment
