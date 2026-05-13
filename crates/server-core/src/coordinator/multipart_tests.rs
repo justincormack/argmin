@@ -7612,6 +7612,139 @@ fn upload_part_copy_streams_multisegment_source_and_persists_checksum() {
 }
 
 #[test]
+fn upload_part_copy_source_read_failure_aborts_destination_stream_session() {
+    let dir = test_util::tempdir();
+    let coord = setup_coordinator(dir.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let data: Vec<u8> = (0..(INTERNAL_SEGMENT_SIZE + 1024))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let session_id = begin_stream_put_test(&coord, "bucket", "src").unwrap();
+    let mut crc64 = checksum::crc64::Hasher::new();
+    for (idx, chunk) in data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
+        coord
+            .append_plaintext_stream_segment_for_test(
+                "bucket",
+                "src",
+                &session_id,
+                idx as u32,
+                chunk,
+            )
+            .unwrap();
+        crc64.update(chunk);
+    }
+    coord
+        .finalize_stream_put(&FinalizeStreamPutRequest {
+            object: object_request("bucket", "src", test_requester()),
+            session_id: &session_id,
+            crc64: crc64.finalize(),
+            total_size: data.len() as u64,
+            metadata_blob: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            write_encryption: ActiveWriteEncryptionRef::None,
+            tags: None,
+            cond: &WriteCondition::default(),
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            requested_object_lock: ObjectLockState::default(),
+        })
+        .unwrap();
+
+    let source_segments = coord
+        .storage_node
+        .test_get_object_segments(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("src"),
+            VersionId::Null,
+        )
+        .unwrap();
+    assert_eq!(source_segments.len(), 2);
+    let broken_segment = &source_segments[1];
+    let broken_ec = EcShape {
+        k: broken_segment.ec_k,
+        m: broken_segment.ec_m,
+    };
+    for shard_index in 0..(broken_segment.ec_k + broken_segment.ec_m) {
+        let shard_path = coord
+            .storage_node
+            .test_payload_shard_file_path(
+                broken_segment.data_pg_id,
+                broken_ec,
+                &broken_segment.segment_okh,
+                broken_segment.segment_vid,
+                shard_index,
+            )
+            .unwrap();
+        std::fs::remove_file(&shard_path).unwrap_or_else(|error| {
+            panic!(
+                "failed to delete source shard {shard_index} at {}: {error}",
+                shard_path.display()
+            )
+        });
+    }
+
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner("bucket", "dst", test_requester(), None),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let err = coord
+        .upload_part_copy(&UploadPartCopyRequest {
+            source: copy_source("bucket", "src", None),
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "dst",
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number: 1,
+            copy_source_range: None,
+            source_sse_customer: None,
+            sse_customer: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ServerError::ObjectNotFound { .. } | ServerError::Store(_)
+        ),
+        "expected source read failure, got {err:?}"
+    );
+    assert_eq!(
+        upload_part_stream_session_count(&coord, "bucket", "dst", &upload.upload_id, 1),
+        0,
+        "failed UploadPartCopy must abort the destination UploadPart stream session"
+    );
+    let parts = coord
+        .list_parts(&ListPartsRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "dst",
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number_marker: None,
+            max_parts: 1000,
+        })
+        .unwrap();
+    assert!(parts.parts.is_empty());
+}
+
+#[test]
 fn upload_part_copy_invalid_part_number_exceeds_max() {
     let dir = test_util::tempdir();
     let coord = setup_coordinator(dir.path());

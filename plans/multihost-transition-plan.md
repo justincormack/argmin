@@ -3042,7 +3042,7 @@ Proposed subphases:
         UploadPart streams cannot survive it as valid sessions
 
    5. Phase 9.3.5: multipart completion and bucket-PG order flow
-      - status: in progress. The completion path now handles object-PG
+      - status: complete. The completion path now handles object-PG
         pre-publish command-id contention after the bucket-PG order reservation
         by draining the winning command and restarting from a fresh object-PG
         snapshot. Coverage pins that a winner published in that window is
@@ -3052,7 +3052,16 @@ Proposed subphases:
         abort before returning the normal missing-upload result and applying
         abort cleanup. Partial bucket-PG order apply is also covered: retrying
         completion finishes the pending order command before publishing the
-        object-PG completion command.
+        object-PG completion command. Same-upload completion retry now drains
+        the matching pending completion and returns that exact terminal outcome
+        without allocating another completed-MPU order. Different uploads for
+        the same destination key are covered by draining the first pending
+        completion, then resnapshotting it as stale payload for the second
+        completion. Partial object-PG completion apply is covered across reopen:
+        open-time recovery converges the pending `CommitMultipartObject` and
+        clears the durable slot. UploadPartCopy source-read failure after the
+        destination UploadPart stream session exists is also pinned; the failed
+        copy aborts the destination session and leaves no committed part.
       - split `complete_multipart_upload_commit_serialized` into explicit
         phases:
         - validate upload and requested parts from the object PG
@@ -3084,8 +3093,10 @@ Proposed subphases:
           completed-MPU order through the bucket PG
         - partial bucket-PG order apply, partial object-PG commit apply, reopen,
           and convergence
-      - exit when MPU completion is deterministic across acting-set replicas and
-        does not depend on `lock_multipart_completion_bucket` for correctness
+      - exit: met. MPU completion is deterministic across acting-set replicas,
+        completion order is reserved through the bucket-PG command stream, and
+        race/retry coverage no longer depends on
+        `lock_multipart_completion_bucket` for correctness.
 
    6. Phase 9.3.6: race matrix and model coverage
       - add a multipart command-stream invariant checker that extends the Phase
