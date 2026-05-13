@@ -1882,6 +1882,75 @@ mod tests {
         assert_clean_metadata_command_stream_at_epoch(map, pg_ids, ClusterEpoch::INITIAL);
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum TerminalMultipartOutcome {
+        Aborted,
+        Completed,
+    }
+
+    fn assert_terminal_multipart_upload_invariants(
+        map: &LocalClusterMap,
+        node_ids: &[NodeId],
+        object_pg: u32,
+        bucket: &crate::BucketName,
+        key: &crate::ObjectKey,
+        upload_id: &crate::UploadId,
+        expected_outcome: TerminalMultipartOutcome,
+    ) {
+        for &node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert!(
+                matches!(
+                    crate::PgMetadataStore::get_multipart_upload(&*pg, upload_id),
+                    Err(crate::MetadataError::NoSuchUpload { .. })
+                ),
+                "terminal upload {upload_id:?} should not leave a multipart_uploads row on node {node_id:?}"
+            );
+
+            let mut active_sessions = Vec::new();
+            for session in crate::PgMetadataStore::list_all_stream_uploads(&*pg).unwrap() {
+                if session.bucket != *bucket || session.key != *key {
+                    continue;
+                }
+                if matches!(
+                    &session.target,
+                    crate::StreamUploadTarget::UploadPart {
+                        upload_id: session_upload_id,
+                        ..
+                    } if session_upload_id == upload_id
+                ) {
+                    let segments =
+                        crate::PgMetadataStore::list_stream_segments(&*pg, &session.session_id)
+                            .unwrap();
+                    active_sessions.push((session, segments));
+                }
+            }
+            assert!(
+                active_sessions.is_empty(),
+                "terminal upload {upload_id:?} should not leave active UploadPart stream sessions on node {node_id:?}: {active_sessions:?}"
+            );
+
+            let completed =
+                crate::PgMetadataStore::get_completed_multipart_upload(&*pg, upload_id).unwrap();
+            match expected_outcome {
+                TerminalMultipartOutcome::Aborted => assert!(
+                    completed.is_none(),
+                    "aborted upload {upload_id:?} should not leave a completed-upload idempotence row on node {node_id:?}: {completed:?}"
+                ),
+                TerminalMultipartOutcome::Completed => {
+                    let completed = completed.unwrap_or_else(|| {
+                        panic!(
+                            "completed upload {upload_id:?} should leave a completed-upload idempotence row on node {node_id:?}"
+                        )
+                    });
+                    assert_eq!(completed.bucket, *bucket);
+                    assert_eq!(completed.key, *key);
+                }
+            }
+        }
+    }
+
     fn write_committed_direct_segment(
         cluster: &crate::StorageCluster,
         payload: &[u8],
@@ -11491,6 +11560,15 @@ mod tests {
                 .is_empty()
             );
         }
+        assert_terminal_multipart_upload_invariants(
+            &reopened,
+            &node_ids,
+            object_pg,
+            &bucket,
+            &key,
+            &upload_id,
+            TerminalMultipartOutcome::Aborted,
+        );
         assert_clean_metadata_command_stream(&reopened, &[object_pg]);
     }
 
@@ -15522,6 +15600,15 @@ mod tests {
                 "complete winner must clean copied staged payload after finalize contention: {error:?}"
             );
         }
+        assert_terminal_multipart_upload_invariants(
+            &map,
+            &node_ids,
+            pg_id.get(),
+            &bucket,
+            &key,
+            &req.upload_id,
+            TerminalMultipartOutcome::Completed,
+        );
         assert_clean_metadata_command_stream(&map, &[pg_id.get()]);
     }
 
@@ -17151,6 +17238,15 @@ mod tests {
             &expected_segment,
             &outcome,
         );
+        assert_terminal_multipart_upload_invariants(
+            &map,
+            &node_ids,
+            object_pg,
+            &bucket,
+            &key,
+            &req.upload_id,
+            TerminalMultipartOutcome::Completed,
+        );
     }
 
     #[test]
@@ -17257,6 +17353,15 @@ mod tests {
             &req,
             &expected_segment,
             &outcome,
+        );
+        assert_terminal_multipart_upload_invariants(
+            &reopened,
+            &node_ids,
+            object_pg,
+            &bucket,
+            &key,
+            &req.upload_id,
+            TerminalMultipartOutcome::Completed,
         );
         assert_clean_metadata_command_stream(&reopened, &[object_pg]);
     }
@@ -17554,6 +17659,15 @@ mod tests {
             &outcome,
             write_sequence,
         );
+        assert_terminal_multipart_upload_invariants(
+            &map,
+            &node_ids,
+            object_pg,
+            &bucket,
+            &key,
+            &req.upload_id,
+            TerminalMultipartOutcome::Completed,
+        );
         for node_id in node_ids {
             let bucket_pg = map
                 .node(node_id)
@@ -17739,6 +17853,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(first_readback, b"streamed completion");
+        assert_terminal_multipart_upload_invariants(
+            &map,
+            &node_ids,
+            object_pg,
+            &bucket,
+            &key,
+            &first_req.upload_id,
+            TerminalMultipartOutcome::Completed,
+        );
+        assert_terminal_multipart_upload_invariants(
+            &map,
+            &node_ids,
+            object_pg,
+            &bucket,
+            &key,
+            &second_req.upload_id,
+            TerminalMultipartOutcome::Completed,
+        );
         assert_clean_metadata_command_stream(&map, &[bucket_pg_id, object_pg]);
     }
 
@@ -17865,6 +17997,15 @@ mod tests {
                 "completion draining abort should delete uploaded part shard {shard_index}"
             );
         }
+        assert_terminal_multipart_upload_invariants(
+            &map,
+            &node_ids,
+            object_pg,
+            &bucket,
+            &key,
+            &req.upload_id,
+            TerminalMultipartOutcome::Aborted,
+        );
         assert_clean_metadata_command_stream(&map, &[object_pg]);
     }
 

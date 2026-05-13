@@ -3099,6 +3099,12 @@ Proposed subphases:
         `lock_multipart_completion_bucket` for correctness.
 
    6. Phase 9.3.6: race matrix and model coverage
+      - status: in progress. The first slice adds a reusable terminal MPU
+        lifecycle invariant checker for storage local-cluster tests. It now
+        pins that terminal abort/complete paths leave no live upload row, no
+        active UploadPart stream sessions or staged stream segments for that
+        upload, and the expected completed-upload idempotence record shape
+        across acting nodes.
       - add a multipart command-stream invariant checker that extends the Phase
         9.2 clean-stream helper with upload lifecycle checks:
         - no active `stream_uploads` or `stream_upload_segments` remain for a
