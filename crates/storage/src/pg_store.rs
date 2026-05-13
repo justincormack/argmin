@@ -1367,6 +1367,47 @@ impl PgStore {
             && entry.log_hash == Some(expected_log_hash))
     }
 
+    pub(crate) fn applied_metadata_command_log_entry_hashes(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
+        let Some(entry) = self.load_metadata_command_log_entry(
+            "load metadata command log entry for partial apply retry validation",
+            command.id().cluster_epoch(),
+            command.id().pg_id(),
+            command.id().log_index(),
+        )?
+        else {
+            return Ok(None);
+        };
+        if !self.metadata_command_log_entry_matches(node_id, command, &entry, false)? {
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch: command.id().cluster_epoch(),
+                log_index: command.id().log_index().get(),
+            });
+        }
+        let Some(previous_log_hash) = entry.previous_log_hash else {
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch: command.id().cluster_epoch(),
+                log_index: command.id().log_index().get(),
+            });
+        };
+        let Some(log_hash) = entry.log_hash else {
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch: command.id().cluster_epoch(),
+                log_index: command.id().log_index().get(),
+            });
+        };
+        Ok(Some((previous_log_hash, log_hash)))
+    }
+
     pub(crate) fn pending_metadata_command_slot(
         &self,
         node_id: u32,
