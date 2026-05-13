@@ -1934,10 +1934,21 @@ mod tests {
             let completed =
                 crate::PgMetadataStore::get_completed_multipart_upload(&*pg, upload_id).unwrap();
             match expected_outcome {
-                TerminalMultipartOutcome::Aborted => assert!(
-                    completed.is_none(),
-                    "aborted upload {upload_id:?} should not leave a completed-upload idempotence row on node {node_id:?}: {completed:?}"
-                ),
+                TerminalMultipartOutcome::Aborted => {
+                    assert!(
+                        completed.is_none(),
+                        "aborted upload {upload_id:?} should not leave a completed-upload idempotence row on node {node_id:?}: {completed:?}"
+                    );
+                    let segments =
+                        crate::PgMetadataStore::get_all_multipart_part_segments_for_upload(
+                            &*pg, upload_id,
+                        )
+                        .unwrap();
+                    assert!(
+                        segments.is_empty(),
+                        "aborted upload {upload_id:?} should not leave multipart part segment rows on node {node_id:?}: {segments:?}"
+                    );
+                }
                 TerminalMultipartOutcome::Completed => {
                     let completed = completed.unwrap_or_else(|| {
                         panic!(
@@ -1946,6 +1957,54 @@ mod tests {
                     });
                     assert_eq!(completed.bucket, *bucket);
                     assert_eq!(completed.key, *key);
+
+                    let segments =
+                        crate::PgMetadataStore::get_all_multipart_part_segments_for_upload(
+                            &*pg, upload_id,
+                        )
+                        .unwrap();
+                    let mut object_parts_by_version = BTreeMap::<u64, BTreeSet<u32>>::new();
+                    for segment in &segments {
+                        assert_ne!(
+                            segment.version_id,
+                            crate::MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
+                            "completed upload {upload_id:?} should not leave staging multipart segment rows on node {node_id:?}: {segment:?}"
+                        );
+                        let version_id = crate::VersionId::from_u64(segment.version_id);
+                        let part_numbers =
+                            object_parts_by_version
+                                .entry(segment.version_id)
+                                .or_insert_with(|| {
+                            let stored = crate::PgMetadataStore::get_object_version(
+                                &*pg, bucket, key, version_id,
+                            )
+                            .unwrap_or_else(|err| {
+                                panic!(
+                                    "completed upload {upload_id:?} segment {segment:?} should reference an existing object version on node {node_id:?}: {err:?}"
+                                )
+                            });
+                            let live = stored.as_live().unwrap_or_else(|| {
+                                panic!(
+                                    "completed upload {upload_id:?} segment {segment:?} should reference a live object version on node {node_id:?}: {stored:?}"
+                                )
+                            });
+                            assert!(
+                                matches!(live.layout, crate::ObjectLayout::MultipartManifest { .. }),
+                                "completed upload {upload_id:?} segment {segment:?} should reference a multipart object version on node {node_id:?}: {live:?}"
+                            );
+                            crate::PgMetadataStore::get_object_parts(
+                                &*pg, bucket, key, version_id,
+                            )
+                            .unwrap()
+                            .into_iter()
+                            .map(|part| part.part_number)
+                            .collect()
+                        });
+                        assert!(
+                            part_numbers.contains(&segment.part_number),
+                            "completed upload {upload_id:?} segment {segment:?} should be referenced by an object part row on node {node_id:?}"
+                        );
+                    }
                 }
             }
         }
@@ -3730,6 +3789,275 @@ mod tests {
             ops in local_cluster_trace_strategy()
         ) {
             run_local_cluster_trace(&ops)?;
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    enum MultipartTraceOp {
+        Create(u8),
+        UploadStreamPart(u8),
+        Complete,
+        Abort,
+        Reopen,
+    }
+
+    #[derive(Debug)]
+    struct MultipartTraceUpload {
+        upload_id: crate::UploadId,
+        parts: Vec<crate::MultipartPartRecord>,
+    }
+
+    fn multipart_trace_strategy() -> impl Strategy<Value = Vec<MultipartTraceOp>> {
+        prop::collection::vec(
+            prop_oneof![
+                3 => any::<u8>().prop_map(MultipartTraceOp::Create),
+                3 => any::<u8>().prop_map(MultipartTraceOp::UploadStreamPart),
+                2 => Just(MultipartTraceOp::Complete),
+                2 => Just(MultipartTraceOp::Abort),
+                1 => Just(MultipartTraceOp::Reopen),
+            ],
+            1..=16,
+        )
+    }
+
+    fn multipart_trace_upload_id(step: usize, seed: u8) -> crate::UploadId {
+        upload_id_from_label(&format!("trmpu{step:02x}{seed:02x}"))
+    }
+
+    fn create_multipart_trace_upload(
+        cluster: &crate::StorageCluster,
+        bucket: &crate::BucketName,
+        key: &crate::ObjectKey,
+        upload_id: crate::UploadId,
+    ) -> TestCaseResult {
+        let create = crate::CreateMultipartUploadReq {
+            upload_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
+        cluster
+            .create_multipart_upload(
+                bucket,
+                key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, _existing_object| Ok::<_, ()>(((), create.clone())),
+            )
+            .map_err(|err| TestCaseError::fail(format!("{err:?}")))?
+            .map_err(|_| TestCaseError::fail("multipart trace create action failed"))?;
+        Ok(())
+    }
+
+    fn complete_multipart_trace_upload(
+        cluster: &crate::StorageCluster,
+        map: &LocalClusterMap,
+        node_ids: &[NodeId],
+        object_pg: u32,
+        bucket: &crate::BucketName,
+        key: &crate::ObjectKey,
+        upload: &MultipartTraceUpload,
+    ) -> TestCaseResult {
+        if upload.parts.is_empty() {
+            return Ok(());
+        }
+        let upload_row = cluster
+            .load_in_progress_multipart_upload(bucket, key, &upload.upload_id)
+            .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+        let size = upload.parts.iter().map(|part| part.size).sum();
+        cluster
+            .complete_multipart_upload_commit_serialized(
+                crate::CompleteMultipartCommitRequest {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    upload_id: upload.upload_id.clone(),
+                    versioning: crate::BucketVersioningState::Disabled,
+                    owner: upload_row.owner,
+                    acl_grants: upload_row.acl_grants,
+                    public_read: upload_row.public_read,
+                    generation_id: upload_row.object_generation_id,
+                    size,
+                    etag_crc64: [0x51; 8],
+                    tags: upload_row.tags,
+                    metadata_blob: Some(upload_row.metadata_blob),
+                    system_metadata_blob: Some(upload_row.system_metadata_blob),
+                    object_lock: upload_row.object_lock,
+                    encryption: upload_row.encryption,
+                    part_records: upload.parts.clone(),
+                },
+                16,
+            )
+            .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+        assert_terminal_multipart_upload_invariants(
+            map,
+            node_ids,
+            object_pg,
+            bucket,
+            key,
+            &upload.upload_id,
+            TerminalMultipartOutcome::Completed,
+        );
+        assert_clean_metadata_command_stream(map, &[object_pg]);
+        Ok(())
+    }
+
+    fn abort_multipart_trace_upload(
+        cluster: &crate::StorageCluster,
+        map: &LocalClusterMap,
+        node_ids: &[NodeId],
+        object_pg: u32,
+        bucket: &crate::BucketName,
+        key: &crate::ObjectKey,
+        upload_id: &crate::UploadId,
+    ) -> TestCaseResult {
+        cluster
+            .abort_multipart_upload(bucket, key, upload_id)
+            .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+        assert_terminal_multipart_upload_invariants(
+            map,
+            node_ids,
+            object_pg,
+            bucket,
+            key,
+            upload_id,
+            TerminalMultipartOutcome::Aborted,
+        );
+        assert_clean_metadata_command_stream(map, &[object_pg]);
+        Ok(())
+    }
+
+    fn run_multipart_trace(ops: &[MultipartTraceOp]) -> TestCaseResult {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut initial_map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape)
+            .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+        let topology = initial_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "mpu-trace-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut initial_map, 1, NodeId::new(1));
+        set_route_primary(&mut initial_map, 2, NodeId::new(1));
+
+        let mut map = Arc::new(initial_map);
+        let mut cluster = crate::StorageCluster::from_local_map(Arc::clone(&map))
+            .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+        create_test_bucket(&cluster, &bucket);
+
+        let mut active_upload = None::<MultipartTraceUpload>;
+        for (step, op) in ops.iter().enumerate() {
+            match op {
+                MultipartTraceOp::Create(seed) => {
+                    if active_upload.is_some() {
+                        continue;
+                    }
+                    let upload_id = multipart_trace_upload_id(step, *seed);
+                    create_multipart_trace_upload(&cluster, &bucket, &key, upload_id.clone())?;
+                    active_upload = Some(MultipartTraceUpload {
+                        upload_id,
+                        parts: Vec::new(),
+                    });
+                }
+                MultipartTraceOp::UploadStreamPart(seed) => {
+                    let Some(upload) = active_upload.as_mut() else {
+                        continue;
+                    };
+                    if !upload.parts.is_empty() {
+                        continue;
+                    }
+                    let segment_seed = seed.wrapping_add(step as u8).max(1);
+                    let payload = format!("multipart trace payload {step} {seed}");
+                    let (_shard_keys, part, _segment) = upload_streamed_test_multipart_part(
+                        &cluster,
+                        &bucket,
+                        &key,
+                        &upload.upload_id,
+                        1,
+                        [segment_seed; 16],
+                        payload.as_bytes(),
+                    );
+                    upload.parts.push(part);
+                }
+                MultipartTraceOp::Complete => {
+                    let Some(upload) = active_upload.take() else {
+                        continue;
+                    };
+                    if upload.parts.is_empty() {
+                        active_upload = Some(upload);
+                        continue;
+                    }
+                    complete_multipart_trace_upload(
+                        &cluster, &map, &node_ids, 2, &bucket, &key, &upload,
+                    )?;
+                }
+                MultipartTraceOp::Abort => {
+                    let Some(upload) = active_upload.take() else {
+                        continue;
+                    };
+                    abort_multipart_trace_upload(
+                        &cluster,
+                        &map,
+                        &node_ids,
+                        2,
+                        &bucket,
+                        &key,
+                        &upload.upload_id,
+                    )?;
+                }
+                MultipartTraceOp::Reopen => {
+                    drop(cluster);
+                    drop(map);
+                    let mut reopened =
+                        LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape)
+                            .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                    set_route_primary(&mut reopened, 1, NodeId::new(1));
+                    set_route_primary(&mut reopened, 2, NodeId::new(1));
+                    map = Arc::new(reopened);
+                    cluster = crate::StorageCluster::from_local_map(Arc::clone(&map))
+                        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                    assert_clean_metadata_command_stream(&map, &[1, 2]);
+                }
+            }
+        }
+
+        if let Some(upload) = active_upload {
+            abort_multipart_trace_upload(
+                &cluster,
+                &map,
+                &node_ids,
+                2,
+                &bucket,
+                &key,
+                &upload.upload_id,
+            )?;
+        }
+        assert_clean_metadata_command_stream(&map, &[1, 2]);
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 24,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn prop_multipart_trace_preserves_terminal_lifecycle_invariants(
+            ops in multipart_trace_strategy()
+        ) {
+            run_multipart_trace(&ops)?;
         }
     }
 
@@ -11214,6 +11542,15 @@ mod tests {
                 Err(crate::MetadataError::NoSuchUpload { .. })
             ));
         }
+        assert_terminal_multipart_upload_invariants(
+            &map,
+            &node_ids,
+            object_pg,
+            &bucket,
+            &key,
+            &first_upload_id,
+            TerminalMultipartOutcome::Aborted,
+        );
 
         let second_upload_id = upload_id_from_label("mpuabortedfresh");
         let second_create = crate::CreateMultipartUploadReq {
@@ -11418,6 +11755,15 @@ mod tests {
                 "retrying pending abort should delete placed shard {key:?}"
             );
         }
+        assert_terminal_multipart_upload_invariants(
+            &map,
+            &node_ids,
+            object_pg,
+            &bucket,
+            &key,
+            &upload_id,
+            TerminalMultipartOutcome::Aborted,
+        );
     }
 
     #[test]
@@ -12055,6 +12401,15 @@ mod tests {
                 "abort must clean copied UploadPart staged payload after contention: {error:?}"
             );
         }
+        assert_terminal_multipart_upload_invariants(
+            &map,
+            &node_ids,
+            object_pg,
+            &bucket,
+            &key,
+            &upload_id,
+            TerminalMultipartOutcome::Aborted,
+        );
         assert_clean_metadata_command_stream(&map, &[object_pg]);
     }
 
@@ -12283,6 +12638,15 @@ mod tests {
         assert!(
             matches!(error, StoreError::NotFound),
             "abort must clean stream part payload after finalize wins the slot: {error:?}"
+        );
+        assert_terminal_multipart_upload_invariants(
+            &map,
+            &node_ids,
+            object_pg,
+            &bucket,
+            &key,
+            &upload_id,
+            TerminalMultipartOutcome::Aborted,
         );
         assert_clean_metadata_command_stream(&map, &[object_pg]);
     }
@@ -12973,6 +13337,15 @@ mod tests {
                 "retrying abort should delete staged UploadPart stream shard {shard_index}"
             );
         }
+        assert_terminal_multipart_upload_invariants(
+            &map,
+            &node_ids,
+            object_pg,
+            &bucket,
+            &key,
+            &upload_id,
+            TerminalMultipartOutcome::Aborted,
+        );
     }
 
     #[test]
@@ -13073,6 +13446,15 @@ mod tests {
                 "lifecycle abort should delete placed shard {key:?}"
             );
         }
+        assert_terminal_multipart_upload_invariants(
+            &map,
+            &node_ids,
+            object_pg,
+            &bucket,
+            &key,
+            &upload_id,
+            TerminalMultipartOutcome::Aborted,
+        );
     }
 
     #[test]
