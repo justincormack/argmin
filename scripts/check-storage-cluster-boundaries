@@ -283,8 +283,8 @@ expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:release_object_generation_reservation_command_required:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster.rs:reserve_next_object_version:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster.rs:reserve_put_object_generation:try_set_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster/request_ops.rs:abort_authorized_multipart_upload_locked:try_set_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster/request_ops.rs:abort_multipart_upload_locked:try_set_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:abort_authorized_multipart_upload_locked:install_snapshot_sensitive_metadata_command_or_drain
+1 crates/storage/src/cluster/request_ops.rs:abort_multipart_upload_locked:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:begin_bucket_delete:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:begin_upload_part_stream_session<T, E>:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:complete_multipart_upload_commit_serialized:try_set_pending_metadata_command_for_bucket
@@ -351,6 +351,8 @@ expected_metadata_command_conflict_uses=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:release_object_generation_reservation:exact-command-match
 1 crates/storage/src/cluster.rs:release_object_generation_reservation_command_required:exact-command-match
 1 crates/storage/src/cluster.rs:reserve_put_object_generation:exact-command-match
+1 crates/storage/src/cluster/request_ops.rs:abort_authorized_multipart_upload_locked:metadata-command-log-conflict
+1 crates/storage/src/cluster/request_ops.rs:abort_multipart_upload_locked:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:apply_new_object_metadata_command_for_bucket:exact-command-match
 1 crates/storage/src/cluster/request_ops.rs:begin_bucket_delete:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:begin_upload_part_stream_session<T, E>:metadata-command-log-conflict

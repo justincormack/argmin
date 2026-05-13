@@ -3006,6 +3006,11 @@ Proposed subphases:
           payload cleanup snapshots after contention
         - install `AbortMultipartUpload`
         - apply through the acting set
+      - current status: abort and authorized-abort now use the
+        snapshot-sensitive pending-slot install wrapper and restart after
+        allocation/install contention; coverage includes active UploadPart
+        stream sessions, UploadPartCopy-style staged copied segments, and
+        streamed-part finalize winning the slot before abort
       - make authorization-bound abort retry compare the current upload row to
         the authorized row after every contention event; if the row changed,
         fail with the normal S3-visible outcome instead of applying stale auth

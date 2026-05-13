@@ -172,8 +172,8 @@ Current production pending-command publishers:
 | `reserve_completed_multipart_upload_order` | `AdvanceCompletedMultipartUploadSequence` | `AllocatorCleanup` | Serialize through the bucket-PG slot; a later object-PG command must be derived from a terminal reservation. |
 | `complete_multipart_upload_commit_serialized` | `CommitMultipartObject` | `SnapshotSensitive` | Rebuild completion parts, cleanup snapshot, stale payload, and bucket-PG order after contention; Phase 9.3 deferral. |
 | `finalize_upload_part_stream` | `CommitStreamPart` | `SnapshotSensitive` | Rebuild stream session, MPU row, staged segments, and displaced part refs after contention. |
-| `abort_multipart_upload_locked` | `AbortMultipartUpload` | `SnapshotSensitive` | Rebuild upload/part/active stream cleanup snapshot after contention; Phase 9.3 deferral. |
-| `abort_authorized_multipart_upload_locked` | `AbortMultipartUpload` | `SnapshotSensitive` | Rebuild authorized upload cleanup snapshot after contention; Phase 9.3 deferral. |
+| `abort_multipart_upload_locked` | `AbortMultipartUpload` | `SnapshotSensitive` | Rebuild upload, part, active stream session, staged segment, and cleanup snapshots after contention. |
+| `abort_authorized_multipart_upload_locked` | `AbortMultipartUpload` | `SnapshotSensitive` | Rebuild authorized upload cleanup snapshot after contention and compare the current upload row to the authorized row before install. |
 
 Adding a production call site that creates or installs a pending metadata
 command requires updating this table and the boundary check allowlist. Direct

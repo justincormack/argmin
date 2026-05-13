@@ -6026,11 +6026,18 @@ impl super::StorageCluster {
                 }
             }
 
-            let Some(command) =
-                self.prepare_abort_multipart_upload_command(pg_id, bucket, key, upload_id)?
-            else {
-                return Ok(false);
-            };
+            let command =
+                match self.prepare_abort_multipart_upload_command(pg_id, bucket, key, upload_id) {
+                    Ok(Some(command)) => command,
+                    Ok(None) => return Ok(false),
+                    Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                        ..
+                    })) => {
+                        self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                        continue 'retry_after_pending_conflict;
+                    }
+                    Err(error) => return Err(error),
+                };
             let MetadataCommandPayload::AbortMultipartUpload(_) = command.payload() else {
                 unreachable!("prepared abort multipart command changed payload kind");
             };
@@ -6038,11 +6045,13 @@ impl super::StorageCluster {
             maybe_run_before_abort_multipart_pending_install_hook(
                 self.metadata_command_apply_test_hook_scope_id(),
             );
-            if self
-                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
-                .is_none()
+            match self
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
             {
-                continue 'retry_after_pending_conflict;
+                super::SnapshotSensitiveCommandInstall::Installed => {}
+                super::SnapshotSensitiveCommandInstall::ContenderDrained => {
+                    continue 'retry_after_pending_conflict;
+                }
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             return Ok(true);
@@ -6084,10 +6093,18 @@ impl super::StorageCluster {
                 }
             }
 
-            let Some(command) =
-                self.prepare_authorized_abort_multipart_upload_command(pg_id, authorized_upload)?
-            else {
-                return Ok(false);
+            let command = match self
+                .prepare_authorized_abort_multipart_upload_command(pg_id, authorized_upload)
+            {
+                Ok(Some(command)) => command,
+                Ok(None) => return Ok(false),
+                Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                    ..
+                })) => {
+                    self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                    continue 'retry_after_pending_conflict;
+                }
+                Err(error) => return Err(error),
             };
             let MetadataCommandPayload::AbortMultipartUpload(_) = command.payload() else {
                 unreachable!("prepared abort multipart command changed payload kind");
@@ -6096,11 +6113,13 @@ impl super::StorageCluster {
             maybe_run_before_abort_multipart_pending_install_hook(
                 self.metadata_command_apply_test_hook_scope_id(),
             );
-            if self
-                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
-                .is_none()
+            match self
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
             {
-                continue 'retry_after_pending_conflict;
+                super::SnapshotSensitiveCommandInstall::Installed => {}
+                super::SnapshotSensitiveCommandInstall::ContenderDrained => {
+                    continue 'retry_after_pending_conflict;
+                }
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             return Ok(true);

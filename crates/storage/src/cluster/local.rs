@@ -10503,7 +10503,7 @@ mod tests {
     }
 
     #[test]
-    fn multipart_abort_pending_install_conflict_cleans_upload_part_stream_session() {
+    fn multipart_abort_pending_install_conflict_cleans_upload_part_stream_session_and_segments() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let ec_shape = EcShape { k: 2, m: 1 };
@@ -10554,13 +10554,87 @@ mod tests {
 
         let pg_id = PgId::new(object_pg);
         let session_id = crate::SessionId::try_from("38".repeat(16)).unwrap();
+        let upload = cluster
+            .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
+            .unwrap();
+        cluster
+            .create_upload_part_stream_session(
+                &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+                1,
+                &session_id,
+            )
+            .unwrap();
+        let first_payload = b"copied segment before abort pending conflict";
+        let (_target, first_segment) = cluster
+            .prepare_stream_segment_append(
+                &bucket,
+                &key,
+                &crate::PrepareStreamUploadSegmentAppendReq {
+                    session_id: session_id.clone(),
+                    segment_index: 0,
+                    size: first_payload.len() as u64,
+                    segment_crc64: Some(checksum::crc64::checksum(first_payload)),
+                    segment_okh: [0x38; 16],
+                },
+            )
+            .unwrap();
+        let written_shards = cluster
+            .write_stream_segment_payload_shards(&first_segment, first_payload)
+            .unwrap();
+        let shard_batch = written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect::<Vec<_>>();
+        cluster
+            .commit_stream_segment_append(
+                &bucket,
+                &key,
+                &session_id,
+                first_segment.segment_index,
+                &first_segment,
+                &shard_batch,
+            )
+            .unwrap();
+        let second_payload = b"second copied segment before abort pending conflict";
+        let (_target, second_segment) = cluster
+            .prepare_stream_segment_append(
+                &bucket,
+                &key,
+                &crate::PrepareStreamUploadSegmentAppendReq {
+                    session_id: session_id.clone(),
+                    segment_index: 1,
+                    size: second_payload.len() as u64,
+                    segment_crc64: Some(checksum::crc64::checksum(second_payload)),
+                    segment_okh: [0x39; 16],
+                },
+            )
+            .unwrap();
+        let written_shards = cluster
+            .write_stream_segment_payload_shards(&second_segment, second_payload)
+            .unwrap();
+        let shard_batch = written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect::<Vec<_>>();
+        cluster
+            .commit_stream_segment_append(
+                &bucket,
+                &key,
+                &session_id,
+                second_segment.segment_index,
+                &second_segment,
+                &shard_batch,
+            )
+            .unwrap();
+
+        let raced_session_id = crate::SessionId::try_from("3a".repeat(16)).unwrap();
         let injected = Arc::new(AtomicBool::new(false));
         let injected_for_hook = Arc::clone(&injected);
         let map_for_hook = Arc::clone(&map);
         let bucket_for_hook = bucket.clone();
         let key_for_hook = key.clone();
         let upload_for_hook = upload_id.clone();
-        let session_for_hook = session_id.clone();
+        let session_for_hook = raced_session_id.clone();
         let command_epoch = cluster.operation_epoch();
         let _hook_guard =
             cluster.test_install_before_abort_multipart_pending_install_hook(Arc::new(move || {
@@ -10617,7 +10691,267 @@ mod tests {
                 crate::PgMetadataStore::get_stream_upload(&*pg, &session_id),
                 Err(crate::MetadataError::StreamSessionNotFound { .. })
             ));
+            assert!(matches!(
+                crate::PgMetadataStore::get_stream_upload(&*pg, &raced_session_id),
+                Err(crate::MetadataError::StreamSessionNotFound { .. })
+            ));
         }
+        for (segment, payload) in [
+            (&first_segment, first_payload.as_slice()),
+            (&second_segment, second_payload.as_slice()),
+        ] {
+            let mut readback = Vec::new();
+            let error = cluster
+                .read_segment_payload_stored_bytes_into(
+                    crate::SegmentStoredBytesRequest {
+                        data_pg_id: segment.data_pg_id,
+                        segment_okh: segment.segment_okh,
+                        segment_vid: segment.segment_vid,
+                        stored_size: payload.len(),
+                        segment_crc64: Some(checksum::crc64::checksum(payload)),
+                        ec: EcShape {
+                            k: segment.ec_k,
+                            m: segment.ec_m,
+                        },
+                    },
+                    &mut readback,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(error, StoreError::NotFound),
+                "abort must clean copied UploadPart staged payload after contention: {error:?}"
+            );
+        }
+        assert_clean_metadata_command_stream(&map, &[object_pg]);
+    }
+
+    #[test]
+    fn multipart_abort_pending_install_conflict_cleans_committed_stream_part() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let upload_id = upload_id_from_label("mpuabortfinpart");
+        let create = crate::CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
+        cluster
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), create.clone()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        let session_id = crate::SessionId::try_from("3b".repeat(16)).unwrap();
+        let upload = cluster
+            .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
+            .unwrap();
+        cluster
+            .create_upload_part_stream_session(
+                &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+                1,
+                &session_id,
+            )
+            .unwrap();
+        let payload = b"streamed part finalized while abort waits for pending slot";
+        let (_target, segment) = cluster
+            .prepare_stream_segment_append(
+                &bucket,
+                &key,
+                &crate::PrepareStreamUploadSegmentAppendReq {
+                    session_id: session_id.clone(),
+                    segment_index: 0,
+                    size: payload.len() as u64,
+                    segment_crc64: Some(checksum::crc64::checksum(payload)),
+                    segment_okh: [0x3b; 16],
+                },
+            )
+            .unwrap();
+        let written_shards = cluster
+            .write_stream_segment_payload_shards(&segment, payload)
+            .unwrap();
+        let shard_batch = written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect::<Vec<_>>();
+        cluster
+            .commit_stream_segment_append(
+                &bucket,
+                &key,
+                &session_id,
+                segment.segment_index,
+                &segment,
+                &shard_batch,
+            )
+            .unwrap();
+
+        let pg_id = PgId::new(object_pg);
+        let injected = Arc::new(AtomicBool::new(false));
+        let injected_for_hook = Arc::clone(&injected);
+        let map_for_hook = Arc::clone(&map);
+        let bucket_for_hook = bucket.clone();
+        let key_for_hook = key.clone();
+        let upload_for_hook = upload_id.clone();
+        let session_for_hook = session_id.clone();
+        let command_epoch = cluster.operation_epoch();
+        let _hook_guard =
+            cluster.test_install_before_abort_multipart_pending_install_hook(Arc::new(move || {
+                if injected_for_hook.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let primary = map_for_hook
+                    .metadata_pg_primary_node(command_epoch, pg_id)
+                    .unwrap();
+                let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+                let upload =
+                    crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_for_hook).unwrap();
+                let staging_segments =
+                    crate::PgMetadataStore::list_stream_segments(&*pg, &session_for_hook).unwrap();
+                let part = crate::MultipartPartRecord {
+                    upload_id: upload_for_hook.clone(),
+                    part_number: 1,
+                    generation: 0,
+                    size: staging_segments.iter().map(|segment| segment.size).sum(),
+                    etag: vec![0x3b; 8],
+                    etag_kind: crate::EtagKind::Crc64,
+                    part_okh: [0u8; 16],
+                    part_vid: crate::GenerationId::MIN,
+                    ec_k: staging_segments[0].ec_k,
+                    ec_m: staging_segments[0].ec_m,
+                    last_modified: 123_456,
+                    checksum: None,
+                };
+                let segments = staging_segments
+                    .iter()
+                    .map(|staged| crate::MultipartPartSegmentRecord {
+                        bucket: bucket_for_hook.clone(),
+                        key: key_for_hook.clone(),
+                        upload_id: upload_for_hook.clone(),
+                        version_id: crate::MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
+                        part_number: 1,
+                        segment_index: staged.segment_index,
+                        size: staged.size,
+                        segment_crc64: staged.segment_crc64,
+                        segment_okh: staged.segment_okh,
+                        segment_vid: staged.segment_vid,
+                        data_pg_id: staged.data_pg_id,
+                        ec_k: staged.ec_k,
+                        ec_m: staged.ec_m,
+                    })
+                    .collect::<Vec<_>>();
+                let log_index = pg.max_metadata_command_log_index(command_epoch).unwrap() + 1;
+                let command = MetadataCommandEnvelope::new(
+                    MetadataCommandId::new(
+                        command_epoch,
+                        pg_id,
+                        MetadataCommandLogIndex::new(log_index).unwrap(),
+                    ),
+                    MetadataCommandPayload::CommitStreamPart(Box::new(CommitStreamPartCommand {
+                        bucket: bucket_for_hook.clone(),
+                        key: key_for_hook.clone(),
+                        session_id: session_for_hook.clone(),
+                        upload,
+                        part,
+                        segments,
+                        existing_part: None,
+                        displaced_segments: Vec::new(),
+                    })),
+                );
+                pg.try_insert_pending_metadata_command_slot(
+                    primary.node_id().as_u32(),
+                    &command,
+                    Some(&bucket_for_hook),
+                )
+                .unwrap();
+            }));
+
+        assert!(cluster
+            .abort_multipart_upload(&bucket, &key, &upload_id)
+            .unwrap());
+        assert!(
+            injected.load(Ordering::SeqCst),
+            "test hook must exercise the stream-part finalize conflict window"
+        );
+        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id),
+                Err(crate::MetadataError::NoSuchUpload { .. })
+            ));
+            assert!(matches!(
+                crate::PgMetadataStore::get_stream_upload(&*pg, &session_id),
+                Err(crate::MetadataError::StreamSessionNotFound { .. })
+            ));
+            assert!(matches!(
+                crate::PgMetadataStore::get_multipart_part(&*pg, &upload_id, 1),
+                Err(crate::MetadataError::PartNotFound { .. })
+            ));
+            assert!(
+                crate::PgMetadataStore::get_all_multipart_part_segments_for_upload(
+                    &*pg, &upload_id,
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
+        let mut readback = Vec::new();
+        let error = cluster
+            .read_segment_payload_stored_bytes_into(
+                crate::SegmentStoredBytesRequest {
+                    data_pg_id: segment.data_pg_id,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    stored_size: payload.len(),
+                    segment_crc64: Some(checksum::crc64::checksum(payload)),
+                    ec: EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
+                },
+                &mut readback,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, StoreError::NotFound),
+            "abort must clean stream part payload after finalize wins the slot: {error:?}"
+        );
+        assert_clean_metadata_command_stream(&map, &[object_pg]);
     }
 
     #[test]
