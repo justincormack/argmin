@@ -187,6 +187,10 @@ uses of `try_set_pending_metadata_command_for_bucket`,
 Snapshot-sensitive publishers should prefer
 `install_snapshot_sensitive_metadata_command_or_drain` so slot contention
 drains the winner and returns to the caller's fresh-snapshot loop.
+If a PG-wide pending slot appears after the publisher has taken its snapshot
+but before it allocates the command id, `MetadataCommandLogConflict` is the
+same pre-publish contention class: the publisher must drain the winner and
+restart from a fresh snapshot, not surface the conflict to the request.
 
 Any multipart publisher still marked as a Phase 9.3 deferral is not claimed as
 fully hardened by earlier phases. These paths are inventoried here and in
@@ -291,6 +295,11 @@ The boundary script inventories production uses of
 `MetadataCommandLogConflict` and `metadata_command_log_conflict_matches`.
 Adding a new broad match must update that inventory and document why it is
 pre-publish retry, exact-command convergence, or fail-closed validation.
+Pre-publish command-id allocation conflicts are retryable only for
+snapshot-sensitive loops that immediately drain the durable PG slot and rerun
+their request action from a fresh snapshot. Finish/convergence conflicts after
+any replica may have accepted the command still require exact command bytes and
+hash-chain proof, or must fail closed.
 
 ## Object Version Reservations
 

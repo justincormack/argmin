@@ -2691,12 +2691,21 @@ Proposed subphases:
        the post-generation-reservation command-id race: if another same-PG
        command wins the durable slot before the create command id is allocated,
        the path drains the winner, releases the reservation, and restarts from
-       a fresh request snapshot. The lower-level stream PUT session-record
+       a fresh request snapshot. Stream PUT finalization and the non-multipart
+       object metadata/delete publishers now treat the same pre-publish
+       command-id conflict as pending-slot contention, including noncurrent
+       lifecycle expiry: drain the winner and restart from a fresh object
+       snapshot instead of surfacing
+       `MetadataCommandLogConflict` to the request. The lower-level stream PUT
+       session-record
        publisher also treats pending-slot install contention as a retry signal
        instead of draining and reusing a prebuilt command. Multipart/UploadPart
-       publishers remain classified and allowlisted, but their conversion is a
-       Phase 9.3 multipart serialization task because they need upload-wide and
-       multi-PG ordering rules rather than the simple object-path wrapper alone
+       publishers remain classified and allowlisted, but their conversion is
+       split by shape: `create_multipart_upload` now handles pre-publish
+       command-id contention by draining and rerunning authorization from a
+       fresh snapshot, while the upload-wide terminal paths remain Phase 9.3
+       multipart serialization work because they need upload-wide and multi-PG
+       ordering rules rather than the simple object-path wrapper alone
    - split command-owned records from runtime/local fields where equality has
      been risky:
      - start with stream upload records, separating command-owned session

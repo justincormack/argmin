@@ -356,10 +356,19 @@ expected_metadata_command_conflict_uses=$(cat <<'EOF'
 1 crates/storage/src/cluster/request_ops.rs:apply_new_object_metadata_command_for_bucket:exact-command-match
 1 crates/storage/src/cluster/request_ops.rs:begin_bucket_delete:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:begin_upload_part_stream_session<T, E>:metadata-command-log-conflict
+1 crates/storage/src/cluster/request_ops.rs:create_multipart_upload<T, E>:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:create_put_object_stream_session<T, E>:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:create_upload_part_stream_session:metadata-command-log-conflict
+1 crates/storage/src/cluster/request_ops.rs:delete_current_object_if<T, E>:metadata-command-log-conflict
+1 crates/storage/src/cluster/request_ops.rs:delete_expired_delete_marker_if_due<E>:metadata-command-log-conflict
+1 crates/storage/src/cluster/request_ops.rs:delete_noncurrent_live_versions_if_due<E>:metadata-command-log-conflict
+1 crates/storage/src/cluster/request_ops.rs:delete_specific_object_version_if<T, E>:metadata-command-log-conflict
+3 crates/storage/src/cluster/request_ops.rs:expire_current_object_if_due<E>:metadata-command-log-conflict
+1 crates/storage/src/cluster/request_ops.rs:finalize_put_object_stream<T, E>:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:finalize_upload_part_stream<T, E>:metadata-command-log-conflict
 2 crates/storage/src/cluster/request_ops.rs:finish_pending_metadata_command_to_acting_set_inner:exact-command-match
+1 crates/storage/src/cluster/request_ops.rs:insert_current_delete_marker_if<T, E>:metadata-command-log-conflict
+1 crates/storage/src/cluster/request_ops.rs:put_object_metadata_if<T, E>:metadata-command-log-conflict
 EOF
 )
 if [[ "$metadata_command_conflict_uses" != "$expected_metadata_command_conflict_uses" ]]; then

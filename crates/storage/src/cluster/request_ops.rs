@@ -58,6 +58,9 @@ type StreamPutCreatePendingInstallTestHook = Arc<dyn Fn() + Send + Sync>;
 type StreamPutCreateCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
+type StreamPutFinalizeCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
 type BucketDeleteCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
@@ -78,6 +81,11 @@ static BEFORE_STREAM_PUT_CREATE_PENDING_INSTALL_HOOKS: OnceLock<
 #[cfg(test)]
 static BEFORE_STREAM_PUT_CREATE_COMMAND_ID_HOOKS: OnceLock<
     Mutex<HashMap<usize, StreamPutCreateCommandIdTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static BEFORE_STREAM_PUT_FINALIZE_COMMAND_ID_HOOKS: OnceLock<
+    Mutex<HashMap<usize, StreamPutFinalizeCommandIdTestHook>>,
 > = OnceLock::new();
 
 #[cfg(test)]
@@ -107,6 +115,11 @@ pub(crate) struct StreamPutCreatePendingInstallTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct StreamPutCreateCommandIdTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct StreamPutFinalizeCommandIdTestHookGuard {
     scope_id: usize,
 }
 
@@ -155,6 +168,18 @@ impl Drop for StreamPutCreateCommandIdTestHookGuard {
     fn drop(&mut self) {
         let hooks =
             BEFORE_STREAM_PUT_CREATE_COMMAND_ID_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for StreamPutFinalizeCommandIdTestHookGuard {
+    fn drop(&mut self) {
+        let hooks =
+            BEFORE_STREAM_PUT_FINALIZE_COMMAND_ID_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -247,6 +272,19 @@ fn maybe_run_before_stream_put_create_pending_install_hook(_scope_id: usize) {
 #[cfg(test)]
 fn maybe_run_before_stream_put_create_command_id_hook(_scope_id: usize) {
     let hook = BEFORE_STREAM_PUT_CREATE_COMMAND_ID_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&_scope_id)
+        .cloned();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn maybe_run_before_stream_put_finalize_command_id_hook(_scope_id: usize) {
+    let hook = BEFORE_STREAM_PUT_FINALIZE_COMMAND_ID_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -557,6 +595,20 @@ impl super::StorageCluster {
             .unwrap_or_else(|e| e.into_inner())
             .insert(scope_id, hook);
         StreamPutCreateCommandIdTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_before_stream_put_finalize_command_id_hook(
+        &self,
+        hook: StreamPutFinalizeCommandIdTestHook,
+    ) -> StreamPutFinalizeCommandIdTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot =
+            BEFORE_STREAM_PUT_FINALIZE_COMMAND_ID_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        StreamPutFinalizeCommandIdTestHookGuard { scope_id }
     }
 
     #[cfg(test)]
@@ -3142,7 +3194,18 @@ impl super::StorageCluster {
             };
             let update =
                 Self::put_object_metadata_command_from_stored(&stored, version_id, mutation)?;
-            let command = self.new_put_object_metadata_command(pg_id, &object_pg, update.object)?;
+            let command =
+                match self.new_put_object_metadata_command(pg_id, &object_pg, update.object) {
+                    Ok(command) => command,
+                    Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                        ..
+                    })) => {
+                        drop(object_pg);
+                        self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
             drop(object_pg);
             match self
                 .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
@@ -3527,7 +3590,18 @@ impl super::StorageCluster {
             };
             let command = self.new_delete_object_version_command(
                 pg_id, &object_pg, bucket, key, version_id, target,
-            )?;
+            );
+            let command = match command {
+                Ok(command) => command,
+                Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                    ..
+                })) => {
+                    drop(object_pg);
+                    self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             drop(object_pg);
             match self
                 .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
@@ -3620,7 +3694,18 @@ impl super::StorageCluster {
                 key,
                 record.version_id,
                 target,
-            )?;
+            );
+            let command = match command {
+                Ok(command) => command,
+                Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                    ..
+                })) => {
+                    drop(object_pg);
+                    self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             drop(object_pg);
             match self
                 .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
@@ -3702,7 +3787,18 @@ impl super::StorageCluster {
                     owner: &owner,
                     stale_payload: None,
                 },
-            )?;
+            );
+            let command = match command {
+                Ok(command) => command,
+                Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                    ..
+                })) => {
+                    drop(object_pg);
+                    self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             drop(object_pg);
             match self
                 .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
@@ -3876,7 +3972,18 @@ impl super::StorageCluster {
                         key,
                         record.version_id,
                         target,
-                    )?;
+                    );
+                    let command = match command {
+                        Ok(command) => command,
+                        Err(ObjectPgActionError::Store(
+                            StoreError::MetadataCommandLogConflict { .. },
+                        )) => {
+                            drop(object_pg);
+                            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     drop(object_pg);
                     (command, reclaim_generation_id)
                 }
@@ -3895,7 +4002,18 @@ impl super::StorageCluster {
                             owner: &owner,
                             stale_payload: None,
                         },
-                    )?;
+                    );
+                    let command = match command {
+                        Ok(command) => command,
+                        Err(ObjectPgActionError::Store(
+                            StoreError::MetadataCommandLogConflict { .. },
+                        )) => {
+                            drop(object_pg);
+                            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     drop(object_pg);
                     (command, None)
                 }
@@ -3918,7 +4036,18 @@ impl super::StorageCluster {
                             owner: &owner,
                             stale_payload,
                         },
-                    )?;
+                    );
+                    let command = match command {
+                        Ok(command) => command,
+                        Err(ObjectPgActionError::Store(
+                            StoreError::MetadataCommandLogConflict { .. },
+                        )) => {
+                            drop(object_pg);
+                            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     drop(object_pg);
                     (command, reclaim_generation_id)
                 }
@@ -4034,8 +4163,18 @@ impl super::StorageCluster {
             drop(object_pg);
 
             for (version_id, target, reclaim_generation_id) in delete_targets {
+                let command_id = match self.next_object_metadata_command_id(pg_id) {
+                    Ok(command_id) => command_id,
+                    Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                        ..
+                    })) => {
+                        self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                        continue 'retry;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let command = MetadataCommandEnvelope::new(
-                    self.next_object_metadata_command_id(pg_id)?,
+                    command_id,
                     MetadataCommandPayload::DeleteObjectVersion(Box::new(
                         DeleteObjectVersionCommand {
                             bucket: bucket.clone(),
@@ -4143,7 +4282,18 @@ impl super::StorageCluster {
                 key,
                 expected_version_id,
                 DeleteObjectVersionTarget::DeleteMarker,
-            )?;
+            );
+            let command = match command {
+                Ok(command) => command,
+                Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                    ..
+                })) => {
+                    drop(object_pg);
+                    self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             drop(object_pg);
             match self
                 .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
@@ -4841,8 +4991,25 @@ impl super::StorageCluster {
                         object_lock: prepared.object_lock,
                         encryption: prepared.encryption.clone(),
                     };
+                    #[cfg(test)]
+                    maybe_run_before_stream_put_finalize_command_id_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                    );
+                    let command_id = match self
+                        .next_object_metadata_command_id_from_locked_pg(pg_id, &object_pg)
+                    {
+                        Ok(command_id) => command_id,
+                        Err(ObjectPgActionError::Store(
+                            StoreError::MetadataCommandLogConflict { .. },
+                        )) => {
+                            drop(object_pg);
+                            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     let command = MetadataCommandEnvelope::new(
-                        self.next_object_metadata_command_id_from_locked_pg(pg_id, &object_pg)?,
+                        command_id,
                         MetadataCommandPayload::CommitDirectPutObject(Box::new(
                             CommitDirectPutObjectCommand {
                                 object,
@@ -4950,9 +5117,23 @@ impl super::StorageCluster {
                         let object_pg = primary_node.get_pg(pg_id.get())?;
                         PgMetadataStore::next_generation_id(&*object_pg, bucket, key)?
                     };
+                    let command_id = match self.next_object_metadata_command_id(pg_id) {
+                        Ok(command_id) => command_id,
+                        Err(ObjectPgActionError::Store(
+                            StoreError::MetadataCommandLogConflict { .. },
+                        )) => {
+                            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+                                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                            return Ok(Ok(Attempt::Retry));
+                        }
+                        Err(error) => {
+                            return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                                error,
+                            ));
+                        }
+                    };
                     let command = MetadataCommandEnvelope::new(
-                        self.next_object_metadata_command_id(pg_id)
-                            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?,
+                        command_id,
                         MetadataCommandPayload::CreateMultipartUpload(Box::new(
                             CreateMultipartUploadCommand::from_request(
                                 create.clone(),

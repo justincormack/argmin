@@ -6867,6 +6867,229 @@ mod tests {
     }
 
     #[test]
+    fn stream_put_finalize_command_id_race_drains_winner_and_retries() {
+        let _guard = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut first_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = first_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "stream-finalize-id-race-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut first_map, 1, NodeId::new(1));
+        set_route_primary(&mut first_map, 2, NodeId::new(1));
+
+        let mut second_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        set_route_primary(&mut second_map, 1, NodeId::new(1));
+        set_route_primary(&mut second_map, 2, NodeId::new(1));
+
+        let first_map = Arc::new(first_map);
+        let second_map = Arc::new(second_map);
+        let first_cluster = crate::StorageCluster::from_local_map(Arc::clone(&first_map)).unwrap();
+        let second_cluster =
+            crate::StorageCluster::from_local_map(Arc::clone(&second_map)).unwrap();
+        create_test_bucket(&first_cluster, &bucket);
+
+        let session_id =
+            crate::SessionId::try_from("5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a".to_string()).unwrap();
+        first_cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                &session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap();
+        let stream_generation_id = {
+            let primary = first_map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
+                .unwrap();
+            let pg = primary.storage_node().get_pg(2).unwrap();
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &session_id,
+            )
+            .unwrap()
+        };
+        let stream_payload = b"stream finalize retries after command-id contention";
+        let stream_crc64 = checksum::crc64::checksum(stream_payload);
+        let (_target, stream_segment) = first_cluster
+            .prepare_stream_segment_append(
+                &bucket,
+                &key,
+                &crate::PrepareStreamUploadSegmentAppendReq {
+                    session_id: session_id.clone(),
+                    segment_index: 0,
+                    size: stream_payload.len() as u64,
+                    segment_crc64: Some(stream_crc64),
+                    segment_okh: [0x5a; 16],
+                },
+            )
+            .unwrap();
+        let stream_written = first_cluster
+            .write_stream_segment_payload_shards(&stream_segment, stream_payload)
+            .unwrap();
+        let stream_shard_batch = stream_written
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect::<Vec<_>>();
+        first_cluster
+            .commit_stream_segment_append(
+                &bucket,
+                &key,
+                &session_id,
+                stream_segment.segment_index,
+                &stream_segment,
+                &stream_shard_batch,
+            )
+            .unwrap();
+
+        let winner_payload = b"winner before stream finalize command id";
+        let winner_reservation_id =
+            crate::SessionId::try_from("5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b".to_string()).unwrap();
+        let winner_generation_id = second_cluster
+            .reserve_put_object_generation(&bucket, &key, &winner_reservation_id)
+            .unwrap();
+        let winner_written = second_cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                winner_generation_id,
+                0,
+                &[0x5b; 16],
+                winner_payload,
+            )
+            .unwrap();
+        let winner_req = direct_put_commit_req(
+            &bucket,
+            &key,
+            winner_reservation_id,
+            winner_generation_id,
+            winner_payload,
+            [0x5b; 16],
+            &winner_written,
+        );
+
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let action_calls = Arc::new(AtomicUsize::new(0));
+        let hook_cluster = Arc::clone(&second_cluster);
+        let hook_map = Arc::clone(&second_map);
+        let hook_bucket = bucket.clone();
+        let hook_req = winner_req.clone();
+        let hook_written_shards = winner_written.written_shards.clone();
+        let hook_ran_for_closure = Arc::clone(&hook_ran);
+        let _hook_guard = first_cluster.test_install_before_stream_put_finalize_command_id_hook(
+            Arc::new(move || {
+                if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let pg_id = PgId::new(2);
+                let shard_batch: Vec<(&ShardKey, WriteAck)> = hook_written_shards
+                    .iter()
+                    .map(|written| (&written.key, written.ack))
+                    .collect();
+                hook_cluster
+                    .register_payload_shard_acks(hook_req.data_pg_id, &shard_batch)
+                    .unwrap();
+                let primary = hook_map
+                    .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+                    .unwrap();
+                let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+                let command = hook_cluster
+                    .prepare_commit_direct_put_object_command(
+                        pg_id,
+                        &pg,
+                        &hook_req,
+                        crate::VersionId::Null,
+                    )
+                    .unwrap();
+                pg.try_insert_pending_metadata_command_slot(
+                    primary.node_id().as_u32(),
+                    &command,
+                    Some(&hook_bucket),
+                )
+                .unwrap();
+            }),
+        );
+
+        let calls_for_action = Arc::clone(&action_calls);
+        let result = first_cluster
+            .finalize_put_object_stream(
+                &bucket,
+                &key,
+                &session_id,
+                stream_payload.len() as u64,
+                move |snapshot| {
+                    calls_for_action.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                        value: snapshot.existing_etag,
+                        versioning: crate::BucketVersioningState::Disabled,
+                        owner: crate::OwnerIdentity::from_principal("owner"),
+                        acl_grants: crate::AclGrants::default(),
+                        public_read: false,
+                        size: stream_payload.len() as u64,
+                        etag_crc64: stream_crc64,
+                        tags: None,
+                        metadata_blob: crate::SerializedMetadataBlob::default(),
+                        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                        object_lock: crate::ObjectLockState::default(),
+                        encryption: crate::ObjectEncryption::None,
+                    })
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(hook_ran.load(Ordering::SeqCst));
+        assert_eq!(
+            action_calls.load(Ordering::SeqCst),
+            2,
+            "stream PUT finalization must rerun after command-id contention"
+        );
+        assert!(
+            result.value.is_some(),
+            "retry should observe the drained winner as the stale payload"
+        );
+        assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_none());
+
+        for node_id in node_ids {
+            let pg = first_map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(2)
+                .unwrap();
+            let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+            let live = stored
+                .as_live()
+                .expect("stream finalization object is live");
+            assert_eq!(live.generation_id, stream_generation_id);
+            assert_eq!(live.size, stream_payload.len() as u64);
+            assert!(matches!(
+                crate::PgMetadataStore::get_stream_upload(&*pg, &session_id),
+                Err(crate::MetadataError::StreamSessionNotFound { .. })
+            ));
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    &session_id,
+                ),
+                Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn stream_put_record_pending_install_race_releases_reservation_and_retries() {
         let _guard = lock_metadata_command_apply_hook_test();
         let tmp = test_util::tempdir();
@@ -7170,6 +7393,159 @@ mod tests {
                 Err(crate::MetadataError::NoSuchUpload { .. })
             ));
         }
+    }
+
+    #[test]
+    fn multipart_create_command_id_race_drains_winner_and_reruns_authorization_action() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut first_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = first_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "mpu-create-id-race-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut first_map, 1, NodeId::new(1));
+        set_route_primary(&mut first_map, 2, NodeId::new(1));
+
+        let mut second_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        set_route_primary(&mut second_map, 1, NodeId::new(1));
+        set_route_primary(&mut second_map, 2, NodeId::new(1));
+
+        let first_map = Arc::new(first_map);
+        let second_map = Arc::new(second_map);
+        let first_cluster = crate::StorageCluster::from_local_map(Arc::clone(&first_map)).unwrap();
+        let second_cluster =
+            crate::StorageCluster::from_local_map(Arc::clone(&second_map)).unwrap();
+        create_test_bucket(&first_cluster, &bucket);
+
+        let winner_payload = b"winner before multipart create command id";
+        let winner_reservation_id =
+            crate::SessionId::try_from("78787878787878787878787878787878".to_string()).unwrap();
+        let winner_generation_id = second_cluster
+            .reserve_put_object_generation(&bucket, &key, &winner_reservation_id)
+            .unwrap();
+        let winner_written = second_cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                winner_generation_id,
+                0,
+                &[0x97; 16],
+                winner_payload,
+            )
+            .unwrap();
+        let winner_req = direct_put_commit_req(
+            &bucket,
+            &key,
+            winner_reservation_id,
+            winner_generation_id,
+            winner_payload,
+            [0x97; 16],
+            &winner_written,
+        );
+        let winner_shard_batch: Vec<(&ShardKey, WriteAck)> = winner_written
+            .written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect();
+        second_cluster
+            .register_payload_shard_acks(winner_req.data_pg_id, &winner_shard_batch)
+            .unwrap();
+
+        let slot_installed = Arc::new(AtomicBool::new(false));
+        let action_calls = Arc::new(AtomicUsize::new(0));
+        let install_map = Arc::clone(&second_map);
+        let install_cluster = Arc::clone(&second_cluster);
+        let install_bucket = bucket.clone();
+        let install_req = winner_req.clone();
+        let install_once = Arc::clone(&slot_installed);
+        let calls_for_action = Arc::clone(&action_calls);
+        let upload_id = upload_id_from_label("mpucreateidrace");
+        let result = first_cluster
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_, existing_object| {
+                    calls_for_action.fetch_add(1, Ordering::SeqCst);
+                    if existing_object.is_some() {
+                        return Err("object already exists");
+                    }
+                    if !install_once.swap(true, Ordering::SeqCst) {
+                        let pg_id = PgId::new(2);
+                        let primary = install_map
+                            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+                            .unwrap();
+                        let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+                        let command = install_cluster
+                            .prepare_commit_direct_put_object_command(
+                                pg_id,
+                                &pg,
+                                &install_req,
+                                crate::VersionId::Null,
+                            )
+                            .unwrap();
+                        pg.try_insert_pending_metadata_command_slot(
+                            primary.node_id().as_u32(),
+                            &command,
+                            Some(&install_bucket),
+                        )
+                        .unwrap();
+                    }
+                    Ok((
+                        (),
+                        crate::CreateMultipartUploadReq {
+                            upload_id: upload_id.clone(),
+                            bucket: bucket.clone(),
+                            key: key.clone(),
+                            tags: None,
+                            metadata_blob: crate::SerializedMetadataBlob::default(),
+                            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                            initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+                            owner: crate::OwnerIdentity::from_principal("owner"),
+                            acl_grants: crate::AclGrants::default(),
+                            public_read: false,
+                            object_lock: crate::ObjectLockState::default(),
+                            checksum: None,
+                            encryption: crate::ObjectEncryption::None,
+                        },
+                    ))
+                },
+            )
+            .unwrap();
+        assert!(matches!(result, Err("object already exists")));
+        assert!(slot_installed.load(Ordering::SeqCst));
+        assert_eq!(
+            action_calls.load(Ordering::SeqCst),
+            2,
+            "multipart create authorization must be rerun after command-id contention"
+        );
+        assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_none());
+
+        for node_id in node_ids {
+            let pg = first_map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(2)
+                .unwrap();
+            let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+            let live = stored.as_live().expect("winner object is live");
+            assert_eq!(live.generation_id, winner_generation_id);
+            assert_eq!(live.size, winner_payload.len() as u64);
+            assert!(matches!(
+                crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id),
+                Err(crate::MetadataError::NoSuchUpload { .. })
+            ));
+        }
+        assert_clean_metadata_command_stream(&first_map, &[2]);
     }
 
     #[test]
@@ -17963,6 +18339,156 @@ mod tests {
             )
             .unwrap());
         }
+    }
+
+    #[test]
+    fn lifecycle_noncurrent_command_id_race_drains_winner_and_reruns_selector() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut first_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = first_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "lifecycle-id-race-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut first_map, 1, NodeId::new(1));
+        set_route_primary(&mut first_map, 2, NodeId::new(1));
+
+        let mut second_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        set_route_primary(&mut second_map, 1, NodeId::new(1));
+        set_route_primary(&mut second_map, 2, NodeId::new(1));
+
+        let first_map = Arc::new(first_map);
+        let second_map = Arc::new(second_map);
+        let first_cluster = crate::StorageCluster::from_local_map(Arc::clone(&first_map)).unwrap();
+        create_test_bucket_with_versioning(
+            &first_cluster,
+            &bucket,
+            crate::BucketVersioningState::Enabled,
+        );
+        put_test_lifecycle(&first_cluster, &bucket);
+        let older = write_committed_direct_segment_for_with_versioning(
+            &first_cluster,
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Enabled,
+            [0xc1; 16],
+            [0xd1; 16],
+            b"older",
+        );
+        let _current = write_committed_direct_segment_for_with_versioning(
+            &first_cluster,
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Enabled,
+            [0xc2; 16],
+            [0xd2; 16],
+            b"current",
+        );
+
+        let slot_installed = Arc::new(AtomicBool::new(false));
+        let selector_calls = Arc::new(AtomicUsize::new(0));
+        let install_map = Arc::clone(&second_map);
+        let install_bucket = bucket.clone();
+        let install_key = key.clone();
+        let install_version_id = older.version_id;
+        let install_once = Arc::clone(&slot_installed);
+        let calls_for_selector = Arc::clone(&selector_calls);
+        let reclaimed = first_cluster
+            .delete_noncurrent_live_versions_if_due(&bucket, &key, move |raw, versions| {
+                assert_eq!(raw, Some("<LifecycleConfiguration/>"));
+                calls_for_selector.fetch_add(1, Ordering::SeqCst);
+                let older_live = versions
+                    .iter()
+                    .find(|stored| stored.version_id() == install_version_id)
+                    .and_then(crate::StoredObject::as_live)
+                    .expect("older version should be listed");
+                if older_live.object_lock.legal_hold == crate::StoredLegalHoldStatus::On {
+                    return Ok::<_, ()>(HashSet::new());
+                }
+                if !install_once.swap(true, Ordering::SeqCst) {
+                    let pg_id = PgId::new(2);
+                    let primary = install_map
+                        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+                        .unwrap();
+                    let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+                    let stored = crate::PgMetadataStore::get_object_version(
+                        &*pg,
+                        &install_bucket,
+                        &install_key,
+                        install_version_id,
+                    )
+                    .unwrap();
+                    let live = stored.as_live().expect("older object is live").clone();
+                    let log_index = pg
+                        .max_metadata_command_log_index(ClusterEpoch::INITIAL)
+                        .unwrap()
+                        + 1;
+                    let command = MetadataCommandEnvelope::new(
+                        MetadataCommandId::new(
+                            ClusterEpoch::INITIAL,
+                            pg_id,
+                            MetadataCommandLogIndex::new(log_index).unwrap(),
+                        ),
+                        MetadataCommandPayload::PutObjectMetadata(Box::new(
+                            PutObjectMetadataCommand::from_live_object_and_mutation(
+                                live,
+                                PutObjectMetadataMutation::PutLegalHold(
+                                    crate::StoredLegalHoldStatus::On,
+                                ),
+                            ),
+                        )),
+                    );
+                    pg.try_insert_pending_metadata_command_slot(
+                        primary.node_id().as_u32(),
+                        &command,
+                        Some(&install_bucket),
+                    )
+                    .unwrap();
+                }
+                Ok(HashSet::from([install_version_id]))
+            })
+            .unwrap()
+            .unwrap();
+        assert!(reclaimed.is_empty());
+        assert!(slot_installed.load(Ordering::SeqCst));
+        assert_eq!(
+            selector_calls.load(Ordering::SeqCst),
+            2,
+            "lifecycle selector must rerun after command-id contention"
+        );
+        assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_none());
+
+        for node_id in node_ids {
+            let pg = first_map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(2)
+                .unwrap();
+            let stored =
+                crate::PgMetadataStore::get_object_version(&*pg, &bucket, &key, older.version_id)
+                    .unwrap();
+            let live = stored.as_live().expect("older object remains live");
+            assert_eq!(
+                live.object_lock.legal_hold,
+                crate::StoredLegalHoldStatus::On
+            );
+            assert!(!crate::PgMetadataStore::payload_reclaim_exists(
+                &*pg,
+                &bucket,
+                &key,
+                older.generation_id
+            )
+            .unwrap());
+        }
+        assert_clean_metadata_command_stream(&first_map, &[2]);
     }
 
     #[test]
