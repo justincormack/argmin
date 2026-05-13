@@ -10388,6 +10388,163 @@ mod tests {
     }
 
     #[test]
+    fn multipart_abort_partial_apply_reopens_and_converges() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape)
+            .expect("open local map");
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let upload_id = upload_id_from_label("mpuabortreopen");
+        let create = crate::CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
+        cluster
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), create.clone()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        let (shard_keys, _uploaded_part, uploaded_segment) = upload_streamed_test_multipart_part(
+            &cluster,
+            &bucket,
+            &key,
+            &upload_id,
+            1,
+            [0xAC; 16],
+            b"uploaded part payload before abort reopen",
+        );
+        let data_pg_id = uploaded_segment.data_pg_id;
+        let part_okh = uploaded_segment.segment_okh;
+        let part_vid = uploaded_segment.segment_vid;
+
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_upload_id = upload_id.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::AbortMultipartUpload(abort)
+                        if abort.upload_id == hook_upload_id
+                            && node_id == NodeId::new(2)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected multipart abort reopen failure",
+                            source: std::io::Error::other(
+                                "injected multipart abort reopen failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .abort_multipart_upload(&bucket, &key, &upload_id)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected multipart abort reopen failure",
+                    ..
+                })
+            ),
+            "expected injected partial abort failure, got {err:?}"
+        );
+        drop(hook_guard);
+        assert!(
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
+            "partial abort must leave a durable primary pending slot before reopen"
+        );
+        drop(cluster);
+        drop(map);
+
+        let reopened = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape)
+            .expect("reopen local map with in-flight multipart abort");
+        let reopened = Arc::new(reopened);
+        let reopened_cluster =
+            crate::StorageCluster::from_local_map(Arc::clone(&reopened)).unwrap();
+        assert!(reopened_cluster
+            .abort_multipart_upload(&bucket, &key, &upload_id)
+            .unwrap());
+        assert!(
+            pending_metadata_command_for_test(&reopened, PgId::new(object_pg), &bucket).is_none()
+        );
+
+        for node_id in node_ids {
+            let node = reopened.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id),
+                Err(crate::MetadataError::NoSuchUpload { .. })
+            ));
+            assert!(matches!(
+                crate::PgMetadataStore::get_multipart_part(&*pg, &upload_id, 1),
+                Err(crate::MetadataError::PartNotFound { .. })
+            ));
+            assert!(
+                crate::PgMetadataStore::get_all_multipart_part_segments_for_upload(
+                    &*pg, &upload_id,
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
+        for (shard_index, key) in shard_keys.iter().enumerate() {
+            assert!(
+                !reopened_cluster
+                    .test_payload_shard_file_exists(
+                        data_pg_id,
+                        ec_shape,
+                        &part_okh,
+                        part_vid,
+                        shard_index as u8
+                    )
+                    .unwrap(),
+                "reopened abort retry should delete placed shard {key:?}"
+            );
+        }
+        assert_clean_metadata_command_stream(&reopened, &[object_pg]);
+    }
+
+    #[test]
     fn multipart_abort_retries_after_pending_install_conflict() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
