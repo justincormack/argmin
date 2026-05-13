@@ -2997,6 +2997,15 @@ Proposed subphases:
         dependency on same-process upload locks
 
    4. Phase 9.3.4: multipart abort serialization
+      - status: complete. `abort_multipart_upload_locked` and
+        `abort_authorized_multipart_upload_locked` now use
+        snapshot-sensitive pending-slot install and fresh-snapshot retry.
+        Coverage includes active UploadPart stream sessions,
+        UploadPartCopy-style staged copied segments, streamed-part finalize
+        winning the slot before abort, completion winning the slot before
+        abort, stale authorized upload rows, partial abort apply followed by
+        local-cluster reopen and convergence, and terminal pending-slot cleanup
+        before later multipart work.
       - convert `abort_multipart_upload_locked` and
         `abort_authorized_multipart_upload_locked` to the same
         snapshot-sensitive shape, or narrow existing loops until they are
@@ -3006,12 +3015,6 @@ Proposed subphases:
           payload cleanup snapshots after contention
         - install `AbortMultipartUpload`
         - apply through the acting set
-      - current status: abort and authorized-abort now use the
-        snapshot-sensitive pending-slot install wrapper and restart after
-        allocation/install contention; coverage includes active UploadPart
-        stream sessions, UploadPartCopy-style staged copied segments, and
-        streamed-part finalize winning the slot before abort, plus partial
-        abort apply followed by local-cluster reopen and retry convergence
       - make authorization-bound abort retry compare the current upload row to
         the authorized row after every contention event; if the row changed,
         fail with the normal S3-visible outcome instead of applying stale auth

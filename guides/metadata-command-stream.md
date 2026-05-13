@@ -188,8 +188,8 @@ Snapshot-sensitive publishers should prefer
 `install_snapshot_sensitive_metadata_command_or_drain` so slot contention
 drains the winner and returns to the caller's fresh-snapshot loop.
 
-The multipart publishers still marked as Phase 9.3 deferrals are not claimed as
-fully hardened by Phase 9.2H. They are inventoried here and in
+Any multipart publisher still marked as a Phase 9.3 deferral is not claimed as
+fully hardened by earlier phases. These paths are inventoried here and in
 `scripts/check-storage-cluster-boundaries` so the remaining `set_pending...` and
 `try_set...` shapes cannot be mistaken for unreviewed omissions. Phase 9.3 owns
 converting those paths to multipart-aware PG-primary serialization and
@@ -250,6 +250,10 @@ Multipart publisher rules:
 - `abort_multipart_upload_locked` and
   `abort_authorized_multipart_upload_locked` must rebuild upload, part, active
   stream session, staged segment, and cleanup snapshots after contention.
+  Authorized abort must compare the current upload row with the already
+  authorized row before publishing; if the row changed, storage returns the
+  normal missing/non-abortable outcome instead of applying a stale
+  authorization snapshot.
 - `complete_multipart_upload_commit_serialized` must reserve completed-MPU
   order through a terminal bucket-PG command before constructing the object-PG
   commit, then reload the object-PG completion snapshot after that order is
