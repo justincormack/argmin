@@ -140,6 +140,13 @@ Publisher classes:
 - `AllocatorCleanup`: the command is cleanup or allocator state with a known
   external owner. It must not steal another request's resources when a pending
   slot is drained.
+- `MatchingOutcomeRetry`: the publisher is snapshot-sensitive for unrelated
+  contention, but an equivalent pending command is also the result the caller
+  is waiting for. These publishers must not use a generic drain-and-retry path
+  for a matching contender, because draining the command can delete the
+  request state needed to reconstruct the response. They need an explicit
+  matching predicate, an outcome extractor from the command-owned row image,
+  and a same-command install-race regression.
 
 Current production pending-command publishers:
 
@@ -174,7 +181,7 @@ Current production pending-command publishers:
 | `begin_upload_part_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Revalidate MPU/session target and rerun the caller action against fresh MPU state using the request-entry authorization snapshot/capability after contention. |
 | `create_upload_part_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Revalidate MPU/session target after contention. |
 | `reserve_completed_multipart_upload_order` | `AdvanceCompletedMultipartUploadSequence` | `AllocatorCleanup` | Serialize through the bucket-PG slot; a later object-PG command must be derived from a terminal reservation. |
-| `complete_multipart_upload_commit_serialized` | `CommitMultipartObject` | `SnapshotSensitive with matching-outcome retry` | Rebuild completion parts, cleanup snapshot, stale payload, and bucket-PG order after unrelated contention. If the contender is the same completion request, finish that exact command through the matching-pending branch and return its computed outcome. |
+| `complete_multipart_upload_commit_serialized` | `CommitMultipartObject` | `MatchingOutcomeRetry` | Rebuild completion parts, cleanup snapshot, stale payload, and bucket-PG order after unrelated contention. If the contender is the same completion request, finish that exact command through the matching-pending branch and return its computed outcome. |
 | `finalize_upload_part_stream` | `CommitStreamPart` | `SnapshotSensitive` | Rebuild stream session, MPU row, staged segments, and displaced part refs after contention. |
 | `abort_multipart_upload_locked` | `AbortMultipartUpload` | `SnapshotSensitive` | Rebuild upload, part, active stream session, staged segment, and cleanup snapshots after contention. |
 | `abort_authorized_multipart_upload_locked` | `AbortMultipartUpload` | `SnapshotSensitive` | Rebuild authorized upload cleanup snapshot after contention and compare the current upload row to the authorized row before install. |
@@ -187,6 +194,13 @@ uses of `try_set_pending_metadata_command_for_bucket`,
 Snapshot-sensitive publishers should prefer
 `install_snapshot_sensitive_metadata_command_or_drain` so slot contention
 drains the winner and returns to the caller's fresh-snapshot loop.
+Matching-outcome retry publishers are the exception: they may use the lower
+level `try_install_pending_metadata_command_for_bucket` only when the
+publisher's retry loop first checks for an equivalent pending command and can
+return the response from that command. Every such exception must be documented
+in the table above, listed in the boundary script allowlist as a
+matching-outcome path, and covered by an install-race regression where the
+equivalent command wins the pending slot after snapshot/command construction.
 If a PG-wide pending slot appears after the publisher has taken its snapshot
 but before it allocates the command id, `MetadataCommandLogConflict` is the
 same pre-publish contention class: the publisher must drain the winner and

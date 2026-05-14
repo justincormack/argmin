@@ -2654,6 +2654,14 @@ Proposed subphases:
      - `ApplyValidated`: command apply fully validates every precondition this
        publisher depends on against current materialized state, so the same
        command may be reused after draining a competing slot
+     - `AllocatorCleanup`: the command is cleanup or allocator state with a
+       known external owner. It must not steal another request's resources when
+       a pending slot is drained.
+     - `MatchingOutcomeRetry`: the publisher is snapshot-sensitive for
+       unrelated contention, but an equivalent pending command is also the
+       caller-visible result. These paths must finish the matching command and
+       return the outcome derived from its command-owned row image instead of
+       draining it through the generic snapshot-sensitive helper.
      The command kind matrix is still useful as a summary, but it is not the
      authority. The same command kind can be safe in one publisher and
      snapshot-sensitive in another if the surrounding request path performs
@@ -2797,6 +2805,13 @@ Proposed subphases:
      - require request-level behavior tests where external state is visible:
        a request must not return an internal command conflict after making the
        mutation observable unless a retry/convergence path is guaranteed
+     - require matching-outcome install-race tests for any publisher classified
+       as `MatchingOutcomeRetry`: inject an equivalent pending command after
+       the losing request has built its command but before pending-slot install,
+       then assert the request returns the command-derived outcome and leaves a
+       clean command stream. This is distinct from unrelated contention tests,
+       because generic drain/retry can erase the state needed to reconstruct
+       the caller-visible result.
      - add a mechanical boundary check for broad
        `MetadataCommandLogConflict` matching in request paths. Matching the
        variant directly is allowed only in named helpers that prove command
@@ -3186,12 +3201,14 @@ Proposed subphases:
         boundary-script exemptions.
 
    7. Phase 9.3.7: remove local-lock authority and clean up deferrals
-      - status: complete. `begin_upload_part_stream_session` and
-        `complete_multipart_upload_commit_serialized` now use
-        `install_snapshot_sensitive_metadata_command_or_drain`, so the final
-        multipart snapshot-sensitive publishers drain a winning PG slot and
-        restart from fresh state instead of calling the lower-level pending-slot
-        helpers directly.
+      - status: complete. `begin_upload_part_stream_session` now uses
+        `install_snapshot_sensitive_metadata_command_or_drain`, so it drains a
+        winning PG slot and restarts from fresh state.
+        `complete_multipart_upload_commit_serialized` is intentionally
+        classified as `MatchingOutcomeRetry`: unrelated contention restarts
+        from a fresh completion snapshot, while an equivalent completion
+        contender is finished and returned from the matching-pending branch
+        rather than drained generically.
       - remove Phase 9.3 deferral wording from
         [metadata-command-stream.md](../guides/metadata-command-stream.md)
       - update `scripts/check-storage-cluster-boundaries` so multipart

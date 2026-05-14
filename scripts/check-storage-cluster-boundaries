@@ -281,8 +281,9 @@ pending_command_publishers=$(
 # Pending command publisher inventory is intentionally explicit. Snapshot-
 # sensitive multipart publishers normally use the snapshot-sensitive install wrapper;
 # lower-level set/try_set helpers are reserved for apply-validated publishers,
-# allocator cleanup, matching-outcome retry paths, and explicitly documented
-# non-multipart transitional paths.
+# allocator cleanup, MatchingOutcomeRetry publishers with same-command
+# install-race coverage, and explicitly documented non-multipart transitional
+# paths.
 expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:abort_stream_upload_session:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards<E>:try_install_pending_metadata_command_for_bucket
