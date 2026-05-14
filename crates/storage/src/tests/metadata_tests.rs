@@ -8314,6 +8314,229 @@ fn bucket_write_reservations_and_drain_round_trip() {
 }
 
 #[test]
+fn durable_bucket_write_reservation_requires_exact_identity() {
+    let (_dir, store) = make_pg_store();
+    let bucket = bucket_name("mybucket");
+    store
+        .create_bucket(
+            &bucket,
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+
+    let reservation = store
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            "reservation-1",
+            "owner-token-1",
+            ClusterEpoch::INITIAL,
+            "put-object",
+            10,
+            Some(20),
+            Some("key=a"),
+        )
+        .unwrap();
+    assert_eq!(reservation.bucket, bucket);
+    assert_eq!(reservation.reservation_id, "reservation-1");
+    assert_eq!(reservation.owner_token, "owner-token-1");
+    assert_eq!(reservation.cluster_epoch, ClusterEpoch::INITIAL);
+    assert_eq!(reservation.operation_kind, "put-object");
+    assert_eq!(reservation.created_at, 10);
+    assert_eq!(reservation.lease_deadline, Some(20));
+    assert_eq!(reservation.target_context.as_deref(), Some("key=a"));
+
+    let duplicate = store
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            "reservation-1",
+            "owner-token-1",
+            ClusterEpoch::INITIAL,
+            "put-object",
+            10,
+            Some(20),
+            Some("key=a"),
+        )
+        .unwrap();
+    assert_eq!(duplicate, reservation);
+
+    let conflict = store
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            "reservation-1",
+            "owner-token-2",
+            ClusterEpoch::INITIAL,
+            "put-object",
+            10,
+            Some(20),
+            Some("key=a"),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        conflict,
+        crate::error::MetadataError::BucketWriteReservationConflict { .. }
+    ));
+
+    let stale_release = store
+        .release_durable_bucket_write_reservation(
+            &bucket,
+            "reservation-1",
+            "owner-token-2",
+            ClusterEpoch::INITIAL,
+            reservation.bucket_execution_generation,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        stale_release,
+        crate::error::MetadataError::BucketWriteReservationNotFound { .. }
+    ));
+    assert_eq!(
+        store
+            .durable_bucket_write_reservations(&bucket)
+            .unwrap()
+            .as_slice(),
+        std::slice::from_ref(&reservation)
+    );
+
+    store
+        .release_durable_bucket_write_reservation(
+            &bucket,
+            "reservation-1",
+            "owner-token-1",
+            ClusterEpoch::INITIAL,
+            reservation.bucket_execution_generation,
+        )
+        .unwrap();
+    assert!(store
+        .durable_bucket_write_reservation(&bucket, "reservation-1")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn durable_bucket_write_drain_blocks_reservations_and_requires_exact_identity() {
+    let (_dir, store) = make_pg_store();
+    let bucket = bucket_name("mybucket");
+    store
+        .create_bucket(
+            &bucket,
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+
+    let drain = store
+        .begin_durable_bucket_write_drain(
+            &bucket,
+            "drain-1",
+            "owner-token-1",
+            ClusterEpoch::INITIAL,
+            30,
+            Some(40),
+        )
+        .unwrap();
+    assert_eq!(drain.bucket, bucket);
+    assert_eq!(drain.drain_id, "drain-1");
+    assert_eq!(drain.owner_token, "owner-token-1");
+    assert_eq!(drain.cluster_epoch, ClusterEpoch::INITIAL);
+    assert_eq!(drain.state, BucketWriteDrainState::Draining);
+    assert_eq!(drain.created_at, 30);
+    assert_eq!(drain.lease_deadline, Some(40));
+
+    let duplicate = store
+        .begin_durable_bucket_write_drain(
+            &bucket,
+            "drain-1",
+            "owner-token-1",
+            ClusterEpoch::INITIAL,
+            30,
+            Some(40),
+        )
+        .unwrap();
+    assert_eq!(duplicate, drain);
+
+    let conflict = store
+        .begin_durable_bucket_write_drain(
+            &bucket,
+            "drain-2",
+            "owner-token-1",
+            ClusterEpoch::INITIAL,
+            30,
+            Some(40),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        conflict,
+        crate::error::MetadataError::BucketWriteDrainConflict { .. }
+    ));
+
+    let blocked = store
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            "reservation-1",
+            "owner-token-1",
+            ClusterEpoch::INITIAL,
+            "put-object",
+            50,
+            None,
+            None,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        blocked,
+        crate::error::MetadataError::BucketWriteDraining
+    ));
+
+    let stale_clear = store
+        .clear_durable_bucket_write_drain(
+            &bucket,
+            "drain-1",
+            "owner-token-2",
+            ClusterEpoch::INITIAL,
+            drain.bucket_execution_generation,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        stale_clear,
+        crate::error::MetadataError::BucketWriteDrainNotFound { .. }
+    ));
+    assert_eq!(
+        store.durable_bucket_write_drain(&bucket).unwrap(),
+        Some(drain.clone())
+    );
+
+    store
+        .clear_durable_bucket_write_drain(
+            &bucket,
+            "drain-1",
+            "owner-token-1",
+            ClusterEpoch::INITIAL,
+            drain.bucket_execution_generation,
+        )
+        .unwrap();
+    assert!(store.durable_bucket_write_drain(&bucket).unwrap().is_none());
+
+    store
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            "reservation-1",
+            "owner-token-1",
+            ClusterEpoch::INITIAL,
+            "put-object",
+            50,
+            None,
+            None,
+        )
+        .unwrap();
+}
+
+#[test]
 fn mark_bucket_deleting_requires_drained_reservations() {
     let (_dir, store) = make_pg_store();
     store

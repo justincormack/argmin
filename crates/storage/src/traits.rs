@@ -96,12 +96,84 @@ pub(crate) trait PgMetadataStore {
     /// Release a previously acquired bucket write reservation.
     fn release_bucket_write_reservation(&self, name: &BucketName) -> Result<(), MetadataError>;
 
+    /// Acquire a durable bucket write reservation record for one bucket
+    /// incarnation.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_durable_bucket_write_reservation(
+        &self,
+        name: &BucketName,
+        reservation_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        operation_kind: &str,
+        created_at: u64,
+        lease_deadline: Option<u64>,
+        target_context: Option<&str>,
+    ) -> Result<BucketWriteReservationRecord, MetadataError>;
+
+    /// Read a durable bucket write reservation by exact key.
+    #[allow(dead_code)]
+    fn durable_bucket_write_reservation(
+        &self,
+        name: &BucketName,
+        reservation_id: &str,
+    ) -> Result<Option<BucketWriteReservationRecord>, MetadataError>;
+
+    /// List durable write reservations for a bucket.
+    #[allow(dead_code)]
+    fn durable_bucket_write_reservations(
+        &self,
+        name: &BucketName,
+    ) -> Result<Vec<BucketWriteReservationRecord>, MetadataError>;
+
+    /// Release a durable bucket write reservation by exact identity.
+    #[allow(dead_code)]
+    fn release_durable_bucket_write_reservation(
+        &self,
+        name: &BucketName,
+        reservation_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        bucket_execution_generation: u64,
+    ) -> Result<(), MetadataError>;
+
     /// Block new bucket write reservations while deletion drains in-flight
     /// writers and verifies emptiness.
     fn begin_bucket_write_drain(&self, name: &BucketName) -> Result<(), MetadataError>;
 
     /// Re-open the bucket for new write reservations after a failed delete.
     fn end_bucket_write_drain(&self, name: &BucketName) -> Result<(), MetadataError>;
+
+    /// Begin a durable bucket write drain for one bucket incarnation.
+    #[allow(dead_code)]
+    fn begin_durable_bucket_write_drain(
+        &self,
+        name: &BucketName,
+        drain_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        created_at: u64,
+        lease_deadline: Option<u64>,
+    ) -> Result<BucketWriteDrainRecord, MetadataError>;
+
+    /// Read a durable bucket write-drain record.
+    #[allow(dead_code)]
+    fn durable_bucket_write_drain(
+        &self,
+        name: &BucketName,
+    ) -> Result<Option<BucketWriteDrainRecord>, MetadataError>;
+
+    /// Clear a durable bucket write drain by exact identity.
+    #[allow(dead_code)]
+    fn clear_durable_bucket_write_drain(
+        &self,
+        name: &BucketName,
+        drain_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        bucket_execution_generation: u64,
+    ) -> Result<(), MetadataError>;
 
     /// Set bucket versioning state.
     ///

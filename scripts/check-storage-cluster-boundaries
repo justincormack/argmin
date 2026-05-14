@@ -138,6 +138,13 @@ production_metadata_methods=$(
             || name == "release_bucket_write_reservation" \
             || name == "begin_bucket_write_drain" \
             || name == "end_bucket_write_drain" \
+            || name == "acquire_durable_bucket_write_reservation" \
+            || name == "durable_bucket_write_reservation" \
+            || name == "durable_bucket_write_reservations" \
+            || name == "release_durable_bucket_write_reservation" \
+            || name == "begin_durable_bucket_write_drain" \
+            || name == "durable_bucket_write_drain" \
+            || name == "clear_durable_bucket_write_drain" \
             || name == "head_bucket" \
             || name == "head_bucket_raw" \
             || name == "head_bucket_record_raw" \

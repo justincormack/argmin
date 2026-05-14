@@ -8879,6 +8879,122 @@ impl PgStore {
     }
 }
 
+#[allow(dead_code)]
+fn bucket_write_reservation_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<BucketWriteReservationRecord, rusqlite::Error> {
+    let bucket_raw: String = row.get(0)?;
+    let cluster_epoch_raw: i64 = row.get(3)?;
+    let bucket_execution_generation_raw: i64 = row.get(4)?;
+    let created_at_raw: i64 = row.get(6)?;
+    let lease_deadline_raw: Option<i64> = row.get(7)?;
+    Ok(BucketWriteReservationRecord {
+        bucket: BucketName::new(bucket_raw).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::from(error),
+            )
+        })?,
+        reservation_id: row.get(1)?,
+        owner_token: row.get(2)?,
+        cluster_epoch: u64::try_from(cluster_epoch_raw)
+            .ok()
+            .and_then(ClusterEpoch::new)
+            .ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Integer,
+                    Box::from(format!("invalid cluster_epoch: {cluster_epoch_raw}")),
+                )
+            })?,
+        bucket_execution_generation: u64::try_from(bucket_execution_generation_raw).map_err(
+            |_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Integer,
+                    Box::from(format!(
+                        "invalid bucket_execution_generation: {bucket_execution_generation_raw}"
+                    )),
+                )
+            },
+        )?,
+        operation_kind: row.get(5)?,
+        created_at: u64::try_from(created_at_raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid created_at: {created_at_raw}")),
+            )
+        })?,
+        lease_deadline: PgStore::parse_optional_u64(lease_deadline_raw, 7, "lease_deadline")?,
+        target_context: row.get(8)?,
+    })
+}
+
+#[allow(dead_code)]
+fn bucket_write_drain_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<BucketWriteDrainRecord, rusqlite::Error> {
+    let bucket_raw: String = row.get(0)?;
+    let cluster_epoch_raw: i64 = row.get(3)?;
+    let bucket_execution_generation_raw: i64 = row.get(4)?;
+    let state_raw: i64 = row.get(5)?;
+    let created_at_raw: i64 = row.get(6)?;
+    let lease_deadline_raw: Option<i64> = row.get(7)?;
+    let state = match state_raw {
+        0 => BucketWriteDrainState::Draining,
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid bucket write drain state: {state_raw}")),
+            ));
+        }
+    };
+    Ok(BucketWriteDrainRecord {
+        bucket: BucketName::new(bucket_raw).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::from(error),
+            )
+        })?,
+        drain_id: row.get(1)?,
+        owner_token: row.get(2)?,
+        cluster_epoch: u64::try_from(cluster_epoch_raw)
+            .ok()
+            .and_then(ClusterEpoch::new)
+            .ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Integer,
+                    Box::from(format!("invalid cluster_epoch: {cluster_epoch_raw}")),
+                )
+            })?,
+        bucket_execution_generation: u64::try_from(bucket_execution_generation_raw).map_err(
+            |_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Integer,
+                    Box::from(format!(
+                        "invalid bucket_execution_generation: {bucket_execution_generation_raw}"
+                    )),
+                )
+            },
+        )?,
+        state,
+        created_at: u64::try_from(created_at_raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid created_at: {created_at_raw}")),
+            )
+        })?,
+        lease_deadline: PgStore::parse_optional_u64(lease_deadline_raw, 7, "lease_deadline")?,
+    })
+}
+
 impl PgMetadataStore for PgStore {
     #[cfg(test)]
     fn create_bucket(
@@ -9242,6 +9358,184 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_durable_bucket_write_reservation(
+        &self,
+        name: &BucketName,
+        reservation_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        operation_kind: &str,
+        created_at: u64,
+        lease_deadline: Option<u64>,
+        target_context: Option<&str>,
+    ) -> Result<BucketWriteReservationRecord, MetadataError> {
+        let created_at = i64::try_from(created_at).map_err(|source| MetadataError::Db {
+            context: "acquire durable bucket write reservation created_at",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
+        let lease_deadline = lease_deadline
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|source| MetadataError::Db {
+                context: "acquire durable bucket write reservation lease_deadline",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        let inserted = self
+            .conn
+            .execute(
+                "INSERT INTO bucket_write_reservations \
+             (bucket_name, reservation_id, owner_token, cluster_epoch, bucket_execution_generation, \
+              operation_kind, created_at, lease_deadline, target_context) \
+             SELECT name, ?1, ?2, ?3, bucket_execution_generation, ?4, ?5, ?6, ?7 \
+             FROM buckets \
+             WHERE name = ?8 AND state = ?9 \
+               AND NOT EXISTS (\
+                   SELECT 1 FROM bucket_write_drains \
+                   WHERE bucket_name = buckets.name AND state = ?10\
+               ) \
+             ON CONFLICT(bucket_name, reservation_id) DO NOTHING",
+                params![
+                    reservation_id,
+                    owner_token,
+                    cluster_epoch.get(),
+                    operation_kind,
+                    created_at,
+                    lease_deadline,
+                    target_context,
+                    name.as_str(),
+                    BucketState::Active as u8,
+                    BucketWriteDrainState::Draining as u8,
+                ],
+            )
+            .map_err(|source| MetadataError::Db {
+                context: "acquire durable bucket write reservation",
+                source,
+            })?;
+
+        if inserted == 0 {
+            if let Some(existing) = self.durable_bucket_write_reservation(name, reservation_id)? {
+                if existing.owner_token == owner_token
+                    && existing.cluster_epoch == cluster_epoch
+                    && existing.operation_kind == operation_kind
+                    && existing.created_at == created_at as u64
+                    && existing.lease_deadline == lease_deadline.map(|deadline| deadline as u64)
+                    && existing.target_context.as_deref() == target_context
+                {
+                    return Ok(existing);
+                }
+                return Err(MetadataError::BucketWriteReservationConflict {
+                    reservation_id: reservation_id.to_string(),
+                });
+            }
+            let info = self.head_bucket_raw(name)?;
+            if info.state == BucketState::Active && self.durable_bucket_write_drain(name)?.is_some()
+            {
+                return Err(MetadataError::BucketWriteDraining);
+            }
+            return Err(bucket_not_found(name.as_str()));
+        }
+
+        self.durable_bucket_write_reservation(name, reservation_id)?
+            .ok_or_else(|| MetadataError::BucketWriteReservationNotFound {
+                reservation_id: reservation_id.to_string(),
+            })
+    }
+
+    fn durable_bucket_write_reservation(
+        &self,
+        name: &BucketName,
+        reservation_id: &str,
+    ) -> Result<Option<BucketWriteReservationRecord>, MetadataError> {
+        match self.conn.query_row(
+            "SELECT bucket_name, reservation_id, owner_token, \
+                    cluster_epoch, bucket_execution_generation, operation_kind, created_at, \
+                    lease_deadline, target_context \
+             FROM bucket_write_reservations \
+             WHERE bucket_name = ?1 AND reservation_id = ?2",
+            params![name.as_str(), reservation_id],
+            bucket_write_reservation_from_row,
+        ) {
+            Ok(record) => Ok(Some(record)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(source) => Err(MetadataError::Db {
+                context: "load durable bucket write reservation",
+                source,
+            }),
+        }
+    }
+
+    fn durable_bucket_write_reservations(
+        &self,
+        name: &BucketName,
+    ) -> Result<Vec<BucketWriteReservationRecord>, MetadataError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT bucket_name, reservation_id, owner_token, \
+                        cluster_epoch, bucket_execution_generation, operation_kind, created_at, \
+                        lease_deadline, target_context \
+                 FROM bucket_write_reservations \
+                 WHERE bucket_name = ?1 \
+                 ORDER BY reservation_id",
+            )
+            .map_err(|source| MetadataError::Db {
+                context: "prepare list durable bucket write reservations",
+                source,
+            })?;
+        let rows = stmt
+            .query_map(params![name.as_str()], bucket_write_reservation_from_row)
+            .map_err(|source| MetadataError::Db {
+                context: "list durable bucket write reservations",
+                source,
+            })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|source| MetadataError::Db {
+                context: "collect durable bucket write reservations",
+                source,
+            })
+    }
+
+    fn release_durable_bucket_write_reservation(
+        &self,
+        name: &BucketName,
+        reservation_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        bucket_execution_generation: u64,
+    ) -> Result<(), MetadataError> {
+        let generation =
+            i64::try_from(bucket_execution_generation).map_err(|source| MetadataError::Db {
+                context: "release durable bucket write reservation generation",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM bucket_write_reservations \
+                 WHERE bucket_name = ?1 AND reservation_id = ?2 \
+                   AND owner_token = ?3 AND cluster_epoch = ?4 \
+                   AND bucket_execution_generation = ?5",
+                params![
+                    name.as_str(),
+                    reservation_id,
+                    owner_token,
+                    cluster_epoch.get(),
+                    generation
+                ],
+            )
+            .map_err(|source| MetadataError::Db {
+                context: "release durable bucket write reservation",
+                source,
+            })?;
+        if deleted == 0 {
+            return Err(MetadataError::BucketWriteReservationNotFound {
+                reservation_id: reservation_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     fn begin_bucket_write_drain(&self, name: &BucketName) -> Result<(), MetadataError> {
         let updated = self
             .conn
@@ -9261,6 +9555,134 @@ impl PgMetadataStore for PgStore {
                 return Err(MetadataError::BucketWriteDraining);
             }
             return Err(bucket_not_found(name.as_str()));
+        }
+        Ok(())
+    }
+
+    fn begin_durable_bucket_write_drain(
+        &self,
+        name: &BucketName,
+        drain_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        created_at: u64,
+        lease_deadline: Option<u64>,
+    ) -> Result<BucketWriteDrainRecord, MetadataError> {
+        let created_at = i64::try_from(created_at).map_err(|source| MetadataError::Db {
+            context: "begin durable bucket write drain created_at",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
+        let lease_deadline = lease_deadline
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|source| MetadataError::Db {
+                context: "begin durable bucket write drain lease_deadline",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        let inserted = self
+            .conn
+            .execute(
+                "INSERT INTO bucket_write_drains \
+                 (bucket_name, drain_id, owner_token, cluster_epoch, bucket_execution_generation, \
+                  state, created_at, lease_deadline) \
+                 SELECT name, ?1, ?2, ?3, bucket_execution_generation, ?4, ?5, ?6 \
+                 FROM buckets \
+                 WHERE name = ?7 AND state = ?8 \
+                 ON CONFLICT(bucket_name) DO NOTHING",
+                params![
+                    drain_id,
+                    owner_token,
+                    cluster_epoch.get(),
+                    BucketWriteDrainState::Draining as u8,
+                    created_at,
+                    lease_deadline,
+                    name.as_str(),
+                    BucketState::Active as u8,
+                ],
+            )
+            .map_err(|source| MetadataError::Db {
+                context: "begin durable bucket write drain",
+                source,
+            })?;
+        if inserted == 0 {
+            if let Some(existing) = self.durable_bucket_write_drain(name)? {
+                if existing.drain_id == drain_id
+                    && existing.owner_token == owner_token
+                    && existing.cluster_epoch == cluster_epoch
+                    && existing.created_at == created_at as u64
+                    && existing.lease_deadline == lease_deadline.map(|deadline| deadline as u64)
+                {
+                    return Ok(existing);
+                }
+                return Err(MetadataError::BucketWriteDrainConflict {
+                    drain_id: drain_id.to_string(),
+                });
+            }
+            return Err(bucket_not_found(name.as_str()));
+        }
+        self.durable_bucket_write_drain(name)?.ok_or_else(|| {
+            MetadataError::BucketWriteDrainNotFound {
+                drain_id: drain_id.to_string(),
+            }
+        })
+    }
+
+    fn durable_bucket_write_drain(
+        &self,
+        name: &BucketName,
+    ) -> Result<Option<BucketWriteDrainRecord>, MetadataError> {
+        match self.conn.query_row(
+            "SELECT bucket_name, drain_id, owner_token, cluster_epoch, bucket_execution_generation, \
+                    state, created_at, lease_deadline \
+             FROM bucket_write_drains \
+             WHERE bucket_name = ?1",
+            params![name.as_str()],
+            bucket_write_drain_from_row,
+        ) {
+            Ok(record) => Ok(Some(record)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(source) => Err(MetadataError::Db {
+                context: "load durable bucket write drain",
+                source,
+            }),
+        }
+    }
+
+    fn clear_durable_bucket_write_drain(
+        &self,
+        name: &BucketName,
+        drain_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        bucket_execution_generation: u64,
+    ) -> Result<(), MetadataError> {
+        let generation =
+            i64::try_from(bucket_execution_generation).map_err(|source| MetadataError::Db {
+                context: "clear durable bucket write drain generation",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM bucket_write_drains \
+                 WHERE bucket_name = ?1 AND drain_id = ?2 AND owner_token = ?3 \
+                   AND cluster_epoch = ?4 AND bucket_execution_generation = ?5",
+                params![
+                    name.as_str(),
+                    drain_id,
+                    owner_token,
+                    cluster_epoch.get(),
+                    generation
+                ],
+            )
+            .map_err(|source| MetadataError::Db {
+                context: "clear durable bucket write drain",
+                source,
+            })?;
+        if deleted == 0 {
+            return Err(MetadataError::BucketWriteDrainNotFound {
+                drain_id: drain_id.to_string(),
+            });
         }
         Ok(())
     }
@@ -15933,6 +16355,92 @@ mod tests {
                     )
                     .unwrap();
             },
+        );
+    }
+
+    #[test]
+    fn durable_bucket_write_coordination_does_not_dirty_metadata_command_state() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("coordination-bucket");
+        create_probe_bucket_direct(&store, &bucket);
+        store.refresh_metadata_command_state_digest().unwrap();
+
+        let initial_digest = store
+            .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
+            .unwrap()
+            .state_digest;
+
+        let reservation = store
+            .acquire_durable_bucket_write_reservation(
+                &bucket,
+                "reservation-1",
+                "owner-token-1",
+                ClusterEpoch::INITIAL,
+                "put-object",
+                1,
+                Some(2),
+                Some("key=a"),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
+                .unwrap()
+                .state_digest,
+            initial_digest
+        );
+
+        store
+            .release_durable_bucket_write_reservation(
+                &bucket,
+                "reservation-1",
+                "owner-token-1",
+                ClusterEpoch::INITIAL,
+                reservation.bucket_execution_generation,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
+                .unwrap()
+                .state_digest,
+            initial_digest
+        );
+
+        let drain = store
+            .begin_durable_bucket_write_drain(
+                &bucket,
+                "drain-1",
+                "owner-token-1",
+                ClusterEpoch::INITIAL,
+                3,
+                Some(4),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
+                .unwrap()
+                .state_digest,
+            initial_digest
+        );
+
+        store
+            .clear_durable_bucket_write_drain(
+                &bucket,
+                "drain-1",
+                "owner-token-1",
+                ClusterEpoch::INITIAL,
+                drain.bucket_execution_generation,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
+                .unwrap()
+                .state_digest,
+            initial_digest
         );
     }
 

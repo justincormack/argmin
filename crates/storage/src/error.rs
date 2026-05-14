@@ -462,6 +462,18 @@ pub enum MetadataError {
     #[error("bucket write reservations are draining")]
     BucketWriteDraining,
 
+    #[error("bucket write reservation conflict: {reservation_id}")]
+    BucketWriteReservationConflict { reservation_id: String },
+
+    #[error("bucket write reservation not found: {reservation_id}")]
+    BucketWriteReservationNotFound { reservation_id: String },
+
+    #[error("bucket write drain conflict: {drain_id}")]
+    BucketWriteDrainConflict { drain_id: String },
+
+    #[error("bucket write drain not found: {drain_id}")]
+    BucketWriteDrainNotFound { drain_id: String },
+
     #[error("object not found")]
     ObjectNotFound,
 

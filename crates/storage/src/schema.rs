@@ -405,6 +405,36 @@ CREATE TABLE IF NOT EXISTS buckets (
     CHECK (object_lock_enabled = 0 OR versioning = 1)
 )";
 
+/// Durable bucket write reservation records.
+const CREATE_BUCKET_WRITE_RESERVATIONS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS bucket_write_reservations (
+    bucket_name      TEXT NOT NULL,
+    reservation_id   TEXT NOT NULL CHECK (length(reservation_id) BETWEEN 1 AND 256),
+    owner_token      TEXT NOT NULL CHECK (length(owner_token) BETWEEN 1 AND 256),
+    cluster_epoch    INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    bucket_execution_generation INTEGER NOT NULL CHECK (bucket_execution_generation >= 0),
+    operation_kind   TEXT NOT NULL CHECK (length(operation_kind) BETWEEN 1 AND 64),
+    created_at       INTEGER NOT NULL CHECK (created_at >= 0),
+    lease_deadline   INTEGER CHECK (lease_deadline IS NULL OR lease_deadline >= 0),
+    target_context   TEXT,
+    PRIMARY KEY (bucket_name, reservation_id),
+    FOREIGN KEY (bucket_name) REFERENCES buckets(name) ON DELETE CASCADE
+)";
+
+/// Durable bucket delete write-drain records.
+const CREATE_BUCKET_WRITE_DRAINS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS bucket_write_drains (
+    bucket_name      TEXT PRIMARY KEY,
+    drain_id         TEXT NOT NULL CHECK (length(drain_id) BETWEEN 1 AND 256),
+    owner_token      TEXT NOT NULL CHECK (length(owner_token) BETWEEN 1 AND 256),
+    cluster_epoch    INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    bucket_execution_generation INTEGER NOT NULL CHECK (bucket_execution_generation >= 0),
+    state            INTEGER NOT NULL CHECK (state IN (0)),
+    created_at       INTEGER NOT NULL CHECK (created_at >= 0),
+    lease_deadline   INTEGER CHECK (lease_deadline IS NULL OR lease_deadline >= 0),
+    FOREIGN KEY (bucket_name) REFERENCES buckets(name) ON DELETE CASCADE
+)";
+
 /// Index for bucket listing by owner and bucket name.
 const CREATE_BUCKETS_OWNER_LIST_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_buckets_owner_list ON buckets (owner_principal, name)";
@@ -542,6 +572,8 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_MULTIPART_PART_CHUNKS_TABLE, [])?;
     conn.execute(CREATE_MULTIPART_PART_CHUNKS_VERSION_INDEX, [])?;
     conn.execute(CREATE_BUCKETS_TABLE, [])?;
+    conn.execute(CREATE_BUCKET_WRITE_RESERVATIONS_TABLE, [])?;
+    conn.execute(CREATE_BUCKET_WRITE_DRAINS_TABLE, [])?;
     conn.execute(CREATE_BUCKETS_OWNER_LIST_INDEX, [])?;
     conn.execute(CREATE_PG_COUNTERS_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_LOG_TABLE, [])?;

@@ -2034,6 +2034,40 @@ pub struct StoredBucketSubresource {
     pub aux: BucketSubresourceAux,
 }
 
+/// Durable bucket write reservation record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketWriteReservationRecord {
+    pub bucket: BucketName,
+    pub reservation_id: String,
+    pub owner_token: String,
+    pub cluster_epoch: ClusterEpoch,
+    pub bucket_execution_generation: u64,
+    pub operation_kind: String,
+    pub created_at: u64,
+    pub lease_deadline: Option<u64>,
+    pub target_context: Option<String>,
+}
+
+/// Durable bucket write-drain state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BucketWriteDrainState {
+    Draining = 0,
+}
+
+/// Durable bucket write-drain record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketWriteDrainRecord {
+    pub bucket: BucketName,
+    pub drain_id: String,
+    pub owner_token: String,
+    pub cluster_epoch: ClusterEpoch,
+    pub bucket_execution_generation: u64,
+    pub state: BucketWriteDrainState,
+    pub created_at: u64,
+    pub lease_deadline: Option<u64>,
+}
+
 /// Bucket metadata.
 #[derive(Clone)]
 pub struct BucketInfo {

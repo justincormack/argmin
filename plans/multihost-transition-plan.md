@@ -3326,15 +3326,23 @@ Proposed subphases:
         rule, DeleteBucket drain loop, and required test matrix.
 
    2. Phase 9.4.2: introduce durable bucket-PG write-drain records
+      - status: in progress. The first storage slice added durable
+        `bucket_write_reservations` and `bucket_write_drains` tables plus
+        PgStore primitives/tests for exact identity, owner token, cluster epoch,
+        bucket execution generation, drain blocking, exact release/clear
+        matching, and proof that these primary-owned coordination rows do not
+        dirty the replica-wide metadata command digest. Production writers still
+        use the legacy bucket-row counters until 9.4.3 moves the cluster wrapper
+        onto these records.
       - replace anonymous bucket-row counters with explicit coordination rows:
         - `bucket_write_reservations`: bucket, reservation id, owner/process
-          token, bucket execution generation or bucket row digest, operation
-          kind, creation time, last heartbeat or owner epoch, and optional
-          request target context for tracing
-        - `bucket_write_drains`: bucket, drain id, owner/process token, state
-          (`Draining`, `MarkingDeleting`, `Abandoned`/expired), creation time,
-          last heartbeat/lease deadline, and the bucket execution generation or
-          bucket row image the drain was created against
+          token, cluster epoch, bucket execution generation or bucket row
+          digest, operation kind, creation time, last heartbeat/lease deadline,
+          and optional request target context for tracing
+        - `bucket_write_drains`: bucket, drain id, owner/process token, cluster
+          epoch, state (`Draining`, `MarkingDeleting`, `Abandoned`/expired),
+          creation time, last heartbeat/lease deadline, and the bucket
+          execution generation or bucket row image the drain was created against
       - decide and document whether these rows are:
         - bucket-PG-primary durable coordination state outside the metadata
           command log for Phase 9, or
@@ -3344,7 +3352,8 @@ Proposed subphases:
         - make the `MarkBucketDeleting` state change remain the durable
           command-stream transition
         - make reservations and temporary drain fences bucket-PG-primary
-          durable coordination rows with their own integrity/recovery checks
+          durable coordination rows outside the replica-wide command-state
+          digest, with their own integrity/recovery checks
         - remove the current bucket-row counter authority once the replacement
           is in place
       - add local PG validation for the coordination rows:

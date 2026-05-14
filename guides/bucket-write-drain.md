@@ -35,6 +35,13 @@ records:
   for writers, drains pending object commands, and decides whether to roll back
   or publish `MarkBucketDeleting`.
 
+These records are not Phase 9.4 command-owned replica state. They are written
+on the bucket PG primary as coordination authority, so they are intentionally
+outside the replica-wide metadata command digest. A later phase may either
+replicate them through the bucket command stream or add a separate
+primary-owned coordination integrity record; until then, they must not be
+treated as part of acting-set metadata agreement.
+
 Each reservation must include at least:
 
 - bucket name
