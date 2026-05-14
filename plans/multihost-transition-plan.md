@@ -3114,9 +3114,11 @@ Proposed subphases:
         UploadPartCopy-shaped copied parts represented as multi-segment
         UploadPart stream state before finalization. It also includes
         delete/recreate of empty bucket incarnations, with a deterministic trace
-        that proves the generated delete/recreate branch runs. Terminal
-        abort/complete outcomes check the lifecycle invariants after generated
-        operations and across reopen.
+        that proves the generated delete/recreate branch runs. The trace now
+        also includes stale-handle attempts for MPU create, UploadPart stream
+        session create, and abort; those operations must fail before mutating
+        upload state. Terminal abort/complete outcomes check the lifecycle
+        invariants after generated operations and across reopen.
       - add a multipart command-stream invariant checker that extends the Phase
         9.2 clean-stream helper with upload lifecycle checks:
         - no active `stream_uploads` or `stream_upload_segments` remain for a

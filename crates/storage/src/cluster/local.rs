@@ -3800,6 +3800,9 @@ mod tests {
         Complete { slot_seed: u8 },
         Abort { slot_seed: u8 },
         DeleteRecreateBucket,
+        StaleCreate { slot_seed: u8, key_seed: u8 },
+        StaleUploadPartCreate { slot_seed: u8, payload_seed: u8 },
+        StaleAbort { slot_seed: u8 },
         Reopen,
     }
 
@@ -3827,6 +3830,13 @@ mod tests {
                 2 => any::<u8>().prop_map(|slot_seed| MultipartTraceOp::Complete { slot_seed }),
                 2 => any::<u8>().prop_map(|slot_seed| MultipartTraceOp::Abort { slot_seed }),
                 1 => Just(MultipartTraceOp::DeleteRecreateBucket),
+                1 => (any::<u8>(), any::<u8>()).prop_map(|(slot_seed, key_seed)| {
+                    MultipartTraceOp::StaleCreate { slot_seed, key_seed }
+                }),
+                1 => (any::<u8>(), any::<u8>()).prop_map(|(slot_seed, payload_seed)| {
+                    MultipartTraceOp::StaleUploadPartCreate { slot_seed, payload_seed }
+                }),
+                1 => any::<u8>().prop_map(|slot_seed| MultipartTraceOp::StaleAbort { slot_seed }),
                 1 => Just(MultipartTraceOp::Reopen),
             ],
             1..=16,
@@ -3871,6 +3881,251 @@ mod tests {
             )
             .map_err(|err| TestCaseError::fail(format!("{err:?}")))?
             .map_err(|_| TestCaseError::fail("multipart trace create action failed"))?;
+        Ok(())
+    }
+
+    fn stale_multipart_trace_cluster(map: &Arc<LocalClusterMap>) -> Arc<crate::StorageCluster> {
+        crate::StorageCluster::test_from_local_map_with_epoch(
+            Arc::clone(map),
+            ClusterEpoch::new(2).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn assert_multipart_trace_stale_snapshot_error(
+        err: crate::BucketSnapshotLoadError,
+    ) -> TestCaseResult {
+        prop_assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Store(StoreError::StaleMetadataOperation {
+                    operation_epoch,
+                    current_epoch,
+                    ..
+                }) if operation_epoch == ClusterEpoch::new(2).unwrap()
+                    && current_epoch == ClusterEpoch::INITIAL
+            ),
+            "unexpected stale multipart snapshot error: {err:?}"
+        );
+        Ok(())
+    }
+
+    fn assert_multipart_trace_stale_object_pg_error(
+        err: crate::ObjectPgActionError,
+    ) -> TestCaseResult {
+        prop_assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::StaleMetadataOperation {
+                    operation_epoch,
+                    current_epoch,
+                    ..
+                }) if operation_epoch == ClusterEpoch::new(2).unwrap()
+                    && current_epoch == ClusterEpoch::INITIAL
+            ),
+            "unexpected stale multipart object-PG error: {err:?}"
+        );
+        Ok(())
+    }
+
+    fn stale_create_multipart_trace_upload(
+        cluster: &crate::StorageCluster,
+        stale_cluster: &crate::StorageCluster,
+        bucket: &crate::BucketName,
+        key: &crate::ObjectKey,
+        upload_id: crate::UploadId,
+    ) -> TestCaseResult {
+        let create = crate::CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
+        let err = stale_cluster
+            .create_multipart_upload(
+                bucket,
+                key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, _existing_object| Ok::<_, ()>(((), create.clone())),
+            )
+            .unwrap_err();
+        assert_multipart_trace_stale_snapshot_error(err)?;
+        let err = cluster
+            .load_multipart_upload(bucket, key, &upload_id)
+            .unwrap_err();
+        prop_assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::NoSuchUpload { .. })
+            ),
+            "stale create mutated upload state: {err:?}"
+        );
+        Ok(())
+    }
+
+    fn stale_create_upload_part_stream_session(
+        cluster: &crate::StorageCluster,
+        stale_cluster: &crate::StorageCluster,
+        map: &LocalClusterMap,
+        bucket: &crate::BucketName,
+        upload: &MultipartTraceUpload,
+        session_id: crate::SessionId,
+    ) -> TestCaseResult {
+        let upload_row = cluster
+            .load_in_progress_multipart_upload(bucket, &upload.key, &upload.upload_id)
+            .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+        let err = stale_cluster
+            .create_upload_part_stream_session(
+                &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload_row),
+                upload.next_part_number,
+                &session_id,
+            )
+            .unwrap_err();
+        assert_multipart_trace_stale_object_pg_error(err)?;
+        cluster
+            .load_in_progress_multipart_upload(bucket, &upload.key, &upload.upload_id)
+            .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+        for node_id in map.node_ids() {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(upload.object_pg)
+                .unwrap();
+            prop_assert!(
+                matches!(
+                    crate::PgMetadataStore::get_stream_upload(&*pg, &session_id),
+                    Err(crate::MetadataError::StreamSessionNotFound { .. })
+                ),
+                "stale UploadPart session create inserted stream_uploads row on node {node_id:?}"
+            );
+            let segments = crate::PgMetadataStore::list_stream_segments(&*pg, &session_id)
+                .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+            prop_assert!(
+                segments.is_empty(),
+                "stale UploadPart session create inserted stream segments on node {node_id:?}: {segments:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct MultipartTraceUploadSnapshot {
+        upload_exists: bool,
+        parts: Vec<crate::MultipartPartRecord>,
+        part_segments: Vec<crate::MultipartPartSegmentRecord>,
+        stream_sessions: Vec<(
+            crate::StreamUploadRecord,
+            Vec<crate::StreamUploadSegmentRecord>,
+        )>,
+    }
+
+    fn multipart_trace_upload_snapshot(
+        map: &LocalClusterMap,
+        node_id: NodeId,
+        upload: &MultipartTraceUpload,
+    ) -> MultipartTraceUploadSnapshot {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(upload.object_pg)
+            .unwrap();
+        let upload_exists =
+            crate::PgMetadataStore::get_multipart_upload(&*pg, &upload.upload_id).is_ok();
+        let parts = if upload_exists {
+            crate::PgMetadataStore::list_multipart_parts(
+                &*pg,
+                &crate::ListPartsReq {
+                    upload_id: upload.upload_id.clone(),
+                    part_number_marker: None,
+                    max_parts: 1000,
+                },
+            )
+            .unwrap()
+            .parts
+        } else {
+            Vec::new()
+        };
+        let part_segments = crate::PgMetadataStore::get_all_multipart_part_segments_for_upload(
+            &*pg,
+            &upload.upload_id,
+        )
+        .unwrap();
+        let mut stream_sessions = crate::PgMetadataStore::list_all_stream_uploads(&*pg)
+            .unwrap()
+            .into_iter()
+            .filter(|session| {
+                matches!(
+                    &session.target,
+                    crate::StreamUploadTarget::UploadPart {
+                        upload_id: session_upload_id,
+                        ..
+                    } if session_upload_id == &upload.upload_id
+                )
+            })
+            .map(|session| {
+                let segments =
+                    crate::PgMetadataStore::list_stream_segments(&*pg, &session.session_id)
+                        .unwrap();
+                (session, segments)
+            })
+            .collect::<Vec<_>>();
+        stream_sessions.sort_by(|(left, _), (right, _)| {
+            left.session_id.as_str().cmp(right.session_id.as_str())
+        });
+        MultipartTraceUploadSnapshot {
+            upload_exists,
+            parts,
+            part_segments,
+            stream_sessions,
+        }
+    }
+
+    fn multipart_trace_upload_snapshots(
+        map: &LocalClusterMap,
+        upload: &MultipartTraceUpload,
+    ) -> BTreeMap<u32, MultipartTraceUploadSnapshot> {
+        map.node_ids()
+            .map(|node_id| {
+                (
+                    node_id.as_u32(),
+                    multipart_trace_upload_snapshot(map, node_id, upload),
+                )
+            })
+            .collect()
+    }
+
+    fn stale_abort_multipart_trace_upload(
+        cluster: &crate::StorageCluster,
+        stale_cluster: &crate::StorageCluster,
+        map: &LocalClusterMap,
+        bucket: &crate::BucketName,
+        upload: &MultipartTraceUpload,
+    ) -> TestCaseResult {
+        let before = multipart_trace_upload_snapshots(map, upload);
+        let err = stale_cluster
+            .abort_multipart_upload(bucket, &upload.key, &upload.upload_id)
+            .unwrap_err();
+        assert_multipart_trace_stale_object_pg_error(err)?;
+        cluster
+            .load_in_progress_multipart_upload(bucket, &upload.key, &upload.upload_id)
+            .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+        let after = multipart_trace_upload_snapshots(map, upload);
+        prop_assert_eq!(
+            after,
+            before,
+            "stale abort changed multipart upload parts or stream-session state"
+        );
         Ok(())
     }
 
@@ -4217,6 +4472,54 @@ mod tests {
                     }
                     delete_recreate_multipart_trace_bucket(&cluster, &map, &bucket)?;
                 }
+                MultipartTraceOp::StaleCreate {
+                    slot_seed,
+                    key_seed,
+                } => {
+                    let stale_cluster = stale_multipart_trace_cluster(&map);
+                    let (key, _) = &keys[usize::from(*key_seed % 2)];
+                    let upload_id = multipart_trace_upload_id(step, *slot_seed);
+                    stale_create_multipart_trace_upload(
+                        &cluster,
+                        &stale_cluster,
+                        &bucket,
+                        key,
+                        upload_id,
+                    )?;
+                }
+                MultipartTraceOp::StaleUploadPartCreate {
+                    slot_seed,
+                    payload_seed,
+                } => {
+                    let Some(upload) = active_uploads[multipart_trace_slot(*slot_seed)].as_ref()
+                    else {
+                        continue;
+                    };
+                    let stale_cluster = stale_multipart_trace_cluster(&map);
+                    let session_id = trace_session(payload_seed.wrapping_add(step as u8));
+                    stale_create_upload_part_stream_session(
+                        &cluster,
+                        &stale_cluster,
+                        &map,
+                        &bucket,
+                        upload,
+                        session_id,
+                    )?;
+                }
+                MultipartTraceOp::StaleAbort { slot_seed } => {
+                    let Some(upload) = active_uploads[multipart_trace_slot(*slot_seed)].as_ref()
+                    else {
+                        continue;
+                    };
+                    let stale_cluster = stale_multipart_trace_cluster(&map);
+                    stale_abort_multipart_trace_upload(
+                        &cluster,
+                        &stale_cluster,
+                        &map,
+                        &bucket,
+                        upload,
+                    )?;
+                }
                 MultipartTraceOp::Reopen => {
                     drop(cluster);
                     drop(map);
@@ -4265,6 +4568,10 @@ mod tests {
             },
             MultipartTraceOp::Abort { slot_seed: 0 },
             MultipartTraceOp::DeleteRecreateBucket,
+            MultipartTraceOp::StaleCreate {
+                slot_seed: 2,
+                key_seed: 1,
+            },
             MultipartTraceOp::Reopen,
             MultipartTraceOp::Create {
                 slot_seed: 1,
@@ -4274,6 +4581,11 @@ mod tests {
                 slot_seed: 1,
                 payload_seed: 9,
             },
+            MultipartTraceOp::StaleUploadPartCreate {
+                slot_seed: 1,
+                payload_seed: 7,
+            },
+            MultipartTraceOp::StaleAbort { slot_seed: 1 },
             MultipartTraceOp::Complete { slot_seed: 1 },
         ])
         .unwrap();
