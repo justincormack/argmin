@@ -5161,11 +5161,10 @@ impl super::StorageCluster {
                         )),
                     );
                     drop(object_pg);
-                    match self.install_snapshot_sensitive_metadata_command_or_drain(
-                        pg_id, bucket, &command,
-                    )? {
-                        super::SnapshotSensitiveCommandInstall::Installed => {}
-                        super::SnapshotSensitiveCommandInstall::ContenderDrained => continue,
+                    if !self
+                        .try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
+                    {
+                        continue;
                     }
                     (command, true)
                 }
@@ -6232,11 +6231,8 @@ impl super::StorageCluster {
                     MetadataCommandPayload::CommitStreamPart(Box::new(command_payload)),
                 );
                 drop(object_pg);
-                match self
-                    .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
-                {
-                    super::SnapshotSensitiveCommandInstall::Installed => {}
-                    super::SnapshotSensitiveCommandInstall::ContenderDrained => continue,
+                if !self.try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)? {
+                    continue;
                 }
                 command
             };
@@ -6372,13 +6368,8 @@ impl super::StorageCluster {
             maybe_run_before_abort_multipart_pending_install_hook(
                 self.metadata_command_apply_test_hook_scope_id(),
             );
-            match self
-                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
-            {
-                super::SnapshotSensitiveCommandInstall::Installed => {}
-                super::SnapshotSensitiveCommandInstall::ContenderDrained => {
-                    continue 'retry_after_pending_conflict;
-                }
+            if !self.try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)? {
+                continue 'retry_after_pending_conflict;
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             return Ok(true);
@@ -6440,13 +6431,8 @@ impl super::StorageCluster {
             maybe_run_before_abort_multipart_pending_install_hook(
                 self.metadata_command_apply_test_hook_scope_id(),
             );
-            match self
-                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
-            {
-                super::SnapshotSensitiveCommandInstall::Installed => {}
-                super::SnapshotSensitiveCommandInstall::ContenderDrained => {
-                    continue 'retry_after_pending_conflict;
-                }
+            if !self.try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)? {
+                continue 'retry_after_pending_conflict;
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             return Ok(true);

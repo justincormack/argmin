@@ -147,6 +147,11 @@ Publisher classes:
   request state needed to reconstruct the response. They need an explicit
   matching predicate, an outcome extractor from the command-owned row image,
   and a same-command install-race regression.
+- `TerminalSessionRetry`: the publisher is snapshot-sensitive and has a
+  terminal command that deletes the stream/upload session it is finalizing or
+  aborting. An equivalent contender must remain visible to the publisher's
+  top-of-loop matching branch; generic drain can delete the session before the
+  retry can validate or finish the matching command.
 
 Current production pending-command publishers:
 
@@ -166,7 +171,7 @@ Current production pending-command publishers:
 | `commit_direct_put_object_from_payload_shards` | `CommitDirectPutObject` | `SnapshotSensitive` | Rebuild commit from fresh object preconditions and stale-payload snapshot after contention. |
 | `create_put_object_stream_session_record_under_reservation` | `CreateStreamUpload` | `SnapshotSensitive` | Low-level PutObject stream-create publisher. The public wrapper first holds a durable bucket write reservation; this internal publisher rebuilds session command and reservation cleanup from fresh object state after contention. |
 | `commit_stream_segment_append` | `AppendStreamSegment` | `ApplyValidated` | Apply validates session binding/state and existing staged segment before inserting. |
-| `abort_stream_upload_session` | `AbortStreamUpload` | `SnapshotSensitive` | Rebuild staged-segment snapshot after contention. |
+| `abort_stream_upload_session` | `AbortStreamUpload` | `TerminalSessionRetry` | Rebuild staged-segment snapshot after unrelated contention. If an equivalent terminal command wins the pending slot, restart without draining so the matching/session-completion branch can finish it. |
 | `put_object_metadata_if` | `PutObjectMetadata` | `SnapshotSensitive` | Rerun request action/preconditions after contention. |
 | `delete_specific_object_version_if` | `DeleteObjectVersion` | `SnapshotSensitive` | Rerun delete preconditions after contention. |
 | `delete_current_object_if` | `DeleteObjectVersion` | `SnapshotSensitive` | Rerun current-object selection after contention. |
@@ -176,15 +181,15 @@ Current production pending-command publishers:
 | `delete_expired_delete_marker_if_due` | `DeleteObjectVersion` | `SnapshotSensitive` | Rerun expired-marker selector after contention. |
 | `reclaim_object_payload_if_unleased` | `DeleteObjectPayloadReclaim` | `SnapshotSensitive` | Recheck lease/fence and reclaim state after contention; cleanup must preserve retryability. |
 | `create_put_object_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Rerun authorization/object snapshot after contention. |
-| `finalize_put_object_stream` | `CommitDirectPutObject` | `SnapshotSensitive` | Rebuild commit from current object preconditions and stream-session snapshot after contention. |
+| `finalize_put_object_stream` | `CommitDirectPutObject` | `TerminalSessionRetry` | Rebuild commit from current object preconditions and stream-session snapshot after unrelated contention. If an equivalent terminal command wins the pending slot, restart without draining so the matching branch can finish it while the session state is still coherent. |
 | `create_multipart_upload` | `CreateMultipartUpload` | `SnapshotSensitive` | Rerun authorization/object snapshot after contention. |
 | `begin_upload_part_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Revalidate MPU/session target and rerun the caller action against fresh MPU state using the request-entry authorization snapshot/capability after contention. |
 | `create_upload_part_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Revalidate MPU/session target after contention. |
 | `reserve_completed_multipart_upload_order` | `AdvanceCompletedMultipartUploadSequence` | `AllocatorCleanup` | Serialize through the bucket-PG slot; a later object-PG command must be derived from a terminal reservation. |
 | `complete_multipart_upload_commit_serialized` | `CommitMultipartObject` | `MatchingOutcomeRetry` | Rebuild completion parts, cleanup snapshot, stale payload, and bucket-PG order after unrelated contention. If the contender is the same completion request, finish that exact command through the matching-pending branch and return its computed outcome. |
-| `finalize_upload_part_stream` | `CommitStreamPart` | `SnapshotSensitive` | Rebuild stream session, MPU row, staged segments, and displaced part refs after contention. |
-| `abort_multipart_upload_locked` | `AbortMultipartUpload` | `SnapshotSensitive` | Rebuild upload, part, active stream session, staged segment, and cleanup snapshots after contention. |
-| `abort_authorized_multipart_upload_locked` | `AbortMultipartUpload` | `SnapshotSensitive` | Rebuild authorized upload cleanup snapshot after contention and compare the current upload row to the authorized row before install. |
+| `finalize_upload_part_stream` | `CommitStreamPart` | `TerminalSessionRetry` | Rebuild stream session, MPU row, staged segments, and displaced part refs after unrelated contention. If an equivalent terminal command wins the pending slot, restart without draining so the matching branch can finish it. |
+| `abort_multipart_upload_locked` | `AbortMultipartUpload` | `TerminalSessionRetry` | Rebuild upload, part, active stream session, staged segment, and cleanup snapshots after unrelated contention. If an equivalent abort wins the pending slot, restart without draining so the matching branch returns the successful abort outcome. |
+| `abort_authorized_multipart_upload_locked` | `AbortMultipartUpload` | `TerminalSessionRetry` | Rebuild authorized upload cleanup snapshot after unrelated contention and compare the current upload row to the authorized row before install. If an equivalent abort wins the pending slot, restart without draining so the matching branch returns the successful abort outcome. |
 
 Adding a production call site that creates or installs a pending metadata
 command requires updating this table and the boundary check allowlist. Direct
@@ -201,6 +206,11 @@ return the response from that command. Every such exception must be documented
 in the table above, listed in the boundary script allowlist as a
 matching-outcome path, and covered by an install-race regression where the
 equivalent command wins the pending slot after snapshot/command construction.
+Terminal-session retry publishers follow the same lower-level install rule,
+but the reason is different: they preserve the equivalent pending command for
+the next loop iteration instead of draining a command that deletes the session
+row needed by the matching branch. Every such publisher needs a same-command
+install-race regression.
 If a PG-wide pending slot appears after the publisher has taken its snapshot
 but before it allocates the command id, `MetadataCommandLogConflict` is the
 same pre-publish contention class: the publisher must drain the winner and

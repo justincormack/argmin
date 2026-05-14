@@ -2662,6 +2662,12 @@ Proposed subphases:
        caller-visible result. These paths must finish the matching command and
        return the outcome derived from its command-owned row image instead of
        draining it through the generic snapshot-sensitive helper.
+     - `TerminalSessionRetry`: the publisher is snapshot-sensitive and has a
+       terminal command that deletes the stream/upload session it is
+       finalizing or aborting. These paths must leave an equivalent pending
+       contender visible to the top-of-loop matching branch instead of
+       generically draining it and then retrying after the session row has
+       disappeared.
      The command kind matrix is still useful as a summary, but it is not the
      authority. The same command kind can be safe in one publisher and
      snapshot-sensitive in another if the surrounding request path performs
@@ -2812,6 +2818,11 @@ Proposed subphases:
        clean command stream. This is distinct from unrelated contention tests,
        because generic drain/retry can erase the state needed to reconstruct
        the caller-visible result.
+     - require terminal-session install-race tests for any publisher classified
+       as `TerminalSessionRetry`: inject an equivalent terminal command after
+       snapshot/command construction but before pending-slot install, then
+       assert the request preserves the equivalent pending command for its
+       matching branch and leaves a clean command stream.
      - add a mechanical boundary check for broad
        `MetadataCommandLogConflict` matching in request paths. Matching the
        variant directly is allowed only in named helpers that prove command
@@ -2979,19 +2990,23 @@ Proposed subphases:
 
    3. Phase 9.3.3: streamed UploadPart finalization
       - status: complete. `finalize_upload_part_stream` now uses the
-        snapshot-sensitive install/drain loop and reloads stream session, MPU,
+        terminal-session retry shape: unrelated contention is drained through
+        the fresh-snapshot loop, while an equivalent terminal
+        `CommitStreamPart` contender is left visible for the matching branch
+        instead of being drained generically. It reloads stream session, MPU,
         existing part, staged segment, and displaced-part state after
         contention before rebuilding `CommitStreamPart`. Coverage now includes
-        duplicate finalize retry through a matching pending command, same-part
-        replacement with displaced payload cleanup, and finalize losing the
-        object-PG slot to both abort and complete terminal commands. The
-        complete-wins-slot coverage stages multiple copied-source-style
-        segments, matching the storage representation used by UploadPartCopy,
-        and proves terminal cleanup removes every copied staged payload. It
-        also covers the crash shapes where a matching terminal
-        `CommitStreamPart` command applied but the durable pending slot
-        survived, and where a partial `CommitStreamPart` apply reopens with the
-        primary pending slot, rehydrates the command, and converges.
+        duplicate finalize retry through a matching pending command, a
+        same-command install race, same-part replacement with displaced payload
+        cleanup, and finalize losing the object-PG slot to both abort and
+        complete terminal commands. The complete-wins-slot coverage stages
+        multiple copied-source-style segments, matching the storage
+        representation used by UploadPartCopy, and proves terminal cleanup
+        removes every copied staged payload. It also covers the crash shapes
+        where a matching terminal `CommitStreamPart` command applied but the
+        durable pending slot survived, and where a partial `CommitStreamPart`
+        apply reopens with the primary pending slot, rehydrates the command,
+        and converges.
       - convert `finalize_upload_part_stream` to the snapshot-sensitive
         install-or-drain shape:
         - reload the stream session, MPU row, existing part row, staged segment
@@ -3021,9 +3036,11 @@ Proposed subphases:
 
    4. Phase 9.3.4: multipart abort serialization
       - status: complete. `abort_multipart_upload_locked` and
-        `abort_authorized_multipart_upload_locked` now use
-        snapshot-sensitive pending-slot install and fresh-snapshot retry.
-        Coverage includes active UploadPart stream sessions,
+        `abort_authorized_multipart_upload_locked` now use the
+        terminal-session retry shape: unrelated contention is drained through
+        the fresh-snapshot loop, while an equivalent abort contender is left
+        visible for the matching branch so the request returns the successful
+        abort outcome. Coverage includes active UploadPart stream sessions,
         UploadPartCopy-style staged copied segments, streamed-part finalize
         winning the slot before abort, completion winning the slot before
         abort, stale authorized upload rows, partial abort apply followed by

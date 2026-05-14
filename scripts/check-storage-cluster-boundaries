@@ -281,11 +281,11 @@ pending_command_publishers=$(
 # Pending command publisher inventory is intentionally explicit. Snapshot-
 # sensitive multipart publishers normally use the snapshot-sensitive install wrapper;
 # lower-level set/try_set helpers are reserved for apply-validated publishers,
-# allocator cleanup, MatchingOutcomeRetry publishers with same-command
-# install-race coverage, and explicitly documented non-multipart transitional
-# paths.
+# allocator cleanup, MatchingOutcomeRetry/terminal-session retry publishers
+# with same-command install-race coverage, and explicitly documented
+# non-multipart transitional paths.
 expected_pending_command_publishers=$(cat <<'EOF'
-1 crates/storage/src/cluster.rs:abort_stream_upload_session:install_snapshot_sensitive_metadata_command_or_drain
+1 crates/storage/src/cluster.rs:abort_stream_upload_session:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards<E>:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster.rs:commit_stream_segment_append:set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster.rs:create_put_object_stream_session_record_under_reservation:try_install_pending_metadata_command_for_bucket
@@ -293,8 +293,8 @@ expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:release_object_generation_reservation_command_required:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster.rs:reserve_next_object_version:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster.rs:reserve_put_object_generation:try_set_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster/request_ops.rs:abort_authorized_multipart_upload_locked:install_snapshot_sensitive_metadata_command_or_drain
-1 crates/storage/src/cluster/request_ops.rs:abort_multipart_upload_locked:install_snapshot_sensitive_metadata_command_or_drain
+1 crates/storage/src/cluster/request_ops.rs:abort_authorized_multipart_upload_locked:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:abort_multipart_upload_locked:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:begin_bucket_delete:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:begin_upload_part_stream_session<T, E>:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:complete_multipart_upload_commit_serialized:try_install_pending_metadata_command_for_bucket
@@ -308,8 +308,8 @@ expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster/request_ops.rs:delete_noncurrent_live_versions_if_due<E>:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:delete_specific_object_version_if<T, E>:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:expire_current_object_if_due<E>:install_snapshot_sensitive_metadata_command_or_drain
-1 crates/storage/src/cluster/request_ops.rs:finalize_put_object_stream<T, E>:install_snapshot_sensitive_metadata_command_or_drain
-1 crates/storage/src/cluster/request_ops.rs:finalize_upload_part_stream<T, E>:install_snapshot_sensitive_metadata_command_or_drain
+1 crates/storage/src/cluster/request_ops.rs:finalize_put_object_stream<T, E>:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:finalize_upload_part_stream<T, E>:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:insert_current_delete_marker_if<T, E>:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:put_bucket_acl_and_load_info:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:put_bucket_property_command_and_load_info:try_set_pending_metadata_command_for_bucket
