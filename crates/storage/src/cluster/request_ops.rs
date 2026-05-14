@@ -6048,13 +6048,11 @@ impl super::StorageCluster {
                     },
                 )),
             );
-            match self
-                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, &bucket, &command)?
-            {
-                super::SnapshotSensitiveCommandInstall::Installed => {}
-                super::SnapshotSensitiveCommandInstall::ContenderDrained => {
-                    continue 'retry_after_pending_conflict;
-                }
+            // A matching completion contender carries the exact outcome this caller must return.
+            // Let the retry loop observe it instead of draining it generically and losing that
+            // request-shaped result.
+            if !self.try_install_pending_metadata_command_for_bucket(pg_id, &bucket, &command)? {
+                continue 'retry_after_pending_conflict;
             }
             self.apply_multipart_completion_command(pg_id, &bucket, &command)?;
 

@@ -18959,6 +18959,111 @@ mod tests {
     }
 
     #[test]
+    fn multipart_completion_pending_install_conflict_with_matching_completion_returns_success() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let (req, mut expected_segment) =
+            seed_streamed_multipart_completion(&cluster, &bucket, &key, "racecomplete");
+        let pg_id = PgId::new(object_pg);
+        let bucket_pg_id = cluster.bucket_metadata_pg_id(&bucket);
+        let last_modified_millis = 987_659;
+        let (pending_completion, write_sequence) = pending_multipart_completion_command_for_test(
+            &map,
+            &cluster,
+            pg_id,
+            &req,
+            last_modified_millis,
+        );
+
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let hook_map = Arc::clone(&map);
+        let hook_bucket = bucket.clone();
+        let hook_command_template = pending_completion.clone();
+        let hook_bucket_pg_id = bucket_pg_id;
+        let hook_ran_for_closure = Arc::clone(&hook_ran);
+        let _hook_guard = cluster.test_install_before_metadata_command_pending_install_hook(
+            Arc::new(move || {
+                if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let bucket_primary = hook_map
+                    .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(hook_bucket_pg_id))
+                    .unwrap();
+                let bucket_pg = bucket_primary
+                    .storage_node()
+                    .get_pg(hook_bucket_pg_id)
+                    .unwrap();
+                let completion_order = bucket_pg
+                    .completed_multipart_upload_sequence_for_bucket(&hook_bucket)
+                    .unwrap();
+                drop(bucket_pg);
+                let mut payload = hook_command_template.payload().clone();
+                let MetadataCommandPayload::CommitMultipartObject(commit) = &mut payload else {
+                    panic!("test command must be a multipart completion");
+                };
+                commit.completion_order = completion_order;
+                let hook_command =
+                    MetadataCommandEnvelope::new(hook_command_template.id(), payload);
+                insert_pending_metadata_command_for_test(
+                    &hook_map,
+                    pg_id,
+                    &hook_bucket,
+                    &hook_command,
+                );
+            }),
+        );
+
+        let outcome = cluster
+            .complete_multipart_upload_commit_serialized(req.clone(), 16)
+            .unwrap();
+
+        assert!(hook_ran.load(Ordering::SeqCst));
+        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+        assert_eq!(outcome.version_id, crate::VersionId::Null);
+        assert_eq!(outcome.live_tags, req.tags);
+        assert_eq!(outcome.live_size, req.size);
+        assert_eq!(outcome.live_last_modified, last_modified_millis);
+        assert!(outcome.stale_payload.is_none());
+        expected_segment.version_id = crate::VersionId::Null.to_u64();
+        assert_streamed_multipart_completion_on_acting_nodes_with_write_sequence(
+            &map,
+            &node_ids,
+            object_pg,
+            &req,
+            &expected_segment,
+            &outcome,
+            write_sequence,
+        );
+        assert_terminal_multipart_upload_invariants(
+            &map,
+            &node_ids,
+            object_pg,
+            &bucket,
+            &key,
+            &req.upload_id,
+            TerminalMultipartOutcome::Completed,
+        );
+        assert_clean_metadata_command_stream(&map, &[bucket_pg_id, object_pg]);
+    }
+
+    #[test]
     fn multipart_completion_drains_other_upload_same_key_and_resnapshots_stale_payload() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

@@ -279,9 +279,10 @@ pending_command_publishers=$(
         | sed 's/^ *//'
 )
 # Pending command publisher inventory is intentionally explicit. Snapshot-
-# sensitive multipart publishers must use the snapshot-sensitive install wrapper;
+# sensitive multipart publishers normally use the snapshot-sensitive install wrapper;
 # lower-level set/try_set helpers are reserved for apply-validated publishers,
-# allocator cleanup, and explicitly documented non-multipart transitional paths.
+# allocator cleanup, matching-outcome retry paths, and explicitly documented
+# non-multipart transitional paths.
 expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:abort_stream_upload_session:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards<E>:try_install_pending_metadata_command_for_bucket
@@ -295,7 +296,7 @@ expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster/request_ops.rs:abort_multipart_upload_locked:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:begin_bucket_delete:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:begin_upload_part_stream_session<T, E>:install_snapshot_sensitive_metadata_command_or_drain
-1 crates/storage/src/cluster/request_ops.rs:complete_multipart_upload_commit_serialized:install_snapshot_sensitive_metadata_command_or_drain
+1 crates/storage/src/cluster/request_ops.rs:complete_multipart_upload_commit_serialized:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:create_bucket_with_config_and_load_info:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:create_multipart_upload<T, E>:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:create_put_object_stream_session<T, E>:try_install_pending_metadata_command_for_bucket
