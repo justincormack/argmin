@@ -3099,28 +3099,27 @@ Proposed subphases:
         `lock_multipart_completion_bucket` for correctness.
 
    6. Phase 9.3.6: race matrix and model coverage
-      - status: in progress. The first slices add a reusable terminal MPU
-        lifecycle invariant checker for storage local-cluster tests and a
-        focused multipart trace model. The checker now pins that terminal
-        abort/complete paths leave no live upload row, no active UploadPart
-        stream sessions or staged stream segments for that upload, no
-        post-abort multipart part segment rows, and only completed streamed
-        part segment rows that are backed by a live multipart object manifest.
-        It also verifies the expected completed-upload idempotence record shape
-        across acting nodes. The initial trace model drives real
-        `StorageCluster` create/upload-part/complete/abort/reopen APIs. It now
-        covers multiple concurrent uploads in one bucket, keys on two object
-        PGs with different primaries, repeated streamed parts, and
-        UploadPartCopy-shaped copied parts represented as multi-segment
-        UploadPart stream state before finalization. It also includes
-        delete/recreate of empty bucket incarnations, with a deterministic trace
-        that proves the generated delete/recreate branch runs. The trace now
-        also includes stale-handle attempts for MPU create, UploadPart stream
-        session create, and abort; those operations must fail before mutating
-        upload state. Terminal abort/complete outcomes check the lifecycle
+      - status: complete. This phase added a reusable terminal MPU lifecycle
+        invariant checker for storage local-cluster tests and a focused
+        multipart trace model. The checker pins that terminal abort/complete
+        paths leave no live upload row, no active UploadPart stream sessions or
+        staged stream segments for that upload, no post-abort multipart part
+        segment rows, and only completed streamed part segment rows that are
+        backed by a live multipart object manifest. It also verifies the
+        expected completed-upload idempotence record shape across acting nodes.
+      - the trace model drives real `StorageCluster`
+        create/upload-part/complete/abort/reopen APIs. It covers multiple
+        concurrent uploads in one bucket, keys on two object PGs with different
+        primaries, repeated streamed parts, and UploadPartCopy-shaped copied
+        parts represented as multi-segment UploadPart stream state before
+        finalization. It includes delete/recreate of empty bucket incarnations,
+        with a deterministic trace proving the generated delete/recreate branch
+        runs. It also includes stale-handle attempts for MPU create, UploadPart
+        stream-session create, and abort; those operations must fail before
+        mutating upload state. Terminal abort/complete outcomes check lifecycle
         invariants after generated operations and across reopen.
-      - add a multipart command-stream invariant checker that extends the Phase
-        9.2 clean-stream helper with upload lifecycle checks:
+      - the multipart command-stream invariant checker extends the Phase 9.2
+        clean-stream helper with upload lifecycle checks:
         - no active `stream_uploads` or `stream_upload_segments` remain for a
           terminal upload
         - an upload has at most one terminal command outcome
@@ -3131,19 +3130,62 @@ Proposed subphases:
           refs
         - omitted parts and displaced part payloads are either cleaned or have
           explicit retry/scavenger records
-      - add a focused stateful trace model for one bucket with multiple keys and
-        uploads:
+      - the focused stateful trace model covers one bucket with multiple keys
+        and uploads:
         - create MPU, create UploadPart stream session, append stream segment,
-          UploadPartCopy session create/source-copy append, finalize part,
-          abort, complete, delete/recreate bucket, reopen
-        - inject PG-slot contention, zero-apply abandon, primary-last partial
-          apply, terminal pending-slot leftover, and stale handle attempts
-      - include two-handle tests for the race classes found in review, not just
-        single-handle hooks
-      - exit when every public multipart mutating request has at least one
-        contention/retry test and one partial-apply/reopen test, including
-        CreateMultipartUpload, UploadPart, UploadPartCopy,
-        CompleteMultipartUpload, and AbortMultipartUpload
+          UploadPartCopy-shaped session create/source-copy append, finalize
+          part, abort, complete, delete/recreate bucket, reopen
+        - stale-handle attempts are generated inside the trace; PG-slot
+          contention, zero-apply abandon, primary-last partial apply, terminal
+          pending-slot leftovers, and two-handle races are pinned by
+          deterministic tests so failures are reproducible
+      - public multipart mutating request coverage at closeout:
+        - `CreateMultipartUpload`: contention/retry is covered by
+          `multipart_create_pending_install_race_reruns_authorization_action`
+          and
+          `multipart_create_command_id_race_drains_winner_and_reruns_authorization_action`;
+          partial apply/retry and partial apply/reopen are covered by
+          `multipart_create_partial_apply_retry_reuses_pending_command` and
+          `multipart_create_partial_apply_reopens_and_converges`.
+        - `UploadPart`: session-create contention is covered by
+          `begin_upload_part_stream_pending_install_race_reruns_action`,
+          `begin_upload_part_stream_drains_pending_completion_before_create`,
+          and `upload_part_stream_create_pending_install_race_reloads_after_abort`;
+          create/finalize partial apply and terminal-slot recovery are covered
+          by `upload_part_stream_create_zero_apply_reopens_and_converges`,
+          `upload_part_stream_finalize_partial_apply_reopens_and_converges`,
+          and `upload_part_stream_finalize_finishes_terminal_pending_slot`.
+        - `UploadPartCopy`: destination command-stream behavior shares the
+          UploadPart stream-session/finalize commands and is exercised in the
+          trace as multi-segment copied-part state. Public request cleanup and
+          source-object races are covered by
+          `upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot`,
+          `upload_part_copy_source_read_failure_aborts_destination_stream_session`,
+          `upload_part_copy_is_consistent_during_concurrent_overwrite`, and
+          `upload_part_copy_survives_source_metadata_delete_mid_read`.
+        - `CompleteMultipartUpload`: command-id contention, matching pending
+          completion, pending abort, zero-apply, partial apply/reopen, and
+          bucket-PG order reservation retry are covered by
+          `multipart_completion_command_id_race_drains_winner_and_resnapshots_stale_payload`,
+          `multipart_completion_drains_matching_pending_completion`,
+          `multipart_completion_drains_pending_abort_before_completing`,
+          `multipart_completion_zero_apply_failure_retains_pending_command_for_retry`,
+          `multipart_completion_partial_apply_reopens_and_converges`, and
+          `multipart_completion_retries_partial_bucket_order_command`.
+        - `AbortMultipartUpload`: install contention, pending completion,
+          cleanup races, zero-apply, partial apply/reopen, and stale handles are
+          covered by `multipart_abort_retries_after_pending_install_conflict`,
+          `multipart_abort_drains_pending_completion_before_aborting`,
+          `multipart_abort_pending_install_conflict_cleans_upload_part_stream_session_and_segments`,
+          `multipart_abort_pending_install_conflict_cleans_committed_stream_part`,
+          `multipart_abort_zero_apply_leaves_upload_in_progress_before_retry`,
+          `multipart_abort_partial_apply_retry_cleans_uploaded_part_payload`,
+          `multipart_abort_partial_apply_reopens_and_converges`, and the trace
+          stale-abort branch.
+      - remaining Phase 9.3 publisher allowlist and documentation deferrals are
+        intentionally left to Phase 9.3.7, which removes the temporary
+        `metadata-command-stream.md` deferral wording and boundary-script
+        exemptions after the final publisher cleanup pass.
 
    7. Phase 9.3.7: remove local-lock authority and clean up deferrals
       - remove Phase 9.3 deferral wording from

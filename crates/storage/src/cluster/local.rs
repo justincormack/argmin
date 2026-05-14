@@ -11927,6 +11927,127 @@ mod tests {
     }
 
     #[test]
+    fn multipart_create_partial_apply_reopens_and_converges() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape)
+            .expect("open local map");
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let upload_id = upload_id_from_label("mpucreatereopen");
+        let create = crate::CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
+
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_upload_id = upload_id.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::CreateMultipartUpload(create)
+                        if create.upload.upload_id == hook_upload_id
+                            && node_id == NodeId::new(0)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected multipart create reopen failure",
+                            source: std::io::Error::other(
+                                "injected multipart create reopen failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), create.clone()))
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Store(StoreError::Io {
+                    context: "injected multipart create reopen failure",
+                    ..
+                })
+            ),
+            "expected injected partial create failure, got {err:?}"
+        );
+        drop(hook_guard);
+        assert!(!fail_once.load(Ordering::SeqCst));
+        assert!(
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
+            "partial multipart create command must remain durable before reopen"
+        );
+        let replica_upload = {
+            let replica = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = replica.get_pg(object_pg).unwrap();
+            crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap()
+        };
+        drop(cluster);
+        drop(map);
+
+        let reopened = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape)
+            .expect("reopen local map with in-flight multipart create");
+        let reopened = Arc::new(reopened);
+        assert!(
+            pending_metadata_command_for_test(&reopened, PgId::new(object_pg), &bucket).is_none(),
+            "open-time recovery should converge and clear the partial create command"
+        );
+
+        for node_id in node_ids {
+            let node = reopened.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            let upload = crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap();
+            assert_eq!(upload.bucket, bucket);
+            assert_eq!(upload.key, key);
+            assert_eq!(upload.initiated_at, replica_upload.initiated_at);
+            assert_eq!(
+                upload.object_generation_id,
+                replica_upload.object_generation_id
+            );
+        }
+        assert_clean_metadata_command_stream(&reopened, &[object_pg]);
+    }
+
+    #[test]
     fn multipart_create_retry_rejects_same_request_with_mismatched_generation() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
