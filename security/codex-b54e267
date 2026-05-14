@@ -1,0 +1,176 @@
+Multipart completion retry can return false NoSuchUpload
+Link: https://chatgpt.com/codex/cloud/security/findings/ba9a5faa7a108191b5cd7c11ecddbaf2?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: b54e267
+Author: justin@specialbusservice.com
+Created: 14/05/2026, 10:59:28
+Assignee: Unassigned
+Signals: Validated, Attack-path
+
+# Resolution
+Fixed in `7cde011 Preserve matching multipart completion retry outcome`.
+
+The multipart completion publisher no longer uses the generic snapshot-sensitive
+install-or-drain wrapper at the final object-PG command install point. If
+another command wins that pending slot, completion now restarts the retry loop
+without draining it. That allows the existing matching-pending
+`CommitMultipartObject` branch to observe an equivalent completion command,
+finish that exact command, and return the command-derived success outcome
+instead of draining it generically and later returning false `NoSuchUpload`.
+
+The fix adds
+`multipart_completion_pending_install_conflict_with_matching_completion_returns_success`,
+which deterministically inserts an equivalent pending completion after the
+top-of-loop pending check and before install. The regression asserts the caller
+receives the successful completion outcome and the command stream is clean.
+
+Verified before the fix commit:
+- `cargo fmt`
+- `./scripts/check-storage-cluster-boundaries`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo nextest run -p storage multipart_completion --no-fail-fast`
+- `cargo nextest run`
+
+# Summary
+Introduced a non-security correctness/availability regression in multipart completion contention handling. It does not appear to enable unauthorized access, data disclosure, or code execution, but it can make valid concurrent/retried multipart completion requests fail spuriously after the object has been committed.
+In complete_multipart_upload_commit_serialized, the new install_snapshot_sensitive_metadata_command_or_drain call drains a winning pending command before returning ContenderDrained. That is unsafe for this path because the loop has special handling for a pending CommitMultipartObject that matches the current request: it computes the completion outcome, applies the command, prunes retention state, and returns success. If another coordinator installs a matching completion command after the top-of-loop pending check but before this request installs its own command, the new helper drains and applies that matching command generically, discards the outcome, and then restarts. On restart, the pending command is gone and the upload is no longer InProgress, so the request can return NoSuchUpload even though the object was successfully committed. The previous code continued without draining at this point, allowing the next loop iteration to observe the pending matching command and return the correct outcome.
+
+# Validation
+## Rubric
+- [x] Confirm the normal matching-pending multipart completion path applies the command and returns the computed success outcome.
+- [x] Confirm the new install-or-drain helper drains/applies a contender command before returning `ContenderDrained`.
+- [x] Deterministically reproduce the timing window where a matching `CommitMultipartObject` appears after the top-of-loop pending check but before object command install.
+- [x] Show the caller receives `NoSuchUpload` after the matching completion was drained/applied, instead of the successful completion outcome.
+- [x] Attempt dynamic validation beyond code reading: direct failing test/backtrace, valgrind attempt, and LLDB debugger trace.
+## Report
+Validated the suspected availability/correctness regression. I first confirmed the relevant control flow: `complete_multipart_upload_commit_serialized` has special matching-pending completion handling at `crates/storage/src/cluster/request_ops.rs:5707-5723`, but after a retry it returns `NoSuchUpload` if the upload is no longer `InProgress` at `request_ops.rs:5729-5738`. The new contention helper is called at `request_ops.rs:5915-5920`; on conflict it invokes `drain_pending_object_metadata_commands_for_bucket` at `crates/storage/src/cluster.rs:1042-1046`, whose drain loop applies pending commands at `cluster.rs:1842-1855` without returning the completion outcome to this caller.
+
+As a positive control, the existing test `multipart_completion_drains_matching_pending_completion` passed, confirming that if the matching pending command exists before the top-of-loop check, the special path succeeds.
+
+I then added a targeted unit test using the existing `test_install_before_metadata_command_pending_install_hook`. The test constructs a valid multipart completion, precomputes an equivalent winning `CommitMultipartObject`, and inserts it exactly when the current request is about to install its object-PG command. This deterministically models the suspected race: after the top-of-loop pending check but before this request installs its own command. Running `RUST_BACKTRACE=1 cargo test -p storage multipart_completion_pending_install_conflict_with_matching_completion_returns_success -- --nocapture` produced:
+
+`inserted matching pending completion during object command install`
+
+then panicked because `complete_multipart_upload_commit_serialized` returned:
+
+`Metadata(NoSuchUpload { upload_id: "racecomplete..." })`
+
+instead of the expected successful completion outcome. This matches the finding: the winning matching command was drained/applied generically, then the loop retried and saw the upload was no longer `InProgress`, causing `NoSuchUpload`.
+
+Valgrind was attempted but unavailable in the container (`bash: command not found: valgrind`). I then used LLDB non-interactively with a breakpoint on `core::panicking::panic_fmt`; it stopped at the test panic and showed the stack through `Result::expect` at `crates/storage/src/cluster/local.rs:18777`, confirming the observed erroneous `NoSuchUpload` result from the targeted repro.
+
+# Evidence
+crates/storage/src/cluster.rs (L1036 to 1047)
+  Note: The wrapper drains whatever pending command won the slot before returning ContenderDrained, which is inappropriate for this completion path's matching-pending-command semantics.
+```
+    fn install_snapshot_sensitive_metadata_command_or_drain(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<SnapshotSensitiveCommandInstall, ObjectPgActionError> {
+        if self.try_install_pending_metadata_command_for_bucket(pg_id, bucket, command)? {
+            Ok(SnapshotSensitiveCommandInstall::Installed)
+        } else {
+            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+            Ok(SnapshotSensitiveCommandInstall::ContenderDrained)
+        }
+```
+
+crates/storage/src/cluster/request_ops.rs (L5707 to 5723)
+  Note: The retry loop has special handling for a pending CommitMultipartObject matching the current request, applying it and returning the correct completion outcome.
+```
+        'retry_after_pending_conflict: loop {
+            while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, &bucket)? {
+                if let MetadataCommandPayload::CommitMultipartObject(commit) = command.payload() {
+                    if commit.matches_request(
+                        &bucket,
+                        &key,
+                        &upload_id,
+                        generation_id,
+                        &req.part_records,
+                    ) {
+                        let outcome = Self::complete_multipart_outcome_from_command(commit);
+                        self.apply_multipart_completion_command(pg_id, &bucket, &command)?;
+                        self.prune_completed_multipart_uploads_for_bucket_with_limit(
+                            &bucket,
+                            keep_completed_uploads,
+                        )?;
+                        return Ok(outcome);
+```
+
+crates/storage/src/cluster/request_ops.rs (L5729 to 5738)
+  Note: After a matching pending completion is drained generically, the retry no longer sees it and can fail here because the multipart upload is no longer InProgress.
+```
+            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let upload = PgMetadataStore::get_multipart_upload(&*object_pg, &upload_id)?;
+            if upload.bucket != bucket
+                || upload.key != key
+                || upload.state != UploadState::InProgress
+            {
+                return Err(MetadataError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                }
+                .into());
+```
+
+crates/storage/src/cluster/request_ops.rs (L5915 to 5921)
+  Note: The introduced call uses the generic install-or-drain wrapper; on contention it drains the pending command and then restarts, losing the chance to return the matching completion outcome.
+```
+            match self
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, &bucket, &command)?
+            {
+                super::SnapshotSensitiveCommandInstall::Installed => {}
+                super::SnapshotSensitiveCommandInstall::ContenderDrained => {
+                    continue 'retry_after_pending_conflict;
+                }
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Although the bug is real and in the main runtime path, the evidence supports only a non-security correctness/idempotency regression. The CompleteMultipartUpload path is reached via the S3 HTTP API, but dispatch authenticates requests and coordinator authorization requires write permission for the in-progress multipart upload. The vulnerable storage logic can discard the outcome of a matching pending completion and return NoSuchUpload after success, but this does not cross confidentiality, integrity, or identity boundaries. Under the stated calibration, ordinary correctness/reliability bugs without material security impact should be classified as ignore for criticality purposes rather than retained as a security finding.
+## Likelihood
+low - The race is plausible under concurrent duplicate completion/retry behavior, but requires authorization to the specific multipart upload and a narrow metadata-command timing window. The deterministic PoC used an internal test hook to force that timing, and there is no identified security payoff for an attacker.
+## Impact
+ignore - The proven effect is an incorrect NoSuchUpload response for a valid concurrent/retried completion after the object was already successfully committed. It does not let an attacker bypass authentication or authorization, read private data, corrupt another tenant's data beyond already-authorized write semantics, execute code, or obtain secrets.
+## Assumptions
+- No deployment/IaC manifests were present in the checkout, so exposure is inferred from application configuration defaults and code paths only.
+- A realistic trigger requires an S3 client that is authorized to complete the affected multipart upload, or an intentionally public-write bucket where anonymous write semantics are already allowed.
+- The validation PoC demonstrates the race deterministically with an internal test hook; production reachability depends on real concurrent/retried CompleteMultipartUpload timing.
+- argmin-s3 service reachable on its HTTP listener
+- valid multipart upload already initiated with uploaded parts
+- requester authorized by bucket policy/ACL/ownership controls to write/complete that multipart upload
+- two equivalent CompleteMultipartUpload attempts contend so that a matching pending CommitMultipartObject is installed after the top-of-loop pending check but before this request installs its own command
+## Path
+Client -> POST ?uploadId -> router -> authz -> storage completion loop -> generic drain of matching pending command -> retry -> false NoSuchUpload
+## Path evidence
+- `crates/argmin-s3/src/config.rs:87-100` - Runtime configuration loads S3 access credentials and defaults the listener to 127.0.0.1:9000; no secret values are present in code.
+- `crates/argmin-s3/src/main.rs:184-208` - Main product binary binds the configured TCP listener for argmin-s3.
+- `crates/server-http/src/http/router.rs:625-628` - POST object requests with uploadId are routed to CompleteMultipartUpload.
+- `crates/server-http/src/http/mod.rs:838-872` - Non-OPTIONS S3 requests are routed then authenticated before dispatch.
+- `crates/server-http/src/http/mod.rs:2778-2820` - CompleteMultipartUpload parses uploadId/XML and calls coordinator.complete_multipart_upload with the authenticated requester.
+- `crates/server-core/src/coordinator/authz/acl.rs:664-712` - Non-BOE authorization loads the in-progress upload and requires multipart write authorization before completion.
+- `crates/server-core/src/coordinator/authz/modern.rs:352-404` - BOE authorization similarly loads the in-progress upload and requires bucket-policy-based write authorization.
+- `crates/storage/src/cluster/request_ops.rs:5707-5723` - The intended special path detects a matching pending CommitMultipartObject, applies it, prunes state, and returns the successful completion outcome.
+- `crates/storage/src/cluster/request_ops.rs:5729-5738` - After the matching command has been drained/applied elsewhere, the retry sees the upload is no longer InProgress and returns NoSuchUpload.
+- `crates/storage/src/cluster/request_ops.rs:5915-5921` - The introduced install-or-drain helper is used on command installation contention and restarts the loop on ContenderDrained.
+- `crates/storage/src/cluster.rs:1036-1047` - The helper drains pending object metadata commands before reporting ContenderDrained, which loses this caller's chance to return the matching completion outcome.
+- `crates/storage/src/cluster.rs:1842-1855` - The drain loop finishes/applies pending commands generically and only collects applied envelopes; it does not propagate multipart completion outcomes to this caller.
+## Narrative
+The finding is a real product-code race in the multipart completion path, reachable through the normal CompleteMultipartUpload operation after authentication/authorization. Static evidence shows the route, authentication, authorization, and storage command handling path. The validated behavior is a false NoSuchUpload response after a matching completion command has already committed the object. That is a correctness/idempotency and limited availability issue for authorized multipart clients, but it does not provide unauthorized read/write/delete, data disclosure, privilege escalation, secret exposure, or code execution. Therefore it should not be treated as a security vulnerability despite being a real bug.
+## Controls
+- SigV4 authentication with anonymous fallback only subject to bucket policy/ACL authorization
+- Bucket policy/ACL/ownership-controls authorization for multipart write completion
+- Default listener is 127.0.0.1:9000 unless ARGMIN_LISTEN_ADDR is changed
+- Connection and in-flight request semaphores bound concurrent load
+- CompleteMultipartUpload XML body is parsed by the S3 HTTP layer before coordinator dispatch
+## Blindspots
+- Static-only repository review; no cloud APIs or live deployment inspection were performed.
+- No Kubernetes, Terraform, Docker Compose, or load-balancer manifests were found to confirm external exposure.
+- Production race frequency was not measured; validation used a targeted unit-test hook to deterministically model the timing window.
+- Complex public-write bucket policy edge cases were not exhaustively modeled, but any such path already grants write capability and does not change the observed bug into an authorization bypass.
