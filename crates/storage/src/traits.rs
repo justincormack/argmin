@@ -138,6 +138,22 @@ pub(crate) trait PgMetadataStore {
         bucket_execution_generation: u64,
     ) -> Result<(), MetadataError>;
 
+    /// Release a metadata-command bucket write proof.
+    ///
+    /// This is the terminal command cleanup path for commands that transfer a
+    /// bucket write reservation into the metadata command stream. It releases
+    /// both the durable reservation row and the legacy active-write counter in
+    /// one PG transaction so a terminal command cannot lose its retry driver
+    /// while leaving the bucket fenced.
+    fn release_metadata_command_bucket_write_reservation(
+        &self,
+        name: &BucketName,
+        reservation_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        bucket_execution_generation: u64,
+    ) -> Result<(), MetadataError>;
+
     /// Block new bucket write reservations while deletion drains in-flight
     /// writers and verifies emptiness.
     fn begin_bucket_write_drain(&self, name: &BucketName) -> Result<(), MetadataError>;

@@ -3416,10 +3416,14 @@ Proposed subphases:
         legacy-counter bridge around command publication. Durable reservation
         IDs use 128 bits of random entropy instead of a per-handle counter, so
         independent `StorageCluster` handles and reopen do not collide on
-        `(bucket, reservation_id)`. Object-PG command payloads do not yet carry
-        apply-time reservation references; that remains part of the Phase
-        9.4.3/9.4.4 fence work before DeleteBucket can rely on durable
-        reservations alone.
+        `(bucket, reservation_id)`. The low-level PutObject stream-create
+        command now carries an encoded durable reservation proof; normal apply,
+        matching pending-command retry, and local-cluster open-time convergence
+        validate that proof against the bucket-PG primary before applying, and
+        the reservation remains live until the pending command converges. The
+        other object-PG write command families still need the same apply-time
+        reservation proof before DeleteBucket can rely on durable reservations
+        alone.
       - introduce a cluster-level bucket write reservation guard that captures:
         bucket PG id, bucket name, reservation id, owner token, acquire epoch,
         and the node/store that accepted the reservation

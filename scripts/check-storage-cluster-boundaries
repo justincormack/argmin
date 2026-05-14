@@ -142,6 +142,7 @@ production_metadata_methods=$(
             || name == "durable_bucket_write_reservation" \
             || name == "durable_bucket_write_reservations" \
             || name == "release_durable_bucket_write_reservation" \
+            || name == "release_metadata_command_bucket_write_reservation" \
             || name == "begin_durable_bucket_write_drain" \
             || name == "durable_bucket_write_drain" \
             || name == "clear_durable_bucket_write_drain" \

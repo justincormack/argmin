@@ -819,6 +819,11 @@ impl super::StorageCluster {
             if acceptance == MetadataCommandAcceptance::AlreadyApplied {
                 continue;
             }
+            self.validate_metadata_command_bucket_write_reservation(command)
+                .map_err(|source| MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source,
+                })?;
             maybe_run_before_metadata_command_apply_hook(
                 self.metadata_command_apply_test_hook_scope_id(),
                 node.node_id(),
@@ -1033,11 +1038,13 @@ impl super::StorageCluster {
             {
                 self.record_abandoned_metadata_command_to_acting_set(&command)
                     .map_err(|error| error.source)?;
+                self.release_metadata_command_bucket_write_reservation(&command)?;
                 self.remove_pending_metadata_command_for_bucket(pg_id, command_bucket, &command)?;
                 return Ok(FinishPendingMetadataCommandResult::Abandoned);
             }
             match self.apply_metadata_command_to_acting_set(&command) {
                 Ok(()) => {
+                    self.release_metadata_command_bucket_write_reservation(&command)?;
                     self.remove_pending_metadata_command_for_bucket(
                         pg_id,
                         command_bucket,
@@ -3509,6 +3516,8 @@ impl super::StorageCluster {
         loop {
             match self.apply_metadata_command_to_acting_set(&command) {
                 Ok(()) => {
+                    self.release_metadata_command_bucket_write_reservation(&command)
+                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
                     self.remove_pending_metadata_command_for_bucket(
                         pg_id,
                         command.bucket_name(),
@@ -5813,6 +5822,8 @@ impl super::StorageCluster {
     ) -> Result<(), ObjectPgActionError> {
         match self.apply_metadata_command_to_acting_set(command) {
             Ok(()) => {
+                self.release_metadata_command_bucket_write_reservation(command)
+                    .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
                 self.remove_pending_metadata_command_for_bucket(pg_id, bucket, command)
                     .map_err(ObjectPgActionError::from)?;
                 self.after_object_metadata_command_applied(command);

@@ -9536,6 +9536,133 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
+    fn release_metadata_command_bucket_write_reservation(
+        &self,
+        name: &BucketName,
+        reservation_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        bucket_execution_generation: u64,
+    ) -> Result<(), MetadataError> {
+        let generation =
+            i64::try_from(bucket_execution_generation).map_err(|source| MetadataError::Db {
+                context: "release metadata command bucket write reservation generation",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|source| MetadataError::Db {
+                context: "begin release metadata command bucket write reservation",
+                source,
+            })?;
+
+        let result = (|| {
+            let existing = self.durable_bucket_write_reservation(name, reservation_id)?;
+            match existing {
+                Some(record)
+                    if record.owner_token == owner_token
+                        && record.cluster_epoch == cluster_epoch
+                        && record.bucket_execution_generation == bucket_execution_generation =>
+                {
+                    let deleted = self
+                        .conn
+                        .execute(
+                            "DELETE FROM bucket_write_reservations \
+                             WHERE bucket_name = ?1 AND reservation_id = ?2 \
+                               AND owner_token = ?3 AND cluster_epoch = ?4 \
+                               AND bucket_execution_generation = ?5",
+                            params![
+                                name.as_str(),
+                                reservation_id,
+                                owner_token,
+                                cluster_epoch.get(),
+                                generation
+                            ],
+                        )
+                        .map_err(|source| MetadataError::Db {
+                            context: "release metadata command durable bucket write reservation",
+                            source,
+                        })?;
+                    if deleted != 1 {
+                        return Err(MetadataError::BucketWriteReservationConflict {
+                            reservation_id: reservation_id.to_string(),
+                        });
+                    }
+                    let released = self
+                        .conn
+                        .execute(
+                            "UPDATE buckets \
+                             SET active_write_reservations = active_write_reservations - 1 \
+                             WHERE name = ?1 AND active_write_reservations > 0",
+                            params![name.as_str()],
+                        )
+                        .map_err(|source| MetadataError::Db {
+                            context: "release metadata command bucket write reservation counter",
+                            source,
+                        })?;
+                    if released != 1 {
+                        return Err(MetadataError::BucketWriteReservationConflict {
+                            reservation_id: reservation_id.to_string(),
+                        });
+                    }
+                }
+                Some(_) => {
+                    return Err(MetadataError::BucketWriteReservationConflict {
+                        reservation_id: reservation_id.to_string(),
+                    });
+                }
+                None => {
+                    let info = match self.head_bucket_raw(name) {
+                        Ok(info) => info,
+                        Err(MetadataError::BucketNotFound { .. }) => return Ok(()),
+                        Err(error) => return Err(error),
+                    };
+                    let durable_count: u32 = self
+                        .conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM bucket_write_reservations WHERE bucket_name = ?1",
+                            params![name.as_str()],
+                            |row| row.get::<_, u32>(0),
+                        )
+                        .map_err(|source| MetadataError::Db {
+                            context: "count metadata command bucket write reservations",
+                            source,
+                        })?;
+                    if info.active_write_reservations > durable_count {
+                        self.conn
+                            .execute(
+                                "UPDATE buckets \
+                                 SET active_write_reservations = active_write_reservations - 1 \
+                                 WHERE name = ?1 AND active_write_reservations > 0",
+                                params![name.as_str()],
+                            )
+                            .map_err(|source| MetadataError::Db {
+                                context:
+                                    "release idempotent metadata command bucket write reservation counter",
+                                source,
+                            })?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self.conn.execute_batch("COMMIT").map_err(|source| {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                MetadataError::Db {
+                    context: "commit release metadata command bucket write reservation",
+                    source,
+                }
+            }),
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
     fn begin_bucket_write_drain(&self, name: &BucketName) -> Result<(), MetadataError> {
         let updated = self
             .conn

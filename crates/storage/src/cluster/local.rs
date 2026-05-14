@@ -12,9 +12,10 @@ use crate::metadata_command::MetadataCommandLogIndex;
 use crate::metadata_command::{
     MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandReplicaState,
 };
+use crate::traits::PgMetadataStore;
 use crate::{
-    BucketName, ClusterEpoch, DataPgId, EcShape, GenerationId, ObjectKey, PgId, PgState,
-    ReclaimWorkItem, ShardIndex, ShardKey, SharedStorageNode, WriteAck,
+    BucketName, ClusterEpoch, DataPgId, EcShape, GenerationId, MetadataError, ObjectKey, PgId,
+    PgState, ReclaimWorkItem, ShardIndex, ShardKey, SharedStorageNode, WriteAck,
 };
 
 const PAYLOAD_SHARD_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin/payload-shard-placement/v1";
@@ -1222,6 +1223,7 @@ fn validate_metadata_command_replay_state(
                 .expect("in-flight recovery convergence requires a primary pending command");
             converge_in_flight_metadata_command_on_open(
                 nodes,
+                pg_routes,
                 pg_id,
                 primary_node_id,
                 cluster_epoch,
@@ -1233,6 +1235,7 @@ fn validate_metadata_command_replay_state(
                 .find_map(|(node_id, state)| (*node_id == primary_node_id).then_some(state))
                 .expect("validated route primary must be in local node set");
             if command.id().log_index().get() <= primary_state.applied_log_index {
+                release_open_metadata_command_bucket_write_reservation(nodes, pg_routes, command)?;
                 clean_terminal_primary_pending_slot_on_open(
                     nodes,
                     pg_id,
@@ -1290,8 +1293,83 @@ fn clean_terminal_primary_pending_slot_on_open(
     Ok(())
 }
 
+fn release_open_metadata_command_bucket_write_reservation(
+    nodes: &BTreeMap<NodeId, LocalNodeStore>,
+    pg_routes: &BTreeMap<PgId, LocalPgRoute>,
+    command: &MetadataCommandEnvelope,
+) -> Result<(), ClusterBuildError> {
+    let Some(proof) = command_bucket_write_reservation_proof(command) else {
+        return Ok(());
+    };
+    let topology = nodes
+        .values()
+        .next()
+        .expect("local cluster must contain at least one node")
+        .storage_node()
+        .pg_topology();
+    let bucket_pg_id = PgId::new(topology.bucket_pg_for(&proof.bucket));
+    let primary_node_id = pg_routes
+        .get(&bucket_pg_id)
+        .expect("validated bucket PG id should have a route")
+        .primary_node_id();
+    let node = nodes
+        .get(&primary_node_id)
+        .expect("validated route primary must be in local node set");
+    let pg = node
+        .storage_node()
+        .get_pg(bucket_pg_id.get())
+        .map_err(|source| ClusterBuildError::OpenLocalNode {
+            node_id: primary_node_id.as_u32(),
+            source,
+        })?;
+    if let Some(record) = PgMetadataStore::durable_bucket_write_reservation(
+        &*pg,
+        &proof.bucket,
+        &proof.reservation_id,
+    )
+    .map_err(|source| ClusterBuildError::OpenLocalNode {
+        node_id: primary_node_id.as_u32(),
+        source: StoreError::Io {
+            context: "load metadata command bucket write reservation on local cluster open",
+            source: std::io::Error::other(source),
+        },
+    })? {
+        if !proof.matches_record(&record) {
+            return Err(ClusterBuildError::OpenLocalNode {
+                node_id: primary_node_id.as_u32(),
+                source: StoreError::Io {
+                    context:
+                        "release metadata command bucket write reservation on local cluster open",
+                    source: std::io::Error::other(MetadataError::BucketWriteReservationConflict {
+                        reservation_id: proof.reservation_id.clone(),
+                    }),
+                },
+            });
+        }
+    }
+    PgMetadataStore::release_metadata_command_bucket_write_reservation(
+        &*pg,
+        &proof.bucket,
+        &proof.reservation_id,
+        &proof.owner_token,
+        proof.cluster_epoch,
+        proof.bucket_execution_generation,
+    )
+    .map_err(|source| ClusterBuildError::OpenLocalNode {
+        node_id: primary_node_id.as_u32(),
+        source: StoreError::Io {
+            context: "release metadata command bucket write reservation on local cluster open",
+            source: std::io::Error::other(source),
+        },
+    })?;
+    node.storage_node()
+        .notify_bucket_coordination_change(&proof.bucket);
+    Ok(())
+}
+
 fn converge_in_flight_metadata_command_on_open(
     nodes: &BTreeMap<NodeId, LocalNodeStore>,
+    pg_routes: &BTreeMap<PgId, LocalPgRoute>,
     pg_id: PgId,
     primary_node_id: NodeId,
     cluster_epoch: ClusterEpoch,
@@ -1300,6 +1378,7 @@ fn converge_in_flight_metadata_command_on_open(
     let mut nodes_primary_last = nodes.iter().collect::<Vec<_>>();
     nodes_primary_last.sort_by_key(|(node_id, _node)| **node_id == primary_node_id);
     for (node_id, node) in nodes_primary_last {
+        validate_open_metadata_command_bucket_write_reservation(nodes, pg_routes, command)?;
         let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
             ClusterBuildError::OpenLocalNode {
                 node_id: node_id.as_u32(),
@@ -1313,6 +1392,7 @@ fn converge_in_flight_metadata_command_on_open(
             })?;
     }
 
+    release_open_metadata_command_bucket_write_reservation(nodes, pg_routes, command)?;
     clean_terminal_primary_pending_slot_on_open(
         nodes,
         pg_id,
@@ -1347,6 +1427,93 @@ fn converge_in_flight_metadata_command_on_open(
         None,
     )
     .map(|_| ())
+}
+
+fn validate_open_metadata_command_bucket_write_reservation(
+    nodes: &BTreeMap<NodeId, LocalNodeStore>,
+    pg_routes: &BTreeMap<PgId, LocalPgRoute>,
+    command: &MetadataCommandEnvelope,
+) -> Result<(), ClusterBuildError> {
+    let Some(proof) = command_bucket_write_reservation_proof(command) else {
+        return Ok(());
+    };
+    if proof.cluster_epoch != command.id().cluster_epoch() {
+        return Err(ClusterBuildError::OpenLocalNode {
+            node_id: 0,
+            source: StoreError::Io {
+                context: "validate metadata command bucket write reservation on local cluster open",
+                source: std::io::Error::other(MetadataError::BucketWriteReservationConflict {
+                    reservation_id: proof.reservation_id.clone(),
+                }),
+            },
+        });
+    }
+    let topology = nodes
+        .values()
+        .next()
+        .expect("local cluster must contain at least one node")
+        .storage_node()
+        .pg_topology();
+    let bucket_pg_id = PgId::new(topology.bucket_pg_for(&proof.bucket));
+    let primary_node_id = pg_routes
+        .get(&bucket_pg_id)
+        .expect("validated bucket PG id should have a route")
+        .primary_node_id();
+    let node = nodes
+        .get(&primary_node_id)
+        .expect("validated route primary must be in local node set");
+    let pg = node
+        .storage_node()
+        .get_pg(bucket_pg_id.get())
+        .map_err(|source| ClusterBuildError::OpenLocalNode {
+            node_id: primary_node_id.as_u32(),
+            source,
+        })?;
+    let record = PgMetadataStore::durable_bucket_write_reservation(
+        &*pg,
+        &proof.bucket,
+        &proof.reservation_id,
+    )
+    .map_err(|source| ClusterBuildError::OpenLocalNode {
+        node_id: primary_node_id.as_u32(),
+        source: StoreError::Io {
+            context: "validate metadata command bucket write reservation on local cluster open",
+            source: std::io::Error::other(source),
+        },
+    })?
+    .ok_or_else(|| ClusterBuildError::OpenLocalNode {
+        node_id: primary_node_id.as_u32(),
+        source: StoreError::Io {
+            context: "validate metadata command bucket write reservation on local cluster open",
+            source: std::io::Error::other(MetadataError::BucketWriteReservationNotFound {
+                reservation_id: proof.reservation_id.clone(),
+            }),
+        },
+    })?;
+    if proof.matches_record(&record) {
+        Ok(())
+    } else {
+        Err(ClusterBuildError::OpenLocalNode {
+            node_id: primary_node_id.as_u32(),
+            source: StoreError::Io {
+                context: "validate metadata command bucket write reservation on local cluster open",
+                source: std::io::Error::other(MetadataError::BucketWriteReservationConflict {
+                    reservation_id: proof.reservation_id.clone(),
+                }),
+            },
+        })
+    }
+}
+
+fn command_bucket_write_reservation_proof(
+    command: &MetadataCommandEnvelope,
+) -> Option<&crate::metadata_command::BucketWriteReservationProof> {
+    match command.payload() {
+        crate::metadata_command::MetadataCommandPayload::CreateStreamUpload(create) => {
+            create.bucket_write_reservation.as_ref()
+        }
+        _ => None,
+    }
 }
 
 fn bucket_snapshot_error_to_store_error(error: crate::BucketSnapshotLoadError) -> StoreError {
@@ -10926,6 +11093,505 @@ mod tests {
         );
         let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
         assert_eq!(info.active_write_reservations, 0);
+    }
+
+    #[test]
+    fn low_level_put_object_stream_create_keeps_reservation_until_pending_converges() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "durable-stream-pending-");
+        let key = key_for_object_pg(topology, &bucket, 1, "key-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let failed = Arc::new(AtomicBool::new(false));
+        let hook_failed = Arc::clone(&failed);
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let hook_guard = cluster.test_install_before_metadata_command_apply_context_hook(Arc::new(
+            move |context| {
+                if context.kind == crate::cluster::MetadataCommandApplyTestKind::CreateStreamUpload
+                    && context.node_id == NodeId::new(1)
+                    && context.bucket.as_ref() == Some(&hook_bucket)
+                    && context.key.as_ref() == Some(&hook_key)
+                    && !hook_failed.swap(true, Ordering::SeqCst)
+                {
+                    return Err(StoreError::Io {
+                        context: "injected stream-create primary apply failure",
+                        source: std::io::Error::other(
+                            "injected stream-create primary apply failure",
+                        ),
+                    });
+                }
+                Ok(())
+            },
+        ));
+
+        let session_id = crate::SessionId::try_from("c0".repeat(16)).unwrap();
+        let err = cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                &session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::ObjectPgActionError::Store(StoreError::Io { .. })
+        ));
+
+        let primary_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        let reservations =
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
+                .unwrap();
+        assert_eq!(reservations.len(), 1);
+        let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
+        assert_eq!(info.active_write_reservations, 1);
+        drop(primary_pg);
+
+        drop(hook_guard);
+        cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                &session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap();
+
+        let primary_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
+                .unwrap()
+                .is_empty()
+        );
+        let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
+        assert_eq!(info.active_write_reservations, 0);
+    }
+
+    #[test]
+    fn live_stream_create_terminal_cleanup_keeps_pending_slot_on_reservation_release_failure() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "live-stream-release-fail-");
+        let key = key_for_object_pg(topology, &bucket, 1, "key-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let reservation = cluster
+            .acquire_durable_bucket_write_reservation(
+                &bucket,
+                "put-object-stream-create",
+                Some(key.as_str()),
+            )
+            .unwrap();
+        let proof = crate::metadata_command::BucketWriteReservationProof::from(&reservation.record);
+        let session_id = crate::SessionId::try_from("c3".repeat(16)).unwrap();
+        let request = crate::CreateStreamUploadReq {
+            session_id: session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: crate::StreamUploadTarget::PutObject,
+            encryption: crate::ObjectEncryption::None,
+        };
+        let pg_id = PgId::new(1);
+        let command = MetadataCommandEnvelope::new(
+            cluster.next_object_metadata_command_id(pg_id).unwrap(),
+            MetadataCommandPayload::CreateStreamUpload(Box::new(
+                crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                    request,
+                    crate::clock::current_time_millis(),
+                    Some(proof),
+                ),
+            )),
+        );
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+            .unwrap();
+
+        {
+            let primary_pg = map
+                .node(NodeId::new(1))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            primary_pg
+                .connection()
+                .execute(
+                    "UPDATE bucket_write_reservations \
+                     SET owner_token = ?1 \
+                     WHERE bucket_name = ?2 AND reservation_id = ?3",
+                    rusqlite::params![
+                        "wrong-live-owner-token",
+                        bucket.as_str(),
+                        reservation.record.reservation_id.as_str()
+                    ],
+                )
+                .unwrap();
+        }
+
+        let err = cluster
+            .finish_pending_object_metadata_command_for_bucket(pg_id, &bucket, &command)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::ObjectPgActionError::Metadata(
+                crate::MetadataError::BucketWriteReservationConflict { .. }
+            )
+        ));
+        assert!(
+            pending_metadata_command_for_test(&map, pg_id, &bucket).is_some(),
+            "release failure must leave the terminal pending slot as the cleanup retry driver"
+        );
+        {
+            let primary_pg = map
+                .node(NodeId::new(1))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket)
+                    .unwrap()
+                    .active_write_reservations,
+                1
+            );
+            assert_eq!(
+                crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            primary_pg
+                .connection()
+                .execute(
+                    "UPDATE bucket_write_reservations \
+                     SET owner_token = ?1 \
+                     WHERE bucket_name = ?2 AND reservation_id = ?3",
+                    rusqlite::params![
+                        reservation.record.owner_token.as_str(),
+                        bucket.as_str(),
+                        reservation.record.reservation_id.as_str()
+                    ],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            cluster
+                .finish_pending_object_metadata_command_for_bucket(pg_id, &bucket, &command)
+                .unwrap(),
+            crate::cluster::PendingMetadataCommandOutcome::Applied
+        );
+        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+        let primary_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket)
+                .unwrap()
+                .active_write_reservations,
+            0
+        );
+        let session = crate::PgMetadataStore::get_stream_upload(&*primary_pg, &session_id).unwrap();
+        assert_eq!(session.bucket, bucket);
+        assert_eq!(session.key, key);
+    }
+
+    #[test]
+    fn stream_create_open_time_convergence_releases_bucket_write_reservation() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "stream-open-release-");
+        let key = key_for_object_pg(topology, &bucket, 1, "key-");
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let failed = Arc::new(AtomicBool::new(false));
+        let hook_failed = Arc::clone(&failed);
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let hook_guard = cluster.test_install_before_metadata_command_apply_context_hook(Arc::new(
+            move |context| {
+                if context.kind == crate::cluster::MetadataCommandApplyTestKind::CreateStreamUpload
+                    && context.node_id == NodeId::new(0)
+                    && context.bucket.as_ref() == Some(&hook_bucket)
+                    && context.key.as_ref() == Some(&hook_key)
+                    && !hook_failed.swap(true, Ordering::SeqCst)
+                {
+                    return Err(StoreError::Io {
+                        context: "injected stream-create reopen failure",
+                        source: std::io::Error::other("injected stream-create reopen failure"),
+                    });
+                }
+                Ok(())
+            },
+        ));
+
+        let session_id = crate::SessionId::try_from("c2".repeat(16)).unwrap();
+        let err = cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                &session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::ObjectPgActionError::Store(StoreError::Io { .. })
+        ));
+        drop(hook_guard);
+
+        let primary_pg = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        let reservation =
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
+                .unwrap()
+                .pop()
+                .expect("partial stream-create command should keep reservation live");
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket)
+                .unwrap()
+                .active_write_reservations,
+            1
+        );
+        drop(primary_pg);
+        let pending = pending_metadata_command_for_test(&map, PgId::new(1), &bucket)
+            .expect("partial stream-create command should remain pending");
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(0), &pending)
+            .unwrap();
+
+        {
+            let primary_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            primary_pg
+                .connection()
+                .execute(
+                    "UPDATE bucket_write_reservations \
+                     SET owner_token = ?1 \
+                     WHERE bucket_name = ?2 AND reservation_id = ?3",
+                    rusqlite::params![
+                        "wrong-owner-token",
+                        bucket.as_str(),
+                        reservation.reservation_id.as_str()
+                    ],
+                )
+                .unwrap();
+        }
+        let err = validate_metadata_command_replay_state(
+            &map.nodes,
+            &map.pg_routes,
+            &[PgId::new(1)],
+            ClusterEpoch::INITIAL,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ClusterBuildError::OpenLocalNode { .. }),
+            "release failure should fail replay validation before slot cleanup: {err:?}"
+        );
+        assert!(
+            pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_some(),
+            "failed release must leave pending slot carrying reservation proof"
+        );
+        {
+            let primary_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket)
+                    .unwrap()
+                    .active_write_reservations,
+                1
+            );
+            primary_pg
+                .connection()
+                .execute(
+                    "UPDATE bucket_write_reservations \
+                     SET owner_token = ?1 \
+                     WHERE bucket_name = ?2 AND reservation_id = ?3",
+                    rusqlite::params![
+                        reservation.owner_token.as_str(),
+                        bucket.as_str(),
+                        reservation.reservation_id.as_str()
+                    ],
+                )
+                .unwrap();
+        }
+        drop(cluster);
+        drop(map);
+
+        let reopened = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape)
+            .expect("reopen local map with in-flight stream create");
+        let reopened = Arc::new(reopened);
+        assert!(
+            pending_metadata_command_for_test(&reopened, PgId::new(1), &bucket).is_none(),
+            "open-time recovery should converge and clear the stream-create pending slot"
+        );
+        for node_id in node_ids {
+            let pg = reopened
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            let session = crate::PgMetadataStore::get_stream_upload(&*pg, &session_id).unwrap();
+            assert_eq!(session.bucket, bucket);
+            assert_eq!(session.key, key);
+        }
+        let primary_pg = reopened
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket)
+                .unwrap()
+                .active_write_reservations,
+            0
+        );
+        drop(primary_pg);
+        assert_clean_metadata_command_stream(&reopened, &[1]);
+    }
+
+    #[test]
+    fn stream_create_command_rejects_missing_bucket_write_reservation_proof() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "stream-proof-missing-");
+        let key = key_for_object_pg(topology, &bucket, 2, "key-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let reservation = cluster
+            .acquire_durable_bucket_write_reservation(
+                &bucket,
+                "put-object-stream-create",
+                Some(key.as_str()),
+            )
+            .unwrap();
+        let proof = crate::metadata_command::BucketWriteReservationProof::from(&reservation.record);
+        cluster
+            .release_durable_bucket_write_reservation(reservation)
+            .unwrap();
+
+        let session_id = crate::SessionId::try_from("c1".repeat(16)).unwrap();
+        let request = crate::CreateStreamUploadReq {
+            session_id: session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: crate::StreamUploadTarget::PutObject,
+            encryption: crate::ObjectEncryption::None,
+        };
+        let command = MetadataCommandEnvelope::new(
+            cluster
+                .next_object_metadata_command_id(PgId::new(2))
+                .unwrap(),
+            MetadataCommandPayload::CreateStreamUpload(Box::new(
+                crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                    request,
+                    crate::clock::current_time_millis(),
+                    Some(proof),
+                ),
+            )),
+        );
+
+        let err = cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::BucketSnapshotLoadError::Metadata(
+                crate::MetadataError::BucketWriteReservationNotFound { .. }
+            )
+        ));
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(2).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_stream_upload(&*pg, &session_id),
+                Err(crate::MetadataError::StreamSessionNotFound { .. })
+            ));
+        }
     }
 
     #[test]

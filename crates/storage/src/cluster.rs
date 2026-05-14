@@ -11,11 +11,11 @@ pub use local::{LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRo
 
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 use crate::metadata_command::{
-    AbortStreamUploadCommand, AppendStreamSegmentCommand, CommitDirectPutObjectCommand,
-    CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteObjectVersionTarget,
-    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
-    ObjectPayloadReclaimCommand, ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
-    ReserveObjectVersionCommand,
+    AbortStreamUploadCommand, AppendStreamSegmentCommand, BucketWriteReservationProof,
+    CommitDirectPutObjectCommand, CreateMultipartUploadCommand, CreateStreamUploadCommand,
+    DeleteObjectVersionTarget, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
+    MetadataCommandPayload, ObjectPayloadReclaimCommand, ReleaseObjectGenerationCommand,
+    ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
 };
 use crate::node::SharedStorageNode;
 use crate::traits::{PgMetadataStore, ShardStore};
@@ -506,6 +506,12 @@ enum ReissuedPendingCommandDecision {
 enum SnapshotSensitiveCommandInstall {
     Installed,
     ContenderDrained,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BucketWriteReservationDisposition {
+    TransferredToCommand,
+    ReleaseByCaller,
 }
 
 fn decide_reissued_pending_command(
@@ -1221,6 +1227,101 @@ impl StorageCluster {
         Ok(Arc::clone(node.storage_node()))
     }
 
+    fn metadata_command_bucket_write_reservation_proof(
+        command: &MetadataCommandEnvelope,
+    ) -> Option<&BucketWriteReservationProof> {
+        match command.payload() {
+            MetadataCommandPayload::CreateStreamUpload(create) => {
+                create.bucket_write_reservation.as_ref()
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn validate_metadata_command_bucket_write_reservation(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let Some(proof) = Self::metadata_command_bucket_write_reservation_proof(command) else {
+            return Ok(());
+        };
+        if proof.cluster_epoch != command.id().cluster_epoch() {
+            return Err(MetadataError::BucketWriteReservationConflict {
+                reservation_id: proof.reservation_id.clone(),
+            }
+            .into());
+        }
+        let pg_id = self.bucket_metadata_pg_id(&proof.bucket);
+        let node = self.bucket_metadata_primary_node_arc(&proof.bucket)?;
+        let bucket_pg = node.get_pg(pg_id)?;
+        let Some(record) = PgMetadataStore::durable_bucket_write_reservation(
+            &*bucket_pg,
+            &proof.bucket,
+            &proof.reservation_id,
+        )?
+        else {
+            return Err(MetadataError::BucketWriteReservationNotFound {
+                reservation_id: proof.reservation_id.clone(),
+            }
+            .into());
+        };
+        if proof.matches_record(&record) {
+            Ok(())
+        } else {
+            Err(MetadataError::BucketWriteReservationConflict {
+                reservation_id: proof.reservation_id.clone(),
+            }
+            .into())
+        }
+    }
+
+    fn release_metadata_command_bucket_write_reservation(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let Some(proof) = Self::metadata_command_bucket_write_reservation_proof(command) else {
+            return Ok(());
+        };
+        let node = self.bucket_metadata_primary_node_arc(&proof.bucket)?;
+        let pg_id = self.bucket_metadata_pg_id(&proof.bucket);
+        let bucket_pg = node.get_pg(pg_id)?;
+        if let Some(record) = PgMetadataStore::durable_bucket_write_reservation(
+            &*bucket_pg,
+            &proof.bucket,
+            &proof.reservation_id,
+        )? {
+            if !proof.matches_record(&record) {
+                return Err(MetadataError::BucketWriteReservationConflict {
+                    reservation_id: proof.reservation_id.clone(),
+                }
+                .into());
+            }
+        }
+        PgMetadataStore::release_metadata_command_bucket_write_reservation(
+            &*bucket_pg,
+            &proof.bucket,
+            &proof.reservation_id,
+            &proof.owner_token,
+            proof.cluster_epoch,
+            proof.bucket_execution_generation,
+        )?;
+        node.notify_bucket_coordination_change(&proof.bucket);
+        Ok(())
+    }
+
+    fn pending_metadata_command_uses_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<bool, ObjectPgActionError> {
+        Ok(self
+            .pending_metadata_command_for_bucket(pg_id, bucket)?
+            .as_ref()
+            .and_then(Self::metadata_command_bucket_write_reservation_proof)
+            == Some(proof))
+    }
+
     fn next_bucket_write_reservation_id(&self) -> Result<String, StoreError> {
         const HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -1699,6 +1800,8 @@ impl StorageCluster {
                     .map_err(|error| {
                         bucket_snapshot_error_to_object_pg_action_error(error.source)
                     })?;
+                self.release_metadata_command_bucket_write_reservation(&command)
+                    .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
                 self.remove_pending_metadata_command_for_bucket(pg_id, command_bucket, &command)
                     .map_err(ObjectPgActionError::from)?;
                 self.after_object_metadata_command_abandoned(&command)?;
@@ -1706,6 +1809,8 @@ impl StorageCluster {
             }
             match self.apply_metadata_command_to_acting_set(&command) {
                 Ok(()) => {
+                    self.release_metadata_command_bucket_write_reservation(&command)
+                        .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
                     self.remove_pending_metadata_command_for_bucket(
                         pg_id,
                         command_bucket,
@@ -2114,6 +2219,7 @@ impl StorageCluster {
                     );
                 }
             }
+            MetadataCommandPayload::CreateStreamUpload(_) => {}
             MetadataCommandPayload::AbortStreamUpload(abort) => {
                 self.delete_staged_stream_segment_payload_shards_best_effort(
                     &abort.staged_segments,
@@ -2925,15 +3031,35 @@ impl StorageCluster {
                 }
                 Err(error) => return Err(bucket_snapshot_error_to_object_pg_action_error(error)),
             };
+            let proof = BucketWriteReservationProof::from(&reservation.record);
+            let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
             let result = self.create_put_object_stream_session_record_under_reservation(
-                bucket, key, session_id, encryption,
+                bucket,
+                key,
+                session_id,
+                encryption,
+                proof.clone(),
             );
-            let release_result = self
-                .release_durable_bucket_write_reservation(reservation)
-                .map_err(bucket_snapshot_error_to_object_pg_action_error);
+            let release_result = match &result {
+                Ok(BucketWriteReservationDisposition::TransferredToCommand) => Ok(()),
+                Ok(BucketWriteReservationDisposition::ReleaseByCaller) => self
+                    .release_durable_bucket_write_reservation(reservation)
+                    .map_err(bucket_snapshot_error_to_object_pg_action_error),
+                Err(_) => {
+                    match self.pending_metadata_command_uses_bucket_write_reservation(
+                        pg_id, bucket, &proof,
+                    ) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => self
+                            .release_durable_bucket_write_reservation(reservation)
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error),
+                        Err(error) => Err(error),
+                    }
+                }
+            };
             return match (result, release_result) {
-                (Ok(()), Ok(())) => Ok(()),
-                (Ok(()), Err(error)) => Err(error),
+                (Ok(_), Ok(())) => Ok(()),
+                (Ok(_), Err(error)) => Err(error),
                 (Err(error), Ok(())) | (Err(error), Err(_)) => Err(error),
             };
         }
@@ -2945,7 +3071,8 @@ impl StorageCluster {
         key: &ObjectKey,
         session_id: &SessionId,
         encryption: ObjectEncryption,
-    ) -> Result<(), ObjectPgActionError> {
+        bucket_write_reservation: BucketWriteReservationProof,
+    ) -> Result<BucketWriteReservationDisposition, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let request = CreateStreamUploadReq {
             session_id: session_id.clone(),
@@ -2959,7 +3086,7 @@ impl StorageCluster {
                 self.drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)?;
             let expected_command = applied_stream_create_command(&applied_commands, &request);
             if self.matching_stream_upload_exists(pg_id, &request, expected_command)? {
-                return Ok(());
+                return Ok(BucketWriteReservationDisposition::ReleaseByCaller);
             }
             self.reserve_put_object_generation(bucket, key, session_id)?;
             let command_id = match self.next_object_metadata_command_id(pg_id) {
@@ -2979,9 +3106,10 @@ impl StorageCluster {
             let command = MetadataCommandEnvelope::new(
                 command_id,
                 MetadataCommandPayload::CreateStreamUpload(Box::new(
-                    CreateStreamUploadCommand::from_request(
+                    CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
                         request.clone(),
                         crate::clock::current_time_millis(),
+                        Some(bucket_write_reservation.clone()),
                     ),
                 )),
             );
@@ -3005,7 +3133,7 @@ impl StorageCluster {
                 }
                 return Err(error);
             }
-            return Ok(());
+            return Ok(BucketWriteReservationDisposition::TransferredToCommand);
         }
     }
 

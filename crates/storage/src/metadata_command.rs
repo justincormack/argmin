@@ -9,14 +9,15 @@ use s3_types::{
 use crate::types::{
     AbortMultipartUploadCleanup, BucketEncryptionConfig, BucketName, BucketObjectOwnership,
     BucketOwnershipControls, BucketState, BucketSubresourceAux, BucketSubresourceKind,
-    ChecksumAlgorithm, ChecksumBytes, ChecksumType, ClusterEpoch, CompletedMultipartUploadRecord,
-    CreateBucketConfig, CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, EtagKind,
-    GenerationId, LiveObjectRecord, ManagedEncryptionAlgorithm, MultipartChecksumConfig,
-    MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
-    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadRecord,
-    ObjectEncryption, ObjectEncryptionType, ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord,
-    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
-    OwnerIdentity, PgId, PublicAccessBlockConfig, PutLiveObjectReq, SerializedMetadataBlob,
+    BucketWriteReservationRecord, ChecksumAlgorithm, ChecksumBytes, ChecksumType, ClusterEpoch,
+    CompletedMultipartUploadRecord, CreateBucketConfig, CreateMultipartUploadReq,
+    CreateStreamUploadReq, EcShape, EtagKind, GenerationId, LiveObjectRecord,
+    ManagedEncryptionAlgorithm, MultipartChecksumConfig, MultipartPartRecord,
+    MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
+    MultipartReclaimRecord, MultipartUploadRecord, ObjectEncryption, ObjectEncryptionType,
+    ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord,
+    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PgId,
+    PublicAccessBlockConfig, PutLiveObjectReq, SerializedMetadataBlob,
     SerializedSystemMetadataBlob, SerializedTagSet, SessionId, StorageClass,
     StreamUploadCommandRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
     TerminalStreamCleanupRecord, UploadId, UploadState, VersionId,
@@ -797,13 +798,65 @@ impl PutObjectMetadataCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BucketWriteReservationProof {
+    pub(crate) bucket: BucketName,
+    pub(crate) reservation_id: String,
+    pub(crate) owner_token: String,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) bucket_execution_generation: u64,
+    pub(crate) operation_kind: String,
+    pub(crate) created_at: u64,
+    pub(crate) lease_deadline: Option<u64>,
+    pub(crate) target_context: Option<String>,
+}
+
+impl From<&BucketWriteReservationRecord> for BucketWriteReservationProof {
+    fn from(record: &BucketWriteReservationRecord) -> Self {
+        Self {
+            bucket: record.bucket.clone(),
+            reservation_id: record.reservation_id.clone(),
+            owner_token: record.owner_token.clone(),
+            cluster_epoch: record.cluster_epoch,
+            bucket_execution_generation: record.bucket_execution_generation,
+            operation_kind: record.operation_kind.clone(),
+            created_at: record.created_at,
+            lease_deadline: record.lease_deadline,
+            target_context: record.target_context.clone(),
+        }
+    }
+}
+
+impl BucketWriteReservationProof {
+    pub(crate) fn matches_record(&self, record: &BucketWriteReservationRecord) -> bool {
+        self.bucket == record.bucket
+            && self.reservation_id == record.reservation_id
+            && self.owner_token == record.owner_token
+            && self.cluster_epoch == record.cluster_epoch
+            && self.bucket_execution_generation == record.bucket_execution_generation
+            && self.operation_kind == record.operation_kind
+            && self.created_at == record.created_at
+            && self.lease_deadline == record.lease_deadline
+            && self.target_context == record.target_context
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CreateStreamUploadCommand {
     pub(crate) session: StreamUploadCommandRecord,
     pub(crate) initial_next_segment_vid: GenerationId,
+    pub(crate) bucket_write_reservation: Option<BucketWriteReservationProof>,
 }
 
 impl CreateStreamUploadCommand {
     pub(crate) fn from_request(request: CreateStreamUploadReq, created_at_millis: u64) -> Self {
+        Self::from_request_with_bucket_write_reservation(request, created_at_millis, None)
+    }
+
+    pub(crate) fn from_request_with_bucket_write_reservation(
+        request: CreateStreamUploadReq,
+        created_at_millis: u64,
+        bucket_write_reservation: Option<BucketWriteReservationProof>,
+    ) -> Self {
         Self {
             session: StreamUploadCommandRecord {
                 session_id: request.session_id,
@@ -815,6 +868,7 @@ impl CreateStreamUploadCommand {
                 encryption: request.encryption,
             },
             initial_next_segment_vid: GenerationId::MIN,
+            bucket_write_reservation,
         }
     }
 }
@@ -1493,6 +1547,8 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                     session: self.read_stream_upload_command_record()?,
                     initial_next_segment_vid: self
                         .read_generation_id("initial next stream segment VID")?,
+                    bucket_write_reservation: self
+                        .read_optional_bucket_write_reservation_proof()?,
                 })),
             ),
             METADATA_COMMAND_APPEND_STREAM_SEGMENT => Ok(
@@ -2056,7 +2112,22 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_valid_u8("stream upload state", 0..=3)?;
         self.read_u64()?;
         self.skip_object_encryption()?;
-        self.read_nonzero_u64("next stream segment VID")
+        self.read_nonzero_u64("next stream segment VID")?;
+        self.skip_bucket_write_reservation_proof()
+    }
+
+    fn skip_bucket_write_reservation_proof(&mut self) -> Result<(), String> {
+        self.skip_optional(|decoder| {
+            decoder.skip_str()?;
+            decoder.skip_str()?;
+            decoder.skip_str()?;
+            decoder.read_u64()?;
+            decoder.read_u64()?;
+            decoder.skip_str()?;
+            decoder.read_u64()?;
+            decoder.skip_optional(|decoder| decoder.read_u64().map(|_| ()))?;
+            decoder.skip_optional(Self::skip_str)
+        })
     }
 
     fn skip_terminal_stream_cleanup(&mut self) -> Result<(), String> {
@@ -2573,6 +2644,25 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         })
     }
 
+    fn read_optional_bucket_write_reservation_proof(
+        &mut self,
+    ) -> Result<Option<BucketWriteReservationProof>, String> {
+        self.read_optional(|decoder| {
+            Ok(BucketWriteReservationProof {
+                bucket: decoder.read_bucket_name()?,
+                reservation_id: decoder.read_string("bucket write reservation id")?,
+                owner_token: decoder.read_string("bucket write reservation owner token")?,
+                cluster_epoch: ClusterEpoch::new(decoder.read_u64()?)
+                    .ok_or_else(|| "invalid bucket write reservation cluster epoch".to_string())?,
+                bucket_execution_generation: decoder.read_u64()?,
+                operation_kind: decoder.read_string("bucket write reservation operation kind")?,
+                created_at: decoder.read_u64()?,
+                lease_deadline: decoder.read_optional_u64_value()?,
+                target_context: decoder.read_optional_string("bucket write reservation target")?,
+            })
+        })
+    }
+
     fn skip_bucket_subresource_mutation(&mut self) -> Result<(), String> {
         match self.read_u8()? {
             1 => {
@@ -2944,6 +3034,7 @@ fn encode_put_object_metadata(out: &mut Vec<u8>, command: &PutObjectMetadataComm
 fn encode_create_stream_upload(out: &mut Vec<u8>, command: &CreateStreamUploadCommand) {
     encode_stream_upload_command_record(out, &command.session);
     put_u64(out, command.initial_next_segment_vid.get());
+    encode_optional_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
 }
 
 fn encode_append_stream_segment(out: &mut Vec<u8>, command: &AppendStreamSegmentCommand) {
@@ -3447,6 +3538,37 @@ fn encode_optional_u64(out: &mut Vec<u8>, value: Option<u64>) {
         Some(value) => {
             put_u8(out, 1);
             put_u64(out, value);
+        }
+    }
+}
+
+fn encode_optional_string(out: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        None => put_u8(out, 0),
+        Some(value) => {
+            put_u8(out, 1);
+            put_str(out, value);
+        }
+    }
+}
+
+fn encode_optional_bucket_write_reservation_proof(
+    out: &mut Vec<u8>,
+    proof: &Option<BucketWriteReservationProof>,
+) {
+    match proof {
+        None => put_u8(out, 0),
+        Some(proof) => {
+            put_u8(out, 1);
+            put_str(out, proof.bucket.as_str());
+            put_str(out, &proof.reservation_id);
+            put_str(out, &proof.owner_token);
+            put_u64(out, proof.cluster_epoch.get());
+            put_u64(out, proof.bucket_execution_generation);
+            put_str(out, &proof.operation_kind);
+            put_u64(out, proof.created_at);
+            encode_optional_u64(out, proof.lease_deadline);
+            encode_optional_string(out, proof.target_context.as_deref());
         }
     }
 }
@@ -4550,9 +4672,9 @@ mod tests {
                 0x423d5ce8ecc3f471,
                 0xa10946bfbddcbb08,
                 0x8f0590d0286f0dc4,
-                0x06e8919990a39895,
-                0x924974de9db8c75c,
-                0xc6696fbaf6843082,
+                0x815cc17ffafdbd72,
+                0x158c357233f435fb,
+                0xb1ad4b91993ad85f,
                 0x8d3e5d6cb995e021,
                 0x873424a13234f823,
                 0x7cf30e2471f346ae,
