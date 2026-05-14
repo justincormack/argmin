@@ -59,7 +59,8 @@ Every public `StorageCluster` operation must fit one of these classes:
 - Bucket write-drain counters are a Phase 9 fence/lease decision. Until then,
   `write_reservations_blocked` and `active_write_reservations` stay outside the
   canonical metadata digest and may only be changed by the explicit
-  write-drain/reservation helpers.
+  write-drain/reservation helpers. The Phase 9.4 target model and publisher
+  audit live in [bucket-write-drain.md](bucket-write-drain.md).
 - Best-effort cleanup may suppress cleanup errors, but typed route/control-plane
   errors must not collapse into `NotFound` or generic IO before the suppression
   point.

@@ -3291,11 +3291,13 @@ Proposed subphases:
         direct PUT, CopyObject, stream PUT create/finalize, CreateMultipartUpload,
         CompleteMultipartUpload, UploadPart/UploadPartCopy paths that create or
         finalize destination stream state, object metadata writes that can
-        affect bucket emptiness, any lifecycle/background object writers, and
-        all bucket-PG control-plane mutators such as PutBucketPolicy, PutBucket
-        CORS, versioning, ACL, ownership controls, public access block, object
-        lock, encryption, lifecycle, tagging-style subresources, and bucket
-        delete begin/finalize helpers
+        affect bucket emptiness, user-visible object delete commands, lifecycle
+        current/noncurrent expiry and expired delete-marker cleanup, any other
+        lifecycle/background object metadata writers, and all bucket-PG
+        control-plane mutators such as PutBucketPolicy, PutBucket CORS,
+        versioning, ACL, ownership controls, public access block, object lock,
+        encryption, lifecycle, tagging-style subresources, and bucket delete
+        begin/finalize helpers
       - classify each caller as one of:
         - needs a short bucket write reservation before taking a bucket snapshot
           and building/publishing object or MPU metadata
@@ -3315,8 +3317,13 @@ Proposed subphases:
         - a new write that arrives after `MarkBucketDeleting` is durable fails
           as the bucket no longer accepts writes
       - add the audit result to
-        [metadata-command-stream.md](../guides/metadata-command-stream.md) or a
-        small bucket-delete/write-drain guide, and link it from this plan
+        [bucket-write-drain.md](../guides/bucket-write-drain.md), and link it
+        from this plan
+      - status: complete. The Phase 9.4.1 audit is captured in
+        [bucket-write-drain.md](../guides/bucket-write-drain.md), including the
+        current counter authority, publisher classification, cross-PG
+        apply-time reservation fence, reservation reap vs object-PG convergence
+        rule, DeleteBucket drain loop, and required test matrix.
 
    2. Phase 9.4.2: introduce durable bucket-PG write-drain records
       - replace anonymous bucket-row counters with explicit coordination rows:
@@ -3502,6 +3509,11 @@ Proposed subphases:
         - DeleteBucket vs CompleteMultipartUpload
         - DeleteBucket vs UploadPart/UploadPartCopy stream session creation and
           finalization where the MPU itself is the visible blocker
+        - DeleteBucket vs current DeleteObject inserting a delete marker
+        - DeleteBucket vs specific-version delete removing the last visible
+          version
+        - DeleteBucket vs lifecycle current expiry, noncurrent expiry, and
+          expired delete-marker cleanup
       - property/model coverage:
         - extend the local-cluster command-stream trace model with bucket drain
           records, durable reservations, owner expiry, restart/open validation,
