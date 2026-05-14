@@ -206,21 +206,15 @@ pub(super) fn maybe_run_bucket_write_drain_wait_hook(bucket: &BucketName) {
 #[cfg(not(any(test, feature = "test-hooks")))]
 pub(super) fn maybe_run_bucket_write_drain_wait_hook(_: &BucketName) {}
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 pub(super) fn maybe_run_bucket_write_reservation_retry_hook(bucket: &BucketName) {
     maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.before_bucket_write_reservation_retry)
 }
 
-#[cfg(not(any(test, feature = "test-hooks")))]
-pub(super) fn maybe_run_bucket_write_reservation_retry_hook(_: &BucketName) {}
-
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 pub(super) fn maybe_run_after_bucket_write_reservation_retry_hook(bucket: &BucketName) {
     maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.after_bucket_write_reservation_retry)
 }
-
-#[cfg(not(any(test, feature = "test-hooks")))]
-pub(super) fn maybe_run_after_bucket_write_reservation_retry_hook(_: &BucketName) {}
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn maybe_run_after_begin_bucket_delete_drain_hook(bucket: &BucketName) {

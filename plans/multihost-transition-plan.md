@@ -3326,7 +3326,7 @@ Proposed subphases:
         rule, DeleteBucket drain loop, and required test matrix.
 
    2. Phase 9.4.2: introduce durable bucket-PG write-drain records
-      - status: in progress. The first storage slice added durable
+      - status: complete. The first storage slice added durable
         `bucket_write_reservations` and `bucket_write_drains` tables plus
         PgStore primitives/tests for exact identity, owner token, cluster epoch,
         bucket execution generation, drain blocking, exact release/clear
@@ -3369,6 +3369,23 @@ Proposed subphases:
           silently successful
 
    3. Phase 9.4.3: move writer acquire/release to `StorageCluster`
+      - status: in progress. `StorageCluster::with_bucket_write_snapshot` now
+        acquires and releases exact durable `bucket_write_reservations` rows on
+        the bucket-PG primary. As a transitional bridge while DeleteBucket still
+        uses the legacy drain, the cluster wrapper also holds the old
+        `active_write_reservations` counter and releases both identities on exit;
+        the old `SharedStorageNode` anonymous-counter snapshot wrapper is
+        test-only. The stream PutObject and CreateMultipartUpload custom
+        snapshot publishers use the cluster wrapper rather than the node-local
+        counter path, and the low-level PutObject stream-create publisher used
+        by HTTP streaming/copy now holds the same durable reservation and
+        legacy-counter bridge around command publication. Durable reservation
+        IDs use 128 bits of random entropy instead of a per-handle counter, so
+        independent `StorageCluster` handles and reopen do not collide on
+        `(bucket, reservation_id)`. Object-PG command payloads do not yet carry
+        apply-time reservation references; that remains part of the Phase
+        9.4.3/9.4.4 fence work before DeleteBucket can rely on durable
+        reservations alone.
       - introduce a cluster-level bucket write reservation guard that captures:
         bucket PG id, bucket name, reservation id, owner token, acquire epoch,
         and the node/store that accepted the reservation

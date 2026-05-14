@@ -1319,8 +1319,150 @@ impl super::StorageCluster {
         request: BucketSnapshotRequest,
         action: impl FnOnce(BucketSnapshot) -> Result<T, E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
-        self.bucket_metadata_primary_node(bucket)?
-            .with_bucket_write_snapshot(bucket, request, action)
+        self.with_bucket_write_reservation_snapshot(bucket, request, |snapshot| {
+            Ok(action(snapshot))
+        })
+    }
+
+    pub(crate) fn with_bucket_write_reservation_snapshot<T, E>(
+        &self,
+        bucket: &BucketName,
+        request: BucketSnapshotRequest,
+        action: impl FnOnce(BucketSnapshot) -> Result<Result<T, E>, BucketSnapshotLoadError>,
+    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        loop {
+            let reservation = match self.acquire_durable_bucket_write_reservation(
+                bucket,
+                "bucket-write-snapshot",
+                None,
+            ) {
+                Ok(reservation) => reservation,
+                Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
+                    self.wait_for_durable_bucket_write_drain(bucket)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+
+            let result = (|| {
+                let bucket_pg = reservation.node.get_pg(reservation.pg_id)?;
+                let snapshot = crate::SharedStorageNode::load_bucket_snapshot_from_pg(
+                    &bucket_pg, bucket, request,
+                )?;
+                drop(bucket_pg);
+                action(snapshot)
+            })();
+            let release_result = self.release_durable_bucket_write_reservation(reservation);
+            return Self::finish_bucket_write_snapshot_operation(result, release_result);
+        }
+    }
+
+    pub(super) fn acquire_durable_bucket_write_reservation(
+        &self,
+        bucket: &BucketName,
+        operation_kind: &'static str,
+        target_context: Option<&str>,
+    ) -> Result<super::DurableBucketWriteReservation, BucketSnapshotLoadError> {
+        let pg_id = self.bucket_metadata_pg_id(bucket);
+        let node = self.bucket_metadata_primary_node_arc(bucket)?;
+        let bucket_pg = node.get_pg(pg_id)?;
+        let reservation_id = self.next_bucket_write_reservation_id()?;
+        let owner_token = self.bucket_write_owner_token();
+        let record = PgMetadataStore::acquire_durable_bucket_write_reservation(
+            &*bucket_pg,
+            bucket,
+            &reservation_id,
+            &owner_token,
+            self.operation_epoch(),
+            operation_kind,
+            crate::clock::current_time_millis(),
+            None,
+            target_context,
+        )?;
+        if let Err(error) = PgMetadataStore::acquire_bucket_write_reservation(&*bucket_pg, bucket) {
+            let _ = PgMetadataStore::release_durable_bucket_write_reservation(
+                &*bucket_pg,
+                bucket,
+                &record.reservation_id,
+                &record.owner_token,
+                record.cluster_epoch,
+                record.bucket_execution_generation,
+            );
+            return Err(error.into());
+        }
+        drop(bucket_pg);
+        Ok(super::DurableBucketWriteReservation {
+            node,
+            pg_id,
+            record,
+            legacy_counter_acquired: true,
+        })
+    }
+
+    pub(super) fn release_durable_bucket_write_reservation(
+        &self,
+        reservation: super::DurableBucketWriteReservation,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let bucket_pg = reservation.node.get_pg(reservation.pg_id)?;
+        let durable_result = PgMetadataStore::release_durable_bucket_write_reservation(
+            &*bucket_pg,
+            &reservation.record.bucket,
+            &reservation.record.reservation_id,
+            &reservation.record.owner_token,
+            reservation.record.cluster_epoch,
+            reservation.record.bucket_execution_generation,
+        );
+        let legacy_result = if reservation.legacy_counter_acquired {
+            PgMetadataStore::release_bucket_write_reservation(
+                &*bucket_pg,
+                &reservation.record.bucket,
+            )
+        } else {
+            Ok(())
+        };
+        if legacy_result.is_ok() && reservation.legacy_counter_acquired {
+            reservation
+                .node
+                .notify_bucket_coordination_change(&reservation.record.bucket);
+        }
+        durable_result?;
+        legacy_result?;
+        Ok(())
+    }
+
+    pub(super) fn wait_for_durable_bucket_write_drain(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let node = self.bucket_metadata_primary_node_arc(bucket)?;
+        let bucket_pg = node.get_pg(self.bucket_metadata_pg_id(bucket))?;
+        match PgMetadataStore::head_bucket(&*bucket_pg, bucket) {
+            Ok(_) => {}
+            Err(MetadataError::BucketNotFound { .. }) => {
+                return Err(MetadataError::BucketNotFound {
+                    name: bucket.clone(),
+                }
+                .into());
+            }
+            Err(other) => return Err(other.into()),
+        }
+        drop(bucket_pg);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        Ok(())
+    }
+
+    fn finish_bucket_write_snapshot_operation<T, E>(
+        result: Result<Result<T, E>, BucketSnapshotLoadError>,
+        release_result: Result<(), BucketSnapshotLoadError>,
+    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        match (result, release_result) {
+            (Ok(Ok(value)), Ok(())) => Ok(Ok(value)),
+            (Ok(Ok(_)), Err(err)) => Err(err),
+            (Ok(Err(err)), Ok(())) => Ok(Err(err)),
+            (Ok(Err(err)), Err(_)) => Ok(Err(err)),
+            (Err(err), Ok(())) => Err(err),
+            (Err(err), Err(_)) => Err(err),
+        }
     }
 
     pub fn load_bucket_snapshot_pair(
@@ -4695,11 +4837,9 @@ impl super::StorageCluster {
             let applied_commands = self
                 .drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)
                 .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-            let primary_node = self.object_metadata_primary_node(bucket, key)?;
-            let attempt = primary_node.with_bucket_write_reservation_snapshot(
-                bucket,
-                request,
-                |snapshot| {
+            let attempt =
+                self.with_bucket_write_reservation_snapshot(bucket, request, |snapshot| {
+                    let primary_node = self.object_metadata_primary_node(bucket, key)?;
                     let object_pg = primary_node.get_pg(pg_id.get())?;
                     let existing_object =
                         match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
@@ -4817,8 +4957,7 @@ impl super::StorageCluster {
                     }
 
                     Ok(Ok(Attempt::Complete(value)))
-                },
-            )?;
+                })?;
             match attempt {
                 Ok(Attempt::Complete(value)) => return Ok(Ok(value)),
                 Ok(Attempt::Retry) => continue,
@@ -5080,11 +5219,9 @@ impl super::StorageCluster {
             let applied_commands = self
                 .drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)
                 .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-            let primary_node = self.object_metadata_primary_node(bucket, key)?;
-            let attempt = primary_node.with_bucket_write_reservation_snapshot(
-                bucket,
-                request,
-                |snapshot| {
+            let attempt =
+                self.with_bucket_write_reservation_snapshot(bucket, request, |snapshot| {
+                    let primary_node = self.object_metadata_primary_node(bucket, key)?;
                     let object_pg = primary_node.get_pg(pg_id.get())?;
                     let existing_object =
                         match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
@@ -5170,8 +5307,7 @@ impl super::StorageCluster {
                         value,
                         initiated_at,
                     })))
-                },
-            )?;
+                })?;
             match attempt {
                 Ok(Attempt::Complete(outcome)) => return Ok(Ok(outcome)),
                 Ok(Attempt::Retry) => continue,

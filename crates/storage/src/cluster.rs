@@ -4,6 +4,7 @@ use std::sync::{Arc, Weak};
 
 use ec::{EcConfig, ErasureCodec};
 use placement::NodeId;
+use ring::rand::SecureRandom;
 
 use local::LocalClusterRuntimeState;
 pub use local::{LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute};
@@ -19,15 +20,15 @@ use crate::metadata_command::{
 use crate::node::SharedStorageNode;
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
-    BucketName, ClusterEpoch, CommitDirectPutObjectReq, CreateStreamUploadReq, DataPgId,
-    DirectPutCommitSnapshot, DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome,
-    GenerationId, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
-    MultipartReclaimRecord, MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout,
-    ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, PgId, PrepareStreamUploadSegmentAppendReq,
-    PutLiveObjectReq, SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey,
-    StreamUploadCommandRecord, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
-    StreamUploadTarget, VersionId, WriteAck, WrittenShardAck,
+    BucketName, BucketWriteReservationRecord, ClusterEpoch, CommitDirectPutObjectReq,
+    CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot, DirectPutWrittenSegment, EcShape,
+    FinalizeDirectPutObjectOutcome, GenerationId, MultipartReclaimPartRecord,
+    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadRecord,
+    ObjectEncryption, ObjectKey, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord,
+    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, PgId,
+    PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SegmentStoredBytesRequest, SessionId,
+    ShardIndex, ShardKey, StreamUploadCommandRecord, StreamUploadRecord, StreamUploadSegmentRecord,
+    StreamUploadState, StreamUploadTarget, VersionId, WriteAck, WrittenShardAck,
 };
 use crate::{BucketSnapshotLoadError, MetadataError, ObjectEtag, ObjectPgActionError};
 
@@ -460,6 +461,13 @@ pub struct StorageCluster {
     operation_epoch: ClusterEpoch,
     #[cfg(any(test, feature = "test-hooks"))]
     test_hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+pub(super) struct DurableBucketWriteReservation {
+    node: Arc<SharedStorageNode>,
+    pg_id: u32,
+    record: BucketWriteReservationRecord,
+    legacy_counter_acquired: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1200,6 +1208,44 @@ impl StorageCluster {
         bucket: &BucketName,
     ) -> Result<&SharedStorageNode, StoreError> {
         self.metadata_pg_primary_node(self.bucket_metadata_pg_id(bucket))
+    }
+
+    fn bucket_metadata_primary_node_arc(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Arc<SharedStorageNode>, StoreError> {
+        let node = self.local_map.metadata_pg_primary_node(
+            self.operation_epoch(),
+            PgId::new(self.bucket_metadata_pg_id(bucket)),
+        )?;
+        Ok(Arc::clone(node.storage_node()))
+    }
+
+    fn next_bucket_write_reservation_id(&self) -> Result<String, StoreError> {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+
+        let rng = ring::rand::SystemRandom::new();
+        let mut id_bytes = [0u8; 16];
+        rng.fill(&mut id_bytes).map_err(|_| StoreError::Io {
+            context: "generate bucket write reservation id",
+            source: std::io::Error::other("failed to generate random reservation id"),
+        })?;
+
+        let mut encoded = String::with_capacity("bucket-write-".len() + id_bytes.len() * 2);
+        encoded.push_str("bucket-write-");
+        for byte in id_bytes {
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        Ok(encoded)
+    }
+
+    fn bucket_write_owner_token(&self) -> String {
+        format!(
+            "process:{}:cluster:{:p}",
+            std::process::id(),
+            Arc::as_ptr(&self.local_map)
+        )
     }
 
     fn object_metadata_primary_node(
@@ -2859,6 +2905,41 @@ impl StorageCluster {
     }
 
     pub fn create_put_object_stream_session_record(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        encryption: ObjectEncryption,
+    ) -> Result<(), ObjectPgActionError> {
+        loop {
+            let reservation = match self.acquire_durable_bucket_write_reservation(
+                bucket,
+                "put-object-stream-create",
+                Some(key.as_str()),
+            ) {
+                Ok(reservation) => reservation,
+                Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
+                    self.wait_for_durable_bucket_write_drain(bucket)
+                        .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+                    continue;
+                }
+                Err(error) => return Err(bucket_snapshot_error_to_object_pg_action_error(error)),
+            };
+            let result = self.create_put_object_stream_session_record_under_reservation(
+                bucket, key, session_id, encryption,
+            );
+            let release_result = self
+                .release_durable_bucket_write_reservation(reservation)
+                .map_err(bucket_snapshot_error_to_object_pg_action_error);
+            return match (result, release_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Ok(()), Err(error)) => Err(error),
+                (Err(error), Ok(())) | (Err(error), Err(_)) => Err(error),
+            };
+        }
+    }
+
+    fn create_put_object_stream_session_record_under_reservation(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,

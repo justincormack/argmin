@@ -7,22 +7,26 @@ processes, restart, and PG-primary ownership.
 
 ## Current Authority
 
-The current write-drain path is still process-shaped:
+The current write-drain path is partially migrated:
 
-- `StorageCluster::with_bucket_write_snapshot` delegates to the bucket metadata
-  primary node.
-- `SharedStorageNode::with_bucket_write_reservation_snapshot` increments
-  `buckets.active_write_reservations`, loads a bucket snapshot, runs the caller
-  action, then decrements the counter.
+- `StorageCluster::with_bucket_write_snapshot` acquires a durable
+  `bucket_write_reservations` row on the bucket-PG primary, loads the bucket
+  snapshot, runs the caller action, then releases that exact row. Until
+  DeleteBucket moves to durable drains, it also holds the legacy
+  `buckets.active_write_reservations` counter so the old drain path remains a
+  correct transitional fence.
+- The old `SharedStorageNode::with_bucket_write_snapshot` anonymous counter
+  path is retained for tests only.
 - `SharedStorageNode::begin_bucket_write_drain` sets
   `buckets.write_reservations_blocked` and waits on a node-local condition
   variable until `active_write_reservations == 0`.
 - `StorageCluster::begin_bucket_delete` uses that node-local drain before it
   publishes the `MarkBucketDeleting` metadata command.
 
-Those counters are anonymous. They do not identify the writer, the bucket
-incarnation, the request class, or whether another process crashed while holding
-the reservation. They are therefore not a multi-process correctness boundary.
+The remaining drain counters are anonymous. They do not identify the writer, the
+bucket incarnation, the request class, or whether another process crashed while
+holding the reservation. They are therefore only a transitional compatibility
+bridge, not a multi-process correctness boundary.
 
 ## Target Authority
 
@@ -56,6 +60,11 @@ Each reservation must include at least:
 Release, reap, and apply-time validation must match bucket name, reservation id,
 owner token, and bucket incarnation. A stale release after delete/recreate must
 not affect a reservation for the new bucket incarnation.
+
+Reservation IDs must be unique across independent `StorageCluster` handles and
+process restarts. The Phase 9.4 implementation uses 128 bits of random entropy
+for the reservation-id suffix; it must not use a per-handle counter as durable
+identity.
 
 ## Publisher Classification
 

@@ -10751,6 +10751,246 @@ mod tests {
     }
 
     #[test]
+    fn cluster_bucket_write_snapshot_uses_durable_reservation_rows() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "durable-write-snapshot-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let second_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        cluster
+            .with_bucket_write_snapshot(&bucket, Default::default(), |snapshot| {
+                assert_eq!(snapshot.bucket.name, bucket);
+                let primary_pg = map
+                    .node(NodeId::new(1))
+                    .unwrap()
+                    .storage_node()
+                    .get_pg(1)
+                    .unwrap();
+                let reservations = crate::PgMetadataStore::durable_bucket_write_reservations(
+                    &*primary_pg,
+                    &bucket,
+                )
+                .unwrap();
+                assert_eq!(reservations.len(), 1);
+                assert_eq!(reservations[0].bucket, bucket);
+                assert_eq!(reservations[0].cluster_epoch, crate::ClusterEpoch::INITIAL);
+                assert_eq!(reservations[0].operation_kind, "bucket-write-snapshot");
+                let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
+                assert_eq!(info.active_write_reservations, 1);
+                drop(primary_pg);
+
+                second_cluster
+                    .with_bucket_write_snapshot(&bucket, Default::default(), |second_snapshot| {
+                        assert_eq!(second_snapshot.bucket.name, bucket);
+                        let primary_pg = map
+                            .node(NodeId::new(1))
+                            .unwrap()
+                            .storage_node()
+                            .get_pg(1)
+                            .unwrap();
+                        let reservations =
+                            crate::PgMetadataStore::durable_bucket_write_reservations(
+                                &*primary_pg,
+                                &bucket,
+                            )
+                            .unwrap();
+                        assert_eq!(reservations.len(), 2);
+                        assert_ne!(
+                            reservations[0].reservation_id,
+                            reservations[1].reservation_id
+                        );
+                        let info =
+                            crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
+                        assert_eq!(info.active_write_reservations, 2);
+                        Ok::<(), ()>(())
+                    })
+                    .unwrap()
+                    .unwrap();
+
+                let primary_pg = map
+                    .node(NodeId::new(1))
+                    .unwrap()
+                    .storage_node()
+                    .get_pg(1)
+                    .unwrap();
+                let reservations = crate::PgMetadataStore::durable_bucket_write_reservations(
+                    &*primary_pg,
+                    &bucket,
+                )
+                .unwrap();
+                assert_eq!(reservations.len(), 1);
+                let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
+                assert_eq!(info.active_write_reservations, 1);
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+            .unwrap();
+
+        let primary_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
+                .unwrap()
+                .is_empty()
+        );
+        let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
+        assert_eq!(info.active_write_reservations, 0);
+    }
+
+    #[test]
+    fn low_level_put_object_stream_create_uses_durable_bucket_reservation() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "durable-stream-create-");
+        let key = key_for_object_pg(topology, &bucket, 1, "key-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let hook_map = Arc::clone(&map);
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let _hook_guard = cluster.test_install_before_metadata_command_apply_context_hook(
+            Arc::new(move |context| {
+                if context.kind != crate::cluster::MetadataCommandApplyTestKind::CreateStreamUpload
+                    || context.bucket.as_ref() != Some(&hook_bucket)
+                    || context.key.as_ref() != Some(&hook_key)
+                {
+                    return Ok(());
+                }
+                let primary_pg = hook_map
+                    .node(NodeId::new(1))
+                    .unwrap()
+                    .storage_node()
+                    .get_pg(1)
+                    .unwrap();
+                let reservations = crate::PgMetadataStore::durable_bucket_write_reservations(
+                    &*primary_pg,
+                    &hook_bucket,
+                )
+                .unwrap();
+                assert_eq!(reservations.len(), 1);
+                assert_eq!(reservations[0].operation_kind, "put-object-stream-create");
+                let info =
+                    crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &hook_bucket).unwrap();
+                assert_eq!(info.active_write_reservations, 1);
+                Ok(())
+            }),
+        );
+
+        let session_id = crate::SessionId::try_from("be".repeat(16)).unwrap();
+        cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                &session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap();
+
+        let primary_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
+                .unwrap()
+                .is_empty()
+        );
+        let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
+        assert_eq!(info.active_write_reservations, 0);
+    }
+
+    #[test]
+    fn low_level_put_object_stream_create_retries_temporary_drain() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "stream-create-drain-");
+        let key = key_for_object_pg(topology, &bucket, 1, "key-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let primary_node = Arc::clone(map.node(NodeId::new(1)).unwrap().storage_node());
+        let drain = primary_node.begin_bucket_write_drain(&bucket).unwrap();
+        let retry_cluster = Arc::clone(&cluster);
+        let retry_bucket = bucket.clone();
+        let retry_key = key.clone();
+        let session_id = crate::SessionId::try_from("bf".repeat(16)).unwrap();
+        let retry_session_id = session_id.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = retry_cluster.create_put_object_stream_session_record(
+                &retry_bucket,
+                &retry_key,
+                &retry_session_id,
+                crate::ObjectEncryption::None,
+            );
+            result_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(result_rx
+            .recv_timeout(std::time::Duration::from_millis(25))
+            .is_err());
+
+        drop(drain);
+        let result = result_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("temporary drain should be retried after release");
+        result.unwrap();
+        handle.join().unwrap();
+
+        let primary_pg = primary_node.get_pg(1).unwrap();
+        let upload = crate::PgMetadataStore::get_stream_upload(&*primary_pg, &session_id).unwrap();
+        assert_eq!(upload.bucket, bucket);
+        assert!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
+                .unwrap()
+                .is_empty()
+        );
+        let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
+        assert_eq!(info.active_write_reservations, 0);
+    }
+
+    #[test]
     fn bucket_metadata_commands_ignore_primary_local_write_reservation_state() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -20455,6 +20695,7 @@ mod tests {
 
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
         let session_id = crate::SessionId::try_from("03".repeat(16)).unwrap();
         cluster
             .create_put_object_stream_session_record(

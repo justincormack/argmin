@@ -286,7 +286,7 @@ expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:abort_stream_upload_session:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards<E>:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster.rs:commit_stream_segment_append:set_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster.rs:create_put_object_stream_session_record:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster.rs:create_put_object_stream_session_record_under_reservation:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster.rs:release_object_generation_reservation:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster.rs:release_object_generation_reservation_command_required:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster.rs:reserve_next_object_version:try_set_pending_metadata_command_for_bucket
@@ -349,7 +349,7 @@ metadata_command_conflict_uses=$(
 expected_metadata_command_conflict_uses=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:apply_new_stream_append_command:exact-command-match
 1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards<E>:exact-command-match
-1 crates/storage/src/cluster.rs:create_put_object_stream_session_record:metadata-command-log-conflict
+1 crates/storage/src/cluster.rs:create_put_object_stream_session_record_under_reservation:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:finish_pending_object_metadata_command_for_bucket:exact-command-match
 1 crates/storage/src/cluster.rs:metadata_command_conflict:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:metadata_command_log_conflict_matches:exact-command-match

@@ -157,7 +157,7 @@ Current production pending-command publishers:
 | `release_object_generation_reservation_command_required` | `ReleaseObjectGeneration` | `AllocatorCleanup` | Required cleanup must retry through slot contention until terminal or fail without losing the cleanup intent. |
 | `release_object_generation_reservation` | `ReleaseObjectGeneration` | `AllocatorCleanup` | Release an already-owned reservation; drain competing PG slot and retry. |
 | `commit_direct_put_object_from_payload_shards` | `CommitDirectPutObject` | `SnapshotSensitive` | Rebuild commit from fresh object preconditions and stale-payload snapshot after contention. |
-| `create_put_object_stream_session_record` | `CreateStreamUpload` | `SnapshotSensitive` | Rebuild session command and reservation cleanup from fresh object state after contention. |
+| `create_put_object_stream_session_record_under_reservation` | `CreateStreamUpload` | `SnapshotSensitive` | Low-level PutObject stream-create publisher. The public wrapper first holds a durable bucket write reservation; this internal publisher rebuilds session command and reservation cleanup from fresh object state after contention. |
 | `commit_stream_segment_append` | `AppendStreamSegment` | `ApplyValidated` | Apply validates session binding/state and existing staged segment before inserting. |
 | `abort_stream_upload_session` | `AbortStreamUpload` | `SnapshotSensitive` | Rebuild staged-segment snapshot after contention. |
 | `put_object_metadata_if` | `PutObjectMetadata` | `SnapshotSensitive` | Rerun request action/preconditions after contention. |

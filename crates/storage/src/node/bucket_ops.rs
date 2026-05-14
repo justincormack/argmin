@@ -418,6 +418,7 @@ impl SharedStorageNode {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_bucket_write_reservation_snapshot<T, E>(
         &self,
         bucket: &BucketName,
@@ -465,7 +466,8 @@ impl SharedStorageNode {
         }
     }
 
-    pub fn with_bucket_write_snapshot<T, E>(
+    #[cfg(test)]
+    pub(crate) fn with_bucket_write_snapshot<T, E>(
         &self,
         bucket: &BucketName,
         request: BucketSnapshotRequest,
@@ -602,6 +604,7 @@ impl SharedStorageNode {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn release_bucket_write_reservation(
         &self,
         bucket: &BucketName,
@@ -626,6 +629,7 @@ impl SharedStorageNode {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn finish_bucket_write_snapshot_operation<T, E>(
         result: Result<Result<T, E>, BucketSnapshotLoadError>,
         release_result: Result<(), BucketSnapshotLoadError>,
