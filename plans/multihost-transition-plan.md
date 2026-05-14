@@ -3219,12 +3219,315 @@ Proposed subphases:
       - exit when the Phase 9.2H publisher table has no Phase 9.3 deferrals,
         the boundary script enforces that state, and the race matrix passes
 5. Phase 9.4 bucket write drain
-   - move bucket delete/write-drain state out of process-local waits into
-     durable or primary-owned metadata
-   - bucket deletion must block new writes, wait for existing write
-     reservations, survive process restart, and resume finalization
-   - exit when bucket delete does not require a local condition variable or
-     same-process waiter to make progress
+   - goal: make the DeleteBucket write fence and in-flight write reservations
+     cluster-visible. Bucket deletion must block new writes, wait for existing
+     bucket write reservations, survive process restart, and resume or roll
+     back without depending on a local condition variable, same-process waiter,
+     or process-local counter.
+   - current problem:
+     - `begin_bucket_delete` still starts with
+       `SharedStorageNode::begin_bucket_write_drain`, which writes
+       `buckets.write_reservations_blocked` and waits for
+       `active_write_reservations` through node-local locking/wakeup
+     - write reservations are bucket-row counters, not command-stream state and
+       not durable ownership records; they cannot distinguish "active in another
+       process" from "process crashed while holding the reservation"
+     - a drain fence can be temporary: DeleteBucket may discover visible data
+       and roll back the fence. That means a crash after blocking writes but
+       before either MarkBucketDeleting or rollback needs a deterministic
+       recovery rule
+     - finalization is correctly after `MarkBucketDeleting`, visible-data
+       checks, and reclaim checks, but the pre-delete write drain is still the
+       last major bucket-delete coordination path that assumes one process
+   - target model:
+     - bucket write reservations become explicit bucket-PG primary records, not
+       anonymous counters on the bucket row
+     - a DeleteBucket drain is an explicit durable bucket-PG fence with an owner
+       token and recovery policy
+     - the write fence is not S3 metadata and does not become part of object
+       visibility semantics, but it is correctness metadata and must be
+       protected by durable validation, boundary checks, and recovery tests
+     - writers encountering an active drain wait/retry from fresh bucket state
+       while the drain is temporary; once `MarkBucketDeleting` is durable they
+       fail as bucket-not-found/deleting through the existing request semantics
+     - release of an acquired write reservation is not new work. It must remain
+       possible after the acquiring handle becomes stale, using the exact
+       bucket-PG/owner/reservation identity captured at acquire time
+     - a write reservation is an apply-time fence, not just an admission token
+       for loading a bucket snapshot. Every bucket-write metadata publisher that
+       builds a command under a reservation must carry the bucket incarnation
+       and reservation identity into the command or an equivalent validated
+       apply context. Command apply must reject the write if the reservation was
+       reaped, the bucket incarnation changed, or the bucket drain reached a
+       terminal deleting state before the command is accepted
+     - object-PG commands that depend on a bucket write reservation must not
+       trust the publisher's stale bucket snapshot. The command payload or
+       command envelope must carry a bucket-PG reservation reference:
+       bucket name, bucket execution generation or bucket row digest,
+       reservation id, reservation owner token, and bucket PG/cluster epoch.
+       Normal apply, pending-command retry, and open-time convergence must
+       re-read the bucket-PG reservation state and fail closed if the referenced
+       reservation is missing, expired/reaped, owned by a different owner,
+       bound to a different bucket incarnation, or covered by a terminal bucket
+       drain. This is the cross-PG fence that prevents a later drainer from
+       converging an old object-PG command after DeleteBucket has decided the
+       reservation can no longer publish
+     - reservation reaping must not strand partially accepted object-PG
+       commands. Phase 9.4 must choose and implement one explicit rule:
+       - either a reservation is not reapable while any pending object-PG
+         command or accepted-but-not-converged object-PG log entry references
+         it, across the full acting set and open-time recovery shapes
+       - or the first object-PG acceptance durably records a reservation proof
+         in the command/log state, and later exact-command convergence validates
+         that proof rather than requiring the live reservation row to still
+         exist
+       The chosen rule must be fail-closed for divergent command bytes or hash
+       chains, but must allow an already accepted exact command to converge
+       instead of leaving partial metadata because DeleteBucket reaped the live
+       reservation after one replica applied it
+
+   1. Phase 9.4.1: audit and freeze write-drain semantics
+      - inventory every production caller that acquires bucket write protection:
+        direct PUT, CopyObject, stream PUT create/finalize, CreateMultipartUpload,
+        CompleteMultipartUpload, UploadPart/UploadPartCopy paths that create or
+        finalize destination stream state, object metadata writes that can
+        affect bucket emptiness, any lifecycle/background object writers, and
+        all bucket-PG control-plane mutators such as PutBucketPolicy, PutBucket
+        CORS, versioning, ACL, ownership controls, public access block, object
+        lock, encryption, lifecycle, tagging-style subresources, and bucket
+        delete begin/finalize helpers
+      - classify each caller as one of:
+        - needs a short bucket write reservation before taking a bucket snapshot
+          and building/publishing object or MPU metadata
+        - is already blocked by an existing MPU/session/object command and only
+          needs to observe the current bucket state
+        - is a bucket-PG control-plane command publisher and must either acquire
+          the durable reservation, be explicitly blocked by the active drain, or
+          prove it is safe because the command itself is the drain/delete
+          transition
+        - is delete/reclaim/background cleanup and must not acquire a new
+          write reservation
+      - pin expected AWS-facing outcomes for DeleteBucket races:
+        - DeleteBucket racing an already-reserved write waits for the write to
+          publish or fail, then returns BucketNotEmpty or proceeds
+        - a new write that arrives while DeleteBucket is only probing/draining
+          waits/retries rather than observing a transient internal state
+        - a new write that arrives after `MarkBucketDeleting` is durable fails
+          as the bucket no longer accepts writes
+      - add the audit result to
+        [metadata-command-stream.md](../guides/metadata-command-stream.md) or a
+        small bucket-delete/write-drain guide, and link it from this plan
+
+   2. Phase 9.4.2: introduce durable bucket-PG write-drain records
+      - replace anonymous bucket-row counters with explicit coordination rows:
+        - `bucket_write_reservations`: bucket, reservation id, owner/process
+          token, bucket execution generation or bucket row digest, operation
+          kind, creation time, last heartbeat or owner epoch, and optional
+          request target context for tracing
+        - `bucket_write_drains`: bucket, drain id, owner/process token, state
+          (`Draining`, `MarkingDeleting`, `Abandoned`/expired), creation time,
+          last heartbeat/lease deadline, and the bucket execution generation or
+          bucket row image the drain was created against
+      - decide and document whether these rows are:
+        - bucket-PG-primary durable coordination state outside the metadata
+          command log for Phase 9, or
+        - command-owned bucket-PG metadata with dedicated
+          `BeginBucketWriteDrain` / `EndBucketWriteDrain` commands
+      - initial preference for this phase:
+        - make the `MarkBucketDeleting` state change remain the durable
+          command-stream transition
+        - make reservations and temporary drain fences bucket-PG-primary
+          durable coordination rows with their own integrity/recovery checks
+        - remove the current bucket-row counter authority once the replacement
+          is in place
+      - add local PG validation for the coordination rows:
+        - no active reservation may reference a missing bucket incarnation
+        - at most one active drain may exist for a bucket
+        - a drain's bucket-generation/preimage must match the current bucket row
+          while the bucket is still Active
+        - release and reap operations must match bucket, reservation id, owner
+          token, and bucket incarnation. A stale release after bucket
+          delete/recreate must not release a reservation for the new bucket
+          incarnation
+        - expired owner tokens make reservations/drains reclaimable, not
+          silently successful
+
+   3. Phase 9.4.3: move writer acquire/release to `StorageCluster`
+      - introduce a cluster-level bucket write reservation guard that captures:
+        bucket PG id, bucket name, reservation id, owner token, acquire epoch,
+        and the node/store that accepted the reservation
+      - `with_bucket_write_snapshot` should become a cluster-owned wrapper:
+        - acquire durable reservation on the bucket PG primary
+        - load the bucket snapshot under that reservation
+        - run the caller action
+        - release the exact reservation on every return path
+      - contention and recovery rules:
+        - if a temporary drain is active, wait/backoff and reload from the
+          bucket PG; do not wait on a same-process condition variable
+        - if `MarkBucketDeleting` is already durable, fail through the normal
+          missing/deleting bucket path
+        - every command built while holding the reservation must encode or
+          otherwise carry enough bucket reservation context for apply to verify
+          that the reservation is still live for the same bucket incarnation
+        - for object-PG command families, apply-time validation must consult the
+          bucket PG using that encoded reservation context. This check must run
+          on:
+          - the initial object-PG command apply
+          - matching pending-command retry/finish paths
+          - open-time in-flight command convergence
+          - duplicate idempotent retry paths that would otherwise accept a
+            matching already-applied object command
+        - if any object-PG replica has already accepted the exact command, retry
+          and open-time convergence must follow the Phase 9.4 reservation-reap
+          rule above: either the reservation is still protected from reaping, or
+          the command's durable reservation proof is sufficient for exact-command
+          convergence
+        - if the reservation is reaped before command apply, apply fails closed
+          and the caller must restart from fresh bucket state rather than
+          publishing a write that DeleteBucket has already decided cannot
+          publish
+        - if the handle becomes stale after acquire, release through the
+          captured reservation identity rather than treating release as new work
+        - if release fails after the caller action has returned, preserve the
+          caller error ordering but leave a typed trace and retryable cleanup
+          signal for the reservation
+      - remove or gate production access to
+        `SharedStorageNode::with_bucket_write_snapshot`,
+        `PgMetadataStore::acquire_bucket_write_reservation`,
+        `release_bucket_write_reservation`, `begin_bucket_write_drain`, and
+        `end_bucket_write_drain` once the cluster wrapper owns the path
+
+   4. Phase 9.4.4: make DeleteBucket begin durable and recoverable
+      - rewrite `begin_bucket_delete` as a bucket-PG-primary state machine:
+        - drain/finish any pending bucket-PG command for the bucket
+        - drain object-PG pending commands that can publish visible data or MPU
+          state for the bucket
+        - install or resume a durable drain fence
+        - wait/poll active durable write reservations until the set is empty,
+          ignoring/reaping only reservations whose owner is provably dead or
+          expired according to the Phase 9.4 owner-token rule
+        - after the reservation set reaches empty, drain/finish all object-PG
+          pending commands for the bucket again. A writer that already held a
+          reservation may have published, partially applied, or left a pending
+          object command after the pre-drain. This post-reservation drain is
+          required before any emptiness decision is trusted
+        - re-check visible data and in-progress multipart state after the
+          post-reservation object-PG drain. If draining produces new relevant
+          state or another reservation appears, repeat the wait/drain/check
+          loop from fresh bucket state
+        - if the bucket is not empty, roll back the drain fence durably and let
+          waiting writers proceed
+        - if the bucket is empty, publish `MarkBucketDeleting` through the
+          bucket-PG command stream and make the drain terminal
+      - crash/restart rules:
+        - drain fence present, no `MarkBucketDeleting`, owner alive: writers
+          continue to wait/retry
+        - drain fence present, no `MarkBucketDeleting`, owner dead/expired:
+          another request or recovery helper rolls the fence back unless it can
+          safely resume the DeleteBucket decision from fresh state
+        - `MarkBucketDeleting` durable, drain fence still present: cleanup is
+          idempotent and writers fail as deleting/missing
+        - partial `MarkBucketDeleting` command apply follows the Phase 9.2H
+          exact-command retry rules and must not be hidden as a transient
+          drain conflict
+
+   5. Phase 9.4.5: finalization and worker wakeup without local waiters
+      - `try_finalize_bucket_delete` must not rely on the process that began
+        the delete:
+        - any process/worker can observe a Deleting bucket and attempt finalize
+        - finalization still checks visible data, reclaim roots, and read pins
+          before calling the finalized-delete acting-set fanout
+        - missing local queue wakeups are performance issues only; progress can
+          be made by polling/listing Deleting buckets or by a durable work item
+      - keep durable reclaim/read-pin work in Phase 9.5-9.7 scope, but make
+        Phase 9.4 finalization robust when the only remaining blocker is the
+        write-drain state
+      - add trace events for every terminal and retryable outcome:
+        drain installed, drain wait, stale reservation ignored/reaped, rollback,
+        mark-deleting command install/apply, finalize pending, and finalized
+
+   6. Phase 9.4.6: remove the old counter authority
+      - remove `write_reservations_blocked` and `active_write_reservations` from
+        production command-owned bucket projections, or leave them as ignored
+        compatibility fields only if the schema still needs them during the
+        slice
+      - update
+        [metadata-model.md](../guides/metadata-model.md) and
+        [storage-cluster-invariants.md](../guides/storage-cluster-invariants.md):
+        - bucket write-drain state is no longer an unresolved Phase 9
+          exception
+        - the new reservation/drain rows are the only production authority
+        - finalized bucket row deletion remains the explicit command-owned
+          metadata exception
+      - extend `scripts/check-storage-cluster-boundaries` so new production
+        direct uses of old bucket write-drain counter helpers fail loudly
+      - remove tests that exercise only the legacy counter API unless they are
+        rewritten as low-level tests for the new durable coordination rows
+
+   7. Phase 9.4.7: tests and closeout
+      - focused storage regressions:
+        - active reservation blocks DeleteBucket until release, then DeleteBucket
+          observes the published data and returns BucketNotEmpty
+        - a command whose reservation was reaped or whose bucket incarnation no
+          longer matches is rejected at apply time, even if it was built from a
+          previously valid bucket snapshot
+        - an object-PG command partially applies while the reservation is live;
+          a DeleteBucket drain then attempts to reap that reservation. The test
+          must prove the selected rule: reaping is blocked until the exact
+          command converges, or the command carries a durable reservation proof
+          and retry/reopen convergence completes safely after reap
+        - temporary DeleteBucket drain against a non-empty bucket rolls back and
+          a waiting write proceeds from fresh bucket state
+        - a writer with an already-acquired reservation publishes a partial
+          object-PG command after the first DeleteBucket object-PG drain; begin
+          delete waits for reservations empty, drains that object-PG command in
+          the post-reservation drain, then bases BucketNotEmpty/finalize
+          decisions on the converged state
+        - empty-bucket DeleteBucket installs the drain, waits for reservations,
+          publishes `MarkBucketDeleting`, and finalizes after restart without a
+          same-process waiter
+        - crash/reopen with drain fence before mark-deleting rolls back or
+          resumes according to the owner-token rule
+        - crash/reopen with partial `MarkBucketDeleting` apply converges through
+          the metadata command stream and does not leak the drain fence
+        - stale cluster handle cannot acquire a new bucket write reservation,
+          but can release a reservation it already acquired
+        - two `LocalClusterMap` handles/process simulations contend on the same
+          bucket drain and reservation records without local condition variables
+      - request-level race coverage:
+        - DeleteBucket vs direct PUT
+        - DeleteBucket vs CopyObject
+        - DeleteBucket vs stream PUT create/finalize
+        - DeleteBucket vs CreateMultipartUpload
+        - DeleteBucket vs CompleteMultipartUpload
+        - DeleteBucket vs UploadPart/UploadPartCopy stream session creation and
+          finalization where the MPU itself is the visible blocker
+      - property/model coverage:
+        - extend the local-cluster command-stream trace model with bucket drain
+          records, durable reservations, owner expiry, restart/open validation,
+          and two handles
+        - invariant: no successful public operation returns with a non-terminal
+          drain fence unless the operation is the active DeleteBucket attempt
+        - invariant: a bucket cannot be finalized while any live write
+          reservation for that bucket is active
+        - invariant: a stale/expired reservation may unblock delete only after
+          the owner-token rule says the writer cannot publish
+      - verification:
+        - `./scripts/check-storage-cluster-boundaries`
+        - targeted bucket delete/write-drain tests
+        - targeted object write, multipart, UploadPartCopy, and lifecycle
+          suites that use bucket write snapshots
+        - `cargo clippy --all-targets --all-features -- -D warnings`
+        - full `cargo nextest run`
+      - exit when:
+        - no production path mutates or reads bucket write-drain authority
+          through process-local counters
+        - DeleteBucket progress does not require a local condition variable or
+          the process that started the delete
+        - restart/open validation catches impossible or unsafe drain/reservation
+          states
+        - the guide, plan, boundary script, and tests agree on the single
+          bucket write-drain authority
 6. Phase 9.5 cross-process read pins
    - replace object payload generation leases with cluster-visible read pins or
      durable expiring leases
