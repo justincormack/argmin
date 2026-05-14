@@ -4007,34 +4007,34 @@ mod reissue_decision_tests {
                 );
                 return Ok(());
             }
-            if let Some(replica) = replicas.iter().find(|replica| {
-                replica.max_log_index < current_log_index
-                    && (replica.max_log_index != primary_applied_log_index
+            for replica in &replicas {
+                if replica.max_log_index < current_log_index {
+                    if replica.max_log_index != primary_applied_log_index
                         || replica.applied_log_index != primary_applied_log_index
-                        || replica.applied_log_hash != primary_applied_log_hash)
-            }) {
-                prop_assert_eq!(
-                    decision,
-                    ReissuedPendingCommandDecision::Conflict {
-                        node_id: replica.node_id,
-                        log_index: primary_applied_log_index.max(replica.max_log_index),
+                        || replica.applied_log_hash != primary_applied_log_hash
+                    {
+                        prop_assert_eq!(
+                            decision,
+                            ReissuedPendingCommandDecision::Conflict {
+                                node_id: replica.node_id,
+                                log_index: primary_applied_log_index.max(replica.max_log_index),
+                            }
+                        );
+                        return Ok(());
                     }
-                );
-                return Ok(());
-            }
-            if let Some(replica) = replicas.iter().find(|replica| {
-                replica.max_log_index >= current_log_index
-                    && replica.replacement_match
-                        != ReissuedPendingCommandReplicaMatch::MatchesHashChain
-            }) {
-                prop_assert_eq!(
-                    decision,
-                    ReissuedPendingCommandDecision::Conflict {
-                        node_id: replica.node_id,
-                        log_index: current_log_index,
-                    }
-                );
-                return Ok(());
+                    continue;
+                }
+                if replica.replacement_match != ReissuedPendingCommandReplicaMatch::MatchesHashChain
+                {
+                    prop_assert_eq!(
+                        decision,
+                        ReissuedPendingCommandDecision::Conflict {
+                            node_id: replica.node_id,
+                            log_index: current_log_index,
+                        }
+                    );
+                    return Ok(());
+                }
             }
             prop_assert_eq!(decision, ReissuedPendingCommandDecision::ReloadCurrent);
         }
