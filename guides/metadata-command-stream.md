@@ -174,7 +174,7 @@ Current production pending-command publishers:
 | `begin_upload_part_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Revalidate MPU/session target and rerun the caller action against fresh MPU state using the request-entry authorization snapshot/capability after contention. |
 | `create_upload_part_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Revalidate MPU/session target after contention. |
 | `reserve_completed_multipart_upload_order` | `AdvanceCompletedMultipartUploadSequence` | `AllocatorCleanup` | Serialize through the bucket-PG slot; a later object-PG command must be derived from a terminal reservation. |
-| `complete_multipart_upload_commit_serialized` | `CommitMultipartObject` | `SnapshotSensitive` | Rebuild completion parts, cleanup snapshot, stale payload, and bucket-PG order after contention; Phase 9.3 deferral. |
+| `complete_multipart_upload_commit_serialized` | `CommitMultipartObject` | `SnapshotSensitive` | Rebuild completion parts, cleanup snapshot, stale payload, and bucket-PG order after contention. |
 | `finalize_upload_part_stream` | `CommitStreamPart` | `SnapshotSensitive` | Rebuild stream session, MPU row, staged segments, and displaced part refs after contention. |
 | `abort_multipart_upload_locked` | `AbortMultipartUpload` | `SnapshotSensitive` | Rebuild upload, part, active stream session, staged segment, and cleanup snapshots after contention. |
 | `abort_authorized_multipart_upload_locked` | `AbortMultipartUpload` | `SnapshotSensitive` | Rebuild authorized upload cleanup snapshot after contention and compare the current upload row to the authorized row before install. |
@@ -192,12 +192,9 @@ but before it allocates the command id, `MetadataCommandLogConflict` is the
 same pre-publish contention class: the publisher must drain the winner and
 restart from a fresh snapshot, not surface the conflict to the request.
 
-Any multipart publisher still marked as a Phase 9.3 deferral is not claimed as
-fully hardened by earlier phases. These paths are inventoried here and in
-`scripts/check-storage-cluster-boundaries` so the remaining `set_pending...` and
-`try_set...` shapes cannot be mistaken for unreviewed omissions. Phase 9.3 owns
-converting those paths to multipart-aware PG-primary serialization and
-fresh-snapshot restart rules.
+The multipart publisher rows above are inventoried here and in
+`scripts/check-storage-cluster-boundaries` so future publisher changes cannot
+silently bypass the snapshot-sensitive restart rules.
 
 ## Multipart Command-Stream Invariants
 
@@ -291,7 +288,7 @@ index can also describe a divergent command-log row.
 | `delete_completed_multipart_upload_record_with_command` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | Used as cleanup after completed MPU retention decisions. |
 | `reserve_completed_multipart_upload_order` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | The returned order must come from a terminal bucket-PG command. |
 | `drain_pending_metadata_command_pg_slot` and `drain_pending_completed_multipart_sequence_command` | bucket PG drain | Fail closed on unsafe finish conflicts. | These are generic drain helpers; they must not hide divergent command-log state from the caller. |
-| `finish_pending_command_for_completed_multipart_order` | bucket/object PG drain | Follows the command family finisher. | Multi-PG MPU completion must not hold ambiguous pending state across PGs; Phase 9.3 owns the remaining multipart serialization work. |
+| `finish_pending_command_for_completed_multipart_order` | bucket/object PG drain | Follows the command family finisher. | Multi-PG MPU completion must not hold ambiguous pending state across PGs; Phase 9.3 pins the multipart serialization rules. |
 
 The boundary script inventories production uses of
 `MetadataCommandLogConflict` and `metadata_command_log_conflict_matches`.

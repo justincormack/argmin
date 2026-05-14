@@ -5276,13 +5276,12 @@ impl super::StorageCluster {
                     ),
                 )),
             );
-            if !self
-                .try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+            match self
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
                 .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
             {
-                self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
-                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-                continue;
+                super::SnapshotSensitiveCommandInstall::Installed => {}
+                super::SnapshotSensitiveCommandInstall::ContenderDrained => continue,
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
                 .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
@@ -5350,9 +5349,11 @@ impl super::StorageCluster {
                     ),
                 )),
             );
-            if !self.try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)? {
-                self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
-                continue;
+            match self
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
+            {
+                super::SnapshotSensitiveCommandInstall::Installed => {}
+                super::SnapshotSensitiveCommandInstall::ContenderDrained => continue,
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             return Ok(session_id.clone());
@@ -5911,12 +5912,13 @@ impl super::StorageCluster {
                     },
                 )),
             );
-            if self
-                .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, &command)
-                .map_err(ObjectPgActionError::from)?
-                .is_none()
+            match self
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, &bucket, &command)?
             {
-                continue 'retry_after_pending_conflict;
+                super::SnapshotSensitiveCommandInstall::Installed => {}
+                super::SnapshotSensitiveCommandInstall::ContenderDrained => {
+                    continue 'retry_after_pending_conflict;
+                }
             }
             self.apply_multipart_completion_command(pg_id, &bucket, &command)?;
 

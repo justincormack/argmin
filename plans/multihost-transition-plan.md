@@ -2627,8 +2627,8 @@ Proposed subphases:
      publisher/path inventory, non-multipart snapshot-sensitive retry shape,
      stream upload command/runtime split, reissue model, crash-step coverage,
      stateful trace coverage, and mechanical boundary checks are in place.
-     Multipart and UploadPart publishers are explicitly inventoried as Phase
-     9.3 deferrals where they still use multipart-specific `set_pending...` or
+     Multipart and UploadPart publishers were explicitly inventoried for Phase
+     9.3 where they still used multipart-specific `set_pending...` or
      `try_set...` shapes. The follow-up finish/convergence pass is also in
      place: command-log conflicts surfaced while finishing a partially applied
      command are classified separately from pending-slot install contention,
@@ -2838,14 +2838,13 @@ Proposed subphases:
    - minimum exit criteria before Phase 9.3:
      - Phase 9.2 invariants are documented
      - all current metadata command publisher paths are classified, with a
-       secondary command-kind summary and explicit Phase 9.3 deferrals where
-       the multipart-specific pending-slot shape remains
+       secondary command-kind summary; historical multipart-specific
+       pending-slot deferrals were closed in Phase 9.3
      - all production pending-command install call sites are inventoried and
        tied to that publisher/path classification
      - non-multipart snapshot-sensitive publishers use the common
        restart-on-contention shape or are explicitly documented as already
-       covered; multipart/UploadPart publishers are explicitly deferred to
-       Phase 9.3
+       covered; multipart/UploadPart publishers are covered by Phase 9.3
      - stream upload command-owned records are separated from runtime allocator
        fields
        - status: terminal MPU cleanup commands now carry
@@ -2866,7 +2865,7 @@ Proposed subphases:
      multipart-specific pending-slot loops with PG-primary command
      serialization and fresh-snapshot retry rules
    - scope:
-     - convert the Phase 9.2H deferrals from
+     - convert the Phase 9.2H multipart publisher deferrals from
        [metadata-command-stream.md](../guides/metadata-command-stream.md):
        `begin_upload_part_stream_session`,
        `create_upload_part_stream_session`, `finalize_upload_part_stream`,
@@ -2901,9 +2900,9 @@ Proposed subphases:
       - status: complete. The multipart command-stream invariants are now
         documented in
         [metadata-command-stream.md](../guides/metadata-command-stream.md),
-        and the boundary script inventory remains the source of truth for the
-        still-deferred multipart pending-slot publishers while the following
-        subphases convert them.
+        and the boundary script inventory remains the source of truth for
+        multipart pending-slot publisher shapes while the following subphases
+        convert them.
       - inventory every multipart publisher, finisher, cleanup path, and helper
         that touches:
         - `multipart_uploads`, `multipart_parts`,
@@ -2929,19 +2928,19 @@ Proposed subphases:
           contention
         - duplicate UploadPart/finalize retries are accepted only when the
           command-owned row image and cleanup refs match exactly
-      - update the boundary script so the remaining multipart deferrals are
-        expected only while this phase is in progress, and so newly introduced
-        multipart pending-slot publishers fail loudly unless documented
+      - update the boundary script so multipart pending-slot publishers fail
+        loudly unless documented, and so temporary multipart deferrals are
+        visible only while the relevant subphase is in progress
       - exit when the audit table, guide text, and boundary allowlist agree
 
    2. Phase 9.3.2: UploadPart stream session creation
       - status: complete. `begin_upload_part_stream_session` and
-        `create_upload_part_stream_session` now use explicit pending-slot
-        install attempts and restart from fresh MPU state after command-id or
-        slot contention. Coverage includes a competing UploadPart stream
-        session that forces the caller action to rerun, abort winning the slot
-        before session creation, raced aborted/completing upload state, and
-        crash-shape pending-slot rehydrate/convergence after reopen.
+        `create_upload_part_stream_session` now use the snapshot-sensitive
+        install-or-drain wrapper and restart from fresh MPU state after
+        command-id or slot contention. Coverage includes a competing UploadPart
+        stream session that forces the caller action to rerun, abort winning the
+        slot before session creation, raced aborted/completing upload state,
+        and crash-shape pending-slot rehydrate/convergence after reopen.
       - convert `begin_upload_part_stream_session` and
         `create_upload_part_stream_session` to the snapshot-sensitive
         install-or-drain shape:
@@ -3182,21 +3181,32 @@ Proposed subphases:
           `multipart_abort_partial_apply_retry_cleans_uploaded_part_payload`,
           `multipart_abort_partial_apply_reopens_and_converges`, and the trace
           stale-abort branch.
-      - remaining Phase 9.3 publisher allowlist and documentation deferrals are
-        intentionally left to Phase 9.3.7, which removes the temporary
-        `metadata-command-stream.md` deferral wording and boundary-script
-        exemptions after the final publisher cleanup pass.
+      - the final publisher cleanup pass was completed in Phase 9.3.7, which
+        removed the temporary `metadata-command-stream.md` deferral wording and
+        boundary-script exemptions.
 
    7. Phase 9.3.7: remove local-lock authority and clean up deferrals
+      - status: complete. `begin_upload_part_stream_session` and
+        `complete_multipart_upload_commit_serialized` now use
+        `install_snapshot_sensitive_metadata_command_or_drain`, so the final
+        multipart snapshot-sensitive publishers drain a winning PG slot and
+        restart from fresh state instead of calling the lower-level pending-slot
+        helpers directly.
       - remove Phase 9.3 deferral wording from
-        [metadata-command-stream.md](../guides/metadata-command-stream.md) once
-        each publisher has been converted
+        [metadata-command-stream.md](../guides/metadata-command-stream.md)
       - update `scripts/check-storage-cluster-boundaries` so multipart
         publishers are no longer exempt from snapshot-sensitive install rules
       - make any remaining local multipart locks clearly performance-only, or
         remove them if they no longer reduce useful contention
+        - status: `lock_multipart_completion_bucket` is documented as an
+          in-process contention reducer only; completed-upload order and object
+          publication correctness come from bucket-PG/object-PG commands,
+          durable pending slots, and command apply validation
       - remove or gate any remaining direct/test-only multipart mutators that
         can bypass the command stream
+        - status: remaining direct multipart seeders/mutators are `#[cfg(test)]`
+          or `#[cfg(any(test, feature = "test-hooks"))]`; production multipart
+          mutation paths go through the metadata command stream
       - run:
         - `cargo fmt`
         - `./scripts/check-storage-cluster-boundaries`
@@ -3204,6 +3214,8 @@ Proposed subphases:
         - targeted server-core and s3-tests multipart suites
         - `cargo clippy --all-targets --all-features -- -D warnings`
         - full `cargo nextest run`
+        - status: all targeted checks and clippy passed; full nextest passed
+          for this closeout
       - exit when the Phase 9.2H publisher table has no Phase 9.3 deferrals,
         the boundary script enforces that state, and the race matrix passes
 5. Phase 9.4 bucket write drain

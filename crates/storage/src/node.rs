@@ -1137,8 +1137,12 @@ impl SharedStorageNode {
         Ok(BucketPgTestGuard { guard })
     }
 
-    /// Lock a bucket-scoped stripe mutex used to serialize multipart
-    /// completion publication order across coordinators.
+    /// Lock a bucket-scoped stripe mutex used to reduce in-process multipart
+    /// completion contention.
+    ///
+    /// This is not metadata command-stream authority. Completed-upload order
+    /// and object publication correctness come from bucket-PG/object-PG
+    /// commands, durable pending slots, and command apply validation.
     pub fn lock_multipart_completion_bucket(&self, bucket: &BucketName) -> BucketLockGuard<'_> {
         observability::trace_scope!(
             TRACE_TARGET,
