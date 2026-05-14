@@ -248,6 +248,12 @@ type StreamAbortHook = Arc<dyn Fn() + Send + Sync>;
 type MetadataCommandPendingInstallHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
+type DirectPutCommandIdHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
+type StreamAppendCommandIdHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
 pub type PayloadShardCleanupTestHook =
     Arc<dyn Fn(&ShardKey) -> Result<(), StoreError> + Send + Sync>;
 
@@ -259,6 +265,8 @@ pub type PayloadCleanupErrorTestHook = Arc<dyn Fn(&'static str, &StoreError) + S
 struct StorageClusterTestHooks {
     before_stream_abort_storage: Option<StreamAbortHook>,
     before_metadata_command_pending_install: Option<MetadataCommandPendingInstallHook>,
+    before_direct_put_command_id: Option<DirectPutCommandIdHook>,
+    before_stream_append_command_id: Option<StreamAppendCommandIdHook>,
     before_placed_payload_shard_delete: Option<PayloadShardCleanupTestHook>,
     before_metadata_primary_payload_ack_delete: Option<PayloadShardCleanupTestHook>,
     best_effort_payload_cleanup_error: Option<PayloadCleanupErrorTestHook>,
@@ -271,6 +279,16 @@ pub struct StreamAbortTestHookGuard {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct MetadataCommandPendingInstallHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct DirectPutCommandIdHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct StreamAppendCommandIdHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -301,6 +319,20 @@ impl Drop for MetadataCommandPendingInstallHookGuard {
             .lock()
             .unwrap()
             .before_metadata_command_pending_install = None;
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for DirectPutCommandIdHookGuard {
+    fn drop(&mut self) {
+        self.hooks.lock().unwrap().before_direct_put_command_id = None;
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for StreamAppendCommandIdHookGuard {
+    fn drop(&mut self) {
+        self.hooks.lock().unwrap().before_stream_append_command_id = None;
     }
 }
 
@@ -831,6 +863,38 @@ impl StorageCluster {
             hook();
         }
     }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn maybe_run_before_direct_put_command_id_hook(&self) {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .before_direct_put_command_id
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    fn maybe_run_before_direct_put_command_id_hook(&self) {}
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn maybe_run_before_stream_append_command_id_hook(&self) {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .before_stream_append_command_id
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    fn maybe_run_before_stream_append_command_id_hook(&self) {}
 
     #[cfg(not(any(test, feature = "test-hooks")))]
     fn maybe_run_before_metadata_command_pending_install_hook(&self) {}
@@ -1387,6 +1451,31 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_before_direct_put_command_id_hook(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> DirectPutCommandIdHookGuard {
+        self.test_hooks.lock().unwrap().before_direct_put_command_id = Some(hook);
+        DirectPutCommandIdHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_before_stream_append_command_id_hook(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> StreamAppendCommandIdHookGuard {
+        self.test_hooks
+            .lock()
+            .unwrap()
+            .before_stream_append_command_id = Some(hook);
+        StreamAppendCommandIdHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_install_before_placed_payload_shard_delete_hook(
         &self,
         hook: PayloadShardCleanupTestHook,
@@ -1630,8 +1719,12 @@ impl StorageCluster {
             }
             let generation_id = object_pg.next_generation_id(bucket, key)?;
             drop(object_pg);
+            let Some(command_id) = self.next_object_metadata_command_id_or_drain(pg_id, bucket)?
+            else {
+                continue;
+            };
             let command = MetadataCommandEnvelope::new(
-                self.next_object_metadata_command_id(pg_id)?,
+                command_id,
                 MetadataCommandPayload::ReserveObjectGeneration(
                     ReserveObjectGenerationCommand::new(
                         bucket.clone(),
@@ -1728,8 +1821,12 @@ impl StorageCluster {
             }
 
             let version_id = self.max_next_object_version_id_on_acting_set(pg_id, bucket, key)?;
+            let Some(command_id) = self.next_object_metadata_command_id_or_drain(pg_id, bucket)?
+            else {
+                continue;
+            };
             let command = MetadataCommandEnvelope::new(
-                self.next_object_metadata_command_id(pg_id)?,
+                command_id,
                 MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
                     bucket.clone(),
                     key.clone(),
@@ -1921,8 +2018,12 @@ impl StorageCluster {
                 }
             }
 
+            let Some(command_id) = self.next_object_metadata_command_id_or_drain(pg_id, bucket)?
+            else {
+                continue;
+            };
             let command = MetadataCommandEnvelope::new(
-                self.next_object_metadata_command_id(pg_id)?,
+                command_id,
                 MetadataCommandPayload::ReleaseObjectGeneration(
                     ReleaseObjectGenerationCommand::new(
                         bucket.clone(),
@@ -2026,6 +2127,21 @@ impl StorageCluster {
     ) -> Result<MetadataCommandId, ObjectPgActionError> {
         self.next_metadata_command_id(pg_id)
             .map_err(ObjectPgActionError::from)
+    }
+
+    fn next_object_metadata_command_id_or_drain(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<MetadataCommandId>, ObjectPgActionError> {
+        match self.next_object_metadata_command_id(pg_id) {
+            Ok(command_id) => Ok(Some(command_id)),
+            Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict { .. })) => {
+                self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn next_object_metadata_command_id_from_locked_pg(
@@ -2286,8 +2402,12 @@ impl StorageCluster {
                     }
                 }
             }
+            let Some(command_id) = self.next_object_metadata_command_id_or_drain(pg_id, bucket)?
+            else {
+                continue;
+            };
             let command = MetadataCommandEnvelope::new(
-                self.next_object_metadata_command_id(pg_id)?,
+                command_id,
                 MetadataCommandPayload::ReleaseObjectGeneration(
                     ReleaseObjectGenerationCommand::new(
                         bucket.clone(),
@@ -2452,10 +2572,39 @@ impl StorageCluster {
                         VersionId::Null
                     };
                     let object_pg = object_node.get_pg(pg_id.get())?;
+                    self.maybe_run_before_direct_put_command_id_hook();
                     let command = match self.prepare_commit_direct_put_object_command(
                         pg_id, &object_pg, req, version_id,
                     ) {
                         Ok(command) => command,
+                        Err(ObjectPgActionError::Store(
+                            StoreError::MetadataCommandLogConflict { .. },
+                        )) => {
+                            drop(object_pg);
+                            if let Err(error) = self
+                                .drain_pending_object_metadata_commands_for_bucket(
+                                    pg_id,
+                                    &req.bucket,
+                                )
+                            {
+                                drop(_bucket_guard);
+                                self.release_object_generation_reservation_after_pending_drain_best_effort(
+                                    pg_id,
+                                    &req.bucket,
+                                    &req.key,
+                                    &req.generation_reservation_id,
+                                );
+                                self.delete_direct_put_segment_payload_shards(
+                                    req.data_pg_id,
+                                    req.ec,
+                                    &req.segment_okh,
+                                    req.segment_vid,
+                                    written_shards,
+                                );
+                                return Err(error);
+                            }
+                            continue;
+                        }
                         Err(error) => {
                             drop(object_pg);
                             drop(_bucket_guard);
@@ -3205,22 +3354,10 @@ impl StorageCluster {
             }
         };
         let _bucket_guard = object_node.lock_bucket(bucket);
-        if let Err(error) = self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket) {
-            self.delete_payload_shard_keys_best_effort(
-                segment_record.data_pg_id,
-                EcShape {
-                    k: segment_record.ec_k,
-                    m: segment_record.ec_m,
-                },
-                &segment_record.segment_okh,
-                segment_record.segment_vid,
-                shard_batch.iter().map(|(key, _)| (*key).clone()),
-            );
-            return Err(error);
-        }
-        let object_pg = match object_node.get_pg(pg_id.get()) {
-            Ok(pg) => pg,
-            Err(error) => {
+        loop {
+            if let Err(error) =
+                self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+            {
                 self.delete_payload_shard_keys_best_effort(
                     segment_record.data_pg_id,
                     EcShape {
@@ -3231,109 +3368,155 @@ impl StorageCluster {
                     segment_record.segment_vid,
                     shard_batch.iter().map(|(key, _)| (*key).clone()),
                 );
-                return Err(error.into());
+                return Err(error);
             }
-        };
-        let session = match object_pg.get_stream_upload(session_id) {
-            Ok(session) => session,
-            Err(error) => {
-                drop(object_pg);
-                self.delete_payload_shard_keys_best_effort(
-                    segment_record.data_pg_id,
-                    EcShape {
-                        k: segment_record.ec_k,
-                        m: segment_record.ec_m,
-                    },
-                    &segment_record.segment_okh,
-                    segment_record.segment_vid,
-                    shard_batch.iter().map(|(key, _)| (*key).clone()),
-                );
-                return Err(error.into());
+            let object_pg = match object_node.get_pg(pg_id.get()) {
+                Ok(pg) => pg,
+                Err(error) => {
+                    self.delete_payload_shard_keys_best_effort(
+                        segment_record.data_pg_id,
+                        EcShape {
+                            k: segment_record.ec_k,
+                            m: segment_record.ec_m,
+                        },
+                        &segment_record.segment_okh,
+                        segment_record.segment_vid,
+                        shard_batch.iter().map(|(key, _)| (*key).clone()),
+                    );
+                    return Err(error.into());
+                }
+            };
+            let session = match object_pg.get_stream_upload(session_id) {
+                Ok(session) => session,
+                Err(error) => {
+                    drop(object_pg);
+                    self.delete_payload_shard_keys_best_effort(
+                        segment_record.data_pg_id,
+                        EcShape {
+                            k: segment_record.ec_k,
+                            m: segment_record.ec_m,
+                        },
+                        &segment_record.segment_okh,
+                        segment_record.segment_vid,
+                        shard_batch.iter().map(|(key, _)| (*key).clone()),
+                    );
+                    return Err(error.into());
+                }
+            };
+            let existing_stream_segment = match object_pg.list_stream_segments(session_id) {
+                Ok(segments) => segments
+                    .into_iter()
+                    .find(|segment| segment.segment_index == segment_index),
+                Err(error) => {
+                    drop(object_pg);
+                    self.delete_payload_shard_keys_best_effort(
+                        segment_record.data_pg_id,
+                        EcShape {
+                            k: segment_record.ec_k,
+                            m: segment_record.ec_m,
+                        },
+                        &segment_record.segment_okh,
+                        segment_record.segment_vid,
+                        shard_batch.iter().map(|(key, _)| (*key).clone()),
+                    );
+                    return Err(error.into());
+                }
+            };
+            drop(object_pg);
+            let _ = session;
+            match existing_stream_segment {
+                Some(existing) if existing == *segment_record => return Ok(()),
+                Some(_) => {
+                    self.delete_payload_shard_keys_best_effort(
+                        segment_record.data_pg_id,
+                        EcShape {
+                            k: segment_record.ec_k,
+                            m: segment_record.ec_m,
+                        },
+                        &segment_record.segment_okh,
+                        segment_record.segment_vid,
+                        shard_batch.iter().map(|(key, _)| (*key).clone()),
+                    );
+                    return Err(ObjectPgActionError::InvalidRequest {
+                        reason: format!("duplicate segment_index {segment_index}"),
+                    });
+                }
+                None => {}
             }
-        };
-        let existing_stream_segment = match object_pg.list_stream_segments(session_id) {
-            Ok(segments) => segments
-                .into_iter()
-                .find(|segment| segment.segment_index == segment_index),
-            Err(error) => {
-                drop(object_pg);
-                self.delete_payload_shard_keys_best_effort(
-                    segment_record.data_pg_id,
-                    EcShape {
-                        k: segment_record.ec_k,
-                        m: segment_record.ec_m,
-                    },
-                    &segment_record.segment_okh,
-                    segment_record.segment_vid,
-                    shard_batch.iter().map(|(key, _)| (*key).clone()),
-                );
-                return Err(error.into());
-            }
-        };
-        drop(object_pg);
-        let _ = session;
-        match existing_stream_segment {
-            Some(existing) if existing == *segment_record => return Ok(()),
-            Some(_) => {
-                self.delete_payload_shard_keys_best_effort(
-                    segment_record.data_pg_id,
-                    EcShape {
-                        k: segment_record.ec_k,
-                        m: segment_record.ec_m,
-                    },
-                    &segment_record.segment_okh,
-                    segment_record.segment_vid,
-                    shard_batch.iter().map(|(key, _)| (*key).clone()),
-                );
-                return Err(ObjectPgActionError::InvalidRequest {
-                    reason: format!("duplicate segment_index {segment_index}"),
-                });
-            }
-            None => {}
-        }
 
-        if let Err(error) = self.register_payload_shard_acks(segment_record.data_pg_id, shard_batch)
-        {
-            self.delete_payload_shard_keys_best_effort(
-                segment_record.data_pg_id,
-                EcShape {
-                    k: segment_record.ec_k,
-                    m: segment_record.ec_m,
-                },
-                &segment_record.segment_okh,
-                segment_record.segment_vid,
-                shard_batch.iter().map(|(key, _)| (*key).clone()),
-            );
-            return Err(error);
-        }
+            self.maybe_run_before_stream_append_command_id_hook();
+            let command_id = match self.next_object_metadata_command_id(pg_id) {
+                Ok(command_id) => command_id,
+                Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                    ..
+                })) => {
+                    continue;
+                }
+                Err(error) => {
+                    self.delete_payload_shard_keys_best_effort(
+                        segment_record.data_pg_id,
+                        EcShape {
+                            k: segment_record.ec_k,
+                            m: segment_record.ec_m,
+                        },
+                        &segment_record.segment_okh,
+                        segment_record.segment_vid,
+                        shard_batch.iter().map(|(key, _)| (*key).clone()),
+                    );
+                    return Err(error);
+                }
+            };
 
-        let command = MetadataCommandEnvelope::new(
-            self.next_object_metadata_command_id(pg_id)?,
-            MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                segment: segment_record.clone(),
-            })),
-        );
-        if let Err(error) = self.set_pending_metadata_command_for_bucket(
-            pg_id,
-            bucket,
-            &command,
-            "conflicting pending command for stream segment append",
-        ) {
-            self.delete_payload_shard_keys_best_effort(
-                segment_record.data_pg_id,
-                EcShape {
-                    k: segment_record.ec_k,
-                    m: segment_record.ec_m,
-                },
-                &segment_record.segment_okh,
-                segment_record.segment_vid,
-                shard_batch.iter().map(|(key, _)| (*key).clone()),
+            if let Err(error) =
+                self.register_payload_shard_acks(segment_record.data_pg_id, shard_batch)
+            {
+                self.delete_payload_shard_keys_best_effort(
+                    segment_record.data_pg_id,
+                    EcShape {
+                        k: segment_record.ec_k,
+                        m: segment_record.ec_m,
+                    },
+                    &segment_record.segment_okh,
+                    segment_record.segment_vid,
+                    shard_batch.iter().map(|(key, _)| (*key).clone()),
+                );
+                return Err(error);
+            }
+
+            let command = MetadataCommandEnvelope::new(
+                command_id,
+                MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    segment: segment_record.clone(),
+                })),
             );
-            return Err(error);
+            if let Err(error) = self.set_pending_metadata_command_for_bucket(
+                pg_id,
+                bucket,
+                &command,
+                "conflicting pending command for stream segment append",
+            ) {
+                self.delete_payload_shard_keys_best_effort(
+                    segment_record.data_pg_id,
+                    EcShape {
+                        k: segment_record.ec_k,
+                        m: segment_record.ec_m,
+                    },
+                    &segment_record.segment_okh,
+                    segment_record.segment_vid,
+                    shard_batch.iter().map(|(key, _)| (*key).clone()),
+                );
+                return Err(error);
+            }
+            return self.apply_new_stream_append_command(
+                pg_id,
+                bucket,
+                &command,
+                segment_record,
+                shard_batch,
+            );
         }
-        self.apply_new_stream_append_command(pg_id, bucket, &command, segment_record, shard_batch)
     }
 
     fn register_payload_shard_acks(
@@ -3391,8 +3574,17 @@ impl StorageCluster {
             let _ = session;
             let staged_segments = object_pg.list_stream_segments(session_id)?;
             drop(object_pg);
+            let command_id = match self.next_object_metadata_command_id(pg_id) {
+                Ok(command_id) => command_id,
+                Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                    ..
+                })) => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let command = MetadataCommandEnvelope::new(
-                self.next_object_metadata_command_id(pg_id)?,
+                command_id,
                 MetadataCommandPayload::AbortStreamUpload(Box::new(AbortStreamUploadCommand {
                     bucket: bucket.clone(),
                     key: key.clone(),

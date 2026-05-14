@@ -7421,6 +7421,167 @@ mod tests {
     }
 
     #[test]
+    fn direct_put_command_id_race_drains_winner_and_reruns_precondition_action() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut first_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = first_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "direct-put-command-id-race-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut first_map, 1, NodeId::new(1));
+        set_route_primary(&mut first_map, 2, NodeId::new(1));
+
+        let mut second_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        set_route_primary(&mut second_map, 1, NodeId::new(1));
+        set_route_primary(&mut second_map, 2, NodeId::new(1));
+
+        let first_map = Arc::new(first_map);
+        let second_map = Arc::new(second_map);
+        let first_cluster = crate::StorageCluster::from_local_map(Arc::clone(&first_map)).unwrap();
+        let second_cluster =
+            crate::StorageCluster::from_local_map(Arc::clone(&second_map)).unwrap();
+        create_test_bucket(&first_cluster, &bucket);
+
+        let loser_payload = b"loser direct put command id";
+        let loser_reservation_id =
+            crate::SessionId::try_from("31313131313131313131313131313131".to_string()).unwrap();
+        let loser_generation_id = first_cluster
+            .reserve_put_object_generation(&bucket, &key, &loser_reservation_id)
+            .unwrap();
+        let loser_written = first_cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                loser_generation_id,
+                0,
+                &[0xa1; 16],
+                loser_payload,
+            )
+            .unwrap();
+        let loser_req = direct_put_commit_req(
+            &bucket,
+            &key,
+            loser_reservation_id,
+            loser_generation_id,
+            loser_payload,
+            [0xa1; 16],
+            &loser_written,
+        );
+
+        let winner_payload = b"winner direct put command id";
+        let winner_reservation_id =
+            crate::SessionId::try_from("32323232323232323232323232323232".to_string()).unwrap();
+        let winner_generation_id = second_cluster
+            .reserve_put_object_generation(&bucket, &key, &winner_reservation_id)
+            .unwrap();
+        let winner_written = second_cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                winner_generation_id,
+                0,
+                &[0xa2; 16],
+                winner_payload,
+            )
+            .unwrap();
+        let winner_req = direct_put_commit_req(
+            &bucket,
+            &key,
+            winner_reservation_id,
+            winner_generation_id,
+            winner_payload,
+            [0xa2; 16],
+            &winner_written,
+        );
+
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let action_calls = Arc::new(AtomicUsize::new(0));
+        let hook_cluster = Arc::clone(&second_cluster);
+        let hook_map = Arc::clone(&second_map);
+        let hook_bucket = bucket.clone();
+        let hook_req = winner_req.clone();
+        let hook_written_shards = winner_written.written_shards.clone();
+        let hook_ran_for_closure = Arc::clone(&hook_ran);
+        let _hook_guard =
+            first_cluster.test_install_before_direct_put_command_id_hook(Arc::new(move || {
+                if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let pg_id = PgId::new(2);
+                let shard_batch: Vec<(&ShardKey, WriteAck)> = hook_written_shards
+                    .iter()
+                    .map(|written| (&written.key, written.ack))
+                    .collect();
+                hook_cluster
+                    .register_payload_shard_acks(hook_req.data_pg_id, &shard_batch)
+                    .unwrap();
+                let primary = hook_map
+                    .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+                    .unwrap();
+                let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+                let command = hook_cluster
+                    .prepare_commit_direct_put_object_command(
+                        pg_id,
+                        &pg,
+                        &hook_req,
+                        crate::VersionId::Null,
+                    )
+                    .unwrap();
+                pg.try_insert_pending_metadata_command_slot(
+                    primary.node_id().as_u32(),
+                    &command,
+                    Some(&hook_bucket),
+                )
+                .unwrap();
+            }));
+
+        let calls_for_action = Arc::clone(&action_calls);
+        let result = first_cluster
+            .commit_direct_put_object_from_payload_shards(
+                &loser_req,
+                &loser_written.written_shards,
+                move |snapshot| {
+                    calls_for_action.fetch_add(1, Ordering::SeqCst);
+                    if snapshot.existing_etag.is_some() {
+                        Err("object already exists")
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap();
+        assert!(matches!(result, Err("object already exists")));
+        assert!(hook_ran.load(Ordering::SeqCst));
+        assert_eq!(
+            action_calls.load(Ordering::SeqCst),
+            2,
+            "direct PUT precondition must be rerun after command-id contention changes object state"
+        );
+        assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_none());
+
+        for node_id in node_ids {
+            let pg = first_map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(2)
+                .unwrap();
+            let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+            let live = stored.as_live().expect("winner object is live");
+            assert_eq!(live.generation_id, winner_generation_id);
+            assert_eq!(live.size, winner_payload.len() as u64);
+        }
+    }
+
+    #[test]
     fn stream_put_finalize_pending_install_race_reruns_precondition_action() {
         let _guard = lock_metadata_command_apply_hook_test();
         let tmp = test_util::tempdir();
@@ -15881,6 +16042,121 @@ mod tests {
     }
 
     #[test]
+    fn stream_put_append_command_id_race_drains_winner_before_ack_publish() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let contender = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let session_id = crate::SessionId::try_from("34".repeat(16)).unwrap();
+        cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                &session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap();
+        let payload = b"stream append command id race";
+        let (_target, segment) = cluster
+            .prepare_stream_segment_append(
+                &bucket,
+                &key,
+                &crate::PrepareStreamUploadSegmentAppendReq {
+                    session_id: session_id.clone(),
+                    segment_index: 0,
+                    size: payload.len() as u64,
+                    segment_crc64: Some(checksum::crc64::checksum(payload)),
+                    segment_okh: [98; 16],
+                },
+            )
+            .unwrap();
+        let written_shards = cluster
+            .write_stream_segment_payload_shards(&segment, payload)
+            .unwrap();
+        let shard_batch: Vec<(&crate::ShardKey, crate::WriteAck)> = written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect();
+        let hook_shard_batch: Vec<(crate::ShardKey, crate::WriteAck)> = written_shards
+            .iter()
+            .map(|written| (written.key.clone(), written.ack))
+            .collect();
+
+        let hook_map = Arc::clone(&map);
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let hook_segment = segment.clone();
+        let hook_once = Arc::new(AtomicBool::new(true));
+        let hook_once_for_closure = Arc::clone(&hook_once);
+        let _guard =
+            cluster.test_install_before_stream_append_command_id_hook(Arc::new(move || {
+                if !hook_once_for_closure.swap(false, Ordering::SeqCst) {
+                    return;
+                }
+                let pg_id = PgId::new(object_pg);
+                let command_id = contender.next_object_metadata_command_id(pg_id).unwrap();
+                let hook_shard_refs: Vec<(&crate::ShardKey, crate::WriteAck)> = hook_shard_batch
+                    .iter()
+                    .map(|(key, ack)| (key, *ack))
+                    .collect();
+                contender
+                    .register_payload_shard_acks(hook_segment.data_pg_id, &hook_shard_refs)
+                    .unwrap();
+                let command = MetadataCommandEnvelope::new(
+                    command_id,
+                    MetadataCommandPayload::AppendStreamSegment(Box::new(
+                        AppendStreamSegmentCommand {
+                            bucket: hook_bucket.clone(),
+                            key: hook_key.clone(),
+                            segment: hook_segment.clone(),
+                        },
+                    )),
+                );
+                insert_pending_metadata_command_for_test(&hook_map, pg_id, &hook_bucket, &command);
+            }));
+
+        cluster
+            .commit_stream_segment_append(
+                &bucket,
+                &key,
+                &session_id,
+                segment.segment_index,
+                &segment,
+                &shard_batch,
+            )
+            .unwrap();
+
+        assert!(!hook_once.load(Ordering::SeqCst));
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+        assert_clean_metadata_command_stream(&map, &[object_pg]);
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::list_stream_segments(&*pg, &session_id).unwrap(),
+                vec![segment.clone()]
+            );
+        }
+    }
+
+    #[test]
     fn stream_abort_pending_drain_cleans_terminal_stream_session() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -20138,6 +20414,65 @@ mod tests {
     }
 
     #[test]
+    fn completed_multipart_order_command_id_race_drains_winner_and_retries() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "mpu-order-command-id-race-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let contender = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let hook_map = Arc::clone(&map);
+        let hook_bucket = bucket.clone();
+        let hook_once = Arc::new(AtomicBool::new(true));
+        let hook_once_for_closure = Arc::clone(&hook_once);
+        let _hook_guard = cluster.test_install_before_completed_multipart_order_command_id_hook(
+            Arc::new(move || {
+                if !hook_once_for_closure.swap(false, Ordering::SeqCst) {
+                    return;
+                }
+                let pg_id = PgId::new(1);
+                let command = MetadataCommandEnvelope::new(
+                    contender.next_metadata_command_id(pg_id).unwrap(),
+                    MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
+                        AdvanceCompletedMultipartUploadSequenceCommand {
+                            bucket: hook_bucket.clone(),
+                            completion_order: 1,
+                        },
+                    ),
+                );
+                insert_pending_metadata_command_for_test(&hook_map, pg_id, &hook_bucket, &command);
+            }),
+        );
+
+        let completion_order = cluster
+            .test_reserve_completed_multipart_upload_order(&bucket)
+            .unwrap();
+
+        assert!(!hook_once.load(Ordering::SeqCst));
+        assert_eq!(completion_order, 2);
+        assert!(pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none());
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let info =
+                crate::traits::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.completed_multipart_upload_sequence, 2);
+        }
+        assert_clean_metadata_command_stream(&map, &[1]);
+    }
+
+    #[test]
     fn multipart_completion_drains_matching_pending_completion() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -20937,6 +21272,66 @@ mod tests {
                 crate::traits::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket).unwrap();
             assert_eq!(info.completed_multipart_upload_sequence, completion_order);
         }
+    }
+
+    #[test]
+    fn completed_multipart_order_drains_other_bucket_sequence_without_stealing_order() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket_a = bucket_for_pg(topology, 1, "mpu-order-other-a-");
+        let bucket_b = bucket_for_pg(topology, 1, "mpu-order-other-b-");
+        assert_ne!(bucket_a, bucket_b);
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket_a);
+        create_test_bucket(&cluster, &bucket_b);
+
+        assert_eq!(
+            cluster
+                .test_reserve_completed_multipart_upload_order(&bucket_b)
+                .unwrap(),
+            1
+        );
+
+        let pg_id = PgId::new(1);
+        let command = MetadataCommandEnvelope::new(
+            cluster.next_metadata_command_id(pg_id).unwrap(),
+            MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
+                AdvanceCompletedMultipartUploadSequenceCommand {
+                    bucket: bucket_a.clone(),
+                    completion_order: 1,
+                },
+            ),
+        );
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket_a, &command);
+
+        assert_eq!(
+            cluster
+                .test_reserve_completed_multipart_upload_order(&bucket_b)
+                .unwrap(),
+            2
+        );
+        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket_b).is_none());
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let bucket_a_info =
+                crate::traits::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket_a).unwrap();
+            let bucket_b_info =
+                crate::traits::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket_b).unwrap();
+            assert_eq!(bucket_a_info.completed_multipart_upload_sequence, 1);
+            assert_eq!(bucket_b_info.completed_multipart_upload_sequence, 2);
+        }
+        assert_clean_metadata_command_stream(&map, &[1]);
     }
 
     #[test]

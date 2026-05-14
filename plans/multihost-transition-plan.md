@@ -2524,15 +2524,21 @@ Proposed subphases:
        fresh metadata snapshot before rebuilding the command. This restart
        shape is used for object metadata mutation, conditional object delete,
        delete-marker insertion, direct PUT finalization, stream PUT
-       session creation, stream PUT abort, stream PUT finalization, multipart
-       upload creation, lifecycle current-object expiry, lifecycle noncurrent
-       expiry, and expired delete-marker removal. Tests cover both an
+       segment append, stream PUT session creation, stream PUT abort,
+       stream PUT finalization, multipart upload creation, lifecycle
+       current-object expiry, lifecycle noncurrent expiry, and expired
+       delete-marker removal. The bucket-PG publishers and object
+       generation/version reservation helpers also drain command-id contention
+       after their pending-slot checks, so a same-PG winner does not surface as
+       an internal metadata-log conflict. Tests cover both an
        unrelated-object retry
        (`object_metadata_pending_install_race_drains_winner_and_retries`) and a
        same-key race where the winner changes the losing request's object-tag
        precondition
        (`object_metadata_pending_install_race_reruns_precondition_action`).
        `direct_put_pending_install_race_reruns_precondition_action`,
+       `direct_put_command_id_race_drains_winner_and_reruns_precondition_action`,
+       `stream_put_append_command_id_race_drains_winner_before_ack_publish`,
        `stream_abort_pending_install_race_rebuilds_staged_segments`,
        `stream_put_finalize_pending_install_race_reruns_precondition_action`,
        `stream_put_create_pending_install_race_reruns_authorization_action`,

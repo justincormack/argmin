@@ -157,21 +157,21 @@ Current production pending-command publishers:
 
 | Publisher path | Command kind | Class | Required contention shape |
 | --- | --- | --- | --- |
-| `create_bucket_with_config_and_load_info` | `CreateBucket` | `ApplyValidated` | Drain competing PG slot; exact-row apply handles idempotence/conflict. |
+| `create_bucket_with_config_and_load_info` | `CreateBucket` | `ApplyValidated` | Drain competing PG slot during pending-slot checks and command-id allocation; exact-row apply handles idempotence/conflict. |
 | `begin_bucket_delete` | `MarkBucketDeleting` | `SnapshotSensitive` | Rebuild from current bucket/delete preconditions after contention. |
-| `delete_completed_multipart_upload_record_with_command` | `DeleteCompletedMultipartUpload` | `ApplyValidated` | Drain competing PG slot; delete is exact tombstone cleanup. |
-| `put_bucket_versioning_and_load_info` | `PutBucketVersioning` | `SnapshotSensitive` | Rebuild bucket post-image after contention. |
-| `put_bucket_acl_and_load_info` | `PutBucketAcl` | `SnapshotSensitive` | Rebuild bucket post-image after contention. |
-| `put_bucket_property_command_and_load_info` | `PutBucketProperty` | `SnapshotSensitive` | Rebuild bucket post-image after contention. |
-| `put_bucket_subresource_command_and_load_info` | `PutBucketSubresource` | `SnapshotSensitive` | Rebuild bucket post-image after contention. |
-| `reserve_put_object_generation` | `ReserveObjectGeneration` | `AllocatorCleanup` | Drain competing PG slot, then allocate/reuse through the reservation owner; do not release a non-matching reservation. |
-| `reserve_next_object_version` | `ReserveObjectVersion` | `AllocatorCleanup` | Drain competing PG slot, then allocate/reuse through the version reservation owner. |
-| `release_object_generation_reservation_command_required` | `ReleaseObjectGeneration` | `AllocatorCleanup` | Required cleanup must retry through slot contention until terminal or fail without losing the cleanup intent. |
-| `release_object_generation_reservation` | `ReleaseObjectGeneration` | `AllocatorCleanup` | Release an already-owned reservation; drain competing PG slot and retry. |
-| `commit_direct_put_object_from_payload_shards` | `CommitDirectPutObject` | `SnapshotSensitive` | Rebuild commit from fresh object preconditions and stale-payload snapshot after contention. |
+| `delete_completed_multipart_upload_record_with_command` | `DeleteCompletedMultipartUpload` | `ApplyValidated` | Drain competing PG slot during pending-slot checks and command-id allocation; delete is exact tombstone cleanup. |
+| `put_bucket_versioning_and_load_info` | `PutBucketVersioning` | `SnapshotSensitive` | Drain competing PG slot during pending-slot checks and command-id allocation; rebuild bucket post-image after contention. |
+| `put_bucket_acl_and_load_info` | `PutBucketAcl` | `SnapshotSensitive` | Drain competing PG slot during pending-slot checks and command-id allocation; rebuild bucket post-image after contention. |
+| `put_bucket_property_command_and_load_info` | `PutBucketProperty` | `SnapshotSensitive` | Drain competing PG slot during pending-slot checks and command-id allocation; rebuild bucket post-image after contention. |
+| `put_bucket_subresource_command_and_load_info` | `PutBucketSubresource` | `SnapshotSensitive` | Drain competing PG slot during pending-slot checks and command-id allocation; rebuild bucket post-image after contention. |
+| `reserve_put_object_generation` | `ReserveObjectGeneration` | `AllocatorCleanup` | Drain competing PG slot before and during command-id allocation, then allocate/reuse through the reservation owner; do not release a non-matching reservation. |
+| `reserve_next_object_version` | `ReserveObjectVersion` | `AllocatorCleanup` | Drain competing PG slot before and during command-id allocation, then allocate/reuse through the version reservation owner. |
+| `release_object_generation_reservation_command_required` | `ReleaseObjectGeneration` | `AllocatorCleanup` | Required cleanup must retry through slot contention, including command-id contention, until terminal or fail without losing the cleanup intent. |
+| `release_object_generation_reservation` | `ReleaseObjectGeneration` | `AllocatorCleanup` | Release an already-owned reservation; drain competing PG slot before and during command-id allocation and retry. |
+| `commit_direct_put_object_from_payload_shards` | `CommitDirectPutObject` | `SnapshotSensitive` | Rebuild commit from fresh object preconditions and stale-payload snapshot after pending-install contention or pre-publish command-id contention. |
 | `create_put_object_stream_session_record_under_reservation` | `CreateStreamUpload` | `SnapshotSensitive` | Low-level PutObject stream-create publisher. The public wrapper first holds a durable bucket write reservation; this internal publisher rebuilds session command and reservation cleanup from fresh object state after contention. |
-| `commit_stream_segment_append` | `AppendStreamSegment` | `ApplyValidated` | Apply validates session binding/state and existing staged segment before inserting. |
-| `abort_stream_upload_session` | `AbortStreamUpload` | `TerminalSessionRetry` | Rebuild staged-segment snapshot after unrelated contention. If an equivalent terminal command wins the pending slot, restart without draining so the matching/session-completion branch can finish it. |
+| `commit_stream_segment_append` | `AppendStreamSegment` | `ApplyValidated` | Command-id contention is drained before shard ack registration; apply validates session binding/state and existing staged segment before inserting. |
+| `abort_stream_upload_session` | `AbortStreamUpload` | `TerminalSessionRetry` | Rebuild staged-segment snapshot after unrelated pending-slot or command-id contention. If an equivalent terminal command wins the pending slot, restart without draining so the matching/session-completion branch can finish it. |
 | `put_object_metadata_if` | `PutObjectMetadata` | `SnapshotSensitive` | Rerun request action/preconditions after contention. |
 | `delete_specific_object_version_if` | `DeleteObjectVersion` | `SnapshotSensitive` | Rerun delete preconditions after contention. |
 | `delete_current_object_if` | `DeleteObjectVersion` | `SnapshotSensitive` | Rerun current-object selection after contention. |
@@ -179,7 +179,7 @@ Current production pending-command publishers:
 | `expire_current_object_if_due` | `DeleteObjectVersion`/`InsertDeleteMarker` | `SnapshotSensitive` | Rerun lifecycle selector and object-lock checks after contention. |
 | `delete_noncurrent_live_versions_if_due` | `DeleteObjectVersion` | `SnapshotSensitive` | Rerun lifecycle selector and object-lock checks after contention. |
 | `delete_expired_delete_marker_if_due` | `DeleteObjectVersion` | `SnapshotSensitive` | Rerun expired-marker selector after contention. |
-| `reclaim_object_payload_if_unleased` | `DeleteObjectPayloadReclaim` | `SnapshotSensitive` | Recheck lease/fence and reclaim state after contention; cleanup must preserve retryability. |
+| `reclaim_object_payload_if_unleased` | `DeleteObjectPayloadReclaim` | `SnapshotSensitive` | Recheck lease/fence and reclaim state after contention, including command-id contention after payload cleanup has started; cleanup must preserve retryability. |
 | `create_put_object_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Rerun authorization/object snapshot after contention. |
 | `finalize_put_object_stream` | `CommitDirectPutObject` | `TerminalSessionRetry` | Rebuild commit from current object preconditions and stream-session snapshot after unrelated contention. If an equivalent terminal command wins the pending slot, restart without draining so the matching branch can finish it while the session state is still coherent. |
 | `create_multipart_upload` | `CreateMultipartUpload` | `SnapshotSensitive` | Rerun authorization/object snapshot after contention. |

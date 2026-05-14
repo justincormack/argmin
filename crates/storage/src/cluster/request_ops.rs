@@ -20,9 +20,10 @@ use crate::metadata_command::{
     CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteCompletedMultipartUploadCommand,
     DeleteObjectPayloadReclaimCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
     InsertDeleteMarkerCommand, MarkBucketDeletingCommand, MetadataCommandAcceptance,
-    MetadataCommandEnvelope, MetadataCommandPayload, ObjectPayloadReclaimCommand,
-    PutBucketAclCommand, PutBucketPropertyCommand, PutBucketSubresourceCommand,
-    PutBucketVersioningCommand, PutObjectMetadataCommand, PutObjectMetadataMutation,
+    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
+    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
+    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
+    PutObjectMetadataMutation,
 };
 use crate::traits::PgMetadataStore;
 use crate::*;
@@ -64,6 +65,9 @@ type StreamPutFinalizeCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 type BucketDeleteCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
+type CompletedMultipartOrderCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
 static BEFORE_METADATA_COMMAND_APPLY_HOOKS: OnceLock<
     Mutex<HashMap<usize, MetadataCommandApplyTestHook>>,
 > = OnceLock::new();
@@ -91,6 +95,11 @@ static BEFORE_STREAM_PUT_FINALIZE_COMMAND_ID_HOOKS: OnceLock<
 #[cfg(test)]
 static BEFORE_BUCKET_DELETE_COMMAND_ID_HOOKS: OnceLock<
     Mutex<HashMap<usize, BucketDeleteCommandIdTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static BEFORE_COMPLETED_MULTIPART_ORDER_COMMAND_ID_HOOKS: OnceLock<
+    Mutex<HashMap<usize, CompletedMultipartOrderCommandIdTestHook>>,
 > = OnceLock::new();
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -125,6 +134,11 @@ pub(crate) struct StreamPutFinalizeCommandIdTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct BucketDeleteCommandIdTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct CompletedMultipartOrderCommandIdTestHookGuard {
     scope_id: usize,
 }
 
@@ -192,6 +206,18 @@ impl Drop for BucketDeleteCommandIdTestHookGuard {
     fn drop(&mut self) {
         let hooks =
             BEFORE_BUCKET_DELETE_COMMAND_ID_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for CompletedMultipartOrderCommandIdTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = BEFORE_COMPLETED_MULTIPART_ORDER_COMMAND_ID_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -298,6 +324,19 @@ fn maybe_run_before_stream_put_finalize_command_id_hook(_scope_id: usize) {
 #[cfg(test)]
 fn maybe_run_before_bucket_delete_command_id_hook(_scope_id: usize) {
     let hook = BEFORE_BUCKET_DELETE_COMMAND_ID_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&_scope_id)
+        .cloned();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn maybe_run_before_completed_multipart_order_command_id_hook(_scope_id: usize) {
+    let hook = BEFORE_COMPLETED_MULTIPART_ORDER_COMMAND_ID_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -624,6 +663,20 @@ impl super::StorageCluster {
         BucketDeleteCommandIdTestHookGuard { scope_id }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_install_before_completed_multipart_order_command_id_hook(
+        &self,
+        hook: CompletedMultipartOrderCommandIdTestHook,
+    ) -> CompletedMultipartOrderCommandIdTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = BEFORE_COMPLETED_MULTIPART_ORDER_COMMAND_ID_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        CompletedMultipartOrderCommandIdTestHookGuard { scope_id }
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_install_before_metadata_command_apply_context_hook(
         &self,
@@ -721,7 +774,11 @@ impl super::StorageCluster {
                     }
                 }
                 None => {
-                    let command_id = self.next_bucket_metadata_command_id(pg_id)?;
+                    let Some(command_id) =
+                        self.next_bucket_metadata_command_id_or_drain(pg_id, &bucket)?
+                    else {
+                        continue;
+                    };
                     let bucket_pg = primary_node.get_pg(pg_id.get())?;
                     let bucket_execution_generation =
                         bucket_pg.next_bucket_execution_generation_candidate()?;
@@ -1158,6 +1215,30 @@ impl super::StorageCluster {
     ) -> Result<(), BucketSnapshotLoadError> {
         self.finish_pending_metadata_command_to_acting_set(pg_id, bucket, command, false)?;
         Ok(())
+    }
+
+    fn next_bucket_metadata_command_id_or_drain(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<MetadataCommandId>, BucketSnapshotLoadError> {
+        match self.next_bucket_metadata_command_id(pg_id) {
+            Ok(command_id) => Ok(Some(command_id)),
+            Err(
+                error @ BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+                    ..
+                }),
+            ) => {
+                if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+                    let pending_bucket = Self::metadata_command_bucket_name(&command).clone();
+                    self.drain_pending_metadata_command_pg_slot(pg_id, &pending_bucket, &command)?;
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn finish_pending_command_for_completed_multipart_order(
@@ -1972,7 +2053,11 @@ impl super::StorageCluster {
                     }
                 }
             } else {
-                let command_id = self.next_bucket_metadata_command_id(pg_id)?;
+                let Some(command_id) =
+                    self.next_bucket_metadata_command_id_or_drain(pg_id, &record.bucket)?
+                else {
+                    continue;
+                };
                 let command = MetadataCommandEnvelope::new(
                     command_id,
                     MetadataCommandPayload::DeleteCompletedMultipartUpload(Box::new(
@@ -2115,7 +2200,11 @@ impl super::StorageCluster {
                     }
                 }
             } else {
-                let command_id = self.next_bucket_metadata_command_id(pg_id)?;
+                let Some(command_id) =
+                    self.next_bucket_metadata_command_id_or_drain(pg_id, bucket)?
+                else {
+                    continue;
+                };
                 let bucket_pg = primary_node.get_pg(pg_id.get())?;
                 let current = bucket_pg.head_bucket_record_raw(bucket)?;
                 let bucket_execution_generation =
@@ -2297,7 +2386,11 @@ impl super::StorageCluster {
                     }
                 }
             } else {
-                let command_id = self.next_bucket_metadata_command_id(pg_id)?;
+                let Some(command_id) =
+                    self.next_bucket_metadata_command_id_or_drain(pg_id, bucket)?
+                else {
+                    continue;
+                };
                 let bucket_pg = primary_node.get_pg(pg_id.get())?;
                 let current = bucket_pg.head_bucket_record_raw(bucket)?;
                 let bucket_execution_generation =
@@ -2395,7 +2488,11 @@ impl super::StorageCluster {
                     }
                 }
             } else {
-                let command_id = self.next_bucket_metadata_command_id(pg_id)?;
+                let Some(command_id) =
+                    self.next_bucket_metadata_command_id_or_drain(pg_id, bucket)?
+                else {
+                    continue;
+                };
                 let bucket_pg = primary_node.get_pg(pg_id.get())?;
                 let current = bucket_pg.head_bucket_record_raw(bucket)?;
                 let bucket_execution_generation =
@@ -2511,7 +2608,11 @@ impl super::StorageCluster {
                     }
                 }
             } else {
-                let command_id = self.next_bucket_metadata_command_id(pg_id)?;
+                let Some(command_id) =
+                    self.next_bucket_metadata_command_id_or_drain(pg_id, bucket)?
+                else {
+                    continue;
+                };
                 let bucket_pg = primary_node.get_pg(pg_id.get())?;
                 let bucket_execution_generation =
                     bucket_pg.next_bucket_execution_generation_candidate()?;
@@ -4673,8 +4774,18 @@ impl super::StorageCluster {
                     continue;
                 }
 
+                let command_id = match self.next_object_metadata_command_id(pg_id) {
+                    Ok(command_id) => command_id,
+                    Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                        ..
+                    })) => {
+                        self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let command = MetadataCommandEnvelope::new(
-                    self.next_object_metadata_command_id(pg_id)?,
+                    command_id,
                     MetadataCommandPayload::DeleteObjectPayloadReclaim(Box::new(
                         DeleteObjectPayloadReclaimCommand::new(
                             bucket.clone(),
@@ -5733,6 +5844,12 @@ impl super::StorageCluster {
         let primary_node = self.bucket_metadata_primary_node(bucket)?;
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+                if self
+                    .drain_unrelated_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                    .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
+                {
+                    continue;
+                }
                 if let MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(advance) =
                     command.payload()
                 {
@@ -5776,9 +5893,18 @@ impl super::StorageCluster {
             })?;
             drop(bucket_pg);
 
+            #[cfg(test)]
+            maybe_run_before_completed_multipart_order_command_id_hook(
+                self.metadata_command_apply_test_hook_scope_id(),
+            );
+            let Some(command_id) = self
+                .next_bucket_metadata_command_id_or_drain(pg_id, bucket)
+                .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
+            else {
+                continue;
+            };
             let command = MetadataCommandEnvelope::new(
-                self.next_metadata_command_id(pg_id)
-                    .map_err(ObjectPgActionError::from)?,
+                command_id,
                 MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
                     AdvanceCompletedMultipartUploadSequenceCommand {
                         bucket: bucket.clone(),

@@ -350,14 +350,18 @@ metadata_command_conflict_uses=$(
         | sed 's/^ *//'
 )
 expected_metadata_command_conflict_uses=$(cat <<'EOF'
+1 crates/storage/src/cluster.rs:abort_stream_upload_session:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:apply_new_stream_append_command:exact-command-match
 1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards<E>:exact-command-match
+1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards<E>:metadata-command-log-conflict
+1 crates/storage/src/cluster.rs:commit_stream_segment_append:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:create_put_object_stream_session_record_under_reservation:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:finish_pending_object_metadata_command_for_bucket:exact-command-match
 1 crates/storage/src/cluster.rs:metadata_command_conflict:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:metadata_command_log_conflict_matches:exact-command-match
 1 crates/storage/src/cluster.rs:metadata_command_log_conflict_matches:metadata-command-log-conflict
 2 crates/storage/src/cluster.rs:next_metadata_command_id_from_locked_pg_at_least:metadata-command-log-conflict
+1 crates/storage/src/cluster.rs:next_object_metadata_command_id_or_drain:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:reissue_pending_metadata_command:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:release_object_generation_reservation:exact-command-match
 1 crates/storage/src/cluster.rs:release_object_generation_reservation_command_required:exact-command-match
@@ -380,7 +384,9 @@ expected_metadata_command_conflict_uses=$(cat <<'EOF'
 1 crates/storage/src/cluster/request_ops.rs:finalize_upload_part_stream<T, E>:metadata-command-log-conflict
 2 crates/storage/src/cluster/request_ops.rs:finish_pending_metadata_command_to_acting_set_inner:exact-command-match
 1 crates/storage/src/cluster/request_ops.rs:insert_current_delete_marker_if<T, E>:metadata-command-log-conflict
+1 crates/storage/src/cluster/request_ops.rs:next_bucket_metadata_command_id_or_drain:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:put_object_metadata_if<T, E>:metadata-command-log-conflict
+1 crates/storage/src/cluster/request_ops.rs:reclaim_object_payload_if_unleased:metadata-command-log-conflict
 EOF
 )
 if [[ "$metadata_command_conflict_uses" != "$expected_metadata_command_conflict_uses" ]]; then
