@@ -571,7 +571,7 @@ pub(super) struct MetadataCommandApplyFailure {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FinishPendingMetadataCommandResult {
+pub(super) enum FinishPendingMetadataCommandResult {
     Applied,
     Abandoned,
     RetryPartialExactConflict,
@@ -1004,7 +1004,7 @@ impl super::StorageCluster {
             .map_err(|error| error.source)
     }
 
-    fn finish_pending_metadata_command_to_acting_set(
+    pub(super) fn finish_pending_metadata_command_to_acting_set(
         &self,
         pg_id: PgId,
         _bucket: &BucketName,
@@ -1029,7 +1029,7 @@ impl super::StorageCluster {
         }
     }
 
-    fn finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
+    pub(super) fn finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
@@ -1041,42 +1041,6 @@ impl super::StorageCluster {
             clear_pending_on_zero_apply,
             true,
         )
-    }
-
-    fn partial_exact_metadata_command_conflict_is_retryable(
-        &self,
-        pg_id: PgId,
-        command: &MetadataCommandEnvelope,
-        applied_nodes: usize,
-    ) -> Result<bool, BucketSnapshotLoadError> {
-        if applied_nodes == 0 {
-            return Ok(false);
-        }
-        let primary_node_id = self
-            .local_map
-            .pg_route(pg_id)
-            .expect("validated metadata PG command route must exist")
-            .primary_node_id();
-        let mut nodes = self
-            .local_map
-            .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id)?;
-        nodes.sort_by_key(|node| node.node_id() == primary_node_id);
-
-        let mut expected_hashes = None;
-        for (index, node) in nodes.into_iter().enumerate() {
-            let pg = node.storage_node().get_pg(pg_id.get())?;
-            let hashes =
-                pg.applied_metadata_command_log_entry_hashes(node.node_id().as_u32(), command)?;
-            match (index < applied_nodes, hashes, expected_hashes) {
-                (true, Some(hashes), None) => expected_hashes = Some(hashes),
-                (true, Some(hashes), Some(expected)) if hashes == expected => {}
-                (true, _, _) => return Ok(false),
-                (false, Some(hashes), Some(expected)) if hashes == expected => {}
-                (false, Some(_), _) => return Ok(false),
-                (false, None, _) => {}
-            }
-        }
-        Ok(expected_hashes.is_some())
     }
 
     fn finish_pending_metadata_command_to_acting_set_inner(
@@ -1114,6 +1078,18 @@ impl super::StorageCluster {
                         applied_nodes,
                         source,
                     } = error;
+                    if retry_partial_exact_conflict
+                        && super::StorageCluster::metadata_command_log_conflict_matches(
+                            &command, &source,
+                        )
+                        && self.partial_exact_metadata_command_conflict_is_retryable(
+                            pg_id,
+                            &command,
+                            applied_nodes,
+                        )?
+                    {
+                        return Ok(FinishPendingMetadataCommandResult::RetryPartialExactConflict);
+                    }
                     if applied_nodes == 0
                         && super::StorageCluster::metadata_command_log_conflict_matches(
                             &command, &source,
@@ -1126,19 +1102,6 @@ impl super::StorageCluster {
                         };
                         command = reissued;
                         continue;
-                    }
-                    if retry_partial_exact_conflict
-                        && applied_nodes > 0
-                        && super::StorageCluster::metadata_command_log_conflict_matches(
-                            &command, &source,
-                        )
-                        && self.partial_exact_metadata_command_conflict_is_retryable(
-                            pg_id,
-                            &command,
-                            applied_nodes,
-                        )?
-                    {
-                        return Ok(FinishPendingMetadataCommandResult::RetryPartialExactConflict);
                     }
                     if clear_pending_on_zero_apply && applied_nodes == 0 {
                         self.record_abandoned_metadata_command_to_acting_set(&command)
@@ -1157,20 +1120,6 @@ impl super::StorageCluster {
 
     fn metadata_command_bucket_name(command: &MetadataCommandEnvelope) -> &BucketName {
         command.bucket_name()
-    }
-
-    fn metadata_command_is_bucket_pg_command(command: &MetadataCommandEnvelope) -> bool {
-        matches!(
-            command.payload(),
-            MetadataCommandPayload::CreateBucket(_)
-                | MetadataCommandPayload::PutBucketVersioning(_)
-                | MetadataCommandPayload::PutBucketAcl(_)
-                | MetadataCommandPayload::PutBucketProperty(_)
-                | MetadataCommandPayload::PutBucketSubresource(_)
-                | MetadataCommandPayload::MarkBucketDeleting(_)
-                | MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
-                | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_)
-        )
     }
 
     fn drain_unrelated_pending_metadata_command_for_bucket(
@@ -1194,12 +1143,13 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
     ) -> Result<(), BucketSnapshotLoadError> {
         if Self::metadata_command_is_bucket_pg_command(command) {
-            self.finish_pending_metadata_command_to_acting_set(
-                pg_id,
-                pending_bucket,
-                command,
-                false,
-            )?;
+            let outcome = self
+                .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
+                    pg_id, command, false,
+                )?;
+            if let FinishPendingMetadataCommandResult::RetryPartialExactConflict = outcome {
+                return Ok(());
+            }
         } else {
             self.finish_pending_object_metadata_command_for_bucket(pg_id, pending_bucket, command)
                 .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
@@ -1701,7 +1651,7 @@ impl super::StorageCluster {
                     | MetadataCommandPayload::AbortMultipartUpload(_)
                     | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
                         for raw_pg_id in self.metadata_pg_ids() {
-                            self.drain_pending_object_metadata_commands_for_bucket(
+                            self.drain_pending_object_metadata_commands_for_exact_bucket(
                                 PgId::new(raw_pg_id),
                                 bucket,
                             )
@@ -1713,7 +1663,7 @@ impl super::StorageCluster {
                 }
             } else {
                 for raw_pg_id in self.metadata_pg_ids() {
-                    self.drain_pending_object_metadata_commands_for_bucket(
+                    self.drain_pending_object_metadata_commands_for_exact_bucket(
                         PgId::new(raw_pg_id),
                         bucket,
                     )
@@ -5904,14 +5854,18 @@ impl super::StorageCluster {
                         super::PendingMetadataCommandOutcome::Applied => {
                             return Ok(completion_order);
                         }
-                        super::PendingMetadataCommandOutcome::Abandoned => continue,
+                        super::PendingMetadataCommandOutcome::Abandoned
+                        | super::PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+                            continue;
+                        }
                     }
                 }
                 match self
                     .finish_pending_command_for_completed_multipart_order(pg_id, bucket, &command)?
                 {
                     super::PendingMetadataCommandOutcome::Applied => continue,
-                    super::PendingMetadataCommandOutcome::Abandoned => continue,
+                    super::PendingMetadataCommandOutcome::Abandoned
+                    | super::PendingMetadataCommandOutcome::RetryPartialExactConflict => continue,
                 }
             }
 
@@ -5963,7 +5917,10 @@ impl super::StorageCluster {
             match self.finish_pending_metadata_command_to_acting_set(pg_id, bucket, &command, true)
             {
                 Ok(super::PendingMetadataCommandOutcome::Applied) => return Ok(completion_order),
-                Ok(super::PendingMetadataCommandOutcome::Abandoned) => continue,
+                Ok(
+                    super::PendingMetadataCommandOutcome::Abandoned
+                    | super::PendingMetadataCommandOutcome::RetryPartialExactConflict,
+                ) => continue,
                 Err(error) => {
                     return Err(super::bucket_snapshot_error_to_object_pg_action_error(
                         error,

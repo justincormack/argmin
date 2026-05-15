@@ -920,7 +920,23 @@ impl HttpFrontend {
                         .push(("x-amz-delete-marker".to_string(), "true".to_string()));
                     resp
                 }
-                Err(err) => S3Response::error_with_ids(&err, s3req.path(), wire_ids),
+                Err(err) => {
+                    if err.http_status() >= 500 {
+                        let _ = observability::event(
+                            TRACE_TARGET,
+                            "dispatch_internal_error",
+                            Some(format_args!(
+                                "method={} path={:?} status={} code={} error={:?}",
+                                s3req.method.as_str(),
+                                s3req.path(),
+                                err.http_status(),
+                                err.s3_error_code(),
+                                err
+                            )),
+                        );
+                    }
+                    S3Response::error_with_ids(&err, s3req.path(), wire_ids)
+                }
             }
         };
         if add_bucket_region_for_token_error

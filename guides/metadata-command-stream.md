@@ -303,7 +303,11 @@ classified separately from pending-slot install contention.
 The general rule is fail closed unless the caller has a positive proof that
 the conflict belongs to the exact same command and hash-chain state. A broad
 `MetadataCommandLogConflict` match is not enough: the same PG, epoch, and log
-index can also describe a divergent command-log row.
+index can also describe a divergent command-log row. A partial exact-command
+retry proof must be established by replicas that applied before the failing
+replica; later replicas may only confirm that already-established command
+chain. If no replica was applied before the conflict, the partial-exact retry
+classification is not available.
 
 | Finish caller/path | Command scope | Finish classification | Notes |
 | --- | --- | --- | --- |

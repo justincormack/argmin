@@ -94,6 +94,7 @@ fn conflicting_pending_object_metadata_command(context: &'static str) -> ObjectP
 pub(super) enum PendingMetadataCommandOutcome {
     Applied,
     Abandoned,
+    RetryPartialExactConflict,
 }
 
 fn object_payload_reclaim_generation(
@@ -628,6 +629,58 @@ impl StorageCluster {
                 && *cluster_epoch == command.id().cluster_epoch()
                 && *log_index == command.id().log_index().get()
         )
+    }
+
+    fn metadata_command_is_bucket_pg_command(command: &MetadataCommandEnvelope) -> bool {
+        matches!(
+            command.payload(),
+            MetadataCommandPayload::CreateBucket(_)
+                | MetadataCommandPayload::PutBucketVersioning(_)
+                | MetadataCommandPayload::PutBucketAcl(_)
+                | MetadataCommandPayload::PutBucketProperty(_)
+                | MetadataCommandPayload::PutBucketSubresource(_)
+                | MetadataCommandPayload::MarkBucketDeleting(_)
+                | MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
+                | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_)
+        )
+    }
+
+    fn partial_exact_metadata_command_conflict_is_retryable(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        applied_nodes: usize,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        if applied_nodes == 0 {
+            return Ok(false);
+        }
+
+        let primary_node_id = self
+            .local_map
+            .pg_route(pg_id)
+            .expect("validated metadata PG command route must exist")
+            .primary_node_id();
+        let mut nodes = self
+            .local_map
+            .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id)?;
+        nodes.sort_by_key(|node| node.node_id() == primary_node_id);
+
+        let mut expected_hashes = None;
+        for (index, node) in nodes.into_iter().enumerate() {
+            let pg = node.storage_node().get_pg(pg_id.get())?;
+            let hashes =
+                pg.applied_metadata_command_log_entry_hashes(node.node_id().as_u32(), command)?;
+            match (index < applied_nodes, hashes, expected_hashes) {
+                (true, Some(hashes), None) => expected_hashes = Some(hashes),
+                (true, Some(hashes), Some(expected)) if hashes == expected => {}
+                (true, _, _) => return Ok(false),
+                (false, Some(_), None) => return Ok(false),
+                (false, Some(hashes), Some(expected)) if hashes == expected => {}
+                (false, Some(_), _) => return Ok(false),
+                (false, None, _) => {}
+            }
+        }
+        Ok(expected_hashes.is_some())
     }
 
     fn matching_reissued_pending_command_if_safe(
@@ -1698,7 +1751,10 @@ impl StorageCluster {
                             pg_id, bucket, &command,
                         )? {
                             PendingMetadataCommandOutcome::Applied => return Ok(generation_id),
-                            PendingMetadataCommandOutcome::Abandoned => continue,
+                            PendingMetadataCommandOutcome::Abandoned
+                            | PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+                                continue;
+                            }
                         }
                     }
                     _ => {}
@@ -1814,7 +1870,8 @@ impl StorageCluster {
                             return Ok(reserved_version_id);
                         }
                         PendingMetadataCommandOutcome::Applied
-                        | PendingMetadataCommandOutcome::Abandoned => continue,
+                        | PendingMetadataCommandOutcome::Abandoned
+                        | PendingMetadataCommandOutcome::RetryPartialExactConflict => continue,
                     }
                 }
                 self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
@@ -1873,7 +1930,8 @@ impl StorageCluster {
     ) -> Result<(), ObjectPgActionError> {
         match self.finish_pending_object_metadata_command_for_bucket(pg_id, bucket, command)? {
             PendingMetadataCommandOutcome::Applied => Ok(()),
-            PendingMetadataCommandOutcome::Abandoned => {
+            PendingMetadataCommandOutcome::Abandoned
+            | PendingMetadataCommandOutcome::RetryPartialExactConflict => {
                 Err(conflicting_pending_object_metadata_command(
                     "abandoned pending object metadata command",
                 ))
@@ -1917,6 +1975,18 @@ impl StorageCluster {
                     .map_err(ObjectPgActionError::from)?;
                     self.after_object_metadata_command_applied(&command);
                     return Ok(PendingMetadataCommandOutcome::Applied);
+                }
+                Err(error)
+                    if Self::metadata_command_log_conflict_matches(&command, &error.source)
+                        && self
+                            .partial_exact_metadata_command_conflict_is_retryable(
+                                pg_id,
+                                &command,
+                                error.applied_nodes,
+                            )
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error)? =>
+                {
+                    return Ok(PendingMetadataCommandOutcome::RetryPartialExactConflict);
                 }
                 Err(error)
                     if error.applied_nodes == 0
@@ -2007,7 +2077,10 @@ impl StorageCluster {
                             pg_id, bucket, &command,
                         )? {
                             PendingMetadataCommandOutcome::Applied => return Ok(()),
-                            PendingMetadataCommandOutcome::Abandoned => continue,
+                            PendingMetadataCommandOutcome::Abandoned
+                            | PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+                                continue;
+                            }
                         }
                     }
                     _ => {
@@ -2099,13 +2172,70 @@ impl StorageCluster {
     ) -> Result<Vec<MetadataCommandEnvelope>, ObjectPgActionError> {
         let mut applied = Vec::new();
         while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
-            let outcome =
-                self.finish_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
-            if outcome == PendingMetadataCommandOutcome::Applied {
-                applied.push(command);
+            let command_bucket = command.bucket_name().clone();
+            if Self::metadata_command_is_bucket_pg_command(&command) {
+                let outcome = self
+                    .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
+                        pg_id,
+                        &command,
+                        false,
+                    )
+                    .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+                match outcome {
+                    request_ops::FinishPendingMetadataCommandResult::Applied
+                    | request_ops::FinishPendingMetadataCommandResult::Abandoned
+                    | request_ops::FinishPendingMetadataCommandResult::RetryPartialExactConflict => {
+                    }
+                }
+                continue;
+            }
+            let outcome = self.finish_pending_object_metadata_command_for_bucket(
+                pg_id,
+                &command_bucket,
+                &command,
+            )?;
+            match outcome {
+                PendingMetadataCommandOutcome::Applied => applied.push(command),
+                PendingMetadataCommandOutcome::Abandoned
+                | PendingMetadataCommandOutcome::RetryPartialExactConflict => {}
             }
         }
         Ok(applied)
+    }
+
+    fn drain_pending_object_metadata_commands_for_exact_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<(), ObjectPgActionError> {
+        while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+            if command.bucket_name() != bucket {
+                return Ok(());
+            }
+            if Self::metadata_command_is_bucket_pg_command(&command) {
+                let outcome = self
+                    .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
+                        pg_id,
+                        &command,
+                        false,
+                    )
+                    .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+                if let request_ops::FinishPendingMetadataCommandResult::RetryPartialExactConflict =
+                    outcome
+                {
+                    continue;
+                }
+                continue;
+            }
+            let outcome =
+                self.finish_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            match outcome {
+                PendingMetadataCommandOutcome::Applied
+                | PendingMetadataCommandOutcome::Abandoned
+                | PendingMetadataCommandOutcome::RetryPartialExactConflict => {}
+            }
+        }
+        Ok(())
     }
 
     fn pending_command_completes_stream_session(
@@ -2392,7 +2522,10 @@ impl StorageCluster {
                             pg_id, bucket, &command,
                         )? {
                             PendingMetadataCommandOutcome::Applied => return Ok(()),
-                            PendingMetadataCommandOutcome::Abandoned => continue,
+                            PendingMetadataCommandOutcome::Abandoned
+                            | PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+                                continue;
+                            }
                         }
                     }
                     _ => {
@@ -2679,6 +2812,11 @@ impl StorageCluster {
                                     "abandoned pending command for direct put commit",
                                 )
                             }
+                            Ok(PendingMetadataCommandOutcome::RetryPartialExactConflict) => {
+                                conflicting_pending_object_metadata_command(
+                                    "retryable partial pending command for direct put commit",
+                                )
+                            }
                             Err(error) => error,
                         };
                         drop(_bucket_guard);
@@ -2702,6 +2840,7 @@ impl StorageCluster {
                             )
                         }
                         Ok(PendingMetadataCommandOutcome::Abandoned) => {}
+                        Ok(PendingMetadataCommandOutcome::RetryPartialExactConflict) => {}
                         Err(error) => {
                             drop(_bucket_guard);
                             self.release_object_generation_reservation_after_pending_drain_best_effort(

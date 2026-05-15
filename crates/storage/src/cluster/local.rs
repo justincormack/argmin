@@ -1923,9 +1923,10 @@ mod tests {
         AdvanceCompletedMultipartUploadSequenceCommand, AppendStreamSegmentCommand,
         BucketPropertyMutation, BucketSubresourceMutation, CommitDirectPutObjectCommand,
         CommitMultipartObjectCommand, CommitStreamPartCommand, CreateBucketCommand,
-        MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
-        MetadataCommandPayload, PutBucketAclCommand, PutBucketVersioningCommand,
-        PutObjectMetadataCommand, PutObjectMetadataMutation, ReserveObjectGenerationCommand,
+        MarkBucketDeletingCommand, MetadataCommandEnvelope, MetadataCommandId,
+        MetadataCommandLogIndex, MetadataCommandPayload, PutBucketAclCommand,
+        PutBucketVersioningCommand, PutObjectMetadataCommand, PutObjectMetadataMutation,
+        ReserveObjectGenerationCommand,
     };
     use proptest::prelude::*;
     use proptest::test_runner::{TestCaseError, TestCaseResult};
@@ -25696,6 +25697,186 @@ mod tests {
             assert_eq!(info.state, crate::BucketState::Deleting);
         }
         assert_clean_metadata_command_stream(&map, &[pg_id.get()]);
+    }
+
+    #[test]
+    fn begin_bucket_delete_retries_after_partial_object_pg_drain_conflict() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let (bucket, key) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "delete-object-pg-conflict-");
+            let key = key_for_object_pg(topology, &bucket, 2, "key-");
+            (bucket, key)
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let object_pg_id = PgId::new(2);
+        let reservation_id = crate::SessionId::try_from("44".repeat(16)).unwrap();
+        let command = MetadataCommandEnvelope::new(
+            cluster
+                .next_object_metadata_command_id(object_pg_id)
+                .unwrap(),
+            MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+                bucket.clone(),
+                key.clone(),
+                reservation_id.clone(),
+                crate::GenerationId::MIN,
+                crate::clock::current_time_millis(),
+            )),
+        );
+        insert_pending_metadata_command_for_test(&map, object_pg_id, &bucket, &command);
+
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let hook_ran_for_closure = Arc::clone(&hook_ran);
+        let _hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                if node_id != NodeId::new(1) || hook_ran_for_closure.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                match command.payload() {
+                    MetadataCommandPayload::ReserveObjectGeneration(reservation)
+                        if reservation.bucket == hook_bucket && reservation.key == hook_key =>
+                    {
+                        hook_ran_for_closure.store(true, Ordering::SeqCst);
+                        Err(StoreError::MetadataCommandLogConflict {
+                            node_id: node_id.as_u32(),
+                            pg_id: command.id().pg_id().get(),
+                            cluster_epoch: command.id().cluster_epoch(),
+                            log_index: command.id().log_index().get(),
+                        })
+                    }
+                    _ => Ok(()),
+                }
+            },
+        ));
+
+        cluster.begin_bucket_delete(&bucket).unwrap();
+
+        assert!(
+            hook_ran.load(Ordering::SeqCst),
+            "test hook should inject a command-log conflict after non-primary object replicas apply"
+        );
+        assert!(
+            pending_metadata_command_for_test(&map, object_pg_id, &bucket).is_none(),
+            "bucket delete should finish object-PG drain instead of surfacing a retryable conflict"
+        );
+        for node_id in node_ids {
+            let bucket_pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket).unwrap();
+            assert_eq!(info.state, crate::BucketState::Deleting);
+
+            let object_pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg_id.get())
+                .unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*object_pg,
+                    &bucket,
+                    &key,
+                    &reservation_id,
+                )
+                .unwrap(),
+                crate::GenerationId::MIN
+            );
+        }
+        assert_clean_metadata_command_stream(&map, &[1, object_pg_id.get()]);
+    }
+
+    #[test]
+    fn begin_bucket_delete_skips_unrelated_all_pg_drain_slot() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let (bucket, pending_bucket) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            (
+                bucket_for_pg(topology, 1, "delete-unrelated-bucket-drain-"),
+                bucket_for_pg(topology, 2, "delete-pending-bucket-drain-"),
+            )
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        create_test_bucket(&cluster, &pending_bucket);
+
+        let pending_pg_id = PgId::new(2);
+        let command_id = cluster
+            .next_bucket_metadata_command_id(pending_pg_id)
+            .unwrap();
+        let pending_primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pending_pg_id)
+            .unwrap();
+        let pending_pg = pending_primary
+            .storage_node()
+            .get_pg(pending_pg_id.get())
+            .unwrap();
+        let current =
+            crate::PgMetadataStore::head_bucket_record_raw(&*pending_pg, &pending_bucket).unwrap();
+        let pending_command = MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand::from_bucket(
+                current.with_execution_generation(
+                    pending_pg
+                        .next_bucket_execution_generation_candidate()
+                        .unwrap(),
+                ),
+            )),
+        );
+        drop(pending_pg);
+        insert_pending_metadata_command_for_test(
+            &map,
+            pending_pg_id,
+            &pending_bucket,
+            &pending_command,
+        );
+
+        cluster.begin_bucket_delete(&bucket).unwrap();
+
+        assert!(
+            pending_metadata_command_for_test(&map, pending_pg_id, &pending_bucket).is_some(),
+            "bucket delete should not drain unrelated bucket-PG work found during all-PG scan"
+        );
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let bucket_pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket).unwrap();
+            assert_eq!(info.state, crate::BucketState::Deleting);
+
+            let pending_pg = node.get_pg(pending_pg_id.get()).unwrap();
+            let pending_info =
+                crate::PgMetadataStore::head_bucket_raw(&*pending_pg, &pending_bucket).unwrap();
+            assert_eq!(pending_info.state, crate::BucketState::Active);
+        }
+        assert_clean_metadata_command_stream(&map, &[1]);
     }
 
     #[test]
