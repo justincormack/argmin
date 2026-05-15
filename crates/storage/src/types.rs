@@ -2613,6 +2613,7 @@ pub struct CommitDirectPutObjectReq {
     pub segment_okh: [u8; 16],
     pub segment_vid: GenerationId,
     pub data_pg_id: u32,
+    pub bucket_write_reservation: Option<crate::BucketWriteReservationProof>,
 }
 
 #[derive(Debug, Clone)]

@@ -1509,6 +1509,9 @@ fn command_bucket_write_reservation_proof(
     command: &MetadataCommandEnvelope,
 ) -> Option<&crate::metadata_command::BucketWriteReservationProof> {
     match command.payload() {
+        crate::metadata_command::MetadataCommandPayload::CommitDirectPutObject(commit) => {
+            commit.bucket_write_reservation.as_ref()
+        }
         crate::metadata_command::MetadataCommandPayload::CreateStreamUpload(create) => {
             create.bucket_write_reservation.as_ref()
         }
@@ -2223,6 +2226,7 @@ mod tests {
         segment_okh: [u8; 16],
         payload: &[u8],
     ) -> CommittedDirectSegment {
+        ensure_test_bucket(cluster, bucket);
         let reservation_id = crate::SessionId::try_from(
             reservation_bytes
                 .iter()
@@ -2265,6 +2269,7 @@ mod tests {
             segment_okh,
             segment_vid: generation_id,
             data_pg_id: written.data_pg_id,
+            bucket_write_reservation: None,
         };
         let outcome = cluster
             .commit_direct_put_object_from_payload_shards(
@@ -2352,6 +2357,15 @@ mod tests {
                 object_lock: crate::BucketObjectLockConfig::default(),
             })
             .unwrap();
+    }
+
+    fn ensure_test_bucket(cluster: &crate::StorageCluster, bucket: &crate::BucketName) {
+        if cluster
+            .load_bucket_snapshot(bucket, crate::BucketSnapshotRequest::default())
+            .is_err()
+        {
+            create_test_bucket(cluster, bucket);
+        }
     }
 
     fn assert_stream_next_segment_vid(
@@ -2494,6 +2508,7 @@ mod tests {
             segment_okh,
             segment_vid: generation_id,
             data_pg_id: written.data_pg_id,
+            bucket_write_reservation: None,
         }
     }
 
@@ -7372,6 +7387,7 @@ mod tests {
                         &pg,
                         &hook_req,
                         crate::VersionId::Null,
+                        None,
                     )
                     .unwrap();
                 pg.try_insert_pending_metadata_command_slot(
@@ -7419,6 +7435,299 @@ mod tests {
             assert_eq!(live.generation_id, winner_generation_id);
             assert_eq!(live.size, winner_payload.len() as u64);
         }
+    }
+
+    #[test]
+    fn direct_put_pending_install_race_keeps_bucket_write_proof_for_retry() {
+        let _guard = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut first_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = first_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "direct-put-proof-race-");
+        let loser_key = key_for_object_pg(topology, &bucket, 2, "loser-");
+        let winner_key = key_for_object_pg(topology, &bucket, 2, "winner-");
+        set_route_primary(&mut first_map, 1, NodeId::new(1));
+        set_route_primary(&mut first_map, 2, NodeId::new(1));
+
+        let mut second_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        set_route_primary(&mut second_map, 1, NodeId::new(1));
+        set_route_primary(&mut second_map, 2, NodeId::new(1));
+
+        let first_map = Arc::new(first_map);
+        let second_map = Arc::new(second_map);
+        let first_cluster = crate::StorageCluster::from_local_map(Arc::clone(&first_map)).unwrap();
+        let second_cluster =
+            crate::StorageCluster::from_local_map(Arc::clone(&second_map)).unwrap();
+        create_test_bucket(&first_cluster, &bucket);
+
+        let loser_payload = b"loser direct put with command proof";
+        let loser_reservation_id =
+            crate::SessionId::try_from("51515151515151515151515151515151".to_string()).unwrap();
+        let loser_generation_id = first_cluster
+            .reserve_put_object_generation(&bucket, &loser_key, &loser_reservation_id)
+            .unwrap();
+        let loser_written = first_cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &loser_key,
+                loser_generation_id,
+                0,
+                &[0xb1; 16],
+                loser_payload,
+            )
+            .unwrap();
+        let command_reservation = first_cluster
+            .acquire_durable_bucket_write_reservation(
+                &bucket,
+                "direct-put-proof-race",
+                Some(loser_key.as_str()),
+            )
+            .unwrap();
+        let mut loser_req = direct_put_commit_req(
+            &bucket,
+            &loser_key,
+            loser_reservation_id,
+            loser_generation_id,
+            loser_payload,
+            [0xb1; 16],
+            &loser_written,
+        );
+        loser_req.bucket_write_reservation = Some(
+            crate::metadata_command::BucketWriteReservationProof::from(&command_reservation.record),
+        );
+
+        let winner_payload = b"winner unrelated direct put";
+        let winner_reservation_id =
+            crate::SessionId::try_from("52525252525252525252525252525252".to_string()).unwrap();
+        let winner_generation_id = second_cluster
+            .reserve_put_object_generation(&bucket, &winner_key, &winner_reservation_id)
+            .unwrap();
+        let winner_written = second_cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &winner_key,
+                winner_generation_id,
+                0,
+                &[0xb2; 16],
+                winner_payload,
+            )
+            .unwrap();
+        let winner_req = direct_put_commit_req(
+            &bucket,
+            &winner_key,
+            winner_reservation_id,
+            winner_generation_id,
+            winner_payload,
+            [0xb2; 16],
+            &winner_written,
+        );
+
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let action_calls = Arc::new(AtomicUsize::new(0));
+        let hook_cluster = Arc::clone(&second_cluster);
+        let hook_map = Arc::clone(&second_map);
+        let hook_bucket = bucket.clone();
+        let hook_req = winner_req.clone();
+        let hook_written_shards = winner_written.written_shards.clone();
+        let hook_ran_for_closure = Arc::clone(&hook_ran);
+        let _hook_guard = first_cluster.test_install_before_metadata_command_pending_install_hook(
+            Arc::new(move || {
+                if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let pg_id = PgId::new(2);
+                let shard_batch: Vec<(&ShardKey, WriteAck)> = hook_written_shards
+                    .iter()
+                    .map(|written| (&written.key, written.ack))
+                    .collect();
+                hook_cluster
+                    .register_payload_shard_acks(hook_req.data_pg_id, &shard_batch)
+                    .unwrap();
+                let primary = hook_map
+                    .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+                    .unwrap();
+                let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+                let command = hook_cluster
+                    .prepare_commit_direct_put_object_command(
+                        pg_id,
+                        &pg,
+                        &hook_req,
+                        crate::VersionId::Null,
+                        None,
+                    )
+                    .unwrap();
+                pg.try_insert_pending_metadata_command_slot(
+                    primary.node_id().as_u32(),
+                    &command,
+                    Some(&hook_bucket),
+                )
+                .unwrap();
+            }),
+        );
+
+        let calls_for_action = Arc::clone(&action_calls);
+        first_cluster
+            .commit_direct_put_object_from_payload_shards(
+                &loser_req,
+                &loser_written.written_shards,
+                move |snapshot| {
+                    calls_for_action.fetch_add(1, Ordering::SeqCst);
+                    assert!(snapshot.existing_etag.is_none());
+                    Ok::<(), ()>(())
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(hook_ran.load(Ordering::SeqCst));
+        assert_eq!(
+            action_calls.load(Ordering::SeqCst),
+            2,
+            "direct PUT must rerun after install contention while keeping its write proof"
+        );
+        assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_none());
+        let object_pg = first_map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
+            .unwrap()
+            .storage_node()
+            .get_pg(2)
+            .unwrap();
+        let stored =
+            crate::PgMetadataStore::get_object_meta(&*object_pg, &bucket, &loser_key).unwrap();
+        assert_eq!(stored.as_live().unwrap().generation_id, loser_generation_id);
+        drop(object_pg);
+        let bucket_pg = first_map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, &bucket)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
+                .unwrap()
+                .active_write_reservations,
+            0
+        );
+        drop(bucket_pg);
+        assert_clean_metadata_command_stream(&first_map, &[2]);
+    }
+
+    #[test]
+    fn direct_put_pre_command_route_error_releases_bucket_write_proof() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut local_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = local_map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut local_map, object_pg, NodeId::new(1));
+        set_route_primary(&mut local_map, data_pg, NodeId::new(2));
+
+        let mut map = Arc::new(local_map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let bucket_pg_id = cluster.bucket_metadata_pg_id(&bucket);
+        let reservation_id =
+            crate::SessionId::try_from("53535353535353535353535353535353".to_string()).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        let payload = b"direct put route failure";
+        let segment_okh = [0xb3; 16];
+        let written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                payload,
+            )
+            .unwrap();
+        let command_reservation = cluster
+            .acquire_durable_bucket_write_reservation(
+                &bucket,
+                "direct-put-route-failure",
+                Some(key.as_str()),
+            )
+            .unwrap();
+        let mut commit_req = direct_put_commit_req(
+            &bucket,
+            &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            &written,
+        );
+        commit_req.bucket_write_reservation = Some(
+            crate::metadata_command::BucketWriteReservationProof::from(&command_reservation.record),
+        );
+        drop(cluster);
+
+        Arc::get_mut(&mut map)
+            .unwrap()
+            .pg_routes
+            .get_mut(&PgId::new(object_pg))
+            .unwrap()
+            .state = PgState::Peering;
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let err = cluster
+            .commit_direct_put_object_from_payload_shards(
+                &commit_req,
+                &written.written_shards,
+                |_| Ok::<(), ()>(()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::ObjectPgActionError::Store(StoreError::PgNotActive {
+                pg_id,
+                state: PgState::Peering,
+                ..
+            }) if pg_id == object_pg
+        ));
+
+        let bucket_pg = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(bucket_pg_id))
+            .unwrap()
+            .storage_node()
+            .get_pg(bucket_pg_id)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, &bucket)
+                .unwrap()
+                .is_empty(),
+            "pre-command storage errors must release caller-owned bucket write proof"
+        );
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
+                .unwrap()
+                .active_write_reservations,
+            0
+        );
     }
 
     #[test]
@@ -7534,6 +7843,7 @@ mod tests {
                         &pg,
                         &hook_req,
                         crate::VersionId::Null,
+                        None,
                     )
                     .unwrap();
                 pg.try_insert_pending_metadata_command_slot(
@@ -7723,7 +8033,9 @@ mod tests {
                     .unwrap();
                 let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
                 let command = hook_cluster
-                    .prepare_commit_direct_put_object_command(pg_id, &pg, &hook_req, version_id)
+                    .prepare_commit_direct_put_object_command(
+                        pg_id, &pg, &hook_req, version_id, None,
+                    )
                     .unwrap();
                 pg.try_insert_pending_metadata_command_slot(
                     primary.node_id().as_u32(),
@@ -7888,6 +8200,7 @@ mod tests {
                         &pg,
                         &hook_req,
                         crate::VersionId::Null,
+                        None,
                     )
                     .unwrap();
                 pg.try_insert_pending_metadata_command_slot(
@@ -8048,6 +8361,7 @@ mod tests {
                         &pg,
                         &hook_req,
                         crate::VersionId::Null,
+                        None,
                     )
                     .unwrap();
                 pg.try_insert_pending_metadata_command_slot(
@@ -8266,6 +8580,7 @@ mod tests {
                         &pg,
                         &hook_req,
                         crate::VersionId::Null,
+                        None,
                     )
                     .unwrap();
                 pg.try_insert_pending_metadata_command_slot(
@@ -8578,6 +8893,7 @@ mod tests {
                         &pg,
                         &hook_req,
                         crate::VersionId::Null,
+                        None,
                     )
                     .unwrap();
                 pg.try_insert_pending_metadata_command_slot(
@@ -8746,6 +9062,7 @@ mod tests {
                                 &pg,
                                 &install_req,
                                 crate::VersionId::Null,
+                                None,
                             )
                             .unwrap();
                         pg.try_insert_pending_metadata_command_slot(
@@ -9505,6 +9822,7 @@ mod tests {
                 &object_pg_store,
                 &commit_req,
                 crate::VersionId::Null,
+                None,
             )
             .unwrap();
         drop(object_pg_store);
@@ -10447,6 +10765,7 @@ mod tests {
                 &object_pg_store,
                 &abandoned_req,
                 crate::VersionId::Null,
+                None,
             )
             .unwrap();
         drop(object_pg_store);
@@ -10697,6 +11016,16 @@ mod tests {
             &written,
         );
         commit_req.versioning = crate::BucketVersioningState::Enabled;
+        let command_reservation = cluster
+            .acquire_durable_bucket_write_reservation(
+                &bucket,
+                "direct-put-commit-test",
+                Some(key.as_str()),
+            )
+            .unwrap();
+        commit_req.bucket_write_reservation = Some(
+            crate::metadata_command::BucketWriteReservationProof::from(&command_reservation.record),
+        );
 
         let outcome = cluster
             .commit_direct_put_object_from_payload_shards(
@@ -12595,6 +12924,7 @@ mod tests {
 
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
         let reservation_id = crate::SessionId::try_from("02".repeat(16)).unwrap();
         let generation_id = cluster
             .reserve_put_object_generation(&bucket, &key, &reservation_id)
@@ -12637,6 +12967,7 @@ mod tests {
             segment_okh,
             segment_vid: generation_id,
             data_pg_id: written.data_pg_id,
+            bucket_write_reservation: None,
         };
         cluster
             .commit_direct_put_object_from_payload_shards(
@@ -13168,6 +13499,7 @@ mod tests {
 
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
         let reservation_id = crate::SessionId::try_from("13".repeat(16)).unwrap();
         let generation_id = cluster
             .reserve_put_object_generation(&bucket, &key, &reservation_id)
@@ -17384,6 +17716,7 @@ mod tests {
                 write_sequence,
                 last_modified_millis: 123_460,
                 stale_payload: None,
+                bucket_write_reservation: None,
             })),
         );
         let inserted = Arc::new(AtomicBool::new(false));
@@ -19245,6 +19578,8 @@ mod tests {
 
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let bucket_pg_id = cluster.bucket_metadata_pg_id(&bucket);
         let reservation_id = crate::SessionId::try_from("14".repeat(16)).unwrap();
         let generation_id = cluster
             .reserve_put_object_generation(&bucket, &key, &reservation_id)
@@ -19271,6 +19606,16 @@ mod tests {
             &written,
         );
         commit_req.versioning = crate::BucketVersioningState::Enabled;
+        let command_reservation = cluster
+            .acquire_durable_bucket_write_reservation(
+                &bucket,
+                "direct-put-commit-test",
+                Some(key.as_str()),
+            )
+            .unwrap();
+        commit_req.bucket_write_reservation = Some(
+            crate::metadata_command::BucketWriteReservationProof::from(&command_reservation.record),
+        );
 
         let _serial = lock_metadata_command_apply_hook_test();
         let fail_once = Arc::new(AtomicBool::new(true));
@@ -19338,6 +19683,26 @@ mod tests {
             assert_eq!(stored.as_live().unwrap().generation_id, generation_id);
         }
         {
+            let bucket_primary = map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(bucket_pg_id))
+                .unwrap()
+                .storage_node();
+            let bucket_pg = bucket_primary.get_pg(bucket_pg_id).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, &bucket)
+                    .unwrap()
+                    .len(),
+                1,
+                "partial direct PUT command must keep its command-owned bucket write proof live"
+            );
+            assert_eq!(
+                crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
+                    .unwrap()
+                    .active_write_reservations,
+                1
+            );
+        }
+        {
             let primary = map.node(NodeId::new(1)).unwrap().storage_node();
             let pg = primary.get_pg(object_pg).unwrap();
             assert!(matches!(
@@ -19356,6 +19721,25 @@ mod tests {
             .unwrap();
 
         assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+        {
+            let bucket_primary = map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(bucket_pg_id))
+                .unwrap()
+                .storage_node();
+            let bucket_pg = bucket_primary.get_pg(bucket_pg_id).unwrap();
+            assert!(
+                crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, &bucket)
+                    .unwrap()
+                    .is_empty(),
+                "direct PUT retry convergence must release the command-owned bucket write proof"
+            );
+            assert_eq!(
+                crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
+                    .unwrap()
+                    .active_write_reservations,
+                0
+            );
+        }
         {
             let primary = map.node(NodeId::new(1)).unwrap().storage_node();
             let pg = primary.get_pg(object_pg).unwrap();
@@ -19382,6 +19766,167 @@ mod tests {
     }
 
     #[test]
+    fn direct_put_open_time_convergence_releases_bucket_write_reservation() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let bucket_pg_id = cluster.bucket_metadata_pg_id(&bucket);
+        let reservation_id = crate::SessionId::try_from("51".repeat(16)).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        let payload = b"direct put metadata command open-time convergence";
+        let segment_okh = [81; 16];
+        let written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                payload,
+            )
+            .unwrap();
+        let command_reservation = cluster
+            .acquire_durable_bucket_write_reservation(
+                &bucket,
+                "direct-put-commit-reopen-test",
+                Some(key.as_str()),
+            )
+            .unwrap();
+        let mut commit_req = direct_put_commit_req(
+            &bucket,
+            &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            &written,
+        );
+        commit_req.bucket_write_reservation = Some(
+            crate::metadata_command::BucketWriteReservationProof::from(&command_reservation.record),
+        );
+
+        let failed = Arc::new(AtomicBool::new(false));
+        let hook_failed = Arc::clone(&failed);
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                        if commit.object.bucket == hook_bucket
+                            && commit.object.key == hook_key
+                            && node_id == NodeId::new(0)
+                            && !hook_failed.swap(true, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected direct put reopen apply failure",
+                            source: std::io::Error::other(
+                                "injected direct put reopen apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .commit_direct_put_object_from_payload_shards(
+                &commit_req,
+                &written.written_shards,
+                |_| Ok::<(), ()>(()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::ObjectPgActionError::Store(StoreError::Io { .. })
+        ));
+        drop(hook_guard);
+        assert!(failed.load(Ordering::SeqCst));
+        assert!(
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
+            "partial direct PUT should leave a pending command for open-time convergence"
+        );
+        {
+            let bucket_primary = map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(bucket_pg_id))
+                .unwrap()
+                .storage_node();
+            let bucket_pg = bucket_primary.get_pg(bucket_pg_id).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, &bucket)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
+                    .unwrap()
+                    .active_write_reservations,
+                1
+            );
+        }
+        drop(cluster);
+        drop(map);
+
+        let reopened = Arc::new(
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap(),
+        );
+        assert!(
+            pending_metadata_command_for_test(&reopened, PgId::new(object_pg), &bucket).is_none(),
+            "open-time convergence should clear the direct PUT pending command"
+        );
+        for node_id in node_ids {
+            let pg = reopened
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+            assert_eq!(stored.as_live().unwrap().generation_id, generation_id);
+        }
+        {
+            let bucket_primary = reopened
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(bucket_pg_id))
+                .unwrap()
+                .storage_node();
+            let bucket_pg = bucket_primary.get_pg(bucket_pg_id).unwrap();
+            assert!(
+                crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, &bucket)
+                    .unwrap()
+                    .is_empty(),
+                "open-time convergence must release the command-owned bucket write proof"
+            );
+            assert_eq!(
+                crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
+                    .unwrap()
+                    .active_write_reservations,
+                0
+            );
+        }
+        assert_clean_metadata_command_stream(&reopened, &[object_pg]);
+    }
+
+    #[test]
     fn object_generation_reservation_entry_drains_pending_direct_put_commit() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -19402,6 +19947,7 @@ mod tests {
 
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
         let reservation_id = crate::SessionId::try_from("22".repeat(16)).unwrap();
         let generation_id = cluster
             .reserve_put_object_generation(&bucket, &key, &reservation_id)
@@ -19524,6 +20070,7 @@ mod tests {
 
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
         let old_committed =
             write_committed_direct_segment_for(&cluster, &bucket, &key, b"old direct object");
 
@@ -20819,6 +21366,7 @@ mod tests {
                     &pg,
                     &winner_req,
                     crate::VersionId::Null,
+                    None,
                 )
                 .unwrap()
         };

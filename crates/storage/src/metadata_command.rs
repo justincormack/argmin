@@ -594,6 +594,7 @@ pub(crate) struct CommitDirectPutObjectCommand {
     pub(crate) write_sequence: u64,
     pub(crate) last_modified_millis: u64,
     pub(crate) stale_payload: Option<ObjectPayloadReclaimCommand>,
+    pub(crate) bucket_write_reservation: Option<BucketWriteReservationProof>,
 }
 
 impl CommitDirectPutObjectCommand {
@@ -798,7 +799,7 @@ impl PutObjectMetadataCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BucketWriteReservationProof {
+pub struct BucketWriteReservationProof {
     pub(crate) bucket: BucketName,
     pub(crate) reservation_id: String,
     pub(crate) owner_token: String,
@@ -1313,7 +1314,8 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 self.skip_str()?;
                 self.read_u64()?;
                 self.read_u64()?;
-                self.skip_optional_stale_payload()
+                self.skip_optional_stale_payload()?;
+                self.skip_bucket_write_reservation_proof()
             }
             METADATA_COMMAND_COMMIT_MULTIPART_OBJECT => {
                 self.skip_str()?;
@@ -1484,6 +1486,8 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                         write_sequence: self.read_u64()?,
                         last_modified_millis: self.read_u64()?,
                         stale_payload: self.read_optional_stale_payload()?,
+                        bucket_write_reservation: self
+                            .read_optional_bucket_write_reservation_proof()?,
                     },
                 )))
             }
@@ -2924,6 +2928,7 @@ fn encode_commit_direct_put_object(out: &mut Vec<u8>, command: &CommitDirectPutO
             encode_multipart_reclaim(out, reclaim);
         }
     }
+    encode_optional_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
 }
 
 fn encode_commit_multipart_object(out: &mut Vec<u8>, command: &CommitMultipartObjectCommand) {
@@ -4326,6 +4331,17 @@ mod tests {
                 }],
             }],
         });
+        let bucket_write_reservation = BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: "direct-put-proof".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: 9,
+            operation_kind: "direct-put-commit".to_string(),
+            created_at: 444,
+            lease_deadline: Some(555),
+            target_context: Some(key.as_str().to_string()),
+        };
         let payloads = [
             MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
                 bucket.clone(),
@@ -4351,6 +4367,7 @@ mod tests {
                 write_sequence: 44,
                 last_modified_millis: 555,
                 stale_payload: Some(segment_reclaim.clone()),
+                bucket_write_reservation: Some(bucket_write_reservation),
             })),
             MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
                 object: object.clone(),
@@ -4359,6 +4376,7 @@ mod tests {
                 write_sequence: 45,
                 last_modified_millis: 556,
                 stale_payload: Some(multipart_reclaim.clone()),
+                bucket_write_reservation: None,
             })),
             MetadataCommandPayload::CommitMultipartObject(Box::new(CommitMultipartObjectCommand {
                 upload_id: upload_id.clone(),
@@ -4656,8 +4674,8 @@ mod tests {
                 0x5fc3fd9935e6b23a,
                 0x56db6be41cc9a89c,
                 0x3acf49df359790d4,
-                0xb5a8e642f639b9a8,
-                0x892df6c0f857bf33,
+                0xed7da0ffcff54285,
+                0xddc16da5e688fb9f,
                 0x7920c33a006e1d68,
                 0x53fdbf4c6f062d53,
                 0x6df04a5fc73e478a,

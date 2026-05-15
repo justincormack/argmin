@@ -15242,6 +15242,7 @@ mod tests {
                 write_sequence: 1,
                 last_modified_millis: 2,
                 stale_payload: None,
+                bucket_write_reservation: None,
             })),
         );
         let mut malformed_bytes = command.command_bytes();

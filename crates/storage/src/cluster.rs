@@ -561,6 +561,21 @@ enum BucketWriteReservationDisposition {
     PreserveForOwnershipCheckFailure,
 }
 
+pub enum BucketWriteSnapshotAction<T, E> {
+    Release(Result<T, E>),
+    TransferredToCommand(Result<T, E>),
+}
+
+impl<T, E> BucketWriteSnapshotAction<T, E> {
+    pub fn release(result: Result<T, E>) -> Self {
+        Self::Release(result)
+    }
+
+    pub fn transferred_to_command(result: Result<T, E>) -> Self {
+        Self::TransferredToCommand(result)
+    }
+}
+
 fn decide_reissued_pending_command(
     primary: ReissuedPendingCommandPrimarySummary,
     acting_set_max_log_index: u64,
@@ -1510,6 +1525,9 @@ impl StorageCluster {
         command: &MetadataCommandEnvelope,
     ) -> Option<&BucketWriteReservationProof> {
         match command.payload() {
+            MetadataCommandPayload::CommitDirectPutObject(commit) => {
+                commit.bucket_write_reservation.as_ref()
+            }
             MetadataCommandPayload::CreateStreamUpload(create) => {
                 create.bucket_write_reservation.as_ref()
             }
@@ -1561,6 +1579,13 @@ impl StorageCluster {
         let Some(proof) = Self::metadata_command_bucket_write_reservation_proof(command) else {
             return Ok(());
         };
+        self.release_bucket_write_reservation_proof(proof)
+    }
+
+    fn release_bucket_write_reservation_proof(
+        &self,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<(), BucketSnapshotLoadError> {
         let node = self.bucket_metadata_primary_node_arc(&proof.bucket)?;
         let pg_id = self.bucket_metadata_pg_id(&proof.bucket);
         let bucket_pg = node.get_pg(pg_id)?;
@@ -2782,9 +2807,30 @@ impl StorageCluster {
         mut action: impl FnMut(DirectPutCommitSnapshot) -> Result<(), E>,
     ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(&req.bucket, &req.key));
-        let object_node = match self.object_metadata_primary_node(&req.bucket, &req.key) {
-            Ok(node) => node,
-            Err(error) => {
+        let mut bucket_write_proof_command_owned = false;
+        macro_rules! release_caller_bucket_write_proof_if_unowned {
+            () => {{
+                if !bucket_write_proof_command_owned {
+                    if let Some(proof) = req.bucket_write_reservation.as_ref() {
+                        self.release_bucket_write_reservation_proof(proof)
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error)
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    Ok(())
+                }
+            }};
+        }
+        macro_rules! cleanup_direct_put_attempt_before_command_ownership {
+            () => {{
+                let release_result = release_caller_bucket_write_proof_if_unowned!();
+                self.release_object_generation_reservation_after_pending_drain_best_effort(
+                    pg_id,
+                    &req.bucket,
+                    &req.key,
+                    &req.generation_reservation_id,
+                );
                 self.delete_direct_put_segment_payload_shards(
                     req.data_pg_id,
                     req.ec,
@@ -2792,6 +2838,13 @@ impl StorageCluster {
                     req.segment_vid,
                     written_shards,
                 );
+                release_result?;
+            }};
+        }
+        let object_node = match self.object_metadata_primary_node(&req.bucket, &req.key) {
+            Ok(node) => node,
+            Err(error) => {
+                cleanup_direct_put_attempt_before_command_ownership!();
                 return Err(error.into());
             }
         };
@@ -2803,9 +2856,24 @@ impl StorageCluster {
         let _bucket_guard = object_node.lock_bucket(&req.bucket);
         let (command, new_pending_command) = loop {
             let (command, new_pending_command) = loop {
-                let Some(command) = self.pending_metadata_command_for_bucket(pg_id, &req.bucket)?
+                let Some(command) =
+                    (match self.pending_metadata_command_for_bucket(pg_id, &req.bucket) {
+                        Ok(command) => command,
+                        Err(error) => {
+                            drop(_bucket_guard);
+                            cleanup_direct_put_attempt_before_command_ownership!();
+                            return Err(error.into());
+                        }
+                    })
                 else {
-                    let object_pg = object_node.get_pg(pg_id.get())?;
+                    let object_pg = match object_node.get_pg(pg_id.get()) {
+                        Ok(object_pg) => object_pg,
+                        Err(error) => {
+                            drop(_bucket_guard);
+                            cleanup_direct_put_attempt_before_command_ownership!();
+                            return Err(error.into());
+                        }
+                    };
                     match self.validate_direct_put_commit_preconditions(
                         &object_pg,
                         req,
@@ -2815,37 +2883,13 @@ impl StorageCluster {
                         Ok(Err(error)) => {
                             drop(object_pg);
                             drop(_bucket_guard);
-                            self.release_object_generation_reservation_after_pending_drain_best_effort(
-                                pg_id,
-                                &req.bucket,
-                                &req.key,
-                                &req.generation_reservation_id,
-                            );
-                            self.delete_direct_put_segment_payload_shards(
-                                req.data_pg_id,
-                                req.ec,
-                                &req.segment_okh,
-                                req.segment_vid,
-                                written_shards,
-                            );
+                            cleanup_direct_put_attempt_before_command_ownership!();
                             return Ok(Err(error));
                         }
                         Err(error) => {
                             drop(object_pg);
                             drop(_bucket_guard);
-                            self.release_object_generation_reservation_after_pending_drain_best_effort(
-                                pg_id,
-                                &req.bucket,
-                                &req.key,
-                                &req.generation_reservation_id,
-                            );
-                            self.delete_direct_put_segment_payload_shards(
-                                req.data_pg_id,
-                                req.ec,
-                                &req.segment_okh,
-                                req.segment_vid,
-                                written_shards,
-                            );
+                            cleanup_direct_put_attempt_before_command_ownership!();
                             return Err(error);
                         }
                     }
@@ -2861,55 +2905,41 @@ impl StorageCluster {
                             Ok(version_id) => version_id,
                             Err(error) => {
                                 drop(_bucket_guard);
-                                self.release_object_generation_reservation_after_pending_drain_best_effort(
-                                    pg_id,
-                                    &req.bucket,
-                                    &req.key,
-                                    &req.generation_reservation_id,
-                                );
-                                self.delete_direct_put_segment_payload_shards(
-                                    req.data_pg_id,
-                                    req.ec,
-                                    &req.segment_okh,
-                                    req.segment_vid,
-                                    written_shards,
-                                );
+                                cleanup_direct_put_attempt_before_command_ownership!();
                                 return Err(error);
                             }
                         }
                     } else {
                         VersionId::Null
                     };
-                    let object_pg = object_node.get_pg(pg_id.get())?;
+                    let object_pg = match object_node.get_pg(pg_id.get()) {
+                        Ok(object_pg) => object_pg,
+                        Err(error) => {
+                            drop(_bucket_guard);
+                            cleanup_direct_put_attempt_before_command_ownership!();
+                            return Err(error.into());
+                        }
+                    };
                     self.maybe_run_before_direct_put_command_id_hook();
                     let command = match self.prepare_commit_direct_put_object_command(
-                        pg_id, &object_pg, req, version_id,
+                        pg_id,
+                        &object_pg,
+                        req,
+                        version_id,
+                        req.bucket_write_reservation.clone(),
                     ) {
                         Ok(command) => command,
                         Err(ObjectPgActionError::Store(
                             StoreError::MetadataCommandLogConflict { .. },
                         )) => {
                             drop(object_pg);
-                            if let Err(error) = self
-                                .drain_pending_object_metadata_commands_for_bucket(
-                                    pg_id,
-                                    &req.bucket,
-                                )
-                            {
+                            let cleanup = self.drain_pending_object_metadata_commands_for_bucket(
+                                pg_id,
+                                &req.bucket,
+                            );
+                            if let Err(error) = cleanup {
                                 drop(_bucket_guard);
-                                self.release_object_generation_reservation_after_pending_drain_best_effort(
-                                    pg_id,
-                                    &req.bucket,
-                                    &req.key,
-                                    &req.generation_reservation_id,
-                                );
-                                self.delete_direct_put_segment_payload_shards(
-                                    req.data_pg_id,
-                                    req.ec,
-                                    &req.segment_okh,
-                                    req.segment_vid,
-                                    written_shards,
-                                );
+                                cleanup_direct_put_attempt_before_command_ownership!();
                                 return Err(error);
                             }
                             continue;
@@ -2917,19 +2947,7 @@ impl StorageCluster {
                         Err(error) => {
                             drop(object_pg);
                             drop(_bucket_guard);
-                            self.release_object_generation_reservation_after_pending_drain_best_effort(
-                                pg_id,
-                                &req.bucket,
-                                &req.key,
-                                &req.generation_reservation_id,
-                            );
-                            self.delete_direct_put_segment_payload_shards(
-                                req.data_pg_id,
-                                req.ec,
-                                &req.segment_okh,
-                                req.segment_vid,
-                                written_shards,
-                            );
+                            cleanup_direct_put_attempt_before_command_ownership!();
                             return Err(error);
                         }
                     };
@@ -2946,7 +2964,12 @@ impl StorageCluster {
                             &req.generation_reservation_id,
                             req.generation_id,
                         )
+                        && commit.bucket_write_reservation.as_ref()
+                            == req.bucket_write_reservation.as_ref()
                 );
+                if is_matching_direct_put {
+                    bucket_write_proof_command_owned = true;
+                }
                 let has_abandoned_log = match self
                     .metadata_command_has_abandoned_log_on_acting_set(&command)
                 {
@@ -2954,19 +2977,7 @@ impl StorageCluster {
                     Err(error) => {
                         let error = bucket_snapshot_error_to_object_pg_action_error(error.source);
                         drop(_bucket_guard);
-                        self.release_object_generation_reservation_after_pending_drain_best_effort(
-                            pg_id,
-                            &req.bucket,
-                            &req.key,
-                            &req.generation_reservation_id,
-                        );
-                        self.delete_direct_put_segment_payload_shards(
-                            req.data_pg_id,
-                            req.ec,
-                            &req.segment_okh,
-                            req.segment_vid,
-                            written_shards,
-                        );
+                        cleanup_direct_put_attempt_before_command_ownership!();
                         return Err(error);
                     }
                 };
@@ -3006,6 +3017,54 @@ impl StorageCluster {
                     if let Err(error) = self.drain_pending_object_metadata_command(pg_id, &command)
                     {
                         drop(_bucket_guard);
+                        cleanup_direct_put_attempt_before_command_ownership!();
+                        return Err(error);
+                    }
+                    continue;
+                }
+                if is_matching_direct_put {
+                    break (command, false);
+                }
+                if let Err(error) = self.drain_pending_object_metadata_command(pg_id, &command) {
+                    drop(_bucket_guard);
+                    cleanup_direct_put_attempt_before_command_ownership!();
+                    return Err(error);
+                }
+            };
+
+            if let Err(error) = self.register_payload_shard_acks(req.data_pg_id, &shard_batch) {
+                if new_pending_command {
+                    drop(_bucket_guard);
+                    let release_result =
+                        self.release_metadata_command_bucket_write_reservation(&command);
+                    self.release_object_generation_reservation_after_pending_drain_best_effort(
+                        pg_id,
+                        &req.bucket,
+                        &req.key,
+                        &req.generation_reservation_id,
+                    );
+                    self.delete_direct_put_segment_payload_shards(
+                        req.data_pg_id,
+                        req.ec,
+                        &req.segment_okh,
+                        req.segment_vid,
+                        written_shards,
+                    );
+                    release_result.map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+                }
+                return Err(error);
+            }
+            if new_pending_command {
+                let installed = match self.try_install_pending_metadata_command_for_bucket(
+                    pg_id,
+                    &req.bucket,
+                    &command,
+                ) {
+                    Ok(installed) => installed,
+                    Err(error) => {
+                        drop(_bucket_guard);
+                        let release_result =
+                            self.release_metadata_command_bucket_write_reservation(&command);
                         self.release_object_generation_reservation_after_pending_drain_best_effort(
                             pg_id,
                             &req.bucket,
@@ -3019,60 +3078,20 @@ impl StorageCluster {
                             req.segment_vid,
                             written_shards,
                         );
+                        release_result.map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+                        return Err(error);
+                    }
+                };
+                if !installed {
+                    let cleanup =
+                        self.drain_pending_object_metadata_commands_for_bucket(pg_id, &req.bucket);
+                    if let Err(error) = cleanup {
+                        drop(_bucket_guard);
+                        cleanup_direct_put_attempt_before_command_ownership!();
                         return Err(error);
                     }
                     continue;
                 }
-                if is_matching_direct_put {
-                    break (command, false);
-                }
-                if let Err(error) = self.drain_pending_object_metadata_command(pg_id, &command) {
-                    drop(_bucket_guard);
-                    self.release_object_generation_reservation_after_pending_drain_best_effort(
-                        pg_id,
-                        &req.bucket,
-                        &req.key,
-                        &req.generation_reservation_id,
-                    );
-                    self.delete_direct_put_segment_payload_shards(
-                        req.data_pg_id,
-                        req.ec,
-                        &req.segment_okh,
-                        req.segment_vid,
-                        written_shards,
-                    );
-                    return Err(error);
-                }
-            };
-
-            if let Err(error) = self.register_payload_shard_acks(req.data_pg_id, &shard_batch) {
-                if new_pending_command {
-                    drop(_bucket_guard);
-                    self.release_object_generation_reservation_after_pending_drain_best_effort(
-                        pg_id,
-                        &req.bucket,
-                        &req.key,
-                        &req.generation_reservation_id,
-                    );
-                    self.delete_direct_put_segment_payload_shards(
-                        req.data_pg_id,
-                        req.ec,
-                        &req.segment_okh,
-                        req.segment_vid,
-                        written_shards,
-                    );
-                }
-                return Err(error);
-            }
-            if new_pending_command
-                && !self.try_install_pending_metadata_command_for_bucket(
-                    pg_id,
-                    &req.bucket,
-                    &command,
-                )?
-            {
-                self.drain_pending_object_metadata_commands_for_bucket(pg_id, &req.bucket)?;
-                continue;
             }
             break (command, new_pending_command);
         };
@@ -3091,6 +3110,8 @@ impl StorageCluster {
                     else {
                         drop(_bucket_guard);
                         if new_pending_command {
+                            self.release_metadata_command_bucket_write_reservation(&command)
+                                .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
                             self.release_object_generation_reservation_after_pending_drain_best_effort(
                                 pg_id,
                                 &req.bucket,
@@ -3117,6 +3138,8 @@ impl StorageCluster {
                             .map_err(|error| {
                                 bucket_snapshot_error_to_object_pg_action_error(error.source)
                             })?;
+                        self.release_metadata_command_bucket_write_reservation(&command)
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
                         self.remove_pending_metadata_command_for_bucket(
                             pg_id,
                             &req.bucket,
@@ -3145,6 +3168,8 @@ impl StorageCluster {
             }
         }
 
+        self.release_metadata_command_bucket_write_reservation(&command)
+            .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
         self.remove_pending_metadata_command_for_bucket(pg_id, command.bucket_name(), &command)
             .map_err(ObjectPgActionError::from)?;
 
@@ -3221,6 +3246,7 @@ impl StorageCluster {
         object_pg: &crate::PgStore,
         req: &CommitDirectPutObjectReq,
         version_id: VersionId,
+        bucket_write_reservation: Option<BucketWriteReservationProof>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         let reserved_generation = object_pg.get_object_generation_reservation(
             &req.bucket,
@@ -3289,6 +3315,7 @@ impl StorageCluster {
             write_sequence,
             last_modified_millis,
             stale_payload,
+            bucket_write_reservation,
         };
         Ok(MetadataCommandEnvelope::new(
             self.next_object_metadata_command_id_from_locked_pg(pg_id, object_pg)?,

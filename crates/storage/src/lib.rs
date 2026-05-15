@@ -38,8 +38,8 @@ pub mod traits;
 pub mod types;
 
 pub use cluster::{
-    LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute, ObjectPayloadLease,
-    ReleasedObjectPayloadLease, ShardLocation, StorageCluster,
+    BucketWriteSnapshotAction, LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute,
+    ObjectPayloadLease, ReleasedObjectPayloadLease, ShardLocation, StorageCluster,
 };
 #[cfg(feature = "test-hooks")]
 pub use cluster::{
@@ -50,6 +50,7 @@ pub use error::{
     BucketSnapshotLoadError, BucketWriteDrainError, ClusterBuildError, MetadataError,
     ObjectPgActionError, ShardIoError, StoreError,
 };
+pub use metadata_command::BucketWriteReservationProof;
 #[cfg(feature = "test-hooks")]
 pub use node::{
     install_bucket_scoped_test_hooks, BucketScopedTestHookGuard, BucketScopedTestHooks,

@@ -3433,10 +3433,14 @@ Proposed subphases:
         an encoded durable reservation proof; normal apply, matching
         pending-command retry, and local-cluster open-time convergence validate
         that proof against the bucket-PG primary before applying, and the
-        reservation remains live until the pending command converges. The other
-        object-PG write command families still need the same apply-time
-        reservation proof before DeleteBucket can rely on durable reservations
-        alone.
+        reservation remains live until the pending command converges. Direct
+        buffered PutObject commit commands now also carry an encoded durable
+        reservation proof; if the direct PUT metadata command becomes pending or
+        partial, the command-owned reservation remains live and is released only
+        after terminal convergence. Stream finalization, multipart, object
+        delete/lifecycle, and object metadata command families still need the
+        same apply-time reservation proof before DeleteBucket can rely on
+        durable reservations alone.
       - introduce a cluster-level bucket write reservation guard that captures:
         bucket PG id, bucket name, reservation id, owner token, acquire epoch,
         and the node/store that accepted the reservation

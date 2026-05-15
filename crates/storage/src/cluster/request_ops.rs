@@ -1359,6 +1359,56 @@ impl super::StorageCluster {
         })
     }
 
+    pub fn with_bucket_write_snapshot_for_command<T, E>(
+        &self,
+        bucket: &BucketName,
+        request: BucketSnapshotRequest,
+        action: impl FnOnce(
+            BucketSnapshot,
+            BucketWriteReservationProof,
+        )
+            -> Result<super::BucketWriteSnapshotAction<T, E>, BucketSnapshotLoadError>,
+    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        loop {
+            let reservation = match self.acquire_durable_bucket_write_reservation(
+                bucket,
+                "bucket-write-snapshot",
+                None,
+            ) {
+                Ok(reservation) => reservation,
+                Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
+                    self.wait_for_durable_bucket_write_drain(bucket)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let proof = BucketWriteReservationProof::from(&reservation.record);
+
+            let result = (|| {
+                let bucket_pg = reservation.node.get_pg(reservation.pg_id)?;
+                let snapshot = crate::SharedStorageNode::load_bucket_snapshot_from_pg(
+                    &bucket_pg, bucket, request,
+                )?;
+                drop(bucket_pg);
+                action(snapshot, proof)
+            })();
+            let (result, release_result) = match result {
+                Ok(super::BucketWriteSnapshotAction::Release(result)) => (
+                    Ok(result),
+                    self.release_durable_bucket_write_reservation(reservation),
+                ),
+                Ok(super::BucketWriteSnapshotAction::TransferredToCommand(result)) => {
+                    (Ok(result), Ok(()))
+                }
+                Err(error) => (
+                    Err(error),
+                    self.release_durable_bucket_write_reservation(reservation),
+                ),
+            };
+            return Self::finish_bucket_write_snapshot_operation(result, release_result);
+        }
+    }
+
     pub(crate) fn with_bucket_write_reservation_snapshot<T, E>(
         &self,
         bucket: &BucketName,
@@ -5313,6 +5363,7 @@ impl super::StorageCluster {
                                 write_sequence,
                                 last_modified_millis,
                                 stale_payload,
+                                bucket_write_reservation: None,
                             },
                         )),
                     );
