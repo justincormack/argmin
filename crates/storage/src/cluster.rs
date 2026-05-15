@@ -1531,6 +1531,9 @@ impl StorageCluster {
             MetadataCommandPayload::CreateStreamUpload(create) => {
                 Some(&create.bucket_write_reservation)
             }
+            MetadataCommandPayload::CommitStreamPart(commit) => {
+                Some(&commit.bucket_write_reservation)
+            }
             MetadataCommandPayload::CreateMultipartUpload(create) => {
                 Some(&create.bucket_write_reservation)
             }

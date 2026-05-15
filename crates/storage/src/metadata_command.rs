@@ -895,6 +895,7 @@ pub(crate) struct CommitStreamPartCommand {
     pub(crate) segments: Vec<MultipartPartSegmentRecord>,
     pub(crate) existing_part: Option<MultipartPartRecord>,
     pub(crate) displaced_segments: Vec<MultipartPartSegmentRecord>,
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
 }
 
 impl CommitStreamPartCommand {
@@ -1376,7 +1377,8 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 self.skip_multipart_part()?;
                 self.skip_repeated(Self::skip_multipart_part_segment)?;
                 self.skip_optional_multipart_part()?;
-                self.skip_repeated(Self::skip_multipart_part_segment)
+                self.skip_repeated(Self::skip_multipart_part_segment)?;
+                self.skip_required_bucket_write_reservation_proof()
             }
             METADATA_COMMAND_CREATE_MULTIPART_UPLOAD => {
                 self.skip_multipart_upload()?;
@@ -1580,6 +1582,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                     segments: self.read_repeated(Self::read_multipart_part_segment)?,
                     existing_part: self.read_optional(Self::read_multipart_part)?,
                     displaced_segments: self.read_repeated(Self::read_multipart_part_segment)?,
+                    bucket_write_reservation: self.read_bucket_write_reservation_proof()?,
                 }),
             )),
             METADATA_COMMAND_CREATE_MULTIPART_UPLOAD => {
@@ -3076,6 +3079,7 @@ fn encode_commit_stream_part(out: &mut Vec<u8>, command: &CommitStreamPartComman
     for segment in &command.displaced_segments {
         encode_multipart_part_segment(out, segment);
     }
+    encode_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
 }
 
 fn encode_create_multipart_upload(out: &mut Vec<u8>, command: &CreateMultipartUploadCommand) {
@@ -4714,6 +4718,7 @@ mod tests {
                 segments: vec![omitted_streaming_segment.clone()],
                 existing_part: Some(uploaded_part),
                 displaced_segments: vec![omitted_streaming_segment],
+                bucket_write_reservation: bucket_write_reservation.clone(),
             })),
             MetadataCommandPayload::DeleteObjectPayloadReclaim(Box::new(
                 DeleteObjectPayloadReclaimCommand::new(
@@ -4806,7 +4811,7 @@ mod tests {
                 0x531372a5ef60100f,
                 0x8d3e5d6cb995e021,
                 0x873424a13234f823,
-                0x7cf30e2471f346ae,
+                0xd791c495e8ce2c3e,
                 0xa9cde2110916a8a6,
                 0x0e53aa8cb595ea77,
                 0x7198824f0ecf3d31,

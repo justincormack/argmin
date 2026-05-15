@@ -3449,11 +3449,14 @@ Proposed subphases:
         UploadPart and the low-level path used by UploadPartCopy. The
         `CreateStreamUpload` command encoding now requires that proof, so
         proofless replay/open-time command bytes fail closed instead of
-        applying outside the bucket-write fence.
-        CompleteMultipartUpload, UploadPart finalization, object
-        delete/lifecycle, and object metadata command families still need the
-        same apply-time reservation proof before DeleteBucket can rely on
-        durable reservations alone. Closeout should also remove the
+        applying outside the bucket-write fence. UploadPart stream finalization
+        now carries the proof in `CommitStreamPart`; matching pending retry,
+        partial/reopen convergence, and open-time recovery validate and release
+        it before clearing the terminal pending slot.
+        CompleteMultipartUpload, object delete/lifecycle, and object metadata
+        command families still need the same apply-time reservation proof before
+        DeleteBucket can rely on durable reservations alone. Closeout should
+        also remove the
         transitional `Option<BucketWriteReservationProof>` storage API surfaces:
         once all production writers pass proofs end to end, require proofs at
         those request boundaries and keep any internal proof acquisition behind

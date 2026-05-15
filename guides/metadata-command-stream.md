@@ -187,7 +187,7 @@ Current production pending-command publishers:
 | `create_upload_part_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Revalidate MPU/session target after contention. The low-level UploadPartCopy path acquires a durable bucket-write reservation before publishing the session command and releases it only after convergence. |
 | `reserve_completed_multipart_upload_order` | `AdvanceCompletedMultipartUploadSequence` | `AllocatorCleanup` | Serialize through the bucket-PG slot; a later object-PG command must be derived from a terminal reservation. |
 | `complete_multipart_upload_commit_serialized` | `CommitMultipartObject` | `MatchingOutcomeRetry` | Rebuild completion parts, cleanup snapshot, stale payload, and bucket-PG order after unrelated contention. If the contender is the same completion request, finish that exact command through the matching-pending branch and return its computed outcome. |
-| `finalize_upload_part_stream` | `CommitStreamPart` | `TerminalSessionRetry` | Rebuild stream session, MPU row, staged segments, and displaced part refs after unrelated contention. If an equivalent terminal command wins the pending slot, restart without draining so the matching branch can finish it. |
+| `finalize_upload_part_stream` | `CommitStreamPart` | `TerminalSessionRetry` | Rebuild stream session, MPU row, staged segments, and displaced part refs after unrelated contention. If an equivalent terminal command wins the pending slot, restart without draining so the matching branch can finish it. The command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
 | `abort_multipart_upload_locked` | `AbortMultipartUpload` | `TerminalSessionRetry` | Rebuild upload, part, active stream session, staged segment, and cleanup snapshots after unrelated contention. If an equivalent abort wins the pending slot, restart without draining so the matching branch returns the successful abort outcome. |
 | `abort_authorized_multipart_upload_locked` | `AbortMultipartUpload` | `TerminalSessionRetry` | Rebuild authorized upload cleanup snapshot after unrelated contention and compare the current upload row to the authorized row before install. If an equivalent abort wins the pending slot, restart without draining so the matching branch returns the successful abort outcome. |
 
@@ -272,6 +272,9 @@ Multipart publisher rules:
   does not mean storage reauthorizes against current bucket policy.
 - `finalize_upload_part_stream` must reload the stream session, MPU row,
   existing part row, staged segments, and displaced part refs after contention.
+  Its `CommitStreamPart` command carries the bucket-write reservation proof;
+  live retry and open-time convergence must validate and release that proof
+  before clearing the terminal pending slot.
 - `abort_multipart_upload_locked` and
   `abort_authorized_multipart_upload_locked` must rebuild upload, part, active
   stream session, staged segment, and cleanup snapshots after contention.

@@ -1515,6 +1515,9 @@ fn command_bucket_write_reservation_proof(
         crate::metadata_command::MetadataCommandPayload::CreateStreamUpload(create) => {
             Some(&create.bucket_write_reservation)
         }
+        crate::metadata_command::MetadataCommandPayload::CommitStreamPart(commit) => {
+            Some(&commit.bucket_write_reservation)
+        }
         crate::metadata_command::MetadataCommandPayload::CreateMultipartUpload(create) => {
             Some(&create.bucket_write_reservation)
         }
@@ -1968,6 +1971,36 @@ mod tests {
             .acquire_durable_bucket_write_reservation(bucket, operation_kind, target_context)
             .unwrap();
         crate::metadata_command::BucketWriteReservationProof::from(&reservation.record)
+    }
+
+    fn assert_bucket_write_reservations_released(
+        map: &LocalClusterMap,
+        bucket: &crate::BucketName,
+    ) {
+        let pg_id = PgId::new(
+            map.node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology()
+                .bucket_pg_for(bucket),
+        );
+        let primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+            .unwrap();
+        let bucket_pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+        assert!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, bucket)
+                .unwrap()
+                .is_empty(),
+            "metadata command convergence must release the durable bucket write reservation"
+        );
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)
+                .unwrap()
+                .active_write_reservations,
+            0,
+            "metadata command convergence must release the legacy bucket write counter"
+        );
     }
 
     struct CommittedDirectSegment {
@@ -9900,6 +9933,7 @@ mod tests {
             );
         }
         assert_clean_metadata_command_stream(&map, &[object_pg]);
+        assert_bucket_write_reservations_released(&map, &bucket);
     }
 
     #[test]
@@ -15387,6 +15421,12 @@ mod tests {
         let key_for_hook = key.clone();
         let upload_for_hook = upload_id.clone();
         let session_for_hook = session_id.clone();
+        let proof_for_hook = acquire_test_bucket_write_proof(
+            &cluster,
+            &bucket,
+            "test-stream-part-commit-race",
+            Some(key.as_str()),
+        );
         let command_epoch = cluster.operation_epoch();
         let _hook_guard =
             cluster.test_install_before_abort_multipart_pending_install_hook(Arc::new(move || {
@@ -15449,6 +15489,7 @@ mod tests {
                         segments,
                         existing_part: None,
                         displaced_segments: Vec::new(),
+                        bucket_write_reservation: proof_for_hook.clone(),
                     })),
                 );
                 pg.try_insert_pending_metadata_command_slot(
@@ -18884,6 +18925,12 @@ mod tests {
         let hook_session_id = session_id.clone();
         let hook_part = expected_part.clone();
         let hook_segments = expected_segments.clone();
+        let hook_proof = acquire_test_bucket_write_proof(
+            &cluster,
+            &bucket,
+            "test-stream-part-terminal-race",
+            Some(key.as_str()),
+        );
         let pg_id = PgId::new(object_pg);
         let _hook_guard = cluster.test_install_before_metadata_command_pending_install_hook(
             Arc::new(move || {
@@ -18905,6 +18952,7 @@ mod tests {
                         segments: hook_segments.clone(),
                         existing_part: None,
                         displaced_segments: Vec::new(),
+                        bucket_write_reservation: hook_proof.clone(),
                     })),
                 );
                 insert_pending_metadata_command_for_test(&hook_map, pg_id, &hook_bucket, &command);
@@ -18939,6 +18987,7 @@ mod tests {
             );
         }
         assert_clean_metadata_command_stream(&map, &[object_pg]);
+        assert_bucket_write_reservations_released(&map, &bucket);
     }
 
     #[test]
@@ -19272,6 +19321,12 @@ mod tests {
             ec_m: segment.ec_m,
         }];
         let pg_id = PgId::new(object_pg);
+        let proof = acquire_test_bucket_write_proof(
+            &cluster,
+            &bucket,
+            "test-stream-part-open-converge",
+            Some(key.as_str()),
+        );
         let command = MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 ClusterEpoch::INITIAL,
@@ -19287,6 +19342,7 @@ mod tests {
                 segments: segments.clone(),
                 existing_part: None,
                 displaced_segments: Vec::new(),
+                bucket_write_reservation: proof,
             })),
         );
         insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
@@ -19347,6 +19403,7 @@ mod tests {
             );
         }
         assert_clean_metadata_command_stream(&map, &[object_pg]);
+        assert_bucket_write_reservations_released(&map, &bucket);
     }
 
     #[test]
@@ -19601,6 +19658,7 @@ mod tests {
             "abort winner must clean staged payload after finalize contention: {error:?}"
         );
         assert_clean_metadata_command_stream(&first_map, &[pg_id.get()]);
+        assert_bucket_write_reservations_released(&first_map, &bucket);
     }
 
     #[test]
