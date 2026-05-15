@@ -15223,6 +15223,17 @@ mod tests {
         let bucket = trusted_bucket_name("pending-slot-huge-count");
         let key = trusted_object_key("object");
         let reservation_id = SessionId::try_from("52".repeat(16)).unwrap();
+        let proof = BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: "pending-slot-proof".to_string(),
+            owner_token: "pending-slot-owner".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: 1,
+            operation_kind: "direct-put-commit".to_string(),
+            created_at: 1,
+            lease_deadline: Some(2),
+            target_context: Some(key.as_str().to_string()),
+        };
         let command = MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 ClusterEpoch::INITIAL,
@@ -15253,7 +15264,7 @@ mod tests {
                 write_sequence: 1,
                 last_modified_millis: 2,
                 stale_payload: None,
-                bucket_write_reservation: None,
+                bucket_write_reservation: proof,
             })),
         );
         let mut malformed_bytes = command.command_bytes();

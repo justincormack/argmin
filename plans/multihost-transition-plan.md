@@ -3439,11 +3439,18 @@ Proposed subphases:
         partial, the command-owned reservation remains live and is released only
         after terminal convergence. CreateMultipartUpload commands now carry
         an encoded durable reservation proof; partial/reopen convergence
-        validates and releases the proof before clearing the pending slot, but
-        CompleteMultipartUpload, UploadPart, stream finalization, object
+        validates and releases the proof before clearing the pending slot.
+        Stream PutObject finalization commands now carry the reservation proof
+        supplied by the coordinator's bucket-write handle; partial/reopen
+        convergence validates and releases the proof before clearing the
+        pending slot. CompleteMultipartUpload, UploadPart, object
         delete/lifecycle, and object metadata command families still need the
         same apply-time reservation proof before DeleteBucket can rely on
-        durable reservations alone.
+        durable reservations alone. Closeout should also remove the
+        transitional `Option<BucketWriteReservationProof>` storage API surfaces:
+        once all production writers pass proofs end to end, require proofs at
+        those request boundaries and keep any internal proof acquisition behind
+        explicit test-only helpers.
       - introduce a cluster-level bucket write reservation guard that captures:
         bucket PG id, bucket name, reservation id, owner token, acquire epoch,
         and the node/store that accepted the reservation

@@ -594,7 +594,7 @@ pub(crate) struct CommitDirectPutObjectCommand {
     pub(crate) write_sequence: u64,
     pub(crate) last_modified_millis: u64,
     pub(crate) stale_payload: Option<ObjectPayloadReclaimCommand>,
-    pub(crate) bucket_write_reservation: Option<BucketWriteReservationProof>,
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
 }
 
 impl CommitDirectPutObjectCommand {
@@ -1318,7 +1318,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 self.read_u64()?;
                 self.read_u64()?;
                 self.skip_optional_stale_payload()?;
-                self.skip_optional_bucket_write_reservation_proof()
+                self.skip_required_bucket_write_reservation_proof()
             }
             METADATA_COMMAND_COMMIT_MULTIPART_OBJECT => {
                 self.skip_str()?;
@@ -1492,8 +1492,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                         write_sequence: self.read_u64()?,
                         last_modified_millis: self.read_u64()?,
                         stale_payload: self.read_optional_stale_payload()?,
-                        bucket_write_reservation: self
-                            .read_optional_bucket_write_reservation_proof()?,
+                        bucket_write_reservation: self.read_bucket_write_reservation_proof()?,
                     },
                 )))
             }
@@ -2941,7 +2940,7 @@ fn encode_commit_direct_put_object(out: &mut Vec<u8>, command: &CommitDirectPutO
             encode_multipart_reclaim(out, reclaim);
         }
     }
-    encode_optional_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
+    encode_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
 }
 
 fn encode_commit_multipart_object(out: &mut Vec<u8>, command: &CommitMultipartObjectCommand) {
@@ -3774,6 +3773,71 @@ mod tests {
     }
 
     #[test]
+    fn commit_direct_put_object_rejects_missing_bucket_write_reservation_proof() {
+        let bucket = BucketName::try_from("direct-proof-required".to_string()).unwrap();
+        let key = ObjectKey::try_from("key".to_string()).unwrap();
+        let proof = BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: "direct-proof-required-reservation".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: 7,
+            operation_kind: "direct-put-commit".to_string(),
+            created_at: 10,
+            lease_deadline: Some(20),
+            target_context: Some(key.as_str().to_string()),
+        };
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
+                object: PutLiveObjectReq {
+                    bucket,
+                    key,
+                    version_id: VersionId::Null,
+                    owner: OwnerIdentity::from_principal("owner"),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    generation_id: GenerationId::MIN,
+                    size: 0,
+                    etag: ObjectEtag::single_part(0),
+                    ec: EcShape { k: 2, m: 1 },
+                    layout: ObjectLayout::Standard,
+                    tags: None,
+                    metadata_blob: Some(SerializedMetadataBlob::default()),
+                    system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
+                    object_lock: ObjectLockState::default(),
+                    encryption: ObjectEncryption::None,
+                },
+                segments: Vec::new(),
+                generation_reservation_id: SessionId::try_from("53".repeat(16)).unwrap(),
+                write_sequence: 1,
+                last_modified_millis: 2,
+                stale_payload: None,
+                bucket_write_reservation: proof.clone(),
+            })),
+        );
+
+        let mut proof_bytes = Vec::new();
+        encode_bucket_write_reservation_proof(&mut proof_bytes, &proof);
+        let mut proofless_bytes = command.command_bytes();
+        assert!(proofless_bytes.ends_with(&proof_bytes));
+        proofless_bytes.truncate(proofless_bytes.len() - proof_bytes.len());
+
+        assert!(
+            decode_metadata_command_envelope(&proofless_bytes).is_err(),
+            "proofless direct PUT command bytes must fail full envelope decode"
+        );
+        assert!(
+            decode_metadata_command_log_entry_header(&proofless_bytes).is_err(),
+            "proofless direct PUT command bytes must fail applied-row validation"
+        );
+    }
+
+    #[test]
     fn metadata_command_canonical_encoding_is_stable() {
         let owner = CanonicalUserId::from_principal("owner");
         let acl_grants = AclGrants::default();
@@ -4385,7 +4449,7 @@ mod tests {
                 write_sequence: 44,
                 last_modified_millis: 555,
                 stale_payload: Some(segment_reclaim.clone()),
-                bucket_write_reservation: Some(bucket_write_reservation.clone()),
+                bucket_write_reservation: bucket_write_reservation.clone(),
             })),
             MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
                 object: object.clone(),
@@ -4394,7 +4458,7 @@ mod tests {
                 write_sequence: 45,
                 last_modified_millis: 556,
                 stale_payload: Some(multipart_reclaim.clone()),
-                bucket_write_reservation: None,
+                bucket_write_reservation: bucket_write_reservation.clone(),
             })),
             MetadataCommandPayload::CommitMultipartObject(Box::new(CommitMultipartObjectCommand {
                 upload_id: upload_id.clone(),
@@ -4694,8 +4758,8 @@ mod tests {
                 0x5fc3fd9935e6b23a,
                 0x56db6be41cc9a89c,
                 0x3acf49df359790d4,
-                0xed7da0ffcff54285,
-                0xddc16da5e688fb9f,
+                0x1709498196ee0830,
+                0xbcb5caaa0f53392e,
                 0x7920c33a006e1d68,
                 0x53fdbf4c6f062d53,
                 0x6df04a5fc73e478a,

@@ -503,121 +503,131 @@ impl Coordinator {
         let tags = req.tags;
         let cond = req.cond;
         let request = BucketHandleRequest::new().requiring_lifecycle_view();
-        self.with_bucket_write_handle_for(&req.object, request, |bucket_handle| {
+        self.with_bucket_write_handle_for_command(&req.object, request, |bucket_handle, proof| {
+            let mut proof_transferred_to_command = false;
             let bucket_info = bucket_handle.bucket().clone();
-            Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
-            let resolved_object_lock =
-                Self::resolve_new_object_lock_state(&bucket_info, req.requested_object_lock)?;
-            #[cfg(test)]
-            if should_probe_finalize_stream_put_commit(req.object.bucket_name()) {
-                let object_pg_ready = self
+            let result = (|| {
+                Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
+                let resolved_object_lock =
+                    Self::resolve_new_object_lock_state(&bucket_info, req.requested_object_lock)?;
+                #[cfg(test)]
+                if should_probe_finalize_stream_put_commit(req.object.bucket_name()) {
+                    let object_pg_ready = self
+                        .storage_node
+                        .try_probe_object_pg_available(
+                            req.object.bucket_name_typed(),
+                            req.object.key_typed(),
+                        )
+                        .map_err(Coordinator::map_object_pg_action_error)?;
+                    if !object_pg_ready {
+                        return Err(ServerError::InternalError {
+                            reason:
+                                "test probe: object pg still locked before finalize_stream_put commit"
+                                    .to_string(),
+                        });
+                    }
+                }
+                proof_transferred_to_command = true;
+                let outcome = self
                     .storage_node
-                    .try_probe_object_pg_available(
+                    .finalize_put_object_stream(
                         req.object.bucket_name_typed(),
                         req.object.key_typed(),
-                    )
-                    .map_err(Coordinator::map_object_pg_action_error)?;
-                if !object_pg_ready {
-                    return Err(ServerError::InternalError {
-                        reason:
-                            "test probe: object pg still locked before finalize_stream_put commit"
-                                .to_string(),
-                    });
-                }
-            }
-            let outcome = self
-                .storage_node
-                .finalize_put_object_stream(
-                    req.object.bucket_name_typed(),
-                    req.object.key_typed(),
-                    session_id,
-                    total_size,
-                    |snapshot: StreamPutFinalizeSnapshot| {
-                        let write_encryption = ActiveWriteEncryption::from_stored_and_active(
-                            &snapshot.session.encryption,
-                            req.write_encryption,
-                        )?;
-                        let system_metadata = Self::object_system_metadata_with_default_checksum(
-                            req.system_metadata,
-                            &write_encryption,
-                            crc64,
-                        );
-                        if !cond.is_empty() {
-                            if matches!(cond, crate::conditional::WriteCondition::IfMatch(_))
-                                && snapshot.existing_etag.is_none()
-                            {
-                                return Err(ServerError::ObjectNotFound {
-                                    bucket: req.object.bucket_name().to_string(),
-                                    key: req.object.key().to_string(),
-                                });
-                            }
-                            crate::conditional::check_write_conditions(
-                                cond,
-                                snapshot.existing_etag.as_deref(),
+                        session_id,
+                        total_size,
+                        Some(proof.clone()),
+                        |snapshot: StreamPutFinalizeSnapshot| {
+                            let write_encryption = ActiveWriteEncryption::from_stored_and_active(
+                                &snapshot.session.encryption,
+                                req.write_encryption,
                             )?;
-                        }
-                        let metadata_blob =
-                            storage::SerializedMetadataBlob::from(metadata_blob.serialize()?);
-                        let (system_metadata_blob, encryption) =
-                            Self::prepare_stored_system_metadata(
-                                &system_metadata,
+                            let system_metadata = Self::object_system_metadata_with_default_checksum(
+                                req.system_metadata,
                                 &write_encryption,
-                            )?;
-                        let owner = Self::effective_put_object_owner(
-                            &bucket_info,
-                            req.object.requester(),
-                            &req.acl,
-                        );
-                        let acl_grants =
-                            Self::object_acl_grants_for_put_object(&bucket_info, &owner, &req.acl);
+                                crc64,
+                            );
+                            if !cond.is_empty() {
+                                if matches!(cond, crate::conditional::WriteCondition::IfMatch(_))
+                                    && snapshot.existing_etag.is_none()
+                                {
+                                    return Err(ServerError::ObjectNotFound {
+                                        bucket: req.object.bucket_name().to_string(),
+                                        key: req.object.key().to_string(),
+                                    });
+                                }
+                                crate::conditional::check_write_conditions(
+                                    cond,
+                                    snapshot.existing_etag.as_deref(),
+                                )?;
+                            }
+                            let metadata_blob =
+                                storage::SerializedMetadataBlob::from(metadata_blob.serialize()?);
+                            let (system_metadata_blob, encryption) =
+                                Self::prepare_stored_system_metadata(
+                                    &system_metadata,
+                                    &write_encryption,
+                                )?;
+                            let owner = Self::effective_put_object_owner(
+                                &bucket_info,
+                                req.object.requester(),
+                                &req.acl,
+                            );
+                            let acl_grants =
+                                Self::object_acl_grants_for_put_object(&bucket_info, &owner, &req.acl);
 
-                        Ok(storage::PreparedStreamPutCommit {
-                            value: system_metadata,
-                            versioning: bucket_info.versioning,
-                            owner,
-                            acl_grants: acl_grants.clone(),
-                            public_read: Self::acl_grants_public_read(&acl_grants),
-                            size: total_size,
-                            etag_crc64: crc64,
-                            tags: tags.map(storage::SerializedTagSet::from),
-                            metadata_blob,
-                            system_metadata_blob,
-                            object_lock: resolved_object_lock,
-                            encryption,
-                        })
-                    },
-                )
-                .map_err(|error| match error {
-                    storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
-                    storage::ObjectPgActionError::InvalidRequest { reason } => {
-                        ServerError::InvalidRequest { reason }
-                    }
-                    storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
-                })??;
-            let lifecycle_expiration = self
-                .current_object_write_lifecycle_expiration_for_loaded_bucket(
-                    &bucket_handle,
-                    key,
-                    outcome.live_tags.as_deref(),
-                    outcome.live_size,
-                    outcome.live_last_modified,
-                )?;
-            if let Some(generation_id) = outcome.stale_generation_id {
-                self.read_runtime().enqueue_object_payload_reclaim_for(
-                    req.object.bucket_name_typed(),
-                    req.object.key_typed(),
-                    generation_id,
-                );
+                            Ok(storage::PreparedStreamPutCommit {
+                                value: system_metadata,
+                                versioning: bucket_info.versioning,
+                                owner,
+                                acl_grants: acl_grants.clone(),
+                                public_read: Self::acl_grants_public_read(&acl_grants),
+                                size: total_size,
+                                etag_crc64: crc64,
+                                tags: tags.map(storage::SerializedTagSet::from),
+                                metadata_blob,
+                                system_metadata_blob,
+                                object_lock: resolved_object_lock,
+                                encryption,
+                            })
+                        },
+                    )
+                    .map_err(|error| match error {
+                        storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
+                        storage::ObjectPgActionError::InvalidRequest { reason } => {
+                            ServerError::InvalidRequest { reason }
+                        }
+                        storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
+                    })??;
+                let lifecycle_expiration = self
+                    .current_object_write_lifecycle_expiration_for_loaded_bucket(
+                        &bucket_handle,
+                        key,
+                        outcome.live_tags.as_deref(),
+                        outcome.live_size,
+                        outcome.live_last_modified,
+                    )?;
+                if let Some(generation_id) = outcome.stale_generation_id {
+                    self.read_runtime().enqueue_object_payload_reclaim_for(
+                        req.object.bucket_name_typed(),
+                        req.object.key_typed(),
+                        generation_id,
+                    );
+                }
+
+                Ok(PutObjectResult {
+                    etag: format_etag(crc64),
+                    last_modified: outcome.live_last_modified,
+                    version_id: outcome.version_id,
+                    system_metadata: outcome.value,
+                    managed_encryption: outcome.encryption.managed_encryption_algorithm(),
+                    lifecycle_expiration,
+                })
+            })();
+            if proof_transferred_to_command {
+                storage::BucketWriteSnapshotAction::transferred_to_command(result)
+            } else {
+                storage::BucketWriteSnapshotAction::release(result)
             }
-
-            Ok(PutObjectResult {
-                etag: format_etag(crc64),
-                last_modified: outcome.live_last_modified,
-                version_id: outcome.version_id,
-                system_metadata: outcome.value,
-                managed_encryption: outcome.encryption.managed_encryption_algorithm(),
-                lifecycle_expiration,
-            })
         })
     }
 

@@ -1526,7 +1526,7 @@ impl StorageCluster {
     ) -> Option<&BucketWriteReservationProof> {
         match command.payload() {
             MetadataCommandPayload::CommitDirectPutObject(commit) => {
-                commit.bucket_write_reservation.as_ref()
+                Some(&commit.bucket_write_reservation)
             }
             MetadataCommandPayload::CreateStreamUpload(create) => {
                 create.bucket_write_reservation.as_ref()
@@ -2810,16 +2810,38 @@ impl StorageCluster {
         mut action: impl FnMut(DirectPutCommitSnapshot) -> Result<(), E>,
     ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(&req.bucket, &req.key));
+        let effective_bucket_write_reservation = match req.bucket_write_reservation.clone() {
+            Some(proof) => proof,
+            None => match self.acquire_durable_bucket_write_reservation(
+                &req.bucket,
+                "direct-put-commit",
+                Some(req.key.as_str()),
+            ) {
+                Ok(reservation) => BucketWriteReservationProof::from(&reservation.record),
+                Err(error) => {
+                    self.release_object_generation_reservation_after_pending_drain_best_effort(
+                        pg_id,
+                        &req.bucket,
+                        &req.key,
+                        &req.generation_reservation_id,
+                    );
+                    self.delete_direct_put_segment_payload_shards(
+                        req.data_pg_id,
+                        req.ec,
+                        &req.segment_okh,
+                        req.segment_vid,
+                        written_shards,
+                    );
+                    return Err(bucket_snapshot_error_to_object_pg_action_error(error));
+                }
+            },
+        };
         let mut bucket_write_proof_command_owned = false;
         macro_rules! release_caller_bucket_write_proof_if_unowned {
             () => {{
                 if !bucket_write_proof_command_owned {
-                    if let Some(proof) = req.bucket_write_reservation.as_ref() {
-                        self.release_bucket_write_reservation_proof(proof)
-                            .map_err(bucket_snapshot_error_to_object_pg_action_error)
-                    } else {
-                        Ok(())
-                    }
+                    self.release_bucket_write_reservation_proof(&effective_bucket_write_reservation)
+                        .map_err(bucket_snapshot_error_to_object_pg_action_error)
                 } else {
                     Ok(())
                 }
@@ -2929,7 +2951,7 @@ impl StorageCluster {
                         &object_pg,
                         req,
                         version_id,
-                        req.bucket_write_reservation.clone(),
+                        Some(effective_bucket_write_reservation.clone()),
                     ) {
                         Ok(command) => command,
                         Err(ObjectPgActionError::Store(
@@ -2967,8 +2989,7 @@ impl StorageCluster {
                             &req.generation_reservation_id,
                             req.generation_id,
                         )
-                        && commit.bucket_write_reservation.as_ref()
-                            == req.bucket_write_reservation.as_ref()
+                        && commit.bucket_write_reservation == effective_bucket_write_reservation
                 );
                 if is_matching_direct_put {
                     bucket_write_proof_command_owned = true;
@@ -3311,6 +3332,20 @@ impl StorageCluster {
             object_lock: req.object_lock,
             encryption: req.encryption.clone(),
         };
+        let command_id = self.next_object_metadata_command_id_from_locked_pg(pg_id, object_pg)?;
+        let bucket_write_reservation = match bucket_write_reservation {
+            Some(proof) => proof,
+            None => {
+                let reservation = self
+                    .acquire_durable_bucket_write_reservation(
+                        &req.bucket,
+                        "direct-put-commit",
+                        Some(req.key.as_str()),
+                    )
+                    .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+                BucketWriteReservationProof::from(&reservation.record)
+            }
+        };
         let command = CommitDirectPutObjectCommand {
             object,
             segments: vec![segment_record],
@@ -3321,7 +3356,7 @@ impl StorageCluster {
             bucket_write_reservation,
         };
         Ok(MetadataCommandEnvelope::new(
-            self.next_object_metadata_command_id_from_locked_pg(pg_id, object_pg)?,
+            command_id,
             MetadataCommandPayload::CommitDirectPutObject(Box::new(command)),
         ))
     }
