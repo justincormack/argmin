@@ -3024,11 +3024,7 @@ impl StorageCluster {
                 if is_matching_direct_put {
                     break (command, false);
                 }
-                if let Err(error) = self.apply_pending_object_metadata_command_for_bucket(
-                    pg_id,
-                    &req.bucket,
-                    &command,
-                ) {
+                if let Err(error) = self.drain_pending_object_metadata_command(pg_id, &command) {
                     drop(_bucket_guard);
                     self.release_object_generation_reservation_after_pending_drain_best_effort(
                         pg_id,

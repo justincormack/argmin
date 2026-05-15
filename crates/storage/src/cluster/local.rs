@@ -10738,6 +10738,153 @@ mod tests {
     }
 
     #[test]
+    fn direct_put_commit_retries_after_unrelated_partial_exact_pending_conflict() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let pending_key = key_for_object_pg(
+            map.node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology(),
+            &bucket,
+            object_pg,
+            "pending-partial-tags-",
+        );
+        write_committed_direct_segment_for(
+            &cluster,
+            &bucket,
+            &pending_key,
+            b"unrelated partial pending object",
+        );
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let hook_key = pending_key.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::PutObjectMetadata(update)
+                        if update.object.bucket == hook_bucket
+                            && update.object.key == hook_key
+                            && node_id == NodeId::new(1)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::MetadataCommandLogConflict {
+                            node_id: node_id.as_u32(),
+                            pg_id: command.id().pg_id().get(),
+                            cluster_epoch: command.id().cluster_epoch(),
+                            log_index: command.id().log_index().get(),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let tags =
+            "<Tagging><TagSet><Tag><Key>phase</Key><Value>partial</Value></Tag></TagSet></Tagging>";
+        let err = cluster
+            .put_object_tags_if(&bucket, &pending_key, None, tags, |stored| {
+                Ok::<_, ()>(stored.version_id())
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                    pg_id,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    ..
+                }) if pg_id == object_pg
+            ),
+            "expected injected retryable exact conflict, got {err:?}"
+        );
+        drop(hook_guard);
+        assert!(
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
+            "partially applied unrelated object metadata command must remain pending"
+        );
+
+        let reservation_id = crate::SessionId::try_from("55".repeat(16)).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        let payload = b"direct put drains unrelated partial exact conflict";
+        let segment_okh = [55; 16];
+        let written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                payload,
+            )
+            .unwrap();
+        let mut commit_req = direct_put_commit_req(
+            &bucket,
+            &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            &written,
+        );
+        commit_req.versioning = crate::BucketVersioningState::Enabled;
+
+        let outcome = cluster
+            .commit_direct_put_object_from_payload_shards(
+                &commit_req,
+                &written.written_shards,
+                |_| Ok::<_, ()>(()),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.live_size, payload.len() as u64);
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+        assert_direct_put_metadata_on_acting_nodes(
+            &map,
+            &node_ids,
+            object_pg,
+            &commit_req,
+            &outcome,
+        );
+
+        for node_id in node_ids {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            let stored =
+                crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &pending_key).unwrap();
+            assert_eq!(stored.as_live().unwrap().tags.as_deref(), Some(tags));
+        }
+    }
+
+    #[test]
     fn reserve_object_version_retry_reuses_pending_partial_replica_command() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
