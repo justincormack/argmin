@@ -25,8 +25,6 @@ use rusqlite::{
 };
 
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
-#[cfg(test)]
-use crate::metadata_command::BucketPropertyMutation;
 use crate::metadata_command::{
     abandoned_command_log_bytes, decode_metadata_command_envelope,
     decode_metadata_command_log_entry_header, metadata_command_log_hash,
@@ -43,6 +41,8 @@ use crate::metadata_command::{
     PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
     ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
 };
+#[cfg(test)]
+use crate::metadata_command::{BucketPropertyMutation, BucketWriteReservationProof};
 use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::*;
@@ -11580,10 +11580,21 @@ impl PgMetadataStore for PgStore {
     #[cfg(test)]
     fn create_multipart_upload(&self, req: &CreateMultipartUploadReq) -> Result<(), MetadataError> {
         let object_generation_id = self.next_generation_id(&req.bucket, &req.key)?;
-        let command = CreateMultipartUploadCommand::from_request(
+        let command = CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
             req.clone(),
             object_generation_id,
             PgStore::now_millis(),
+            BucketWriteReservationProof {
+                bucket: req.bucket.clone(),
+                reservation_id: "test-create-mpu-reservation".to_string(),
+                owner_token: "test-owner-token".to_string(),
+                cluster_epoch: ClusterEpoch::INITIAL,
+                bucket_execution_generation: 1,
+                operation_kind: "create-multipart-upload".to_string(),
+                created_at: PgStore::now_millis(),
+                lease_deadline: None,
+                target_context: Some(req.key.as_str().to_string()),
+            },
         );
         self.create_multipart_upload_explicit(&command.upload)
     }
@@ -15283,6 +15294,98 @@ mod tests {
         assert!(
             matches!(err, StoreError::MetadataCommandLogConflict { .. }),
             "malformed repeated count must fail closed as command conflict, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn pending_metadata_command_slot_rejects_proofless_create_multipart_upload() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("pending-slot-proofless-mpu");
+        let key = trusted_object_key("object");
+        let upload_id = UploadId::try_from(format!("{}{}", "upload", ".".repeat(122))).unwrap();
+        let proof = BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: "proofless-mpu-reservation".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: 1,
+            operation_kind: "create-multipart-upload".to_string(),
+            created_at: 2,
+            lease_deadline: None,
+            target_context: Some(key.as_str().to_string()),
+        };
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CreateMultipartUpload(Box::new(
+                CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
+                    CreateMultipartUploadReq {
+                        upload_id,
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        tags: None,
+                        metadata_blob: SerializedMetadataBlob::default(),
+                        system_metadata_blob: SerializedSystemMetadataBlob::default(),
+                        initiator: Some(OwnerIdentity::from_principal("initiator")),
+                        owner: OwnerIdentity::from_principal("owner"),
+                        acl_grants: AclGrants::default(),
+                        public_read: false,
+                        object_lock: ObjectLockState::default(),
+                        checksum: None,
+                        encryption: ObjectEncryption::None,
+                    },
+                    GenerationId::MIN,
+                    3,
+                    proof,
+                ),
+            )),
+        );
+        let mut proofless_bytes = command.command_bytes();
+        let reservation_id_bytes = b"proofless-mpu-reservation";
+        let reservation_id_offset = proofless_bytes
+            .windows(reservation_id_bytes.len())
+            .position(|window| window == reservation_id_bytes)
+            .expect("proof reservation id should be encoded");
+        let encoded_bucket_name = {
+            let mut encoded = Vec::new();
+            encoded.extend_from_slice(&(bucket.as_str().len() as u32).to_le_bytes());
+            encoded.extend_from_slice(bucket.as_str().as_bytes());
+            encoded
+        };
+        let proof_start = proofless_bytes[..reservation_id_offset]
+            .windows(encoded_bucket_name.len())
+            .rposition(|window| window == encoded_bucket_name)
+            .expect("proof bucket name should be encoded before reservation id");
+        proofless_bytes.truncate(proof_start);
+        let proofless_checksum = checksum::crc64::checksum(&proofless_bytes);
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO metadata_command_pending_slot \
+                 (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, scope_bucket) \
+                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    ClusterEpoch::INITIAL.get() as i64,
+                    1_i64,
+                    1_i64,
+                    proofless_checksum as i64,
+                    proofless_bytes,
+                    bucket.as_str(),
+                ],
+            )
+            .unwrap();
+
+        let err = store
+            .pending_metadata_command_envelope(0, ClusterEpoch::INITIAL)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::MetadataCommandLogConflict { .. }),
+            "proofless MPU-create command must fail closed as command conflict, got {err:?}"
         );
     }
 

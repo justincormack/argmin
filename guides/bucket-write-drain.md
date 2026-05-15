@@ -77,7 +77,7 @@ write-drain mechanism.
 | Stream PutObject session create | `create_stream_put_session_for_authorized_write` / `create_put_object_stream_session` / `create_put_object_stream_session_record` | Carries a durable reservation proof in the session command; apply/retry/open-time convergence validate and release it |
 | Stream PutObject finalize | `Coordinator::finalize_stream_put` via `with_bucket_write_handle_for` | Needs reservation and cross-PG apply fence for final object publish |
 | CopyObject destination write | `authorize_copy_object` and stream destination commit | Needs destination bucket write reservation; source reads do not acquire destination write protection |
-| CreateMultipartUpload | `authorize_create_multipart_upload` / `StorageCluster::create_multipart_upload` | Needs reservation and cross-PG apply fence for the MPU row |
+| CreateMultipartUpload | `authorize_create_multipart_upload` / `StorageCluster::create_multipart_upload` | Carries a durable reservation proof in the MPU-create command; apply/retry/open-time convergence validate and release it |
 | CompleteMultipartUpload | `authorize_complete_multipart_upload` / `complete_multipart_upload_commit_serialized` | Needs reservation and cross-PG apply fence for final object publish and cleanup |
 | UploadPart stream session create | `begin_stream_part` / `begin_upload_part_stream_session` / `create_upload_part_stream_session` | Needs reservation before creating destination UploadPart stream state |
 | UploadPart stream finalize | `finalize_upload_part_stream` | Needs reservation and cross-PG apply fence for committed part state |

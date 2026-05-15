@@ -1515,6 +1515,9 @@ fn command_bucket_write_reservation_proof(
         crate::metadata_command::MetadataCommandPayload::CreateStreamUpload(create) => {
             create.bucket_write_reservation.as_ref()
         }
+        crate::metadata_command::MetadataCommandPayload::CreateMultipartUpload(create) => {
+            Some(&create.bucket_write_reservation)
+        }
         _ => None,
     }
 }
@@ -13901,14 +13904,17 @@ mod tests {
         let ec_shape = EcShape { k: 2, m: 1 };
         let map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape)
             .expect("open local map");
-        let (bucket, key, object_pg, _data_pg) = {
+        let (bucket, key, object_pg, _data_pg, bucket_pg) = {
             let topology = map
                 .nodes
                 .get(&NodeId::new(0))
                 .unwrap()
                 .storage_node()
                 .pg_topology();
-            bucket_key_with_distinct_object_and_data_pg(topology)
+            let (bucket, key, object_pg, data_pg) =
+                bucket_key_with_distinct_object_and_data_pg(topology);
+            let bucket_pg = topology.bucket_pg_for(&bucket);
+            (bucket, key, object_pg, data_pg, bucket_pg)
         };
 
         let map = Arc::new(map);
@@ -13978,10 +13984,41 @@ mod tests {
         );
         drop(hook_guard);
         assert!(!fail_once.load(Ordering::SeqCst));
+        let pending = pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket);
         assert!(
-            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
+            pending.is_some(),
             "partial multipart create command must remain durable before reopen"
         );
+        let pending = pending.unwrap();
+        assert!(
+            matches!(
+                pending.payload(),
+                MetadataCommandPayload::CreateMultipartUpload(create)
+                    if create.bucket_write_reservation.operation_kind == "create-multipart-upload"
+            ),
+            "partial multipart create command must carry the bucket write reservation proof"
+        );
+        {
+            let bucket_primary = map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(bucket_pg))
+                .unwrap();
+            let bucket_pg_store = bucket_primary.storage_node().get_pg(bucket_pg).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::durable_bucket_write_reservations(
+                    &*bucket_pg_store,
+                    &bucket,
+                )
+                .unwrap()
+                .len(),
+                1
+            );
+            assert_eq!(
+                crate::PgMetadataStore::head_bucket_raw(&*bucket_pg_store, &bucket)
+                    .unwrap()
+                    .active_write_reservations,
+                1
+            );
+        }
         let replica_upload = {
             let replica = map.node(NodeId::new(1)).unwrap().storage_node();
             let pg = replica.get_pg(object_pg).unwrap();
@@ -14010,7 +14047,25 @@ mod tests {
                 replica_upload.object_generation_id
             );
         }
-        assert_clean_metadata_command_stream(&reopened, &[object_pg]);
+        {
+            let bucket_primary = reopened
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(bucket_pg))
+                .unwrap();
+            let bucket_pg_store = bucket_primary.storage_node().get_pg(bucket_pg).unwrap();
+            assert!(crate::PgMetadataStore::durable_bucket_write_reservations(
+                &*bucket_pg_store,
+                &bucket,
+            )
+            .unwrap()
+            .is_empty());
+            assert_eq!(
+                crate::PgMetadataStore::head_bucket_raw(&*bucket_pg_store, &bucket)
+                    .unwrap()
+                    .active_write_reservations,
+                0
+            );
+        }
+        assert_clean_metadata_command_stream(&reopened, &[bucket_pg, object_pg]);
     }
 
     #[test]

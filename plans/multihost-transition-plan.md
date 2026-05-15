@@ -3437,7 +3437,10 @@ Proposed subphases:
         buffered PutObject commit commands now also carry an encoded durable
         reservation proof; if the direct PUT metadata command becomes pending or
         partial, the command-owned reservation remains live and is released only
-        after terminal convergence. Stream finalization, multipart, object
+        after terminal convergence. CreateMultipartUpload commands now carry
+        an encoded durable reservation proof; partial/reopen convergence
+        validates and releases the proof before clearing the pending slot, but
+        CompleteMultipartUpload, UploadPart, stream finalization, object
         delete/lifecycle, and object metadata command families still need the
         same apply-time reservation proof before DeleteBucket can rely on
         durable reservations alone.

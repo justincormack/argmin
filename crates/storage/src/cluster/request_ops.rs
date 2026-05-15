@@ -5428,95 +5428,140 @@ impl super::StorageCluster {
             let applied_commands = self
                 .drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)
                 .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-            let attempt =
-                self.with_bucket_write_reservation_snapshot(bucket, request, |snapshot| {
-                    let primary_node = self.object_metadata_primary_node(bucket, key)?;
+            let reservation = match self.acquire_durable_bucket_write_reservation(
+                bucket,
+                "create-multipart-upload",
+                Some(key.as_str()),
+            ) {
+                Ok(reservation) => reservation,
+                Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
+                    self.wait_for_durable_bucket_write_drain(bucket)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let proof = BucketWriteReservationProof::from(&reservation.record);
+            let mut disposition = super::BucketWriteReservationDisposition::ReleaseByCaller;
+            let result = (|| {
+                let bucket_pg = reservation.node.get_pg(reservation.pg_id)?;
+                let snapshot = crate::SharedStorageNode::load_bucket_snapshot_from_pg(
+                    &bucket_pg, bucket, request,
+                )?;
+                drop(bucket_pg);
+
+                let primary_node = self.object_metadata_primary_node(bucket, key)?;
+                let object_pg = primary_node.get_pg(pg_id.get())?;
+                let existing_object =
+                    match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
+                        Ok(StoredObject::Live(record)) => Some(StoredObject::Live(record)),
+                        Ok(StoredObject::DeleteMarker(_)) | Err(MetadataError::ObjectNotFound) => {
+                            None
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
+                drop(object_pg);
+
+                let (value, create) = match action(snapshot, existing_object) {
+                    Ok(prepared) => prepared,
+                    Err(error) => return Ok(Err(error)),
+                };
+                if let Some(initiated_at) = self
+                    .matching_multipart_upload_initiated_at(
+                        pg_id,
+                        &create,
+                        super::applied_multipart_create_command(&applied_commands, &create),
+                    )
+                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
+                {
+                    return Ok(Ok(Attempt::Complete(CreateMultipartUploadOutcome {
+                        value,
+                        initiated_at,
+                    })));
+                }
+
+                let object_generation_id = {
                     let object_pg = primary_node.get_pg(pg_id.get())?;
-                    let existing_object =
-                        match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
-                            Ok(StoredObject::Live(record)) => Some(StoredObject::Live(record)),
-                            Ok(StoredObject::DeleteMarker(_))
-                            | Err(MetadataError::ObjectNotFound) => None,
-                            Err(error) => return Err(error.into()),
-                        };
-                    drop(object_pg);
-
-                    let (value, create) = match action(snapshot, existing_object) {
-                        Ok(prepared) => prepared,
-                        Err(error) => return Ok(Err(error)),
-                    };
-                    if let Some(initiated_at) = self
-                        .matching_multipart_upload_initiated_at(
-                            pg_id,
-                            &create,
-                            super::applied_multipart_create_command(&applied_commands, &create),
-                        )
-                        .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
-                    {
-                        return Ok(Ok(Attempt::Complete(CreateMultipartUploadOutcome {
-                            value,
-                            initiated_at,
-                        })));
+                    PgMetadataStore::next_generation_id(&*object_pg, bucket, key)?
+                };
+                let command_id = match self.next_object_metadata_command_id(pg_id) {
+                    Ok(command_id) => command_id,
+                    Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                        ..
+                    })) => {
+                        self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+                            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                        return Ok(Ok(Attempt::Retry));
                     }
-
-                    let object_generation_id = {
-                        let object_pg = primary_node.get_pg(pg_id.get())?;
-                        PgMetadataStore::next_generation_id(&*object_pg, bucket, key)?
-                    };
-                    let command_id = match self.next_object_metadata_command_id(pg_id) {
-                        Ok(command_id) => command_id,
-                        Err(ObjectPgActionError::Store(
-                            StoreError::MetadataCommandLogConflict { .. },
-                        )) => {
-                            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
-                                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-                            return Ok(Ok(Attempt::Retry));
-                        }
-                        Err(error) => {
-                            return Err(super::object_pg_action_error_to_bucket_snapshot_error(
-                                error,
-                            ));
-                        }
-                    };
-                    let command = MetadataCommandEnvelope::new(
-                        command_id,
-                        MetadataCommandPayload::CreateMultipartUpload(Box::new(
-                            CreateMultipartUploadCommand::from_request(
-                                create.clone(),
-                                object_generation_id,
-                                crate::clock::current_time_millis(),
-                            ),
-                        )),
-                    );
-                    match self
-                        .install_snapshot_sensitive_metadata_command_or_drain(
-                            pg_id, bucket, &command,
-                        )
-                        .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
-                    {
-                        super::SnapshotSensitiveCommandInstall::Installed => {}
-                        super::SnapshotSensitiveCommandInstall::ContenderDrained => {
-                            return Ok(Ok(Attempt::Retry));
-                        }
-                    }
-                    if let Err(error) =
-                        self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
-                    {
+                    Err(error) => {
                         return Err(super::object_pg_action_error_to_bucket_snapshot_error(
                             error,
                         ));
                     }
+                };
+                let command = MetadataCommandEnvelope::new(
+                    command_id,
+                    MetadataCommandPayload::CreateMultipartUpload(Box::new(
+                        CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
+                            create.clone(),
+                            object_generation_id,
+                            crate::clock::current_time_millis(),
+                            proof.clone(),
+                        ),
+                    )),
+                );
+                match self
+                    .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
+                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
+                {
+                    super::SnapshotSensitiveCommandInstall::Installed => {}
+                    super::SnapshotSensitiveCommandInstall::ContenderDrained => {
+                        return Ok(Ok(Attempt::Retry));
+                    }
+                }
+                if let Err(error) =
+                    self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
+                {
+                    match self.pending_metadata_command_uses_bucket_write_reservation(
+                        pg_id, bucket, &proof,
+                    ) {
+                        Ok(true) => {
+                            disposition =
+                                super::BucketWriteReservationDisposition::TransferredToCommand;
+                        }
+                        Ok(false) => {}
+                        Err(lookup_error) => {
+                            disposition = super::BucketWriteReservationDisposition::PreserveForOwnershipCheckFailure;
+                            return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                                lookup_error,
+                            ));
+                        }
+                    }
+                    return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                        error,
+                    ));
+                }
+                disposition = super::BucketWriteReservationDisposition::TransferredToCommand;
 
-                    let initiated_at = {
-                        let object_pg = primary_node.get_pg(pg_id.get())?;
-                        PgMetadataStore::get_multipart_upload(&*object_pg, &create.upload_id)?
-                            .initiated_at
-                    };
-                    Ok(Ok(Attempt::Complete(CreateMultipartUploadOutcome {
-                        value,
-                        initiated_at,
-                    })))
-                })?;
+                let initiated_at = {
+                    let object_pg = primary_node.get_pg(pg_id.get())?;
+                    PgMetadataStore::get_multipart_upload(&*object_pg, &create.upload_id)?
+                        .initiated_at
+                };
+                Ok(Ok(Attempt::Complete(CreateMultipartUploadOutcome {
+                    value,
+                    initiated_at,
+                })))
+            })();
+            let release_result = match disposition {
+                super::BucketWriteReservationDisposition::TransferredToCommand => Ok(()),
+                super::BucketWriteReservationDisposition::PreserveForOwnershipCheckFailure => {
+                    Ok(())
+                }
+                super::BucketWriteReservationDisposition::ReleaseByCaller => {
+                    self.release_durable_bucket_write_reservation(reservation)
+                }
+            };
+            let attempt = Self::finish_bucket_write_snapshot_operation(result, release_result)?;
             match attempt {
                 Ok(Attempt::Complete(outcome)) => return Ok(Ok(outcome)),
                 Ok(Attempt::Retry) => continue,

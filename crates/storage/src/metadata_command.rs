@@ -921,13 +921,15 @@ impl CommitStreamPartCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CreateMultipartUploadCommand {
     pub(crate) upload: MultipartUploadRecord,
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
 }
 
 impl CreateMultipartUploadCommand {
-    pub(crate) fn from_request(
+    pub(crate) fn from_request_with_bucket_write_reservation(
         request: CreateMultipartUploadReq,
         object_generation_id: GenerationId,
         initiated_at_millis: u64,
+        bucket_write_reservation: BucketWriteReservationProof,
     ) -> Self {
         Self {
             upload: MultipartUploadRecord {
@@ -948,6 +950,7 @@ impl CreateMultipartUploadCommand {
                 checksum: request.checksum,
                 encryption: request.encryption,
             },
+            bucket_write_reservation,
         }
     }
 }
@@ -1315,7 +1318,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 self.read_u64()?;
                 self.read_u64()?;
                 self.skip_optional_stale_payload()?;
-                self.skip_bucket_write_reservation_proof()
+                self.skip_optional_bucket_write_reservation_proof()
             }
             METADATA_COMMAND_COMMIT_MULTIPART_OBJECT => {
                 self.skip_str()?;
@@ -1379,7 +1382,10 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 self.skip_optional_multipart_part()?;
                 self.skip_repeated(Self::skip_multipart_part_segment)
             }
-            METADATA_COMMAND_CREATE_MULTIPART_UPLOAD => self.skip_multipart_upload(),
+            METADATA_COMMAND_CREATE_MULTIPART_UPLOAD => {
+                self.skip_multipart_upload()?;
+                self.skip_required_bucket_write_reservation_proof()
+            }
             METADATA_COMMAND_ABORT_MULTIPART_UPLOAD => {
                 self.skip_str()?;
                 self.skip_str()?;
@@ -1586,6 +1592,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 Ok(MetadataCommandPayload::CreateMultipartUpload(Box::new(
                     CreateMultipartUploadCommand {
                         upload: self.read_multipart_upload()?,
+                        bucket_write_reservation: self.read_bucket_write_reservation_proof()?,
                     },
                 )))
             }
@@ -2117,21 +2124,23 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_u64()?;
         self.skip_object_encryption()?;
         self.read_nonzero_u64("next stream segment VID")?;
-        self.skip_bucket_write_reservation_proof()
+        self.skip_optional_bucket_write_reservation_proof()
     }
 
-    fn skip_bucket_write_reservation_proof(&mut self) -> Result<(), String> {
-        self.skip_optional(|decoder| {
-            decoder.skip_str()?;
-            decoder.skip_str()?;
-            decoder.skip_str()?;
-            decoder.read_u64()?;
-            decoder.read_u64()?;
-            decoder.skip_str()?;
-            decoder.read_u64()?;
-            decoder.skip_optional(|decoder| decoder.read_u64().map(|_| ()))?;
-            decoder.skip_optional(Self::skip_str)
-        })
+    fn skip_optional_bucket_write_reservation_proof(&mut self) -> Result<(), String> {
+        self.skip_optional(Self::skip_required_bucket_write_reservation_proof)
+    }
+
+    fn skip_required_bucket_write_reservation_proof(&mut self) -> Result<(), String> {
+        self.skip_str()?;
+        self.skip_str()?;
+        self.skip_str()?;
+        self.read_u64()?;
+        self.read_u64()?;
+        self.skip_str()?;
+        self.read_u64()?;
+        self.skip_optional(|decoder| decoder.read_u64().map(|_| ()))?;
+        self.skip_optional(Self::skip_str)
     }
 
     fn skip_terminal_stream_cleanup(&mut self) -> Result<(), String> {
@@ -2651,19 +2660,23 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
     fn read_optional_bucket_write_reservation_proof(
         &mut self,
     ) -> Result<Option<BucketWriteReservationProof>, String> {
-        self.read_optional(|decoder| {
-            Ok(BucketWriteReservationProof {
-                bucket: decoder.read_bucket_name()?,
-                reservation_id: decoder.read_string("bucket write reservation id")?,
-                owner_token: decoder.read_string("bucket write reservation owner token")?,
-                cluster_epoch: ClusterEpoch::new(decoder.read_u64()?)
-                    .ok_or_else(|| "invalid bucket write reservation cluster epoch".to_string())?,
-                bucket_execution_generation: decoder.read_u64()?,
-                operation_kind: decoder.read_string("bucket write reservation operation kind")?,
-                created_at: decoder.read_u64()?,
-                lease_deadline: decoder.read_optional_u64_value()?,
-                target_context: decoder.read_optional_string("bucket write reservation target")?,
-            })
+        self.read_optional(Self::read_bucket_write_reservation_proof)
+    }
+
+    fn read_bucket_write_reservation_proof(
+        &mut self,
+    ) -> Result<BucketWriteReservationProof, String> {
+        Ok(BucketWriteReservationProof {
+            bucket: self.read_bucket_name()?,
+            reservation_id: self.read_string("bucket write reservation id")?,
+            owner_token: self.read_string("bucket write reservation owner token")?,
+            cluster_epoch: ClusterEpoch::new(self.read_u64()?)
+                .ok_or_else(|| "invalid bucket write reservation cluster epoch".to_string())?,
+            bucket_execution_generation: self.read_u64()?,
+            operation_kind: self.read_string("bucket write reservation operation kind")?,
+            created_at: self.read_u64()?,
+            lease_deadline: self.read_optional_u64_value()?,
+            target_context: self.read_optional_string("bucket write reservation target")?,
         })
     }
 
@@ -3083,6 +3096,7 @@ fn encode_commit_stream_part(out: &mut Vec<u8>, command: &CommitStreamPartComman
 
 fn encode_create_multipart_upload(out: &mut Vec<u8>, command: &CreateMultipartUploadCommand) {
     encode_multipart_upload(out, &command.upload);
+    encode_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
 }
 
 fn encode_abort_multipart_upload(out: &mut Vec<u8>, command: &AbortMultipartUploadCommand) {
@@ -3565,17 +3579,21 @@ fn encode_optional_bucket_write_reservation_proof(
         None => put_u8(out, 0),
         Some(proof) => {
             put_u8(out, 1);
-            put_str(out, proof.bucket.as_str());
-            put_str(out, &proof.reservation_id);
-            put_str(out, &proof.owner_token);
-            put_u64(out, proof.cluster_epoch.get());
-            put_u64(out, proof.bucket_execution_generation);
-            put_str(out, &proof.operation_kind);
-            put_u64(out, proof.created_at);
-            encode_optional_u64(out, proof.lease_deadline);
-            encode_optional_string(out, proof.target_context.as_deref());
+            encode_bucket_write_reservation_proof(out, proof);
         }
     }
+}
+
+fn encode_bucket_write_reservation_proof(out: &mut Vec<u8>, proof: &BucketWriteReservationProof) {
+    put_str(out, proof.bucket.as_str());
+    put_str(out, &proof.reservation_id);
+    put_str(out, &proof.owner_token);
+    put_u64(out, proof.cluster_epoch.get());
+    put_u64(out, proof.bucket_execution_generation);
+    put_str(out, &proof.operation_kind);
+    put_u64(out, proof.created_at);
+    encode_optional_u64(out, proof.lease_deadline);
+    encode_optional_string(out, proof.target_context.as_deref());
 }
 
 fn encode_bucket_subresource_mutation(out: &mut Vec<u8>, mutation: &BucketSubresourceMutation) {
@@ -4367,7 +4385,7 @@ mod tests {
                 write_sequence: 44,
                 last_modified_millis: 555,
                 stale_payload: Some(segment_reclaim.clone()),
-                bucket_write_reservation: Some(bucket_write_reservation),
+                bucket_write_reservation: Some(bucket_write_reservation.clone()),
             })),
             MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
                 object: object.clone(),
@@ -4498,7 +4516,7 @@ mod tests {
                 },
             })),
             MetadataCommandPayload::CreateMultipartUpload(Box::new(
-                CreateMultipartUploadCommand::from_request(
+                CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
                     CreateMultipartUploadReq {
                         upload_id: upload_id.clone(),
                         bucket: bucket.clone(),
@@ -4516,10 +4534,12 @@ mod tests {
                     },
                     generation_id,
                     560,
+                    bucket_write_reservation.clone(),
                 ),
             )),
             MetadataCommandPayload::CreateMultipartUpload(Box::new(CreateMultipartUploadCommand {
                 upload: multipart_upload_with_checksum,
+                bucket_write_reservation: bucket_write_reservation.clone(),
             })),
             MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
                 bucket: bucket.clone(),
@@ -4687,8 +4707,8 @@ mod tests {
                 0x74df7243409a2637,
                 0x5fd68ba34c3c927a,
                 0xaaee1aa183a67da1,
-                0x423d5ce8ecc3f471,
-                0xa10946bfbddcbb08,
+                0x18628b4680d19eea,
+                0x4842e9828aac6523,
                 0x8f0590d0286f0dc4,
                 0x815cc17ffafdbd72,
                 0x158c357233f435fb,

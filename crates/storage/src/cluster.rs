@@ -1531,6 +1531,9 @@ impl StorageCluster {
             MetadataCommandPayload::CreateStreamUpload(create) => {
                 create.bucket_write_reservation.as_ref()
             }
+            MetadataCommandPayload::CreateMultipartUpload(create) => {
+                Some(&create.bucket_write_reservation)
+            }
             _ => None,
         }
     }
