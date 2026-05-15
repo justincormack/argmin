@@ -1174,18 +1174,14 @@ impl super::StorageCluster {
     ) -> Result<Option<MetadataCommandId>, BucketSnapshotLoadError> {
         match self.next_bucket_metadata_command_id(pg_id) {
             Ok(command_id) => Ok(Some(command_id)),
-            Err(
-                error @ BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
-                    ..
-                }),
-            ) => {
+            Err(BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+                ..
+            })) => {
                 if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                     let pending_bucket = Self::metadata_command_bucket_name(&command).clone();
                     self.drain_pending_metadata_command_pg_slot(pg_id, &pending_bucket, &command)?;
-                    Ok(None)
-                } else {
-                    Err(error)
                 }
+                Ok(None)
             }
             Err(error) => Err(error),
         }
@@ -3377,7 +3373,7 @@ impl super::StorageCluster {
                     }
                 }
 
-                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                self.drain_pending_object_metadata_command(pg_id, &command)?;
                 continue;
             }
 
@@ -3767,7 +3763,7 @@ impl super::StorageCluster {
                         }));
                     }
                 }
-                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                self.drain_pending_object_metadata_command(pg_id, &command)?;
                 continue;
             }
 
@@ -3862,7 +3858,7 @@ impl super::StorageCluster {
                         }
                     }
                 }
-                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                self.drain_pending_object_metadata_command(pg_id, &command)?;
                 continue;
             }
 
@@ -3962,7 +3958,7 @@ impl super::StorageCluster {
                         }));
                     }
                 }
-                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                self.drain_pending_object_metadata_command(pg_id, &command)?;
                 continue;
             }
 
@@ -4330,7 +4326,7 @@ impl super::StorageCluster {
                         return Ok(Ok(reclaim_generation_id.into_iter().collect()));
                     }
                 }
-                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                self.drain_pending_object_metadata_command(pg_id, &command)?;
                 continue;
             }
 
@@ -4459,7 +4455,7 @@ impl super::StorageCluster {
                         return Ok(Ok(due));
                     }
                 }
-                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                self.drain_pending_object_metadata_command(pg_id, &command)?;
                 continue;
             }
 
@@ -5129,7 +5125,7 @@ impl super::StorageCluster {
                     if let Some(command) = pending_command.clone() =>
                 {
                     drop(object_pg);
-                    self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                    self.drain_pending_object_metadata_command(pg_id, &command)?;
                     continue;
                 }
                 Err(error) => return Err(error.into()),

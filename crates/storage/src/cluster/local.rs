@@ -8849,6 +8849,195 @@ mod tests {
     }
 
     #[test]
+    fn reissue_accepts_terminal_pending_command_after_stale_primary_max_snapshot() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+            .unwrap();
+        let topology = primary.storage_node().pg_topology();
+        let bucket = bucket_for_pg(topology, pg_id.get(), "terminal-pending-reissue-");
+        let command = create_bucket_metadata_command(pg_id, 1, bucket.clone());
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(primary.node_id(), &command)
+            .unwrap();
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+        let reloaded = cluster
+            .matching_reissued_pending_command_if_safe(
+                pg_id,
+                primary.node_id(),
+                0,
+                command.id().log_index().get(),
+                &command,
+                command.clone(),
+            )
+            .unwrap();
+
+        assert_eq!(reloaded.as_ref(), Some(&command));
+    }
+
+    #[test]
+    fn terminal_pending_reissue_rejects_different_stale_payload() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+            .unwrap();
+        let topology = primary.storage_node().pg_topology();
+        let current_bucket = bucket_for_pg(topology, pg_id.get(), "terminal-current-");
+        let stale_bucket = bucket_for_pg(topology, pg_id.get(), "terminal-stale-");
+        let current = create_bucket_metadata_command(pg_id, 1, current_bucket.clone());
+        let stale = create_bucket_metadata_command(pg_id, 1, stale_bucket);
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(primary.node_id(), &current)
+            .unwrap();
+        insert_pending_metadata_command_for_test(&map, pg_id, &current_bucket, &current);
+
+        let reloaded = cluster
+            .matching_reissued_pending_command_if_safe(
+                pg_id,
+                primary.node_id(),
+                0,
+                current.id().log_index().get(),
+                &stale,
+                current,
+            )
+            .unwrap();
+
+        assert_eq!(reloaded, None);
+    }
+
+    #[test]
+    fn terminal_pending_reissue_rejects_divergent_replica_prefix() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let current_bucket = bucket_for_pg(topology, 1, "terminal-divergent-current-");
+        let divergent_bucket = bucket_for_pg(topology, 1, "terminal-divergent-other-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let current = create_bucket_metadata_command(pg_id, 1, current_bucket.clone());
+        let primary_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        primary_pg
+            .apply_metadata_command_and_record(NodeId::new(1).as_u32(), &current)
+            .unwrap();
+        drop(primary_pg);
+        insert_pending_metadata_command_for_test(&map, pg_id, &current_bucket, &current);
+
+        let divergent = create_bucket_metadata_command(pg_id, 1, divergent_bucket);
+        let non_primary_pg = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        non_primary_pg
+            .apply_metadata_command_and_record(NodeId::new(0).as_u32(), &divergent)
+            .unwrap();
+        drop(non_primary_pg);
+
+        let err = cluster
+            .matching_reissued_pending_command_if_safe(
+                pg_id,
+                NodeId::new(1),
+                0,
+                current.id().log_index().get(),
+                &current,
+                current.clone(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::MetadataCommandLogConflict {
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn terminal_pending_reissue_rejects_live_replica_ahead_of_stale_max() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let current_bucket = bucket_for_pg(topology, 1, "terminal-ahead-current-");
+        let tail_bucket = bucket_for_pg(topology, 1, "terminal-ahead-tail-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let current = create_bucket_metadata_command(pg_id, 1, current_bucket.clone());
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &current)
+            .unwrap();
+        insert_pending_metadata_command_for_test(&map, pg_id, &current_bucket, &current);
+
+        let tail = create_bucket_metadata_command(pg_id, 2, tail_bucket);
+        let non_primary_pg = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        non_primary_pg
+            .apply_metadata_command_and_record(NodeId::new(0).as_u32(), &tail)
+            .unwrap();
+        drop(non_primary_pg);
+
+        let err = cluster
+            .matching_reissued_pending_command_if_safe(
+                pg_id,
+                NodeId::new(1),
+                0,
+                current.id().log_index().get(),
+                &current,
+                current.clone(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::MetadataCommandLogConflict {
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn stale_duplicate_metadata_command_index_on_non_primary_fails_closed_without_dropping_slot() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

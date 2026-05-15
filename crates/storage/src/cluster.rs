@@ -14,8 +14,8 @@ use crate::metadata_command::{
     AbortStreamUploadCommand, AppendStreamSegmentCommand, BucketWriteReservationProof,
     CommitDirectPutObjectCommand, CreateMultipartUploadCommand, CreateStreamUploadCommand,
     DeleteObjectVersionTarget, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
-    MetadataCommandPayload, ObjectPayloadReclaimCommand, ReleaseObjectGenerationCommand,
-    ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
+    MetadataCommandPayload, MetadataCommandReplicaState, ObjectPayloadReclaimCommand,
+    ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
 };
 use crate::node::SharedStorageNode;
 use crate::traits::{PgMetadataStore, ShardStore};
@@ -699,6 +699,35 @@ impl StorageCluster {
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         let primary_pg = primary.storage_node().get_pg(pg_id.get())?;
         let primary_state = primary_pg.metadata_command_replica_state()?;
+        if current_log_index == primary_state.applied_log_index {
+            let Some((_, log_hash)) = primary_pg
+                .applied_metadata_command_log_entry_hashes(primary_node_id.as_u32(), &current)?
+            else {
+                return Err(self.metadata_command_conflict(
+                    primary_node_id,
+                    pg_id,
+                    current_log_index,
+                ));
+            };
+            if log_hash != primary_state.applied_log_hash {
+                return Err(self.metadata_command_conflict(
+                    primary_node_id,
+                    pg_id,
+                    current_log_index,
+                ));
+            }
+            if !payload_matches {
+                return Ok(None);
+            }
+            drop(primary_pg);
+            return self.matching_terminal_pending_command_if_safe(
+                pg_id,
+                primary_node_id,
+                acting_set_max_log_index,
+                &primary_state,
+                current,
+            );
+        }
         let primary_summary = ReissuedPendingCommandPrimarySummary {
             node_id: primary_node_id,
             max_log_index: primary_max_log_index,
@@ -714,6 +743,22 @@ impl StorageCluster {
         ) {
             ReissuedPendingCommandDecision::StaleCommandDisplaced => return Ok(None),
             ReissuedPendingCommandDecision::Conflict { node_id, log_index } => {
+                let _ = observability::event(
+                    TRACE_TARGET,
+                    "metadata_command_reissue_conflict",
+                    Some(format_args!(
+                        "pg_id={} node_id={:?} log_index={} primary_node_id={:?} primary_max={} primary_applied={} acting_set_max={} current_index={} payload_matches={} phase=primary",
+                        pg_id.get(),
+                        node_id,
+                        log_index,
+                        primary_node_id,
+                        primary_max_log_index,
+                        primary_state.applied_log_index,
+                        acting_set_max_log_index,
+                        current_log_index,
+                        payload_matches,
+                    )),
+                );
                 return Err(self.metadata_command_conflict(node_id, pg_id, log_index));
             }
             ReissuedPendingCommandDecision::ReloadCurrent => {}
@@ -756,9 +801,100 @@ impl StorageCluster {
             ReissuedPendingCommandDecision::StaleCommandDisplaced => Ok(None),
             ReissuedPendingCommandDecision::ReloadCurrent => Ok(Some(current)),
             ReissuedPendingCommandDecision::Conflict { node_id, log_index } => {
+                let _ = observability::event(
+                    TRACE_TARGET,
+                    "metadata_command_reissue_conflict",
+                    Some(format_args!(
+                        "pg_id={} node_id={:?} log_index={} primary_node_id={:?} primary_max={} primary_applied={} acting_set_max={} current_index={} payload_matches={} phase=replica",
+                        pg_id.get(),
+                        node_id,
+                        log_index,
+                        primary_node_id,
+                        primary_max_log_index,
+                        primary_state.applied_log_index,
+                        acting_set_max_log_index,
+                        current_log_index,
+                        payload_matches,
+                    )),
+                );
                 Err(self.metadata_command_conflict(node_id, pg_id, log_index))
             }
         }
+    }
+
+    fn matching_terminal_pending_command_if_safe(
+        &self,
+        pg_id: PgId,
+        primary_node_id: NodeId,
+        acting_set_max_log_index: u64,
+        primary_state: &MetadataCommandReplicaState,
+        current: MetadataCommandEnvelope,
+    ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
+        let current_log_index = current.id().log_index().get();
+        let Some(previous_log_index) = current_log_index.checked_sub(1) else {
+            return Err(self.metadata_command_conflict(primary_node_id, pg_id, current_log_index));
+        };
+        if acting_set_max_log_index > current_log_index {
+            return Err(self.metadata_command_conflict(
+                primary_node_id,
+                pg_id,
+                acting_set_max_log_index,
+            ));
+        }
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let primary_pg = primary.storage_node().get_pg(pg_id.get())?;
+        let Some((previous_log_hash, terminal_log_hash)) = primary_pg
+            .applied_metadata_command_log_entry_hashes(primary_node_id.as_u32(), &current)?
+        else {
+            return Err(self.metadata_command_conflict(primary_node_id, pg_id, current_log_index));
+        };
+        if terminal_log_hash != primary_state.applied_log_hash {
+            return Err(self.metadata_command_conflict(primary_node_id, pg_id, current_log_index));
+        }
+        drop(primary_pg);
+
+        for node in self
+            .local_map
+            .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
+        {
+            let pg = node.storage_node().get_pg(pg_id.get())?;
+            let node_max_log_index = pg.max_metadata_command_log_index(self.operation_epoch())?;
+            let node_state = pg.metadata_command_replica_state()?;
+            if node_max_log_index > current_log_index {
+                return Err(self.metadata_command_conflict(
+                    node.node_id(),
+                    pg_id,
+                    node_max_log_index,
+                ));
+            }
+            if node_max_log_index < current_log_index {
+                if node_max_log_index != previous_log_index
+                    || node_state.applied_log_index != previous_log_index
+                    || node_state.applied_log_hash != previous_log_hash
+                {
+                    return Err(self.metadata_command_conflict(
+                        node.node_id(),
+                        pg_id,
+                        previous_log_index.max(node_max_log_index),
+                    ));
+                }
+                continue;
+            }
+            if !pg.has_matching_applied_metadata_command_log_entry(
+                node.node_id().as_u32(),
+                &current,
+                previous_log_hash,
+            )? {
+                return Err(self.metadata_command_conflict(
+                    node.node_id(),
+                    pg_id,
+                    current_log_index,
+                ));
+            }
+        }
+        Ok(Some(current))
     }
 
     fn reissue_pending_metadata_command(
@@ -1881,7 +2017,7 @@ impl StorageCluster {
                         | PendingMetadataCommandOutcome::RetryPartialExactConflict => continue,
                     }
                 }
-                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                self.drain_pending_object_metadata_command(pg_id, &command)?;
                 continue;
             }
 
@@ -1943,6 +2079,23 @@ impl StorageCluster {
                     "abandoned pending object metadata command",
                 ))
             }
+        }
+    }
+
+    fn drain_pending_object_metadata_command(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), ObjectPgActionError> {
+        let command_bucket = command.bucket_name().clone();
+        match self.finish_pending_object_metadata_command_for_bucket(
+            pg_id,
+            &command_bucket,
+            command,
+        )? {
+            PendingMetadataCommandOutcome::Applied
+            | PendingMetadataCommandOutcome::Abandoned
+            | PendingMetadataCommandOutcome::RetryPartialExactConflict => Ok(()),
         }
     }
 
