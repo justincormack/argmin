@@ -25700,6 +25700,100 @@ mod tests {
     }
 
     #[test]
+    fn begin_bucket_delete_reissues_stale_duplicate_mark_deleting_index() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap());
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let (occupant_bucket, delete_bucket) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            (
+                bucket_for_pg(topology, pg_id.get(), "delete-stale-occupant-"),
+                bucket_for_pg(topology, pg_id.get(), "delete-stale-mark-"),
+            )
+        };
+        create_test_bucket(&cluster, &occupant_bucket);
+        create_test_bucket(&cluster, &delete_bucket);
+
+        let stale_command_id = cluster.next_bucket_metadata_command_id(pg_id).unwrap();
+        let primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+            .unwrap();
+        let primary_pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+        let occupant_current =
+            crate::PgMetadataStore::head_bucket_record_raw(&*primary_pg, &occupant_bucket).unwrap();
+        let occupant_command = MetadataCommandEnvelope::new(
+            stale_command_id,
+            MetadataCommandPayload::PutBucketVersioning(PutBucketVersioningCommand::from_bucket(
+                occupant_current.with_execution_generation(
+                    primary_pg
+                        .next_bucket_execution_generation_candidate()
+                        .unwrap(),
+                ),
+                crate::BucketVersioningState::Enabled,
+            )),
+        );
+        let delete_current =
+            crate::PgMetadataStore::head_bucket_record_raw(&*primary_pg, &delete_bucket).unwrap();
+        let stale_delete_command = MetadataCommandEnvelope::new(
+            stale_command_id,
+            MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand::from_bucket(
+                delete_current.with_execution_generation(
+                    primary_pg
+                        .next_bucket_execution_generation_candidate()
+                        .unwrap(),
+                ),
+            )),
+        );
+        drop(primary_pg);
+
+        for node_id in node_ids {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(pg_id.get())
+                .unwrap();
+            pg.apply_metadata_command_and_record(node_id.as_u32(), &occupant_command)
+                .unwrap();
+        }
+        insert_pending_metadata_command_for_test(
+            &map,
+            pg_id,
+            &delete_bucket,
+            &stale_delete_command,
+        );
+
+        cluster.begin_bucket_delete(&delete_bucket).unwrap();
+
+        assert!(
+            pending_metadata_command_for_test(&map, pg_id, &delete_bucket).is_none(),
+            "stale duplicate-index mark command should be reissued and cleared"
+        );
+        for node_id in node_ids {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(pg_id.get())
+                .unwrap();
+            let occupant = crate::PgMetadataStore::head_bucket_raw(&*pg, &occupant_bucket).unwrap();
+            assert_eq!(occupant.versioning, crate::BucketVersioningState::Enabled);
+            let deleted = crate::PgMetadataStore::head_bucket_raw(&*pg, &delete_bucket).unwrap();
+            assert_eq!(deleted.state, crate::BucketState::Deleting);
+        }
+        assert_clean_metadata_command_stream(&map, &[pg_id.get()]);
+    }
+
+    #[test]
     fn begin_bucket_delete_retries_after_partial_object_pg_drain_conflict() {
         let _serial = lock_metadata_command_apply_hook_test();
         let tmp = test_util::tempdir();

@@ -801,8 +801,8 @@ impl StorageCluster {
                 primary.node_id().as_u32(),
                 self.operation_epoch(),
             )? {
+                drop(pg);
                 if current != *command {
-                    drop(pg);
                     return self
                         .matching_reissued_pending_command_if_safe(
                             pg_id,
@@ -814,12 +814,19 @@ impl StorageCluster {
                         )
                         .map_err(BucketSnapshotLoadError::from);
                 }
+                return self
+                    .matching_reissued_pending_command_if_safe(
+                        pg_id,
+                        primary.node_id(),
+                        primary_max_log_index,
+                        acting_set_max_log_index,
+                        command,
+                        current,
+                    )
+                    .map_err(BucketSnapshotLoadError::from);
             } else {
                 return Ok(None);
             }
-            return Err(self
-                .metadata_command_conflict(primary.node_id(), pg_id, acting_set_max_log_index)
-                .into());
         }
         let next_log_index = primary_max_log_index
             .max(command.id().log_index().get())
