@@ -11352,6 +11352,228 @@ mod tests {
     }
 
     #[test]
+    fn stream_put_create_keeps_reservation_until_pending_converges() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "durable-stream-request-pending-");
+        let key = key_for_object_pg(topology, &bucket, 1, "key-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let failed = Arc::new(AtomicBool::new(false));
+        let hook_failed = Arc::clone(&failed);
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let hook_guard = cluster.test_install_before_metadata_command_apply_context_hook(Arc::new(
+            move |context| {
+                if context.kind == crate::cluster::MetadataCommandApplyTestKind::CreateStreamUpload
+                    && context.node_id == NodeId::new(1)
+                    && context.bucket.as_ref() == Some(&hook_bucket)
+                    && context.key.as_ref() == Some(&hook_key)
+                    && !hook_failed.swap(true, Ordering::SeqCst)
+                {
+                    return Err(StoreError::Io {
+                        context: "injected request stream-create primary apply failure",
+                        source: std::io::Error::other(
+                            "injected request stream-create primary apply failure",
+                        ),
+                    });
+                }
+                Ok(())
+            },
+        ));
+
+        let session_id = crate::SessionId::try_from("d0".repeat(16)).unwrap();
+        let err = cluster
+            .create_put_object_stream_session(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_, _| {
+                    Ok::<_, ()>((
+                        (),
+                        crate::CreateStreamUploadReq {
+                            session_id: session_id.clone(),
+                            bucket: bucket.clone(),
+                            key: key.clone(),
+                            target: crate::StreamUploadTarget::PutObject,
+                            encryption: crate::ObjectEncryption::None,
+                        },
+                    ))
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::BucketSnapshotLoadError::Store(StoreError::Io { .. })
+        ));
+
+        let primary_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        let reservations =
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
+                .unwrap();
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].operation_kind, "put-object-stream-create");
+        let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
+        assert_eq!(info.active_write_reservations, 1);
+        drop(primary_pg);
+
+        drop(hook_guard);
+        cluster
+            .create_put_object_stream_session(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_, _| {
+                    Ok::<_, ()>((
+                        (),
+                        crate::CreateStreamUploadReq {
+                            session_id: session_id.clone(),
+                            bucket: bucket.clone(),
+                            key: key.clone(),
+                            target: crate::StreamUploadTarget::PutObject,
+                            encryption: crate::ObjectEncryption::None,
+                        },
+                    ))
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        let primary_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
+                .unwrap()
+                .is_empty()
+        );
+        let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
+        assert_eq!(info.active_write_reservations, 0);
+    }
+
+    #[test]
+    fn stream_put_create_preserves_reservation_when_pending_owner_check_fails() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "stream-owner-check-fail-");
+        let key = key_for_object_pg(topology, &bucket, 1, "key-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let failed = Arc::new(AtomicBool::new(false));
+        let hook_failed = Arc::clone(&failed);
+        let hook_map = Arc::clone(&map);
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let _hook_guard = cluster.test_install_before_metadata_command_apply_context_hook(
+            Arc::new(move |context| {
+                if context.kind != crate::cluster::MetadataCommandApplyTestKind::CreateStreamUpload
+                    || context.bucket.as_ref() != Some(&hook_bucket)
+                    || context.key.as_ref() != Some(&hook_key)
+                    || hook_failed.swap(true, Ordering::SeqCst)
+                {
+                    return Ok(());
+                }
+                let primary_pg = hook_map
+                    .node(NodeId::new(1))
+                    .unwrap()
+                    .storage_node()
+                    .get_pg(1)
+                    .unwrap();
+                primary_pg
+                    .connection()
+                    .execute(
+                        "UPDATE metadata_command_pending_slot SET command_bytes = ?1",
+                        rusqlite::params![vec![0_u8]],
+                    )
+                    .unwrap();
+                Err(StoreError::Io {
+                    context: "injected request stream-create apply failure after corrupt pending",
+                    source: std::io::Error::other(
+                        "injected request stream-create apply failure after corrupt pending",
+                    ),
+                })
+            }),
+        );
+
+        let session_id = crate::SessionId::try_from("d1".repeat(16)).unwrap();
+        let err = cluster
+            .create_put_object_stream_session(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_, _| {
+                    Ok::<_, ()>((
+                        (),
+                        crate::CreateStreamUploadReq {
+                            session_id: session_id.clone(),
+                            bucket: bucket.clone(),
+                            key: key.clone(),
+                            target: crate::StreamUploadTarget::PutObject,
+                            encryption: crate::ObjectEncryption::None,
+                        },
+                    ))
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::BucketSnapshotLoadError::Store(
+                StoreError::MetadataCommandLogChecksumMismatch { .. }
+            )
+        ));
+
+        let primary_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
+                .unwrap()
+                .len(),
+            1,
+            "ownership-check failures must preserve reservation proof for recovery"
+        );
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket)
+                .unwrap()
+                .active_write_reservations,
+            1
+        );
+    }
+
+    #[test]
     fn live_stream_create_terminal_cleanup_keeps_pending_slot_on_reservation_release_failure() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

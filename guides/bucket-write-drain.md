@@ -74,7 +74,7 @@ write-drain mechanism.
 | Publisher family | Current path | Classification |
 | --- | --- | --- |
 | Small direct PutObject | `Coordinator::put_object_from_authorized_write` via `with_bucket_write_handle_for` | Needs short bucket write reservation before object command publish |
-| Stream PutObject session create | `create_stream_put_session_for_authorized_write` / `create_put_object_stream_session_record` | Needs reservation and cross-PG apply fence for the session command |
+| Stream PutObject session create | `create_stream_put_session_for_authorized_write` / `create_put_object_stream_session` / `create_put_object_stream_session_record` | Carries a durable reservation proof in the session command; apply/retry/open-time convergence validate and release it |
 | Stream PutObject finalize | `Coordinator::finalize_stream_put` via `with_bucket_write_handle_for` | Needs reservation and cross-PG apply fence for final object publish |
 | CopyObject destination write | `authorize_copy_object` and stream destination commit | Needs destination bucket write reservation; source reads do not acquire destination write protection |
 | CreateMultipartUpload | `authorize_create_multipart_upload` / `StorageCluster::create_multipart_upload` | Needs reservation and cross-PG apply fence for the MPU row |

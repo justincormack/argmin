@@ -15,15 +15,15 @@ use super::{
 };
 use crate::metadata_command::{
     AbortMultipartUploadCommand, AdvanceCompletedMultipartUploadSequenceCommand,
-    BucketPropertyMutation, BucketRecord, BucketSubresourceMutation, CommitDirectPutObjectCommand,
-    CommitMultipartObjectCommand, CommitStreamPartCommand, CreateBucketCommand,
-    CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteCompletedMultipartUploadCommand,
-    DeleteObjectPayloadReclaimCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
-    InsertDeleteMarkerCommand, MarkBucketDeletingCommand, MetadataCommandAcceptance,
-    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
-    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
-    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
-    PutObjectMetadataMutation,
+    BucketPropertyMutation, BucketRecord, BucketSubresourceMutation, BucketWriteReservationProof,
+    CommitDirectPutObjectCommand, CommitMultipartObjectCommand, CommitStreamPartCommand,
+    CreateBucketCommand, CreateMultipartUploadCommand, CreateStreamUploadCommand,
+    DeleteCompletedMultipartUploadCommand, DeleteObjectPayloadReclaimCommand,
+    DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
+    MarkBucketDeletingCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
+    MetadataCommandId, MetadataCommandPayload, ObjectPayloadReclaimCommand, PutBucketAclCommand,
+    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
+    PutObjectMetadataCommand, PutObjectMetadataMutation,
 };
 use crate::traits::PgMetadataStore;
 use crate::*;
@@ -4957,91 +4957,65 @@ impl super::StorageCluster {
             let applied_commands = self
                 .drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)
                 .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-            let attempt =
-                self.with_bucket_write_reservation_snapshot(bucket, request, |snapshot| {
-                    let primary_node = self.object_metadata_primary_node(bucket, key)?;
-                    let object_pg = primary_node.get_pg(pg_id.get())?;
-                    let existing_object =
-                        match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
-                            Ok(StoredObject::Live(record)) => Some(StoredObject::Live(record)),
-                            Ok(StoredObject::DeleteMarker(_))
-                            | Err(MetadataError::ObjectNotFound) => None,
-                            Err(error) => return Err(error.into()),
-                        };
-                    drop(object_pg);
+            let reservation = match self.acquire_durable_bucket_write_reservation(
+                bucket,
+                "put-object-stream-create",
+                Some(key.as_str()),
+            ) {
+                Ok(reservation) => reservation,
+                Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
+                    self.wait_for_durable_bucket_write_drain(bucket)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let proof = BucketWriteReservationProof::from(&reservation.record);
+            let mut disposition = super::BucketWriteReservationDisposition::ReleaseByCaller;
+            let result = (|| {
+                let bucket_pg = reservation.node.get_pg(reservation.pg_id)?;
+                let snapshot = crate::SharedStorageNode::load_bucket_snapshot_from_pg(
+                    &bucket_pg, bucket, request,
+                )?;
+                drop(bucket_pg);
 
-                    let (value, create) = match action(snapshot, existing_object) {
-                        Ok(prepared) => prepared,
-                        Err(error) => return Ok(Err(error)),
+                let primary_node = self.object_metadata_primary_node(bucket, key)?;
+                let object_pg = primary_node.get_pg(pg_id.get())?;
+                let existing_object =
+                    match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
+                        Ok(StoredObject::Live(record)) => Some(StoredObject::Live(record)),
+                        Ok(StoredObject::DeleteMarker(_)) | Err(MetadataError::ObjectNotFound) => {
+                            None
+                        }
+                        Err(error) => return Err(error.into()),
                     };
-                    if self
-                        .matching_stream_upload_exists(
-                            pg_id,
-                            &create,
-                            super::applied_stream_create_command(&applied_commands, &create),
-                        )
-                        .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
-                    {
-                        return Ok(Ok(Attempt::Complete(value)));
-                    }
-                    self.reserve_put_object_generation(bucket, key, &create.session_id)
-                        .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                drop(object_pg);
 
-                    #[cfg(test)]
-                    maybe_run_before_stream_put_create_command_id_hook(
-                        self.metadata_command_apply_test_hook_scope_id(),
-                    );
-                    let command_id = match self.next_object_metadata_command_id(pg_id) {
-                        Ok(command_id) => command_id,
-                        Err(ObjectPgActionError::Store(
-                            StoreError::MetadataCommandLogConflict { .. },
-                        )) => {
-                            let cleanup = self
-                                .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
-                                .and_then(|_| {
-                                    self.release_object_generation_reservation(
-                                        bucket,
-                                        key,
-                                        &create.session_id,
-                                    )
-                                });
-                            if let Err(cleanup_error) = cleanup {
-                                return Err(
-                                    super::object_pg_action_error_to_bucket_snapshot_error(
-                                        cleanup_error,
-                                    ),
-                                );
-                            }
-                            return Ok(Ok(Attempt::Retry));
-                        }
-                        Err(error) => {
-                            let _ = self.release_object_generation_reservation(
-                                bucket,
-                                key,
-                                &create.session_id,
-                            );
-                            return Err(super::object_pg_action_error_to_bucket_snapshot_error(
-                                error,
-                            ));
-                        }
-                    };
-                    let command = MetadataCommandEnvelope::new(
-                        command_id,
-                        MetadataCommandPayload::CreateStreamUpload(Box::new(
-                            CreateStreamUploadCommand::from_request(
-                                create.clone(),
-                                crate::clock::current_time_millis(),
-                            ),
-                        )),
-                    );
-                    #[cfg(test)]
-                    maybe_run_before_stream_put_create_pending_install_hook(
-                        self.metadata_command_apply_test_hook_scope_id(),
-                    );
-                    if !self
-                        .try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)
-                        .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
-                    {
+                let (value, create) = match action(snapshot, existing_object) {
+                    Ok(prepared) => prepared,
+                    Err(error) => return Ok(Err(error)),
+                };
+                if self
+                    .matching_stream_upload_exists(
+                        pg_id,
+                        &create,
+                        super::applied_stream_create_command(&applied_commands, &create),
+                    )
+                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
+                {
+                    return Ok(Ok(Attempt::Complete(value)));
+                }
+                self.reserve_put_object_generation(bucket, key, &create.session_id)
+                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+
+                #[cfg(test)]
+                maybe_run_before_stream_put_create_command_id_hook(
+                    self.metadata_command_apply_test_hook_scope_id(),
+                );
+                let command_id = match self.next_object_metadata_command_id(pg_id) {
+                    Ok(command_id) => command_id,
+                    Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                        ..
+                    })) => {
                         let cleanup = self
                             .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
                             .and_then(|_| {
@@ -5058,26 +5032,93 @@ impl super::StorageCluster {
                         }
                         return Ok(Ok(Attempt::Retry));
                     }
-                    if let Err(error) =
-                        self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
-                    {
-                        if self
-                            .pending_metadata_command_for_bucket(pg_id, bucket)?
-                            .is_none()
-                        {
+                    Err(error) => {
+                        let _ = self.release_object_generation_reservation(
+                            bucket,
+                            key,
+                            &create.session_id,
+                        );
+                        return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                            error,
+                        ));
+                    }
+                };
+                let command = MetadataCommandEnvelope::new(
+                    command_id,
+                    MetadataCommandPayload::CreateStreamUpload(Box::new(
+                        CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                            create.clone(),
+                            crate::clock::current_time_millis(),
+                            Some(proof.clone()),
+                        ),
+                    )),
+                );
+                #[cfg(test)]
+                maybe_run_before_stream_put_create_pending_install_hook(
+                    self.metadata_command_apply_test_hook_scope_id(),
+                );
+                if !self
+                    .try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
+                {
+                    let cleanup = self
+                        .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+                        .and_then(|_| {
+                            self.release_object_generation_reservation(
+                                bucket,
+                                key,
+                                &create.session_id,
+                            )
+                        });
+                    if let Err(cleanup_error) = cleanup {
+                        return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                            cleanup_error,
+                        ));
+                    }
+                    return Ok(Ok(Attempt::Retry));
+                }
+                if let Err(error) =
+                    self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
+                {
+                    match self.pending_metadata_command_uses_bucket_write_reservation(
+                        pg_id, bucket, &proof,
+                    ) {
+                        Ok(true) => {
+                            disposition =
+                                super::BucketWriteReservationDisposition::TransferredToCommand;
+                        }
+                        Ok(false) => {
                             let _ = self.release_object_generation_reservation(
                                 bucket,
                                 key,
                                 &create.session_id,
                             );
                         }
-                        return Err(super::object_pg_action_error_to_bucket_snapshot_error(
-                            error,
-                        ));
+                        Err(lookup_error) => {
+                            disposition = super::BucketWriteReservationDisposition::PreserveForOwnershipCheckFailure;
+                            return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                                lookup_error,
+                            ));
+                        }
                     }
+                    return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                        error,
+                    ));
+                }
 
-                    Ok(Ok(Attempt::Complete(value)))
-                })?;
+                disposition = super::BucketWriteReservationDisposition::TransferredToCommand;
+                Ok(Ok(Attempt::Complete(value)))
+            })();
+            let release_result = match disposition {
+                super::BucketWriteReservationDisposition::TransferredToCommand => Ok(()),
+                super::BucketWriteReservationDisposition::PreserveForOwnershipCheckFailure => {
+                    Ok(())
+                }
+                super::BucketWriteReservationDisposition::ReleaseByCaller => {
+                    self.release_durable_bucket_write_reservation(reservation)
+                }
+            };
+            let attempt = Self::finish_bucket_write_snapshot_operation(result, release_result)?;
             match attempt {
                 Ok(Attempt::Complete(value)) => return Ok(Ok(value)),
                 Ok(Attempt::Retry) => continue,

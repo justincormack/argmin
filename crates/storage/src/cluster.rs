@@ -544,6 +544,7 @@ enum SnapshotSensitiveCommandInstall {
 enum BucketWriteReservationDisposition {
     TransferredToCommand,
     ReleaseByCaller,
+    PreserveForOwnershipCheckFailure,
 }
 
 fn decide_reissued_pending_command(
@@ -3191,6 +3192,7 @@ impl StorageCluster {
             );
             let release_result = match &result {
                 Ok(BucketWriteReservationDisposition::TransferredToCommand) => Ok(()),
+                Ok(BucketWriteReservationDisposition::PreserveForOwnershipCheckFailure) => Ok(()),
                 Ok(BucketWriteReservationDisposition::ReleaseByCaller) => self
                     .release_durable_bucket_write_reservation(reservation)
                     .map_err(bucket_snapshot_error_to_object_pg_action_error),

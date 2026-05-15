@@ -3417,17 +3417,17 @@ Proposed subphases:
         the old `SharedStorageNode` anonymous-counter snapshot wrapper is
         test-only. The stream PutObject and CreateMultipartUpload custom
         snapshot publishers use the cluster wrapper rather than the node-local
-        counter path, and the low-level PutObject stream-create publisher used
-        by HTTP streaming/copy now holds the same durable reservation and
-        legacy-counter bridge around command publication. Durable reservation
+        counter path. Both request-level and low-level PutObject stream-create
+        publishers now hold a durable reservation and legacy-counter bridge
+        around command publication. Durable reservation
         IDs use 128 bits of random entropy instead of a per-handle counter, so
         independent `StorageCluster` handles and reopen do not collide on
-        `(bucket, reservation_id)`. The low-level PutObject stream-create
-        command now carries an encoded durable reservation proof; normal apply,
-        matching pending-command retry, and local-cluster open-time convergence
-        validate that proof against the bucket-PG primary before applying, and
-        the reservation remains live until the pending command converges. The
-        other object-PG write command families still need the same apply-time
+        `(bucket, reservation_id)`. PutObject stream-create commands now carry
+        an encoded durable reservation proof; normal apply, matching
+        pending-command retry, and local-cluster open-time convergence validate
+        that proof against the bucket-PG primary before applying, and the
+        reservation remains live until the pending command converges. The other
+        object-PG write command families still need the same apply-time
         reservation proof before DeleteBucket can rely on durable reservations
         alone.
       - introduce a cluster-level bucket write reservation guard that captures:
