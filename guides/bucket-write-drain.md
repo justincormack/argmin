@@ -79,7 +79,7 @@ write-drain mechanism.
 | CopyObject destination write | `authorize_copy_object` and stream destination commit | Needs destination bucket write reservation; source reads do not acquire destination write protection |
 | CreateMultipartUpload | `authorize_create_multipart_upload` / `StorageCluster::create_multipart_upload` | Carries a durable reservation proof in the MPU-create command; apply/retry/open-time convergence validate and release it |
 | CompleteMultipartUpload | `authorize_complete_multipart_upload` / `complete_multipart_upload_commit_serialized` | Needs reservation and cross-PG apply fence for final object publish and cleanup |
-| UploadPart stream session create | `begin_stream_part` / `begin_upload_part_stream_session` / `create_upload_part_stream_session` | Needs reservation before creating destination UploadPart stream state |
+| UploadPart stream session create | `begin_stream_part` / `begin_upload_part_stream_session` / `create_upload_part_stream_session` | Carries a durable reservation proof in the UploadPart session command; apply/retry/open-time convergence validate and release it |
 | UploadPart stream finalize | `finalize_upload_part_stream` | Needs reservation and cross-PG apply fence for committed part state |
 | UploadPartCopy | `upload_part_copy` creates a destination stream session, appends copied source segments, and finalizes | Needs destination reservation for session create/finalize; source read authorization is separate |
 | Bucket control-plane writes | policy, CORS, tagging/ABAC, public access block, ownership controls, lifecycle, encryption, versioning, object lock, ACL | Must either acquire the durable reservation, be explicitly blocked by an active drain, or prove the command is itself the drain/delete transition |
@@ -106,6 +106,10 @@ equivalent command envelope field:
 - reservation id
 - reservation owner token
 - bucket PG and cluster epoch
+
+`CreateStreamUpload` is a proof-required command. PutObject stream-create and
+UploadPart stream-create bytes without a durable bucket-write proof are
+malformed and must fail decode/replay validation.
 
 Object-PG command apply must re-read and validate that bucket-PG reference. The
 validation must run for:

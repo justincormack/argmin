@@ -1529,7 +1529,7 @@ impl StorageCluster {
                 Some(&commit.bucket_write_reservation)
             }
             MetadataCommandPayload::CreateStreamUpload(create) => {
-                create.bucket_write_reservation.as_ref()
+                Some(&create.bucket_write_reservation)
             }
             MetadataCommandPayload::CreateMultipartUpload(create) => {
                 Some(&create.bucket_write_reservation)
@@ -3622,7 +3622,7 @@ impl StorageCluster {
                     CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
                         request.clone(),
                         crate::clock::current_time_millis(),
-                        Some(bucket_write_reservation.clone()),
+                        bucket_write_reservation.clone(),
                     ),
                 )),
             );

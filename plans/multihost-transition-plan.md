@@ -3443,7 +3443,14 @@ Proposed subphases:
         Stream PutObject finalization commands now carry the reservation proof
         supplied by the coordinator's bucket-write handle; partial/reopen
         convergence validates and releases the proof before clearing the
-        pending slot. CompleteMultipartUpload, UploadPart, object
+        pending slot. UploadPart stream-session creation now also carries a
+        durable reservation proof in the CreateStreamUpload command, including
+        pending-slot retry and proof release coverage for both request-level
+        UploadPart and the low-level path used by UploadPartCopy. The
+        `CreateStreamUpload` command encoding now requires that proof, so
+        proofless replay/open-time command bytes fail closed instead of
+        applying outside the bucket-write fence.
+        CompleteMultipartUpload, UploadPart finalization, object
         delete/lifecycle, and object metadata command families still need the
         same apply-time reservation proof before DeleteBucket can rely on
         durable reservations alone. Closeout should also remove the

@@ -5099,7 +5099,7 @@ impl super::StorageCluster {
                         CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
                             create.clone(),
                             crate::clock::current_time_millis(),
-                            Some(proof.clone()),
+                            proof.clone(),
                         ),
                     )),
                 );
@@ -5734,28 +5734,64 @@ impl super::StorageCluster {
 
     pub fn begin_upload_part_stream_session<T, E>(
         &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-        part_number: u32,
-        session_id: &SessionId,
+        req: BeginUploadPartStreamSessionReq,
         mut action: impl FnMut(
             &MultipartUploadRecord,
         ) -> Result<(AuthorizedMultipartUploadRecord, T), E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let primary_node = self.object_metadata_primary_node(bucket, key)?;
-        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let BeginUploadPartStreamSessionReq {
+            bucket,
+            key,
+            upload_id,
+            part_number,
+            session_id,
+            bucket_write_reservation,
+        } = req;
+        let pg_id = PgId::new(self.object_metadata_pg_id(&bucket, &key));
+        let primary_node = self.object_metadata_primary_node(&bucket, &key)?;
+        let _bucket_guard = primary_node.lock_bucket(&bucket);
+        macro_rules! release_caller_bucket_write_proof {
+            () => {{
+                self.release_bucket_write_reservation_proof(&bucket_write_reservation)
+            }};
+        }
         loop {
-            let applied_commands = self
-                .drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)
-                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-            let object_pg = primary_node.get_pg(pg_id.get())?;
-            let upload = PgMetadataStore::get_multipart_upload(&*object_pg, upload_id)?;
-            if upload.bucket != *bucket
-                || upload.key != *key
+            let applied_commands = match self
+                .drain_pending_object_metadata_commands_for_bucket_collect(pg_id, &bucket)
+            {
+                Ok(applied_commands) => applied_commands,
+                Err(error) => {
+                    drop(_bucket_guard);
+                    release_caller_bucket_write_proof!()?;
+                    return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                        error,
+                    ));
+                }
+            };
+            let object_pg = match primary_node.get_pg(pg_id.get()) {
+                Ok(object_pg) => object_pg,
+                Err(error) => {
+                    drop(_bucket_guard);
+                    release_caller_bucket_write_proof!()?;
+                    return Err(error.into());
+                }
+            };
+            let upload = match PgMetadataStore::get_multipart_upload(&*object_pg, &upload_id) {
+                Ok(upload) => upload,
+                Err(error) => {
+                    drop(object_pg);
+                    drop(_bucket_guard);
+                    release_caller_bucket_write_proof!()?;
+                    return Err(error.into());
+                }
+            };
+            if upload.bucket != bucket
+                || upload.key != key
                 || upload.state != UploadState::InProgress
             {
+                drop(object_pg);
+                drop(_bucket_guard);
+                release_caller_bucket_write_proof!()?;
                 return Err(BucketSnapshotLoadError::Metadata(
                     MetadataError::NoSuchUpload {
                         upload_id: upload_id.to_string(),
@@ -5764,9 +5800,17 @@ impl super::StorageCluster {
             }
             let (authorized_upload, result) = match action(&upload) {
                 Ok((authorized_upload, result)) => (authorized_upload, result),
-                Err(error) => return Ok(Err(error)),
+                Err(error) => {
+                    drop(object_pg);
+                    drop(_bucket_guard);
+                    release_caller_bucket_write_proof!()?;
+                    return Ok(Err(error));
+                }
             };
             if authorized_upload.record() != &upload {
+                drop(object_pg);
+                drop(_bucket_guard);
+                release_caller_bucket_write_proof!()?;
                 return Err(BucketSnapshotLoadError::Metadata(
                     MetadataError::NoSuchUpload {
                         upload_id: upload_id.to_string(),
@@ -5784,26 +5828,44 @@ impl super::StorageCluster {
                 encryption: upload.encryption.clone(),
             };
             drop(object_pg);
-            if self
-                .matching_stream_upload_exists(
-                    pg_id,
-                    &create,
-                    super::applied_stream_create_command(&applied_commands, &create),
-                )
-                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
-            {
-                return Ok(Ok(result));
+            match self.matching_stream_upload_exists(
+                pg_id,
+                &create,
+                super::applied_stream_create_command(&applied_commands, &create),
+            ) {
+                Ok(true) => {
+                    drop(_bucket_guard);
+                    release_caller_bucket_write_proof!()?;
+                    return Ok(Ok(result));
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    drop(_bucket_guard);
+                    release_caller_bucket_write_proof!()?;
+                    return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                        error,
+                    ));
+                }
             }
             let command_id = match self.next_object_metadata_command_id(pg_id) {
                 Ok(command_id) => command_id,
                 Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
                     ..
                 })) => {
-                    self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
-                        .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                    if let Err(error) =
+                        self.drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+                    {
+                        drop(_bucket_guard);
+                        release_caller_bucket_write_proof!()?;
+                        return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                            error,
+                        ));
+                    }
                     continue;
                 }
                 Err(error) => {
+                    drop(_bucket_guard);
+                    release_caller_bucket_write_proof!()?;
                     return Err(super::object_pg_action_error_to_bucket_snapshot_error(
                         error,
                     ));
@@ -5812,20 +5874,27 @@ impl super::StorageCluster {
             let command = MetadataCommandEnvelope::new(
                 command_id,
                 MetadataCommandPayload::CreateStreamUpload(Box::new(
-                    CreateStreamUploadCommand::from_request(
+                    CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
                         create,
                         crate::clock::current_time_millis(),
+                        bucket_write_reservation.clone(),
                     ),
                 )),
             );
-            match self
-                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
-                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
-            {
-                super::SnapshotSensitiveCommandInstall::Installed => {}
-                super::SnapshotSensitiveCommandInstall::ContenderDrained => continue,
+            let install_result =
+                self.install_snapshot_sensitive_metadata_command_or_drain(pg_id, &bucket, &command);
+            match install_result {
+                Ok(super::SnapshotSensitiveCommandInstall::Installed) => {}
+                Ok(super::SnapshotSensitiveCommandInstall::ContenderDrained) => continue,
+                Err(error) => {
+                    drop(_bucket_guard);
+                    release_caller_bucket_write_proof!()?;
+                    return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                        error,
+                    ));
+                }
             }
-            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
+            self.apply_new_object_metadata_command_for_bucket(pg_id, &bucket, &command)
                 .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
             return Ok(Ok(result));
         }
@@ -5842,13 +5911,63 @@ impl super::StorageCluster {
         let upload_id = &authorized_upload.record().upload_id;
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
-        let _bucket_guard = primary_node.lock_bucket(bucket);
         loop {
-            let applied_commands =
-                self.drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)?;
-            let object_pg = primary_node.get_pg(pg_id.get())?;
-            let upload = PgMetadataStore::get_multipart_upload(&*object_pg, upload_id)?;
+            let reservation = match self.acquire_durable_bucket_write_reservation(
+                bucket,
+                "upload-part-stream-create",
+                Some(key.as_str()),
+            ) {
+                Ok(reservation) => reservation,
+                Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
+                    self.wait_for_durable_bucket_write_drain(bucket)
+                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(super::bucket_snapshot_error_to_object_pg_action_error(
+                        error,
+                    ))
+                }
+            };
+            let bucket_write_reservation = BucketWriteReservationProof::from(&reservation.record);
+            let _bucket_guard = primary_node.lock_bucket(bucket);
+            macro_rules! release_caller_bucket_write_proof {
+                () => {{
+                    self.release_bucket_write_reservation_proof(&bucket_write_reservation)
+                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
+                }};
+            }
+            let applied_commands = match self
+                .drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)
+            {
+                Ok(applied_commands) => applied_commands,
+                Err(error) => {
+                    drop(_bucket_guard);
+                    release_caller_bucket_write_proof!()?;
+                    return Err(error);
+                }
+            };
+            let object_pg = match primary_node.get_pg(pg_id.get()) {
+                Ok(object_pg) => object_pg,
+                Err(error) => {
+                    drop(_bucket_guard);
+                    release_caller_bucket_write_proof!()?;
+                    return Err(error.into());
+                }
+            };
+            let upload = match PgMetadataStore::get_multipart_upload(&*object_pg, upload_id) {
+                Ok(upload) => upload,
+                Err(error) => {
+                    drop(object_pg);
+                    drop(_bucket_guard);
+                    release_caller_bucket_write_proof!()?;
+                    return Err(error.into());
+                }
+            };
             if upload != *authorized_upload.record() || upload.state != UploadState::InProgress {
+                drop(object_pg);
+                drop(_bucket_guard);
+                release_caller_bucket_write_proof!()?;
                 return Err(MetadataError::NoSuchUpload {
                     upload_id: upload_id.to_string(),
                 }
@@ -5865,37 +5984,68 @@ impl super::StorageCluster {
                 encryption: upload.encryption,
             };
             drop(object_pg);
-            if self.matching_stream_upload_exists(
+            match self.matching_stream_upload_exists(
                 pg_id,
                 &create,
                 super::applied_stream_create_command(&applied_commands, &create),
-            )? {
-                return Ok(session_id.clone());
+            ) {
+                Ok(true) => {
+                    drop(_bucket_guard);
+                    release_caller_bucket_write_proof!()?;
+                    return Ok(session_id.clone());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    drop(_bucket_guard);
+                    release_caller_bucket_write_proof!()?;
+                    return Err(error);
+                }
             }
             let command_id = match self.next_object_metadata_command_id(pg_id) {
                 Ok(command_id) => command_id,
                 Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
                     ..
                 })) => {
-                    self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                    if let Err(error) =
+                        self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+                    {
+                        drop(_bucket_guard);
+                        release_caller_bucket_write_proof!()?;
+                        return Err(error);
+                    }
+                    drop(_bucket_guard);
+                    release_caller_bucket_write_proof!()?;
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    drop(_bucket_guard);
+                    release_caller_bucket_write_proof!()?;
+                    return Err(error);
+                }
             };
             let command = MetadataCommandEnvelope::new(
                 command_id,
                 MetadataCommandPayload::CreateStreamUpload(Box::new(
-                    CreateStreamUploadCommand::from_request(
+                    CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
                         create,
                         crate::clock::current_time_millis(),
+                        bucket_write_reservation.clone(),
                     ),
                 )),
             );
-            match self
-                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
+            match self.install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
             {
-                super::SnapshotSensitiveCommandInstall::Installed => {}
-                super::SnapshotSensitiveCommandInstall::ContenderDrained => continue,
+                Ok(super::SnapshotSensitiveCommandInstall::Installed) => {}
+                Ok(super::SnapshotSensitiveCommandInstall::ContenderDrained) => {
+                    drop(_bucket_guard);
+                    release_caller_bucket_write_proof!()?;
+                    continue;
+                }
+                Err(error) => {
+                    drop(_bucket_guard);
+                    release_caller_bucket_write_proof!()?;
+                    return Err(error);
+                }
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             return Ok(session_id.clone());

@@ -845,18 +845,14 @@ impl BucketWriteReservationProof {
 pub(crate) struct CreateStreamUploadCommand {
     pub(crate) session: StreamUploadCommandRecord,
     pub(crate) initial_next_segment_vid: GenerationId,
-    pub(crate) bucket_write_reservation: Option<BucketWriteReservationProof>,
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
 }
 
 impl CreateStreamUploadCommand {
-    pub(crate) fn from_request(request: CreateStreamUploadReq, created_at_millis: u64) -> Self {
-        Self::from_request_with_bucket_write_reservation(request, created_at_millis, None)
-    }
-
     pub(crate) fn from_request_with_bucket_write_reservation(
         request: CreateStreamUploadReq,
         created_at_millis: u64,
-        bucket_write_reservation: Option<BucketWriteReservationProof>,
+        bucket_write_reservation: BucketWriteReservationProof,
     ) -> Self {
         Self {
             session: StreamUploadCommandRecord {
@@ -1556,8 +1552,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                     session: self.read_stream_upload_command_record()?,
                     initial_next_segment_vid: self
                         .read_generation_id("initial next stream segment VID")?,
-                    bucket_write_reservation: self
-                        .read_optional_bucket_write_reservation_proof()?,
+                    bucket_write_reservation: self.read_bucket_write_reservation_proof()?,
                 })),
             ),
             METADATA_COMMAND_APPEND_STREAM_SEGMENT => Ok(
@@ -2123,11 +2118,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_u64()?;
         self.skip_object_encryption()?;
         self.read_nonzero_u64("next stream segment VID")?;
-        self.skip_optional_bucket_write_reservation_proof()
-    }
-
-    fn skip_optional_bucket_write_reservation_proof(&mut self) -> Result<(), String> {
-        self.skip_optional(Self::skip_required_bucket_write_reservation_proof)
+        self.skip_required_bucket_write_reservation_proof()
     }
 
     fn skip_required_bucket_write_reservation_proof(&mut self) -> Result<(), String> {
@@ -2656,12 +2647,6 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         })
     }
 
-    fn read_optional_bucket_write_reservation_proof(
-        &mut self,
-    ) -> Result<Option<BucketWriteReservationProof>, String> {
-        self.read_optional(Self::read_bucket_write_reservation_proof)
-    }
-
     fn read_bucket_write_reservation_proof(
         &mut self,
     ) -> Result<BucketWriteReservationProof, String> {
@@ -3051,7 +3036,7 @@ fn encode_put_object_metadata(out: &mut Vec<u8>, command: &PutObjectMetadataComm
 fn encode_create_stream_upload(out: &mut Vec<u8>, command: &CreateStreamUploadCommand) {
     encode_stream_upload_command_record(out, &command.session);
     put_u64(out, command.initial_next_segment_vid.get());
-    encode_optional_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
+    encode_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
 }
 
 fn encode_append_stream_segment(out: &mut Vec<u8>, command: &AppendStreamSegmentCommand) {
@@ -3570,19 +3555,6 @@ fn encode_optional_string(out: &mut Vec<u8>, value: Option<&str>) {
     }
 }
 
-fn encode_optional_bucket_write_reservation_proof(
-    out: &mut Vec<u8>,
-    proof: &Option<BucketWriteReservationProof>,
-) {
-    match proof {
-        None => put_u8(out, 0),
-        Some(proof) => {
-            put_u8(out, 1);
-            encode_bucket_write_reservation_proof(out, proof);
-        }
-    }
-}
-
 fn encode_bucket_write_reservation_proof(out: &mut Vec<u8>, proof: &BucketWriteReservationProof) {
     put_str(out, proof.bucket.as_str());
     put_str(out, &proof.reservation_id);
@@ -3834,6 +3806,58 @@ mod tests {
         assert!(
             decode_metadata_command_log_entry_header(&proofless_bytes).is_err(),
             "proofless direct PUT command bytes must fail applied-row validation"
+        );
+    }
+
+    #[test]
+    fn create_stream_upload_rejects_missing_bucket_write_reservation_proof() {
+        let bucket = BucketName::try_from("stream-proof-required".to_string()).unwrap();
+        let key = ObjectKey::try_from("key".to_string()).unwrap();
+        let proof = BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: "stream-proof-required-reservation".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: 7,
+            operation_kind: "put-object-stream-create".to_string(),
+            created_at: 10,
+            lease_deadline: Some(20),
+            target_context: Some(key.as_str().to_string()),
+        };
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CreateStreamUpload(Box::new(
+                CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                    CreateStreamUploadReq {
+                        session_id: SessionId::try_from("54".repeat(16)).unwrap(),
+                        bucket,
+                        key,
+                        target: StreamUploadTarget::PutObject,
+                        encryption: ObjectEncryption::None,
+                    },
+                    11,
+                    proof.clone(),
+                ),
+            )),
+        );
+
+        let mut proof_bytes = Vec::new();
+        encode_bucket_write_reservation_proof(&mut proof_bytes, &proof);
+        let mut proofless_bytes = command.command_bytes();
+        assert!(proofless_bytes.ends_with(&proof_bytes));
+        proofless_bytes.truncate(proofless_bytes.len() - proof_bytes.len());
+
+        assert!(
+            decode_metadata_command_envelope(&proofless_bytes).is_err(),
+            "proofless stream-create command bytes must fail full envelope decode"
+        );
+        assert!(
+            decode_metadata_command_log_entry_header(&proofless_bytes).is_err(),
+            "proofless stream-create command bytes must fail applied-row validation"
         );
     }
 
@@ -4629,7 +4653,7 @@ mod tests {
                 },
             })),
             MetadataCommandPayload::CreateStreamUpload(Box::new(
-                CreateStreamUploadCommand::from_request(
+                CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
                     CreateStreamUploadReq {
                         session_id: stream_session_id.clone(),
                         bucket: bucket.clone(),
@@ -4638,10 +4662,11 @@ mod tests {
                         encryption: ObjectEncryption::None,
                     },
                     561,
+                    bucket_write_reservation.clone(),
                 ),
             )),
             MetadataCommandPayload::CreateStreamUpload(Box::new(
-                CreateStreamUploadCommand::from_request(
+                CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
                     CreateStreamUploadReq {
                         session_id: SessionId::try_from("32".repeat(16)).unwrap(),
                         bucket: bucket.clone(),
@@ -4653,10 +4678,11 @@ mod tests {
                         encryption: ObjectEncryption::None,
                     },
                     562,
+                    bucket_write_reservation.clone(),
                 ),
             )),
             MetadataCommandPayload::CreateStreamUpload(Box::new(
-                CreateStreamUploadCommand::from_request(
+                CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
                     CreateStreamUploadReq {
                         session_id: SessionId::try_from("33".repeat(16)).unwrap(),
                         bucket: bucket.clone(),
@@ -4665,6 +4691,7 @@ mod tests {
                         encryption: sse_s3_encryption,
                     },
                     563,
+                    bucket_write_reservation.clone(),
                 ),
             )),
             MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
@@ -4774,9 +4801,9 @@ mod tests {
                 0x18628b4680d19eea,
                 0x4842e9828aac6523,
                 0x8f0590d0286f0dc4,
-                0x815cc17ffafdbd72,
-                0x158c357233f435fb,
-                0xb1ad4b91993ad85f,
+                0x81840bc9d613bfcc,
+                0xf65437e673629d78,
+                0x531372a5ef60100f,
                 0x8d3e5d6cb995e021,
                 0x873424a13234f823,
                 0x7cf30e2471f346ae,

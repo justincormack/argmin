@@ -2617,6 +2617,16 @@ pub struct CommitDirectPutObjectReq {
 }
 
 #[derive(Debug, Clone)]
+pub struct BeginUploadPartStreamSessionReq {
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub upload_id: UploadId,
+    pub part_number: u32,
+    pub session_id: SessionId,
+    pub bucket_write_reservation: crate::BucketWriteReservationProof,
+}
+
+#[derive(Debug, Clone)]
 pub struct DirectPutCommitSnapshot {
     pub existing_etag: Option<String>,
 }

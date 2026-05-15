@@ -132,73 +132,68 @@ impl Coordinator {
         let request = BucketHandleRequest::new()
             .requiring_policy_view()
             .requiring_bucket_tags_if_abac_enabled();
-        let expected_bucket_owner = req.upload.expected_bucket_owner();
         let session_id = Self::random_session_id("failed to generate session ID")?;
-        self.storage_node
-            .with_bucket_write_snapshot(
-                req.upload.bucket_name_typed(),
-                request.resolve_to_storage_request(),
-                |snapshot| {
-                    let bucket_handle = self
-                        .bucket_handle_loader()
-                        .load_bucket_handle_from_snapshot(
-                            snapshot,
-                            expected_bucket_owner,
-                            request,
-                        )?;
-                    #[cfg(test)]
-                    maybe_run_bucket_write_handle_loaded_hook(
-                        req.upload.bucket_name_typed().as_str(),
-                    );
-                    #[cfg(test)]
-                    if should_probe_begin_stream_part_session(req.upload.bucket_name()) {
-                        let object_pg_ready = self
-                            .storage_node
-                            .try_probe_object_pg_available(
-                                req.upload.bucket_name_typed(),
-                                req.upload.key_typed(),
-                            )
-                            .map_err(Coordinator::map_object_pg_action_error)?;
-                        if !object_pg_ready {
-                            return Err(ServerError::InternalError {
-                                reason:
-                                    "test probe: object pg still locked before begin_stream_part session"
-                                        .to_string(),
-                            });
-                        }
-                    }
-                    self.storage_node
-                        .begin_upload_part_stream_session(
+        self.with_bucket_write_handle_for_command(&req.upload, request, |bucket_handle, proof| {
+            let mut proof_transferred_to_command = false;
+            let result = (|| {
+                #[cfg(test)]
+                if should_probe_begin_stream_part_session(req.upload.bucket_name()) {
+                    let object_pg_ready = self
+                        .storage_node
+                        .try_probe_object_pg_available(
                             req.upload.bucket_name_typed(),
                             req.upload.key_typed(),
-                            req.upload.upload_id_typed(),
-                            req.part_number,
-                            &session_id,
-                            |upload| {
-                                let authorized = self.authorize_begin_stream_part_with_upload(
+                        )
+                        .map_err(Coordinator::map_object_pg_action_error)?;
+                    if !object_pg_ready {
+                        return Err(ServerError::InternalError {
+                            reason:
+                                "test probe: object pg still locked before begin_stream_part session"
+                                    .to_string(),
+                        });
+                    }
+                }
+                proof_transferred_to_command = true;
+                self.storage_node
+                    .begin_upload_part_stream_session(
+                        storage::BeginUploadPartStreamSessionReq {
+                            bucket: req.upload.bucket_name_typed().clone(),
+                            key: req.upload.key_typed().clone(),
+                            upload_id: req.upload.upload_id_typed().clone(),
+                            part_number: req.part_number,
+                            session_id: session_id.clone(),
+                            bucket_write_reservation: proof.clone(),
+                        },
+                        |upload| {
+                            let authorized =
+                                self.authorize_begin_stream_part_with_upload(
                                     req,
                                     &bucket_handle,
                                     upload,
                                 )?;
-                                let checksum_algorithm = authorized
-                                    .upload
-                                    .checksum
-                                    .map(MultipartChecksumConfig::algorithm);
-                                let authorized_upload = authorized.upload;
-                                Ok::<_, ServerError>((
-                                    authorized_upload,
-                                    BeginStreamPartResult {
+                            let checksum_algorithm = authorized
+                                .upload
+                                .checksum
+                                .map(MultipartChecksumConfig::algorithm);
+                            let authorized_upload = authorized.upload;
+                            Ok::<_, ServerError>((
+                                authorized_upload,
+                                BeginStreamPartResult {
                                     session_id: session_id.clone(),
                                     checksum_algorithm,
                                     sse_customer: authorized.sse_customer,
-                                    },
-                                ))
-                            },
-                        )
-                        .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
-                },
-            )
-            .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
+                                },
+                            ))
+                        },
+                    )
+                    .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
+            })();
+            if proof_transferred_to_command {
+                storage::BucketWriteSnapshotAction::transferred_to_command(result)
+            } else {
+                storage::BucketWriteSnapshotAction::release(result)
+            }
+        })
     }
 
     pub(super) fn validate_upload_part_number(part_number: u32) -> Result<(), ServerError> {
