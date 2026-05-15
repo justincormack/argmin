@@ -230,34 +230,73 @@ impl Coordinator {
             enabled: object_lock_enabled,
             default_retention: None,
         };
-        match self
-            .storage_node
-            .create_bucket_with_config_and_load_info(&storage::CreateBucketConfig {
-                name: name.as_str(),
-                owner_principal: owner.principal.as_str(),
-                owner_canonical_id: &owner.canonical_id,
-                acl_grants: &acl_grants,
-                public_read,
-                public_write,
-                versioning: initial_versioning,
-                object_lock: initial_object_lock,
-            })
-            .map_err(Self::map_bucket_snapshot_load_error)?
-        {
-            storage::node::BucketCreateAttemptOutcome::Created(_info) => {
-                Ok(BucketCreateOutcome::Created)
+        loop {
+            match self
+                .storage_node
+                .create_bucket_with_config_and_load_info(&storage::CreateBucketConfig {
+                    name: name.as_str(),
+                    owner_principal: owner.principal.as_str(),
+                    owner_canonical_id: &owner.canonical_id,
+                    acl_grants: &acl_grants,
+                    public_read,
+                    public_write,
+                    versioning: initial_versioning,
+                    object_lock: initial_object_lock,
+                })
+                .map_err(Self::map_bucket_snapshot_load_error)?
+            {
+                storage::node::BucketCreateAttemptOutcome::Created(_info) => {
+                    return Ok(BucketCreateOutcome::Created);
+                }
+                storage::node::BucketCreateAttemptOutcome::Exists(existing) => {
+                    match existing.state {
+                        BucketState::Active
+                            if existing.owner_principal == owner.principal
+                                && existing.owner_canonical_id == owner.canonical_id =>
+                        {
+                            return Ok(BucketCreateOutcome::AlreadyOwned);
+                        }
+                        BucketState::Active => return Err(ServerError::BucketAlreadyExists),
+                        BucketState::Deleting => {
+                            let _ = observability::event(
+                                TRACE_TARGET,
+                                "bucket_create_finalize_deleting_start",
+                                Some(format_args!("bucket={:?}", name)),
+                            );
+                            match self.storage_node.try_finalize_bucket_delete(name) {
+                                Ok(
+                                    storage::BucketDeleteFinalizeOutcome::Finalized
+                                    | storage::BucketDeleteFinalizeOutcome::NotFound,
+                                ) => {
+                                    let _ = observability::event(
+                                        TRACE_TARGET,
+                                        "bucket_create_finalize_deleting_done",
+                                        Some(format_args!("bucket={:?}", name)),
+                                    );
+                                    continue;
+                                }
+                                Ok(storage::BucketDeleteFinalizeOutcome::NotDeleting) => {
+                                    let _ = observability::event(
+                                        TRACE_TARGET,
+                                        "bucket_create_finalize_deleting_changed",
+                                        Some(format_args!("bucket={:?}", name)),
+                                    );
+                                    continue;
+                                }
+                                Ok(storage::BucketDeleteFinalizeOutcome::Pending) => {
+                                    let _ = observability::event(
+                                        TRACE_TARGET,
+                                        "bucket_create_finalize_deleting_pending",
+                                        Some(format_args!("bucket={:?}", name)),
+                                    );
+                                    return Err(ServerError::BucketAlreadyExists);
+                                }
+                                Err(err) => return Err(Self::map_bucket_write_drain_error(err)),
+                            }
+                        }
+                    }
+                }
             }
-            storage::node::BucketCreateAttemptOutcome::Exists(existing) => match existing.state {
-                BucketState::Active
-                    if existing.owner_principal == owner.principal
-                        && existing.owner_canonical_id == owner.canonical_id =>
-                {
-                    Ok(BucketCreateOutcome::AlreadyOwned)
-                }
-                BucketState::Active | BucketState::Deleting => {
-                    Err(ServerError::BucketAlreadyExists)
-                }
-            },
         }
     }
 

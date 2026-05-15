@@ -6,6 +6,9 @@ use s3_types::{
     AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, LifecycleExpiration,
     LifecycleRule, LifecycleRuleFilter, LifecycleRuleStatus, LifecycleTag,
 };
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use storage::{install_bucket_scoped_test_hooks, BucketScopedTestHooks};
 
 fn delete_bucket_test(coord: &Coordinator, name: &str) -> Result<(), ServerError> {
     coord.delete_bucket(&bucket_request_with_expected_owner(
@@ -600,6 +603,86 @@ fn bucket_crud() {
     assert!(coord
         .unchecked_active_bucket_summary("test-bucket")
         .is_err());
+}
+
+#[test]
+fn create_bucket_reuse_finalizes_deleting_bucket_inline() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_without_reclaim_sweeper(tmp.path());
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    delete_bucket_test(&coord, "bucket").unwrap();
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let info = coord.unchecked_active_bucket_summary("bucket").unwrap();
+    assert_eq!(info.name, "bucket");
+}
+
+#[test]
+fn create_bucket_reloads_when_deleting_bucket_is_recreated_by_racer() {
+    let _storage_serial = super::test_hooks::STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap();
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_without_reclaim_sweeper(tmp.path());
+    let bucket = trusted_bucket_name("bucket");
+    let owner = storage::OwnerIdentity::from_principal("default-owner");
+    let acl_grants = Coordinator::bucket_acl_grants_from_flags(&owner, false, false);
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    delete_bucket_test(&coord, "bucket").unwrap();
+
+    let storage = Arc::clone(&coord.storage_node);
+    let hook_bucket = bucket.clone();
+    let hook_owner = owner.clone();
+    let hook_acl_grants = acl_grants.clone();
+    let lock_attempts = Arc::new(AtomicUsize::new(0));
+    let raced = Arc::new(AtomicBool::new(false));
+    let _hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
+        target: Some(bucket.clone()),
+        before_bucket_lock_acquire: Some(Arc::new({
+            let lock_attempts = Arc::clone(&lock_attempts);
+            let raced = Arc::clone(&raced);
+            move || {
+                if lock_attempts.fetch_add(1, Ordering::SeqCst) != 1 {
+                    return;
+                }
+                if raced.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                storage.try_finalize_bucket_delete(&hook_bucket).unwrap();
+                storage
+                    .create_bucket_with_config_and_load_info(&storage::CreateBucketConfig {
+                        name: hook_bucket.as_str(),
+                        owner_principal: hook_owner.principal.as_str(),
+                        owner_canonical_id: &hook_owner.canonical_id,
+                        acl_grants: &hook_acl_grants,
+                        public_read: false,
+                        public_write: false,
+                        versioning: BucketVersioningState::Disabled,
+                        object_lock: storage::BucketObjectLockConfig {
+                            enabled: false,
+                            default_retention: None,
+                        },
+                    })
+                    .unwrap();
+            }
+        })),
+        ..BucketScopedTestHooks::default()
+    });
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    assert!(raced.load(Ordering::SeqCst));
 }
 
 #[test]
