@@ -26138,6 +26138,169 @@ mod tests {
     }
 
     #[test]
+    fn begin_bucket_delete_reissue_waits_for_primary_last_apply_window() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap());
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let (occupant_bucket, delete_bucket) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            (
+                bucket_for_pg(topology, pg_id.get(), "delete-window-occupant-"),
+                bucket_for_pg(topology, pg_id.get(), "delete-window-mark-"),
+            )
+        };
+        create_test_bucket(&cluster, &occupant_bucket);
+        create_test_bucket(&cluster, &delete_bucket);
+
+        let stale_command_id = cluster.next_bucket_metadata_command_id(pg_id).unwrap();
+        let primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+            .unwrap();
+        let primary_pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+        let occupant_current =
+            crate::PgMetadataStore::head_bucket_record_raw(&*primary_pg, &occupant_bucket).unwrap();
+        let occupant_command = MetadataCommandEnvelope::new(
+            stale_command_id,
+            MetadataCommandPayload::PutBucketVersioning(PutBucketVersioningCommand::from_bucket(
+                occupant_current.with_execution_generation(
+                    primary_pg
+                        .next_bucket_execution_generation_candidate()
+                        .unwrap(),
+                ),
+                crate::BucketVersioningState::Enabled,
+            )),
+        );
+        let delete_current =
+            crate::PgMetadataStore::head_bucket_record_raw(&*primary_pg, &delete_bucket).unwrap();
+        let stale_delete_command = MetadataCommandEnvelope::new(
+            stale_command_id,
+            MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand::from_bucket(
+                delete_current.with_execution_generation(
+                    primary_pg
+                        .next_bucket_execution_generation_candidate()
+                        .unwrap(),
+                ),
+            )),
+        );
+        drop(primary_pg);
+        insert_pending_metadata_command_for_test(
+            &map,
+            pg_id,
+            &delete_bucket,
+            &stale_delete_command,
+        );
+
+        let primary_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_primary = Arc::new((Mutex::new(false), Condvar::new()));
+        let occupant_map = Arc::clone(&map);
+        let occupant_command_for_thread = occupant_command.clone();
+        let primary_gate_for_thread = Arc::clone(&primary_gate);
+        let release_primary_for_thread = Arc::clone(&release_primary);
+        let occupant_thread = std::thread::spawn(move || {
+            let pg_lock = occupant_map.runtime_state().metadata_command_pg_lock(pg_id);
+            let _pg_guard = pg_lock.lock().unwrap();
+            for node_id in [NodeId::new(1), NodeId::new(2)] {
+                let pg = occupant_map
+                    .node(node_id)
+                    .unwrap()
+                    .storage_node()
+                    .get_pg(pg_id.get())
+                    .unwrap();
+                pg.apply_metadata_command_and_record(
+                    node_id.as_u32(),
+                    &occupant_command_for_thread,
+                )
+                .unwrap();
+            }
+            {
+                let (lock, cv) = &*primary_gate_for_thread;
+                *lock.lock().unwrap() = true;
+                cv.notify_all();
+            }
+            {
+                let (lock, cv) = &*release_primary_for_thread;
+                let _guard = cv
+                    .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |released| {
+                        !*released
+                    })
+                    .unwrap();
+            }
+            let pg = occupant_map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(pg_id.get())
+                .unwrap();
+            pg.apply_metadata_command_and_record(0, &occupant_command_for_thread)
+                .unwrap();
+        });
+
+        {
+            let (lock, cv) = &*primary_gate;
+            let guard = cv
+                .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |at_primary| {
+                    !*at_primary
+                })
+                .unwrap()
+                .0;
+            assert!(
+                *guard,
+                "occupant command should pause in the primary-last apply window"
+            );
+        }
+
+        let reissue_cluster = cluster.clone();
+        let stale_for_thread = stale_delete_command.clone();
+        let reissue_thread = std::thread::spawn(move || {
+            reissue_cluster
+                .test_reissue_pending_metadata_command(pg_id, &stale_for_thread)
+                .unwrap()
+        });
+
+        {
+            let (lock, cv) = &*release_primary;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        occupant_thread.join().unwrap();
+        let replacement = reissue_thread
+            .join()
+            .unwrap()
+            .expect("stale delete command should be reissued after in-flight apply finishes");
+        assert_eq!(
+            replacement.id().log_index().get(),
+            stale_command_id.log_index().get() + 1
+        );
+        assert_eq!(replacement.payload(), stale_delete_command.payload());
+
+        cluster.begin_bucket_delete(&delete_bucket).unwrap();
+
+        for node_id in node_ids {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(pg_id.get())
+                .unwrap();
+            let occupant = crate::PgMetadataStore::head_bucket_raw(&*pg, &occupant_bucket).unwrap();
+            assert_eq!(occupant.versioning, crate::BucketVersioningState::Enabled);
+            let deleted = crate::PgMetadataStore::head_bucket_raw(&*pg, &delete_bucket).unwrap();
+            assert_eq!(deleted.state, crate::BucketState::Deleting);
+        }
+        assert_clean_metadata_command_stream(&map, &[pg_id.get()]);
+    }
+
+    #[test]
     fn begin_bucket_delete_retries_after_partial_object_pg_drain_conflict() {
         let _serial = lock_metadata_command_apply_hook_test();
         let tmp = test_util::tempdir();

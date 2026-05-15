@@ -915,6 +915,11 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<Option<MetadataCommandEnvelope>, BucketSnapshotLoadError> {
+        let pg_lock = self
+            .local_map
+            .runtime_state()
+            .metadata_command_pg_lock(pg_id);
+        let _pg_guard = pg_lock.lock().unwrap_or_else(|e| e.into_inner());
         let bucket = command.bucket_name().clone();
         let primary = self
             .local_map

@@ -4096,24 +4096,21 @@ impl super::StorageCluster {
                         if marker.matches_request(bucket, key) =>
                     {
                         let object_pg = primary_node.get_pg(pg_id.get())?;
-                        let stored = match PgMetadataStore::get_object_meta(
-                            &*object_pg,
-                            bucket,
-                            key,
-                        ) {
-                            Ok(stored) => stored,
-                            Err(MetadataError::ObjectNotFound) => {
-                                drop(object_pg);
-                                self.apply_exact_pending_object_metadata_command(
+                        let stored =
+                            match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
+                                Ok(stored) => stored,
+                                Err(MetadataError::ObjectNotFound) => {
+                                    drop(object_pg);
+                                    self.apply_exact_pending_object_metadata_command(
                                     pg_id,
                                     super::ExactPendingObjectMetadataCommand::for_checked_request(
                                         &command,
                                     ),
                                 )?;
-                                return Ok(Ok(None));
-                            }
-                            Err(error) => return Err(error.into()),
-                        };
+                                    return Ok(Ok(None));
+                                }
+                                Err(error) => return Err(error.into()),
+                            };
                         let StoredObject::Live(record) = stored else {
                             drop(object_pg);
                             self.apply_exact_pending_object_metadata_command(
