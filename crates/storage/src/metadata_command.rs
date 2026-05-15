@@ -615,6 +615,7 @@ impl CommitDirectPutObjectCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitMultipartObjectCommand {
     pub(crate) upload_id: UploadId,
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
     pub(crate) object: PutLiveObjectReq,
     pub(crate) parts: Vec<ObjectPartRecord>,
     pub(crate) selected_streaming_segments: Vec<MultipartPartSegmentRecord>,
@@ -761,6 +762,7 @@ pub(crate) enum PutObjectMetadataMutation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PutObjectMetadataCommand {
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
     pub(crate) object: LiveObjectRecord,
 }
 
@@ -768,6 +770,7 @@ impl PutObjectMetadataCommand {
     pub(crate) fn from_live_object_and_mutation(
         mut object: LiveObjectRecord,
         mutation: PutObjectMetadataMutation,
+        bucket_write_reservation: BucketWriteReservationProof,
     ) -> Self {
         match mutation {
             PutObjectMetadataMutation::PutTags(tags) => {
@@ -790,7 +793,10 @@ impl PutObjectMetadataCommand {
                 object.public_read = public_read;
             }
         }
-        Self { object }
+        Self {
+            bucket_write_reservation,
+            object,
+        }
     }
 
     pub(crate) fn matches_object(&self, object: &LiveObjectRecord) -> bool {
@@ -1331,7 +1337,8 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 self.read_u64()?;
                 self.skip_optional_owner_identity()?;
                 self.read_u64()?;
-                self.skip_optional_stale_payload()
+                self.skip_optional_stale_payload()?;
+                self.skip_required_bucket_write_reservation_proof()
             }
             METADATA_COMMAND_DELETE_OBJECT_VERSION => {
                 self.skip_str()?;
@@ -1356,7 +1363,10 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 self.read_u64()?;
                 self.skip_optional_stale_payload()
             }
-            METADATA_COMMAND_PUT_OBJECT_METADATA => self.skip_live_object_record(),
+            METADATA_COMMAND_PUT_OBJECT_METADATA => {
+                self.skip_live_object_record()?;
+                self.skip_required_bucket_write_reservation_proof()
+            }
             METADATA_COMMAND_CREATE_STREAM_UPLOAD => self.skip_create_stream_upload(),
             METADATA_COMMAND_APPEND_STREAM_SEGMENT => {
                 self.skip_str()?;
@@ -1514,6 +1524,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                         initiator: self.read_optional_owner_identity()?,
                         last_modified_millis: self.read_u64()?,
                         stale_payload: self.read_optional_stale_payload()?,
+                        bucket_write_reservation: self.read_bucket_write_reservation_proof()?,
                     },
                 )))
             }
@@ -1547,6 +1558,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             METADATA_COMMAND_PUT_OBJECT_METADATA => Ok(MetadataCommandPayload::PutObjectMetadata(
                 Box::new(PutObjectMetadataCommand {
                     object: self.read_live_object_record()?,
+                    bucket_write_reservation: self.read_bucket_write_reservation_proof()?,
                 }),
             )),
             METADATA_COMMAND_CREATE_STREAM_UPLOAD => Ok(
@@ -2981,6 +2993,7 @@ fn encode_commit_multipart_object(out: &mut Vec<u8>, command: &CommitMultipartOb
             encode_multipart_reclaim(out, reclaim);
         }
     }
+    encode_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
 }
 
 fn encode_delete_object_version(out: &mut Vec<u8>, command: &DeleteObjectVersionCommand) {
@@ -3034,6 +3047,7 @@ fn encode_insert_delete_marker(out: &mut Vec<u8>, command: &InsertDeleteMarkerCo
 
 fn encode_put_object_metadata(out: &mut Vec<u8>, command: &PutObjectMetadataCommand) {
     encode_live_object_record(out, &command.object);
+    encode_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
 }
 
 fn encode_create_stream_upload(out: &mut Vec<u8>, command: &CreateStreamUploadCommand) {
@@ -3866,6 +3880,146 @@ mod tests {
     }
 
     #[test]
+    fn commit_multipart_object_rejects_missing_bucket_write_reservation_proof() {
+        let bucket = BucketName::try_from("multipart-proof-required".to_string()).unwrap();
+        let key = ObjectKey::try_from("key".to_string()).unwrap();
+        let proof = BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: "multipart-proof-required-reservation".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: 7,
+            operation_kind: "complete-multipart-upload".to_string(),
+            created_at: 10,
+            lease_deadline: Some(20),
+            target_context: Some(key.as_str().to_string()),
+        };
+        let parts_count = std::num::NonZeroU32::new(1).unwrap();
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CommitMultipartObject(Box::new(CommitMultipartObjectCommand {
+                upload_id: UploadId::try_from("u".repeat(128)).unwrap(),
+                bucket_write_reservation: proof.clone(),
+                object: PutLiveObjectReq {
+                    bucket,
+                    key,
+                    version_id: VersionId::Null,
+                    owner: OwnerIdentity::from_principal("owner"),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    generation_id: GenerationId::MIN,
+                    size: 0,
+                    etag: ObjectEtag::MultipartComposite {
+                        crc64: [0; 8],
+                        parts: parts_count,
+                    },
+                    ec: EcShape { k: 0, m: 0 },
+                    layout: ObjectLayout::MultipartManifest { parts_count },
+                    tags: None,
+                    metadata_blob: Some(SerializedMetadataBlob::default()),
+                    system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
+                    object_lock: ObjectLockState::default(),
+                    encryption: ObjectEncryption::None,
+                },
+                parts: Vec::new(),
+                selected_streaming_segments: Vec::new(),
+                omitted_parts: Vec::new(),
+                omitted_streaming_segments: Vec::new(),
+                stream_uploads: Vec::new(),
+                stream_upload_segments: Vec::new(),
+                write_sequence: 1,
+                completion_order: 1,
+                completed_at_millis: 2,
+                initiator: None,
+                last_modified_millis: 2,
+                stale_payload: None,
+            })),
+        );
+
+        let mut proof_bytes = Vec::new();
+        encode_bucket_write_reservation_proof(&mut proof_bytes, &proof);
+        let mut proofless_bytes = command.command_bytes();
+        assert!(proofless_bytes.ends_with(&proof_bytes));
+        proofless_bytes.truncate(proofless_bytes.len() - proof_bytes.len());
+
+        assert!(
+            decode_metadata_command_envelope(&proofless_bytes).is_err(),
+            "proofless complete-multipart command bytes must fail full envelope decode"
+        );
+        assert!(
+            decode_metadata_command_log_entry_header(&proofless_bytes).is_err(),
+            "proofless complete-multipart command bytes must fail applied-row validation"
+        );
+    }
+
+    #[test]
+    fn put_object_metadata_rejects_missing_bucket_write_reservation_proof() {
+        let bucket = BucketName::try_from("metadata-proof-required".to_string()).unwrap();
+        let key = ObjectKey::try_from("key".to_string()).unwrap();
+        let proof = BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: "metadata-proof-required-reservation".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: 7,
+            operation_kind: "put-object-metadata".to_string(),
+            created_at: 10,
+            lease_deadline: Some(20),
+            target_context: Some(key.as_str().to_string()),
+        };
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
+                bucket_write_reservation: proof.clone(),
+                object: LiveObjectRecord {
+                    bucket,
+                    key,
+                    version_id: VersionId::Null,
+                    owner: OwnerIdentity::from_principal("owner"),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    generation_id: GenerationId::MIN,
+                    size: 0,
+                    etag: ObjectEtag::single_part(0),
+                    last_modified: 1,
+                    became_noncurrent_at: None,
+                    storage_class: StorageClass::Standard,
+                    ec: EcShape { k: 0, m: 0 },
+                    layout: ObjectLayout::Standard,
+                    tags: Some(SerializedTagSet::new("<Tagging/>".to_string())),
+                    metadata_blob: Some(SerializedMetadataBlob::default()),
+                    system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
+                    object_lock: ObjectLockState::default(),
+                    encryption: ObjectEncryption::None,
+                },
+            })),
+        );
+
+        let mut proof_bytes = Vec::new();
+        encode_bucket_write_reservation_proof(&mut proof_bytes, &proof);
+        let mut proofless_bytes = command.command_bytes();
+        assert!(proofless_bytes.ends_with(&proof_bytes));
+        proofless_bytes.truncate(proofless_bytes.len() - proof_bytes.len());
+
+        assert!(
+            decode_metadata_command_envelope(&proofless_bytes).is_err(),
+            "proofless put-object-metadata command bytes must fail full envelope decode"
+        );
+        assert!(
+            decode_metadata_command_log_entry_header(&proofless_bytes).is_err(),
+            "proofless put-object-metadata command bytes must fail applied-row validation"
+        );
+    }
+
+    #[test]
     fn metadata_command_canonical_encoding_is_stable() {
         let owner = CanonicalUserId::from_principal("owner");
         let acl_grants = AclGrants::default();
@@ -4490,6 +4644,7 @@ mod tests {
             })),
             MetadataCommandPayload::CommitMultipartObject(Box::new(CommitMultipartObjectCommand {
                 upload_id: upload_id.clone(),
+                bucket_write_reservation: bucket_write_reservation.clone(),
                 object: multipart_object,
                 parts: vec![part],
                 selected_streaming_segments: vec![selected_streaming_segment.clone()],
@@ -4571,6 +4726,7 @@ mod tests {
                 stale_payload: Some(multipart_reclaim.clone()),
             }),
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
+                bucket_write_reservation: bucket_write_reservation.clone(),
                 object: LiveObjectRecord {
                     version_id: VersionId::from_u64(8),
                     tags: Some(SerializedTagSet::new("<Tagging/>".to_string())),
@@ -4578,6 +4734,7 @@ mod tests {
                 },
             })),
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
+                bucket_write_reservation: bucket_write_reservation.clone(),
                 object: LiveObjectRecord {
                     version_id: VersionId::from_u64(8),
                     tags: None,
@@ -4585,6 +4742,7 @@ mod tests {
                 },
             })),
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
+                bucket_write_reservation: bucket_write_reservation.clone(),
                 object: LiveObjectRecord {
                     version_id: VersionId::from_u64(8),
                     object_lock: ObjectLockState {
@@ -4598,6 +4756,7 @@ mod tests {
                 },
             })),
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
+                bucket_write_reservation: bucket_write_reservation.clone(),
                 object: LiveObjectRecord {
                     version_id: VersionId::from_u64(8),
                     object_lock: ObjectLockState {
@@ -4737,6 +4896,7 @@ mod tests {
                 ),
             )),
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
+                bucket_write_reservation: bucket_write_reservation.clone(),
                 object: LiveObjectRecord {
                     bucket: bucket.clone(),
                     key: key.clone(),
@@ -4792,17 +4952,17 @@ mod tests {
                 0x3acf49df359790d4,
                 0x1709498196ee0830,
                 0xbcb5caaa0f53392e,
-                0x7920c33a006e1d68,
+                0x0fd434d65722acdf,
                 0x53fdbf4c6f062d53,
                 0x6df04a5fc73e478a,
                 0x2a3c1d82cb08bbdd,
                 0x6a5e23df842faebe,
                 0x8e2a154ef6fa870e,
                 0xa3de4500905f67bf,
-                0xc0d44346162de207,
-                0x74df7243409a2637,
-                0x5fd68ba34c3c927a,
-                0xaaee1aa183a67da1,
+                0x3c180aad45432e94,
+                0x148d763dc19749f9,
+                0x74269a8640f6cc38,
+                0xf202bed248d94901,
                 0x18628b4680d19eea,
                 0x4842e9828aac6523,
                 0x8f0590d0286f0dc4,
@@ -4814,7 +4974,7 @@ mod tests {
                 0xd791c495e8ce2c3e,
                 0xa9cde2110916a8a6,
                 0x0e53aa8cb595ea77,
-                0x7198824f0ecf3d31,
+                0x1fb89915efec6e7a,
                 0x13ddd49bdbc91001,
                 0x1946524188e07bbb,
             ]

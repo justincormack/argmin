@@ -1512,11 +1512,17 @@ fn command_bucket_write_reservation_proof(
         crate::metadata_command::MetadataCommandPayload::CommitDirectPutObject(commit) => {
             Some(&commit.bucket_write_reservation)
         }
+        crate::metadata_command::MetadataCommandPayload::CommitMultipartObject(commit) => {
+            Some(&commit.bucket_write_reservation)
+        }
         crate::metadata_command::MetadataCommandPayload::CreateStreamUpload(create) => {
             Some(&create.bucket_write_reservation)
         }
         crate::metadata_command::MetadataCommandPayload::CommitStreamPart(commit) => {
             Some(&commit.bucket_write_reservation)
+        }
+        crate::metadata_command::MetadataCommandPayload::PutObjectMetadata(update) => {
+            Some(&update.bucket_write_reservation)
         }
         crate::metadata_command::MetadataCommandPayload::CreateMultipartUpload(create) => {
             Some(&create.bucket_write_reservation)
@@ -2827,6 +2833,12 @@ mod tests {
         let completion_order = cluster
             .test_reserve_completed_multipart_upload_order(&req.bucket)
             .unwrap();
+        let bucket_write_reservation = acquire_test_bucket_write_proof(
+            cluster,
+            &req.bucket,
+            "test-complete-multipart",
+            Some(req.key.as_str()),
+        );
         (
             MetadataCommandEnvelope::new(
                 MetadataCommandId::new(
@@ -2837,6 +2849,7 @@ mod tests {
                 MetadataCommandPayload::CommitMultipartObject(Box::new(
                     CommitMultipartObjectCommand {
                         upload_id: req.upload_id.clone(),
+                        bucket_write_reservation,
                         object: crate::PutLiveObjectReq {
                             bucket: req.bucket.clone(),
                             key: req.key.clone(),
@@ -7121,6 +7134,12 @@ mod tests {
             "<Tagging><TagSet><Tag><Key>slot</Key><Value>winner</Value></Tag></TagSet></Tagging>"
                 .to_string();
         let hook_second_tags = second_tags.clone();
+        let hook_proof = acquire_test_bucket_write_proof(
+            &first_cluster,
+            &bucket,
+            "test-put-object-metadata-race",
+            Some(second_key.as_str()),
+        );
         let _hook_guard = first_cluster.test_install_before_metadata_command_pending_install_hook(
             Arc::new(move || {
                 if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
@@ -7148,6 +7167,7 @@ mod tests {
                         PutObjectMetadataCommand::from_live_object_and_mutation(
                             live,
                             PutObjectMetadataMutation::PutTags(hook_second_tags.clone()),
+                            hook_proof.clone(),
                         ),
                     )),
                 );
@@ -7239,6 +7259,12 @@ mod tests {
             "<Tagging><TagSet><Tag><Key>slot</Key><Value>winner</Value></Tag></TagSet></Tagging>"
                 .to_string();
         let hook_winner_tags = winner_tags.clone();
+        let hook_proof = acquire_test_bucket_write_proof(
+            &first_cluster,
+            &bucket,
+            "test-put-object-metadata-race",
+            Some(key.as_str()),
+        );
         let _hook_guard = first_cluster.test_install_before_metadata_command_pending_install_hook(
             Arc::new(move || {
                 if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
@@ -7266,6 +7292,7 @@ mod tests {
                         PutObjectMetadataCommand::from_live_object_and_mutation(
                             live,
                             PutObjectMetadataMutation::PutTags(hook_winner_tags.clone()),
+                            hook_proof.clone(),
                         ),
                     )),
                 );
@@ -7319,6 +7346,7 @@ mod tests {
                 Some(winner_tags.as_str())
             );
         }
+        assert_bucket_write_reservations_released(&first_map, &bucket);
     }
 
     #[test]
@@ -19775,6 +19803,12 @@ mod tests {
         let hook_key = key.clone();
         let hook_req = req.clone();
         let hook_session_id = session_id.clone();
+        let hook_proof = acquire_test_bucket_write_proof(
+            &cluster,
+            &bucket,
+            "test-complete-multipart-race",
+            Some(key.as_str()),
+        );
         let _hook_guard = cluster.test_install_before_metadata_command_pending_install_hook(
             Arc::new(move || {
                 if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
@@ -19853,6 +19887,7 @@ mod tests {
                     MetadataCommandPayload::CommitMultipartObject(Box::new(
                         CommitMultipartObjectCommand {
                             upload_id: hook_req.upload_id.clone(),
+                            bucket_write_reservation: hook_proof.clone(),
                             object: crate::PutLiveObjectReq {
                                 bucket: hook_bucket.clone(),
                                 key: hook_key.clone(),
@@ -21888,6 +21923,7 @@ mod tests {
             &req.upload_id,
             TerminalMultipartOutcome::Completed,
         );
+        assert_bucket_write_reservations_released(&map, &bucket);
     }
 
     #[test]
@@ -22005,6 +22041,7 @@ mod tests {
             TerminalMultipartOutcome::Completed,
         );
         assert_clean_metadata_command_stream(&reopened, &[object_pg]);
+        assert_bucket_write_reservations_released(&reopened, &bucket);
     }
 
     #[test]
@@ -22384,6 +22421,7 @@ mod tests {
             );
         }
         assert_clean_metadata_command_stream(&map, &[bucket_pg_id, object_pg]);
+        assert_bucket_write_reservations_released(&map, &bucket);
     }
 
     #[test]
@@ -22489,6 +22527,7 @@ mod tests {
             TerminalMultipartOutcome::Completed,
         );
         assert_clean_metadata_command_stream(&map, &[bucket_pg_id, object_pg]);
+        assert_bucket_write_reservations_released(&map, &bucket);
     }
 
     #[test]
@@ -23269,6 +23308,7 @@ mod tests {
                 None
             );
         }
+        assert_bucket_write_reservations_released(&map, &bucket);
     }
 
     #[test]
@@ -23401,6 +23441,105 @@ mod tests {
                 Some(tags)
             );
         }
+        assert_bucket_write_reservations_released(&map, &bucket);
+    }
+
+    #[test]
+    fn object_metadata_partial_apply_reopens_and_converges() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        write_committed_direct_segment_for(&cluster, &bucket, &key, b"object metadata reopen");
+        let tags =
+            "<Tagging><TagSet><Tag><Key>retry</Key><Value>reopen</Value></Tag></TagSet></Tagging>";
+
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::PutObjectMetadata(update)
+                        if update.object.bucket == hook_bucket
+                            && update.object.key == hook_key
+                            && node_id == NodeId::new(0)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected object metadata reopen apply failure",
+                            source: std::io::Error::other(
+                                "injected object metadata reopen apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+        let err = cluster
+            .put_object_tags_if(&bucket, &key, None, tags, |stored| {
+                Ok::<_, ()>(stored.version_id())
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected object metadata reopen apply failure",
+                    ..
+                })
+            ),
+            "expected injected primary failure, got {err:?}"
+        );
+        drop(hook_guard);
+        assert!(
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
+            "partial object metadata command must remain durable before reopen"
+        );
+        drop(cluster);
+        drop(map);
+
+        let reopened_map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let reopened_map = Arc::new(reopened_map);
+        assert!(
+            pending_metadata_command_for_test(&reopened_map, PgId::new(object_pg), &bucket)
+                .is_none(),
+            "open-time recovery should converge and clear the partial object metadata command"
+        );
+        for node_id in node_ids {
+            let node = reopened_map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::get_object_tags(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    crate::VersionId::Null,
+                )
+                .unwrap()
+                .as_deref(),
+                Some(tags)
+            );
+        }
+        assert_clean_metadata_command_stream(&reopened_map, &[object_pg]);
+        assert_bucket_write_reservations_released(&reopened_map, &bucket);
     }
 
     #[test]
@@ -23439,6 +23578,12 @@ mod tests {
         mismatched_post_image.tags = Some(crate::SerializedTagSet::new(tags.to_string()));
         mismatched_post_image.public_read = !stored.public_read;
         let pg_id = PgId::new(object_pg);
+        let proof = acquire_test_bucket_write_proof(
+            &cluster,
+            &bucket,
+            "test-put-object-metadata",
+            Some(key.as_str()),
+        );
         let command = MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 ClusterEpoch::INITIAL,
@@ -23446,6 +23591,7 @@ mod tests {
                 map.test_next_metadata_command_log_index(pg_id),
             ),
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
+                bucket_write_reservation: proof,
                 object: mismatched_post_image,
             })),
         );
@@ -23508,6 +23654,12 @@ mod tests {
         post_image.size += 1;
 
         let pg_id = PgId::new(object_pg);
+        let proof = acquire_test_bucket_write_proof(
+            &cluster,
+            &bucket,
+            "test-put-object-metadata",
+            Some(key.as_str()),
+        );
         let command = MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 ClusterEpoch::INITIAL,
@@ -23515,6 +23667,7 @@ mod tests {
                 map.test_next_metadata_command_log_index(pg_id),
             ),
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
+                bucket_write_reservation: proof,
                 object: post_image,
             })),
         );
@@ -23965,6 +24118,12 @@ mod tests {
         let hook_key = key.clone();
         let hook_version_id = older.version_id;
         let hook_ran_for_closure = Arc::clone(&hook_ran);
+        let hook_proof = acquire_test_bucket_write_proof(
+            &first_cluster,
+            &bucket,
+            "test-put-object-metadata-race",
+            Some(key.as_str()),
+        );
         let _hook_guard = first_cluster.test_install_before_metadata_command_pending_install_hook(
             Arc::new(move || {
                 if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
@@ -23999,6 +24158,7 @@ mod tests {
                             PutObjectMetadataMutation::PutLegalHold(
                                 crate::StoredLegalHoldStatus::On,
                             ),
+                            hook_proof.clone(),
                         ),
                     )),
                 );
@@ -24122,6 +24282,12 @@ mod tests {
         let install_version_id = older.version_id;
         let install_once = Arc::clone(&slot_installed);
         let calls_for_selector = Arc::clone(&selector_calls);
+        let install_proof = acquire_test_bucket_write_proof(
+            &first_cluster,
+            &bucket,
+            "test-put-object-metadata-race",
+            Some(key.as_str()),
+        );
         let reclaimed = first_cluster
             .delete_noncurrent_live_versions_if_due(&bucket, &key, move |raw, versions| {
                 assert_eq!(raw, Some("<LifecycleConfiguration/>"));
@@ -24164,6 +24330,7 @@ mod tests {
                                 PutObjectMetadataMutation::PutLegalHold(
                                     crate::StoredLegalHoldStatus::On,
                                 ),
+                                install_proof.clone(),
                             ),
                         )),
                     );

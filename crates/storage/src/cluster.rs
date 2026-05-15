@@ -1528,11 +1528,17 @@ impl StorageCluster {
             MetadataCommandPayload::CommitDirectPutObject(commit) => {
                 Some(&commit.bucket_write_reservation)
             }
+            MetadataCommandPayload::CommitMultipartObject(commit) => {
+                Some(&commit.bucket_write_reservation)
+            }
             MetadataCommandPayload::CreateStreamUpload(create) => {
                 Some(&create.bucket_write_reservation)
             }
             MetadataCommandPayload::CommitStreamPart(commit) => {
                 Some(&commit.bucket_write_reservation)
+            }
+            MetadataCommandPayload::PutObjectMetadata(update) => {
+                Some(&update.bucket_write_reservation)
             }
             MetadataCommandPayload::CreateMultipartUpload(create) => {
                 Some(&create.bucket_write_reservation)

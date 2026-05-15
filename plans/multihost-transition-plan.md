@@ -3452,11 +3452,16 @@ Proposed subphases:
         applying outside the bucket-write fence. UploadPart stream finalization
         now carries the proof in `CommitStreamPart`; matching pending retry,
         partial/reopen convergence, and open-time recovery validate and release
-        it before clearing the terminal pending slot.
-        CompleteMultipartUpload, object delete/lifecycle, and object metadata
-        command families still need the same apply-time reservation proof before
-        DeleteBucket can rely on durable reservations alone. Closeout should
-        also remove the
+        it before clearing the terminal pending slot. CompleteMultipartUpload
+        now carries the proof in `CommitMultipartObject`; matching pending
+        retry, partial/reopen convergence, and open-time recovery validate and
+        release it before clearing the terminal pending slot.
+        Object metadata updates now carry the proof in `PutObjectMetadata`;
+        matching pending retry, partial/reopen convergence, and open-time
+        recovery validate and release it before clearing the terminal pending
+        slot. Object delete/lifecycle command families still need the same
+        apply-time reservation proof before DeleteBucket can rely on durable
+        reservations alone. Closeout should also remove the
         transitional `Option<BucketWriteReservationProof>` storage API surfaces:
         once all production writers pass proofs end to end, require proofs at
         those request boundaries and keep any internal proof acquisition behind
