@@ -98,6 +98,17 @@ fail_with_matches \
     "metadata_primary_bridge_node used outside cfg-gated test hooks" \
     "$unexpected_metadata_bridge"
 
+legacy_object_pending_helpers=$(
+    rg -n --color=never \
+        'apply_pending_object_metadata_command_for_bucket|finish_pending_object_metadata_command_for_bucket' \
+        crates/storage/src \
+        -g '*.rs' \
+        || true
+)
+fail_with_matches \
+    "Use exact/drain object pending-command helpers; legacy bucket-named object finisher helpers are not allowed" \
+    "$legacy_object_pending_helpers"
+
 direct_shard_matches=$(
     rg -n --color=never '\.(write_shard|read_shard|delete_shard|write_shard_file|read_shard_file|read_shard_file_into|delete_shard_file)\(' \
         crates/storage/src \
@@ -356,7 +367,7 @@ expected_metadata_command_conflict_uses=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards<E>:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:commit_stream_segment_append:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:create_put_object_stream_session_record_under_reservation:metadata-command-log-conflict
-2 crates/storage/src/cluster.rs:finish_pending_object_metadata_command_for_bucket:exact-command-match
+2 crates/storage/src/cluster.rs:finish_object_pg_pending_slot:exact-command-match
 1 crates/storage/src/cluster.rs:metadata_command_conflict:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:metadata_command_log_conflict_matches:exact-command-match
 1 crates/storage/src/cluster.rs:metadata_command_log_conflict_matches:metadata-command-log-conflict

@@ -309,6 +309,22 @@ replica; later replicas may only confirm that already-established command
 chain. If no replica was applied before the conflict, the partial-exact retry
 classification is not available.
 
+Object-PG pending slots have two separate finish APIs:
+
+- Exact request outcome: the caller has already matched the PG-slot command to
+  the request whose result it will return. It must pass an
+  `ExactPendingObjectMetadataCommand` proof token and handle `Applied`,
+  `Abandoned`, and retryable partial-exact outcomes explicitly.
+- Generic drain: the caller only needs to make PG-slot progress before
+  restarting from a fresh snapshot. It must not report the drained command as
+  the current request's success, and it must not delete extra request state
+  outside the command finisher.
+
+The old bucket-named object finisher shape is banned because it hid the fact
+that the slot is PG-scoped. Draining a command for another bucket, key, upload,
+or generation is normal contention progress; treating it as this request's
+outcome is only valid after an exact matching predicate has succeeded.
+
 | Finish caller/path | Command scope | Finish classification | Notes |
 | --- | --- | --- | --- |
 | `create_bucket_with_config_and_load_info` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | Create is not reported successful until the command converges and the primary row is reloaded. |

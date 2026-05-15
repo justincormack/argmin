@@ -1139,7 +1139,7 @@ impl super::StorageCluster {
     fn drain_pending_metadata_command_pg_slot(
         &self,
         pg_id: PgId,
-        pending_bucket: &BucketName,
+        _pending_bucket: &BucketName,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), BucketSnapshotLoadError> {
         if Self::metadata_command_is_bucket_pg_command(command) {
@@ -1151,7 +1151,7 @@ impl super::StorageCluster {
                 return Ok(());
             }
         } else {
-            self.finish_pending_object_metadata_command_for_bucket(pg_id, pending_bucket, command)
+            self.drain_pending_object_metadata_command(pg_id, command)
                 .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
         }
         Ok(())
@@ -1163,7 +1163,8 @@ impl super::StorageCluster {
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), BucketSnapshotLoadError> {
-        self.finish_pending_metadata_command_to_acting_set(pg_id, bucket, command, false)?;
+        let _ =
+            self.finish_pending_metadata_command_to_acting_set(pg_id, bucket, command, false)?;
         Ok(())
     }
 
@@ -1209,7 +1210,7 @@ impl super::StorageCluster {
             | MetadataCommandPayload::CreateMultipartUpload(_)
             | MetadataCommandPayload::AbortMultipartUpload(_)
             | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
-                self.finish_pending_object_metadata_command_for_bucket(pg_id, bucket, command)
+                self.finish_object_pg_pending_slot(pg_id, command)
             }
             MetadataCommandPayload::CreateBucket(_)
             | MetadataCommandPayload::PutBucketVersioning(_)
@@ -1612,10 +1613,11 @@ impl super::StorageCluster {
                         (command, false)
                     }
                     MetadataCommandPayload::MarkBucketDeleting(_) => {
-                        self.finish_pending_metadata_command_to_acting_set(
-                            pg_id, bucket, &command, false,
-                        )
-                        .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                        let _ = self
+                            .finish_pending_metadata_command_to_acting_set(
+                                pg_id, bucket, &command, false,
+                            )
+                            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
                         continue;
                     }
                     MetadataCommandPayload::CreateBucket(_)
@@ -1625,10 +1627,11 @@ impl super::StorageCluster {
                     | MetadataCommandPayload::PutBucketSubresource(_)
                     | MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
                     | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
-                        self.finish_pending_metadata_command_to_acting_set(
-                            pg_id, bucket, &command, false,
-                        )
-                        .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                        let _ = self
+                            .finish_pending_metadata_command_to_acting_set(
+                                pg_id, bucket, &command, false,
+                            )
+                            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
                         continue;
                     }
                     MetadataCommandPayload::ReserveObjectGeneration(_)
@@ -1973,7 +1976,7 @@ impl super::StorageCluster {
                         (command, false)
                     }
                     MetadataCommandPayload::DeleteCompletedMultipartUpload(_) => {
-                        self.finish_pending_metadata_command_to_acting_set(
+                        let _ = self.finish_pending_metadata_command_to_acting_set(
                             pg_id,
                             &record.bucket,
                             &command,
@@ -3324,13 +3327,7 @@ impl super::StorageCluster {
                             Some(version_id) => {
                                 if version_id != update.object.version_id {
                                     drop(object_pg);
-                                    self.apply_pending_object_metadata_command_for_bucket(
-                                        pg_id, bucket, &command,
-                                    )?;
-                                    self.remove_pending_metadata_command_for_bucket(
-                                        pg_id, bucket, &command,
-                                    )
-                                    .map_err(ObjectPgActionError::from)?;
+                                    self.drain_pending_object_metadata_command(pg_id, &command)?;
                                     continue;
                                 }
                                 PgMetadataStore::get_object_version(
@@ -3345,9 +3342,7 @@ impl super::StorageCluster {
                                     PgMetadataStore::get_object_meta(&*object_pg, bucket, key)?;
                                 if stored.version_id() != update.object.version_id {
                                     drop(object_pg);
-                                    self.apply_pending_object_metadata_command_for_bucket(
-                                        pg_id, bucket, &command,
-                                    )?;
+                                    self.drain_pending_object_metadata_command(pg_id, &command)?;
                                     continue;
                                 }
                                 stored
@@ -3366,8 +3361,9 @@ impl super::StorageCluster {
                             ));
                         }
                         drop(object_pg);
-                        self.apply_pending_object_metadata_command_for_bucket(
-                            pg_id, bucket, &command,
+                        self.apply_exact_pending_object_metadata_command(
+                            pg_id,
+                            super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
                         )?;
                         return Ok(Ok(value));
                     }
@@ -3754,8 +3750,9 @@ impl super::StorageCluster {
                             Err(error) => return Ok(Err(error)),
                         };
                         drop(object_pg);
-                        self.apply_pending_object_metadata_command_for_bucket(
-                            pg_id, bucket, &command,
+                        self.apply_exact_pending_object_metadata_command(
+                            pg_id,
+                            super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
                         )?;
                         return Ok(Ok(DeleteSpecificObjectVersionOutcome {
                             value,
@@ -3848,8 +3845,11 @@ impl super::StorageCluster {
                                 Err(error) => return Ok(Err(error)),
                             };
                             drop(object_pg);
-                            self.apply_pending_object_metadata_command_for_bucket(
-                                pg_id, bucket, &command,
+                            self.apply_exact_pending_object_metadata_command(
+                                pg_id,
+                                super::ExactPendingObjectMetadataCommand::for_checked_request(
+                                    &command,
+                                ),
                             )?;
                             return Ok(Ok(DeleteCurrentObjectOutcome {
                                 value,
@@ -3949,8 +3949,9 @@ impl super::StorageCluster {
                             Err(error) => return Ok(Err(error)),
                         };
                         drop(object_pg);
-                        self.apply_pending_object_metadata_command_for_bucket(
-                            pg_id, bucket, &command,
+                        self.apply_exact_pending_object_metadata_command(
+                            pg_id,
+                            super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
                         )?;
                         return Ok(Ok(InsertCurrentDeleteMarkerOutcome {
                             value,
@@ -4056,8 +4057,11 @@ impl super::StorageCluster {
                             Ok(stored) => stored,
                             Err(MetadataError::ObjectNotFound) => {
                                 drop(object_pg);
-                                self.apply_pending_object_metadata_command_for_bucket(
-                                    pg_id, bucket, &command,
+                                self.apply_exact_pending_object_metadata_command(
+                                    pg_id,
+                                    super::ExactPendingObjectMetadataCommand::for_checked_request(
+                                        &command,
+                                    ),
                                 )?;
                                 return Ok(Ok(None));
                             }
@@ -4065,8 +4069,11 @@ impl super::StorageCluster {
                         };
                         let StoredObject::Live(record) = stored else {
                             drop(object_pg);
-                            self.apply_pending_object_metadata_command_for_bucket(
-                                pg_id, bucket, &command,
+                            self.apply_exact_pending_object_metadata_command(
+                                pg_id,
+                                super::ExactPendingObjectMetadataCommand::for_checked_request(
+                                    &command,
+                                ),
                             )?;
                             return Ok(Ok(None));
                         };
@@ -4075,8 +4082,9 @@ impl super::StorageCluster {
                             Err(error) => return Ok(Err(error)),
                         };
                         drop(object_pg);
-                        self.apply_pending_object_metadata_command_for_bucket(
-                            pg_id, bucket, &command,
+                        self.apply_exact_pending_object_metadata_command(
+                            pg_id,
+                            super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
                         )?;
                         return Ok(Ok(due.then_some(ExpireCurrentObjectOutcome {
                             reclaim_generation_id: super::delete_object_version_reclaim_generation(
@@ -4088,29 +4096,41 @@ impl super::StorageCluster {
                         if marker.matches_request(bucket, key) =>
                     {
                         let object_pg = primary_node.get_pg(pg_id.get())?;
-                        let stored =
-                            match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
-                                Ok(stored) => stored,
-                                Err(MetadataError::ObjectNotFound) => {
-                                    drop(object_pg);
-                                    self.apply_pending_object_metadata_command_for_bucket(
-                                        pg_id, bucket, &command,
-                                    )?;
-                                    return Ok(Ok(None));
-                                }
-                                Err(error) => return Err(error.into()),
-                            };
+                        let stored = match PgMetadataStore::get_object_meta(
+                            &*object_pg,
+                            bucket,
+                            key,
+                        ) {
+                            Ok(stored) => stored,
+                            Err(MetadataError::ObjectNotFound) => {
+                                drop(object_pg);
+                                self.apply_exact_pending_object_metadata_command(
+                                    pg_id,
+                                    super::ExactPendingObjectMetadataCommand::for_checked_request(
+                                        &command,
+                                    ),
+                                )?;
+                                return Ok(Ok(None));
+                            }
+                            Err(error) => return Err(error.into()),
+                        };
                         let StoredObject::Live(record) = stored else {
                             drop(object_pg);
-                            self.apply_pending_object_metadata_command_for_bucket(
-                                pg_id, bucket, &command,
+                            self.apply_exact_pending_object_metadata_command(
+                                pg_id,
+                                super::ExactPendingObjectMetadataCommand::for_checked_request(
+                                    &command,
+                                ),
                             )?;
                             return Ok(Ok(None));
                         };
                         if record.version_id != expected_version_id {
                             drop(object_pg);
-                            self.apply_pending_object_metadata_command_for_bucket(
-                                pg_id, bucket, &command,
+                            self.apply_exact_pending_object_metadata_command(
+                                pg_id,
+                                super::ExactPendingObjectMetadataCommand::for_checked_request(
+                                    &command,
+                                ),
                             )?;
                             return Ok(Ok(None));
                         }
@@ -4121,17 +4141,16 @@ impl super::StorageCluster {
                         let reclaim_generation_id =
                             super::object_payload_reclaim_generation(&marker.stale_payload);
                         drop(object_pg);
-                        self.apply_pending_object_metadata_command_for_bucket(
-                            pg_id, bucket, &command,
+                        self.apply_exact_pending_object_metadata_command(
+                            pg_id,
+                            super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
                         )?;
                         return Ok(Ok(due.then_some(ExpireCurrentObjectOutcome {
                             reclaim_generation_id,
                         })));
                     }
                     _ => {
-                        self.apply_pending_object_metadata_command_for_bucket(
-                            pg_id, bucket, &command,
-                        )?;
+                        self.drain_pending_object_metadata_command(pg_id, &command)?;
                         continue;
                     }
                 }
@@ -4301,8 +4320,11 @@ impl super::StorageCluster {
                             Ok(versions) => versions,
                             Err(MetadataError::ObjectNotFound) => {
                                 drop(object_pg);
-                                self.apply_pending_object_metadata_command_for_bucket(
-                                    pg_id, bucket, &command,
+                                self.apply_exact_pending_object_metadata_command(
+                                    pg_id,
+                                    super::ExactPendingObjectMetadataCommand::for_checked_request(
+                                        &command,
+                                    ),
                                 )?;
                                 return Ok(Ok(Vec::new()));
                             }
@@ -4320,8 +4342,9 @@ impl super::StorageCluster {
                             })
                             .flatten();
                         drop(object_pg);
-                        self.apply_pending_object_metadata_command_for_bucket(
-                            pg_id, bucket, &command,
+                        self.apply_exact_pending_object_metadata_command(
+                            pg_id,
+                            super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
                         )?;
                         return Ok(Ok(reclaim_generation_id.into_iter().collect()));
                     }
@@ -4437,8 +4460,11 @@ impl super::StorageCluster {
                             Ok(versions) => versions,
                             Err(MetadataError::ObjectNotFound) => {
                                 drop(object_pg);
-                                self.apply_pending_object_metadata_command_for_bucket(
-                                    pg_id, bucket, &command,
+                                self.apply_exact_pending_object_metadata_command(
+                                    pg_id,
+                                    super::ExactPendingObjectMetadataCommand::for_checked_request(
+                                        &command,
+                                    ),
                                 )?;
                                 return Ok(Ok(false));
                             }
@@ -4449,8 +4475,9 @@ impl super::StorageCluster {
                             Err(error) => return Ok(Err(error)),
                         };
                         drop(object_pg);
-                        self.apply_pending_object_metadata_command_for_bucket(
-                            pg_id, bucket, &command,
+                        self.apply_exact_pending_object_metadata_command(
+                            pg_id,
+                            super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
                         )?;
                         return Ok(Ok(due));
                     }
@@ -4626,11 +4653,24 @@ impl super::StorageCluster {
                 MetadataCommandPayload::DeleteObjectPayloadReclaim(delete)
                     if delete.matches_request(bucket, key, generation_id)
             );
-            self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             if matching_reclaim_delete {
-                runtime_state.clear_object_payload_reclaim_fence(bucket, key, generation_id);
-                return Ok(true);
+                match self.finish_exact_pending_object_metadata_command(
+                    pg_id,
+                    super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
+                )? {
+                    super::PendingMetadataCommandOutcome::Applied => {
+                        runtime_state.clear_object_payload_reclaim_fence(
+                            bucket,
+                            key,
+                            generation_id,
+                        );
+                        return Ok(true);
+                    }
+                    super::PendingMetadataCommandOutcome::Abandoned
+                    | super::PendingMetadataCommandOutcome::RetryPartialExactConflict => continue,
+                }
             }
+            self.drain_pending_object_metadata_command(pg_id, &command)?;
         }
 
         let reclaim = {
@@ -4713,10 +4753,19 @@ impl super::StorageCluster {
                         MetadataCommandPayload::DeleteObjectPayloadReclaim(delete)
                             if delete.matches_request(bucket, key, generation_id)
                     );
-                    self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
                     if matching_reclaim_delete {
-                        return Ok(true);
+                        match self.finish_exact_pending_object_metadata_command(
+                            pg_id,
+                            super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
+                        )? {
+                            super::PendingMetadataCommandOutcome::Applied => return Ok(true),
+                            super::PendingMetadataCommandOutcome::Abandoned
+                            | super::PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+                                continue;
+                            }
+                        }
                     }
+                    self.drain_pending_object_metadata_command(pg_id, &command)?;
                     continue;
                 }
 
@@ -5100,7 +5149,7 @@ impl super::StorageCluster {
                 if is_matching_stream_commit {
                     break;
                 }
-                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                self.drain_pending_object_metadata_command(pg_id, &command)?;
             }
 
             let pending_command = self
@@ -5125,7 +5174,10 @@ impl super::StorageCluster {
                     if let Some(command) = pending_command.clone() =>
                 {
                     drop(object_pg);
-                    self.drain_pending_object_metadata_command(pg_id, &command)?;
+                    self.apply_exact_pending_object_metadata_command(
+                        pg_id,
+                        super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
+                    )?;
                     continue;
                 }
                 Err(error) => return Err(error.into()),
@@ -5282,7 +5334,10 @@ impl super::StorageCluster {
         if new_pending_command {
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
         } else {
-            self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            self.apply_exact_pending_object_metadata_command(
+                pg_id,
+                super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
+            )?;
         }
 
         let object_pg = primary_node.get_pg(pg_id.get())?;
@@ -5989,7 +6044,7 @@ impl super::StorageCluster {
                         return Ok(outcome);
                     }
                 }
-                self.apply_pending_object_metadata_command_for_bucket(pg_id, &bucket, &command)?;
+                self.drain_pending_object_metadata_command(pg_id, &command)?;
             }
 
             let object_pg = primary_node.get_pg(pg_id.get())?;
@@ -6262,7 +6317,7 @@ impl super::StorageCluster {
                     pending_command = Some(command);
                     break;
                 }
-                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                self.drain_pending_object_metadata_command(pg_id, &command)?;
             }
 
             let object_pg = primary_node.get_pg(pg_id.get())?;
@@ -6272,9 +6327,10 @@ impl super::StorageCluster {
                     if let Some(command) = pending_command.clone() =>
                 {
                     drop(object_pg);
-                    self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
-                    self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
-                        .map_err(ObjectPgActionError::from)?;
+                    self.apply_exact_pending_object_metadata_command(
+                        pg_id,
+                        super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
+                    )?;
                     continue;
                 }
                 Err(error) => return Err(error.into()),
@@ -6373,7 +6429,10 @@ impl super::StorageCluster {
             };
             let last_modified = commit.part.last_modified;
             if command_is_pending {
-                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                self.apply_exact_pending_object_metadata_command(
+                    pg_id,
+                    super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
+                )?;
             } else {
                 self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             }
@@ -6474,10 +6533,14 @@ impl super::StorageCluster {
                             && abort.key == *key
                             && abort.upload_id == *upload_id
                 );
-                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
                 if matching_abort {
+                    self.apply_exact_pending_object_metadata_command(
+                        pg_id,
+                        super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
+                    )?;
                     return Ok(true);
                 }
+                self.drain_pending_object_metadata_command(pg_id, &command)?;
             }
 
             let command =
@@ -6536,10 +6599,14 @@ impl super::StorageCluster {
                             && abort.key == *key
                             && abort.upload_id == *upload_id
                 );
-                self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
                 if matching_abort {
+                    self.apply_exact_pending_object_metadata_command(
+                        pg_id,
+                        super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
+                    )?;
                     return Ok(true);
                 }
+                self.drain_pending_object_metadata_command(pg_id, &command)?;
             }
 
             let command = match self
@@ -6656,10 +6723,14 @@ impl super::StorageCluster {
                         && abort.key == *key
                         && abort.upload_id == *upload_id
             );
-            self.apply_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             if matching_abort {
+                self.apply_exact_pending_object_metadata_command(
+                    pg_id,
+                    super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
+                )?;
                 return Ok(Ok(true));
             }
+            self.drain_pending_object_metadata_command(pg_id, &command)?;
         }
 
         let upload = {

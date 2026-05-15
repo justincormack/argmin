@@ -2834,13 +2834,20 @@ Proposed subphases:
        variant directly is allowed only in named helpers that prove command
        identity and hash-chain state, or in allocation paths that immediately
        restart before publishing state.
+     - split object-PG pending-slot finishing into explicit exact-outcome and
+       generic-drain APIs. The exact-outcome API requires a checked-request
+       proof token and is only for branches returning the pending command as
+       this caller's result. Generic drain may finish any PG-scoped object
+       command only as contention progress before the caller restarts from a
+       fresh snapshot.
      - status: finish/convergence paths are documented in
        [metadata-command-stream.md](../guides/metadata-command-stream.md), the
        boundary script inventories every production command-log conflict
-       match, and local-cluster tests cover partial exact `MarkBucketDeleting`
-       retry, divergent same-index bucket-delete and bucket-update
-       fail-closed behavior, ordinary partial bucket-command retry, and
-       terminal pending-slot cleanup before a later bucket command.
+       match, bans the legacy bucket-named object finisher helpers, and
+       local-cluster tests cover partial exact `MarkBucketDeleting` retry,
+       divergent same-index bucket-delete and bucket-update fail-closed
+       behavior, ordinary partial bucket-command retry, and terminal
+       pending-slot cleanup before a later bucket command.
    - expand the local-cluster stateful model to include two handles,
      pending-slot contention, reissue, zero-apply abandon, partial
      primary-last apply, restart/open validation, and stale-handle attempts

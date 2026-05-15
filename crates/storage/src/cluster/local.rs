@@ -11984,7 +11984,10 @@ mod tests {
         }
 
         let err = cluster
-            .finish_pending_object_metadata_command_for_bucket(pg_id, &bucket, &command)
+            .finish_exact_pending_object_metadata_command(
+                pg_id,
+                crate::cluster::ExactPendingObjectMetadataCommand::for_checked_request(&command),
+            )
             .unwrap_err();
         assert!(matches!(
             err,
@@ -12032,7 +12035,12 @@ mod tests {
 
         assert_eq!(
             cluster
-                .finish_pending_object_metadata_command_for_bucket(pg_id, &bucket, &command)
+                .finish_exact_pending_object_metadata_command(
+                    pg_id,
+                    crate::cluster::ExactPendingObjectMetadataCommand::for_checked_request(
+                        &command,
+                    ),
+                )
                 .unwrap(),
             crate::cluster::PendingMetadataCommandOutcome::Applied
         );

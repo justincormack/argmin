@@ -90,11 +90,24 @@ fn conflicting_pending_object_metadata_command(context: &'static str) -> ObjectP
     })
 }
 
+#[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PendingMetadataCommandOutcome {
     Applied,
     Abandoned,
     RetryPartialExactConflict,
+}
+
+pub(super) struct ExactPendingObjectMetadataCommand<'a> {
+    command: &'a MetadataCommandEnvelope,
+}
+
+impl<'a> ExactPendingObjectMetadataCommand<'a> {
+    /// Caller has already matched this PG-slot command to the request whose
+    /// result will be returned to the client.
+    pub(super) fn for_checked_request(command: &'a MetadataCommandEnvelope) -> Self {
+        Self { command }
+    }
 }
 
 fn object_payload_reclaim_generation(
@@ -1890,9 +1903,9 @@ impl StorageCluster {
                         if reservation.matches_request(bucket, key, reservation_id) =>
                     {
                         let generation_id = reservation.generation_id;
-                        match self.finish_pending_object_metadata_command_for_bucket(
-                            pg_id, bucket, &command,
-                        )? {
+                        let exact =
+                            ExactPendingObjectMetadataCommand::for_checked_request(&command);
+                        match self.finish_exact_pending_object_metadata_command(pg_id, exact)? {
                             PendingMetadataCommandOutcome::Applied => return Ok(generation_id),
                             PendingMetadataCommandOutcome::Abandoned
                             | PendingMetadataCommandOutcome::RetryPartialExactConflict => {
@@ -1902,7 +1915,7 @@ impl StorageCluster {
                     }
                     _ => {}
                 }
-                self.finish_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                self.drain_pending_object_metadata_command(pg_id, &command)?;
                 continue;
             }
 
@@ -2006,9 +2019,15 @@ impl StorageCluster {
                 {
                     let reserved_version_id = reservation.version_id;
                     let matches_request = reservation.matches_request(bucket, key);
-                    match self.finish_pending_object_metadata_command_for_bucket(
-                        pg_id, bucket, &command,
-                    )? {
+                    let outcome = if matches_request {
+                        let exact =
+                            ExactPendingObjectMetadataCommand::for_checked_request(&command);
+                        self.finish_exact_pending_object_metadata_command(pg_id, exact)?
+                    } else {
+                        self.drain_pending_object_metadata_command(pg_id, &command)?;
+                        continue;
+                    };
+                    match outcome {
                         PendingMetadataCommandOutcome::Applied if matches_request => {
                             return Ok(reserved_version_id);
                         }
@@ -2065,13 +2084,20 @@ impl StorageCluster {
         Ok(version_id)
     }
 
-    fn apply_pending_object_metadata_command_for_bucket(
+    fn finish_exact_pending_object_metadata_command(
         &self,
         pg_id: PgId,
-        bucket: &BucketName,
-        command: &MetadataCommandEnvelope,
+        command: ExactPendingObjectMetadataCommand<'_>,
+    ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        self.finish_object_pg_pending_slot(pg_id, command.command)
+    }
+
+    fn apply_exact_pending_object_metadata_command(
+        &self,
+        pg_id: PgId,
+        command: ExactPendingObjectMetadataCommand<'_>,
     ) -> Result<(), ObjectPgActionError> {
-        match self.finish_pending_object_metadata_command_for_bucket(pg_id, bucket, command)? {
+        match self.finish_exact_pending_object_metadata_command(pg_id, command)? {
             PendingMetadataCommandOutcome::Applied => Ok(()),
             PendingMetadataCommandOutcome::Abandoned
             | PendingMetadataCommandOutcome::RetryPartialExactConflict => {
@@ -2087,22 +2113,16 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), ObjectPgActionError> {
-        let command_bucket = command.bucket_name().clone();
-        match self.finish_pending_object_metadata_command_for_bucket(
-            pg_id,
-            &command_bucket,
-            command,
-        )? {
+        match self.finish_object_pg_pending_slot(pg_id, command)? {
             PendingMetadataCommandOutcome::Applied
             | PendingMetadataCommandOutcome::Abandoned
             | PendingMetadataCommandOutcome::RetryPartialExactConflict => Ok(()),
         }
     }
 
-    fn finish_pending_object_metadata_command_for_bucket(
+    fn finish_object_pg_pending_slot(
         &self,
         pg_id: PgId,
-        _bucket: &BucketName,
         command: &MetadataCommandEnvelope,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
         let mut command = command.clone();
@@ -2233,9 +2253,9 @@ impl StorageCluster {
                     MetadataCommandPayload::ReleaseObjectGeneration(reservation)
                         if reservation.matches_request(bucket, key, reservation_id) =>
                     {
-                        match self.finish_pending_object_metadata_command_for_bucket(
-                            pg_id, bucket, &command,
-                        )? {
+                        let exact =
+                            ExactPendingObjectMetadataCommand::for_checked_request(&command);
+                        match self.finish_exact_pending_object_metadata_command(pg_id, exact)? {
                             PendingMetadataCommandOutcome::Applied => return Ok(()),
                             PendingMetadataCommandOutcome::Abandoned
                             | PendingMetadataCommandOutcome::RetryPartialExactConflict => {
@@ -2244,9 +2264,7 @@ impl StorageCluster {
                         }
                     }
                     _ => {
-                        self.finish_pending_object_metadata_command_for_bucket(
-                            pg_id, bucket, &command,
-                        )?;
+                        self.drain_pending_object_metadata_command(pg_id, &command)?;
                         continue;
                     }
                 }
@@ -2332,7 +2350,6 @@ impl StorageCluster {
     ) -> Result<Vec<MetadataCommandEnvelope>, ObjectPgActionError> {
         let mut applied = Vec::new();
         while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
-            let command_bucket = command.bucket_name().clone();
             if Self::metadata_command_is_bucket_pg_command(&command) {
                 let outcome = self
                     .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
@@ -2349,11 +2366,7 @@ impl StorageCluster {
                 }
                 continue;
             }
-            let outcome = self.finish_pending_object_metadata_command_for_bucket(
-                pg_id,
-                &command_bucket,
-                &command,
-            )?;
+            let outcome = self.finish_object_pg_pending_slot(pg_id, &command)?;
             match outcome {
                 PendingMetadataCommandOutcome::Applied => applied.push(command),
                 PendingMetadataCommandOutcome::Abandoned
@@ -2387,8 +2400,7 @@ impl StorageCluster {
                 }
                 continue;
             }
-            let outcome =
-                self.finish_pending_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            let outcome = self.finish_object_pg_pending_slot(pg_id, &command)?;
             match outcome {
                 PendingMetadataCommandOutcome::Applied
                 | PendingMetadataCommandOutcome::Abandoned
@@ -2678,9 +2690,9 @@ impl StorageCluster {
                     MetadataCommandPayload::ReleaseObjectGeneration(reservation)
                         if reservation.matches_request(bucket, key, reservation_id) =>
                     {
-                        match self.finish_pending_object_metadata_command_for_bucket(
-                            pg_id, bucket, &command,
-                        )? {
+                        let exact =
+                            ExactPendingObjectMetadataCommand::for_checked_request(&command);
+                        match self.finish_exact_pending_object_metadata_command(pg_id, exact)? {
                             PendingMetadataCommandOutcome::Applied => return Ok(()),
                             PendingMetadataCommandOutcome::Abandoned
                             | PendingMetadataCommandOutcome::RetryPartialExactConflict => {
@@ -2689,9 +2701,7 @@ impl StorageCluster {
                         }
                     }
                     _ => {
-                        self.finish_pending_object_metadata_command_for_bucket(
-                            pg_id, bucket, &command,
-                        )?;
+                        self.drain_pending_object_metadata_command(pg_id, &command)?;
                         continue;
                     }
                 }
@@ -2957,28 +2967,27 @@ impl StorageCluster {
                 };
                 if has_abandoned_log {
                     if is_matching_direct_put {
-                        let error = match self.finish_pending_object_metadata_command_for_bucket(
-                            pg_id,
-                            &req.bucket,
-                            &command,
-                        ) {
-                            Ok(PendingMetadataCommandOutcome::Applied) => {
-                                unreachable!(
-                                    "already-classified abandoned metadata command was applied"
-                                )
-                            }
-                            Ok(PendingMetadataCommandOutcome::Abandoned) => {
-                                conflicting_pending_object_metadata_command(
-                                    "abandoned pending command for direct put commit",
-                                )
-                            }
-                            Ok(PendingMetadataCommandOutcome::RetryPartialExactConflict) => {
-                                conflicting_pending_object_metadata_command(
-                                    "retryable partial pending command for direct put commit",
-                                )
-                            }
-                            Err(error) => error,
-                        };
+                        let exact =
+                            ExactPendingObjectMetadataCommand::for_checked_request(&command);
+                        let error =
+                            match self.finish_exact_pending_object_metadata_command(pg_id, exact) {
+                                Ok(PendingMetadataCommandOutcome::Applied) => {
+                                    unreachable!(
+                                        "already-classified abandoned metadata command was applied"
+                                    )
+                                }
+                                Ok(PendingMetadataCommandOutcome::Abandoned) => {
+                                    conflicting_pending_object_metadata_command(
+                                        "abandoned pending command for direct put commit",
+                                    )
+                                }
+                                Ok(PendingMetadataCommandOutcome::RetryPartialExactConflict) => {
+                                    conflicting_pending_object_metadata_command(
+                                        "retryable partial pending command for direct put commit",
+                                    )
+                                }
+                                Err(error) => error,
+                            };
                         drop(_bucket_guard);
                         self.delete_direct_put_segment_payload_shards(
                             req.data_pg_id,
@@ -2989,35 +2998,23 @@ impl StorageCluster {
                         );
                         return Err(error);
                     }
-                    match self.finish_pending_object_metadata_command_for_bucket(
-                        pg_id,
-                        &req.bucket,
-                        &command,
-                    ) {
-                        Ok(PendingMetadataCommandOutcome::Applied) => {
-                            unreachable!(
-                                "already-classified abandoned metadata command was applied"
-                            )
-                        }
-                        Ok(PendingMetadataCommandOutcome::Abandoned) => {}
-                        Ok(PendingMetadataCommandOutcome::RetryPartialExactConflict) => {}
-                        Err(error) => {
-                            drop(_bucket_guard);
-                            self.release_object_generation_reservation_after_pending_drain_best_effort(
-                                pg_id,
-                                &req.bucket,
-                                &req.key,
-                                &req.generation_reservation_id,
-                            );
-                            self.delete_direct_put_segment_payload_shards(
-                                req.data_pg_id,
-                                req.ec,
-                                &req.segment_okh,
-                                req.segment_vid,
-                                written_shards,
-                            );
-                            return Err(error);
-                        }
+                    if let Err(error) = self.drain_pending_object_metadata_command(pg_id, &command)
+                    {
+                        drop(_bucket_guard);
+                        self.release_object_generation_reservation_after_pending_drain_best_effort(
+                            pg_id,
+                            &req.bucket,
+                            &req.key,
+                            &req.generation_reservation_id,
+                        );
+                        self.delete_direct_put_segment_payload_shards(
+                            req.data_pg_id,
+                            req.ec,
+                            &req.segment_okh,
+                            req.segment_vid,
+                            written_shards,
+                        );
+                        return Err(error);
                     }
                     continue;
                 }
