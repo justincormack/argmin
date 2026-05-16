@@ -714,6 +714,7 @@ pub(crate) enum DeleteObjectVersionTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeleteObjectVersionCommand {
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
     pub(crate) bucket: BucketName,
     pub(crate) key: ObjectKey,
     pub(crate) version_id: VersionId,
@@ -733,6 +734,7 @@ impl DeleteObjectVersionCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InsertDeleteMarkerCommand {
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
     pub(crate) bucket: BucketName,
     pub(crate) key: ObjectKey,
     pub(crate) version_id: VersionId,
@@ -1352,7 +1354,8 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                         self.skip_live_payload_reclaim()
                     }
                     tag => Err(format!("invalid delete object target tag {tag}")),
-                }
+                }?;
+                self.skip_required_bucket_write_reservation_proof()
             }
             METADATA_COMMAND_INSERT_DELETE_MARKER => {
                 self.skip_str()?;
@@ -1361,7 +1364,8 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 self.skip_owner_identity()?;
                 self.read_u64()?;
                 self.read_u64()?;
-                self.skip_optional_stale_payload()
+                self.skip_optional_stale_payload()?;
+                self.skip_required_bucket_write_reservation_proof()
             }
             METADATA_COMMAND_PUT_OBJECT_METADATA => {
                 self.skip_live_object_record()?;
@@ -1542,6 +1546,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                         },
                         tag => return Err(format!("invalid delete object target tag {tag}")),
                     },
+                    bucket_write_reservation: self.read_bucket_write_reservation_proof()?,
                 })),
             ),
             METADATA_COMMAND_INSERT_DELETE_MARKER => Ok(
@@ -1553,6 +1558,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                     write_sequence: self.read_u64()?,
                     last_modified_millis: self.read_u64()?,
                     stale_payload: self.read_optional_stale_payload()?,
+                    bucket_write_reservation: self.read_bucket_write_reservation_proof()?,
                 }),
             ),
             METADATA_COMMAND_PUT_OBJECT_METADATA => Ok(MetadataCommandPayload::PutObjectMetadata(
@@ -3022,6 +3028,7 @@ fn encode_delete_object_version(out: &mut Vec<u8>, command: &DeleteObjectVersion
             }
         }
     }
+    encode_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
 }
 
 fn encode_insert_delete_marker(out: &mut Vec<u8>, command: &InsertDeleteMarkerCommand) {
@@ -3043,6 +3050,7 @@ fn encode_insert_delete_marker(out: &mut Vec<u8>, command: &InsertDeleteMarkerCo
             encode_multipart_reclaim(out, reclaim);
         }
     }
+    encode_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
 }
 
 fn encode_put_object_metadata(out: &mut Vec<u8>, command: &PutObjectMetadataCommand) {
@@ -4020,6 +4028,101 @@ mod tests {
     }
 
     #[test]
+    fn delete_object_version_rejects_missing_bucket_write_reservation_proof() {
+        let bucket = BucketName::try_from("delete-proof-required".to_string()).unwrap();
+        let key = ObjectKey::try_from("key".to_string()).unwrap();
+        let proof = BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: "delete-proof-required-reservation".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: 7,
+            operation_kind: "delete-object-version".to_string(),
+            created_at: 10,
+            lease_deadline: Some(20),
+            target_context: Some(key.as_str().to_string()),
+        };
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
+                bucket_write_reservation: proof.clone(),
+                bucket,
+                key,
+                version_id: VersionId::from_u64(7),
+                target: DeleteObjectVersionTarget::DeleteMarker,
+            })),
+        );
+
+        let mut proof_bytes = Vec::new();
+        encode_bucket_write_reservation_proof(&mut proof_bytes, &proof);
+        let mut proofless_bytes = command.command_bytes();
+        assert!(proofless_bytes.ends_with(&proof_bytes));
+        proofless_bytes.truncate(proofless_bytes.len() - proof_bytes.len());
+
+        assert!(
+            decode_metadata_command_envelope(&proofless_bytes).is_err(),
+            "proofless delete-object-version command bytes must fail full envelope decode"
+        );
+        assert!(
+            decode_metadata_command_log_entry_header(&proofless_bytes).is_err(),
+            "proofless delete-object-version command bytes must fail applied-row validation"
+        );
+    }
+
+    #[test]
+    fn insert_delete_marker_rejects_missing_bucket_write_reservation_proof() {
+        let bucket = BucketName::try_from("marker-proof-required".to_string()).unwrap();
+        let key = ObjectKey::try_from("key".to_string()).unwrap();
+        let proof = BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: "marker-proof-required-reservation".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: 7,
+            operation_kind: "insert-delete-marker".to_string(),
+            created_at: 10,
+            lease_deadline: Some(20),
+            target_context: Some(key.as_str().to_string()),
+        };
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                bucket_write_reservation: proof.clone(),
+                bucket,
+                key,
+                version_id: VersionId::from_u64(7),
+                owner: OwnerIdentity::from_principal("owner"),
+                write_sequence: 1,
+                last_modified_millis: 2,
+                stale_payload: None,
+            }),
+        );
+
+        let mut proof_bytes = Vec::new();
+        encode_bucket_write_reservation_proof(&mut proof_bytes, &proof);
+        let mut proofless_bytes = command.command_bytes();
+        assert!(proofless_bytes.ends_with(&proof_bytes));
+        proofless_bytes.truncate(proofless_bytes.len() - proof_bytes.len());
+
+        assert!(
+            decode_metadata_command_envelope(&proofless_bytes).is_err(),
+            "proofless insert-delete-marker command bytes must fail full envelope decode"
+        );
+        assert!(
+            decode_metadata_command_log_entry_header(&proofless_bytes).is_err(),
+            "proofless insert-delete-marker command bytes must fail applied-row validation"
+        );
+    }
+
+    #[test]
     fn metadata_command_canonical_encoding_is_stable() {
         let owner = CanonicalUserId::from_principal("owner");
         let acl_grants = AclGrants::default();
@@ -4671,12 +4774,14 @@ mod tests {
                 stale_payload: Some(multipart_reclaim.clone()),
             })),
             MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
+                bucket_write_reservation: bucket_write_reservation.clone(),
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: VersionId::from_u64(7),
                 target: DeleteObjectVersionTarget::DeleteMarker,
             })),
             MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
+                bucket_write_reservation: bucket_write_reservation.clone(),
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: VersionId::Null,
@@ -4687,6 +4792,7 @@ mod tests {
                 },
             })),
             MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
+                bucket_write_reservation: bucket_write_reservation.clone(),
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: VersionId::from_u64(11),
@@ -4699,6 +4805,7 @@ mod tests {
                 },
             })),
             MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                bucket_write_reservation: bucket_write_reservation.clone(),
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: VersionId::from_u64(8),
@@ -4708,6 +4815,7 @@ mod tests {
                 stale_payload: None,
             }),
             MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                bucket_write_reservation: bucket_write_reservation.clone(),
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: VersionId::from_u64(9),
@@ -4717,6 +4825,7 @@ mod tests {
                 stale_payload: Some(segment_reclaim.clone()),
             }),
             MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                bucket_write_reservation: bucket_write_reservation.clone(),
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: VersionId::from_u64(10),
@@ -4953,12 +5062,12 @@ mod tests {
                 0x1709498196ee0830,
                 0xbcb5caaa0f53392e,
                 0x0fd434d65722acdf,
-                0x53fdbf4c6f062d53,
-                0x6df04a5fc73e478a,
-                0x2a3c1d82cb08bbdd,
-                0x6a5e23df842faebe,
-                0x8e2a154ef6fa870e,
-                0xa3de4500905f67bf,
+                0xbb25f6244db4157a,
+                0x9b1f0763fadb4394,
+                0x29319fa2320b5fe6,
+                0xdb4c50b38f78ad70,
+                0x7b3ca1162beb9003,
+                0xbc28df17e8e3b46b,
                 0x3c180aad45432e94,
                 0x148d763dc19749f9,
                 0x74269a8640f6cc38,

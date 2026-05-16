@@ -3416,7 +3416,7 @@ Proposed subphases:
           silently successful
 
    3. Phase 9.4.3: move writer acquire/release to `StorageCluster`
-      - status: in progress. `StorageCluster::with_bucket_write_snapshot` now
+      - status: complete. `StorageCluster::with_bucket_write_snapshot` now
         acquires and releases exact durable `bucket_write_reservations` rows on
         the bucket-PG primary. As a transitional bridge while DeleteBucket still
         uses the legacy drain, the cluster wrapper also holds the old
@@ -3459,13 +3459,14 @@ Proposed subphases:
         Object metadata updates now carry the proof in `PutObjectMetadata`;
         matching pending retry, partial/reopen convergence, and open-time
         recovery validate and release it before clearing the terminal pending
-        slot. Object delete/lifecycle command families still need the same
-        apply-time reservation proof before DeleteBucket can rely on durable
-        reservations alone. Closeout should also remove the
-        transitional `Option<BucketWriteReservationProof>` storage API surfaces:
-        once all production writers pass proofs end to end, require proofs at
-        those request boundaries and keep any internal proof acquisition behind
-        explicit test-only helpers.
+        slot. Object delete/lifecycle command families now carry the proof in
+        `DeleteObjectVersion` and `InsertDeleteMarker`; matching pending retry,
+        partial/reopen convergence, and open-time recovery validate and release
+        it before clearing the terminal pending slot. The remaining cleanup is
+        to remove transitional `Option<BucketWriteReservationProof>` storage API
+        surfaces: once all production writers pass proofs end to end, require
+        proofs at those request boundaries and keep any internal proof
+        acquisition behind explicit test-only helpers.
       - introduce a cluster-level bucket write reservation guard that captures:
         bucket PG id, bucket name, reservation id, owner token, acquire epoch,
         and the node/store that accepted the reservation

@@ -1524,6 +1524,12 @@ fn command_bucket_write_reservation_proof(
         crate::metadata_command::MetadataCommandPayload::PutObjectMetadata(update) => {
             Some(&update.bucket_write_reservation)
         }
+        crate::metadata_command::MetadataCommandPayload::DeleteObjectVersion(delete) => {
+            Some(&delete.bucket_write_reservation)
+        }
+        crate::metadata_command::MetadataCommandPayload::InsertDeleteMarker(marker) => {
+            Some(&marker.bucket_write_reservation)
+        }
         crate::metadata_command::MetadataCommandPayload::CreateMultipartUpload(create) => {
             Some(&create.bucket_write_reservation)
         }
@@ -22911,6 +22917,7 @@ mod tests {
                 "delete command should publish reclaim metadata on node {node_id:?}"
             );
         }
+        assert_bucket_write_reservations_released(&map, &bucket);
     }
 
     #[test]
@@ -23031,6 +23038,139 @@ mod tests {
             )
             .unwrap());
         }
+        assert_bucket_write_reservations_released(&map, &bucket);
+    }
+
+    #[test]
+    fn object_delete_metadata_command_partial_apply_reopens_and_releases_bucket_write_reservation()
+    {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let (bucket, key, object_pg, _data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let committed =
+            write_committed_direct_segment_for(&cluster, &bucket, &key, b"delete reopen");
+
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::DeleteObjectVersion(delete)
+                        if delete.bucket == hook_bucket
+                            && delete.key == hook_key
+                            && node_id == NodeId::new(0)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected object delete reopen apply failure",
+                            source: std::io::Error::other(
+                                "injected object delete reopen apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .delete_current_object_if(&bucket, &key, |_| Ok::<(), ()>(()))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected object delete reopen apply failure",
+                    ..
+                })
+            ),
+            "expected injected primary failure, got {err:?}"
+        );
+        drop(hook_guard);
+        assert!(!fail_once.load(Ordering::SeqCst));
+        assert!(
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
+            "partial object delete command must remain durable before reopen"
+        );
+        for node_id in [NodeId::new(1), NodeId::new(2)] {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+                Err(crate::MetadataError::ObjectNotFound)
+            ));
+        }
+        {
+            let primary_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            let stored =
+                crate::PgMetadataStore::get_object_meta(&*primary_pg, &bucket, &key).unwrap();
+            assert_eq!(
+                stored.as_live().unwrap().generation_id,
+                committed.generation_id
+            );
+        }
+        drop(cluster);
+        drop(map);
+
+        let reopened = Arc::new(
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape)
+                .expect("reopen local map with in-flight object delete command"),
+        );
+        assert!(
+            pending_metadata_command_for_test(&reopened, PgId::new(object_pg), &bucket).is_none(),
+            "open-time recovery should converge and clear the partial object delete command"
+        );
+        for node_id in node_ids {
+            let pg = reopened
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+                Err(crate::MetadataError::ObjectNotFound)
+            ));
+            assert!(
+                crate::PgMetadataStore::payload_reclaim_exists(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    committed.generation_id
+                )
+                .unwrap(),
+                "open-time delete convergence should publish reclaim metadata on node {node_id:?}"
+            );
+        }
+        assert_clean_metadata_command_stream(&reopened, &[object_pg]);
+        assert_bucket_write_reservations_released(&reopened, &bucket);
     }
 
     #[test]
@@ -23840,6 +23980,7 @@ mod tests {
                 "null live segment rows should be removed on node {node_id:?}"
             );
         }
+        assert_bucket_write_reservations_released(&map, &bucket);
     }
 
     #[test]
@@ -24057,6 +24198,7 @@ mod tests {
             let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
             assert_eq!(stored.version_id(), current.version_id);
         }
+        assert_bucket_write_reservations_released(&map, &bucket);
     }
 
     #[test]
@@ -24400,6 +24542,7 @@ mod tests {
 
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
         let owner = crate::OwnerIdentity::from_principal("owner");
 
         let marker = cluster
@@ -24432,6 +24575,130 @@ mod tests {
             &key,
             marker.version_id.to_u64() + 1,
         );
+        assert_bucket_write_reservations_released(&map, &bucket);
+    }
+
+    #[test]
+    fn insert_delete_marker_partial_apply_reopens_and_releases_bucket_write_reservation() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let (bucket, key, object_pg, _) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let owner = crate::OwnerIdentity::from_principal("owner");
+
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::InsertDeleteMarker(marker)
+                        if marker.bucket == hook_bucket
+                            && marker.key == hook_key
+                            && node_id == NodeId::new(0)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected delete marker reopen apply failure",
+                            source: std::io::Error::other(
+                                "injected delete marker reopen apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .insert_current_delete_marker_if(&bucket, &key, owner.clone(), |_| Ok::<(), ()>(()))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected delete marker reopen apply failure",
+                    ..
+                })
+            ),
+            "expected injected primary failure, got {err:?}"
+        );
+        drop(hook_guard);
+        assert!(!fail_once.load(Ordering::SeqCst));
+        assert!(
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
+            "partial delete-marker command must remain durable before reopen"
+        );
+        for node_id in [NodeId::new(1), NodeId::new(2)] {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+            assert!(matches!(stored, crate::StoredObject::DeleteMarker(_)));
+        }
+        {
+            let primary_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_meta(&*primary_pg, &bucket, &key),
+                Err(crate::MetadataError::ObjectNotFound)
+            ));
+        }
+        drop(cluster);
+        drop(map);
+
+        let reopened = Arc::new(
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape)
+                .expect("reopen local map with in-flight delete-marker command"),
+        );
+        assert!(
+            pending_metadata_command_for_test(&reopened, PgId::new(object_pg), &bucket).is_none(),
+            "open-time recovery should converge and clear the partial delete-marker command"
+        );
+        for node_id in node_ids {
+            let pg = reopened
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+            match stored {
+                crate::StoredObject::DeleteMarker(record) => {
+                    assert_eq!(record.version_id, crate::VersionId::from_u64(1));
+                    assert_eq!(record.owner, owner);
+                }
+                other => panic!("expected delete marker on node {node_id:?}, got {other:?}"),
+            }
+        }
+        assert_object_version_counter_on_acting_nodes(
+            &reopened, &node_ids, object_pg, &bucket, &key, 2,
+        );
+        assert_clean_metadata_command_stream(&reopened, &[object_pg]);
+        assert_bucket_write_reservations_released(&reopened, &bucket);
     }
 
     #[test]

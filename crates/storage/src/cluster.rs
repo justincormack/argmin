@@ -1540,6 +1540,12 @@ impl StorageCluster {
             MetadataCommandPayload::PutObjectMetadata(update) => {
                 Some(&update.bucket_write_reservation)
             }
+            MetadataCommandPayload::DeleteObjectVersion(delete) => {
+                Some(&delete.bucket_write_reservation)
+            }
+            MetadataCommandPayload::InsertDeleteMarker(marker) => {
+                Some(&marker.bucket_write_reservation)
+            }
             MetadataCommandPayload::CreateMultipartUpload(create) => {
                 Some(&create.bucket_write_reservation)
             }

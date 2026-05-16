@@ -38,6 +38,14 @@ struct InsertDeleteMarkerDraft<'a> {
     stale_payload: Option<ObjectPayloadReclaimCommand>,
 }
 
+struct DeleteObjectVersionDraft<'a> {
+    bucket: &'a BucketName,
+    key: &'a ObjectKey,
+    version_id: VersionId,
+    target: DeleteObjectVersionTarget,
+    bucket_write_reservation: BucketWriteReservationProof,
+}
+
 struct BucketLifecycleContext<'a> {
     bucket_node: &'a SharedStorageNode,
     _bucket_guard: crate::node::BucketLockGuard<'a>,
@@ -3814,22 +3822,51 @@ impl super::StorageCluster {
         })
     }
 
+    fn acquire_bucket_write_proof_for_object_metadata_command(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        operation_kind: &'static str,
+    ) -> Result<Option<BucketWriteReservationProof>, ObjectPgActionError> {
+        match self.acquire_durable_bucket_write_reservation(
+            bucket,
+            operation_kind,
+            Some(key.as_str()),
+        ) {
+            Ok(reservation) => Ok(Some(BucketWriteReservationProof::from(&reservation.record))),
+            Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
+                self.wait_for_durable_bucket_write_drain(bucket)
+                    .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+                Ok(None)
+            }
+            Err(error) => Err(super::bucket_snapshot_error_to_object_pg_action_error(
+                error,
+            )),
+        }
+    }
+
+    fn release_bucket_write_proof_for_object_metadata_command(
+        &self,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<(), ObjectPgActionError> {
+        self.release_bucket_write_reservation_proof(proof)
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
+    }
+
     fn new_delete_object_version_command(
         &self,
         pg_id: PgId,
         object_pg: &crate::PgStore,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: VersionId,
-        target: DeleteObjectVersionTarget,
+        draft: DeleteObjectVersionDraft<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         Ok(MetadataCommandEnvelope::new(
             self.next_object_metadata_command_id_from_locked_pg(pg_id, object_pg)?,
             MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                version_id,
-                target,
+                bucket_write_reservation: draft.bucket_write_reservation,
+                bucket: draft.bucket.clone(),
+                key: draft.key.clone(),
+                version_id: draft.version_id,
+                target: draft.target,
             })),
         ))
     }
@@ -3839,10 +3876,12 @@ impl super::StorageCluster {
         pg_id: PgId,
         object_pg: &crate::PgStore,
         draft: InsertDeleteMarkerDraft<'_>,
+        bucket_write_reservation: BucketWriteReservationProof,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         Ok(MetadataCommandEnvelope::new(
             self.next_object_metadata_command_id_from_locked_pg(pg_id, object_pg)?,
             MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                bucket_write_reservation,
                 bucket: draft.bucket.clone(),
                 key: draft.key.clone(),
                 version_id: draft.version_id,
@@ -3932,27 +3971,81 @@ impl super::StorageCluster {
                 continue;
             }
 
-            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let bucket_write_reservation = match self
+                .acquire_bucket_write_proof_for_object_metadata_command(
+                    bucket,
+                    key,
+                    "delete-object-version",
+                )? {
+                Some(proof) => proof,
+                None => continue,
+            };
+            let object_pg = match primary_node.get_pg(pg_id.get()) {
+                Ok(object_pg) => object_pg,
+                Err(error) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error.into());
+                }
+            };
             let stored =
                 match PgMetadataStore::get_object_version(&*object_pg, bucket, key, version_id) {
                     Ok(stored) => Some(stored),
                     Err(MetadataError::ObjectNotFound) => None,
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        drop(object_pg);
+                        self.release_bucket_write_proof_for_object_metadata_command(
+                            &bucket_write_reservation,
+                        )?;
+                        return Err(error.into());
+                    }
                 };
             let value = match action(stored.as_ref()) {
                 Ok(value) => value,
-                Err(error) => return Ok(Err(error)),
+                Err(error) => {
+                    drop(object_pg);
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Ok(Err(error));
+                }
             };
-            let Some(target) =
-                self.delete_command_target_from_stored(&object_pg, bucket, key, stored.as_ref())?
-            else {
+            let target = match self.delete_command_target_from_stored(
+                &object_pg,
+                bucket,
+                key,
+                stored.as_ref(),
+            ) {
+                Ok(target) => target,
+                Err(error) => {
+                    drop(object_pg);
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error);
+                }
+            };
+            let Some(target) = target else {
+                drop(object_pg);
+                self.release_bucket_write_proof_for_object_metadata_command(
+                    &bucket_write_reservation,
+                )?;
                 return Ok(Ok(DeleteSpecificObjectVersionOutcome {
                     value,
                     deleted: DeletedSpecificObjectVersion::Missing,
                 }));
             };
             let command = self.new_delete_object_version_command(
-                pg_id, &object_pg, bucket, key, version_id, target,
+                pg_id,
+                &object_pg,
+                DeleteObjectVersionDraft {
+                    bucket,
+                    key,
+                    version_id,
+                    target,
+                    bucket_write_reservation: bucket_write_reservation.clone(),
+                },
             );
             let command = match command {
                 Ok(command) => command,
@@ -3960,17 +4053,40 @@ impl super::StorageCluster {
                     ..
                 })) => {
                     drop(object_pg);
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
                     self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    drop(object_pg);
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error);
+                }
             };
             drop(object_pg);
-            match self
-                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
+            let install = match self
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
             {
+                Ok(install) => install,
+                Err(error) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error);
+                }
+            };
+            match install {
                 super::SnapshotSensitiveCommandInstall::Installed => {}
-                super::SnapshotSensitiveCommandInstall::ContenderDrained => continue,
+                super::SnapshotSensitiveCommandInstall::ContenderDrained => {
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    continue;
+                }
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() else {
@@ -4030,36 +4146,85 @@ impl super::StorageCluster {
                 continue;
             }
 
-            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let bucket_write_reservation = match self
+                .acquire_bucket_write_proof_for_object_metadata_command(
+                    bucket,
+                    key,
+                    "delete-current-object",
+                )? {
+                Some(proof) => proof,
+                None => continue,
+            };
+            let object_pg = match primary_node.get_pg(pg_id.get()) {
+                Ok(object_pg) => object_pg,
+                Err(error) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error.into());
+                }
+            };
             let stored = match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
                 Ok(stored) => Some(stored),
                 Err(MetadataError::ObjectNotFound) => None,
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    drop(object_pg);
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error.into());
+                }
             };
             let value = match action(stored.as_ref()) {
                 Ok(value) => value,
-                Err(error) => return Ok(Err(error)),
+                Err(error) => {
+                    drop(object_pg);
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Ok(Err(error));
+                }
             };
             let Some(stored) = stored.as_ref() else {
+                drop(object_pg);
+                self.release_bucket_write_proof_for_object_metadata_command(
+                    &bucket_write_reservation,
+                )?;
                 return Ok(Ok(DeleteCurrentObjectOutcome {
                     value,
                     deleted: DeletedCurrentObject::Missing,
                 }));
             };
             let StoredObject::Live(record) = stored else {
+                drop(object_pg);
+                self.release_bucket_write_proof_for_object_metadata_command(
+                    &bucket_write_reservation,
+                )?;
                 return Ok(Ok(DeleteCurrentObjectOutcome {
                     value,
                     deleted: DeletedCurrentObject::DeleteMarker,
                 }));
             };
-            let target = self.live_delete_command_target(&object_pg, bucket, key, record)?;
+            let target = match self.live_delete_command_target(&object_pg, bucket, key, record) {
+                Ok(target) => target,
+                Err(error) => {
+                    drop(object_pg);
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error);
+                }
+            };
             let command = self.new_delete_object_version_command(
                 pg_id,
                 &object_pg,
-                bucket,
-                key,
-                record.version_id,
-                target,
+                DeleteObjectVersionDraft {
+                    bucket,
+                    key,
+                    version_id: record.version_id,
+                    target,
+                    bucket_write_reservation: bucket_write_reservation.clone(),
+                },
             );
             let command = match command {
                 Ok(command) => command,
@@ -4067,17 +4232,40 @@ impl super::StorageCluster {
                     ..
                 })) => {
                     drop(object_pg);
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
                     self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    drop(object_pg);
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error);
+                }
             };
             drop(object_pg);
-            match self
-                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
+            let install = match self
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
             {
+                Ok(install) => install,
+                Err(error) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error);
+                }
+            };
+            match install {
                 super::SnapshotSensitiveCommandInstall::Installed => {}
-                super::SnapshotSensitiveCommandInstall::ContenderDrained => continue,
+                super::SnapshotSensitiveCommandInstall::ContenderDrained => {
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    continue;
+                }
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() else {
@@ -4131,19 +4319,65 @@ impl super::StorageCluster {
                 continue;
             }
 
-            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let bucket_write_reservation = match self
+                .acquire_bucket_write_proof_for_object_metadata_command(
+                    bucket,
+                    key,
+                    "insert-delete-marker",
+                )? {
+                Some(proof) => proof,
+                None => continue,
+            };
+            let object_pg = match primary_node.get_pg(pg_id.get()) {
+                Ok(object_pg) => object_pg,
+                Err(error) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error.into());
+                }
+            };
             let stored = match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
                 Ok(stored) => Some(stored),
                 Err(MetadataError::ObjectNotFound) => None,
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    drop(object_pg);
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error.into());
+                }
             };
             let value = match action(stored.as_ref()) {
                 Ok(value) => value,
-                Err(error) => return Ok(Err(error)),
+                Err(error) => {
+                    drop(object_pg);
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Ok(Err(error));
+                }
             };
             drop(object_pg);
-            let marker_vid = self.reserve_next_object_version(pg_id, bucket, key, primary_node)?;
-            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let marker_vid =
+                match self.reserve_next_object_version(pg_id, bucket, key, primary_node) {
+                    Ok(marker_vid) => marker_vid,
+                    Err(error) => {
+                        self.release_bucket_write_proof_for_object_metadata_command(
+                            &bucket_write_reservation,
+                        )?;
+                        return Err(error);
+                    }
+                };
+            let object_pg = match primary_node.get_pg(pg_id.get()) {
+                Ok(object_pg) => object_pg,
+                Err(error) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error.into());
+                }
+            };
             let command = self.new_insert_delete_marker_command(
                 pg_id,
                 &object_pg,
@@ -4154,6 +4388,7 @@ impl super::StorageCluster {
                     owner: &owner,
                     stale_payload: None,
                 },
+                bucket_write_reservation.clone(),
             );
             let command = match command {
                 Ok(command) => command,
@@ -4161,17 +4396,40 @@ impl super::StorageCluster {
                     ..
                 })) => {
                     drop(object_pg);
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
                     self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    drop(object_pg);
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error);
+                }
             };
             drop(object_pg);
-            match self
-                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
+            let install = match self
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
             {
+                Ok(install) => install,
+                Err(error) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error);
+                }
+            };
+            match install {
                 super::SnapshotSensitiveCommandInstall::Installed => {}
-                super::SnapshotSensitiveCommandInstall::ContenderDrained => continue,
+                super::SnapshotSensitiveCommandInstall::ContenderDrained => {
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    continue;
+                }
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             return Ok(Ok(InsertCurrentDeleteMarkerOutcome {
@@ -4321,39 +4579,98 @@ impl super::StorageCluster {
                 }
             }
 
-            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let bucket_write_reservation = match self
+                .acquire_bucket_write_proof_for_object_metadata_command(
+                    bucket,
+                    key,
+                    "lifecycle-current-expiry",
+                )? {
+                Some(proof) => proof,
+                None => continue,
+            };
+            let object_pg = match primary_node.get_pg(pg_id.get()) {
+                Ok(object_pg) => object_pg,
+                Err(error) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error.into());
+                }
+            };
             let stored = match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
                 Ok(stored) => stored,
-                Err(MetadataError::ObjectNotFound) => return Ok(Ok(None)),
-                Err(error) => return Err(error.into()),
+                Err(MetadataError::ObjectNotFound) => {
+                    drop(object_pg);
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Ok(Ok(None));
+                }
+                Err(error) => {
+                    drop(object_pg);
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error.into());
+                }
             };
             let StoredObject::Live(record) = stored else {
+                drop(object_pg);
+                self.release_bucket_write_proof_for_object_metadata_command(
+                    &bucket_write_reservation,
+                )?;
                 return Ok(Ok(None));
             };
             if record.version_id != expected_version_id {
+                drop(object_pg);
+                self.release_bucket_write_proof_for_object_metadata_command(
+                    &bucket_write_reservation,
+                )?;
                 return Ok(Ok(None));
             }
             let due = match should_expire(raw_lifecycle.as_deref(), &record) {
                 Ok(due) => due,
-                Err(error) => return Ok(Err(error)),
+                Err(error) => {
+                    drop(object_pg);
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Ok(Err(error));
+                }
             };
             if !due {
+                drop(object_pg);
+                self.release_bucket_write_proof_for_object_metadata_command(
+                    &bucket_write_reservation,
+                )?;
                 return Ok(Ok(None));
             }
 
             let (command, reclaim_generation_id) = match bucket_info.versioning {
                 BucketVersioningState::Disabled => {
                     let target =
-                        self.live_delete_command_target(&object_pg, bucket, key, &record)?;
+                        match self.live_delete_command_target(&object_pg, bucket, key, &record) {
+                            Ok(target) => target,
+                            Err(error) => {
+                                drop(object_pg);
+                                self.release_bucket_write_proof_for_object_metadata_command(
+                                    &bucket_write_reservation,
+                                )?;
+                                return Err(error);
+                            }
+                        };
                     let reclaim_generation_id =
                         super::delete_object_version_reclaim_generation(&target);
                     let command = self.new_delete_object_version_command(
                         pg_id,
                         &object_pg,
-                        bucket,
-                        key,
-                        record.version_id,
-                        target,
+                        DeleteObjectVersionDraft {
+                            bucket,
+                            key,
+                            version_id: record.version_id,
+                            target,
+                            bucket_write_reservation: bucket_write_reservation.clone(),
+                        },
                     );
                     let command = match command {
                         Ok(command) => command,
@@ -4361,10 +4678,19 @@ impl super::StorageCluster {
                             StoreError::MetadataCommandLogConflict { .. },
                         )) => {
                             drop(object_pg);
+                            self.release_bucket_write_proof_for_object_metadata_command(
+                                &bucket_write_reservation,
+                            )?;
                             self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
                             continue;
                         }
-                        Err(error) => return Err(error),
+                        Err(error) => {
+                            drop(object_pg);
+                            self.release_bucket_write_proof_for_object_metadata_command(
+                                &bucket_write_reservation,
+                            )?;
+                            return Err(error);
+                        }
                     };
                     drop(object_pg);
                     (command, reclaim_generation_id)
@@ -4372,8 +4698,24 @@ impl super::StorageCluster {
                 BucketVersioningState::Enabled => {
                     drop(object_pg);
                     let marker_vid =
-                        self.reserve_next_object_version(pg_id, bucket, key, primary_node)?;
-                    let object_pg = primary_node.get_pg(pg_id.get())?;
+                        match self.reserve_next_object_version(pg_id, bucket, key, primary_node) {
+                            Ok(marker_vid) => marker_vid,
+                            Err(error) => {
+                                self.release_bucket_write_proof_for_object_metadata_command(
+                                    &bucket_write_reservation,
+                                )?;
+                                return Err(error);
+                            }
+                        };
+                    let object_pg = match primary_node.get_pg(pg_id.get()) {
+                        Ok(object_pg) => object_pg,
+                        Err(error) => {
+                            self.release_bucket_write_proof_for_object_metadata_command(
+                                &bucket_write_reservation,
+                            )?;
+                            return Err(error.into());
+                        }
+                    };
                     let command = self.new_insert_delete_marker_command(
                         pg_id,
                         &object_pg,
@@ -4384,6 +4726,7 @@ impl super::StorageCluster {
                             owner: &owner,
                             stale_payload: None,
                         },
+                        bucket_write_reservation.clone(),
                     );
                     let command = match command {
                         Ok(command) => command,
@@ -4391,10 +4734,19 @@ impl super::StorageCluster {
                             StoreError::MetadataCommandLogConflict { .. },
                         )) => {
                             drop(object_pg);
+                            self.release_bucket_write_proof_for_object_metadata_command(
+                                &bucket_write_reservation,
+                            )?;
                             self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
                             continue;
                         }
-                        Err(error) => return Err(error),
+                        Err(error) => {
+                            drop(object_pg);
+                            self.release_bucket_write_proof_for_object_metadata_command(
+                                &bucket_write_reservation,
+                            )?;
+                            return Err(error);
+                        }
                     };
                     drop(object_pg);
                     (command, None)
@@ -4405,7 +4757,17 @@ impl super::StorageCluster {
                         bucket,
                         key,
                         crate::clock::current_time_millis(),
-                    )?;
+                    );
+                    let stale_payload = match stale_payload {
+                        Ok(stale_payload) => stale_payload,
+                        Err(error) => {
+                            drop(object_pg);
+                            self.release_bucket_write_proof_for_object_metadata_command(
+                                &bucket_write_reservation,
+                            )?;
+                            return Err(error.into());
+                        }
+                    };
                     let reclaim_generation_id =
                         super::object_payload_reclaim_generation(&stale_payload);
                     let command = self.new_insert_delete_marker_command(
@@ -4418,6 +4780,7 @@ impl super::StorageCluster {
                             owner: &owner,
                             stale_payload,
                         },
+                        bucket_write_reservation.clone(),
                     );
                     let command = match command {
                         Ok(command) => command,
@@ -4425,20 +4788,43 @@ impl super::StorageCluster {
                             StoreError::MetadataCommandLogConflict { .. },
                         )) => {
                             drop(object_pg);
+                            self.release_bucket_write_proof_for_object_metadata_command(
+                                &bucket_write_reservation,
+                            )?;
                             self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
                             continue;
                         }
-                        Err(error) => return Err(error),
+                        Err(error) => {
+                            drop(object_pg);
+                            self.release_bucket_write_proof_for_object_metadata_command(
+                                &bucket_write_reservation,
+                            )?;
+                            return Err(error);
+                        }
                     };
                     drop(object_pg);
                     (command, reclaim_generation_id)
                 }
             };
-            match self
-                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
+            let install = match self
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
             {
+                Ok(install) => install,
+                Err(error) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error);
+                }
+            };
+            match install {
                 super::SnapshotSensitiveCommandInstall::Installed => {}
-                super::SnapshotSensitiveCommandInstall::ContenderDrained => continue,
+                super::SnapshotSensitiveCommandInstall::ContenderDrained => {
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    continue;
+                }
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             return Ok(Ok(Some(ExpireCurrentObjectOutcome {
@@ -4549,20 +4935,38 @@ impl super::StorageCluster {
             drop(object_pg);
 
             for (version_id, target, reclaim_generation_id) in delete_targets {
+                let bucket_write_reservation = match self
+                    .acquire_bucket_write_proof_for_object_metadata_command(
+                        bucket,
+                        key,
+                        "lifecycle-noncurrent-expiry",
+                    )? {
+                    Some(proof) => proof,
+                    None => continue 'retry,
+                };
                 let command_id = match self.next_object_metadata_command_id(pg_id) {
                     Ok(command_id) => command_id,
                     Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
                         ..
                     })) => {
+                        self.release_bucket_write_proof_for_object_metadata_command(
+                            &bucket_write_reservation,
+                        )?;
                         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
                         continue 'retry;
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        self.release_bucket_write_proof_for_object_metadata_command(
+                            &bucket_write_reservation,
+                        )?;
+                        return Err(error);
+                    }
                 };
                 let command = MetadataCommandEnvelope::new(
                     command_id,
                     MetadataCommandPayload::DeleteObjectVersion(Box::new(
                         DeleteObjectVersionCommand {
+                            bucket_write_reservation: bucket_write_reservation.clone(),
                             bucket: bucket.clone(),
                             key: key.clone(),
                             version_id,
@@ -4570,11 +4974,25 @@ impl super::StorageCluster {
                         },
                     )),
                 );
-                match self
-                    .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
+                let install = match self
+                    .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
                 {
+                    Ok(install) => install,
+                    Err(error) => {
+                        self.release_bucket_write_proof_for_object_metadata_command(
+                            &bucket_write_reservation,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                match install {
                     super::SnapshotSensitiveCommandInstall::Installed => {}
-                    super::SnapshotSensitiveCommandInstall::ContenderDrained => continue 'retry,
+                    super::SnapshotSensitiveCommandInstall::ContenderDrained => {
+                        self.release_bucket_write_proof_for_object_metadata_command(
+                            &bucket_write_reservation,
+                        )?;
+                        continue 'retry;
+                    }
                 }
                 self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
                 if let Some(generation_id) = reclaim_generation_id {
@@ -4651,27 +5069,69 @@ impl super::StorageCluster {
                 continue;
             }
 
-            let object_pg = primary_node.get_pg(pg_id.get())?;
+            let bucket_write_reservation = match self
+                .acquire_bucket_write_proof_for_object_metadata_command(
+                    bucket,
+                    key,
+                    "lifecycle-expired-delete-marker",
+                )? {
+                Some(proof) => proof,
+                None => continue,
+            };
+            let object_pg = match primary_node.get_pg(pg_id.get()) {
+                Ok(object_pg) => object_pg,
+                Err(error) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error.into());
+                }
+            };
             let versions =
                 match PgMetadataStore::list_object_versions_for_key(&*object_pg, bucket, key) {
                     Ok(versions) => versions,
-                    Err(MetadataError::ObjectNotFound) => return Ok(Ok(false)),
-                    Err(error) => return Err(error.into()),
+                    Err(MetadataError::ObjectNotFound) => {
+                        drop(object_pg);
+                        self.release_bucket_write_proof_for_object_metadata_command(
+                            &bucket_write_reservation,
+                        )?;
+                        return Ok(Ok(false));
+                    }
+                    Err(error) => {
+                        drop(object_pg);
+                        self.release_bucket_write_proof_for_object_metadata_command(
+                            &bucket_write_reservation,
+                        )?;
+                        return Err(error.into());
+                    }
                 };
             let due = match should_delete(raw_lifecycle.as_deref(), &versions) {
                 Ok(due) => due,
-                Err(error) => return Ok(Err(error)),
+                Err(error) => {
+                    drop(object_pg);
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Ok(Err(error));
+                }
             };
             if !due {
+                drop(object_pg);
+                self.release_bucket_write_proof_for_object_metadata_command(
+                    &bucket_write_reservation,
+                )?;
                 return Ok(Ok(false));
             }
             let command = self.new_delete_object_version_command(
                 pg_id,
                 &object_pg,
-                bucket,
-                key,
-                expected_version_id,
-                DeleteObjectVersionTarget::DeleteMarker,
+                DeleteObjectVersionDraft {
+                    bucket,
+                    key,
+                    version_id: expected_version_id,
+                    target: DeleteObjectVersionTarget::DeleteMarker,
+                    bucket_write_reservation: bucket_write_reservation.clone(),
+                },
             );
             let command = match command {
                 Ok(command) => command,
@@ -4679,17 +5139,40 @@ impl super::StorageCluster {
                     ..
                 })) => {
                     drop(object_pg);
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
                     self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    drop(object_pg);
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error);
+                }
             };
             drop(object_pg);
-            match self
-                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)?
+            let install = match self
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
             {
+                Ok(install) => install,
+                Err(error) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error);
+                }
+            };
+            match install {
                 super::SnapshotSensitiveCommandInstall::Installed => {}
-                super::SnapshotSensitiveCommandInstall::ContenderDrained => continue,
+                super::SnapshotSensitiveCommandInstall::ContenderDrained => {
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    continue;
+                }
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             return Ok(Ok(true));

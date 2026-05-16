@@ -6501,7 +6501,14 @@ impl PgStore {
                         stale_payload,
                     )?;
                 }
-                store.put_delete_marker_explicit_in_open_txn(command)
+                store.put_delete_marker_explicit_in_open_txn(
+                    &command.bucket,
+                    &command.key,
+                    command.version_id,
+                    &command.owner,
+                    command.write_sequence,
+                    command.last_modified_millis,
+                )
             },
         )
     }
@@ -7527,24 +7534,25 @@ impl PgStore {
 
     fn put_delete_marker_explicit_in_open_txn(
         &self,
-        command: &InsertDeleteMarkerCommand,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        owner: &OwnerIdentity,
+        write_sequence: u64,
+        last_modified_millis: u64,
     ) -> Result<(), MetadataError> {
         self.mark_current_live_noncurrent(
-            command.bucket.as_str(),
-            command.key.as_str(),
-            command.version_id,
-            command.last_modified_millis,
+            bucket.as_str(),
+            key.as_str(),
+            version_id,
+            last_modified_millis,
         )
         .map_err(|e| MetadataError::Db {
             context: "put object meta (mark noncurrent delete marker)",
             source: e,
         })?;
-        self.advance_object_version_counter_in_open_txn(
-            &command.bucket,
-            &command.key,
-            command.version_id,
-        )?;
-        let sql = if command.version_id.is_null() {
+        self.advance_object_version_counter_in_open_txn(bucket, key, version_id)?;
+        let sql = if version_id.is_null() {
             "INSERT OR REPLACE INTO objects \
              (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
               storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read) \
@@ -7558,13 +7566,13 @@ impl PgStore {
         self.execute_cached_metadata(
             sql,
             params![
-                command.bucket,
-                command.key,
-                command.version_id.to_u64() as i64,
-                command.write_sequence as i64,
-                command.last_modified_millis as i64,
-                command.owner.principal,
-                command.owner.canonical_id.as_str(),
+                bucket,
+                key,
+                version_id.to_u64() as i64,
+                write_sequence as i64,
+                last_modified_millis as i64,
+                owner.principal,
+                owner.canonical_id.as_str(),
                 "",
             ],
             "put object meta (delete marker)",
@@ -10190,15 +10198,14 @@ impl PgMetadataStore for PgStore {
             PutObjectReq::DeleteMarker(req) => {
                 let write_sequence =
                     self.next_object_write_sequence(req.bucket.as_str(), req.key.as_str())?;
-                self.put_delete_marker_explicit_in_open_txn(&InsertDeleteMarkerCommand {
-                    bucket: req.bucket.clone(),
-                    key: req.key.clone(),
-                    version_id: req.version_id,
-                    owner: req.owner.clone(),
+                self.put_delete_marker_explicit_in_open_txn(
+                    &req.bucket,
+                    &req.key,
+                    req.version_id,
+                    &req.owner,
                     write_sequence,
-                    last_modified_millis: now,
-                    stale_payload: None,
-                })
+                    now,
+                )
             }
         })();
 
