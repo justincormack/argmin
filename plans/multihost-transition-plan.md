@@ -3554,6 +3554,92 @@ Proposed subphases:
         - partial `MarkBucketDeleting` command apply follows the Phase 9.2H
           exact-command retry rules and must not be hidden as a transient
           drain conflict
+      - concrete implementation slices:
+        1. Add a cluster-owned durable delete-drain helper around the existing
+           `bucket_write_drains` table. The helper generates a random
+           `drain_id`, uses the cluster bucket-write owner token and operation
+           epoch, and calls `PgMetadataStore::begin_durable_bucket_write_drain`
+           on the bucket-PG primary. A competing active drain is normal
+           DeleteBucket contention: wait/back off, reload bucket state, and
+           retry rather than surfacing an internal conflict. Rollback/persist
+           must be explicit; do not rely on `Drop` for correctness.
+        2. Rework `begin_bucket_delete` around the durable drain authority:
+           drain the bucket-PG pending command for this bucket, drain all
+           object-PG pending commands for this bucket, install or resume the
+           durable drain, wait until durable bucket write reservations are
+           empty, drain all object-PG pending commands for the bucket again,
+           then re-check visible objects, stream uploads, and MPU state from a
+           fresh snapshot.
+        3. Wire bucket control-plane publishers into the durable drain
+           boundary. Bucket-PG mutators such as versioning, ACL, lifecycle,
+           policy/CORS/tagging-style subresources, object lock, encryption,
+           ownership controls, and public access block must either acquire the
+           durable write reservation, be explicitly rejected/waited behind an
+           active delete drain, or prove they are the delete transition itself.
+           A DeleteBucket drain must not be able to make an emptiness decision
+           while a bucket-PG control-plane command that changes write/list/delete
+           behavior is pending or can be newly published.
+        4. If the fresh post-drain check finds blocking state, clear the durable
+           drain by exact identity and return the normal S3 non-empty outcome.
+           If it is empty, publish `MarkBucketDeleting` through the bucket-PG
+           command stream; once that command is terminal, the drain is terminal
+           too and new writers fail through normal missing/deleting bucket
+           semantics.
+        5. Keep the legacy `active_write_reservations` bridge only as
+           transitional compatibility. DeleteBucket must stop depending on the
+           node-local condition variable, but writers still acquire the legacy
+           counter until Phase 9.4.6 removes the old authority. After durable
+           reservations reach empty, a nonzero legacy counter should be treated
+           as a transitional integrity condition to cover with tests rather than
+           as the primary wait primitive.
+        6. Do not add broad stale-reservation reaping in the first slice. A
+           reservation is not safely reapable while any pending object-PG
+           command or accepted-but-not-converged object-PG log entry can
+           reference it. Start conservative: wait for live durable reservations
+           to release, and only add exact-owner stale cleanup when it can prove
+           the reservation is not command-owned. More aggressive owner
+           heartbeat/lease reaping can be layered after the durable drain loop
+           is correct.
+      - helper/API work expected in this phase:
+        - cluster helper to install/resume a durable bucket delete drain
+        - cluster helper to clear a durable drain by exact identity
+        - bucket-PG helper to list active durable write reservations for the
+          bucket
+        - object-PG helper to drain every visible-data/MPU publishing pending
+          command for the bucket across all metadata PGs
+        - one fresh-state predicate for DeleteBucket blocking state, covering
+          visible object versions, active stream uploads, and in-progress MPU
+          rows
+      - required test order for this phase:
+        1. active durable reservation blocks DeleteBucket; after release, the
+           delete sees the writer's published data and returns BucketNotEmpty
+        2. empty bucket installs a durable drain, publishes
+           `MarkBucketDeleting`, and finalizes
+        3. non-empty bucket installs a durable drain, detects data, clears the
+           drain, and later writers can proceed
+        4. a writer already holding a reservation publishes a pending or partial
+           object command after the first object-PG drain; DeleteBucket's
+           post-reservation drain sees that command before deciding emptiness
+        5. DeleteBucket races versioned current DeleteObject that inserts a
+           delete marker during the drain
+        6. DeleteBucket races specific-version delete that removes the last
+           visible version
+        7. DeleteBucket races lifecycle current expiry, noncurrent expiry, and
+           expired delete-marker cleanup
+        8. delete/recreate does not let stale drain clear/release affect the new
+           bucket incarnation
+        9. restart/open with a durable drain but no terminal
+           `MarkBucketDeleting` resumes or rolls back from fresh state without a
+           same-process waiter
+        10. bucket control-plane writes racing an active delete drain are either
+            blocked/retried behind the drain or covered by an explicit durable
+            write reservation. Cover at least versioning, lifecycle, and one
+            subresource/policy-style command because those change the semantics
+            of subsequent object writes, deletes, or listing decisions
+        11. partial primary-last `MarkBucketDeleting` apply with a durable drain
+            survives retry/reopen convergence, leaves the terminal drain state
+            coherent, and fails closed for divergent same-index command-log
+            state rather than treating it as a transient drain conflict
 
    5. Phase 9.4.5: finalization and worker wakeup without local waiters
       - `try_finalize_bucket_delete` must not rely on the process that began
