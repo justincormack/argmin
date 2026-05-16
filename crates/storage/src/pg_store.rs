@@ -5826,7 +5826,7 @@ impl PgStore {
         command: &CommitDirectPutObjectCommand,
     ) -> Result<(), MetadataError> {
         if self.direct_put_command_already_applied(command)? {
-            return Ok(());
+            return self.cleanup_direct_put_terminal_staging(command);
         }
 
         let reserved_generation = self.get_object_generation_reservation(
@@ -5864,24 +5864,49 @@ impl PgStore {
                         stale_payload,
                     )?;
                 }
-                store
-                    .conn
-                    .execute(
-                        "DELETE FROM stream_uploads \
-                     WHERE session_id = ?1 AND bucket = ?2 AND key = ?3",
-                        params![
-                            command.generation_reservation_id.as_str(),
-                            &command.object.bucket,
-                            &command.object.key
-                        ],
-                    )
-                    .map_err(|e| MetadataError::Db {
-                        context: "commit standard object command (delete stream staging)",
-                        source: e,
-                    })?;
+                store.delete_direct_put_stream_upload_in_open_txn(command)?;
                 Ok(())
             },
         )
+    }
+
+    fn cleanup_direct_put_terminal_staging(
+        &self,
+        command: &CommitDirectPutObjectCommand,
+    ) -> Result<(), MetadataError> {
+        self.with_immediate_txn(
+            "cleanup already-applied direct put command (begin txn)",
+            "cleanup already-applied direct put command (commit txn)",
+            |store| {
+                store.delete_object_generation_reservation_direct(
+                    &command.object.bucket,
+                    &command.object.key,
+                    &command.generation_reservation_id,
+                )?;
+                store.delete_direct_put_stream_upload_in_open_txn(command)
+            },
+        )
+    }
+
+    fn delete_direct_put_stream_upload_in_open_txn(
+        &self,
+        command: &CommitDirectPutObjectCommand,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM stream_uploads \
+                 WHERE session_id = ?1 AND bucket = ?2 AND key = ?3",
+                params![
+                    command.generation_reservation_id.as_str(),
+                    &command.object.bucket,
+                    &command.object.key
+                ],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "commit standard object command (delete stream staging)",
+                source: e,
+            })?;
+        Ok(())
     }
 
     fn direct_put_command_already_applied(
@@ -16891,6 +16916,117 @@ mod tests {
         );
         let state = store.metadata_command_replica_state().unwrap();
         assert_eq!(state.applied_log_index, 1);
+    }
+
+    #[test]
+    fn already_applied_direct_put_command_cleans_terminal_staging() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("direct-put-terminal-cleanup");
+        let key = trusted_object_key("object");
+        let reservation_id = SessionId::try_from("73".repeat(16)).unwrap();
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
+                object: PutLiveObjectReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: VersionId::Null,
+                    owner: test_owner(),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    generation_id: GenerationId::MIN,
+                    size: 0,
+                    etag: ObjectEtag::single_part(0),
+                    ec: EcShape { k: 2, m: 1 },
+                    layout: ObjectLayout::Standard,
+                    tags: None,
+                    metadata_blob: Some(SerializedMetadataBlob::default()),
+                    system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
+                    object_lock: ObjectLockState::default(),
+                    encryption: ObjectEncryption::None,
+                },
+                segments: Vec::new(),
+                generation_reservation_id: reservation_id.clone(),
+                write_sequence: 1,
+                last_modified_millis: 2,
+                stale_payload: None,
+                bucket_write_reservation: BucketWriteReservationProof {
+                    bucket: bucket.clone(),
+                    reservation_id: "direct-put-proof".to_string(),
+                    owner_token: "direct-put-proof-owner".to_string(),
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    bucket_execution_generation: 1,
+                    operation_kind: "direct-put-commit".to_string(),
+                    created_at: 1,
+                    lease_deadline: Some(2),
+                    target_context: Some(key.as_str().to_string()),
+                },
+            })),
+        );
+
+        insert_direct_put_terminal_staging(&store, &bucket, &key, &reservation_id);
+        store.apply_metadata_command(&command).unwrap();
+
+        insert_direct_put_terminal_staging(&store, &bucket, &key, &reservation_id);
+        store.apply_metadata_command(&command).unwrap();
+
+        assert!(matches!(
+            store.get_stream_upload(&reservation_id),
+            Err(MetadataError::StreamSessionNotFound { .. })
+        ));
+        assert!(matches!(
+            store.get_object_generation_reservation(&bucket, &key, &reservation_id),
+            Err(MetadataError::ObjectGenerationReservationNotFound { .. })
+        ));
+    }
+
+    fn insert_direct_put_terminal_staging(
+        store: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO object_generation_reservations \
+                 (reservation_id, bucket, key, generation_id, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    reservation_id.as_str(),
+                    bucket.as_str(),
+                    key.as_str(),
+                    GenerationId::MIN.get() as i64,
+                    1_i64,
+                ],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO stream_uploads \
+                 (session_id, bucket, key, op_kind, upload_id, part_number, state, \
+                  created_at, encryption_type, encryption_state) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    reservation_id.as_str(),
+                    bucket.as_str(),
+                    key.as_str(),
+                    StreamUploadKind::PutObject as u8,
+                    Option::<&str>::None,
+                    Option::<i64>::None,
+                    StreamUploadState::InProgress as u8,
+                    1_i64,
+                    ObjectEncryption::None.encryption_type() as u8,
+                    Option::<&[u8]>::None,
+                ],
+            )
+            .unwrap();
     }
 
     #[test]
