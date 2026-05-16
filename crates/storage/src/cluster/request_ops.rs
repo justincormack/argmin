@@ -881,6 +881,17 @@ impl super::StorageCluster {
                     source: source.into(),
                 })?;
             if acceptance == MetadataCommandAcceptance::AlreadyApplied {
+                let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
+                    MetadataCommandApplyFailure {
+                        applied_nodes,
+                        source: source.into(),
+                    }
+                })?;
+                pg.apply_metadata_command_and_record(node.node_id().as_u32(), command)
+                    .map_err(|source| MetadataCommandApplyFailure {
+                        applied_nodes,
+                        source,
+                    })?;
                 continue;
             }
             self.validate_metadata_command_bucket_write_reservation(command)

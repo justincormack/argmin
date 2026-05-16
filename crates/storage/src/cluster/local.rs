@@ -13942,6 +13942,105 @@ mod tests {
     }
 
     #[test]
+    fn already_recorded_direct_put_fanout_cleans_terminal_stream_uploads() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let reservation_id = crate::SessionId::try_from("68".repeat(16)).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        let payload = b"direct put already-recorded fanout cleanup";
+        let segment_okh = [68; 16];
+        let written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                payload,
+            )
+            .unwrap();
+        let commit_req = direct_put_commit_req(
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id: reservation_id.clone(),
+                generation_id,
+                payload,
+                segment_okh,
+                written: &written,
+            },
+        );
+        let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+        let primary_pg = primary.get_pg(object_pg).unwrap();
+        let command = cluster
+            .prepare_commit_direct_put_object_command(
+                PgId::new(object_pg),
+                &primary_pg,
+                &commit_req,
+                crate::VersionId::Null,
+                commit_req.bucket_write_reservation.clone(),
+            )
+            .unwrap();
+        drop(primary_pg);
+
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+            .unwrap();
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            crate::PgMetadataStore::create_stream_upload(
+                &*pg,
+                &crate::CreateStreamUploadReq {
+                    session_id: reservation_id.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    target: crate::StreamUploadTarget::PutObject,
+                    encryption: crate::ObjectEncryption::None,
+                },
+            )
+            .unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+        }
+
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+            .unwrap();
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_stream_upload(&*pg, &reservation_id),
+                Err(crate::MetadataError::StreamSessionNotFound { .. })
+            ));
+        }
+        assert_clean_metadata_command_stream(&map, &[object_pg]);
+    }
+
+    #[test]
     fn stream_put_staging_commands_apply_to_all_acting_object_pg_nodes() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -21367,6 +21466,103 @@ mod tests {
             &key,
             outcome.version_id.to_u64() + 1,
         );
+    }
+
+    #[test]
+    fn already_recorded_multipart_completion_fanout_cleans_terminal_stream_uploads() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let (req, _) = seed_streamed_multipart_completion(&cluster, &bucket, &key, "mpufanout");
+        let stale_session_id = crate::SessionId::try_from("69".repeat(16)).unwrap();
+        let upload = cluster
+            .load_in_progress_multipart_upload(&bucket, &key, &req.upload_id)
+            .unwrap();
+        cluster
+            .create_upload_part_stream_session(
+                &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+                2,
+                &stale_session_id,
+            )
+            .unwrap();
+        let (mut command, _) = pending_multipart_completion_command_for_test(
+            &map,
+            &cluster,
+            PgId::new(object_pg),
+            &req,
+            1234,
+        );
+        {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = primary.get_pg(object_pg).unwrap();
+            let active_session = crate::PgMetadataStore::get_stream_upload(&*pg, &stale_session_id)
+                .expect("active UploadPart stream session");
+            let stream_upload_segments =
+                crate::PgMetadataStore::list_stream_segments(&*pg, &stale_session_id)
+                    .expect("active UploadPart stream segments");
+            let mut payload = command.payload().clone();
+            let MetadataCommandPayload::CommitMultipartObject(commit) = &mut payload else {
+                unreachable!("test helper must build a multipart completion command");
+            };
+            commit.stream_uploads = vec![crate::TerminalStreamCleanupRecord::from(&active_session)];
+            commit.stream_upload_segments = stream_upload_segments;
+            command = MetadataCommandEnvelope::new(command.id(), payload);
+        }
+
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+            .unwrap();
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            crate::PgMetadataStore::create_stream_upload(
+                &*pg,
+                &crate::CreateStreamUploadReq {
+                    session_id: stale_session_id.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    target: crate::StreamUploadTarget::UploadPart {
+                        upload_id: req.upload_id.clone(),
+                        part_number: 2,
+                    },
+                    encryption: crate::ObjectEncryption::None,
+                },
+            )
+            .unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+        }
+
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+            .unwrap();
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_stream_upload(&*pg, &stale_session_id),
+                Err(crate::MetadataError::StreamSessionNotFound { .. })
+            ));
+        }
+        assert_clean_metadata_command_stream(&map, &[object_pg]);
     }
 
     #[test]

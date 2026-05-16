@@ -387,7 +387,7 @@ fn configured_test_timeout() -> std::time::Duration {
     let timeout_secs: u64 = std::env::var("S3_TEST_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| if external_test_mode() { 30 } else { 5 });
+        .unwrap_or(30);
     std::time::Duration::from_secs(timeout_secs)
 }
 

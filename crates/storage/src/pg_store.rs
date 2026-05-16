@@ -5677,9 +5677,25 @@ impl PgStore {
                 self.record_metadata_command_applied_inner(node_id, command)
                     .map_err(BucketSnapshotLoadError::Store)
             }
-            MetadataCommandAcceptance::AlreadyApplied => self
-                .record_metadata_command_applied_inner(node_id, command)
-                .map_err(BucketSnapshotLoadError::Store),
+            MetadataCommandAcceptance::AlreadyApplied => {
+                let record = self
+                    .record_metadata_command_applied_inner(node_id, command)
+                    .map_err(BucketSnapshotLoadError::Store)?;
+                if record.state.applied_log_index >= command.id().log_index().get()
+                    && self
+                        .cleanup_already_applied_metadata_command_terminal_staging(command)
+                        .map_err(BucketSnapshotLoadError::Metadata)?
+                {
+                    self.update_metadata_command_replica_state(
+                        record.state.cluster_epoch,
+                        record.state.applied_log_index,
+                        record.state.applied_log_hash,
+                    )
+                    .map_err(BucketSnapshotLoadError::Store)
+                } else {
+                    Ok(record)
+                }
+            }
         })();
 
         match result {
@@ -5870,6 +5886,23 @@ impl PgStore {
         )
     }
 
+    fn cleanup_already_applied_metadata_command_terminal_staging(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, MetadataError> {
+        match command.payload() {
+            MetadataCommandPayload::CommitDirectPutObject(command) => {
+                self.cleanup_direct_put_terminal_staging(command)?;
+                Ok(true)
+            }
+            MetadataCommandPayload::CommitMultipartObject(command) => {
+                self.cleanup_multipart_object_terminal_staging(command)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn cleanup_direct_put_terminal_staging(
         &self,
         command: &CommitDirectPutObjectCommand,
@@ -5907,6 +5940,26 @@ impl PgStore {
                 source: e,
             })?;
         Ok(())
+    }
+
+    fn cleanup_multipart_object_terminal_staging(
+        &self,
+        command: &CommitMultipartObjectCommand,
+    ) -> Result<(), MetadataError> {
+        self.with_immediate_txn(
+            "cleanup already-applied multipart object command (begin txn)",
+            "cleanup already-applied multipart object command (commit txn)",
+            |store| {
+                store.delete_multipart_part_staging_segments_for_upload_in_open_txn(
+                    &command.upload_id,
+                )?;
+                store.release_multipart_completion_reservation_in_open_txn(command)?;
+                for session in &command.stream_uploads {
+                    store.delete_stream_upload_direct(&session.session_id)?;
+                }
+                store.delete_multipart_upload_if_present_in_open_txn(&command.upload_id)
+            },
+        )
     }
 
     fn direct_put_command_already_applied(
@@ -16919,7 +16972,7 @@ mod tests {
     }
 
     #[test]
-    fn already_applied_direct_put_command_cleans_terminal_staging() {
+    fn already_applied_direct_put_command_cleans_terminal_staging_on_apply() {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
         let bucket = trusted_bucket_name("direct-put-terminal-cleanup");
@@ -16983,6 +17036,90 @@ mod tests {
             store.get_object_generation_reservation(&bucket, &key, &reservation_id),
             Err(MetadataError::ObjectGenerationReservationNotFound { .. })
         ));
+    }
+
+    #[test]
+    fn already_recorded_direct_put_command_cleans_terminal_staging_and_digest() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("direct-put-record-cleanup");
+        let key = trusted_object_key("object");
+        let reservation_id = SessionId::try_from("74".repeat(16)).unwrap();
+        let command = direct_put_terminal_cleanup_command(&bucket, &key, &reservation_id);
+
+        insert_direct_put_terminal_staging(&store, &bucket, &key, &reservation_id);
+        store.refresh_metadata_command_state_digest().unwrap();
+        store
+            .apply_metadata_command_and_record(0, &command)
+            .unwrap();
+
+        insert_direct_put_terminal_staging(&store, &bucket, &key, &reservation_id);
+        store.refresh_metadata_command_state_digest().unwrap();
+        store
+            .apply_metadata_command_and_record(0, &command)
+            .unwrap();
+
+        assert!(matches!(
+            store.get_stream_upload(&reservation_id),
+            Err(MetadataError::StreamSessionNotFound { .. })
+        ));
+        assert!(matches!(
+            store.get_object_generation_reservation(&bucket, &key, &reservation_id),
+            Err(MetadataError::ObjectGenerationReservationNotFound { .. })
+        ));
+        store
+            .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
+            .unwrap();
+    }
+
+    fn direct_put_terminal_cleanup_command(
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> MetadataCommandEnvelope {
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
+                object: PutLiveObjectReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: VersionId::Null,
+                    owner: test_owner(),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    generation_id: GenerationId::MIN,
+                    size: 0,
+                    etag: ObjectEtag::single_part(0),
+                    ec: EcShape { k: 2, m: 1 },
+                    layout: ObjectLayout::Standard,
+                    tags: None,
+                    metadata_blob: Some(SerializedMetadataBlob::default()),
+                    system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
+                    object_lock: ObjectLockState::default(),
+                    encryption: ObjectEncryption::None,
+                },
+                segments: Vec::new(),
+                generation_reservation_id: reservation_id.clone(),
+                write_sequence: 1,
+                last_modified_millis: 2,
+                stale_payload: None,
+                bucket_write_reservation: BucketWriteReservationProof {
+                    bucket: bucket.clone(),
+                    reservation_id: "direct-put-proof".to_string(),
+                    owner_token: "direct-put-proof-owner".to_string(),
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    bucket_execution_generation: 1,
+                    operation_kind: "direct-put-commit".to_string(),
+                    created_at: 1,
+                    lease_deadline: Some(2),
+                    target_context: Some(key.as_str().to_string()),
+                },
+            })),
+        )
     }
 
     fn insert_direct_put_terminal_staging(
