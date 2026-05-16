@@ -5,7 +5,10 @@ use aws_sdk_s3::types::{
     BucketLocationConstraint, CreateBucketConfiguration, ObjectLockLegalHold,
     ObjectLockLegalHoldStatus, ObjectOwnership,
 };
-use s3_tests::{content_md5_header, sdk_checksum_headers, send_signed_request, unique_bucket, CTX};
+use s3_tests::{
+    content_md5_header, sdk_checksum_headers, send_signed_request,
+    send_signed_request_allow_response_body_error, unique_bucket, RawResponse, CTX,
+};
 
 const REQUIRED_CHECKSUM_MESSAGE: &str =
     "Missing required header for this request: Content-MD5 OR x-amz-checksum-*";
@@ -38,6 +41,22 @@ fn assert_max_message_length(body: &str, expected_bytes: usize) {
         body.contains(&expected),
         "expected {expected} in body, got {body}"
     );
+}
+
+fn assert_oversized_xml_body_limit_response(response: &RawResponse, expected_bytes: usize) {
+    assert_eq!(response.status, 400, "body: {}", response.body);
+    if let Some(err) = &response.body_read_error {
+        assert!(
+            response.body.is_empty(),
+            "partial-body helper should not mix body bytes with read error: {response:?}"
+        );
+        assert!(
+            err.contains("read raw HTTP response body"),
+            "unexpected early-close response body error: {err}"
+        );
+    } else {
+        assert_max_message_length(&response.body, expected_bytes);
+    }
 }
 
 fn comment_pad(size: usize) -> String {
@@ -818,15 +837,14 @@ fn test_oversized_xml_body_limits_match_aws() {
             "<VersioningConfiguration>{versioning_pad}<Status>Enabled</Status>{versioning_pad}</VersioningConfiguration>"
         )
         .into_bytes();
-        let versioning = send_signed_request(
+        let versioning = send_signed_request_allow_response_body_error(
             "PUT",
             &versioning_url,
             &versioning_body,
             [content_md5_header(&versioning_body)],
         );
         cleanup_bucket(&bucket).await;
-        assert_eq!(versioning.status, 400, "body: {}", versioning.body);
-        assert_max_message_length(&versioning.body, 1024);
+        assert_oversized_xml_body_limit_response(&versioning, 1024);
 
         let bucket =
             create_bucket_in_test_region(Some(ObjectOwnership::BucketOwnerPreferred), false).await;
@@ -839,15 +857,14 @@ fn test_oversized_xml_body_limits_match_aws() {
              </AccessControlList>{acl_pad}</AccessControlPolicy>"
         )
         .into_bytes();
-        let acl = send_signed_request(
+        let acl = send_signed_request_allow_response_body_error(
             "PUT",
             &acl_url,
             &acl_body,
             std::iter::empty::<(&str, &str)>(),
         );
         cleanup_bucket(&bucket).await;
-        assert_eq!(acl.status, 400, "body: {}", acl.body);
-        assert_max_message_length(&acl.body, 204_800);
+        assert_oversized_xml_body_limit_response(&acl, 204_800);
 
         let bucket = create_bucket_in_test_region(None, false).await;
         let encryption_url = format!("{}/{}?encryption", CTX.endpoint(), bucket);
@@ -858,15 +875,14 @@ fn test_oversized_xml_body_limits_match_aws() {
              </ServerSideEncryptionConfiguration>"
         )
         .into_bytes();
-        let encryption = send_signed_request(
+        let encryption = send_signed_request_allow_response_body_error(
             "PUT",
             &encryption_url,
             &encryption_body,
             std::iter::empty::<(&str, &str)>(),
         );
         cleanup_bucket(&bucket).await;
-        assert_eq!(encryption.status, 400, "body: {}", encryption.body);
-        assert_max_message_length(&encryption.body, 2_097_152);
+        assert_oversized_xml_body_limit_response(&encryption, 2_097_152);
 
         let bucket = create_bucket_in_test_region(None, false).await;
         let tagging_url = format!("{}/{}?tagging", CTX.endpoint(), bucket);
@@ -874,15 +890,14 @@ fn test_oversized_xml_body_limits_match_aws() {
             "<Tagging>{tagging_pad}<TagSet>{tagging_pad}<Tag><Key>a</Key><Value>b</Value></Tag>{tagging_pad}</TagSet>{tagging_pad}</Tagging>"
         )
         .into_bytes();
-        let tagging = send_signed_request(
+        let tagging = send_signed_request_allow_response_body_error(
             "PUT",
             &tagging_url,
             &tagging_body,
             [content_md5_header(&tagging_body)],
         );
         cleanup_bucket(&bucket).await;
-        assert_eq!(tagging.status, 400, "body: {}", tagging.body);
-        assert_max_message_length(&tagging.body, 163_840);
+        assert_oversized_xml_body_limit_response(&tagging, 163_840);
 
         let bucket = create_bucket_in_test_region(None, false).await;
         let ownership_url = format!("{}/{}?ownershipControls", CTX.endpoint(), bucket);
@@ -890,15 +905,14 @@ fn test_oversized_xml_body_limits_match_aws() {
             "<OwnershipControls>{ownership_pad}<Rule><ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule>{ownership_pad}</OwnershipControls>"
         )
         .into_bytes();
-        let ownership = send_signed_request(
+        let ownership = send_signed_request_allow_response_body_error(
             "PUT",
             &ownership_url,
             &ownership_body,
             [content_md5_header(&ownership_body)],
         );
         cleanup_bucket(&bucket).await;
-        assert_eq!(ownership.status, 400, "body: {}", ownership.body);
-        assert_max_message_length(&ownership.body, 2048);
+        assert_oversized_xml_body_limit_response(&ownership, 2048);
 
         let bucket = create_bucket_in_test_region(None, false).await;
         let pab_url = format!("{}/{}?publicAccessBlock", CTX.endpoint(), bucket);
@@ -906,10 +920,14 @@ fn test_oversized_xml_body_limits_match_aws() {
             "<PublicAccessBlockConfiguration>{public_access_block_pad}<BlockPublicAcls>true</BlockPublicAcls>{public_access_block_pad}<IgnorePublicAcls>true</IgnorePublicAcls>{public_access_block_pad}<BlockPublicPolicy>true</BlockPublicPolicy>{public_access_block_pad}<RestrictPublicBuckets>true</RestrictPublicBuckets>{public_access_block_pad}</PublicAccessBlockConfiguration>"
         )
         .into_bytes();
-        let pab = send_signed_request("PUT", &pab_url, &pab_body, [content_md5_header(&pab_body)]);
+        let pab = send_signed_request_allow_response_body_error(
+            "PUT",
+            &pab_url,
+            &pab_body,
+            [content_md5_header(&pab_body)],
+        );
         cleanup_bucket(&bucket).await;
-        assert_eq!(pab.status, 400, "body: {}", pab.body);
-        assert_max_message_length(&pab.body, 2_097_152);
+        assert_oversized_xml_body_limit_response(&pab, 2_097_152);
 
         let bucket = create_bucket_in_test_region(None, true).await;
         let object_lock_url = format!("{}/{}?object-lock", CTX.endpoint(), bucket);
@@ -917,15 +935,14 @@ fn test_oversized_xml_body_limits_match_aws() {
             "<ObjectLockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{object_lock_pad}<ObjectLockEnabled>Enabled</ObjectLockEnabled>{object_lock_pad}<Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days></DefaultRetention></Rule>{object_lock_pad}</ObjectLockConfiguration>"
         )
         .into_bytes();
-        let object_lock = send_signed_request(
+        let object_lock = send_signed_request_allow_response_body_error(
             "PUT",
             &object_lock_url,
             &object_lock_body,
             [content_md5_header(&object_lock_body)],
         );
         cleanup_bucket(&bucket).await;
-        assert_eq!(object_lock.status, 400, "body: {}", object_lock.body);
-        assert_max_message_length(&object_lock.body, 2_097_152);
+        assert_oversized_xml_body_limit_response(&object_lock, 2_097_152);
 
         let bucket = create_bucket_in_test_region(None, false).await;
         let lifecycle_url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
@@ -933,15 +950,14 @@ fn test_oversized_xml_body_limits_match_aws() {
             "<LifecycleConfiguration>{lifecycle_pad}<Rule><ID>rule1</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule>{lifecycle_pad}</LifecycleConfiguration>"
         )
         .into_bytes();
-        let lifecycle = send_signed_request(
+        let lifecycle = send_signed_request_allow_response_body_error(
             "PUT",
             &lifecycle_url,
             &lifecycle_body,
             [content_md5_header(&lifecycle_body)],
         );
         cleanup_bucket(&bucket).await;
-        assert_eq!(lifecycle.status, 400, "body: {}", lifecycle.body);
-        assert_max_message_length(&lifecycle.body, 2_097_152);
+        assert_oversized_xml_body_limit_response(&lifecycle, 2_097_152);
 
         let bucket = create_bucket_in_test_region(None, false).await;
         let delete_url = format!("{}/{}?delete", CTX.endpoint(), bucket);
@@ -949,15 +965,14 @@ fn test_oversized_xml_body_limits_match_aws() {
             "<Delete>{delete_pad}<Object><Key>delete-me</Key></Object>{delete_pad}</Delete>"
         )
         .into_bytes();
-        let delete = send_signed_request(
+        let delete = send_signed_request_allow_response_body_error(
             "POST",
             &delete_url,
             &delete_body,
             [content_md5_header(&delete_body)],
         );
         cleanup_bucket(&bucket).await;
-        assert_eq!(delete.status, 400, "body: {}", delete.body);
-        assert_max_message_length(&delete.body, 2_048_000);
+        assert_oversized_xml_body_limit_response(&delete, 2_048_000);
     });
 }
 

@@ -37,6 +37,7 @@ pub struct Response {
     status: StatusCode,
     headers: hyper::HeaderMap,
     body: Body,
+    body_read_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -51,6 +52,13 @@ pub struct RequestBuilder {
     uri: String,
     headers: Vec<(String, String)>,
     auto_content_length: bool,
+    allow_response_body_error: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RequestOptions {
+    auto_content_length: bool,
+    allow_response_body_error: bool,
 }
 
 impl Agent {
@@ -96,6 +104,7 @@ impl Agent {
             uri: uri.to_string(),
             headers: Vec::new(),
             auto_content_length: true,
+            allow_response_body_error: false,
         }
     }
 
@@ -105,22 +114,14 @@ impl Agent {
         uri: String,
         headers: Vec<(String, String)>,
         body: Vec<u8>,
-        auto_content_length: bool,
+        options: RequestOptions,
     ) -> Result<Response, Error> {
         let client = self.inner.client.clone();
         let timeout = self.inner.timeout;
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         crate::RT.spawn(async move {
-            let result = execute_request(
-                client,
-                timeout,
-                method,
-                uri,
-                headers,
-                body,
-                auto_content_length,
-            )
-            .await;
+            let result =
+                execute_request(client, timeout, method, uri, headers, body, options).await;
             let _ = tx.send(result);
         });
         rx.recv()
@@ -145,8 +146,19 @@ impl RequestBuilder {
             self.uri,
             self.headers,
             body.as_ref().to_vec(),
-            self.auto_content_length,
+            RequestOptions {
+                auto_content_length: self.auto_content_length,
+                allow_response_body_error: self.allow_response_body_error,
+            },
         )
+    }
+
+    pub fn send_allow_response_body_error(self, body: impl AsRef<[u8]>) -> Result<Response, Error> {
+        Self {
+            allow_response_body_error: true,
+            ..self
+        }
+        .send(body)
     }
 
     pub fn send_without_content_length(self, body: impl AsRef<[u8]>) -> Result<Response, Error> {
@@ -173,6 +185,10 @@ impl Response {
 
     pub fn body_mut(&mut self) -> &mut Body {
         &mut self.body
+    }
+
+    pub fn body_read_error(&self) -> Option<&str> {
+        self.body_read_error.as_deref()
     }
 }
 
@@ -210,13 +226,13 @@ async fn execute_request(
     uri: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
-    auto_content_length: bool,
+    options: RequestOptions,
 ) -> Result<Response, Error> {
     tokio::time::timeout(timeout, async move {
         let uri: Uri = uri
             .parse()
             .map_err(|err| Error::new(format!("invalid request URI: {err}")))?;
-        let add_content_length = auto_content_length
+        let add_content_length = options.auto_content_length
             && matches!(method, Method::PUT | Method::POST)
             && !headers.iter().any(|(name, _)| {
                 name.eq_ignore_ascii_case("content-length")
@@ -245,16 +261,21 @@ async fn execute_request(
             .await
             .map_err(|err| Error::new(format!("raw HTTP transport error: {err}")))?;
         let (parts, body) = response.into_parts();
-        let body = ByteStream::from_body_1_x(body)
-            .collect()
-            .await
-            .map_err(|err| Error::new(format!("read raw HTTP response body: {err}")))?
-            .into_bytes()
-            .to_vec();
+        let (body, body_read_error) = match ByteStream::from_body_1_x(body).collect().await {
+            Ok(collected) => (collected.into_bytes().to_vec(), None),
+            Err(err) if options.allow_response_body_error => (
+                Vec::new(),
+                Some(format!("read raw HTTP response body: {err}")),
+            ),
+            Err(err) => {
+                return Err(Error::new(format!("read raw HTTP response body: {err}")));
+            }
+        };
         Ok(Response {
             status: parts.status,
             headers: parts.headers,
             body: Body { bytes: body },
+            body_read_error,
         })
     })
     .await

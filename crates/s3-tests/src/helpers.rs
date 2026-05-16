@@ -426,6 +426,7 @@ pub struct RawResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    pub body_read_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -622,6 +623,36 @@ where
     )
 }
 
+/// Send a raw signed S3 request and preserve response metadata if the response
+/// body races with an early server-side connection close.
+pub fn send_signed_request_allow_response_body_error<K, V, I>(
+    method: &str,
+    url_str: &str,
+    body: &[u8],
+    extra_headers: I,
+) -> RawResponse
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    send_signed_request_to_endpoint_for_service_with_credentials_inner(
+        method,
+        url_str,
+        url_str,
+        body,
+        extra_headers,
+        "s3",
+        SignedRequestCredentials {
+            access_key: CTX.access_key(),
+            secret_key: CTX.secret_key(),
+            region: CTX.region(),
+            tls_ca_pem: CTX.tls_ca_pem(),
+        },
+        true,
+    )
+}
+
 /// Send a raw signed S3 request using explicit endpoint credentials.
 pub fn send_signed_request_with_credentials<K, V, I>(
     method: &str,
@@ -680,6 +711,34 @@ pub fn send_signed_request_to_endpoint_for_service_with_credentials<K, V, I>(
     extra_headers: I,
     service: &str,
     credentials: SignedRequestCredentials<'_>,
+) -> RawResponse
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    send_signed_request_to_endpoint_for_service_with_credentials_inner(
+        method,
+        connect_url_str,
+        signed_url_str,
+        body,
+        extra_headers,
+        service,
+        credentials,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_signed_request_to_endpoint_for_service_with_credentials_inner<K, V, I>(
+    method: &str,
+    connect_url_str: &str,
+    signed_url_str: &str,
+    body: &[u8],
+    extra_headers: I,
+    service: &str,
+    credentials: SignedRequestCredentials<'_>,
+    allow_response_body_error: bool,
 ) -> RawResponse
 where
     K: AsRef<str>,
@@ -821,7 +880,11 @@ where
                 }
                 request = request.header(name, value);
             }
-            request.send(body)
+            if allow_response_body_error {
+                request.send_allow_response_body_error(body)
+            } else {
+                request.send(body)
+            }
         };
         let mut response = match response_result {
             Ok(response) => response,
@@ -834,6 +897,7 @@ where
             Err(err) => panic!("raw request transport error: {err}"),
         };
         let status = response.status().as_u16();
+        let body_read_error = response.body_read_error().map(ToOwned::to_owned);
         let body_text = response.body_mut().read_to_string().unwrap_or_default();
         if status == 503
             && body_text.contains("<Code>SlowDown</Code>")
@@ -861,6 +925,7 @@ where
             status,
             headers,
             body: body_text,
+            body_read_error,
         };
     }
 }

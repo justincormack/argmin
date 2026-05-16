@@ -277,6 +277,7 @@ pub fn post_object_raw_to_test_endpoint_with_headers(
         status,
         headers,
         body,
+        body_read_error: None,
     }
 }
 
