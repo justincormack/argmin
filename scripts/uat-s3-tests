@@ -238,7 +238,9 @@ if ! curl -k -sS "$endpoint/" >/dev/null 2>&1; then
 fi
 
 cmd=(cargo nextest run -p s3-tests)
-cmd+=("${cargo_args[@]}")
+if ((${#cargo_args[@]})); then
+    cmd+=("${cargo_args[@]}")
+fi
 
 echo "== argmin-s3 UAT s3-tests =="
 printf '+'
