@@ -2329,7 +2329,12 @@ mod tests {
             segment_okh,
             segment_vid: generation_id,
             data_pg_id: written.data_pg_id,
-            bucket_write_reservation: None,
+            bucket_write_reservation: acquire_test_bucket_write_proof(
+                cluster,
+                bucket,
+                "direct-put-commit-test",
+                Some(key.as_str()),
+            ),
         };
         let outcome = cluster
             .commit_direct_put_object_from_payload_shards(
@@ -2537,38 +2542,56 @@ mod tests {
             .unwrap();
     }
 
-    fn direct_put_commit_req(
-        bucket: &crate::BucketName,
-        key: &crate::ObjectKey,
+    struct DirectPutCommitReqFixture<'a> {
+        bucket: &'a crate::BucketName,
+        key: &'a crate::ObjectKey,
         reservation_id: crate::SessionId,
         generation_id: crate::GenerationId,
-        payload: &[u8],
+        payload: &'a [u8],
         segment_okh: [u8; 16],
-        written: &crate::DirectPutWrittenSegment,
+        written: &'a crate::DirectPutWrittenSegment,
+    }
+
+    fn direct_put_commit_req(
+        cluster: &crate::StorageCluster,
+        fixture: DirectPutCommitReqFixture<'_>,
+    ) -> crate::CommitDirectPutObjectReq {
+        let bucket_write_reservation = acquire_test_bucket_write_proof(
+            cluster,
+            fixture.bucket,
+            "direct-put-commit-test",
+            Some(fixture.key.as_str()),
+        );
+        direct_put_commit_req_with_bucket_write_proof(fixture, bucket_write_reservation)
+    }
+
+    fn direct_put_commit_req_with_bucket_write_proof(
+        fixture: DirectPutCommitReqFixture<'_>,
+        bucket_write_reservation: crate::metadata_command::BucketWriteReservationProof,
     ) -> crate::CommitDirectPutObjectReq {
         crate::CommitDirectPutObjectReq {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            generation_reservation_id: reservation_id,
+            bucket: fixture.bucket.clone(),
+            key: fixture.key.clone(),
+            generation_reservation_id: fixture.reservation_id,
             versioning: crate::BucketVersioningState::Disabled,
             owner: crate::OwnerIdentity::from_principal("owner"),
             acl_grants: crate::AclGrants::default(),
             public_read: false,
-            generation_id,
-            size: payload.len() as u64,
-            etag_crc64: checksum::crc64::checksum(payload),
-            ec: written.ec,
+            generation_id: fixture.generation_id,
+            size: fixture.payload.len() as u64,
+            etag_crc64: checksum::crc64::checksum(fixture.payload),
+            ec: fixture.written.ec,
             tags: None,
             metadata_blob: crate::SerializedMetadataBlob::default(),
             system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
             object_lock: crate::ObjectLockState::default(),
             encryption: crate::ObjectEncryption::None,
             segment_index: 0,
-            segment_crc64: Some(checksum::crc64::checksum(payload)),
-            segment_okh,
-            segment_vid: generation_id,
-            data_pg_id: written.data_pg_id,
-            bucket_write_reservation: None,
+            segment_crc64: Some(checksum::crc64::checksum(fixture.payload)),
+            segment_okh: fixture.segment_okh,
+            segment_vid: fixture.generation_id,
+            data_pg_id: fixture.written.data_pg_id,
+            bucket_write_reservation,
         }
     }
 
@@ -7403,13 +7426,16 @@ mod tests {
             )
             .unwrap();
         let loser_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            loser_reservation_id,
-            loser_generation_id,
-            loser_payload,
-            [0x91; 16],
-            &loser_written,
+            &first_cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id: loser_reservation_id,
+                generation_id: loser_generation_id,
+                payload: loser_payload,
+                segment_okh: [0x91; 16],
+                written: &loser_written,
+            },
         );
 
         let winner_payload = b"winner direct put";
@@ -7429,13 +7455,16 @@ mod tests {
             )
             .unwrap();
         let winner_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            winner_reservation_id,
-            winner_generation_id,
-            winner_payload,
-            [0x92; 16],
-            &winner_written,
+            &first_cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id: winner_reservation_id,
+                generation_id: winner_generation_id,
+                payload: winner_payload,
+                segment_okh: [0x92; 16],
+                written: &winner_written,
+            },
         );
 
         let hook_ran = Arc::new(AtomicBool::new(false));
@@ -7469,7 +7498,7 @@ mod tests {
                         &pg,
                         &hook_req,
                         crate::VersionId::Null,
-                        None,
+                        hook_req.bucket_write_reservation.clone(),
                     )
                     .unwrap();
                 pg.try_insert_pending_metadata_command_slot(
@@ -7574,16 +7603,16 @@ mod tests {
                 Some(loser_key.as_str()),
             )
             .unwrap();
-        let mut loser_req = direct_put_commit_req(
-            &bucket,
-            &loser_key,
-            loser_reservation_id,
-            loser_generation_id,
-            loser_payload,
-            [0xb1; 16],
-            &loser_written,
-        );
-        loser_req.bucket_write_reservation = Some(
+        let loser_req = direct_put_commit_req_with_bucket_write_proof(
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &loser_key,
+                reservation_id: loser_reservation_id,
+                generation_id: loser_generation_id,
+                payload: loser_payload,
+                segment_okh: [0xb1; 16],
+                written: &loser_written,
+            },
             crate::metadata_command::BucketWriteReservationProof::from(&command_reservation.record),
         );
 
@@ -7604,13 +7633,16 @@ mod tests {
             )
             .unwrap();
         let winner_req = direct_put_commit_req(
-            &bucket,
-            &winner_key,
-            winner_reservation_id,
-            winner_generation_id,
-            winner_payload,
-            [0xb2; 16],
-            &winner_written,
+            &first_cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &winner_key,
+                reservation_id: winner_reservation_id,
+                generation_id: winner_generation_id,
+                payload: winner_payload,
+                segment_okh: [0xb2; 16],
+                written: &winner_written,
+            },
         );
 
         let hook_ran = Arc::new(AtomicBool::new(false));
@@ -7644,7 +7676,7 @@ mod tests {
                         &pg,
                         &hook_req,
                         crate::VersionId::Null,
-                        None,
+                        hook_req.bucket_write_reservation.clone(),
                     )
                     .unwrap();
                 pg.try_insert_pending_metadata_command_slot(
@@ -7755,16 +7787,16 @@ mod tests {
                 Some(key.as_str()),
             )
             .unwrap();
-        let mut commit_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            reservation_id,
-            generation_id,
-            payload,
-            segment_okh,
-            &written,
-        );
-        commit_req.bucket_write_reservation = Some(
+        let commit_req = direct_put_commit_req_with_bucket_write_proof(
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id,
+                generation_id,
+                payload,
+                segment_okh,
+                written: &written,
+            },
             crate::metadata_command::BucketWriteReservationProof::from(&command_reservation.record),
         );
         drop(cluster);
@@ -7859,13 +7891,16 @@ mod tests {
             )
             .unwrap();
         let loser_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            loser_reservation_id,
-            loser_generation_id,
-            loser_payload,
-            [0xa1; 16],
-            &loser_written,
+            &first_cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id: loser_reservation_id,
+                generation_id: loser_generation_id,
+                payload: loser_payload,
+                segment_okh: [0xa1; 16],
+                written: &loser_written,
+            },
         );
 
         let winner_payload = b"winner direct put command id";
@@ -7885,13 +7920,16 @@ mod tests {
             )
             .unwrap();
         let winner_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            winner_reservation_id,
-            winner_generation_id,
-            winner_payload,
-            [0xa2; 16],
-            &winner_written,
+            &first_cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id: winner_reservation_id,
+                generation_id: winner_generation_id,
+                payload: winner_payload,
+                segment_okh: [0xa2; 16],
+                written: &winner_written,
+            },
         );
 
         let hook_ran = Arc::new(AtomicBool::new(false));
@@ -7925,7 +7963,7 @@ mod tests {
                         &pg,
                         &hook_req,
                         crate::VersionId::Null,
-                        None,
+                        hook_req.bucket_write_reservation.clone(),
                     )
                     .unwrap();
                 pg.try_insert_pending_metadata_command_slot(
@@ -8069,13 +8107,16 @@ mod tests {
             )
             .unwrap();
         let winner_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            winner_reservation_id,
-            winner_generation_id,
-            winner_payload,
-            [0x94; 16],
-            &winner_written,
+            &first_cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id: winner_reservation_id,
+                generation_id: winner_generation_id,
+                payload: winner_payload,
+                segment_okh: [0x94; 16],
+                written: &winner_written,
+            },
         );
         let mut winner_req = winner_req;
         winner_req.versioning = crate::BucketVersioningState::Enabled;
@@ -8116,7 +8157,11 @@ mod tests {
                 let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
                 let command = hook_cluster
                     .prepare_commit_direct_put_object_command(
-                        pg_id, &pg, &hook_req, version_id, None,
+                        pg_id,
+                        &pg,
+                        &hook_req,
+                        version_id,
+                        hook_req.bucket_write_reservation.clone(),
                     )
                     .unwrap();
                 pg.try_insert_pending_metadata_command_slot(
@@ -8135,7 +8180,12 @@ mod tests {
                 &key,
                 &session_id,
                 loser_payload.len() as u64,
-                None,
+                acquire_test_bucket_write_proof(
+                    &first_cluster,
+                    &bucket,
+                    "stream-put-finalize-test",
+                    Some(key.as_str()),
+                ),
                 move |snapshot| {
                     calls_for_action.fetch_add(1, Ordering::SeqCst);
                     if snapshot.existing_etag.is_some() {
@@ -8243,13 +8293,16 @@ mod tests {
             )
             .unwrap();
         let winner_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            winner_reservation_id,
-            winner_generation_id,
-            winner_payload,
-            [0x95; 16],
-            &winner_written,
+            &first_cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id: winner_reservation_id,
+                generation_id: winner_generation_id,
+                payload: winner_payload,
+                segment_okh: [0x95; 16],
+                written: &winner_written,
+            },
         );
 
         let hook_ran = Arc::new(AtomicBool::new(false));
@@ -8283,7 +8336,7 @@ mod tests {
                         &pg,
                         &hook_req,
                         crate::VersionId::Null,
-                        None,
+                        hook_req.bucket_write_reservation.clone(),
                     )
                     .unwrap();
                 pg.try_insert_pending_metadata_command_slot(
@@ -8404,13 +8457,16 @@ mod tests {
             )
             .unwrap();
         let winner_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            winner_reservation_id,
-            winner_generation_id,
-            winner_payload,
-            [0x96; 16],
-            &winner_written,
+            &first_cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id: winner_reservation_id,
+                generation_id: winner_generation_id,
+                payload: winner_payload,
+                segment_okh: [0x96; 16],
+                written: &winner_written,
+            },
         );
 
         let hook_ran = Arc::new(AtomicBool::new(false));
@@ -8444,7 +8500,7 @@ mod tests {
                         &pg,
                         &hook_req,
                         crate::VersionId::Null,
-                        None,
+                        hook_req.bucket_write_reservation.clone(),
                     )
                     .unwrap();
                 pg.try_insert_pending_metadata_command_slot(
@@ -8623,13 +8679,16 @@ mod tests {
             )
             .unwrap();
         let winner_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            winner_reservation_id,
-            winner_generation_id,
-            winner_payload,
-            [0x5b; 16],
-            &winner_written,
+            &first_cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id: winner_reservation_id,
+                generation_id: winner_generation_id,
+                payload: winner_payload,
+                segment_okh: [0x5b; 16],
+                written: &winner_written,
+            },
         );
 
         let hook_ran = Arc::new(AtomicBool::new(false));
@@ -8663,7 +8722,7 @@ mod tests {
                         &pg,
                         &hook_req,
                         crate::VersionId::Null,
-                        None,
+                        hook_req.bucket_write_reservation.clone(),
                     )
                     .unwrap();
                 pg.try_insert_pending_metadata_command_slot(
@@ -8682,7 +8741,12 @@ mod tests {
                 &key,
                 &session_id,
                 stream_payload.len() as u64,
-                None,
+                acquire_test_bucket_write_proof(
+                    &first_cluster,
+                    &bucket,
+                    "stream-put-finalize-test",
+                    Some(key.as_str()),
+                ),
                 move |snapshot| {
                     calls_for_action.fetch_add(1, Ordering::SeqCst);
                     Ok::<_, ()>(crate::PreparedStreamPutCommit {
@@ -8937,13 +9001,16 @@ mod tests {
             )
             .unwrap();
         let winner_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            winner_reservation_id,
-            winner_generation_id,
-            winner_payload,
-            [0x96; 16],
-            &winner_written,
+            &first_cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id: winner_reservation_id,
+                generation_id: winner_generation_id,
+                payload: winner_payload,
+                segment_okh: [0x96; 16],
+                written: &winner_written,
+            },
         );
 
         let hook_ran = Arc::new(AtomicBool::new(false));
@@ -8977,7 +9044,7 @@ mod tests {
                         &pg,
                         &hook_req,
                         crate::VersionId::Null,
-                        None,
+                        hook_req.bucket_write_reservation.clone(),
                     )
                     .unwrap();
                 pg.try_insert_pending_metadata_command_slot(
@@ -9098,13 +9165,16 @@ mod tests {
             )
             .unwrap();
         let winner_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            winner_reservation_id,
-            winner_generation_id,
-            winner_payload,
-            [0x97; 16],
-            &winner_written,
+            &first_cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id: winner_reservation_id,
+                generation_id: winner_generation_id,
+                payload: winner_payload,
+                segment_okh: [0x97; 16],
+                written: &winner_written,
+            },
         );
         let winner_shard_batch: Vec<(&ShardKey, WriteAck)> = winner_written
             .written_shards
@@ -9146,7 +9216,7 @@ mod tests {
                                 &pg,
                                 &install_req,
                                 crate::VersionId::Null,
-                                None,
+                                install_req.bucket_write_reservation.clone(),
                             )
                             .unwrap();
                         pg.try_insert_pending_metadata_command_slot(
@@ -9898,17 +9968,18 @@ mod tests {
                 payload,
             )
             .unwrap();
-        let commit_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            reservation_id,
-            generation_id,
-            payload,
-            segment_okh,
-            &written,
+        let commit_req = direct_put_commit_req_with_bucket_write_proof(
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id,
+                generation_id,
+                payload,
+                segment_okh,
+                written: &written,
+            },
+            bucket_write_proof.clone(),
         );
-        let mut commit_req = commit_req;
-        commit_req.bucket_write_reservation = Some(bucket_write_proof.clone());
         let object_node = cluster.object_metadata_primary_node(&bucket, &key).unwrap();
         let object_pg_store = object_node.get_pg(object_pg).unwrap();
         let stale_command = cluster
@@ -9917,7 +9988,7 @@ mod tests {
                 &object_pg_store,
                 &commit_req,
                 crate::VersionId::Null,
-                Some(bucket_write_proof),
+                bucket_write_proof,
             )
             .unwrap();
         drop(object_pg_store);
@@ -10737,13 +10808,16 @@ mod tests {
             )
             .unwrap();
         let commit_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            reservation_id.clone(),
-            generation_id,
-            payload,
-            segment_okh,
-            &written,
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id: reservation_id.clone(),
+                generation_id,
+                payload,
+                segment_okh,
+                written: &written,
+            },
         );
 
         let _serial = lock_metadata_command_apply_hook_test();
@@ -10868,16 +10942,19 @@ mod tests {
             )
             .unwrap();
         let abandoned_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            reservation_id.clone(),
-            generation_id,
-            abandoned_payload,
-            abandoned_okh,
-            &abandoned_written,
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id: reservation_id.clone(),
+                generation_id,
+                payload: abandoned_payload,
+                segment_okh: abandoned_okh,
+                written: &abandoned_written,
+            },
         );
         let mut abandoned_req = abandoned_req;
-        abandoned_req.bucket_write_reservation = Some(bucket_write_proof.clone());
+        abandoned_req.bucket_write_reservation = bucket_write_proof.clone();
         let object_node = cluster.object_metadata_primary_node(&bucket, &key).unwrap();
         let object_pg_store = object_node.get_pg(object_pg).unwrap();
         let command = cluster
@@ -10886,7 +10963,7 @@ mod tests {
                 &object_pg_store,
                 &abandoned_req,
                 crate::VersionId::Null,
-                Some(bucket_write_proof.clone()),
+                bucket_write_proof.clone(),
             )
             .unwrap();
         drop(object_pg_store);
@@ -10925,16 +11002,19 @@ mod tests {
             )
             .unwrap();
         let current_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            reservation_id.clone(),
-            generation_id,
-            current_payload,
-            current_okh,
-            &current_written,
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id: reservation_id.clone(),
+                generation_id,
+                payload: current_payload,
+                segment_okh: current_okh,
+                written: &current_written,
+            },
         );
         let mut current_req = current_req;
-        current_req.bucket_write_reservation = Some(bucket_write_proof);
+        current_req.bucket_write_reservation = bucket_write_proof;
         let current_shard_batch: Vec<(&ShardKey, crate::WriteAck)> = current_written
             .written_shards
             .iter()
@@ -11130,26 +11210,18 @@ mod tests {
             )
             .unwrap();
         let mut commit_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            reservation_id,
-            generation_id,
-            payload,
-            segment_okh,
-            &written,
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id,
+                generation_id,
+                payload,
+                segment_okh,
+                written: &written,
+            },
         );
         commit_req.versioning = crate::BucketVersioningState::Enabled;
-        let command_reservation = cluster
-            .acquire_durable_bucket_write_reservation(
-                &bucket,
-                "direct-put-commit-test",
-                Some(key.as_str()),
-            )
-            .unwrap();
-        commit_req.bucket_write_reservation = Some(
-            crate::metadata_command::BucketWriteReservationProof::from(&command_reservation.record),
-        );
-
         let outcome = cluster
             .commit_direct_put_object_from_payload_shards(
                 &commit_req,
@@ -11295,13 +11367,16 @@ mod tests {
             )
             .unwrap();
         let mut commit_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            reservation_id,
-            generation_id,
-            payload,
-            segment_okh,
-            &written,
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id,
+                generation_id,
+                payload,
+                segment_okh,
+                written: &written,
+            },
         );
         commit_req.versioning = crate::BucketVersioningState::Enabled;
 
@@ -11599,13 +11674,16 @@ mod tests {
             )
             .unwrap();
         let mut commit_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            reservation_id,
-            generation_id,
-            payload,
-            segment_okh,
-            &written,
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id,
+                generation_id,
+                payload,
+                segment_okh,
+                written: &written,
+            },
         );
         commit_req.versioning = crate::BucketVersioningState::Enabled;
 
@@ -13090,7 +13168,12 @@ mod tests {
             segment_okh,
             segment_vid: generation_id,
             data_pg_id: written.data_pg_id,
-            bucket_write_reservation: None,
+            bucket_write_reservation: acquire_test_bucket_write_proof(
+                &cluster,
+                &bucket,
+                "direct-put-commit-test",
+                Some(key.as_str()),
+            ),
         };
         cluster
             .commit_direct_put_object_from_payload_shards(
@@ -13640,13 +13723,16 @@ mod tests {
             )
             .unwrap();
         let mut commit_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            reservation_id,
-            generation_id,
-            payload,
-            segment_okh,
-            &written,
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id,
+                generation_id,
+                payload,
+                segment_okh,
+                written: &written,
+            },
         );
         commit_req.versioning = crate::BucketVersioningState::Enabled;
 
@@ -18063,7 +18149,7 @@ mod tests {
                 &key,
                 &session_id,
                 payload.len() as u64,
-                Some(command_proof),
+                command_proof,
                 |_| {
                     Ok::<_, ()>(crate::PreparedStreamPutCommit {
                         value: (),
@@ -18190,7 +18276,7 @@ mod tests {
         let action_called_for_closure = Arc::clone(&action_called);
 
         let err = cluster
-            .finalize_put_object_stream(&bucket, &key, &session_id, 0, Some(proof), move |_| {
+            .finalize_put_object_stream(&bucket, &key, &session_id, 0, proof, move |_| {
                 action_called_for_closure.store(true, Ordering::SeqCst);
                 Ok::<_, ()>(crate::PreparedStreamPutCommit {
                     value: (),
@@ -18275,7 +18361,7 @@ mod tests {
         let proof = crate::metadata_command::BucketWriteReservationProof::from(&reservation.record);
 
         let result: Result<crate::FinalizeStreamPutOutcome<()>, &str> = cluster
-            .finalize_put_object_stream(&bucket, &key, &session_id, 0, Some(proof), |_| {
+            .finalize_put_object_stream(&bucket, &key, &session_id, 0, proof, |_| {
                 Err("condition failed")
             })
             .unwrap();
@@ -18465,7 +18551,7 @@ mod tests {
                 &key,
                 &session_id,
                 payload.len() as u64,
-                Some(request_proof),
+                request_proof,
                 |_| {
                     Ok::<_, ()>(crate::PreparedStreamPutCommit {
                         value: "ok",
@@ -18578,7 +18664,12 @@ mod tests {
                 &key,
                 &session_id,
                 payload.len() as u64,
-                None,
+                acquire_test_bucket_write_proof(
+                    &cluster,
+                    &bucket,
+                    "stream-put-finalize-test",
+                    Some(key.as_str()),
+                ),
                 |_| {
                     Ok::<_, ()>(crate::PreparedStreamPutCommit {
                         value: (),
@@ -20356,26 +20447,18 @@ mod tests {
             )
             .unwrap();
         let mut commit_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            reservation_id,
-            generation_id,
-            payload,
-            segment_okh,
-            &written,
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id,
+                generation_id,
+                payload,
+                segment_okh,
+                written: &written,
+            },
         );
         commit_req.versioning = crate::BucketVersioningState::Enabled;
-        let command_reservation = cluster
-            .acquire_durable_bucket_write_reservation(
-                &bucket,
-                "direct-put-commit-test",
-                Some(key.as_str()),
-            )
-            .unwrap();
-        commit_req.bucket_write_reservation = Some(
-            crate::metadata_command::BucketWriteReservationProof::from(&command_reservation.record),
-        );
-
         let _serial = lock_metadata_command_apply_hook_test();
         let fail_once = Arc::new(AtomicBool::new(true));
         let hook_bucket = bucket.clone();
@@ -20561,26 +20644,18 @@ mod tests {
                 payload,
             )
             .unwrap();
-        let command_reservation = cluster
-            .acquire_durable_bucket_write_reservation(
-                &bucket,
-                "direct-put-commit-reopen-test",
-                Some(key.as_str()),
-            )
-            .unwrap();
-        let mut commit_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            reservation_id,
-            generation_id,
-            payload,
-            segment_okh,
-            &written,
+        let commit_req = direct_put_commit_req(
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id,
+                generation_id,
+                payload,
+                segment_okh,
+                written: &written,
+            },
         );
-        commit_req.bucket_write_reservation = Some(
-            crate::metadata_command::BucketWriteReservationProof::from(&command_reservation.record),
-        );
-
         let failed = Arc::new(AtomicBool::new(false));
         let hook_failed = Arc::clone(&failed);
         let hook_bucket = bucket.clone();
@@ -20724,13 +20799,16 @@ mod tests {
             )
             .unwrap();
         let commit_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            reservation_id,
-            generation_id,
-            payload,
-            segment_okh,
-            &written,
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id,
+                generation_id,
+                payload,
+                segment_okh,
+                written: &written,
+            },
         );
 
         let _serial = lock_metadata_command_apply_hook_test();
@@ -20851,13 +20929,16 @@ mod tests {
             )
             .unwrap();
         let commit_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            reservation_id,
-            generation_id,
-            payload,
-            segment_okh,
-            &written,
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id,
+                generation_id,
+                payload,
+                segment_okh,
+                written: &written,
+            },
         );
 
         let _serial = lock_metadata_command_apply_hook_test();
@@ -21239,13 +21320,16 @@ mod tests {
             )
             .unwrap();
         let mut direct_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            reservation_id.clone(),
-            direct_generation_id,
-            direct_payload,
-            direct_okh,
-            &direct_written,
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id: reservation_id.clone(),
+                generation_id: direct_generation_id,
+                payload: direct_payload,
+                segment_okh: direct_okh,
+                written: &direct_written,
+            },
         );
         direct_req.versioning = crate::BucketVersioningState::Enabled;
 
@@ -22100,13 +22184,16 @@ mod tests {
             )
             .unwrap();
         let winner_req = direct_put_commit_req(
-            &bucket,
-            &key,
-            winner_reservation_id,
-            winner_generation_id,
-            winner_payload,
-            [0x8a; 16],
-            &winner_written,
+            &first_cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id: winner_reservation_id,
+                generation_id: winner_generation_id,
+                payload: winner_payload,
+                segment_okh: [0x8a; 16],
+                written: &winner_written,
+            },
         );
         let winner_shard_batch: Vec<(&ShardKey, WriteAck)> = winner_written
             .written_shards
@@ -22127,7 +22214,7 @@ mod tests {
                     &pg,
                     &winner_req,
                     crate::VersionId::Null,
-                    None,
+                    winner_req.bucket_write_reservation.clone(),
                 )
                 .unwrap()
         };

@@ -198,7 +198,7 @@ impl Coordinator {
                     segment_okh,
                     segment_vid,
                     data_pg_id: written_segment.data_pg_id,
-                    bucket_write_reservation: Some(proof),
+                    bucket_write_reservation: proof,
                 };
                 #[cfg(test)]
                 if should_probe_direct_put_commit(authorized.bucket()) {
@@ -535,7 +535,7 @@ impl Coordinator {
                         req.object.key_typed(),
                         session_id,
                         total_size,
-                        Some(proof.clone()),
+                        proof.clone(),
                         |snapshot: StreamPutFinalizeSnapshot| {
                             let write_encryption = ActiveWriteEncryption::from_stored_and_active(
                                 &snapshot.session.encryption,

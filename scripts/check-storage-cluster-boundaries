@@ -427,6 +427,19 @@ fail_with_matches \
     "CreateStreamUploadCommand must use StreamUploadCommandRecord plus an explicit allocator floor, not StreamUploadRecord" \
     "$stream_create_runtime_record_payloads"
 
+optional_bucket_write_proof_fields=$(
+    rg -n --color=never \
+        'bucket_write_reservation:[[:space:]]*Option<([^>]*::)?BucketWriteReservationProof>' \
+        crates/storage/src/types.rs \
+        crates/storage/src/metadata_command.rs \
+        crates/storage/src/cluster.rs \
+        crates/storage/src/cluster/request_ops.rs \
+        || true
+)
+fail_with_matches \
+    "Bucket-write publishing request/command surfaces must require BucketWriteReservationProof" \
+    "$optional_bucket_write_proof_fields"
+
 raw_stream_upload_vector_comparisons=$(
     awk '
     FNR == 1 {

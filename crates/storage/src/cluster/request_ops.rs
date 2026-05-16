@@ -5776,23 +5776,11 @@ impl super::StorageCluster {
         key: &ObjectKey,
         session_id: &SessionId,
         total_size: u64,
-        bucket_write_reservation: Option<BucketWriteReservationProof>,
+        bucket_write_reservation: BucketWriteReservationProof,
         mut action: impl FnMut(StreamPutFinalizeSnapshot) -> Result<PreparedStreamPutCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPutOutcome<T>, E>, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let effective_bucket_write_reservation = match bucket_write_reservation {
-            Some(proof) => proof,
-            None => {
-                let reservation = self
-                    .acquire_durable_bucket_write_reservation(
-                        bucket,
-                        "stream-put-finalize",
-                        Some(key.as_str()),
-                    )
-                    .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
-                BucketWriteReservationProof::from(&reservation.record)
-            }
-        };
+        let effective_bucket_write_reservation = bucket_write_reservation;
         let mut bucket_write_proof_command_owned = false;
         macro_rules! release_caller_bucket_write_proof_if_unowned {
             () => {{

@@ -3462,11 +3462,19 @@ Proposed subphases:
         slot. Object delete/lifecycle command families now carry the proof in
         `DeleteObjectVersion` and `InsertDeleteMarker`; matching pending retry,
         partial/reopen convergence, and open-time recovery validate and release
-        it before clearing the terminal pending slot. The remaining cleanup is
-        to remove transitional `Option<BucketWriteReservationProof>` storage API
-        surfaces: once all production writers pass proofs end to end, require
-        proofs at those request boundaries and keep any internal proof
-        acquisition behind explicit test-only helpers.
+        it before clearing the terminal pending slot. The transitional
+        proof-optional storage request surfaces for direct PUT commit and stream
+        PUT finalization have been removed, so production writer boundaries now
+        require an explicit `BucketWriteReservationProof` rather than
+        synthesizing one after write admission. Internal retry helpers may still
+        return an optional proof only to represent an active drain wait/retry,
+        not to publish a proofless command. Phase 9.4.3 closeout audited the
+        proof-bearing writer command surface and added a boundary guard for
+        proof-optional publishing fields. The remaining old anonymous-counter
+        and drain primitives are not writer-publish authority anymore, but they
+        remain production-visible for DeleteBucket begin/finalize until Phase
+        9.4.4 moves the delete state machine and Phase 9.4.6 removes the old
+        counter authority.
       - introduce a cluster-level bucket write reservation guard that captures:
         bucket PG id, bucket name, reservation id, owner token, acquire epoch,
         and the node/store that accepted the reservation
@@ -3505,11 +3513,13 @@ Proposed subphases:
         - if release fails after the caller action has returned, preserve the
           caller error ordering but leave a typed trace and retryable cleanup
           signal for the reservation
-      - remove or gate production access to
-        `SharedStorageNode::with_bucket_write_snapshot`,
+      - old anonymous-counter cleanup is deferred: after Phase 9.4.4 no longer
+        uses `SharedStorageNode::begin_bucket_write_drain` for DeleteBucket, and
+        after Phase 9.4.6 removes the legacy counter bridge, remove or gate
+        production access to `SharedStorageNode::with_bucket_write_snapshot`,
         `PgMetadataStore::acquire_bucket_write_reservation`,
         `release_bucket_write_reservation`, `begin_bucket_write_drain`, and
-        `end_bucket_write_drain` once the cluster wrapper owns the path
+        `end_bucket_write_drain`.
 
    4. Phase 9.4.4: make DeleteBucket begin durable and recoverable
       - rewrite `begin_bucket_delete` as a bucket-PG-primary state machine:

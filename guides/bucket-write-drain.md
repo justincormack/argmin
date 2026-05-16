@@ -108,8 +108,11 @@ equivalent command envelope field:
 - reservation owner token
 - bucket PG and cluster epoch
 
-`CreateStreamUpload` is a proof-required command. PutObject stream-create and
-UploadPart stream-create bytes without a durable bucket-write proof are
+The object metadata command families that can publish user-visible bucket
+writes are proof-required commands: `CommitDirectPutObject`,
+`CreateStreamUpload`, `CreateMultipartUpload`, `CommitStreamPart`,
+`CommitMultipartObject`, `PutObjectMetadata`, `DeleteObjectVersion`, and
+`InsertDeleteMarker`. Command bytes without a durable bucket-write proof are
 malformed and must fail decode/replay validation.
 
 Object-PG command apply must re-read and validate that bucket-PG reference. The
