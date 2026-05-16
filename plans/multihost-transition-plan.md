@@ -3545,6 +3545,15 @@ Proposed subphases:
           waiting writers proceed
         - if the bucket is empty, publish `MarkBucketDeleting` through the
           bucket-PG command stream and make the drain terminal
+      - explicitly define and audit the synchronous DeleteBucket return
+        boundary. The request may return after the durable drain, fresh
+        emptiness proof, and terminal `MarkBucketDeleting` are complete; it
+        must not wait for async finalization, payload reclaim, read-lease
+        expiry, or final row deletion. During the rewrite, classify every wait
+        in `begin_bucket_delete` as response-correctness required,
+        transitional-implementation required, or deferrable background work,
+        and remove or move waits that are not needed to make the S3 response
+        correct.
       - crash/restart rules:
         - drain fence present, no `MarkBucketDeleting`, owner alive: writers
           continue to wait/retry
@@ -3572,7 +3581,15 @@ Proposed subphases:
            empty, drain all object-PG pending commands for the bucket again,
            then re-check visible objects, stream uploads, and MPU state from a
            fresh snapshot.
-        3. Wire bucket control-plane publishers into the durable drain
+        3. Add a return-boundary audit while reworking `begin_bucket_delete`.
+           Keep only waits needed before returning a correct DeleteBucket
+           result: admitted writers that can still publish visible data,
+           bucket-relevant pending metadata commands, fresh visible-data/MPU
+           checks, and terminal `MarkBucketDeleting` convergence. Confirm that
+           finalization, physical reclaim, read-pin/read-lease waits, completed
+           async cleanup, and final metadata row deletion remain behind the
+           async finalizer.
+        4. Wire bucket control-plane publishers into the durable drain
            boundary. Bucket-PG mutators such as versioning, ACL, lifecycle,
            policy/CORS/tagging-style subresources, object lock, encryption,
            ownership controls, and public access block must either acquire the
@@ -3581,20 +3598,20 @@ Proposed subphases:
            A DeleteBucket drain must not be able to make an emptiness decision
            while a bucket-PG control-plane command that changes write/list/delete
            behavior is pending or can be newly published.
-        4. If the fresh post-drain check finds blocking state, clear the durable
+        5. If the fresh post-drain check finds blocking state, clear the durable
            drain by exact identity and return the normal S3 non-empty outcome.
            If it is empty, publish `MarkBucketDeleting` through the bucket-PG
            command stream; once that command is terminal, the drain is terminal
            too and new writers fail through normal missing/deleting bucket
            semantics.
-        5. Keep the legacy `active_write_reservations` bridge only as
+        6. Keep the legacy `active_write_reservations` bridge only as
            transitional compatibility. DeleteBucket must stop depending on the
            node-local condition variable, but writers still acquire the legacy
            counter until Phase 9.4.6 removes the old authority. After durable
            reservations reach empty, a nonzero legacy counter should be treated
            as a transitional integrity condition to cover with tests rather than
            as the primary wait primitive.
-        6. Do not add broad stale-reservation reaping in the first slice. A
+        7. Do not add broad stale-reservation reaping in the first slice. A
            reservation is not safely reapable while any pending object-PG
            command or accepted-but-not-converged object-PG log entry can
            reference it. Start conservative: wait for live durable reservations
