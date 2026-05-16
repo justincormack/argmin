@@ -1589,6 +1589,17 @@ impl PgStore {
                 cluster_epoch: command.id().cluster_epoch(),
             });
         }
+        if self
+            .load_metadata_command_log_entry(
+                "check pending metadata command slot log entry",
+                command.id().cluster_epoch(),
+                command.id().pg_id(),
+                command.id().log_index(),
+            )?
+            .is_some()
+        {
+            return Err(self.metadata_command_log_conflict(node_id, command));
+        }
         let command_bytes = command.command_bytes();
         let inserted = self.execute_cached(
             "INSERT INTO metadata_command_pending_slot \
@@ -15229,6 +15240,35 @@ mod tests {
                 .is_none(),
             "slot should be empty after exact removal"
         );
+    }
+
+    #[test]
+    fn pending_metadata_command_slot_rejects_terminal_log_index() {
+        let tmp = test_util::tempdir();
+        let bucket = trusted_bucket_name("pending-slot-terminal");
+        let first_command = create_bucket_probe_command(1, 1, bucket.clone(), 1);
+        let stale_command = create_bucket_probe_command(1, 1, bucket.clone(), 2);
+        let next_command = create_bucket_probe_command(1, 2, bucket.clone(), 3);
+
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        store
+            .apply_metadata_command_and_record(0, &first_command)
+            .unwrap();
+
+        let err = store
+            .try_insert_pending_metadata_command_slot(0, &stale_command, Some(&bucket))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::MetadataCommandLogConflict {
+                pg_id: 1,
+                log_index: 1,
+                ..
+            }
+        ));
+        store
+            .try_insert_pending_metadata_command_slot(0, &next_command, Some(&bucket))
+            .unwrap();
     }
 
     #[test]

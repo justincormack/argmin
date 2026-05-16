@@ -803,23 +803,22 @@ impl super::StorageCluster {
                         command_id,
                         MetadataCommandPayload::CreateBucket(command),
                     );
-                    if self
-                        .try_set_pending_metadata_command_for_bucket(pg_id, &bucket, &command)?
-                        .is_none()
-                    {
+                    if !self.try_set_bucket_pg_pending_command_or_retry(pg_id, &bucket, &command)? {
                         continue;
                     }
                     (command, true)
                 }
             };
-            let outcome = self.finish_pending_metadata_command_to_acting_set(
-                pg_id,
-                &bucket,
-                &command,
-                clear_pending_on_zero_apply,
-            )?;
-            if outcome == super::PendingMetadataCommandOutcome::Abandoned {
-                continue;
+            let outcome = self
+                .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
+                    pg_id,
+                    &command,
+                    clear_pending_on_zero_apply,
+                )?;
+            match outcome {
+                FinishPendingMetadataCommandResult::Applied => {}
+                FinishPendingMetadataCommandResult::Abandoned
+                | FinishPendingMetadataCommandResult::RetryPartialExactConflict => continue,
             }
 
             let bucket_pg = primary_node.get_pg(pg_id.get())?;
@@ -1094,6 +1093,7 @@ impl super::StorageCluster {
                             pg_id,
                             &command,
                             applied_nodes,
+                            &source,
                         )?
                     {
                         return Ok(FinishPendingMetadataCommandResult::RetryPartialExactConflict);
@@ -1193,6 +1193,26 @@ impl super::StorageCluster {
                 Ok(None)
             }
             Err(error) => Err(error),
+        }
+    }
+
+    fn try_set_bucket_pg_pending_command_or_retry(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        match self.try_set_pending_metadata_command_for_bucket(pg_id, bucket, command) {
+            Ok(Some(())) => Ok(true),
+            Ok(None) => Ok(false),
+            Err(StoreError::MetadataCommandLogConflict { .. }) => {
+                if let Some(pending) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+                    let pending_bucket = Self::metadata_command_bucket_name(&pending).clone();
+                    self.drain_pending_metadata_command_pg_slot(pg_id, &pending_bucket, &pending)?;
+                }
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -1773,10 +1793,9 @@ impl super::StorageCluster {
                         ),
                     ),
                 );
-                if self
-                    .try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command)
-                    .map_err(BucketWriteDrainError::from)?
-                    .is_none()
+                if !self
+                    .try_set_bucket_pg_pending_command_or_retry(pg_id, bucket, &command)
+                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
                 {
                     continue;
                 }
@@ -2073,10 +2092,11 @@ impl super::StorageCluster {
                         },
                     )),
                 );
-                if self
-                    .try_set_pending_metadata_command_for_bucket(pg_id, &record.bucket, &command)?
-                    .is_none()
-                {
+                if !self.try_set_bucket_pg_pending_command_or_retry(
+                    pg_id,
+                    &record.bucket,
+                    &command,
+                )? {
                     continue;
                 }
                 (command, true)
@@ -2226,10 +2246,7 @@ impl super::StorageCluster {
                     ),
                 );
                 drop(bucket_pg);
-                if self
-                    .try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
-                    .is_none()
-                {
+                if !self.try_set_bucket_pg_pending_command_or_retry(pg_id, bucket, &command)? {
                     continue;
                 }
                 (command, true)
@@ -2412,10 +2429,7 @@ impl super::StorageCluster {
                     )),
                 );
                 drop(bucket_pg);
-                if self
-                    .try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
-                    .is_none()
-                {
+                if !self.try_set_bucket_pg_pending_command_or_retry(pg_id, bucket, &command)? {
                     continue;
                 }
                 (command, true)
@@ -2514,10 +2528,7 @@ impl super::StorageCluster {
                     ),
                 );
                 drop(bucket_pg);
-                if self
-                    .try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
-                    .is_none()
-                {
+                if !self.try_set_bucket_pg_pending_command_or_retry(pg_id, bucket, &command)? {
                     continue;
                 }
                 (command, true)
@@ -2632,10 +2643,7 @@ impl super::StorageCluster {
                         bucket_execution_generation,
                     )),
                 );
-                if self
-                    .try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
-                    .is_none()
-                {
+                if !self.try_set_bucket_pg_pending_command_or_retry(pg_id, bucket, &command)? {
                     continue;
                 }
                 (command, true)
@@ -3757,6 +3765,19 @@ impl super::StorageCluster {
                             ));
                         };
                         command = reissued;
+                        continue;
+                    }
+                    if super::StorageCluster::metadata_command_log_conflict_matches(
+                        &command, &source,
+                    ) && self
+                        .partial_exact_metadata_command_conflict_is_retryable(
+                            pg_id,
+                            &command,
+                            applied_nodes,
+                            &source,
+                        )
+                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
+                    {
                         continue;
                     }
                     if applied_nodes == 0 {
@@ -5438,12 +5459,9 @@ impl super::StorageCluster {
                         ),
                     )),
                 );
-                self.set_pending_metadata_command_for_bucket(
-                    pg_id,
-                    bucket,
-                    &command,
-                    "conflicting pending command for payload reclaim metadata delete",
-                )?;
+                if !self.try_install_object_pg_pending_command_or_drain(pg_id, bucket, &command)? {
+                    continue;
+                }
                 self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
                 return Ok(true);
             }
@@ -5701,7 +5719,7 @@ impl super::StorageCluster {
                     self.metadata_command_apply_test_hook_scope_id(),
                 );
                 if !self
-                    .try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                    .try_install_object_pg_pending_command_or_drain(pg_id, bucket, &command)
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
                 {
                     let cleanup = self
@@ -6098,6 +6116,17 @@ impl super::StorageCluster {
                         .try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)
                     {
                         Ok(installed) => installed,
+                        Err(ObjectPgActionError::Store(
+                            StoreError::MetadataCommandLogConflict { .. },
+                        )) => {
+                            if let Err(error) = self
+                                .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+                            {
+                                release_caller_bucket_write_proof_if_unowned!()?;
+                                return Err(error);
+                            }
+                            continue;
+                        }
                         Err(error) => {
                             release_caller_bucket_write_proof_if_unowned!()?;
                             return Err(error);
@@ -6934,10 +6963,9 @@ impl super::StorageCluster {
                     },
                 ),
             );
-            if self
-                .try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command)
-                .map_err(ObjectPgActionError::from)?
-                .is_none()
+            if !self
+                .try_set_bucket_pg_pending_command_or_retry(pg_id, bucket, &command)
+                .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
             {
                 continue;
             }
@@ -6971,18 +6999,55 @@ impl super::StorageCluster {
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), ObjectPgActionError> {
-        match self.apply_metadata_command_to_acting_set(command) {
-            Ok(()) => {
-                self.release_metadata_command_bucket_write_reservation(command)
-                    .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
-                self.remove_pending_metadata_command_for_bucket(pg_id, bucket, command)
-                    .map_err(ObjectPgActionError::from)?;
-                self.after_object_metadata_command_applied(command);
-                Ok(())
+        let mut command = command.clone();
+        loop {
+            match self.apply_metadata_command_to_acting_set(&command) {
+                Ok(()) => {
+                    self.release_metadata_command_bucket_write_reservation(&command)
+                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+                    self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                        .map_err(ObjectPgActionError::from)?;
+                    self.after_object_metadata_command_applied(&command);
+                    return Ok(());
+                }
+                Err(error)
+                    if super::StorageCluster::metadata_command_log_conflict_matches(
+                        &command,
+                        &error.source,
+                    ) && self
+                        .partial_exact_metadata_command_conflict_is_retryable(
+                            pg_id,
+                            &command,
+                            error.applied_nodes,
+                            &error.source,
+                        )
+                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)? =>
+                {
+                    continue;
+                }
+                Err(error)
+                    if error.applied_nodes == 0
+                        && super::StorageCluster::metadata_command_log_conflict_matches(
+                            &command,
+                            &error.source,
+                        ) =>
+                {
+                    let Some(reissued) = self
+                        .reissue_pending_metadata_command(pg_id, &command)
+                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
+                    else {
+                        return Err(super::conflicting_pending_object_metadata_command(
+                            "pending multipart completion command was displaced during reissue",
+                        ));
+                    };
+                    command = reissued;
+                }
+                Err(error) => {
+                    return Err(super::bucket_snapshot_error_to_object_pg_action_error(
+                        error.source,
+                    ))
+                }
             }
-            Err(error) => Err(super::bucket_snapshot_error_to_object_pg_action_error(
-                error.source,
-            )),
         }
     }
 
@@ -7360,6 +7425,19 @@ impl super::StorageCluster {
                 .try_install_pending_metadata_command_for_bucket(pg_id, &bucket, &command)
             {
                 Ok(installed) => installed,
+                Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                    ..
+                })) => {
+                    drop(_bucket_guard);
+                    if let Err(error) =
+                        self.drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+                    {
+                        release_bucket_write_proof!()?;
+                        return Err(error);
+                    }
+                    release_bucket_write_proof!()?;
+                    continue 'retry_after_pending_conflict;
+                }
                 Err(error) => {
                     drop(_bucket_guard);
                     release_bucket_write_proof!()?;
@@ -7367,8 +7445,30 @@ impl super::StorageCluster {
                 }
             };
             if !installed {
+                let pending_owns_proof =
+                    match self.pending_metadata_command_for_bucket(pg_id, &bucket) {
+                        Ok(Some(pending)) => matches!(
+                            pending.payload(),
+                            MetadataCommandPayload::CommitMultipartObject(commit)
+                                if commit.matches_request(
+                                    &bucket,
+                                    &key,
+                                    &upload_id,
+                                    generation_id,
+                                    &req.part_records,
+                                ) && commit.bucket_write_reservation == bucket_write_reservation
+                        ),
+                        Ok(None) => false,
+                        Err(error) => {
+                            drop(_bucket_guard);
+                            release_bucket_write_proof!()?;
+                            return Err(error.into());
+                        }
+                    };
                 drop(_bucket_guard);
-                release_bucket_write_proof!()?;
+                if !pending_owns_proof {
+                    release_bucket_write_proof!()?;
+                }
                 continue 'retry_after_pending_conflict;
             }
             drop(_bucket_guard);
@@ -7600,6 +7700,8 @@ impl super::StorageCluster {
                 })
                 .or_else(|| bucket_write_proof.clone())
                 .expect("stream part commit command must carry a bucket-write proof");
+            let expected_command_bucket_write_reservation =
+                command_bucket_write_reservation.clone();
             let command_payload = CommitStreamPartCommand {
                 bucket: bucket.clone(),
                 key: key.clone(),
@@ -7632,8 +7734,13 @@ impl super::StorageCluster {
                             StoreError::MetadataCommandLogConflict { .. },
                         )) => {
                             drop(object_pg);
+                            if let Err(error) = self
+                                .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+                            {
+                                release_bucket_write_proof_if_unowned!()?;
+                                return Err(error);
+                            }
                             release_bucket_write_proof_if_unowned!()?;
-                            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
                             continue;
                         }
                         Err(error) => {
@@ -7651,13 +7758,42 @@ impl super::StorageCluster {
                     .try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)
                 {
                     Ok(installed) => installed,
+                    Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                        ..
+                    })) => {
+                        if let Err(error) =
+                            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+                        {
+                            release_bucket_write_proof_if_unowned!()?;
+                            return Err(error);
+                        }
+                        release_bucket_write_proof_if_unowned!()?;
+                        continue;
+                    }
                     Err(error) => {
                         release_bucket_write_proof_if_unowned!()?;
                         return Err(error);
                     }
                 };
                 if !installed {
-                    release_bucket_write_proof_if_unowned!()?;
+                    let pending_owns_proof = match self
+                        .pending_metadata_command_for_bucket(pg_id, bucket)
+                    {
+                        Ok(Some(pending)) => matches!(
+                            pending.payload(),
+                            MetadataCommandPayload::CommitStreamPart(commit)
+                                if commit.matches_request(bucket, key, upload_id, session_id, part_number)
+                                    && commit.bucket_write_reservation == expected_command_bucket_write_reservation
+                        ),
+                        Ok(None) => false,
+                        Err(error) => {
+                            release_bucket_write_proof_if_unowned!()?;
+                            return Err(error.into());
+                        }
+                    };
+                    if !pending_owns_proof {
+                        release_bucket_write_proof_if_unowned!()?;
+                    }
                     continue;
                 }
                 command
@@ -7801,7 +7937,7 @@ impl super::StorageCluster {
             maybe_run_before_abort_multipart_pending_install_hook(
                 self.metadata_command_apply_test_hook_scope_id(),
             );
-            if !self.try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)? {
+            if !self.try_install_object_pg_pending_command_or_drain(pg_id, bucket, &command)? {
                 continue 'retry_after_pending_conflict;
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
@@ -7868,7 +8004,7 @@ impl super::StorageCluster {
             maybe_run_before_abort_multipart_pending_install_hook(
                 self.metadata_command_apply_test_hook_scope_id(),
             );
-            if !self.try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)? {
+            if !self.try_install_object_pg_pending_command_or_drain(pg_id, bucket, &command)? {
                 continue 'retry_after_pending_conflict;
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;

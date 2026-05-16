@@ -170,7 +170,7 @@ Current production pending-command publishers:
 | `release_object_generation_reservation` | `ReleaseObjectGeneration` | `AllocatorCleanup` | Release an already-owned reservation; drain competing PG slot before and during command-id allocation and retry. |
 | `commit_direct_put_object_from_payload_shards` | `CommitDirectPutObject` | `SnapshotSensitive` | Rebuild commit from fresh object preconditions and stale-payload snapshot after pending-install contention or pre-publish command-id contention. The commit command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
 | `create_put_object_stream_session_record_under_reservation` | `CreateStreamUpload` | `SnapshotSensitive` | Low-level PutObject stream-create publisher. The public wrapper first holds a durable bucket write reservation; this internal publisher rebuilds session command and reservation cleanup from fresh object state after contention. |
-| `commit_stream_segment_append` | `AppendStreamSegment` | `ApplyValidated` | Command-id contention is drained before shard ack registration; apply validates session binding/state and existing staged segment before inserting. |
+| `commit_stream_segment_append` | `AppendStreamSegment` | `ApplyValidated` | Command-id and pending-install contention are drained and retried from a fresh stream-session snapshot without deleting the staged payload; apply validates session binding/state and existing staged segment before inserting. |
 | `abort_stream_upload_session` | `AbortStreamUpload` | `TerminalSessionRetry` | Rebuild staged-segment snapshot after unrelated pending-slot or command-id contention. If an equivalent terminal command wins the pending slot, restart without draining so the matching/session-completion branch can finish it. |
 | `put_object_metadata_if` | `PutObjectMetadata` | `SnapshotSensitive` | Rerun request action/preconditions after contention. The command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
 | `delete_specific_object_version_if` | `DeleteObjectVersion` | `SnapshotSensitive` | Rerun delete preconditions after contention. The command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
@@ -210,7 +210,11 @@ Terminal-session retry publishers follow the same lower-level install rule,
 but the reason is different: they preserve the equivalent pending command for
 the next loop iteration instead of draining a command that deletes the session
 row needed by the matching branch. Every such publisher needs a same-command
-install-race regression.
+install-race regression. If the raw install reports `MetadataCommandLogConflict`
+because the prebuilt command id is already terminal, that is still ordinary
+unrelated contention: drain the current PG slot and restart from a fresh
+snapshot. Only an occupied slot with an equivalent terminal command is preserved
+for the matching branch.
 If a PG-wide pending slot appears after the publisher has taken its snapshot
 but before it allocates the command id, `MetadataCommandLogConflict` is the
 same pre-publish contention class: the publisher must drain the winner and
@@ -309,8 +313,10 @@ the conflict belongs to the exact same command and hash-chain state. A broad
 index can also describe a divergent command-log row. A partial exact-command
 retry proof must be established by replicas that applied before the failing
 replica; later replicas may only confirm that already-established command
-chain. If no replica was applied before the conflict, the partial-exact retry
-classification is not available.
+chain. If the first failing replica already has the exact command row, retry is
+allowed only after validating that row's bytes, checksum, `previous_log_hash`,
+and `log_hash` against the primary prefix; a same-index conflict without that
+hash-chain proof is still divergent state and must fail closed.
 
 Object-PG pending slots have two separate finish APIs:
 

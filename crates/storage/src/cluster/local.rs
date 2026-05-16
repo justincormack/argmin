@@ -2475,6 +2475,9 @@ mod tests {
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
     ) {
+        if force_insert_terminal_pending_metadata_command_for_test(map, pg_id, bucket, command) {
+            return;
+        }
         let primary = map
             .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
             .unwrap();
@@ -2485,6 +2488,71 @@ mod tests {
             Some(bucket),
         )
         .unwrap();
+    }
+
+    fn force_insert_pending_metadata_command_for_test(
+        map: &LocalClusterMap,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) {
+        let primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+            .unwrap();
+        let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+        let command_bytes = command.command_bytes();
+        pg.connection()
+            .execute(
+                "INSERT INTO metadata_command_pending_slot \
+                 (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, scope_bucket) \
+                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(singleton) DO UPDATE SET \
+                   cluster_epoch = excluded.cluster_epoch, \
+                   pg_id = excluded.pg_id, \
+                   log_index = excluded.log_index, \
+                   command_checksum = excluded.command_checksum, \
+                   command_bytes = excluded.command_bytes, \
+                   scope_bucket = excluded.scope_bucket",
+                rusqlite::params![
+                    command.id().cluster_epoch().get() as i64,
+                    command.id().pg_id().get() as i64,
+                    command.id().log_index().get() as i64,
+                    command.checksum_crc64() as i64,
+                    command_bytes,
+                    Some(bucket.as_str()),
+                ],
+            )
+            .unwrap();
+    }
+
+    fn force_insert_terminal_pending_metadata_command_for_test(
+        map: &LocalClusterMap,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> bool {
+        let primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+            .unwrap();
+        let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+        let terminal_exists = pg
+            .has_matching_applied_metadata_command_log_entry(
+                primary.node_id().as_u32(),
+                command,
+                pg.metadata_command_replica_state()
+                    .unwrap()
+                    .applied_log_hash,
+            )
+            .unwrap_or(false)
+            || matches!(
+                pg.applied_metadata_command_log_entry_hashes(primary.node_id().as_u32(), command),
+                Ok(Some(_))
+            );
+        drop(pg);
+        if terminal_exists {
+            force_insert_pending_metadata_command_for_test(map, pg_id, bucket, command);
+        }
+        terminal_exists
     }
 
     fn create_bucket_metadata_command(
@@ -3999,14 +4067,12 @@ mod tests {
                         ),
                         stale_duplicate.payload().clone(),
                     );
-                    cluster
-                        .try_set_pending_metadata_command_for_bucket(
-                            pg_id,
-                            &second_bucket,
-                            &stale_duplicate,
-                        )
-                        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?
-                        .expect("trace duplicate pending install should not race");
+                    force_insert_pending_metadata_command_for_test(
+                        &map,
+                        pg_id,
+                        &second_bucket,
+                        &stale_duplicate,
+                    );
 
                     create_test_bucket(&cluster, &second_bucket);
                     for node_id in trace_node_ids() {
@@ -6063,19 +6129,7 @@ mod tests {
             cluster
                 .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(0), &command)
                 .unwrap();
-            let primary_pg = map
-                .node(NodeId::new(0))
-                .unwrap()
-                .storage_node()
-                .get_pg(1)
-                .unwrap();
-            primary_pg
-                .try_insert_pending_metadata_command_slot(
-                    NodeId::new(0).as_u32(),
-                    &command,
-                    Some(&bucket),
-                )
-                .unwrap();
+            force_insert_pending_metadata_command_for_test(&map, PgId::new(1), &bucket, &command);
             bucket
         };
 
@@ -9298,10 +9352,12 @@ mod tests {
             .unwrap();
 
         let stale_duplicate = create_bucket_metadata_command(pg_id, 1, second_bucket.clone());
-        cluster
-            .try_set_pending_metadata_command_for_bucket(pg_id, &second_bucket, &stale_duplicate)
-            .unwrap()
-            .unwrap();
+        force_insert_pending_metadata_command_for_test(
+            &map,
+            pg_id,
+            &second_bucket,
+            &stale_duplicate,
+        );
 
         create_test_bucket(&cluster, &second_bucket);
 
@@ -9998,14 +10054,12 @@ mod tests {
         cluster
             .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(0), &occupant)
             .unwrap();
-        cluster
-            .try_set_pending_metadata_command_for_bucket(
-                PgId::new(object_pg),
-                &bucket,
-                &stale_command,
-            )
-            .unwrap()
-            .unwrap();
+        force_insert_pending_metadata_command_for_test(
+            &map,
+            PgId::new(object_pg),
+            &bucket,
+            &stale_command,
+        );
 
         let outcome = cluster
             .commit_direct_put_object_from_payload_shards(
@@ -10111,14 +10165,12 @@ mod tests {
         cluster
             .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &occupant)
             .unwrap();
-        cluster
-            .try_set_pending_metadata_command_for_bucket(
-                PgId::new(object_pg),
-                &bucket,
-                &stale_command,
-            )
-            .unwrap()
-            .unwrap();
+        force_insert_pending_metadata_command_for_test(
+            &map,
+            PgId::new(object_pg),
+            &bucket,
+            &stale_command,
+        );
 
         cluster
             .apply_new_stream_append_command(
@@ -11299,57 +11351,6 @@ mod tests {
             b"unrelated partial pending object",
         );
 
-        let _serial = lock_metadata_command_apply_hook_test();
-        let fail_once = Arc::new(AtomicBool::new(true));
-        let hook_bucket = bucket.clone();
-        let hook_key = pending_key.clone();
-        let fail_once_hook = Arc::clone(&fail_once);
-        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
-            move |node_id, command| {
-                match command.payload() {
-                    MetadataCommandPayload::PutObjectMetadata(update)
-                        if update.object.bucket == hook_bucket
-                            && update.object.key == hook_key
-                            && node_id == NodeId::new(1)
-                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
-                    {
-                        return Err(StoreError::MetadataCommandLogConflict {
-                            node_id: node_id.as_u32(),
-                            pg_id: command.id().pg_id().get(),
-                            cluster_epoch: command.id().cluster_epoch(),
-                            log_index: command.id().log_index().get(),
-                        });
-                    }
-                    _ => {}
-                }
-                Ok(())
-            },
-        ));
-
-        let tags =
-            "<Tagging><TagSet><Tag><Key>phase</Key><Value>partial</Value></Tag></TagSet></Tagging>";
-        let err = cluster
-            .put_object_tags_if(&bucket, &pending_key, None, tags, |stored| {
-                Ok::<_, ()>(stored.version_id())
-            })
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                crate::ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
-                    pg_id,
-                    cluster_epoch: ClusterEpoch::INITIAL,
-                    ..
-                }) if pg_id == object_pg
-            ),
-            "expected injected retryable exact conflict, got {err:?}"
-        );
-        drop(hook_guard);
-        assert!(
-            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
-            "partially applied unrelated object metadata command must remain pending"
-        );
-
         let reservation_id = crate::SessionId::try_from("55".repeat(16)).unwrap();
         let generation_id = cluster
             .reserve_put_object_generation(&bucket, &key, &reservation_id)
@@ -11380,6 +11381,79 @@ mod tests {
         );
         commit_req.versioning = crate::BucketVersioningState::Enabled;
 
+        let tags =
+            "<Tagging><TagSet><Tag><Key>phase</Key><Value>partial</Value></Tag></TagSet></Tagging>";
+        let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+        let pg = primary.get_pg(object_pg).unwrap();
+        let live = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &pending_key)
+            .unwrap()
+            .into_live()
+            .unwrap();
+        drop(pg);
+        let pg_id = PgId::new(object_pg);
+        let proof = acquire_test_bucket_write_proof(
+            &cluster,
+            &bucket,
+            "test-put-object-metadata",
+            Some(pending_key.as_str()),
+        );
+        let pending_command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                map.test_next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::PutObjectMetadata(Box::new(
+                PutObjectMetadataCommand::from_live_object_and_mutation(
+                    live,
+                    PutObjectMetadataMutation::PutTags(tags.to_string()),
+                    proof,
+                ),
+            )),
+        );
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &pending_command);
+        assert!(
+            pending_metadata_command_for_test(&map, pg_id, &bucket).is_some(),
+            "unrelated object metadata command must start pending"
+        );
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_map = Arc::clone(&map);
+        let hook_bucket = bucket.clone();
+        let hook_key = pending_key.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::PutObjectMetadata(update)
+                        if update.object.bucket == hook_bucket
+                            && update.object.key == hook_key
+                            && node_id == NodeId::new(2)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        let node = hook_map.node(NodeId::new(2)).unwrap().storage_node();
+                        let pg = node.get_pg(command.id().pg_id().get())?;
+                        pg.apply_metadata_command_and_record(NodeId::new(2).as_u32(), command)
+                            .map_err(|error| match error {
+                                crate::BucketSnapshotLoadError::Store(error) => error,
+                                crate::BucketSnapshotLoadError::Metadata(error) => {
+                                    panic!("manual object metadata command apply failed: {error}")
+                                }
+                            })?;
+                        return Err(StoreError::MetadataCommandLogConflict {
+                            node_id: node_id.as_u32(),
+                            pg_id: command.id().pg_id().get(),
+                            cluster_epoch: command.id().cluster_epoch(),
+                            log_index: command.id().log_index().get(),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
         let outcome = cluster
             .commit_direct_put_object_from_payload_shards(
                 &commit_req,
@@ -11388,8 +11462,9 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+        drop(hook_guard);
         assert_eq!(outcome.live_size, payload.len() as u64);
-        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
         assert_direct_put_metadata_on_acting_nodes(
             &map,
             &node_ids,
@@ -11409,6 +11484,109 @@ mod tests {
                 crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &pending_key).unwrap();
             assert_eq!(stored.as_live().unwrap().tags.as_deref(), Some(tags));
         }
+    }
+
+    #[test]
+    fn direct_put_commit_retries_partial_exact_command_conflict() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let reservation_id = crate::SessionId::try_from("56".repeat(16)).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        let payload = b"direct put exact partial retry";
+        let segment_okh = [56; 16];
+        let written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                payload,
+            )
+            .unwrap();
+        let commit_req = direct_put_commit_req(
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id,
+                generation_id,
+                payload,
+                segment_okh,
+                written: &written,
+            },
+        );
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let applied_by_hook = Arc::new(AtomicBool::new(false));
+        let hook_map = Arc::clone(&map);
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let applied_by_hook_guard = Arc::clone(&applied_by_hook);
+        let _hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                        if commit.object.bucket == hook_bucket
+                            && commit.object.key == hook_key
+                            && node_id == NodeId::new(2)
+                            && !applied_by_hook_guard.swap(true, Ordering::SeqCst) =>
+                    {
+                        let node = hook_map.node(NodeId::new(2)).unwrap().storage_node();
+                        let pg = node.get_pg(command.id().pg_id().get())?;
+                        pg.apply_metadata_command_and_record(NodeId::new(2).as_u32(), command)
+                            .map_err(|error| match error {
+                                crate::BucketSnapshotLoadError::Store(error) => error,
+                                crate::BucketSnapshotLoadError::Metadata(error) => {
+                                    panic!("manual direct put command apply failed: {error}")
+                                }
+                            })?;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let outcome = cluster
+            .commit_direct_put_object_from_payload_shards(
+                &commit_req,
+                &written.written_shards,
+                |_| Ok::<_, ()>(()),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(applied_by_hook.load(Ordering::SeqCst));
+        assert_eq!(outcome.live_size, payload.len() as u64);
+        assert_direct_put_metadata_on_acting_nodes(
+            &map,
+            &node_ids,
+            object_pg,
+            &commit_req,
+            &outcome,
+        );
+        assert_clean_metadata_command_stream(&map, &[object_pg]);
     }
 
     #[test]
@@ -23129,6 +23307,139 @@ mod tests {
     }
 
     #[test]
+    fn object_delete_exact_pending_retry_converges_partial_exact_conflict() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let committed =
+            write_committed_direct_segment_for(&cluster, &bucket, &key, b"exact delete retry");
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let fail_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::DeleteObjectVersion(delete)
+                        if delete.bucket == hook_bucket
+                            && delete.key == hook_key
+                            && node_id == NodeId::new(2)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected exact pending delete apply failure",
+                            source: std::io::Error::other(
+                                "injected exact pending delete apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .delete_current_object_if(&bucket, &key, |_| Ok::<(), ()>(()))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected exact pending delete apply failure",
+                    ..
+                })
+            ),
+            "expected injected node-2 failure, got {err:?}"
+        );
+        drop(fail_guard);
+        assert!(!fail_once.load(Ordering::SeqCst));
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some());
+
+        let applied_by_hook = Arc::new(AtomicBool::new(false));
+        let hook_map = Arc::clone(&map);
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let applied_by_hook_guard = Arc::clone(&applied_by_hook);
+        let apply_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::DeleteObjectVersion(delete)
+                        if delete.bucket == hook_bucket
+                            && delete.key == hook_key
+                            && node_id == NodeId::new(2)
+                            && !applied_by_hook_guard.swap(true, Ordering::SeqCst) =>
+                    {
+                        let node = hook_map.node(NodeId::new(2)).unwrap().storage_node();
+                        let pg = node.get_pg(command.id().pg_id().get())?;
+                        pg.apply_metadata_command_and_record(NodeId::new(2).as_u32(), command)
+                            .map_err(|error| match error {
+                                crate::BucketSnapshotLoadError::Store(error) => error,
+                                crate::BucketSnapshotLoadError::Metadata(error) => {
+                                    panic!(
+                                        "manual exact pending delete command apply failed: {error}"
+                                    )
+                                }
+                            })?;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let outcome = cluster
+            .delete_current_object_if(&bucket, &key, |stored| {
+                assert!(matches!(stored, Some(crate::StoredObject::Live(_))));
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+            .unwrap();
+        drop(apply_guard);
+        assert!(applied_by_hook.load(Ordering::SeqCst));
+        assert!(matches!(
+            outcome.deleted,
+            crate::DeletedCurrentObject::Live {
+                generation_id,
+                ..
+            } if generation_id == committed.generation_id
+        ));
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+        for node_id in node_ids {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+                Err(crate::MetadataError::ObjectNotFound)
+            ));
+        }
+        assert_clean_metadata_command_stream(&map, &[object_pg]);
+        assert_bucket_write_reservations_released(&map, &bucket);
+    }
+
+    #[test]
     fn object_delete_metadata_command_partial_apply_reopens_and_releases_bucket_write_reservation()
     {
         let _serial = lock_metadata_command_apply_hook_test();
@@ -25739,6 +26050,158 @@ mod tests {
     }
 
     #[test]
+    fn create_bucket_retries_partial_exact_command_conflict() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "partial-create-exact-conflict-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let acl_grants = crate::AclGrants::default();
+        let _serial = lock_metadata_command_apply_hook_test();
+        let applied_by_hook = Arc::new(AtomicBool::new(false));
+        let hook_map = Arc::clone(&map);
+        let hook_bucket = bucket.clone();
+        let applied_by_hook_guard = Arc::clone(&applied_by_hook);
+        let _hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::CreateBucket(create)
+                        if create.bucket.name == hook_bucket
+                            && node_id == NodeId::new(2)
+                            && !applied_by_hook_guard.swap(true, Ordering::SeqCst) =>
+                    {
+                        let node = hook_map.node(NodeId::new(2)).unwrap().storage_node();
+                        let pg = node.get_pg(1)?;
+                        pg.apply_metadata_command_and_record(NodeId::new(2).as_u32(), command)
+                            .map_err(|error| match error {
+                                crate::BucketSnapshotLoadError::Store(error) => error,
+                                crate::BucketSnapshotLoadError::Metadata(error) => {
+                                    panic!("manual create bucket command apply failed: {error}")
+                                }
+                            })?;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let created = cluster
+            .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+                name: bucket.as_str(),
+                owner_principal: "owner",
+                owner_canonical_id: &owner,
+                acl_grants: &acl_grants,
+                public_read: false,
+                public_write: false,
+                versioning: crate::BucketVersioningState::Disabled,
+                object_lock: crate::BucketObjectLockConfig::default(),
+            })
+            .unwrap();
+        assert!(matches!(
+            created,
+            crate::BucketCreateAttemptOutcome::Created(info) if info.name == bucket
+        ));
+        assert!(applied_by_hook.load(Ordering::SeqCst));
+
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.name, bucket);
+        }
+        assert_clean_metadata_command_stream(&map, &[1]);
+    }
+
+    #[test]
+    fn create_bucket_retries_partial_exact_command_conflict_on_first_replica() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "partial-create-first-exact-conflict-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let acl_grants = crate::AclGrants::default();
+        let _serial = lock_metadata_command_apply_hook_test();
+        let applied_by_hook = Arc::new(AtomicBool::new(false));
+        let hook_map = Arc::clone(&map);
+        let hook_bucket = bucket.clone();
+        let applied_by_hook_guard = Arc::clone(&applied_by_hook);
+        let _hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::CreateBucket(create)
+                        if create.bucket.name == hook_bucket
+                            && node_id == NodeId::new(0)
+                            && !applied_by_hook_guard.swap(true, Ordering::SeqCst) =>
+                    {
+                        let node = hook_map.node(NodeId::new(0)).unwrap().storage_node();
+                        let pg = node.get_pg(1)?;
+                        pg.apply_metadata_command_and_record(NodeId::new(0).as_u32(), command)
+                            .map_err(|error| match error {
+                                crate::BucketSnapshotLoadError::Store(error) => error,
+                                crate::BucketSnapshotLoadError::Metadata(error) => {
+                                    panic!("manual create bucket command apply failed: {error}")
+                                }
+                            })?;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let created = cluster
+            .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+                name: bucket.as_str(),
+                owner_principal: "owner",
+                owner_canonical_id: &owner,
+                acl_grants: &acl_grants,
+                public_read: false,
+                public_write: false,
+                versioning: crate::BucketVersioningState::Disabled,
+                object_lock: crate::BucketObjectLockConfig::default(),
+            })
+            .unwrap();
+        assert!(matches!(
+            created,
+            crate::BucketCreateAttemptOutcome::Created(info) if info.name == bucket
+        ));
+        assert!(applied_by_hook.load(Ordering::SeqCst));
+
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.name, bucket);
+        }
+        assert_clean_metadata_command_stream(&map, &[1]);
+    }
+
+    #[test]
     fn create_bucket_drains_different_bucket_pending_command_on_same_pg() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -27787,6 +28250,7 @@ mod tests {
 
         let pg_id = PgId::new(1);
         let hook_ran = Arc::new(AtomicBool::new(false));
+        let hook_map = Arc::clone(&map);
         let hook_bucket = bucket.clone();
         let hook_ran_for_closure = Arc::clone(&hook_ran);
         let _hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
@@ -27799,6 +28263,15 @@ mod tests {
                         if mark.bucket_name() == &hook_bucket =>
                     {
                         hook_ran_for_closure.store(true, Ordering::SeqCst);
+                        let node = hook_map.node(NodeId::new(1)).unwrap().storage_node();
+                        let pg = node.get_pg(command.id().pg_id().get())?;
+                        pg.apply_metadata_command_and_record(NodeId::new(1).as_u32(), command)
+                            .map_err(|error| match error {
+                                crate::BucketSnapshotLoadError::Store(error) => error,
+                                crate::BucketSnapshotLoadError::Metadata(error) => {
+                                    panic!("manual mark deleting command apply failed: {error}")
+                                }
+                            })?;
                         Err(StoreError::MetadataCommandLogConflict {
                             node_id: node_id.as_u32(),
                             pg_id: command.id().pg_id().get(),
@@ -27896,7 +28369,7 @@ mod tests {
             pg.apply_metadata_command_and_record(node_id.as_u32(), &occupant_command)
                 .unwrap();
         }
-        insert_pending_metadata_command_for_test(
+        force_insert_pending_metadata_command_for_test(
             &map,
             pg_id,
             &delete_bucket,
@@ -28129,6 +28602,7 @@ mod tests {
         insert_pending_metadata_command_for_test(&map, object_pg_id, &bucket, &command);
 
         let hook_ran = Arc::new(AtomicBool::new(false));
+        let hook_map = Arc::clone(&map);
         let hook_bucket = bucket.clone();
         let hook_key = key.clone();
         let hook_ran_for_closure = Arc::clone(&hook_ran);
@@ -28142,6 +28616,15 @@ mod tests {
                         if reservation.bucket == hook_bucket && reservation.key == hook_key =>
                     {
                         hook_ran_for_closure.store(true, Ordering::SeqCst);
+                        let node = hook_map.node(NodeId::new(1)).unwrap().storage_node();
+                        let pg = node.get_pg(command.id().pg_id().get())?;
+                        pg.apply_metadata_command_and_record(NodeId::new(1).as_u32(), command)
+                            .map_err(|error| match error {
+                                crate::BucketSnapshotLoadError::Store(error) => error,
+                                crate::BucketSnapshotLoadError::Metadata(error) => {
+                                    panic!("manual object PG command apply failed: {error}")
+                                }
+                            })?;
                         Err(StoreError::MetadataCommandLogConflict {
                             node_id: node_id.as_u32(),
                             pg_id: command.id().pg_id().get(),

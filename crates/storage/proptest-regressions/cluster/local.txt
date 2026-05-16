@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 7b29d4b71a6a31518ecf13c2f60679c4ab2966fef3961d328b060266a631ffce # shrinks to ops = [SetPgState(Peering), LeaseReleaseAcrossEpoch(0)]
+cc e6942dc846c1ec075b45a82190142f1e0eea10468d463e2ea9b4eec0987658df # shrinks to ops = [ReissueDuplicateCreateBucketIndex(0)]

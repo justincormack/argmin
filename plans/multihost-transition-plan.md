@@ -2798,7 +2798,9 @@ Proposed subphases:
          zero acting-set replicas accepted/mutated/logged the command
        - partial exact-command apply: may retry/converge only with proof that
          already-applied replicas recorded the exact command bytes/checksum and
-         matching `previous_log_hash`/`log_hash`
+         matching `previous_log_hash`/`log_hash`; if the first failing replica
+         already has the exact terminal row, it can establish the proof only by
+         matching that row against the primary prefix hash-chain
        - divergent command-log state: must fail closed and must not be
          swallowed as ordinary contention
        - post-publish cleanup failure: must not turn an externally visible
