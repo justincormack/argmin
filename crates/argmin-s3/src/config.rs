@@ -41,6 +41,8 @@ pub(crate) struct ServerConfig {
     pub(crate) max_connections: u32,
     pub(crate) max_inflight_requests: u32,
     pub(crate) stream_read_chunk_size: usize,
+    pub(crate) panic_on_500: bool,
+    pub(crate) abort_on_500: bool,
 }
 
 impl ServerConfig {
@@ -62,6 +64,8 @@ impl ServerConfig {
     ///   `ARGMIN_MAX_CONNECTIONS` (512)
     ///   `ARGMIN_MAX_INFLIGHT_REQUESTS` (32)
     ///   `ARGMIN_STREAM_READ_CHUNK_SIZE` (8388608)
+    ///   `ARGMIN_PANIC_ON_500` (false)
+    ///   `ARGMIN_ABORT_ON_500` (false)
     ///
     /// UAT-only optional credentials for running `s3-tests` against the
     /// standalone binary:
@@ -136,6 +140,14 @@ impl ServerConfig {
             .unwrap_or_else(|| server_core::coordinator::INTERNAL_SEGMENT_SIZE.to_string())
             .parse()
             .map_err(|e| format!("invalid ARGMIN_STREAM_READ_CHUNK_SIZE: {e}"))?;
+        let panic_on_500 = match get("ARGMIN_PANIC_ON_500") {
+            Some(value) => parse_bool_env("ARGMIN_PANIC_ON_500", &value)?,
+            None => false,
+        };
+        let abort_on_500 = match get("ARGMIN_ABORT_ON_500") {
+            Some(value) => parse_bool_env("ARGMIN_ABORT_ON_500", &value)?,
+            None => false,
+        };
 
         if pg_count == 0 {
             return Err("ARGMIN_PG_COUNT must be > 0".to_string());
@@ -206,7 +218,17 @@ impl ServerConfig {
             max_connections,
             max_inflight_requests,
             stream_read_chunk_size,
+            panic_on_500,
+            abort_on_500,
         })
+    }
+}
+
+fn parse_bool_env(name: &str, value: &str) -> Result<bool, String> {
+    match value.trim() {
+        "1" | "true" | "TRUE" | "True" | "yes" | "YES" | "Yes" | "on" | "ON" | "On" => Ok(true),
+        "0" | "false" | "FALSE" | "False" | "no" | "NO" | "No" | "off" | "OFF" | "Off" => Ok(false),
+        _ => Err(format!("{name} must be a boolean value")),
     }
 }
 
@@ -424,6 +446,8 @@ mod tests {
             cfg.stream_read_chunk_size,
             server_core::coordinator::INTERNAL_SEGMENT_SIZE
         );
+        assert!(!cfg.panic_on_500);
+        assert!(!cfg.abort_on_500);
         assert_eq!(cfg.access_key_id, "AKID");
         assert_eq!(cfg.secret_access_key, "SECRET");
         assert_eq!(cfg.host_id, None);
@@ -767,5 +791,41 @@ mod tests {
             ServerConfig::from_lookup(make_required_env(&[("ARGMIN_STREAM_READ_CHUNK_SIZE", "0")]))
                 .unwrap_err();
         assert!(err.contains("ARGMIN_STREAM_READ_CHUNK_SIZE must be > 0"));
+    }
+
+    #[test]
+    fn panic_on_500_accepts_boolean_values() {
+        let cfg = ServerConfig::from_lookup(make_required_env(&[("ARGMIN_PANIC_ON_500", "true")]))
+            .unwrap();
+        assert!(cfg.panic_on_500);
+
+        let cfg =
+            ServerConfig::from_lookup(make_required_env(&[("ARGMIN_PANIC_ON_500", "0")])).unwrap();
+        assert!(!cfg.panic_on_500);
+    }
+
+    #[test]
+    fn panic_on_500_rejects_invalid_boolean() {
+        let err = ServerConfig::from_lookup(make_required_env(&[("ARGMIN_PANIC_ON_500", "maybe")]))
+            .unwrap_err();
+        assert!(err.contains("ARGMIN_PANIC_ON_500"));
+    }
+
+    #[test]
+    fn abort_on_500_accepts_boolean_values() {
+        let cfg =
+            ServerConfig::from_lookup(make_required_env(&[("ARGMIN_ABORT_ON_500", "on")])).unwrap();
+        assert!(cfg.abort_on_500);
+
+        let cfg = ServerConfig::from_lookup(make_required_env(&[("ARGMIN_ABORT_ON_500", "false")]))
+            .unwrap();
+        assert!(!cfg.abort_on_500);
+    }
+
+    #[test]
+    fn abort_on_500_rejects_invalid_boolean() {
+        let err = ServerConfig::from_lookup(make_required_env(&[("ARGMIN_ABORT_ON_500", "maybe")]))
+            .unwrap_err();
+        assert!(err.contains("ARGMIN_ABORT_ON_500"));
     }
 }

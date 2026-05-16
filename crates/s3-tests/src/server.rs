@@ -245,13 +245,17 @@ impl TestServer {
             .collect();
 
         // Spawn the server as a background task
+        let serve_config = server_http::http::serve::ServeConfig {
+            abort_on_500: true,
+            ..server_http::http::serve::ServeConfig::default()
+        };
         let server_task = match transport {
             TestServerTransport::Http => tokio::spawn(server_http::http::serve::serve(
                 listener,
                 frontends,
                 TEST_MAX_CONNECTIONS,
                 TEST_MAX_INFLIGHT_REQUESTS,
-                server_http::http::serve::ServeConfig::default(),
+                serve_config,
             )),
             TestServerTransport::Https => {
                 let tls_acceptor = make_test_tls_acceptor();
@@ -261,7 +265,7 @@ impl TestServer {
                     frontends,
                     TEST_MAX_CONNECTIONS,
                     TEST_MAX_INFLIGHT_REQUESTS,
-                    server_http::http::serve::ServeConfig::default(),
+                    serve_config,
                 ))
             }
         };

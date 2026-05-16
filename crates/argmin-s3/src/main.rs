@@ -203,7 +203,7 @@ async fn main() {
     };
 
     eprintln!(
-        "argmin-s3 listening on {}://{} (EC {},{}, {} PGs, {} workers, max {} conns, max {} in-flight, read chunk {} bytes, region {}, host id {})",
+        "argmin-s3 listening on {}://{} (EC {},{}, {} PGs, {} workers, max {} conns, max {} in-flight, read chunk {} bytes, panic-on-500 {}, abort-on-500 {}, region {}, host id {})",
         scheme,
         config.listen_addr,
         config.ec_k,
@@ -213,12 +213,16 @@ async fn main() {
         config.max_connections,
         config.max_inflight_requests,
         config.stream_read_chunk_size,
+        config.panic_on_500,
+        config.abort_on_500,
         config.region,
         host_id
     );
 
     let serve_config = server_http::http::serve::ServeConfig {
         stream_read_chunk_size: config.stream_read_chunk_size,
+        panic_on_500: config.panic_on_500,
+        abort_on_500: config.abort_on_500,
         ..server_http::http::serve::ServeConfig::default()
     };
     match tls_acceptor {

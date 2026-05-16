@@ -219,6 +219,16 @@ pub struct ServeConfig {
     /// Chunk size used when pulling data from core `ReadHandle`s into the HTTP
     /// response body stream.
     pub stream_read_chunk_size: usize,
+    /// Panic instead of returning HTTP 500 responses.
+    ///
+    /// This is a diagnostic mode for local conformance/stress runs where SDK
+    /// retries can otherwise hide transient internal errors.
+    pub panic_on_500: bool,
+    /// Abort the process instead of returning HTTP 500 responses.
+    ///
+    /// This is stricter than `panic_on_500`: it makes hidden 500s fail the
+    /// whole local test process instead of only dropping one request task.
+    pub abort_on_500: bool,
 }
 
 impl Default for ServeConfig {
@@ -228,6 +238,8 @@ impl Default for ServeConfig {
             request_wait_timeout: Duration::from_secs(5),
             body_idle_timeout: Duration::from_secs(30),
             stream_read_chunk_size: server_core::coordinator::INTERNAL_SEGMENT_SIZE,
+            panic_on_500: false,
+            abort_on_500: false,
         }
     }
 }
@@ -575,6 +587,8 @@ async fn handle(
             resp,
             None,
             state.config.stream_read_chunk_size,
+            state.config.panic_on_500,
+            state.config.abort_on_500,
             response_trace,
         ));
     };
@@ -589,6 +603,8 @@ async fn handle(
                 S3Response::error_with_ids(&err, "", &wire_ids),
                 Some(req_permit),
                 state.config.stream_read_chunk_size,
+                state.config.panic_on_500,
+                state.config.abort_on_500,
                 response_trace,
             ))
         }
@@ -601,6 +617,8 @@ async fn handle(
                     S3Response::error_with_ids(&err, "", &wire_ids),
                     Some(req_permit),
                     state.config.stream_read_chunk_size,
+                    state.config.panic_on_500,
+                    state.config.abort_on_500,
                     response_trace.clone(),
                 ))
             }
@@ -614,6 +632,8 @@ async fn handle(
                     S3Response::error_with_ids(&err, "", &wire_ids),
                     Some(req_permit),
                     state.config.stream_read_chunk_size,
+                    state.config.panic_on_500,
+                    state.config.abort_on_500,
                     response_trace.clone(),
                 ))
             }
@@ -677,6 +697,8 @@ async fn handle(
             resp,
             Some(req_permit),
             state.config.stream_read_chunk_size,
+            state.config.panic_on_500,
+            state.config.abort_on_500,
             response_trace,
         ));
     }
@@ -689,6 +711,8 @@ async fn handle(
                     S3Response::error_with_ids(&err, "", &wire_ids),
                     Some(req_permit),
                     state.config.stream_read_chunk_size,
+                    state.config.panic_on_500,
+                    state.config.abort_on_500,
                     response_trace,
                 ));
             }
@@ -717,6 +741,8 @@ async fn handle(
             resp,
             Some(req_permit),
             state.config.stream_read_chunk_size,
+            state.config.panic_on_500,
+            state.config.abort_on_500,
             response_trace,
         ));
     }
@@ -732,6 +758,8 @@ async fn handle(
                     S3Response::error_with_ids(&err, "", &wire_ids),
                     Some(req_permit),
                     state.config.stream_read_chunk_size,
+                    state.config.panic_on_500,
+                    state.config.abort_on_500,
                     response_trace,
                 ));
             }
@@ -744,6 +772,8 @@ async fn handle(
                 S3Response::error_with_ids(&err, "", &wire_ids),
                 Some(req_permit),
                 state.config.stream_read_chunk_size,
+                state.config.panic_on_500,
+                state.config.abort_on_500,
                 response_trace,
             ));
         }
@@ -770,6 +800,8 @@ async fn handle(
         resp,
         Some(req_permit),
         state.config.stream_read_chunk_size,
+        state.config.panic_on_500,
+        state.config.abort_on_500,
         response_trace,
     ))
 }

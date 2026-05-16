@@ -80,6 +80,7 @@ async fn start_server(
         // Use a short request wait timeout so the SlowDown test completes
         // in ~100ms instead of the production default (5s).
         request_wait_timeout: Duration::from_millis(100),
+        abort_on_500: true,
         ..server_http::http::serve::ServeConfig::default()
     };
 

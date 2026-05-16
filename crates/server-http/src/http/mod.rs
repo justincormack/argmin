@@ -4517,13 +4517,41 @@ pub fn s3_response_to_hyper(
     resp: S3Response,
     permit: Option<OwnedSemaphorePermit>,
     stream_read_chunk_size: usize,
+    panic_on_500: bool,
+    abort_on_500: bool,
     trace_meta: ResponseTraceMeta,
 ) -> http::Response<S3HyperBody> {
+    fn fail_on_500_diagnostic(message: String, panic_on_500: bool, abort_on_500: bool) {
+        if abort_on_500 {
+            use std::io::Write as _;
+
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(stderr, "{message}");
+            let _ = stderr.flush();
+            std::process::abort();
+        }
+        if panic_on_500 {
+            panic!("{message}");
+        }
+    }
+
     fn internal_error_response(
         reason: String,
         permit: Option<OwnedSemaphorePermit>,
+        panic_on_500: bool,
+        abort_on_500: bool,
         trace_meta: ResponseTraceMeta,
     ) -> http::Response<S3HyperBody> {
+        fail_on_500_diagnostic(
+            format!(
+                "HTTP response conversion produced InternalError for {} {} (has_query={}): {reason}",
+                trace_meta.method,
+                trace_meta.path,
+                trace_meta.query.has_query()
+            ),
+            panic_on_500,
+            abort_on_500,
+        );
         let wire_ids =
             WireResponseIds::new(trace_meta.context.request_id(), trace_meta.host_id.clone());
         let resp =
@@ -4572,12 +4600,27 @@ pub fn s3_response_to_hyper(
     } else {
         resp.body.len() as u64
     };
+    if (panic_on_500 || abort_on_500) && resp.status_code == 500 {
+        let body = String::from_utf8_lossy(&resp.body);
+        fail_on_500_diagnostic(
+            format!(
+                "server produced HTTP 500 response for {} {} (has_query={}): {body}",
+                trace_meta.method,
+                trace_meta.path,
+                trace_meta.query.has_query()
+            ),
+            panic_on_500,
+            abort_on_500,
+        );
+    }
     let status = match http::StatusCode::from_u16(resp.status_code) {
         Ok(status) => status,
         Err(err) => {
             return internal_error_response(
                 format!("invalid response status code {}: {err}", resp.status_code),
                 permit,
+                panic_on_500,
+                abort_on_500,
                 trace_meta,
             )
         }
@@ -4593,6 +4636,8 @@ pub fn s3_response_to_hyper(
                 return internal_error_response(
                     format!("invalid response header name {name:?}: {err}"),
                     permit,
+                    panic_on_500,
+                    abort_on_500,
                     trace_meta,
                 )
             }
@@ -4603,6 +4648,8 @@ pub fn s3_response_to_hyper(
                 return internal_error_response(
                     format!("invalid response header value for {name}: {err}"),
                     permit,
+                    panic_on_500,
+                    abort_on_500,
                     trace_meta,
                 )
             }
@@ -6523,6 +6570,8 @@ mod tests {
             resp,
             None,
             8192,
+            false,
+            false,
             ResponseTraceMeta::new(
                 crate::http::new_request_trace_context(),
                 Arc::<str>::from("host-id"),
@@ -6532,6 +6581,32 @@ mod tests {
             ),
         );
         assert_eq!(hyper_resp.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    #[should_panic(expected = "server produced HTTP 500 response")]
+    fn s3_response_to_hyper_panics_on_500_when_enabled() {
+        let resp = S3Response {
+            status_code: 500,
+            headers: Vec::new(),
+            body: b"<Error><Code>InternalError</Code></Error>".to_vec(),
+            stream: None,
+        };
+
+        let _ = s3_response_to_hyper(
+            resp,
+            None,
+            8192,
+            true,
+            false,
+            ResponseTraceMeta::new(
+                crate::http::new_request_trace_context(),
+                Arc::<str>::from("host-id"),
+                "GET",
+                "/",
+                "",
+            ),
+        );
     }
 
     #[test]
@@ -6550,6 +6625,8 @@ mod tests {
             resp,
             None,
             8192,
+            false,
+            false,
             ResponseTraceMeta::new(
                 crate::http::new_request_trace_context(),
                 Arc::<str>::from("host-id"),
@@ -6609,6 +6686,8 @@ mod tests {
             resp,
             None,
             8192,
+            false,
+            false,
             ResponseTraceMeta::new(
                 observability::TraceContext::from_ids(
                     "0123456789abcdef0123456789abcdef".to_string(),

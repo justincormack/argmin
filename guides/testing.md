@@ -125,7 +125,7 @@ For external AWS-backed workflows, prefer the wrapper scripts under
   - configures UAT-only primary, alternate, same-account constrained, and
     owner-root credentials
   - runs `s3-tests` against that process as an external endpoint
-  - forwards extra arguments to `cargo test -p s3-tests`
+  - forwards extra arguments to `cargo nextest run -p s3-tests`
 - `./scripts/diff-tests`
   - runs the standalone AWS-vs-local `s3-diff-tests` suite
   - loads AWS credentials from `.env`
@@ -136,9 +136,10 @@ For external AWS-backed workflows, prefer the wrapper scripts under
   - loads the primary AWS credentials from `.env`
   - uses the same AWS user as `./scripts/aws-tests`
 
-The AWS-backed scripts accept `--region`, and `aws-tests` / `diff-tests` also accept
-additional `cargo test` selectors and `-- --nocapture` style test-binary
-arguments.
+The AWS-backed scripts accept `--region`, and `aws-tests` / `diff-tests` also
+accept additional `cargo test` selectors and `-- --nocapture` style test-binary
+arguments. `uat-s3-tests` accepts additional `cargo nextest run` selectors and
+options.
 
 ## Standalone `argmin-s3` UAT `s3-tests`
 
@@ -165,6 +166,8 @@ The wrapper:
   - `ARGMIN_UAT_SECOND_SECRET_ACCESS_KEY`
   - `ARGMIN_UAT_OWNER_ROOT_ACCESS_KEY_ID`
   - `ARGMIN_UAT_OWNER_ROOT_SECRET_ACCESS_KEY`
+- enables `ARGMIN_ABORT_ON_500=1` by default so internal server errors are not
+  hidden by SDK retries during local acceptance runs
 
 These UAT variables exist only to drive acceptance and conformance testing.
 They are deliberately not a production account-management API.
@@ -172,7 +175,7 @@ They are deliberately not a production account-management API.
 Example targeted run:
 
 ```bash
-./scripts/uat-s3-tests --test bucket_crud -- --nocapture
+./scripts/uat-s3-tests --test bucket_crud
 ```
 
 Example run against an already-built binary:
@@ -190,6 +193,19 @@ Example full acceptance run:
 The wrapper provides deterministic default credentials. Override them with the
 same environment variables if a specific test setup needs stable names or
 secrets across runs.
+
+`ARGMIN_PANIC_ON_500` and `ARGMIN_ABORT_ON_500` are diagnostic server options,
+not normal production behavior. Both default to false in `argmin-s3` itself.
+The UAT wrapper and embedded local `s3-tests` server enable abort-on-500 so
+hidden 500s fail the whole local test process at the point the server produces
+the internal error.
+
+For convenience, the UAT wrapper also maps `S3_TEST_TRACE`,
+`S3_TEST_TRACE_FILTER`, `S3_TEST_TRACE_FILE`, `S3_TEST_TRACE_DIR`, and
+`S3_TEST_TRACE_SYNC` onto the standalone server's `ARGMIN_TRACE*` variables.
+When tracing is requested and the wrapper is launching through `cargo run`, it
+adds `--features deep-tracing` automatically. With `--binary PATH`, the binary
+must already have been built with `deep-tracing` support.
 
 By default the wrapper creates and removes a temporary data directory. A
 directory supplied with `--data-dir PATH` or `ARGMIN_UAT_DATA_DIR` is treated as
