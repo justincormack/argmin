@@ -180,6 +180,25 @@ Different owner tokens alone are not proof of a dead owner. Terminal
 converges primary-last partial apply and keeps the terminal drain until
 finalization removes the bucket row.
 
+## DeleteBucket Finalization
+
+`try_finalize_bucket_delete` is process-independent. Once the bucket row is in
+`Deleting` state, any cluster handle may retry finalization; it does not require
+the process or local waiter that installed the delete drain.
+
+Finalization still checks the state that must remain asynchronous after the
+DeleteBucket response boundary:
+
+- visible object versions and in-progress multipart uploads
+- payload reclaim roots
+- active in-memory object payload leases
+- completed multipart-upload idempotence rows that must be pruned before the
+  bucket row is removed
+
+Missing local queue wakeups are therefore performance issues, not correctness
+issues. A worker can make progress by polling/listing deleting buckets and
+calling finalization again after reclaim or lease blockers clear.
+
 ## Required Tests
 
 Phase 9.4 must include storage and request-level coverage for:

@@ -3710,6 +3710,13 @@ Proposed subphases:
             state rather than treating it as a transient drain conflict
 
    5. Phase 9.4.5: finalization and worker wakeup without local waiters
+      - status: complete. The cluster finalizer is process-independent: a
+        reopened cluster handle can finalize a bucket that another process moved
+        to terminal `Deleting`, and finalization remains pending while reclaim
+        metadata or in-memory read leases block physical cleanup. A focused
+        regression now proves worker progress can clear the reclaim root and a
+        later finalizer retry removes the bucket row without relying on the
+        original DeleteBucket process.
       - `try_finalize_bucket_delete` must not rely on the process that began
         the delete:
         - any process/worker can observe a Deleting bucket and attempt finalize

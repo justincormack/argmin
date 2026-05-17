@@ -28277,6 +28277,126 @@ mod tests {
     }
 
     #[test]
+    fn finalized_bucket_delete_after_reopen_does_not_need_begin_waiter() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "delete-finalize-reopen-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        cluster.begin_bucket_delete(&bucket).unwrap();
+        assert_clean_metadata_command_stream(&map, &[1]);
+        drop(cluster);
+        drop(map);
+
+        let mut reopened =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        set_route_primary(&mut reopened, 1, NodeId::new(1));
+        let reopened = Arc::new(reopened);
+        let reopened_cluster =
+            crate::StorageCluster::from_local_map(Arc::clone(&reopened)).unwrap();
+
+        assert_eq!(
+            reopened_cluster
+                .try_finalize_bucket_delete(&bucket)
+                .unwrap(),
+            crate::BucketDeleteFinalizeOutcome::Finalized,
+            "finalization must not require the process that began DeleteBucket"
+        );
+        assert_eq!(
+            reopened_cluster
+                .try_finalize_bucket_delete(&bucket)
+                .unwrap(),
+            crate::BucketDeleteFinalizeOutcome::NotFound,
+            "finalized delete should be idempotent after row removal"
+        );
+        assert_clean_metadata_command_stream(&reopened, &[1]);
+    }
+
+    #[test]
+    fn finalized_bucket_delete_waits_for_reclaim_then_finalizes_after_worker_progress() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let committed =
+            write_committed_direct_segment_for(&cluster, &bucket, &key, b"finalize reclaim");
+        let lease = cluster
+            .acquire_object_payload_lease(&bucket, &key, committed.generation_id)
+            .unwrap();
+
+        let delete_outcome = cluster
+            .delete_current_object_if(&bucket, &key, |stored| {
+                assert!(matches!(stored, Some(crate::StoredObject::Live(_))));
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            delete_outcome.deleted,
+            crate::DeletedCurrentObject::Live {
+                generation_id,
+                ..
+            } if generation_id == committed.generation_id
+        ));
+        assert!(
+            cluster
+                .payload_reclaim_exists(&bucket, &key, committed.generation_id)
+                .unwrap(),
+            "object delete should leave payload reclaim metadata"
+        );
+
+        cluster.begin_bucket_delete(&bucket).unwrap();
+        assert_eq!(
+            cluster.try_finalize_bucket_delete(&bucket).unwrap(),
+            crate::BucketDeleteFinalizeOutcome::Pending,
+            "finalization must wait while reclaim metadata or read leases remain"
+        );
+
+        let released = lease.release();
+        assert_eq!(released.remaining(), 0);
+        assert!(
+            cluster
+                .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
+                .unwrap(),
+            "worker progress should clear the reclaim root after the read lease releases"
+        );
+        assert_eq!(
+            cluster.try_finalize_bucket_delete(&bucket).unwrap(),
+            crate::BucketDeleteFinalizeOutcome::Finalized
+        );
+        assert_clean_metadata_command_stream(&map, &[1, object_pg]);
+    }
+
+    #[test]
     fn finalized_bucket_delete_preserves_unrelated_same_pg_pending_command() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
