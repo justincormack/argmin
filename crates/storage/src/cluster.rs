@@ -20,12 +20,12 @@ use crate::metadata_command::{
 use crate::node::SharedStorageNode;
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
-    BucketName, BucketWriteReservationRecord, ClusterEpoch, CommitDirectPutObjectReq,
-    CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot, DirectPutWrittenSegment, EcShape,
-    FinalizeDirectPutObjectOutcome, GenerationId, MultipartReclaimPartRecord,
-    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadRecord,
-    ObjectEncryption, ObjectKey, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord,
-    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, PgId,
+    BucketName, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
+    CommitDirectPutObjectReq, CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot,
+    DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
+    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
+    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectPartRecord,
+    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, PgId,
     PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SegmentStoredBytesRequest, SessionId,
     ShardIndex, ShardKey, StreamUploadCommandRecord, StreamUploadRecord, StreamUploadSegmentRecord,
     StreamUploadState, StreamUploadTarget, VersionId, WriteAck, WrittenShardAck,
@@ -515,6 +515,17 @@ pub(super) struct DurableBucketWriteReservation {
     pg_id: u32,
     record: BucketWriteReservationRecord,
     legacy_counter_acquired: bool,
+}
+
+pub(super) struct DurableBucketWriteDrain {
+    node: Arc<SharedStorageNode>,
+    pg_id: u32,
+    record: BucketWriteDrainRecord,
+}
+
+pub(super) enum DurableBucketDeleteDrainBegin {
+    Acquired(DurableBucketWriteDrain),
+    AlreadyDeleting,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1726,17 +1737,32 @@ impl StorageCluster {
     }
 
     fn next_bucket_write_reservation_id(&self) -> Result<String, StoreError> {
+        self.next_bucket_write_coordination_id(
+            "bucket-write-",
+            "generate bucket write reservation id",
+        )
+    }
+
+    fn next_bucket_write_drain_id(&self) -> Result<String, StoreError> {
+        self.next_bucket_write_coordination_id("bucket-drain-", "generate bucket write drain id")
+    }
+
+    fn next_bucket_write_coordination_id(
+        &self,
+        prefix: &'static str,
+        context: &'static str,
+    ) -> Result<String, StoreError> {
         const HEX: &[u8; 16] = b"0123456789abcdef";
 
         let rng = ring::rand::SystemRandom::new();
         let mut id_bytes = [0u8; 16];
         rng.fill(&mut id_bytes).map_err(|_| StoreError::Io {
-            context: "generate bucket write reservation id",
+            context,
             source: std::io::Error::other("failed to generate random reservation id"),
         })?;
 
-        let mut encoded = String::with_capacity("bucket-write-".len() + id_bytes.len() * 2);
-        encoded.push_str("bucket-write-");
+        let mut encoded = String::with_capacity(prefix.len() + id_bytes.len() * 2);
+        encoded.push_str(prefix);
         for byte in id_bytes {
             encoded.push(HEX[(byte >> 4) as usize] as char);
             encoded.push(HEX[(byte & 0x0f) as usize] as char);

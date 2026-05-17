@@ -1575,6 +1575,128 @@ impl super::StorageCluster {
         Ok(())
     }
 
+    pub(super) fn begin_durable_bucket_delete_drain(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<super::DurableBucketDeleteDrainBegin, BucketWriteDrainError> {
+        loop {
+            let pg_id = self.bucket_metadata_pg_id(bucket);
+            let node = self.bucket_metadata_primary_node_arc(bucket)?;
+            let bucket_pg = node.get_pg(pg_id)?;
+            let drain_id = self.next_bucket_write_drain_id()?;
+            let owner_token = self.bucket_write_owner_token();
+            match PgMetadataStore::begin_durable_bucket_write_drain(
+                &*bucket_pg,
+                bucket,
+                &drain_id,
+                &owner_token,
+                self.operation_epoch(),
+                crate::clock::current_time_millis(),
+                None,
+            ) {
+                Ok(record) => {
+                    drop(bucket_pg);
+                    return Ok(super::DurableBucketDeleteDrainBegin::Acquired(
+                        super::DurableBucketWriteDrain {
+                            node,
+                            pg_id,
+                            record,
+                        },
+                    ));
+                }
+                Err(MetadataError::BucketWriteDrainConflict { .. }) => {
+                    match PgMetadataStore::head_bucket_record_raw(&*bucket_pg, bucket) {
+                        Ok(current) if current.state == BucketState::Deleting => {
+                            drop(bucket_pg);
+                            return Ok(super::DurableBucketDeleteDrainBegin::AlreadyDeleting);
+                        }
+                        Ok(_) => {}
+                        Err(MetadataError::BucketNotFound { .. }) => {
+                            return Err(MetadataError::BucketNotFound {
+                                name: bucket.clone(),
+                            }
+                            .into());
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                    drop(bucket_pg);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    pub(super) fn clear_durable_bucket_delete_drain(
+        &self,
+        drain: &super::DurableBucketWriteDrain,
+    ) -> Result<(), BucketWriteDrainError> {
+        let bucket_pg = drain.node.get_pg(drain.pg_id)?;
+        PgMetadataStore::clear_durable_bucket_write_drain(
+            &*bucket_pg,
+            &drain.record.bucket,
+            &drain.record.drain_id,
+            &drain.record.owner_token,
+            drain.record.cluster_epoch,
+            drain.record.bucket_execution_generation,
+        )?;
+        drop(bucket_pg);
+        drain
+            .node
+            .notify_bucket_coordination_change(&drain.record.bucket);
+        Ok(())
+    }
+
+    fn rollback_durable_bucket_delete_drain(
+        &self,
+        drain: &super::DurableBucketWriteDrain,
+    ) -> Result<(), BucketWriteDrainError> {
+        match self.clear_durable_bucket_delete_drain(drain) {
+            Ok(()) => Ok(()),
+            Err(BucketWriteDrainError::Metadata(
+                MetadataError::BucketWriteDrainNotFound { .. }
+                | MetadataError::BucketNotFound { .. },
+            )) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn wait_for_durable_bucket_write_reservations_empty(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<(), BucketWriteDrainError> {
+        loop {
+            let pg_id = self.bucket_metadata_pg_id(bucket);
+            let node = self.bucket_metadata_primary_node_arc(bucket)?;
+            let bucket_pg = node.get_pg(pg_id)?;
+            let reservations =
+                PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, bucket)?;
+            if reservations.is_empty() {
+                return Ok(());
+            }
+            drop(bucket_pg);
+            self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs(bucket)?;
+            crate::node::maybe_run_bucket_write_drain_wait_hook(bucket);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<(), BucketWriteDrainError> {
+        for raw_pg_id in self.metadata_pg_ids() {
+            self.drain_pending_object_metadata_commands_for_exact_bucket(
+                PgId::new(raw_pg_id),
+                bucket,
+            )
+            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        }
+        Ok(())
+    }
+
     fn finish_bucket_write_snapshot_operation<T, E>(
         result: Result<Result<T, E>, BucketSnapshotLoadError>,
         release_result: Result<(), BucketSnapshotLoadError>,
@@ -1660,10 +1782,41 @@ impl super::StorageCluster {
             "bucket_delete_begin_start",
             Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
         );
-        let drain = node.begin_bucket_write_drain(bucket)?;
+        {
+            let bucket_pg = node.get_pg(pg_id.get())?;
+            let current = bucket_pg.head_bucket_record_raw(bucket)?;
+            if current.state == BucketState::Deleting {
+                node.notify_bucket_coordination_change(bucket);
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "bucket_delete_begin_done",
+                    Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
+                );
+                return Ok(());
+            }
+        }
+        let durable_drain = match self.begin_durable_bucket_delete_drain(bucket)? {
+            super::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
+            super::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
+                node.notify_bucket_coordination_change(bucket);
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "bucket_delete_begin_done",
+                    Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
+                );
+                return Ok(());
+            }
+        };
+        let drain = match node.begin_bucket_write_drain_without_reservation_wait(bucket) {
+            Ok(drain) => drain,
+            Err(error) => {
+                self.rollback_durable_bucket_delete_drain(&durable_drain)?;
+                return Err(error);
+            }
+        };
         crate::node::maybe_run_after_begin_bucket_delete_drain_hook(bucket);
 
-        loop {
+        let result = (|| loop {
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
                 self.pending_metadata_command_for_bucket(pg_id, bucket)?
             {
@@ -1750,14 +1903,15 @@ impl super::StorageCluster {
                     }
                 }
             } else {
-                for raw_pg_id in self.metadata_pg_ids() {
-                    self.drain_pending_object_metadata_commands_for_exact_bucket(
-                        PgId::new(raw_pg_id),
-                        bucket,
-                    )
-                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
-                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs(bucket)?;
+                if self
+                    .pending_metadata_command_for_bucket(pg_id, bucket)?
+                    .is_some()
+                {
+                    continue;
                 }
+                self.wait_for_durable_bucket_write_reservations_empty(bucket)?;
+                self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs(bucket)?;
                 if self
                     .pending_metadata_command_for_bucket(pg_id, bucket)?
                     .is_some()
@@ -1784,13 +1938,6 @@ impl super::StorageCluster {
                 let bucket_pg = node.get_pg(pg_id.get())?;
                 let current = bucket_pg.head_bucket_record_raw(bucket)?;
                 if current.state == BucketState::Deleting {
-                    node.notify_bucket_coordination_change(bucket);
-                    drain.persist();
-                    let _ = observability::event(
-                        super::TRACE_TARGET,
-                        "bucket_delete_begin_done",
-                        Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
-                    );
                     return Ok(());
                 }
                 let bucket_execution_generation =
@@ -1825,14 +1972,24 @@ impl super::StorageCluster {
                 | FinishPendingMetadataCommandResult::RetryPartialExactConflict => continue,
             }
 
-            node.notify_bucket_coordination_change(bucket);
-            drain.persist();
-            let _ = observability::event(
-                super::TRACE_TARGET,
-                "bucket_delete_begin_done",
-                Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
-            );
             return Ok(());
+        })();
+
+        match result {
+            Ok(()) => {
+                node.notify_bucket_coordination_change(bucket);
+                drain.persist();
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "bucket_delete_begin_done",
+                    Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.rollback_durable_bucket_delete_drain(&durable_drain)?;
+                Err(error)
+            }
         }
     }
 

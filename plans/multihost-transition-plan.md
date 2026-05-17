@@ -3524,6 +3524,22 @@ Proposed subphases:
         `end_bucket_write_drain`.
 
    4. Phase 9.4.4: make DeleteBucket begin durable and recoverable
+      - status: in progress. The first implementation slice added a
+        cluster-owned durable delete-drain helper using `bucket_write_drains`,
+        installed that durable drain at the start of `begin_bucket_delete`, and
+        rolls it back on pre-terminal failure while leaving it terminal after
+        successful `MarkBucketDeleting`. The legacy bridge drain now only
+        blocks new legacy writers; durable reservation waiting drains
+        bucket-relevant object-PG pending work each pass so command-owned
+        reservation proofs can converge and release. `begin_bucket_delete`
+        also recognizes an already-Deleting bucket before trying to install a
+        new Active-only durable drain, and the durable-drain conflict path
+        reloads raw bucket state so a raced terminal `Deleting` transition is
+        handled as idempotent success instead of going through active-only
+        `HeadBucket` semantics. Targeted regressions cover non-empty rollback,
+        terminal drain persistence/idempotent retry, durable-drain conflict
+        after terminal delete begin, and an admitted writer that publishes
+        visible data after the delete drain starts.
       - rewrite `begin_bucket_delete` as a bucket-PG-primary state machine:
         - drain/finish any pending bucket-PG command for the bucket
         - drain object-PG pending commands that can publish visible data or MPU

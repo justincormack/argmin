@@ -1958,6 +1958,7 @@ mod tests {
 
     static METADATA_COMMAND_APPLY_HOOK_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
     static PAYLOAD_CLEANUP_HOOK_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+    static BUCKET_SCOPED_HOOK_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn lock_metadata_command_apply_hook_test() -> std::sync::MutexGuard<'static, ()> {
         METADATA_COMMAND_APPLY_HOOK_TEST_SERIAL
@@ -1968,6 +1969,13 @@ mod tests {
 
     fn lock_payload_cleanup_hook_test() -> std::sync::MutexGuard<'static, ()> {
         PAYLOAD_CLEANUP_HOOK_TEST_SERIAL
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lock_bucket_scoped_hook_test() -> std::sync::MutexGuard<'static, ()> {
+        BUCKET_SCOPED_HOOK_TEST_SERIAL
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -29624,6 +29632,26 @@ mod tests {
             ),
             "routed non-empty bucket should reject delete, got {err:?}"
         );
+        {
+            let bucket_pg = map
+                .node(NodeId::new(1))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            assert!(
+                crate::PgMetadataStore::durable_bucket_write_drain(&*bucket_pg, &bucket)
+                    .unwrap()
+                    .is_none(),
+                "non-empty DeleteBucket must roll back the temporary durable drain"
+            );
+            let bucket_info = crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
+                .expect("non-empty delete should leave the bucket active");
+            assert!(
+                !bucket_info.write_reservations_blocked,
+                "non-empty DeleteBucket must roll back the transitional legacy drain"
+            );
+        }
 
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
@@ -29655,6 +29683,30 @@ mod tests {
         drop(node_two_pg);
 
         cluster.begin_bucket_delete(&bucket).unwrap();
+        {
+            let bucket_pg = map
+                .node(NodeId::new(1))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            assert!(
+                crate::PgMetadataStore::durable_bucket_write_drain(&*bucket_pg, &bucket)
+                    .unwrap()
+                    .is_some(),
+                "successful DeleteBucket begin should leave a terminal durable drain until finalize"
+            );
+        }
+        assert!(
+            matches!(
+                cluster.begin_durable_bucket_delete_drain(&bucket).unwrap(),
+                super::super::DurableBucketDeleteDrainBegin::AlreadyDeleting
+            ),
+            "durable delete-drain conflict must observe terminal Deleting as idempotent success"
+        );
+        cluster
+            .begin_bucket_delete(&bucket)
+            .expect("retrying DeleteBucket after MarkBucketDeleting should be idempotent");
         assert_eq!(
             cluster.try_finalize_bucket_delete(&bucket).unwrap(),
             crate::BucketDeleteFinalizeOutcome::Finalized
@@ -29675,6 +29727,185 @@ mod tests {
             .unwrap()
             .is_none(),
             "finalization should prune routed completed-upload tombstones"
+        );
+    }
+
+    #[test]
+    fn begin_bucket_delete_waits_for_durable_reservation_and_post_drains_visible_write() {
+        let _serial = lock_bucket_scoped_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let (bucket, key) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "delete-durable-reservation-");
+            let key = key_for_object_pg(topology, &bucket, 2, "key-");
+            (bucket, key)
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let reservation = cluster
+            .acquire_durable_bucket_write_reservation(
+                &bucket,
+                "test-held-write",
+                Some(key.as_str()),
+            )
+            .unwrap();
+        let bucket_write_proof =
+            crate::metadata_command::BucketWriteReservationProof::from(&reservation.record);
+        let payload = b"visible";
+        let generation_reservation_id = crate::SessionId::try_from("72".repeat(16)).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &generation_reservation_id)
+            .unwrap();
+        let segment_okh = [71; 16];
+        let written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                payload,
+            )
+            .unwrap();
+        let commit_req = crate::CommitDirectPutObjectReq {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_reservation_id,
+            versioning: crate::BucketVersioningState::Disabled,
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            generation_id,
+            size: payload.len() as u64,
+            etag_crc64: checksum::crc64::checksum(payload),
+            ec: written.ec,
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            object_lock: crate::ObjectLockState::default(),
+            encryption: crate::ObjectEncryption::None,
+            segment_index: 0,
+            segment_crc64: Some(checksum::crc64::checksum(payload)),
+            segment_okh,
+            segment_vid: generation_id,
+            data_pg_id: written.data_pg_id,
+            bucket_write_reservation: bucket_write_proof,
+        };
+
+        let delete_started = Arc::new((Mutex::new(false), Condvar::new()));
+        let delete_waiting = Arc::new((Mutex::new(false), Condvar::new()));
+        let hook_bucket = bucket.clone();
+        let delete_waiting_for_hook = Arc::clone(&delete_waiting);
+        let _hook_guard =
+            crate::node::install_bucket_scoped_test_hooks(crate::node::BucketScopedTestHooks {
+                target: Some(hook_bucket),
+                before_bucket_write_drain_wait: Some(Arc::new(move || {
+                    let (lock, cv) = &*delete_waiting_for_hook;
+                    *lock.lock().unwrap() = true;
+                    cv.notify_all();
+                })),
+                ..crate::node::BucketScopedTestHooks::default()
+            });
+
+        let delete_cluster = Arc::clone(&cluster);
+        let delete_bucket = bucket.clone();
+        let delete_started_for_thread = Arc::clone(&delete_started);
+        let delete_thread = std::thread::spawn(move || {
+            {
+                let (lock, cv) = &*delete_started_for_thread;
+                *lock.lock().unwrap() = true;
+                cv.notify_all();
+            }
+            delete_cluster.begin_bucket_delete(&delete_bucket)
+        });
+
+        {
+            let (lock, cv) = &*delete_started;
+            let guard = cv
+                .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |started| {
+                    !*started
+                })
+                .unwrap()
+                .0;
+            assert!(*guard, "delete thread should start");
+        }
+        {
+            let (lock, cv) = &*delete_waiting;
+            let guard = cv
+                .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |waiting| {
+                    !*waiting
+                })
+                .unwrap()
+                .0;
+            assert!(
+                *guard,
+                "DeleteBucket should wait for the durable writer reservation before emptiness"
+            );
+        }
+
+        {
+            let pg_id = PgId::new(2);
+            let shard_batch: Vec<(&ShardKey, WriteAck)> = written
+                .written_shards
+                .iter()
+                .map(|written| (&written.key, written.ack))
+                .collect();
+            cluster
+                .register_payload_shard_acks(written.data_pg_id, &shard_batch)
+                .unwrap();
+            let primary = map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+                .unwrap();
+            let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+            let command = cluster
+                .prepare_commit_direct_put_object_command(
+                    pg_id,
+                    &pg,
+                    &commit_req,
+                    crate::VersionId::Null,
+                    commit_req.bucket_write_reservation.clone(),
+                )
+                .unwrap();
+            pg.try_insert_pending_metadata_command_slot(
+                primary.node_id().as_u32(),
+                &command,
+                Some(&bucket),
+            )
+            .unwrap();
+        }
+
+        let err = delete_thread.join().unwrap().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketWriteDrainError::Metadata(crate::MetadataError::BucketNotEmpty)
+            ),
+            "post-reservation drain/check should see the committed object, got {err:?}"
+        );
+        assert_bucket_write_reservations_released(&map, &bucket);
+        let bucket_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::durable_bucket_write_drain(&*bucket_pg, &bucket)
+                .unwrap()
+                .is_none(),
+            "failed DeleteBucket should clear its temporary durable drain"
         );
     }
 

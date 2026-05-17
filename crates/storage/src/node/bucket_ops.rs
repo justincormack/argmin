@@ -103,6 +103,36 @@ impl SharedStorageNode {
         }
     }
 
+    pub fn begin_bucket_write_drain_without_reservation_wait(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketWriteDrainGuard<'_>, BucketWriteDrainError> {
+        loop {
+            let pg_id = self.pg_topology.bucket_pg_for(bucket);
+            let bucket_pg = self.get_pg(pg_id)?;
+            match PgMetadataStore::begin_bucket_write_drain(&*bucket_pg, bucket) {
+                Ok(()) => {
+                    return Ok(BucketWriteDrainGuard {
+                        node: self,
+                        bucket: bucket.clone(),
+                        persisted: false,
+                    });
+                }
+                Err(crate::error::MetadataError::BucketWriteDraining) => {
+                    let (generation_lock, generation_cvar) =
+                        &self.bucket_coordination[self.bucket_lock_index(bucket)];
+                    let mut generation = generation_lock.lock().unwrap();
+                    let observed_generation = *generation;
+                    drop(bucket_pg);
+                    while *generation == observed_generation {
+                        generation = generation_cvar.wait(generation).unwrap();
+                    }
+                }
+                Err(other) => return Err(other.into()),
+            }
+        }
+    }
+
     #[cfg(test)]
     pub fn begin_bucket_delete(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
         let drain = self.begin_bucket_write_drain(bucket)?;
