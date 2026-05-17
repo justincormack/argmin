@@ -3523,8 +3523,14 @@ Proposed subphases:
         `release_bucket_write_reservation`, `begin_bucket_write_drain`, and
         `end_bucket_write_drain`.
 
+   <a id="phase-944-make-deletebucket-begin-durable-and-recoverable"></a>
    4. Phase 9.4.4: make DeleteBucket begin durable and recoverable
-      - status: in progress. The first implementation slice added a
+      - status: complete. DeleteBucket begin now uses the bucket-PG durable
+        drain as its correctness authority, keeps the legacy drain only as a
+        transitional writer bridge, drains object-PG work while waiting for
+        durable reservations to empty, handles expired no-waiter drains
+        conservatively, and has regression coverage for every required test
+        item below. The first implementation slice added a
         cluster-owned durable delete-drain helper using `bucket_write_drains`,
         installed that durable drain at the start of `begin_bucket_delete`, and
         rolls it back on pre-terminal failure while leaving it terminal after
@@ -3564,10 +3570,11 @@ Proposed subphases:
         crash boundary, open-time recovery converges the command, and the
         terminal drain remains durable.
       - rewrite `begin_bucket_delete` as a bucket-PG-primary state machine:
-        - drain/finish any pending bucket-PG command for the bucket
-        - drain object-PG pending commands that can publish visible data or MPU
-          state for the bucket
         - install or resume a durable drain fence
+        - drain/finish any pending bucket-PG command for the bucket under that
+          fence
+        - drain object-PG pending commands that can publish visible data or MPU
+          state for the bucket under that fence
         - wait/poll active durable write reservations until the set is empty,
           ignoring/reaping only reservations whose owner is provably dead or
           expired according to the Phase 9.4 owner-token rule
@@ -3593,6 +3600,9 @@ Proposed subphases:
         transitional-implementation required, or deferrable background work,
         and remove or move waits that are not needed to make the S3 response
         correct.
+        A future optimization for classifying publish-ready durable write
+        reservations without waiting is tracked separately in
+        [DeleteBucket Reservation Classification Optimization](delete-bucket-reservation-classification-plan.md).
       - crash/restart rules:
         - drain fence present, no `MarkBucketDeleting`, owner alive: writers
           continue to wait/retry

@@ -29941,6 +29941,40 @@ mod tests {
             "blocked lifecycle command must not leave a pending slot"
         );
 
+        let cors_command_id = MetadataCommandId::new(
+            crate::ClusterEpoch::INITIAL,
+            pg_id,
+            MetadataCommandLogIndex::new(2).unwrap(),
+        );
+        let cors_command = {
+            let bucket_pg = primary.get_pg(pg_id.get()).unwrap();
+            let generation = bucket_pg
+                .next_bucket_execution_generation_candidate()
+                .unwrap();
+            MetadataCommandEnvelope::new(
+                cors_command_id,
+                MetadataCommandPayload::PutBucketSubresource(PutBucketSubresourceCommand::new(
+                    bucket.clone(),
+                    BucketSubresourceMutation::Put {
+                        kind: crate::BucketSubresourceKind::Cors,
+                        body: "<CORSConfiguration/>".to_string(),
+                        aux: crate::BucketSubresourceAux::None,
+                    },
+                    generation,
+                )),
+            )
+        };
+        assert!(
+            !cluster
+                .try_set_bucket_control_pending_command_or_retry(pg_id, &bucket, &cors_command)
+                .unwrap(),
+            "CORS command must not install while a durable delete drain is active"
+        );
+        assert!(
+            pending_metadata_command_for_test(&map, pg_id, &bucket).is_none(),
+            "blocked CORS command must not leave a pending slot"
+        );
+
         cluster.clear_durable_bucket_delete_drain(&drain).unwrap();
         let versioned = cluster
             .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
@@ -29957,6 +29991,25 @@ mod tests {
             )
             .unwrap();
         assert!(lifecycle.bucket_lifecycle_present);
+        cluster
+            .put_bucket_subresource_and_load_info(
+                &bucket,
+                crate::PutBucketSubresource {
+                    kind: crate::BucketSubresourceKind::Cors,
+                    body: "<CORSConfiguration/>",
+                    aux: crate::BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+        let bucket_pg = primary.get_pg(pg_id.get()).unwrap();
+        let cors = crate::PgMetadataStore::get_bucket_subresource(
+            &*bucket_pg,
+            &bucket,
+            crate::BucketSubresourceKind::Cors,
+        )
+        .unwrap()
+        .expect("CORS subresource should be installed after the drain clears");
+        assert_eq!(cors.body, "<CORSConfiguration/>");
     }
 
     #[test]

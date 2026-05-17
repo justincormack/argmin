@@ -7,21 +7,25 @@ processes, restart, and PG-primary ownership.
 
 ## Current Authority
 
-The current write-drain path is partially migrated:
+The current write-drain path is mostly migrated for write admission and
+DeleteBucket begin:
 
 - `StorageCluster::with_bucket_write_snapshot` acquires a durable
   `bucket_write_reservations` row on the bucket-PG primary, loads the bucket
-  snapshot, runs the caller action, then releases that exact row. Until
-  DeleteBucket moves to durable drains, it also holds the legacy
-  `buckets.active_write_reservations` counter so the old drain path remains a
-  correct transitional fence.
+  snapshot, runs the caller action, then releases that exact row. It also holds
+  the legacy `buckets.active_write_reservations` counter as a transitional
+  bridge until Phase 9.4.6 removes the old authority.
 - The old `SharedStorageNode::with_bucket_write_snapshot` anonymous counter
   path is retained for tests only.
-- `SharedStorageNode::begin_bucket_write_drain` sets
-  `buckets.write_reservations_blocked` and waits on a node-local condition
-  variable until `active_write_reservations == 0`.
-- `StorageCluster::begin_bucket_delete` uses that node-local drain before it
-  publishes the `MarkBucketDeleting` metadata command.
+- `StorageCluster::begin_bucket_delete` installs a durable
+  `bucket_write_drains` row on the bucket-PG primary, uses the legacy
+  `write_reservations_blocked` flag only as a transitional writer bridge,
+  drains bucket-relevant pending object commands while waiting for durable
+  reservations to empty, then either rolls back the durable drain by exact
+  identity or publishes terminal `MarkBucketDeleting`.
+- `SharedStorageNode::begin_bucket_write_drain` is still called by the cluster
+  DeleteBucket path to block legacy writers, but it is no longer the primary
+  multi-process correctness boundary.
 
 The remaining drain counters are anonymous. They do not identify the writer, the
 bucket incarnation, the request class, or whether another process crashed while
@@ -147,11 +151,12 @@ replica mutated while remaining replicas can no longer accept the same command.
 
 ## DeleteBucket Drain Loop
 
-`begin_bucket_delete` must become a bucket-PG-primary state machine:
+`begin_bucket_delete` is a bucket-PG-primary state machine:
 
-1. Finish pending bucket-PG commands for the bucket.
-2. Drain object-PG pending commands that can publish visible data or MPU state.
-3. Install or resume the durable drain fence.
+1. Install or resume the durable drain fence on the bucket-PG primary.
+2. Finish pending bucket-PG commands for the bucket under that fence.
+3. Drain object-PG pending commands that can publish visible data or MPU state
+   under that fence.
 4. Wait or poll until active durable write reservations are empty, reaping only
    reservations allowed by the owner-token and reap-vs-convergence rules.
 5. Drain object-PG pending commands for the bucket again. A writer that already
@@ -167,6 +172,13 @@ replica mutated while remaining replicas can no longer accept the same command.
 Once `MarkBucketDeleting` is durable, new writes fail through the normal
 missing/deleting bucket semantics. Before that terminal point, writers observing
 the temporary drain wait/back off and retry from fresh bucket state.
+
+The implemented recovery rule is conservative: a durable drain without terminal
+`MarkBucketDeleting` is rolled back only when it has an explicit expired lease.
+Different owner tokens alone are not proof of a dead owner. Terminal
+`MarkBucketDeleting` with a surviving durable drain is idempotent; reopen
+converges primary-last partial apply and keeps the terminal drain until
+finalization removes the bucket row.
 
 ## Required Tests
 
