@@ -191,6 +191,17 @@ pub(crate) trait PgMetadataStore {
         bucket_execution_generation: u64,
     ) -> Result<(), MetadataError>;
 
+    /// Atomically clear an expired durable drain for an active bucket.
+    ///
+    /// Returns the cleared record when the drain's lease deadline is present
+    /// and not later than `now`. Non-expired and missing drains return `Ok(None)`.
+    #[allow(dead_code)]
+    fn clear_expired_durable_bucket_write_drain(
+        &self,
+        name: &BucketName,
+        now: u64,
+    ) -> Result<Option<BucketWriteDrainRecord>, MetadataError>;
+
     /// Set bucket versioning state.
     ///
     /// Validates transitions: Disabled→Enabled and Enabled↔Suspended are allowed.

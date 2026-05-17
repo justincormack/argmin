@@ -3548,7 +3548,21 @@ Proposed subphases:
         delete-marker insertion is drained before the emptiness check and
         correctly returns `BucketNotEmpty`, while a pending specific-version
         delete that removes the last visible version is drained before
-        `MarkBucketDeleting` is published.
+        `MarkBucketDeleting` is published. The fourth slice pinned the
+        lifecycle publishers specifically: pending lifecycle current expiry,
+        noncurrent expiry, and expired delete-marker cleanup commands are
+        drained before DeleteBucket trusts the post-drain emptiness check. The
+        fifth slice pinned the bucket-incarnation boundary: an old terminal
+        delete drain cannot clear a fresh drain installed after delete/recreate,
+        because durable drain cleanup is matched by exact drain identity and
+        bucket execution generation. The sixth slice added conservative
+        no-waiter recovery for durable drains with an explicit expired lease:
+        a restarted DeleteBucket can atomically roll back the expired drain and
+        legacy bridge from fresh bucket state before installing its own drain.
+        The seventh slice pinned primary-last `MarkBucketDeleting` reopen
+        convergence: a durable drain plus primary pending slot survives the
+        crash boundary, open-time recovery converges the command, and the
+        terminal drain remains durable.
       - rewrite `begin_bucket_delete` as a bucket-PG-primary state machine:
         - drain/finish any pending bucket-PG command for the bucket
         - drain object-PG pending commands that can publish visible data or MPU

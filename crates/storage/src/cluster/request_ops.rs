@@ -1649,6 +1649,25 @@ impl super::StorageCluster {
                     ));
                 }
                 Err(MetadataError::BucketWriteDrainConflict { .. }) => {
+                    if let Some(expired) =
+                        PgMetadataStore::clear_expired_durable_bucket_write_drain(
+                            &*bucket_pg,
+                            bucket,
+                            crate::clock::current_time_millis(),
+                        )?
+                    {
+                        let _ = observability::event(
+                            super::TRACE_TARGET,
+                            "bucket_delete_expired_drain_rollback",
+                            Some(format_args!(
+                                "bucket={:?} pg_id={} drain_id={}",
+                                bucket, pg_id, expired.drain_id
+                            )),
+                        );
+                        drop(bucket_pg);
+                        node.notify_bucket_coordination_change(bucket);
+                        continue;
+                    }
                     match PgMetadataStore::head_bucket_record_raw(&*bucket_pg, bucket) {
                         Ok(current) if current.state == BucketState::Deleting => {
                             drop(bucket_pg);

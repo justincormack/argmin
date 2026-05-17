@@ -157,6 +157,7 @@ production_metadata_methods=$(
             || name == "begin_durable_bucket_write_drain" \
             || name == "durable_bucket_write_drain" \
             || name == "clear_durable_bucket_write_drain" \
+            || name == "clear_expired_durable_bucket_write_drain" \
             || name == "head_bucket" \
             || name == "head_bucket_raw" \
             || name == "head_bucket_record_raw" \

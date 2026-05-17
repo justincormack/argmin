@@ -9960,6 +9960,132 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
+    fn clear_expired_durable_bucket_write_drain(
+        &self,
+        name: &BucketName,
+        now: u64,
+    ) -> Result<Option<BucketWriteDrainRecord>, MetadataError> {
+        let now = i64::try_from(now).map_err(|source| MetadataError::Db {
+            context: "clear expired durable bucket write drain now",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|source| MetadataError::Db {
+                context: "clear expired durable bucket write drain (begin txn)",
+                source,
+            })?;
+        let result = (|| {
+            let Some(record) = (match self.conn.query_row(
+                "SELECT bucket_name, drain_id, owner_token, cluster_epoch, bucket_execution_generation, \
+                        state, created_at, lease_deadline \
+                 FROM bucket_write_drains \
+                 WHERE bucket_name = ?1",
+                params![name.as_str()],
+                bucket_write_drain_from_row,
+            ) {
+                Ok(record) => Some(record),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(source) => {
+                    return Err(MetadataError::Db {
+                        context: "clear expired durable bucket write drain (load drain)",
+                        source,
+                    });
+                }
+            }) else {
+                return Ok(None);
+            };
+            let Some(lease_deadline) = record.lease_deadline else {
+                return Ok(None);
+            };
+            let lease_deadline =
+                i64::try_from(lease_deadline).map_err(|source| MetadataError::Db {
+                    context: "clear expired durable bucket write drain lease deadline",
+                    source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                })?;
+            if lease_deadline > now {
+                return Ok(None);
+            }
+            let bucket = self.head_bucket_record_raw(name)?;
+            if bucket.state != BucketState::Active
+                || bucket.bucket_execution_generation != record.bucket_execution_generation
+            {
+                return Ok(None);
+            }
+            let deleted = self
+                .conn
+                .execute(
+                    "DELETE FROM bucket_write_drains \
+                     WHERE bucket_name = ?1 AND drain_id = ?2 AND owner_token = ?3 \
+                       AND cluster_epoch = ?4 AND bucket_execution_generation = ?5 \
+                       AND lease_deadline IS NOT NULL AND lease_deadline <= ?6",
+                    params![
+                        name.as_str(),
+                        &record.drain_id,
+                        &record.owner_token,
+                        record.cluster_epoch.get(),
+                        i64::try_from(record.bucket_execution_generation).map_err(|source| {
+                            MetadataError::Db {
+                                context: "clear expired durable bucket write drain generation",
+                                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                            }
+                        })?,
+                        now,
+                    ],
+                )
+                .map_err(|source| MetadataError::Db {
+                    context: "clear expired durable bucket write drain (delete drain)",
+                    source,
+                })?;
+            if deleted == 0 {
+                return Ok(None);
+            }
+            if bucket.write_reservations_blocked {
+                self.conn
+                    .execute(
+                        "UPDATE buckets \
+                         SET write_reservations_blocked = 0 \
+                         WHERE name = ?1 AND state = ?2 AND bucket_execution_generation = ?3",
+                        params![
+                            name.as_str(),
+                            BucketState::Active as u8,
+                            i64::try_from(bucket.bucket_execution_generation).map_err(
+                                |source| MetadataError::Db {
+                                    context:
+                                        "clear expired durable bucket write drain bucket generation",
+                                    source: rusqlite::Error::ToSqlConversionFailure(Box::new(
+                                        source,
+                                    )),
+                                },
+                            )?,
+                        ],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "clear expired durable bucket write drain (open bucket)",
+                        source,
+                    })?;
+            }
+            Ok(Some(record))
+        })();
+        match result {
+            Ok(record) => self
+                .conn
+                .execute_batch("COMMIT")
+                .map(|()| record)
+                .map_err(|source| {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    MetadataError::Db {
+                        context: "clear expired durable bucket write drain (commit txn)",
+                        source,
+                    }
+                }),
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
     fn end_bucket_write_drain(&self, name: &BucketName) -> Result<(), MetadataError> {
         let updated = self
             .conn

@@ -29042,6 +29042,114 @@ mod tests {
     }
 
     #[test]
+    fn begin_bucket_delete_partial_mark_deleting_reopens_and_converges() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "delete-mark-reopen-")
+        };
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let pg_id = PgId::new(1);
+        let command_id = cluster.next_bucket_metadata_command_id(pg_id).unwrap();
+        let command = {
+            let primary_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(pg_id.get())
+                .unwrap();
+            let now = crate::clock::current_time_millis();
+            crate::PgMetadataStore::begin_durable_bucket_write_drain(
+                &*primary_pg,
+                &bucket,
+                "delete-mark-reopen-drain",
+                "delete-mark-reopen-owner",
+                crate::ClusterEpoch::INITIAL,
+                now,
+                None,
+            )
+            .unwrap();
+            crate::PgMetadataStore::begin_bucket_write_drain(&*primary_pg, &bucket).unwrap();
+            let current =
+                crate::PgMetadataStore::head_bucket_record_raw(&*primary_pg, &bucket).unwrap();
+            let command = MetadataCommandEnvelope::new(
+                command_id,
+                MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand::from_bucket(
+                    current.with_execution_generation(
+                        primary_pg
+                            .next_bucket_execution_generation_candidate()
+                            .unwrap(),
+                    ),
+                )),
+            );
+            primary_pg
+                .try_insert_pending_metadata_command_slot(0, &command, Some(&bucket))
+                .unwrap();
+            command
+        };
+        for node_id in [NodeId::new(1), NodeId::new(2)] {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(pg_id.get())
+                .unwrap();
+            pg.apply_metadata_command_and_record(node_id.as_u32(), &command)
+                .unwrap();
+        }
+        assert!(
+            pending_metadata_command_for_test(&map, pg_id, &bucket).is_some(),
+            "partial MarkBucketDeleting must leave the primary pending slot durable"
+        );
+        drop(cluster);
+        drop(map);
+
+        let reopened =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
+        for node_id in node_ids {
+            let pg = reopened
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(info.state, crate::BucketState::Deleting);
+        }
+        assert!(
+            pending_metadata_command_for_test(&reopened, pg_id, &bucket).is_none(),
+            "open-time convergence should clear terminal MarkBucketDeleting pending slot"
+        );
+        let primary_pg = reopened
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::durable_bucket_write_drain(&*primary_pg, &bucket)
+                .unwrap()
+                .is_some(),
+            "terminal delete drain should remain durable after reopen convergence"
+        );
+        drop(primary_pg);
+        assert_clean_metadata_command_stream(&reopened, &[1]);
+    }
+
+    #[test]
     fn bucket_update_fails_closed_on_divergent_same_index_after_partial_apply() {
         let _serial = lock_metadata_command_apply_hook_test();
         let tmp = test_util::tempdir();
@@ -30248,6 +30356,566 @@ mod tests {
             assert_eq!(bucket_info.state, crate::BucketState::Deleting);
         }
         assert_clean_metadata_command_stream(&map, &[1, object_pg_id]);
+    }
+
+    #[test]
+    fn begin_bucket_delete_drains_pending_lifecycle_current_expiry_marker() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg_id, data_pg_id) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "delete-lifecycle-current-");
+            let key = key_for_object_pg(topology, &bucket, 2, "current-");
+            (bucket, key, 2, 3)
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, object_pg_id, NodeId::new(2));
+        set_route_primary(&mut map, data_pg_id, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket_with_versioning(
+            &cluster,
+            &bucket,
+            crate::BucketVersioningState::Enabled,
+        );
+        put_test_lifecycle(&cluster, &bucket);
+        let committed = write_committed_direct_segment_for_with_versioning(
+            &cluster,
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Enabled,
+            [0x93; 16],
+            [0x94; 16],
+            b"lifecycle current before delete",
+        );
+
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::InsertDeleteMarker(marker)
+                        if marker.bucket == hook_bucket
+                            && marker.key == hook_key
+                            && node_id == NodeId::new(2)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected lifecycle current expiry apply failure",
+                            source: std::io::Error::other(
+                                "injected lifecycle current expiry apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .expire_current_object_if_due(&bucket, &key, committed.version_id, |_, _| {
+                Ok::<_, ()>(true)
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected lifecycle current expiry apply failure",
+                    ..
+                })
+            ),
+            "expected injected lifecycle current expiry failure, got {err:?}"
+        );
+        drop(hook_guard);
+        assert!(!fail_once.load(Ordering::SeqCst));
+        assert!(
+            pending_metadata_command_for_test(&map, PgId::new(object_pg_id), &bucket).is_some(),
+            "partial lifecycle current expiry command should remain pending"
+        );
+
+        let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketWriteDrainError::Metadata(crate::MetadataError::BucketNotEmpty)
+            ),
+            "DeleteBucket should see the lifecycle delete marker as visible data, got {err:?}"
+        );
+        assert!(
+            pending_metadata_command_for_test(&map, PgId::new(object_pg_id), &bucket).is_none()
+        );
+        assert_bucket_write_reservations_released(&map, &bucket);
+        for node_id in node_ids {
+            let object_pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg_id)
+                .unwrap();
+            let current = crate::PgMetadataStore::get_object_meta(&*object_pg, &bucket, &key)
+                .expect("DeleteBucket should leave the lifecycle marker visible");
+            assert!(
+                matches!(current, crate::StoredObject::DeleteMarker(_)),
+                "expected current delete marker on node {node_id:?}, got {current:?}"
+            );
+        }
+        assert_clean_metadata_command_stream(&map, &[1, object_pg_id]);
+    }
+
+    #[test]
+    fn begin_bucket_delete_drains_pending_lifecycle_noncurrent_expiry() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg_id, data_pg_id) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "delete-lifecycle-noncurrent-");
+            let key = key_for_object_pg(topology, &bucket, 2, "noncurrent-");
+            (bucket, key, 2, 3)
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, object_pg_id, NodeId::new(2));
+        set_route_primary(&mut map, data_pg_id, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket_with_versioning(
+            &cluster,
+            &bucket,
+            crate::BucketVersioningState::Enabled,
+        );
+        put_test_lifecycle(&cluster, &bucket);
+        let older = write_committed_direct_segment_for_with_versioning(
+            &cluster,
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Enabled,
+            [0xa1; 16],
+            [0xa2; 16],
+            b"older lifecycle version",
+        );
+        let current = write_committed_direct_segment_for_with_versioning(
+            &cluster,
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Enabled,
+            [0xa3; 16],
+            [0xa4; 16],
+            b"current lifecycle version",
+        );
+
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let older_version = older.version_id;
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::DeleteObjectVersion(delete)
+                        if delete.bucket == hook_bucket
+                            && delete.key == hook_key
+                            && delete.version_id == older_version
+                            && node_id == NodeId::new(2)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected lifecycle noncurrent expiry apply failure",
+                            source: std::io::Error::other(
+                                "injected lifecycle noncurrent expiry apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .delete_noncurrent_live_versions_if_due(&bucket, &key, |_, _| {
+                Ok::<_, ()>(HashSet::from([older.version_id]))
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected lifecycle noncurrent expiry apply failure",
+                    ..
+                })
+            ),
+            "expected injected lifecycle noncurrent expiry failure, got {err:?}"
+        );
+        drop(hook_guard);
+        assert!(!fail_once.load(Ordering::SeqCst));
+        assert!(
+            pending_metadata_command_for_test(&map, PgId::new(object_pg_id), &bucket).is_some(),
+            "partial lifecycle noncurrent expiry command should remain pending"
+        );
+
+        let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketWriteDrainError::Metadata(crate::MetadataError::BucketNotEmpty)
+            ),
+            "DeleteBucket should still see the current version after draining noncurrent expiry, got {err:?}"
+        );
+        assert!(
+            pending_metadata_command_for_test(&map, PgId::new(object_pg_id), &bucket).is_none()
+        );
+        assert_bucket_write_reservations_released(&map, &bucket);
+        for node_id in node_ids {
+            let object_pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg_id)
+                .unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_version(
+                    &*object_pg,
+                    &bucket,
+                    &key,
+                    older.version_id,
+                ),
+                Err(crate::MetadataError::ObjectNotFound)
+            ));
+            let visible = crate::PgMetadataStore::get_object_meta(&*object_pg, &bucket, &key)
+                .expect("current version should remain visible");
+            assert_eq!(visible.version_id(), current.version_id);
+        }
+        assert_clean_metadata_command_stream(&map, &[1, object_pg_id]);
+    }
+
+    #[test]
+    fn begin_bucket_delete_drains_pending_lifecycle_expired_delete_marker_cleanup() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg_id, data_pg_id) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "delete-lifecycle-marker-");
+            let key = key_for_object_pg(topology, &bucket, 2, "marker-");
+            (bucket, key, 2, 3)
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, object_pg_id, NodeId::new(2));
+        set_route_primary(&mut map, data_pg_id, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket_with_versioning(
+            &cluster,
+            &bucket,
+            crate::BucketVersioningState::Enabled,
+        );
+        put_test_lifecycle(&cluster, &bucket);
+        let live = write_committed_direct_segment_for_with_versioning(
+            &cluster,
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Enabled,
+            [0xb1; 16],
+            [0xb2; 16],
+            b"live behind marker",
+        );
+        let marker = cluster
+            .insert_current_delete_marker_if(
+                &bucket,
+                &key,
+                crate::OwnerIdentity::from_principal("owner"),
+                |_| Ok::<_, ()>(()),
+            )
+            .unwrap()
+            .unwrap();
+
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let marker_version = marker.version_id;
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::DeleteObjectVersion(delete)
+                        if delete.bucket == hook_bucket
+                            && delete.key == hook_key
+                            && delete.version_id == marker_version
+                            && matches!(delete.target, DeleteObjectVersionTarget::DeleteMarker)
+                            && node_id == NodeId::new(2)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected lifecycle delete-marker cleanup apply failure",
+                            source: std::io::Error::other(
+                                "injected lifecycle delete-marker cleanup apply failure",
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .delete_expired_delete_marker_if_due(&bucket, &key, marker.version_id, |_, _| {
+                Ok::<_, ()>(true)
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected lifecycle delete-marker cleanup apply failure",
+                    ..
+                })
+            ),
+            "expected injected lifecycle delete-marker cleanup failure, got {err:?}"
+        );
+        drop(hook_guard);
+        assert!(!fail_once.load(Ordering::SeqCst));
+        assert!(
+            pending_metadata_command_for_test(&map, PgId::new(object_pg_id), &bucket).is_some(),
+            "partial lifecycle delete-marker cleanup command should remain pending"
+        );
+
+        let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketWriteDrainError::Metadata(crate::MetadataError::BucketNotEmpty)
+            ),
+            "DeleteBucket should still see the revealed live version after draining marker cleanup, got {err:?}"
+        );
+        assert!(
+            pending_metadata_command_for_test(&map, PgId::new(object_pg_id), &bucket).is_none()
+        );
+        assert_bucket_write_reservations_released(&map, &bucket);
+        for node_id in node_ids {
+            let object_pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg_id)
+                .unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_version(
+                    &*object_pg,
+                    &bucket,
+                    &key,
+                    marker.version_id,
+                ),
+                Err(crate::MetadataError::ObjectNotFound)
+            ));
+            let visible = crate::PgMetadataStore::get_object_meta(&*object_pg, &bucket, &key)
+                .expect("live version should be revealed after marker cleanup");
+            assert_eq!(visible.version_id(), live.version_id);
+        }
+        assert_clean_metadata_command_stream(&map, &[1, object_pg_id]);
+    }
+
+    #[test]
+    fn stale_delete_drain_identity_cannot_clear_recreated_bucket_drain() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "stale-delete-drain-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        cluster.begin_bucket_delete(&bucket).unwrap();
+
+        let old_drain = {
+            let node = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg_id = 1;
+            let pg = node.get_pg(pg_id).unwrap();
+            let record = crate::PgMetadataStore::durable_bucket_write_drain(&*pg, &bucket)
+                .unwrap()
+                .expect("DeleteBucket begin should leave a terminal durable drain");
+            super::super::DurableBucketWriteDrain {
+                node: Arc::clone(node),
+                pg_id,
+                record,
+            }
+        };
+        assert_eq!(
+            cluster.try_finalize_bucket_delete(&bucket).unwrap(),
+            crate::BucketDeleteFinalizeOutcome::Finalized
+        );
+        create_test_bucket(&cluster, &bucket);
+
+        let new_drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
+            super::super::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
+            super::super::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
+                panic!("recreated active bucket should acquire a fresh delete drain")
+            }
+        };
+        assert_ne!(
+            old_drain.record.bucket_execution_generation,
+            new_drain.record.bucket_execution_generation,
+            "delete/recreate must produce a distinct bucket incarnation"
+        );
+
+        let err = cluster
+            .clear_durable_bucket_delete_drain(&old_drain)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketWriteDrainError::Metadata(
+                    crate::MetadataError::BucketWriteDrainNotFound { .. }
+                )
+            ),
+            "stale drain cleanup should not match the recreated bucket, got {err:?}"
+        );
+        {
+            let pg = map
+                .node(NodeId::new(1))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            let current = crate::PgMetadataStore::durable_bucket_write_drain(&*pg, &bucket)
+                .unwrap()
+                .expect("fresh drain should remain installed");
+            assert_eq!(current.drain_id, new_drain.record.drain_id);
+            assert_eq!(
+                current.bucket_execution_generation,
+                new_drain.record.bucket_execution_generation
+            );
+        }
+
+        cluster
+            .clear_durable_bucket_delete_drain(&new_drain)
+            .unwrap();
+        let info = cluster.head_bucket_info(&bucket).unwrap();
+        assert_eq!(info.state, crate::BucketState::Active);
+    }
+
+    #[test]
+    fn begin_bucket_delete_recovers_expired_durable_drain_after_reopen() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "expired-delete-drain-")
+        };
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let old_drain_id = "expired-delete-drain-before-reopen";
+        {
+            let pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            let now = crate::clock::current_time_millis();
+            crate::PgMetadataStore::begin_durable_bucket_write_drain(
+                &*pg,
+                &bucket,
+                old_drain_id,
+                "dead-delete-owner",
+                crate::ClusterEpoch::INITIAL,
+                now.saturating_sub(10),
+                Some(now.saturating_sub(1)),
+            )
+            .unwrap();
+            crate::PgMetadataStore::begin_bucket_write_drain(&*pg, &bucket).unwrap();
+            let blocked = crate::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket).unwrap();
+            assert!(blocked.write_reservations_blocked);
+        }
+        drop(cluster);
+        drop(map);
+
+        let reopened =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
+        let reopened_cluster =
+            crate::StorageCluster::from_local_map(Arc::clone(&reopened)).unwrap();
+        reopened_cluster.begin_bucket_delete(&bucket).unwrap();
+
+        {
+            let pg = reopened
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            let current = crate::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket).unwrap();
+            assert_eq!(current.state, crate::BucketState::Deleting);
+            assert!(current.write_reservations_blocked);
+            let drain = crate::PgMetadataStore::durable_bucket_write_drain(&*pg, &bucket)
+                .unwrap()
+                .expect(
+                    "DeleteBucket should leave a terminal drain after recovering the expired drain",
+                );
+            assert_ne!(
+                drain.drain_id, old_drain_id,
+                "expired pre-reopen drain must be rolled back by exact identity"
+            );
+        }
+        assert!(
+            matches!(
+                reopened_cluster
+                    .begin_durable_bucket_delete_drain(&bucket)
+                    .unwrap(),
+                super::super::DurableBucketDeleteDrainBegin::AlreadyDeleting
+            ),
+            "recovered terminal delete should be idempotent after reopen"
+        );
+        assert_clean_metadata_command_stream(&reopened, &[1]);
     }
 
     #[test]
