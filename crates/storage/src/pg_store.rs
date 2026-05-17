@@ -9459,6 +9459,7 @@ impl PgMetadataStore for PgStore {
         )
     }
 
+    #[cfg(test)]
     fn acquire_bucket_write_reservation(
         &self,
         name: &BucketName,
@@ -9485,6 +9486,7 @@ impl PgMetadataStore for PgStore {
         Err(bucket_not_found(name.as_str()))
     }
 
+    #[cfg(test)]
     fn release_bucket_write_reservation(&self, name: &BucketName) -> Result<(), MetadataError> {
         let updated = self
             .conn
@@ -9735,23 +9737,6 @@ impl PgMetadataStore for PgStore {
                             reservation_id: reservation_id.to_string(),
                         });
                     }
-                    let released = self
-                        .conn
-                        .execute(
-                            "UPDATE buckets \
-                             SET active_write_reservations = active_write_reservations - 1 \
-                             WHERE name = ?1 AND active_write_reservations > 0",
-                            params![name.as_str()],
-                        )
-                        .map_err(|source| MetadataError::Db {
-                            context: "release metadata command bucket write reservation counter",
-                            source,
-                        })?;
-                    if released != 1 {
-                        return Err(MetadataError::BucketWriteReservationConflict {
-                            reservation_id: reservation_id.to_string(),
-                        });
-                    }
                 }
                 Some(_) => {
                     return Err(MetadataError::BucketWriteReservationConflict {
@@ -9759,36 +9744,7 @@ impl PgMetadataStore for PgStore {
                     });
                 }
                 None => {
-                    let info = match self.head_bucket_raw(name) {
-                        Ok(info) => info,
-                        Err(MetadataError::BucketNotFound { .. }) => return Ok(()),
-                        Err(error) => return Err(error),
-                    };
-                    let durable_count: u32 = self
-                        .conn
-                        .query_row(
-                            "SELECT COUNT(*) FROM bucket_write_reservations WHERE bucket_name = ?1",
-                            params![name.as_str()],
-                            |row| row.get::<_, u32>(0),
-                        )
-                        .map_err(|source| MetadataError::Db {
-                            context: "count metadata command bucket write reservations",
-                            source,
-                        })?;
-                    if info.active_write_reservations > durable_count {
-                        self.conn
-                            .execute(
-                                "UPDATE buckets \
-                                 SET active_write_reservations = active_write_reservations - 1 \
-                                 WHERE name = ?1 AND active_write_reservations > 0",
-                                params![name.as_str()],
-                            )
-                            .map_err(|source| MetadataError::Db {
-                                context:
-                                    "release idempotent metadata command bucket write reservation counter",
-                                source,
-                            })?;
-                    }
+                    return Ok(());
                 }
             }
             Ok(())
@@ -10039,31 +9995,6 @@ impl PgMetadataStore for PgStore {
                 })?;
             if deleted == 0 {
                 return Ok(None);
-            }
-            if bucket.write_reservations_blocked {
-                self.conn
-                    .execute(
-                        "UPDATE buckets \
-                         SET write_reservations_blocked = 0 \
-                         WHERE name = ?1 AND state = ?2 AND bucket_execution_generation = ?3",
-                        params![
-                            name.as_str(),
-                            BucketState::Active as u8,
-                            i64::try_from(bucket.bucket_execution_generation).map_err(
-                                |source| MetadataError::Db {
-                                    context:
-                                        "clear expired durable bucket write drain bucket generation",
-                                    source: rusqlite::Error::ToSqlConversionFailure(Box::new(
-                                        source,
-                                    )),
-                                },
-                            )?,
-                        ],
-                    )
-                    .map_err(|source| MetadataError::Db {
-                        context: "clear expired durable bucket write drain (open bucket)",
-                        source,
-                    })?;
             }
             Ok(Some(record))
         })();

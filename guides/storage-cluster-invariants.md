@@ -56,11 +56,13 @@ Every public `StorageCluster` operation must fit one of these classes:
   after `MarkBucketDeleting`, write drain, visible-data checks, and reclaim
   checks have completed. The PgStore implementation must fail closed if the
   local row still exists in any state other than `Deleting`.
-- Bucket write-drain counters are a Phase 9 fence/lease decision. Until then,
-  `write_reservations_blocked` and `active_write_reservations` stay outside the
-  canonical metadata digest and may only be changed by the explicit
-  write-drain/reservation helpers. The Phase 9.4 target model and publisher
-  audit live in [bucket-write-drain.md](bucket-write-drain.md).
+- Bucket write-drain authority is durable and bucket-PG-primary owned.
+  Production write admission uses `bucket_write_reservations`; DeleteBucket
+  begin uses `bucket_write_drains`. The legacy bucket-row counters,
+  `write_reservations_blocked` and `active_write_reservations`, are retired
+  compatibility/test-only state during Phase 9.4.6 removal and are not
+  production fence authority. The Phase 9.4 model and publisher audit live in
+  [bucket-write-drain.md](bucket-write-drain.md).
 - Best-effort cleanup may suppress cleanup errors, but typed route/control-plane
   errors must not collapse into `NotFound` or generic IO before the suppression
   point.

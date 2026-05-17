@@ -3273,13 +3273,13 @@ Proposed subphases:
      bucket write reservations, survive process restart, and resume or roll
      back without depending on a local condition variable, same-process waiter,
      or process-local counter.
-   - current problem:
-     - `begin_bucket_delete` still starts with
-       `SharedStorageNode::begin_bucket_write_drain`, which writes
-       `buckets.write_reservations_blocked` and waits for
+   - original problem addressed by Phase 9.4:
+     - `begin_bucket_delete` started with
+       `SharedStorageNode::begin_bucket_write_drain`, which wrote
+       `buckets.write_reservations_blocked` and waited for
        `active_write_reservations` through node-local locking/wakeup
-     - write reservations are bucket-row counters, not command-stream state and
-       not durable ownership records; they cannot distinguish "active in another
+     - write reservations were bucket-row counters, not command-stream state and
+       not durable ownership records; they could not distinguish "active in another
        process" from "process crashed while holding the reservation"
      - a drain fence can be temporary: DeleteBucket may discover visible data
        and roll back the fence. That means a crash after blocking writes but
@@ -3420,15 +3420,12 @@ Proposed subphases:
    3. Phase 9.4.3: move writer acquire/release to `StorageCluster`
       - status: complete. `StorageCluster::with_bucket_write_snapshot` now
         acquires and releases exact durable `bucket_write_reservations` rows on
-        the bucket-PG primary. As a transitional bridge while DeleteBucket still
-        uses the legacy drain, the cluster wrapper also holds the old
-        `active_write_reservations` counter and releases both identities on exit;
-        the old `SharedStorageNode` anonymous-counter snapshot wrapper is
-        test-only. The stream PutObject and CreateMultipartUpload custom
+        the bucket-PG primary. The old `SharedStorageNode` anonymous-counter
+        snapshot wrapper is test-only. The stream PutObject and CreateMultipartUpload custom
         snapshot publishers use the cluster wrapper rather than the node-local
         counter path. Both request-level and low-level PutObject stream-create
-        publishers now hold a durable reservation and legacy-counter bridge
-        around command publication. Durable reservation
+        publishers now hold a durable reservation around command publication.
+        Durable reservation
         IDs use 128 bits of random entropy instead of a per-handle counter, so
         independent `StorageCluster` handles and reopen do not collide on
         `(bucket, reservation_id)`. PutObject stream-create commands now carry
@@ -3473,10 +3470,8 @@ Proposed subphases:
         not to publish a proofless command. Phase 9.4.3 closeout audited the
         proof-bearing writer command surface and added a boundary guard for
         proof-optional publishing fields. The remaining old anonymous-counter
-        and drain primitives are not writer-publish authority anymore, but they
-        remain production-visible for DeleteBucket begin/finalize until Phase
-        9.4.4 moves the delete state machine and Phase 9.4.6 removes the old
-        counter authority.
+        and drain primitives are not writer-publish authority anymore, and Phase
+        9.4.6 removes the old counter fields and low-level APIs.
       - introduce a cluster-level bucket write reservation guard that captures:
         bucket PG id, bucket name, reservation id, owner token, acquire epoch,
         and the node/store that accepted the reservation
@@ -3515,10 +3510,10 @@ Proposed subphases:
         - if release fails after the caller action has returned, preserve the
           caller error ordering but leave a typed trace and retryable cleanup
           signal for the reservation
-      - old anonymous-counter cleanup is deferred: after Phase 9.4.4 no longer
-        uses `SharedStorageNode::begin_bucket_write_drain` for DeleteBucket, and
-        after Phase 9.4.6 removes the legacy counter bridge, remove or gate
-        production access to `SharedStorageNode::with_bucket_write_snapshot`,
+      - old anonymous-counter cleanup: Phase 9.4.4 moved DeleteBucket off
+        `SharedStorageNode::begin_bucket_write_drain`, and Phase 9.4.6 retires
+        the remaining counter-based write-drain path. Remove or gate production access to
+        `SharedStorageNode::with_bucket_write_snapshot`,
         `PgMetadataStore::acquire_bucket_write_reservation`,
         `release_bucket_write_reservation`, `begin_bucket_write_drain`, and
         `end_bucket_write_drain`.
@@ -3526,16 +3521,14 @@ Proposed subphases:
    <a id="phase-944-make-deletebucket-begin-durable-and-recoverable"></a>
    4. Phase 9.4.4: make DeleteBucket begin durable and recoverable
       - status: complete. DeleteBucket begin now uses the bucket-PG durable
-        drain as its correctness authority, keeps the legacy drain only as a
-        transitional writer bridge, drains object-PG work while waiting for
-        durable reservations to empty, handles expired no-waiter drains
+        drain as its correctness authority, drains object-PG work while waiting
+        for durable reservations to empty, handles expired no-waiter drains
         conservatively, and has regression coverage for every required test
         item below. The first implementation slice added a
         cluster-owned durable delete-drain helper using `bucket_write_drains`,
         installed that durable drain at the start of `begin_bucket_delete`, and
         rolls it back on pre-terminal failure while leaving it terminal after
-        successful `MarkBucketDeleting`. The legacy bridge drain now only
-        blocks new legacy writers; durable reservation waiting drains
+        successful `MarkBucketDeleting`. Durable reservation waiting drains
         bucket-relevant object-PG pending work each pass so command-owned
         reservation proofs can converge and release. `begin_bucket_delete`
         also recognizes an already-Deleting bucket before trying to install a
@@ -3563,8 +3556,8 @@ Proposed subphases:
         because durable drain cleanup is matched by exact drain identity and
         bucket execution generation. The sixth slice added conservative
         no-waiter recovery for durable drains with an explicit expired lease:
-        a restarted DeleteBucket can atomically roll back the expired drain and
-        legacy bridge from fresh bucket state before installing its own drain.
+        a restarted DeleteBucket can atomically roll back the expired durable
+        drain from fresh bucket state before installing its own drain.
         The seventh slice pinned primary-last `MarkBucketDeleting` reopen
         convergence: a durable drain plus primary pending slot survives the
         crash boundary, open-time recovery converges the command, and the
@@ -3653,13 +3646,11 @@ Proposed subphases:
            command stream; once that command is terminal, the drain is terminal
            too and new writers fail through normal missing/deleting bucket
            semantics.
-        6. Keep the legacy `active_write_reservations` bridge only as
-           transitional compatibility. DeleteBucket must stop depending on the
-           node-local condition variable, but writers still acquire the legacy
-           counter until Phase 9.4.6 removes the old authority. After durable
-           reservations reach empty, a nonzero legacy counter should be treated
-           as a transitional integrity condition to cover with tests rather than
-           as the primary wait primitive.
+        6. Remove the legacy `active_write_reservations` bridge. DeleteBucket
+           must not depend on the node-local condition variable, and writers
+           must acquire only durable bucket write reservation rows. During the
+           Phase 9.4.6 removal slice, any nonzero legacy counter is test-only
+           compatibility state, not production authority.
         7. Do not add broad stale-reservation reaping in the first slice. A
            reservation is not safely reapable while any pending object-PG
            command or accepted-but-not-converged object-PG log entry can

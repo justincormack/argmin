@@ -1547,23 +1547,11 @@ impl super::StorageCluster {
             None,
             target_context,
         )?;
-        if let Err(error) = PgMetadataStore::acquire_bucket_write_reservation(&*bucket_pg, bucket) {
-            let _ = PgMetadataStore::release_durable_bucket_write_reservation(
-                &*bucket_pg,
-                bucket,
-                &record.reservation_id,
-                &record.owner_token,
-                record.cluster_epoch,
-                record.bucket_execution_generation,
-            );
-            return Err(error.into());
-        }
         drop(bucket_pg);
         Ok(super::DurableBucketWriteReservation {
             node,
             pg_id,
             record,
-            legacy_counter_acquired: true,
         })
     }
 
@@ -1580,21 +1568,7 @@ impl super::StorageCluster {
             reservation.record.cluster_epoch,
             reservation.record.bucket_execution_generation,
         );
-        let legacy_result = if reservation.legacy_counter_acquired {
-            PgMetadataStore::release_bucket_write_reservation(
-                &*bucket_pg,
-                &reservation.record.bucket,
-            )
-        } else {
-            Ok(())
-        };
-        if legacy_result.is_ok() && reservation.legacy_counter_acquired {
-            reservation
-                .node
-                .notify_bucket_coordination_change(&reservation.record.bucket);
-        }
         durable_result?;
-        legacy_result?;
         Ok(())
     }
 
@@ -1870,13 +1844,6 @@ impl super::StorageCluster {
                 return Ok(());
             }
         };
-        let drain = match node.begin_bucket_write_drain_without_reservation_wait(bucket) {
-            Ok(drain) => drain,
-            Err(error) => {
-                self.rollback_durable_bucket_delete_drain(&durable_drain)?;
-                return Err(error);
-            }
-        };
         crate::node::maybe_run_after_begin_bucket_delete_drain_hook(bucket);
 
         let result = (|| loop {
@@ -2041,7 +2008,6 @@ impl super::StorageCluster {
         match result {
             Ok(()) => {
                 node.notify_bucket_coordination_change(bucket);
-                drain.persist();
                 let _ = observability::event(
                     super::TRACE_TARGET,
                     "bucket_delete_begin_done",

@@ -7,30 +7,27 @@ processes, restart, and PG-primary ownership.
 
 ## Current Authority
 
-The current write-drain path is mostly migrated for write admission and
-DeleteBucket begin:
+The current write-drain path uses durable coordination rows for production write
+admission and DeleteBucket begin:
 
 - `StorageCluster::with_bucket_write_snapshot` acquires a durable
   `bucket_write_reservations` row on the bucket-PG primary, loads the bucket
-  snapshot, runs the caller action, then releases that exact row. It also holds
-  the legacy `buckets.active_write_reservations` counter as a transitional
-  bridge until Phase 9.4.6 removes the old authority.
+  snapshot, runs the caller action, then releases that exact row.
 - The old `SharedStorageNode::with_bucket_write_snapshot` anonymous counter
   path is retained for tests only.
 - `StorageCluster::begin_bucket_delete` installs a durable
-  `bucket_write_drains` row on the bucket-PG primary, uses the legacy
-  `write_reservations_blocked` flag only as a transitional writer bridge,
-  drains bucket-relevant pending object commands while waiting for durable
-  reservations to empty, then either rolls back the durable drain by exact
-  identity or publishes terminal `MarkBucketDeleting`.
-- `SharedStorageNode::begin_bucket_write_drain` is still called by the cluster
-  DeleteBucket path to block legacy writers, but it is no longer the primary
-  multi-process correctness boundary.
+  `bucket_write_drains` row on the bucket-PG primary, drains bucket-relevant
+  pending object commands while waiting for durable reservations to empty, then
+  either rolls back the durable drain by exact identity or publishes terminal
+  `MarkBucketDeleting`.
+- The legacy bucket-row counters, `write_reservations_blocked` and
+  `active_write_reservations`, are unused compatibility/test-only state until
+  Phase 9.4.6 removes them.
 
-The remaining drain counters are anonymous. They do not identify the writer, the
+The retired drain counters are anonymous. They do not identify the writer, the
 bucket incarnation, the request class, or whether another process crashed while
-holding the reservation. They are therefore only a transitional compatibility
-bridge, not a multi-process correctness boundary.
+holding the reservation. They are therefore not a multi-process correctness
+boundary.
 
 ## Target Authority
 

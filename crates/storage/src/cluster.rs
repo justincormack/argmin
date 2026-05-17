@@ -514,7 +514,6 @@ pub(super) struct DurableBucketWriteReservation {
     node: Arc<SharedStorageNode>,
     pg_id: u32,
     record: BucketWriteReservationRecord,
-    legacy_counter_acquired: bool,
 }
 
 pub(super) struct DurableBucketWriteDrain {

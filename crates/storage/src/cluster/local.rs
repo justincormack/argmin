@@ -2020,7 +2020,7 @@ mod tests {
                 .unwrap()
                 .active_write_reservations,
             0,
-            "metadata command convergence must release the legacy bucket write counter"
+            "metadata command convergence must not depend on the legacy bucket write counter"
         );
     }
 
@@ -12170,7 +12170,7 @@ mod tests {
                 assert_eq!(reservations[0].cluster_epoch, crate::ClusterEpoch::INITIAL);
                 assert_eq!(reservations[0].operation_kind, "bucket-write-snapshot");
                 let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
-                assert_eq!(info.active_write_reservations, 1);
+                assert_eq!(info.active_write_reservations, 0);
                 drop(primary_pg);
 
                 second_cluster
@@ -12195,7 +12195,7 @@ mod tests {
                         );
                         let info =
                             crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
-                        assert_eq!(info.active_write_reservations, 2);
+                        assert_eq!(info.active_write_reservations, 0);
                         Ok::<(), ()>(())
                     })
                     .unwrap()
@@ -12214,7 +12214,7 @@ mod tests {
                 .unwrap();
                 assert_eq!(reservations.len(), 1);
                 let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
-                assert_eq!(info.active_write_reservations, 1);
+                assert_eq!(info.active_write_reservations, 0);
                 Ok::<(), ()>(())
             })
             .unwrap()
@@ -12280,7 +12280,7 @@ mod tests {
                 assert_eq!(reservations[0].operation_kind, "put-object-stream-create");
                 let info =
                     crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &hook_bucket).unwrap();
-                assert_eq!(info.active_write_reservations, 1);
+                assert_eq!(info.active_write_reservations, 0);
                 Ok(())
             }),
         );
@@ -12377,7 +12377,7 @@ mod tests {
                 .unwrap();
         assert_eq!(reservations.len(), 1);
         let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
-        assert_eq!(info.active_write_reservations, 1);
+        assert_eq!(info.active_write_reservations, 0);
         drop(primary_pg);
 
         drop(hook_guard);
@@ -12484,7 +12484,7 @@ mod tests {
         assert_eq!(reservations.len(), 1);
         assert_eq!(reservations[0].operation_kind, "put-object-stream-create");
         let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
-        assert_eq!(info.active_write_reservations, 1);
+        assert_eq!(info.active_write_reservations, 0);
         drop(primary_pg);
 
         drop(hook_guard);
@@ -12623,7 +12623,7 @@ mod tests {
             crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket)
                 .unwrap()
                 .active_write_reservations,
-            1
+            0
         );
     }
 
@@ -12727,7 +12727,7 @@ mod tests {
                 crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket)
                     .unwrap()
                     .active_write_reservations,
-                1
+                0
             );
             assert_eq!(
                 crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
@@ -12855,7 +12855,7 @@ mod tests {
             crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket)
                 .unwrap()
                 .active_write_reservations,
-            1
+            0
         );
         drop(primary_pg);
         let pending = pending_metadata_command_for_test(&map, PgId::new(1), &bucket)
@@ -12911,7 +12911,7 @@ mod tests {
                 crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket)
                     .unwrap()
                     .active_write_reservations,
-                1
+                0
             );
             primary_pg
                 .connection()
@@ -13040,7 +13040,7 @@ mod tests {
     }
 
     #[test]
-    fn low_level_put_object_stream_create_retries_temporary_drain() {
+    fn low_level_put_object_stream_create_retries_durable_delete_drain() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let ec_shape = EcShape { k: 2, m: 1 };
@@ -13059,7 +13059,12 @@ mod tests {
         create_test_bucket(&cluster, &bucket);
 
         let primary_node = Arc::clone(map.node(NodeId::new(1)).unwrap().storage_node());
-        let drain = primary_node.begin_bucket_write_drain(&bucket).unwrap();
+        let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
+            super::super::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
+            super::super::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
+                panic!("active test bucket should acquire a temporary durable delete drain")
+            }
+        };
         let retry_cluster = Arc::clone(&cluster);
         let retry_bucket = bucket.clone();
         let retry_key = key.clone();
@@ -13079,13 +13084,13 @@ mod tests {
         });
         started_rx.recv().unwrap();
         assert!(result_rx
-            .recv_timeout(std::time::Duration::from_millis(25))
+            .recv_timeout(std::time::Duration::from_millis(50))
             .is_err());
 
-        drop(drain);
+        cluster.clear_durable_bucket_delete_drain(&drain).unwrap();
         let result = result_rx
             .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("temporary drain should be retried after release");
+            .expect("temporary durable drain should be retried after release");
         result.unwrap();
         handle.join().unwrap();
 
@@ -14508,7 +14513,7 @@ mod tests {
                 crate::PgMetadataStore::head_bucket_raw(&*bucket_pg_store, &bucket)
                     .unwrap()
                     .active_write_reservations,
-                1
+                0
             );
         }
         let replica_upload = {
@@ -16274,7 +16279,7 @@ mod tests {
                 .unwrap()
                 .active_write_reservations,
             0,
-            "UploadPart stream-create command convergence must release the legacy bridge counter"
+            "UploadPart stream-create command convergence must not depend on the legacy bridge counter"
         );
     }
 
@@ -18487,7 +18492,7 @@ mod tests {
                 crate::PgMetadataStore::head_bucket_raw(&*bucket_pg_store, &bucket)
                     .unwrap()
                     .active_write_reservations,
-                1
+                0
             );
         }
         assert_stream_next_segment_vid(&map, NodeId::new(1), object_pg, &session_id, 2);
@@ -20827,7 +20832,7 @@ mod tests {
                 crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
                     .unwrap()
                     .active_write_reservations,
-                1
+                0
             );
         }
         {
@@ -21001,7 +21006,7 @@ mod tests {
                 crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
                     .unwrap()
                     .active_write_reservations,
-                1
+                0
             );
         }
         drop(cluster);

@@ -88,12 +88,14 @@ pub(crate) trait PgMetadataStore {
     ///
     /// Reservations fence bucket deletion while cross-PG write publication is
     /// in progress. Returns the current bucket metadata on success.
+    #[cfg(test)]
     fn acquire_bucket_write_reservation(
         &self,
         name: &BucketName,
     ) -> Result<BucketInfo, MetadataError>;
 
     /// Release a previously acquired bucket write reservation.
+    #[cfg(test)]
     fn release_bucket_write_reservation(&self, name: &BucketName) -> Result<(), MetadataError>;
 
     /// Acquire a durable bucket write reservation record for one bucket
@@ -142,9 +144,8 @@ pub(crate) trait PgMetadataStore {
     ///
     /// This is the terminal command cleanup path for commands that transfer a
     /// bucket write reservation into the metadata command stream. It releases
-    /// both the durable reservation row and the legacy active-write counter in
-    /// one PG transaction so a terminal command cannot lose its retry driver
-    /// while leaving the bucket fenced.
+    /// the durable reservation row in one PG transaction so a terminal command
+    /// cannot lose its retry driver while leaving the bucket fenced.
     fn release_metadata_command_bucket_write_reservation(
         &self,
         name: &BucketName,
