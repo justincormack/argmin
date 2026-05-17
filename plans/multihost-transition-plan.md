@@ -3539,7 +3539,11 @@ Proposed subphases:
         `HeadBucket` semantics. Targeted regressions cover non-empty rollback,
         terminal drain persistence/idempotent retry, durable-drain conflict
         after terminal delete begin, and an admitted writer that publishes
-        visible data after the delete drain starts.
+        visible data after the delete drain starts. The second slice added an
+        atomic bucket-control pending-slot install path for bucket versioning,
+        ACL, property, and subresource publishers; those commands are now
+        explicitly blocked by an active durable delete drain instead of being
+        allowed to publish behind the drain.
       - rewrite `begin_bucket_delete` as a bucket-PG-primary state machine:
         - drain/finish any pending bucket-PG command for the bucket
         - drain object-PG pending commands that can publish visible data or MPU

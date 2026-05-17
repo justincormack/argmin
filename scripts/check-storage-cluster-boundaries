@@ -272,6 +272,8 @@ pending_command_publishers=$(
 	            helper = "try_install_object_pg_pending_command_or_drain"
 	        } else if ($0 ~ /try_set_bucket_pg_pending_command_or_retry\(/) {
 	            helper = "try_set_bucket_pg_pending_command_or_retry"
+	        } else if ($0 ~ /try_set_bucket_control_pending_command_or_retry\(/) {
+	            helper = "try_set_bucket_control_pending_command_or_retry"
 	        } else if ($0 ~ /install_snapshot_sensitive_metadata_command_or_drain\(/) {
 	            helper = "install_snapshot_sensitive_metadata_command_or_drain"
 	        } else if ($0 ~ /set_pending_metadata_command_for_bucket\(/) {
@@ -285,6 +287,7 @@ pending_command_publishers=$(
 	            || current_fn == "try_set_object_pg_pending_command_or_drain" \
 	            || current_fn == "try_install_object_pg_pending_command_or_drain" \
 	            || current_fn == "try_set_bucket_pg_pending_command_or_retry" \
+	            || current_fn == "try_set_bucket_control_pending_command_or_retry" \
 	            || current_fn == "install_snapshot_sensitive_metadata_command_or_drain" \
 	            || current_fn == "try_set_pending_metadata_command_for_bucket") {
             next
@@ -304,7 +307,9 @@ pending_command_publishers=$(
 # lower-level set/try_set helpers are reserved for apply-validated publishers,
 # allocator cleanup, MatchingOutcomeRetry/terminal-session retry publishers
 # with same-command install-race coverage, and explicitly documented
-# non-multipart transitional paths.
+# non-multipart transitional paths. Bucket control-plane publishers use the
+# bucket-control helper so active durable DeleteBucket drains block publication
+# atomically with pending-slot installation.
 expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:abort_stream_upload_session:try_install_object_pg_pending_command_or_drain
 1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards<E>:try_install_object_pg_pending_command_or_drain
@@ -332,10 +337,10 @@ expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster/request_ops.rs:finalize_put_object_stream<T, E>:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:finalize_upload_part_stream<T, E>:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:insert_current_delete_marker_if<T, E>:install_snapshot_sensitive_metadata_command_or_drain
-1 crates/storage/src/cluster/request_ops.rs:put_bucket_acl_and_load_info:try_set_bucket_pg_pending_command_or_retry
-1 crates/storage/src/cluster/request_ops.rs:put_bucket_property_command_and_load_info:try_set_bucket_pg_pending_command_or_retry
-1 crates/storage/src/cluster/request_ops.rs:put_bucket_subresource_command_and_load_info:try_set_bucket_pg_pending_command_or_retry
-1 crates/storage/src/cluster/request_ops.rs:put_bucket_versioning_and_load_info:try_set_bucket_pg_pending_command_or_retry
+1 crates/storage/src/cluster/request_ops.rs:put_bucket_acl_and_load_info:try_set_bucket_control_pending_command_or_retry
+1 crates/storage/src/cluster/request_ops.rs:put_bucket_property_command_and_load_info:try_set_bucket_control_pending_command_or_retry
+1 crates/storage/src/cluster/request_ops.rs:put_bucket_subresource_command_and_load_info:try_set_bucket_control_pending_command_or_retry
+1 crates/storage/src/cluster/request_ops.rs:put_bucket_versioning_and_load_info:try_set_bucket_control_pending_command_or_retry
 1 crates/storage/src/cluster/request_ops.rs:put_object_metadata_if<T, E>:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:reclaim_object_payload_if_unleased:try_install_object_pg_pending_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:reserve_completed_multipart_upload_order:try_set_bucket_pg_pending_command_or_retry
@@ -410,6 +415,7 @@ expected_metadata_command_conflict_uses=$(cat <<'EOF'
 1 crates/storage/src/cluster/request_ops.rs:next_bucket_metadata_command_id_or_drain:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:put_object_metadata_if<T, E>:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:reclaim_object_payload_if_unleased:metadata-command-log-conflict
+1 crates/storage/src/cluster/request_ops.rs:try_set_bucket_control_pending_command_or_retry:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:try_set_bucket_pg_pending_command_or_retry:metadata-command-log-conflict
 EOF
 )

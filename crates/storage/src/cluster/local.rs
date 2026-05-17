@@ -1946,8 +1946,8 @@ mod tests {
         CommitMultipartObjectCommand, CommitStreamPartCommand, CreateBucketCommand,
         MarkBucketDeletingCommand, MetadataCommandEnvelope, MetadataCommandId,
         MetadataCommandLogIndex, MetadataCommandPayload, PutBucketAclCommand,
-        PutBucketVersioningCommand, PutObjectMetadataCommand, PutObjectMetadataMutation,
-        ReserveObjectGenerationCommand,
+        PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
+        PutObjectMetadataMutation, ReserveObjectGenerationCommand,
     };
     use proptest::prelude::*;
     use proptest::test_runner::{TestCaseError, TestCaseResult};
@@ -29728,6 +29728,126 @@ mod tests {
             .is_none(),
             "finalization should prune routed completed-upload tombstones"
         );
+    }
+
+    #[test]
+    fn bucket_control_plane_pending_install_waits_behind_durable_delete_drain() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "control-plane-drain-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let pg_id = PgId::new(1);
+        let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+        let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
+            super::super::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
+            super::super::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
+                panic!("fresh active bucket should acquire delete drain")
+            }
+        };
+
+        let versioning_command_id = MetadataCommandId::new(
+            crate::ClusterEpoch::INITIAL,
+            pg_id,
+            MetadataCommandLogIndex::new(2).unwrap(),
+        );
+        let versioning_command = {
+            let bucket_pg = primary.get_pg(pg_id.get()).unwrap();
+            let current = crate::PgMetadataStore::head_bucket_record_raw(&*bucket_pg, &bucket)
+                .unwrap()
+                .with_execution_generation(
+                    bucket_pg
+                        .next_bucket_execution_generation_candidate()
+                        .unwrap(),
+                );
+            MetadataCommandEnvelope::new(
+                versioning_command_id,
+                MetadataCommandPayload::PutBucketVersioning(
+                    PutBucketVersioningCommand::from_bucket(
+                        current,
+                        crate::BucketVersioningState::Enabled,
+                    ),
+                ),
+            )
+        };
+        assert!(
+            !cluster
+                .try_set_bucket_control_pending_command_or_retry(
+                    pg_id,
+                    &bucket,
+                    &versioning_command
+                )
+                .unwrap(),
+            "versioning command must not install while a durable delete drain is active"
+        );
+        assert!(
+            pending_metadata_command_for_test(&map, pg_id, &bucket).is_none(),
+            "blocked bucket control-plane command must not leave a pending slot"
+        );
+
+        let lifecycle_command_id = MetadataCommandId::new(
+            crate::ClusterEpoch::INITIAL,
+            pg_id,
+            MetadataCommandLogIndex::new(2).unwrap(),
+        );
+        let lifecycle_command = {
+            let bucket_pg = primary.get_pg(pg_id.get()).unwrap();
+            let generation = bucket_pg
+                .next_bucket_execution_generation_candidate()
+                .unwrap();
+            MetadataCommandEnvelope::new(
+                lifecycle_command_id,
+                MetadataCommandPayload::PutBucketSubresource(PutBucketSubresourceCommand::new(
+                    bucket.clone(),
+                    BucketSubresourceMutation::Put {
+                        kind: crate::BucketSubresourceKind::Lifecycle,
+                        body: "<LifecycleConfiguration/>".to_string(),
+                        aux: crate::BucketSubresourceAux::None,
+                    },
+                    generation,
+                )),
+            )
+        };
+        assert!(
+            !cluster
+                .try_set_bucket_control_pending_command_or_retry(pg_id, &bucket, &lifecycle_command)
+                .unwrap(),
+            "lifecycle command must not install while a durable delete drain is active"
+        );
+        assert!(
+            pending_metadata_command_for_test(&map, pg_id, &bucket).is_none(),
+            "blocked lifecycle command must not leave a pending slot"
+        );
+
+        cluster.clear_durable_bucket_delete_drain(&drain).unwrap();
+        let versioned = cluster
+            .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+            .unwrap();
+        assert_eq!(versioned.versioning, crate::BucketVersioningState::Enabled);
+        let lifecycle = cluster
+            .put_bucket_subresource_and_load_info(
+                &bucket,
+                crate::PutBucketSubresource {
+                    kind: crate::BucketSubresourceKind::Lifecycle,
+                    body: "<LifecycleConfiguration/>",
+                    aux: crate::BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+        assert!(lifecycle.bucket_lifecycle_present);
     }
 
     #[test]

@@ -1227,6 +1227,50 @@ impl super::StorageCluster {
         }
     }
 
+    pub(super) fn try_set_bucket_control_pending_command_or_retry(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let pg = primary.storage_node().get_pg(pg_id.get())?;
+        match pg.try_insert_bucket_control_pending_metadata_command_slot(
+            primary.node_id().as_u32(),
+            command,
+            bucket,
+        ) {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                drop(pg);
+                if let Some(pending) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+                    let pending_bucket = Self::metadata_command_bucket_name(&pending).clone();
+                    self.drain_pending_metadata_command_pg_slot(pg_id, &pending_bucket, &pending)?;
+                    return Ok(false);
+                }
+
+                let pg = primary.storage_node().get_pg(pg_id.get())?;
+                if PgMetadataStore::durable_bucket_write_drain(&*pg, bucket)?.is_some() {
+                    drop(pg);
+                    self.wait_for_durable_bucket_write_drain(bucket)?;
+                    return Ok(false);
+                }
+                Ok(false)
+            }
+            Err(StoreError::MetadataCommandLogConflict { .. }) => {
+                drop(pg);
+                if let Some(pending) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+                    let pending_bucket = Self::metadata_command_bucket_name(&pending).clone();
+                    self.drain_pending_metadata_command_pg_slot(pg_id, &pending_bucket, &pending)?;
+                }
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn finish_pending_command_for_completed_multipart_order(
         &self,
         pg_id: PgId,
@@ -2414,7 +2458,7 @@ impl super::StorageCluster {
                     ),
                 );
                 drop(bucket_pg);
-                if !self.try_set_bucket_pg_pending_command_or_retry(pg_id, bucket, &command)? {
+                if !self.try_set_bucket_control_pending_command_or_retry(pg_id, bucket, &command)? {
                     continue;
                 }
                 (command, true)
@@ -2597,7 +2641,7 @@ impl super::StorageCluster {
                     )),
                 );
                 drop(bucket_pg);
-                if !self.try_set_bucket_pg_pending_command_or_retry(pg_id, bucket, &command)? {
+                if !self.try_set_bucket_control_pending_command_or_retry(pg_id, bucket, &command)? {
                     continue;
                 }
                 (command, true)
@@ -2696,7 +2740,7 @@ impl super::StorageCluster {
                     ),
                 );
                 drop(bucket_pg);
-                if !self.try_set_bucket_pg_pending_command_or_retry(pg_id, bucket, &command)? {
+                if !self.try_set_bucket_control_pending_command_or_retry(pg_id, bucket, &command)? {
                     continue;
                 }
                 (command, true)
@@ -2811,7 +2855,7 @@ impl super::StorageCluster {
                         bucket_execution_generation,
                     )),
                 );
-                if !self.try_set_bucket_pg_pending_command_or_retry(pg_id, bucket, &command)? {
+                if !self.try_set_bucket_control_pending_command_or_retry(pg_id, bucket, &command)? {
                     continue;
                 }
                 (command, true)

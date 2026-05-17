@@ -1640,6 +1640,55 @@ impl PgStore {
         })
     }
 
+    pub(crate) fn try_insert_bucket_control_pending_metadata_command_slot(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+        bucket: &BucketName,
+    ) -> Result<bool, StoreError> {
+        if command.id().pg_id().get() != self.pg_id {
+            return Err(StoreError::MetadataCommandWrongPg {
+                node_id,
+                command_pg_id: command.id().pg_id().get(),
+                target_pg_id: self.pg_id,
+                cluster_epoch: command.id().cluster_epoch(),
+            });
+        }
+        if self
+            .load_metadata_command_log_entry(
+                "check bucket control pending metadata command slot log entry",
+                command.id().cluster_epoch(),
+                command.id().pg_id(),
+                command.id().log_index(),
+            )?
+            .is_some()
+        {
+            return Err(self.metadata_command_log_conflict(node_id, command));
+        }
+
+        let command_bytes = command.command_bytes();
+        let inserted = self.execute_cached(
+            "INSERT INTO metadata_command_pending_slot \
+             (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, scope_bucket) \
+             SELECT 0, ?1, ?2, ?3, ?4, ?5, ?6 \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM bucket_write_drains WHERE bucket_name = ?7 \
+             ) \
+             ON CONFLICT(singleton) DO NOTHING",
+            params![
+                command.id().cluster_epoch().get() as i64,
+                command.id().pg_id().get() as i64,
+                command.id().log_index().get() as i64,
+                command.checksum_crc64() as i64,
+                command_bytes,
+                bucket.as_str(),
+                bucket.as_str(),
+            ],
+            "insert bucket control pending metadata command slot",
+        )?;
+        Ok(inserted == 1)
+    }
+
     pub(crate) fn remove_pending_metadata_command_slot(
         &self,
         node_id: u32,
