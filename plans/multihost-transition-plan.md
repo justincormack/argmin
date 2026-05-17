@@ -3543,7 +3543,12 @@ Proposed subphases:
         atomic bucket-control pending-slot install path for bucket versioning,
         ACL, property, and subresource publishers; those commands are now
         explicitly blocked by an active durable delete drain instead of being
-        allowed to publish behind the drain.
+        allowed to publish behind the drain. The third slice added focused
+        DeleteBucket/object-delete drain regressions: a pending versioned
+        delete-marker insertion is drained before the emptiness check and
+        correctly returns `BucketNotEmpty`, while a pending specific-version
+        delete that removes the last visible version is drained before
+        `MarkBucketDeleting` is published.
       - rewrite `begin_bucket_delete` as a bucket-PG-primary state machine:
         - drain/finish any pending bucket-PG command for the bucket
         - drain object-PG pending commands that can publish visible data or MPU
