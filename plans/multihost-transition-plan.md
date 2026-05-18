@@ -3725,7 +3725,7 @@ Proposed subphases:
       - status: complete. Removed `write_reservations_blocked` and
         `active_write_reservations` from bucket schema, bucket row types, and
         command-owned bucket projections.
-      - update
+      - status: complete. Updated
         [metadata-model.md](../guides/metadata-model.md) and
         [storage-cluster-invariants.md](../guides/storage-cluster-invariants.md):
         - bucket write-drain state is no longer an unresolved Phase 9
