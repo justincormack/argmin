@@ -85,15 +85,13 @@ command-owned durable serving, in-progress, and cleanup metadata:
 - `stream_upload_segments`
 - `stream_uploads`
 
-The legacy bucket-row write-drain counters, `write_reservations_blocked` and
-`active_write_reservations`, remain transitional Phase 9 compatibility state.
-The Phase 9.4 replacement rows, `bucket_write_reservations` and
-`bucket_write_drains`, are bucket-PG-primary coordination authority, not
-replica-wide command-owned metadata. They are therefore intentionally outside
-the canonical full-PG command-state digest until Phase 9 either replicates them
-through the command stream or defines a separate primary-owned coordination
-integrity record. The Phase 9.4 replacement model and current publisher audit
-are tracked in [bucket-write-drain.md](bucket-write-drain.md).
+The Phase 9.4 rows, `bucket_write_reservations` and `bucket_write_drains`, are
+bucket-PG-primary coordination authority, not replica-wide command-owned
+metadata. They are therefore intentionally outside the canonical full-PG
+command-state digest until Phase 9 either replicates them through the command
+stream or defines a separate primary-owned coordination integrity record. The
+Phase 9.4 replacement model and current publisher audit are tracked in
+[bucket-write-drain.md](bucket-write-drain.md).
 
 The full-PG encoding starts with a stable domain/version header. Each included
 table digest encodes explicit table and column names, filter identity, row

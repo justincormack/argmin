@@ -51,7 +51,7 @@ const TRACE_TARGET: &str = "storage";
 
 const LIFECYCLE_SUBRESOURCE_KIND_SQL: i64 = BucketSubresourceKind::Lifecycle as u8 as i64;
 const BUCKET_INFO_SELECT: &str = "\
-SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, \
+SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, \
        public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls_mode, \
        EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 4 AND body IS NOT NULL) AS bucket_policy_present, \
        bucket_policy_public, bucket_policy_generation, \
@@ -59,7 +59,7 @@ SELECT name, owner_principal, owner_canonical_id, created_at, region, state, ver
        bucket_lifecycle_generation, bucket_execution_generation, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
 FROM buckets";
 const BUCKET_INFO_BY_NAME_SELECT: &str = "\
-SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, \
+SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, \
        public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls_mode, \
        EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 4 AND body IS NOT NULL) AS bucket_policy_present, \
        bucket_policy_public, bucket_policy_generation, \
@@ -68,7 +68,7 @@ SELECT name, owner_principal, owner_canonical_id, created_at, region, state, ver
 FROM buckets WHERE name = ?1";
 
 const BUCKET_RECORD_BY_NAME_SELECT: &str = "\
-SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, \
+SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, \
        public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls_mode, \
        bucket_policy_public, bucket_policy_generation, bucket_lifecycle_generation, bucket_execution_generation, completed_multipart_upload_sequence, bucket_abac_enabled, default_encryption_type, sse_c_blocked, \
        object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
@@ -3776,19 +3776,6 @@ impl PgStore {
             .transpose()
     }
 
-    fn parse_u32(value: i64, col: usize, field: &str) -> Result<u32, rusqlite::Error> {
-        u32::try_from(value).map_err(|_| {
-            rusqlite::Error::FromSqlConversionFailure(
-                col,
-                rusqlite::types::Type::Integer,
-                Box::from(format!(
-                    "invalid {field}: {value} (expected integer in 0..={})",
-                    u32::MAX
-                )),
-            )
-        })
-    }
-
     fn parse_optional_u64(
         value: Option<i64>,
         col: usize,
@@ -4071,23 +4058,23 @@ impl PgStore {
             Self::parse_canonical_user_id(owner_canonical_id_raw, 2, "owner_canonical_id")?;
         let public_access_block = Self::parse_public_access_block(
             (
+                row.get::<_, i64>(10)?,
+                row.get::<_, i64>(11)?,
                 row.get::<_, i64>(12)?,
                 row.get::<_, i64>(13)?,
                 row.get::<_, i64>(14)?,
-                row.get::<_, i64>(15)?,
-                row.get::<_, i64>(16)?,
             ),
-            [12, 13, 14, 15, 16],
+            [10, 11, 12, 13, 14],
         )?;
-        let ownership_controls = Self::parse_ownership_controls(row.get(17)?, 17)?;
+        let ownership_controls = Self::parse_ownership_controls(row.get(15)?, 15)?;
         let object_lock = Self::parse_bucket_object_lock(
             (
-                row.get::<_, i64>(27)?,
-                row.get::<_, Option<u8>>(28)?,
-                row.get::<_, Option<i64>>(29)?,
-                row.get::<_, Option<i64>>(30)?,
+                row.get::<_, i64>(25)?,
+                row.get::<_, Option<u8>>(26)?,
+                row.get::<_, Option<i64>>(27)?,
+                row.get::<_, Option<i64>>(28)?,
             ),
-            [27, 28, 29, 30],
+            [25, 26, 27, 28],
         )?;
         let acl_grants = Self::parse_acl_grants(row.get::<_, String>(7)?, 7, "acl_grants")?;
         Ok(BucketInfo {
@@ -4107,35 +4094,29 @@ impl PgStore {
             acl_grants,
             public_read: row.get::<_, i64>(8)? != 0,
             public_write: row.get::<_, i64>(9)? != 0,
-            write_reservations_blocked: row.get::<_, i64>(10)? != 0,
-            active_write_reservations: Self::parse_u32(
-                row.get::<_, i64>(11)?,
-                11,
-                "active_write_reservations",
-            )?,
             public_access_block,
             ownership_controls,
-            bucket_policy_present: row.get::<_, i64>(18)? != 0,
-            bucket_policy_public: row.get::<_, i64>(19)? != 0,
-            bucket_policy_generation: row.get::<_, i64>(20)? as u64,
-            bucket_lifecycle_present: row.get::<_, i64>(21)? != 0,
-            bucket_lifecycle_generation: row.get::<_, i64>(22)? as u64,
-            bucket_execution_generation: row.get::<_, i64>(23)? as u64,
-            bucket_abac_enabled: row.get::<_, i64>(24)? != 0,
+            bucket_policy_present: row.get::<_, i64>(16)? != 0,
+            bucket_policy_public: row.get::<_, i64>(17)? != 0,
+            bucket_policy_generation: row.get::<_, i64>(18)? as u64,
+            bucket_lifecycle_present: row.get::<_, i64>(19)? != 0,
+            bucket_lifecycle_generation: row.get::<_, i64>(20)? as u64,
+            bucket_execution_generation: row.get::<_, i64>(21)? as u64,
+            bucket_abac_enabled: row.get::<_, i64>(22)? != 0,
             encryption: BucketEncryptionConfig {
                 default_encryption: row
-                    .get::<_, Option<u8>>(25)?
+                    .get::<_, Option<u8>>(23)?
                     .map(|value| {
                         ManagedEncryptionAlgorithm::from_u8(value).ok_or_else(|| {
                             rusqlite::Error::FromSqlConversionFailure(
-                                25,
+                                23,
                                 rusqlite::types::Type::Integer,
                                 Box::from(format!("invalid default_encryption_type: {value}")),
                             )
                         })
                     })
                     .transpose()?,
-                sse_c_blocked: row.get::<_, i64>(26)? != 0,
+                sse_c_blocked: row.get::<_, i64>(24)? != 0,
             }
             .effective(),
         })
@@ -4147,23 +4128,23 @@ impl PgStore {
             Self::parse_canonical_user_id(owner_canonical_id_raw, 2, "owner_canonical_id")?;
         let public_access_block = Self::parse_public_access_block(
             (
+                row.get::<_, i64>(10)?,
+                row.get::<_, i64>(11)?,
                 row.get::<_, i64>(12)?,
                 row.get::<_, i64>(13)?,
                 row.get::<_, i64>(14)?,
-                row.get::<_, i64>(15)?,
-                row.get::<_, i64>(16)?,
             ),
-            [12, 13, 14, 15, 16],
+            [10, 11, 12, 13, 14],
         )?;
-        let ownership_controls = Self::parse_ownership_controls(row.get(17)?, 17)?;
+        let ownership_controls = Self::parse_ownership_controls(row.get(15)?, 15)?;
         let object_lock = Self::parse_bucket_object_lock(
             (
-                row.get::<_, i64>(26)?,
-                row.get::<_, Option<u8>>(27)?,
-                row.get::<_, Option<i64>>(28)?,
-                row.get::<_, Option<i64>>(29)?,
+                row.get::<_, i64>(24)?,
+                row.get::<_, Option<u8>>(25)?,
+                row.get::<_, Option<i64>>(26)?,
+                row.get::<_, Option<i64>>(27)?,
             ),
-            [26, 27, 28, 29],
+            [24, 25, 26, 27],
         )?;
         let acl_grants = Self::parse_acl_grants(row.get::<_, String>(7)?, 7, "acl_grants")?;
         Ok(BucketRecord {
@@ -4183,34 +4164,28 @@ impl PgStore {
             acl_grants,
             public_read: row.get::<_, i64>(8)? != 0,
             public_write: row.get::<_, i64>(9)? != 0,
-            write_reservations_blocked: row.get::<_, i64>(10)? != 0,
-            active_write_reservations: Self::parse_u32(
-                row.get::<_, i64>(11)?,
-                11,
-                "active_write_reservations",
-            )?,
             public_access_block,
             ownership_controls,
-            bucket_policy_public: row.get::<_, i64>(18)? != 0,
-            bucket_policy_generation: row.get::<_, i64>(19)? as u64,
-            bucket_lifecycle_generation: row.get::<_, i64>(20)? as u64,
-            bucket_execution_generation: row.get::<_, i64>(21)? as u64,
-            completed_multipart_upload_sequence: row.get::<_, i64>(22)? as u64,
-            bucket_abac_enabled: row.get::<_, i64>(23)? != 0,
+            bucket_policy_public: row.get::<_, i64>(16)? != 0,
+            bucket_policy_generation: row.get::<_, i64>(17)? as u64,
+            bucket_lifecycle_generation: row.get::<_, i64>(18)? as u64,
+            bucket_execution_generation: row.get::<_, i64>(19)? as u64,
+            completed_multipart_upload_sequence: row.get::<_, i64>(20)? as u64,
+            bucket_abac_enabled: row.get::<_, i64>(21)? != 0,
             encryption: BucketEncryptionConfig {
                 default_encryption: row
-                    .get::<_, Option<u8>>(24)?
+                    .get::<_, Option<u8>>(22)?
                     .map(|value| {
                         ManagedEncryptionAlgorithm::from_u8(value).ok_or_else(|| {
                             rusqlite::Error::FromSqlConversionFailure(
-                                24,
+                                22,
                                 rusqlite::types::Type::Integer,
                                 Box::from(format!("invalid default_encryption_type: {value}")),
                             )
                         })
                     })
                     .transpose()?,
-                sse_c_blocked: row.get::<_, i64>(25)? != 0,
+                sse_c_blocked: row.get::<_, i64>(23)? != 0,
             },
         })
     }
@@ -5210,8 +5185,8 @@ impl PgStore {
                 };
                 match store.conn.execute(
                     "INSERT INTO buckets \
-                     (name, owner_principal, owner_canonical_id, created_at, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years, bucket_execution_generation) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, 0, ?10, 1, ?11, ?12, ?13, ?14, ?15)",
+                     (name, owner_principal, owner_canonical_id, created_at, state, versioning, acl_grants, public_read, public_write, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years, bucket_execution_generation) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?15)",
                     params![
                         config.name,
                         config.owner_principal,
@@ -5291,8 +5266,8 @@ impl PgStore {
                 )?;
                 match store.conn.execute(
                     "INSERT INTO buckets \
-                     (name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls_mode, bucket_policy_public, bucket_policy_generation, bucket_lifecycle_generation, bucket_execution_generation, completed_multipart_upload_sequence, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
+                     (name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls_mode, bucket_policy_public, bucket_policy_generation, bucket_lifecycle_generation, bucket_execution_generation, completed_multipart_upload_sequence, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
                     params![
                         bucket.name.as_str(),
                         &bucket.owner_principal,
@@ -5304,8 +5279,6 @@ impl PgStore {
                         bucket.acl_grants.serialized(),
                         i32::from(bucket.public_read),
                         i32::from(bucket.public_write),
-                        0_i32,
-                        0_i64,
                         public_access_block_present,
                         public_access_block_block_public_acls,
                         public_access_block_ignore_public_acls,
@@ -9437,9 +9410,7 @@ impl PgMetadataStore for PgStore {
                          SET state = ?1, \
                              bucket_execution_generation = ?2 \
                          WHERE name = ?3 \
-                           AND state = ?4 \
-                           AND write_reservations_blocked = 1 \
-                           AND active_write_reservations = 0",
+                           AND state = ?4",
                         params![
                             BucketState::Deleting as u8,
                             generation as i64,
@@ -9457,53 +9428,6 @@ impl PgMetadataStore for PgStore {
                 Ok(())
             },
         )
-    }
-
-    #[cfg(test)]
-    fn acquire_bucket_write_reservation(
-        &self,
-        name: &BucketName,
-    ) -> Result<BucketInfo, MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets \
-                 SET active_write_reservations = active_write_reservations + 1 \
-                 WHERE name = ?1 AND state = ?2 AND write_reservations_blocked = 0",
-                params![name.as_str(), BucketState::Active as u8],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "acquire bucket write reservation",
-                source: e,
-            })?;
-        if updated == 1 {
-            return self.head_bucket_raw(name);
-        }
-        let info = self.head_bucket_raw(name)?;
-        if info.state == BucketState::Active && info.write_reservations_blocked {
-            return Err(MetadataError::BucketWriteDraining);
-        }
-        Err(bucket_not_found(name.as_str()))
-    }
-
-    #[cfg(test)]
-    fn release_bucket_write_reservation(&self, name: &BucketName) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets \
-                 SET active_write_reservations = active_write_reservations - 1 \
-                 WHERE name = ?1 AND active_write_reservations > 0",
-                params![name.as_str()],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "release bucket write reservation",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(bucket_not_found(name.as_str()));
-        }
-        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9765,29 +9689,6 @@ impl PgMetadataStore for PgStore {
         }
     }
 
-    fn begin_bucket_write_drain(&self, name: &BucketName) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets \
-                 SET write_reservations_blocked = 1 \
-                 WHERE name = ?1 AND state = ?2 AND write_reservations_blocked = 0",
-                params![name.as_str(), BucketState::Active as u8],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "begin bucket write drain",
-                source: e,
-            })?;
-        if updated == 0 {
-            let info = self.head_bucket_raw(name)?;
-            if info.state == BucketState::Active && info.write_reservations_blocked {
-                return Err(MetadataError::BucketWriteDraining);
-            }
-            return Err(bucket_not_found(name.as_str()));
-        }
-        Ok(())
-    }
-
     fn begin_durable_bucket_write_drain(
         &self,
         name: &BucketName,
@@ -10015,25 +9916,6 @@ impl PgMetadataStore for PgStore {
                 Err(error)
             }
         }
-    }
-
-    fn end_bucket_write_drain(&self, name: &BucketName) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets \
-                 SET write_reservations_blocked = 0 \
-                 WHERE name = ?1 AND state = ?2 AND write_reservations_blocked = 1",
-                params![name.as_str(), BucketState::Active as u8],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "end bucket write drain",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(bucket_not_found(name.as_str()));
-        }
-        Ok(())
     }
 
     #[cfg(test)]

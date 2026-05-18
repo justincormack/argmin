@@ -1490,9 +1490,8 @@ Work items:
        `multipart_part_segments`; Phase 7.3 expands this into the broader
        canonical binary inventory
      - the `buckets` digest uses an explicit committed-metadata column allowlist;
-       transient write-drain counters such as `write_reservations_blocked` and
-       `active_write_reservations` are excluded; at the Phase 6.6 boundary the
-       local completed-MPU order allocator column
+       at the Phase 6.6 boundary, then-transient write-drain counters were
+       excluded and the local completed-MPU order allocator column
        `completed_multipart_upload_sequence` was also still excluded
      - transient bridge/staging/reclaim/allocator tables are intentionally
        outside this digest until those paths are fully command-owned; examples
@@ -2010,13 +2009,12 @@ Completed:
   - narrowed the raw multipart upload state setter to test/test-hook builds, so
     production code cannot change digest-covered upload state outside command
     apply
-  - retained explicit exclusions for state that is still local-only or still
-    mutates outside its own command stream:
-    - bucket write-drain counters (`write_reservations_blocked` and
-      `active_write_reservations`) are bucket-delete/read-write fencing state,
-      not canonical S3 metadata; they remain outside the metadata digest until
-      the Phase 9 lease/fence model decides whether this state should stay
-      process-local or become a replicated fence
+  - retained explicit exclusions for state that was still local-only or still
+    mutated outside its own command stream at this phase:
+    - bucket write-drain counters were bucket-delete/read-write fencing state,
+      not canonical S3 metadata; Phase 9.4 replaced them with durable
+      bucket-PG-primary coordination rows, and Phase 9.4.6 removed the old
+      bucket-row counter fields
   - added a mechanical storage-cluster boundary check that fails closed if new
     ungated production `PgMetadataStore` methods are added outside the explicit
     read-only/finalized-delete/write-drain allowlist
@@ -2026,9 +2024,10 @@ Completed:
     PgStore unit coverage, replica-local assertions, and explicit
     fault-injection/divergence setup with a comment
   - Phase 7.3 is complete: canonical binary state encoding covers every current
-    command-owned metadata table, production direct mutators for digest-covered
-    metadata are gated or private, and bucket write-drain counters are
-    explicitly deferred to the Phase 9 fence/lease model
+    command-owned metadata table, and production direct mutators for
+    digest-covered metadata are gated or private. The bucket write-drain counter
+    deferral was closed by Phase 9.4 durable coordination rows and Phase 9.4.6
+    counter removal.
 - Phase 7.4 step 1:
   - added the persisted integrity record inventory to
     [metadata-model.md](../guides/metadata-model.md), covering current
@@ -3370,7 +3369,7 @@ Proposed subphases:
         from this plan
       - status: complete. The Phase 9.4.1 audit is captured in
         [bucket-write-drain.md](../guides/bucket-write-drain.md), including the
-        current counter authority, publisher classification, cross-PG
+        retired counter authority, publisher classification, cross-PG
         apply-time reservation fence, reservation reap vs object-PG convergence
         rule, DeleteBucket drain loop, and required test matrix.
 
@@ -3380,9 +3379,9 @@ Proposed subphases:
         PgStore primitives/tests for exact identity, owner token, cluster epoch,
         bucket execution generation, drain blocking, exact release/clear
         matching, and proof that these primary-owned coordination rows do not
-        dirty the replica-wide metadata command digest. Production writers still
-        use the legacy bucket-row counters until 9.4.3 moves the cluster wrapper
-        onto these records.
+        dirty the replica-wide metadata command digest. Phase 9.4.3 moved
+        production writers onto these records, and Phase 9.4.6 removed the
+        legacy bucket-row counters.
       - replace anonymous bucket-row counters with explicit coordination rows:
         - `bucket_write_reservations`: bucket, reservation id, owner/process
           token, cluster epoch, bucket execution generation or bucket row
@@ -3510,9 +3509,9 @@ Proposed subphases:
         - if release fails after the caller action has returned, preserve the
           caller error ordering but leave a typed trace and retryable cleanup
           signal for the reservation
-      - old anonymous-counter cleanup: Phase 9.4.4 moved DeleteBucket off
-        `SharedStorageNode::begin_bucket_write_drain`, and Phase 9.4.6 retires
-        the remaining counter-based write-drain path. Remove or gate production access to
+      - old anonymous-counter cleanup: complete. Phase 9.4.4 moved
+        DeleteBucket off `SharedStorageNode::begin_bucket_write_drain`, and
+        Phase 9.4.6 removed the remaining counter-based write-drain path:
         `SharedStorageNode::with_bucket_write_snapshot`,
         `PgMetadataStore::acquire_bucket_write_reservation`,
         `release_bucket_write_reservation`, `begin_bucket_write_drain`, and
@@ -3648,9 +3647,9 @@ Proposed subphases:
            semantics.
         6. Remove the legacy `active_write_reservations` bridge. DeleteBucket
            must not depend on the node-local condition variable, and writers
-           must acquire only durable bucket write reservation rows. During the
-           Phase 9.4.6 removal slice, any nonzero legacy counter is test-only
-           compatibility state, not production authority.
+           must acquire only durable bucket write reservation rows. Status:
+           complete; the legacy bucket-row counter fields and helper APIs were
+           removed.
         7. Do not add broad stale-reservation reaping in the first slice. A
            reservation is not safely reapable while any pending object-PG
            command or accepted-but-not-converged object-PG log entry can
@@ -3723,10 +3722,9 @@ Proposed subphases:
         mark-deleting command install/apply, finalize pending, and finalized
 
    6. Phase 9.4.6: remove the old counter authority
-      - remove `write_reservations_blocked` and `active_write_reservations` from
-        production command-owned bucket projections, or leave them as ignored
-        compatibility fields only if the schema still needs them during the
-        slice
+      - status: complete. Removed `write_reservations_blocked` and
+        `active_write_reservations` from bucket schema, bucket row types, and
+        command-owned bucket projections.
       - update
         [metadata-model.md](../guides/metadata-model.md) and
         [storage-cluster-invariants.md](../guides/storage-cluster-invariants.md):
@@ -3735,10 +3733,11 @@ Proposed subphases:
         - the new reservation/drain rows are the only production authority
         - finalized bucket row deletion remains the explicit command-owned
           metadata exception
-      - extend `scripts/check-storage-cluster-boundaries` so new production
-        direct uses of old bucket write-drain counter helpers fail loudly
-      - remove tests that exercise only the legacy counter API unless they are
-        rewritten as low-level tests for the new durable coordination rows
+      - status: complete. `scripts/check-storage-cluster-boundaries` still
+        fails loudly if old bucket write-drain counter helper names reappear in
+        production code.
+      - status: complete. Tests that only exercised the legacy counter API were
+        removed; durable coordination row tests remain.
 
    7. Phase 9.4.7: tests and closeout
       - focused storage regressions:
@@ -3927,13 +3926,15 @@ Phase 9.1 audit checklist:
    - replacement owner: Phase 9.4 durable or PG-primary bucket write-drain
      state, with restartable polling or notifications
 9. bucket write reservation counters
-   - current mechanism: durable bucket rows with reservation fields, currently
-     treated as runtime coordination state rather than command-owned metadata
+   - retired mechanism: durable bucket rows with reservation fields, treated as
+     runtime coordination state rather than command-owned metadata before Phase
+     9.4
    - classification: write lifetime protection
-   - risk: reservation accounting must be made restart-safe and multi-process
-     visible before bucket delete can rely on it
-   - replacement owner: Phase 9.4 durable reservation table or command-owned
-     bucket-drain state
+   - outcome: Phase 9.4 made reservation accounting restart-safe and
+     multi-process visible through `bucket_write_reservations` and
+     `bucket_write_drains`; Phase 9.4.6 removed the old bucket-row counter
+     fields and helper APIs
+   - replacement owner: Phase 9.4 durable reservation/drain tables
 10. cluster object payload leases and reclaim fences
    - current process-local mechanism:
      `LocalObjectPayloadLeaseState` lease counts, reclaim fences, and active

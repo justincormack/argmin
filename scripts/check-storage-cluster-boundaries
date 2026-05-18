@@ -141,14 +141,21 @@ fail_with_matches \
     "Legacy metadata-primary payload write path reintroduced" \
     "$legacy_payload_matches"
 
+legacy_bucket_counter_matches=$(
+    rg -n --color=never \
+        '\b(acquire_bucket_write_reservation|release_bucket_write_reservation|begin_bucket_write_drain|end_bucket_write_drain)\b' \
+        crates/storage/src \
+        -g '*.rs' \
+        || true
+)
+fail_with_matches \
+    "Legacy bucket-row write-drain counter helper reintroduced" \
+    "$legacy_bucket_counter_matches"
+
 production_metadata_methods=$(
     awk '
     function is_allowed_production_method(name) {
         return name == "delete_finalized_bucket" \
-            || name == "acquire_bucket_write_reservation" \
-            || name == "release_bucket_write_reservation" \
-            || name == "begin_bucket_write_drain" \
-            || name == "end_bucket_write_drain" \
             || name == "acquire_durable_bucket_write_reservation" \
             || name == "durable_bucket_write_reservation" \
             || name == "durable_bucket_write_reservations" \

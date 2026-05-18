@@ -16,9 +16,9 @@ use s3_types::VersionId;
 #[cfg(test)]
 use s3_types::{AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId};
 
-use crate::error::{
-    BucketSnapshotLoadError, BucketWriteDrainError, ObjectPgActionError, StoreError,
-};
+#[cfg(test)]
+use crate::error::BucketWriteDrainError;
+use crate::error::{BucketSnapshotLoadError, ObjectPgActionError, StoreError};
 use crate::pg_store::PgStore;
 use crate::pg_topology::PgTopology;
 use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
@@ -121,20 +121,12 @@ pub enum BucketPairPgGuards<'a> {
     },
 }
 
-pub struct BucketWriteDrainGuard<'a> {
-    node: &'a SharedStorageNode,
-    bucket: BucketName,
-    persisted: bool,
-}
-
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Default, Clone)]
 pub struct BucketScopedTestHooks {
     pub target: Option<BucketName>,
     pub before_bucket_lock_acquire: Option<Arc<dyn Fn() + Send + Sync>>,
     pub before_bucket_write_drain_wait: Option<Arc<dyn Fn() + Send + Sync>>,
-    pub before_bucket_write_reservation_retry: Option<Arc<dyn Fn() + Send + Sync>>,
-    pub after_bucket_write_reservation_retry: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_begin_bucket_delete_drain: Option<Arc<dyn Fn() + Send + Sync>>,
     pub before_multipart_completion_lock: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_multipart_completion_lock: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -206,16 +198,6 @@ pub(super) fn maybe_run_bucket_write_drain_wait_hook(bucket: &BucketName) {
 #[cfg(not(any(test, feature = "test-hooks")))]
 pub(super) fn maybe_run_bucket_write_drain_wait_hook(_: &BucketName) {}
 
-#[cfg(test)]
-pub(super) fn maybe_run_bucket_write_reservation_retry_hook(bucket: &BucketName) {
-    maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.before_bucket_write_reservation_retry)
-}
-
-#[cfg(test)]
-pub(super) fn maybe_run_after_bucket_write_reservation_retry_hook(bucket: &BucketName) {
-    maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.after_bucket_write_reservation_retry)
-}
-
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn maybe_run_after_begin_bucket_delete_drain_hook(bucket: &BucketName) {
     maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.after_begin_bucket_delete_drain)
@@ -278,20 +260,6 @@ pub(crate) fn maybe_run_after_direct_put_metadata_publish_hook(
         hook()?;
     }
     Ok(())
-}
-
-impl BucketWriteDrainGuard<'_> {
-    pub fn persist(mut self) {
-        self.persisted = true;
-    }
-}
-
-impl Drop for BucketWriteDrainGuard<'_> {
-    fn drop(&mut self) {
-        if !self.persisted {
-            let _ = self.node.end_bucket_write_drain(&self.bucket);
-        }
-    }
 }
 
 impl<'a> BucketPairPgGuards<'a> {
@@ -1005,9 +973,7 @@ impl SharedStorageNode {
                 BucketSnapshotLoadError::Store(err) => BucketWriteDrainError::Store(err),
                 BucketSnapshotLoadError::Metadata(err) => BucketWriteDrainError::Metadata(err),
             })?;
-        let drain = self.begin_bucket_write_drain(bucket)?;
         self.mark_bucket_deleting(bucket)?;
-        drain.persist();
         Ok(())
     }
 
@@ -1585,9 +1551,6 @@ impl Drop for EncodeScratch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{mpsc, Arc, OnceLock};
-
-    static STORAGE_TEST_HOOK_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn bucket_name(name: &str) -> BucketName {
         BucketName::try_from(name).unwrap()
@@ -1867,49 +1830,6 @@ mod tests {
     }
 
     #[test]
-    fn with_bucket_write_snapshot_loads_requested_subresources_and_releases() {
-        let tmp = test_util::tempdir();
-        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
-        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
-        let bucket_pg = node
-            .get_pg(node.pg_topology().bucket_pg_for(&bucket))
-            .unwrap();
-        bucket_pg
-            .put_bucket_subresource(
-                &bucket,
-                crate::types::PutBucketSubresource {
-                    kind: crate::types::BucketSubresourceKind::Lifecycle,
-                    body: "<LifecycleConfiguration><Rule><ID>r</ID><Status>Enabled</Status><Filter><Prefix></Prefix></Filter><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
-                    aux: crate::types::BucketSubresourceAux::None,
-                },
-            )
-            .unwrap();
-        drop(bucket_pg);
-
-        let first = node
-            .with_bucket_write_snapshot(
-                &bucket,
-                crate::types::BucketSnapshotRequest {
-                    lifecycle: true,
-                    ..Default::default()
-                },
-                |snapshot| Ok::<_, ()>(snapshot.lifecycle),
-            )
-            .unwrap();
-        assert!(matches!(
-            first,
-            Ok(crate::types::LoadedBucketSubresource::Loaded(_))
-        ));
-
-        let second = node
-            .with_bucket_write_snapshot(&bucket, Default::default(), |snapshot| {
-                Ok::<_, ()>(snapshot.bucket)
-            })
-            .unwrap();
-        assert_eq!(second.unwrap().name, bucket);
-    }
-
-    #[test]
     fn finish_bucket_write_snapshot_operation_preserves_action_error_over_release_error() {
         let result = SharedStorageNode::finish_bucket_write_snapshot_operation::<(), &'static str>(
             Ok(Err("action failed")),
@@ -1920,215 +1840,11 @@ mod tests {
     }
 
     #[test]
-    fn bucket_write_drain_guard_releases_on_drop() {
-        let tmp = test_util::tempdir();
-        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
-        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
-
-        {
-            let _drain = node.begin_bucket_write_drain(&bucket).unwrap();
-        }
-
-        let result = node
-            .with_bucket_write_snapshot(&bucket, Default::default(), |snapshot| {
-                Ok::<_, ()>(snapshot.bucket)
-            })
-            .unwrap();
-        assert_eq!(result.unwrap().name, bucket);
-    }
-
-    #[test]
-    fn with_bucket_write_snapshot_waits_for_temporary_drain_then_succeeds() {
-        let tmp = test_util::tempdir();
-        let node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap());
-        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
-
-        let _serial = STORAGE_TEST_HOOK_SERIAL
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
-        let (retry_tx, retry_rx) = mpsc::channel();
-        let _hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
-            target: Some(bucket.clone()),
-            after_bucket_write_reservation_retry: Some(Arc::new(move || {
-                let _ = retry_tx.send(());
-            })),
-            ..BucketScopedTestHooks::default()
-        });
-
-        let drain = node.begin_bucket_write_drain(&bucket).unwrap();
-        let node_for_thread = Arc::clone(&node);
-        let bucket_for_thread = bucket.clone();
-        let (result_tx, result_rx) = mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let result = node_for_thread
-                .with_bucket_write_snapshot(&bucket_for_thread, Default::default(), |snapshot| {
-                    Ok::<_, ()>(snapshot.bucket)
-                })
-                .unwrap();
-            result_tx.send(result).unwrap();
-        });
-
-        retry_rx.recv().unwrap();
-        assert!(matches!(
-            result_rx.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
-        ));
-
-        drop(drain);
-
-        let result = result_rx.recv().unwrap();
-        assert_eq!(result.unwrap().name, bucket);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn with_bucket_write_snapshot_stops_waiting_once_bucket_delete_becomes_terminal() {
-        let tmp = test_util::tempdir();
-        let node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap());
-        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
-
-        #[derive(Debug)]
-        enum RequestEvent {
-            FirstRetryObserved,
-            UnexpectedExtraRetry,
-            Completed(Result<Result<BucketInfo, ()>, crate::error::BucketSnapshotLoadError>),
-        }
-
-        let _serial = STORAGE_TEST_HOOK_SERIAL
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
-        let (delete_paused_tx, delete_paused_rx) = mpsc::channel();
-        let delete_release = Arc::new((Mutex::new(false), Condvar::new()));
-        let retry_release = Arc::new((Mutex::new(false), Condvar::new()));
-        let retry_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (event_tx, event_rx) = mpsc::channel();
-        let event_tx_for_hook = event_tx.clone();
-        let retry_count_hook = Arc::clone(&retry_count);
-        let delete_release_hook = Arc::clone(&delete_release);
-        let retry_release_hook = Arc::clone(&retry_release);
-        let _hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
-            target: Some(bucket.clone()),
-            after_begin_bucket_delete_drain: Some(Arc::new(move || {
-                let _ = delete_paused_tx.send(());
-                let (lock, cvar) = &*delete_release_hook;
-                let mut released = lock.lock().unwrap();
-                while !*released {
-                    released = cvar.wait(released).unwrap();
-                }
-            })),
-            after_bucket_write_reservation_retry: Some(Arc::new(move || {
-                match retry_count_hook.fetch_add(1, Ordering::SeqCst) {
-                    0 => {
-                        let _ = event_tx_for_hook.send(RequestEvent::FirstRetryObserved);
-                        let (lock, cvar) = &*retry_release_hook;
-                        let mut released = lock.lock().unwrap();
-                        while !*released {
-                            released = cvar.wait(released).unwrap();
-                        }
-                    }
-                    _ => {
-                        let _ = event_tx_for_hook.send(RequestEvent::UnexpectedExtraRetry);
-                    }
-                }
-            })),
-            ..BucketScopedTestHooks::default()
-        });
-
-        let node_for_delete = Arc::clone(&node);
-        let bucket_for_delete = bucket.clone();
-        let (delete_tx, delete_rx) = mpsc::channel();
-        let delete_handle = std::thread::spawn(move || {
-            let result = node_for_delete.begin_bucket_delete(&bucket_for_delete);
-            delete_tx.send(result).unwrap();
-        });
-
-        delete_paused_rx.recv().unwrap();
-
-        let node_for_request = Arc::clone(&node);
-        let bucket_for_request = bucket.clone();
-        let request_handle = std::thread::spawn(move || {
-            let result = node_for_request.with_bucket_write_snapshot(
-                &bucket_for_request,
-                Default::default(),
-                |snapshot| Ok::<_, ()>(snapshot.bucket),
-            );
-            event_tx.send(RequestEvent::Completed(result)).unwrap();
-        });
-
-        match event_rx.recv().unwrap() {
-            RequestEvent::FirstRetryObserved => {}
-            other => panic!("expected first retry event, got {other:?}"),
-        }
-
-        {
-            let (lock, cvar) = &*delete_release;
-            let mut released = lock.lock().unwrap();
-            *released = true;
-            cvar.notify_all();
-        }
-        {
-            let (lock, cvar) = &*retry_release;
-            let mut released = lock.lock().unwrap();
-            *released = true;
-            cvar.notify_all();
-        }
-
-        match event_rx.recv().unwrap() {
-            RequestEvent::Completed(Err(crate::error::BucketSnapshotLoadError::Metadata(
-                crate::error::MetadataError::BucketNotFound { .. },
-            ))) => {}
-            RequestEvent::UnexpectedExtraRetry => {
-                panic!("request retried again after bucket delete became terminal")
-            }
-            other => panic!("expected BucketNotFound completion, got {other:?}"),
-        }
-        delete_handle.join().unwrap();
-        delete_rx.recv().unwrap().unwrap();
-        request_handle.join().unwrap();
-    }
-
-    #[test]
-    fn begin_bucket_delete_rejects_nonempty_bucket() {
-        let tmp = test_util::tempdir();
-        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
-        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
-        let object_pg = node
-            .get_pg(node.pg_topology().object_pg(bucket.as_str(), "key"))
-            .unwrap();
-        object_pg
-            .create_multipart_upload(&crate::types::CreateMultipartUploadReq {
-                upload_id: crate::tests::multipart_upload_id("upload"),
-                bucket: bucket.clone(),
-                key: ObjectKey::try_from("key").unwrap(),
-                tags: None,
-                metadata_blob: vec![].into(),
-                system_metadata_blob: crate::types::SerializedSystemMetadataBlob::default(),
-                initiator: None,
-                owner: crate::types::OwnerIdentity::from_principal("owner"),
-                acl_grants: s3_types::AclGrants::default(),
-                public_read: false,
-                object_lock: crate::types::ObjectLockState::default(),
-                checksum: None,
-                encryption: crate::types::ObjectEncryption::None,
-            })
-            .unwrap();
-        drop(object_pg);
-
-        let err = node.begin_bucket_delete(&bucket).unwrap_err();
-        assert!(matches!(
-            err,
-            BucketWriteDrainError::Metadata(crate::error::MetadataError::BucketNotEmpty)
-        ));
-    }
-
-    #[test]
     fn try_finalize_bucket_delete_finalizes_empty_deleting_bucket() {
         let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
         let bucket = create_bucket_for_snapshot_test(&node, "bucket");
-        node.begin_bucket_delete(&bucket).unwrap();
+        node.mark_bucket_deleting(&bucket).unwrap();
 
         assert_eq!(
             node.try_finalize_bucket_delete(&bucket).unwrap(),

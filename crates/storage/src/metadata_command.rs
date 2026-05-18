@@ -146,8 +146,6 @@ pub struct BucketRecord {
     pub(crate) acl_grants: AclGrants,
     pub(crate) public_read: bool,
     pub(crate) public_write: bool,
-    pub(crate) write_reservations_blocked: bool,
-    pub(crate) active_write_reservations: u32,
     pub(crate) public_access_block: Option<PublicAccessBlockConfig>,
     pub(crate) ownership_controls: Option<BucketOwnershipControls>,
     pub(crate) bucket_policy_public: bool,
@@ -179,8 +177,6 @@ impl BucketRecord {
             acl_grants: config.acl_grants.clone(),
             public_read: config.public_read,
             public_write: config.public_write,
-            write_reservations_blocked: false,
-            active_write_reservations: 0,
             public_access_block: None,
             ownership_controls: None,
             bucket_policy_public: false,
@@ -206,9 +202,7 @@ impl BucketRecord {
         self
     }
 
-    pub(crate) fn command_metadata_projection(mut self) -> Self {
-        self.write_reservations_blocked = false;
-        self.active_write_reservations = 0;
+    pub(crate) fn command_metadata_projection(self) -> Self {
         self
     }
 
@@ -1877,8 +1871,6 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             acl_grants: self.read_acl_grants()?,
             public_read: self.read_bool()?,
             public_write: self.read_bool()?,
-            write_reservations_blocked: false,
-            active_write_reservations: 0,
             public_access_block: self.read_public_access_block()?,
             ownership_controls: self.read_ownership_controls()?,
             bucket_policy_public: self.read_bool()?,
@@ -4272,15 +4264,11 @@ mod tests {
     }
 
     #[test]
-    fn bucket_command_encoding_ignores_runtime_write_reservation_state() {
+    fn bucket_command_encoding_preserves_completed_multipart_sequence() {
         let mut current = test_bucket_record("bucket", 13);
-        current.write_reservations_blocked = true;
-        current.active_write_reservations = 7;
         current.completed_multipart_upload_sequence = 11;
 
         let command = PutBucketAclCommand::from_bucket(current, AclGrants::default(), true, false);
-        assert!(!command.bucket.write_reservations_blocked);
-        assert_eq!(command.bucket.active_write_reservations, 0);
         assert_eq!(command.bucket.completed_multipart_upload_sequence, 11);
 
         let id = MetadataCommandId::new(

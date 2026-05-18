@@ -84,20 +84,6 @@ pub(crate) trait PgMetadataStore {
     #[cfg(test)]
     fn mark_bucket_deleting(&self, name: &BucketName) -> Result<(), MetadataError>;
 
-    /// Acquire a short-lived bucket write reservation.
-    ///
-    /// Reservations fence bucket deletion while cross-PG write publication is
-    /// in progress. Returns the current bucket metadata on success.
-    #[cfg(test)]
-    fn acquire_bucket_write_reservation(
-        &self,
-        name: &BucketName,
-    ) -> Result<BucketInfo, MetadataError>;
-
-    /// Release a previously acquired bucket write reservation.
-    #[cfg(test)]
-    fn release_bucket_write_reservation(&self, name: &BucketName) -> Result<(), MetadataError>;
-
     /// Acquire a durable bucket write reservation record for one bucket
     /// incarnation.
     #[allow(dead_code)]
@@ -154,13 +140,6 @@ pub(crate) trait PgMetadataStore {
         cluster_epoch: ClusterEpoch,
         bucket_execution_generation: u64,
     ) -> Result<(), MetadataError>;
-
-    /// Block new bucket write reservations while deletion drains in-flight
-    /// writers and verifies emptiness.
-    fn begin_bucket_write_drain(&self, name: &BucketName) -> Result<(), MetadataError>;
-
-    /// Re-open the bucket for new write reservations after a failed delete.
-    fn end_bucket_write_drain(&self, name: &BucketName) -> Result<(), MetadataError>;
 
     /// Begin a durable bucket write drain for one bucket incarnation.
     #[allow(dead_code)]

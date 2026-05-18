@@ -13,21 +13,15 @@ admission and DeleteBucket begin:
 - `StorageCluster::with_bucket_write_snapshot` acquires a durable
   `bucket_write_reservations` row on the bucket-PG primary, loads the bucket
   snapshot, runs the caller action, then releases that exact row.
-- The old `SharedStorageNode::with_bucket_write_snapshot` anonymous counter
-  path is retained for tests only.
 - `StorageCluster::begin_bucket_delete` installs a durable
   `bucket_write_drains` row on the bucket-PG primary, drains bucket-relevant
   pending object commands while waiting for durable reservations to empty, then
   either rolls back the durable drain by exact identity or publishes terminal
   `MarkBucketDeleting`.
-- The legacy bucket-row counters, `write_reservations_blocked` and
-  `active_write_reservations`, are unused compatibility/test-only state until
-  Phase 9.4.6 removes them.
-
-The retired drain counters are anonymous. They do not identify the writer, the
-bucket incarnation, the request class, or whether another process crashed while
-holding the reservation. They are therefore not a multi-process correctness
-boundary.
+- The legacy bucket-row counters have been removed. The retired drain counters
+  were anonymous: they did not identify the writer, the bucket incarnation, the
+  request class, or whether another process crashed while holding the
+  reservation. They are not a multi-process correctness boundary.
 
 ## Target Authority
 

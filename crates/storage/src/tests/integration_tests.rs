@@ -989,9 +989,6 @@ fn bucket_deletion_lifecycle() {
         .unwrap();
 
     // Mark bucket as deleting.
-    store
-        .begin_bucket_write_drain(&bucket_name("doomed"))
-        .unwrap();
     store.mark_bucket_deleting(&bucket_name("doomed")).unwrap();
 
     // head_bucket no longer sees it.

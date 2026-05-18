@@ -374,8 +374,6 @@ CREATE TABLE IF NOT EXISTS buckets (
     acl_grants       TEXT NOT NULL DEFAULT '',
     public_read      INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1)),
     public_write     INTEGER NOT NULL DEFAULT 0 CHECK (public_write IN (0, 1)),
-    write_reservations_blocked INTEGER NOT NULL DEFAULT 0 CHECK (write_reservations_blocked IN (0, 1)),
-    active_write_reservations INTEGER NOT NULL DEFAULT 0 CHECK (active_write_reservations >= 0),
     public_access_block_present INTEGER NOT NULL DEFAULT 0 CHECK (public_access_block_present IN (0, 1)),
     public_access_block_block_public_acls INTEGER NOT NULL DEFAULT 0 CHECK (public_access_block_block_public_acls IN (0, 1)),
     public_access_block_ignore_public_acls INTEGER NOT NULL DEFAULT 0 CHECK (public_access_block_ignore_public_acls IN (0, 1)),
@@ -601,7 +599,6 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_segment_crc_columns(conn)?;
     migrate_owner_identity_columns(conn)?;
     migrate_acl_grant_columns(conn)?;
-    migrate_bucket_write_reservation_columns(conn)?;
     migrate_object_write_sequence_columns(conn)?;
     migrate_object_became_noncurrent_columns(conn)?;
     migrate_multipart_upload_tag_columns(conn)?;
@@ -1007,22 +1004,6 @@ fn migrate_owner_identity_columns(conn: &Connection) -> Result<(), rusqlite::Err
         )?;
     }
 
-    Ok(())
-}
-
-fn migrate_bucket_write_reservation_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
-    let migrations = [
-        "ALTER TABLE buckets ADD COLUMN write_reservations_blocked INTEGER NOT NULL DEFAULT 0 CHECK (write_reservations_blocked IN (0, 1))",
-        "ALTER TABLE buckets ADD COLUMN active_write_reservations INTEGER NOT NULL DEFAULT 0 CHECK (active_write_reservations >= 0)",
-    ];
-    for sql in &migrations {
-        match conn.execute(sql, []) {
-            Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
-                if msg.contains("duplicate column name") => {}
-            Err(e) => return Err(e),
-        }
-    }
     Ok(())
 }
 

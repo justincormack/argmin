@@ -2015,13 +2015,6 @@ mod tests {
                 .is_empty(),
             "metadata command convergence must release the durable bucket write reservation"
         );
-        assert_eq!(
-            crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)
-                .unwrap()
-                .active_write_reservations,
-            0,
-            "metadata command convergence must not depend on the legacy bucket write counter"
-        );
     }
 
     struct CommittedDirectSegment {
@@ -7792,12 +7785,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(
-            crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
-                .unwrap()
-                .active_write_reservations,
-            0
-        );
         drop(bucket_pg);
         assert_clean_metadata_command_stream(&first_map, &[2]);
     }
@@ -7898,12 +7885,6 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "pre-command storage errors must release caller-owned bucket write proof"
-        );
-        assert_eq!(
-            crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
-                .unwrap()
-                .active_write_reservations,
-            0
         );
     }
 
@@ -12066,73 +12047,6 @@ mod tests {
     }
 
     #[test]
-    fn metadata_state_digest_ignores_bucket_write_reservation_counters() {
-        let tmp = test_util::tempdir();
-        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
-        let ec_shape = EcShape { k: 2, m: 1 };
-        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
-        let topology = map
-            .node(NodeId::new(0))
-            .unwrap()
-            .storage_node()
-            .pg_topology();
-        let reserved_bucket = bucket_for_pg(topology, 1, "digest-reserved-");
-        let next_bucket = bucket_for_pg(topology, 1, "digest-after-reservation-");
-        set_route_primary(&mut map, 1, NodeId::new(1));
-
-        let map = Arc::new(map);
-        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
-        let first_command =
-            create_bucket_metadata_command(PgId::new(1), 1, reserved_bucket.clone());
-        cluster
-            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &first_command)
-            .unwrap();
-
-        {
-            let node_zero_pg = map
-                .node(NodeId::new(0))
-                .unwrap()
-                .storage_node()
-                .get_pg(1)
-                .unwrap();
-            let reserved = crate::PgMetadataStore::acquire_bucket_write_reservation(
-                &*node_zero_pg,
-                &reserved_bucket,
-            )
-            .unwrap();
-            assert_eq!(reserved.active_write_reservations, 1);
-            crate::PgMetadataStore::begin_bucket_write_drain(&*node_zero_pg, &reserved_bucket)
-                .unwrap();
-            let draining =
-                crate::PgMetadataStore::head_bucket_raw(&*node_zero_pg, &reserved_bucket).unwrap();
-            assert!(draining.write_reservations_blocked);
-        }
-
-        let second_command = create_bucket_metadata_command(PgId::new(1), 2, next_bucket.clone());
-        cluster
-            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &second_command)
-            .unwrap();
-
-        {
-            let node_zero_pg = map
-                .node(NodeId::new(0))
-                .unwrap()
-                .storage_node()
-                .get_pg(1)
-                .unwrap();
-            crate::PgMetadataStore::release_bucket_write_reservation(
-                &*node_zero_pg,
-                &reserved_bucket,
-            )
-            .unwrap();
-            crate::PgMetadataStore::end_bucket_write_drain(&*node_zero_pg, &reserved_bucket)
-                .unwrap();
-            let info = crate::PgMetadataStore::head_bucket(&*node_zero_pg, &next_bucket).unwrap();
-            assert_eq!(info.name, next_bucket);
-        }
-    }
-
-    #[test]
     fn cluster_bucket_write_snapshot_uses_durable_reservation_rows() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -12169,8 +12083,7 @@ mod tests {
                 assert_eq!(reservations[0].bucket, bucket);
                 assert_eq!(reservations[0].cluster_epoch, crate::ClusterEpoch::INITIAL);
                 assert_eq!(reservations[0].operation_kind, "bucket-write-snapshot");
-                let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
-                assert_eq!(info.active_write_reservations, 0);
+                let _ = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
                 drop(primary_pg);
 
                 second_cluster
@@ -12193,9 +12106,8 @@ mod tests {
                             reservations[0].reservation_id,
                             reservations[1].reservation_id
                         );
-                        let info =
+                        let _ =
                             crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
-                        assert_eq!(info.active_write_reservations, 0);
                         Ok::<(), ()>(())
                     })
                     .unwrap()
@@ -12213,8 +12125,7 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(reservations.len(), 1);
-                let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
-                assert_eq!(info.active_write_reservations, 0);
+                let _ = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
                 Ok::<(), ()>(())
             })
             .unwrap()
@@ -12231,8 +12142,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
-        assert_eq!(info.active_write_reservations, 0);
+        let _ = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
     }
 
     #[test]
@@ -12278,9 +12188,8 @@ mod tests {
                 .unwrap();
                 assert_eq!(reservations.len(), 1);
                 assert_eq!(reservations[0].operation_kind, "put-object-stream-create");
-                let info =
+                let _ =
                     crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &hook_bucket).unwrap();
-                assert_eq!(info.active_write_reservations, 0);
                 Ok(())
             }),
         );
@@ -12306,8 +12215,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
-        assert_eq!(info.active_write_reservations, 0);
+        let _ = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
     }
 
     #[test]
@@ -12376,8 +12284,7 @@ mod tests {
             crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
                 .unwrap();
         assert_eq!(reservations.len(), 1);
-        let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
-        assert_eq!(info.active_write_reservations, 0);
+        let _ = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
         drop(primary_pg);
 
         drop(hook_guard);
@@ -12401,8 +12308,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
-        assert_eq!(info.active_write_reservations, 0);
+        let _ = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
     }
 
     #[test]
@@ -12483,8 +12389,7 @@ mod tests {
                 .unwrap();
         assert_eq!(reservations.len(), 1);
         assert_eq!(reservations[0].operation_kind, "put-object-stream-create");
-        let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
-        assert_eq!(info.active_write_reservations, 0);
+        let _ = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
         drop(primary_pg);
 
         drop(hook_guard);
@@ -12520,8 +12425,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
-        assert_eq!(info.active_write_reservations, 0);
+        let _ = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
     }
 
     #[test]
@@ -12618,12 +12522,6 @@ mod tests {
                 .len(),
             1,
             "ownership-check failures must preserve reservation proof for recovery"
-        );
-        assert_eq!(
-            crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket)
-                .unwrap()
-                .active_write_reservations,
-            0
         );
     }
 
@@ -12724,12 +12622,6 @@ mod tests {
                 .get_pg(1)
                 .unwrap();
             assert_eq!(
-                crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket)
-                    .unwrap()
-                    .active_write_reservations,
-                0
-            );
-            assert_eq!(
                 crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
                     .unwrap()
                     .len(),
@@ -12772,12 +12664,6 @@ mod tests {
             crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
                 .unwrap()
                 .is_empty()
-        );
-        assert_eq!(
-            crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket)
-                .unwrap()
-                .active_write_reservations,
-            0
         );
         let session = crate::PgMetadataStore::get_stream_upload(&*primary_pg, &session_id).unwrap();
         assert_eq!(session.bucket, bucket);
@@ -12851,12 +12737,6 @@ mod tests {
                 .unwrap()
                 .pop()
                 .expect("partial stream-create command should keep reservation live");
-        assert_eq!(
-            crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket)
-                .unwrap()
-                .active_write_reservations,
-            0
-        );
         drop(primary_pg);
         let pending = pending_metadata_command_for_test(&map, PgId::new(1), &bucket)
             .expect("partial stream-create command should remain pending");
@@ -12907,12 +12787,6 @@ mod tests {
                 .storage_node()
                 .get_pg(1)
                 .unwrap();
-            assert_eq!(
-                crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket)
-                    .unwrap()
-                    .active_write_reservations,
-                0
-            );
             primary_pg
                 .connection()
                 .execute(
@@ -12958,12 +12832,6 @@ mod tests {
             crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
                 .unwrap()
                 .is_empty()
-        );
-        assert_eq!(
-            crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket)
-                .unwrap()
-                .active_write_reservations,
-            0
         );
         drop(primary_pg);
         assert_clean_metadata_command_stream(&reopened, &[1]);
@@ -13102,80 +12970,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let info = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
-        assert_eq!(info.active_write_reservations, 0);
-    }
-
-    #[test]
-    fn bucket_metadata_commands_ignore_primary_local_write_reservation_state() {
-        let tmp = test_util::tempdir();
-        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
-        let ec_shape = EcShape { k: 2, m: 1 };
-        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
-        let topology = map
-            .node(NodeId::new(0))
-            .unwrap()
-            .storage_node()
-            .pg_topology();
-        let bucket = bucket_for_pg(topology, 1, "bucket-command-reserved-");
-        set_route_primary(&mut map, 1, NodeId::new(1));
-
-        let map = Arc::new(map);
-        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
-        create_test_bucket(&cluster, &bucket);
-
-        {
-            let primary_pg = map
-                .node(NodeId::new(1))
-                .unwrap()
-                .storage_node()
-                .get_pg(1)
-                .unwrap();
-            let reserved =
-                crate::PgMetadataStore::acquire_bucket_write_reservation(&*primary_pg, &bucket)
-                    .unwrap();
-            assert_eq!(reserved.active_write_reservations, 1);
-        }
-
-        let acl_grants = crate::AclGrants::default();
-        cluster
-            .put_bucket_acl_and_load_info(&bucket, &acl_grants, true, false)
-            .unwrap();
-        cluster
-            .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
-            .unwrap();
-        let public_access_block = crate::PublicAccessBlockConfig {
-            block_public_acls: true,
-            ignore_public_acls: true,
-            block_public_policy: true,
-            restrict_public_buckets: true,
-        };
-        cluster
-            .put_bucket_public_access_block_and_load_info(&bucket, public_access_block)
-            .unwrap();
-
-        for node_id in node_ids {
-            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
-            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
-            assert_eq!(info.acl_grants, acl_grants);
-            assert!(info.public_read);
-            assert!(!info.public_write);
-            assert_eq!(info.versioning, crate::BucketVersioningState::Enabled);
-            assert_eq!(info.public_access_block, Some(public_access_block));
-            if node_id == NodeId::new(1) {
-                assert_eq!(info.active_write_reservations, 1);
-            } else {
-                assert_eq!(info.active_write_reservations, 0);
-            }
-        }
-
-        let primary_pg = map
-            .node(NodeId::new(1))
-            .unwrap()
-            .storage_node()
-            .get_pg(1)
-            .unwrap();
-        crate::PgMetadataStore::release_bucket_write_reservation(&*primary_pg, &bucket).unwrap();
+        let _ = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
     }
 
     #[test]
@@ -14509,12 +14304,6 @@ mod tests {
                 .len(),
                 1
             );
-            assert_eq!(
-                crate::PgMetadataStore::head_bucket_raw(&*bucket_pg_store, &bucket)
-                    .unwrap()
-                    .active_write_reservations,
-                0
-            );
         }
         let replica_upload = {
             let replica = map.node(NodeId::new(1)).unwrap().storage_node();
@@ -14555,12 +14344,6 @@ mod tests {
             )
             .unwrap()
             .is_empty());
-            assert_eq!(
-                crate::PgMetadataStore::head_bucket_raw(&*bucket_pg_store, &bucket)
-                    .unwrap()
-                    .active_write_reservations,
-                0
-            );
         }
         assert_clean_metadata_command_stream(&reopened, &[bucket_pg, object_pg]);
     }
@@ -16274,13 +16057,6 @@ mod tests {
                 .is_empty(),
             "UploadPart stream-create command convergence must release the durable reservation"
         );
-        assert_eq!(
-            crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
-                .unwrap()
-                .active_write_reservations,
-            0,
-            "UploadPart stream-create command convergence must not depend on the legacy bridge counter"
-        );
     }
 
     #[test]
@@ -16513,12 +16289,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(
-            crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
-                .unwrap()
-                .active_write_reservations,
-            0
-        );
     }
 
     #[test]
@@ -16613,12 +16383,6 @@ mod tests {
             crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, &bucket)
                 .unwrap()
                 .is_empty()
-        );
-        assert_eq!(
-            crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
-                .unwrap()
-                .active_write_reservations,
-            0
         );
     }
 
@@ -18488,12 +18252,6 @@ mod tests {
                 .len(),
                 1
             );
-            assert_eq!(
-                crate::PgMetadataStore::head_bucket_raw(&*bucket_pg_store, &bucket)
-                    .unwrap()
-                    .active_write_reservations,
-                0
-            );
         }
         assert_stream_next_segment_vid(&map, NodeId::new(1), object_pg, &session_id, 2);
 
@@ -18525,12 +18283,6 @@ mod tests {
             )
             .unwrap()
             .is_empty());
-            assert_eq!(
-                crate::PgMetadataStore::head_bucket_raw(&*bucket_pg_store, &bucket)
-                    .unwrap()
-                    .active_write_reservations,
-                0
-            );
         }
     }
 
@@ -18605,12 +18357,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(
-            crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
-                .unwrap()
-                .active_write_reservations,
-            0
-        );
     }
 
     #[test]
@@ -18666,12 +18412,6 @@ mod tests {
             crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, &bucket)
                 .unwrap()
                 .is_empty()
-        );
-        assert_eq!(
-            crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
-                .unwrap()
-                .active_write_reservations,
-            0
         );
     }
 
@@ -20828,12 +20568,6 @@ mod tests {
                 1,
                 "partial direct PUT command must keep its command-owned bucket write proof live"
             );
-            assert_eq!(
-                crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
-                    .unwrap()
-                    .active_write_reservations,
-                0
-            );
         }
         {
             let primary = map.node(NodeId::new(1)).unwrap().storage_node();
@@ -20865,12 +20599,6 @@ mod tests {
                     .unwrap()
                     .is_empty(),
                 "direct PUT retry convergence must release the command-owned bucket write proof"
-            );
-            assert_eq!(
-                crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
-                    .unwrap()
-                    .active_write_reservations,
-                0
             );
         }
         {
@@ -21002,12 +20730,6 @@ mod tests {
                     .len(),
                 1
             );
-            assert_eq!(
-                crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
-                    .unwrap()
-                    .active_write_reservations,
-                0
-            );
         }
         drop(cluster);
         drop(map);
@@ -21040,12 +20762,6 @@ mod tests {
                     .unwrap()
                     .is_empty(),
                 "open-time convergence must release the command-owned bucket write proof"
-            );
-            assert_eq!(
-                crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
-                    .unwrap()
-                    .active_write_reservations,
-                0
             );
         }
         assert_clean_metadata_command_stream(&reopened, &[object_pg]);
@@ -29207,7 +28923,6 @@ mod tests {
                 None,
             )
             .unwrap();
-            crate::PgMetadataStore::begin_bucket_write_drain(&*primary_pg, &bucket).unwrap();
             let current =
                 crate::PgMetadataStore::head_bucket_record_raw(&*primary_pg, &bucket).unwrap();
             let command = MetadataCommandEnvelope::new(
@@ -29879,12 +29594,8 @@ mod tests {
                     .is_none(),
                 "non-empty DeleteBucket must roll back the temporary durable drain"
             );
-            let bucket_info = crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
+            let _ = crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
                 .expect("non-empty delete should leave the bucket active");
-            assert!(
-                !bucket_info.write_reservations_blocked,
-                "non-empty DeleteBucket must roll back the transitional legacy drain"
-            );
         }
 
         for node_id in node_ids {
@@ -30403,10 +30114,6 @@ mod tests {
             let bucket_info = crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
                 .expect("BucketNotEmpty should leave the bucket active");
             assert_eq!(bucket_info.state, crate::BucketState::Active);
-            assert!(
-                !bucket_info.write_reservations_blocked,
-                "BucketNotEmpty rollback should clear the transitional drain on node {node_id:?}"
-            );
         }
         let bucket_pg = map
             .node(NodeId::new(1))
@@ -31051,9 +30758,6 @@ mod tests {
                 Some(now.saturating_sub(1)),
             )
             .unwrap();
-            crate::PgMetadataStore::begin_bucket_write_drain(&*pg, &bucket).unwrap();
-            let blocked = crate::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket).unwrap();
-            assert!(blocked.write_reservations_blocked);
         }
         drop(cluster);
         drop(map);
@@ -31073,7 +30777,6 @@ mod tests {
                 .unwrap();
             let current = crate::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket).unwrap();
             assert_eq!(current.state, crate::BucketState::Deleting);
-            assert!(current.write_reservations_blocked);
             let drain = crate::PgMetadataStore::durable_bucket_write_drain(&*pg, &bucket)
                 .unwrap()
                 .expect(

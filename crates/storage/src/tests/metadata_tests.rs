@@ -542,9 +542,6 @@ fn file_bucket_metadata_create_head_list_delete() {
             state: BucketState::Active
         }
     ));
-    store
-        .begin_bucket_write_drain(&bucket_name("alpha"))
-        .unwrap();
     store.mark_bucket_deleting(&bucket_name("alpha")).unwrap();
     store
         .delete_finalized_bucket(&bucket_name("alpha"))
@@ -639,10 +636,6 @@ fn delete_bucket_clears_completed_multipart_upload_records() {
         .get_completed_multipart_upload(&multipart_upload_id("completed-upload"))
         .unwrap()
         .is_some());
-
-    store
-        .begin_bucket_write_drain(&bucket_name("bucket"))
-        .unwrap();
     store.mark_bucket_deleting(&bucket_name("bucket")).unwrap();
     store
         .delete_finalized_bucket(&bucket_name("bucket"))
@@ -703,7 +696,6 @@ fn delete_bucket_clears_object_version_counter_records() {
     assert_eq!(counter_rows, 1);
 
     store.delete_object_version(&bucket, &key, v1).unwrap();
-    store.begin_bucket_write_drain(&bucket).unwrap();
     store.mark_bucket_deleting(&bucket).unwrap();
     store.delete_finalized_bucket(&bucket).unwrap();
     let counter_rows: i64 = store
@@ -1194,7 +1186,6 @@ fn file_bucket_execution_generation_advances_across_delete_recreate() {
         .head_bucket(&bucket)
         .unwrap()
         .bucket_execution_generation;
-    store.begin_bucket_write_drain(&bucket).unwrap();
     store.mark_bucket_deleting(&bucket).unwrap();
     store.delete_finalized_bucket(&bucket).unwrap();
     store
@@ -1542,10 +1533,6 @@ fn delete_bucket_cascades_bucket_subresources() {
         .get_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Policy)
         .unwrap()
         .is_some());
-
-    store
-        .begin_bucket_write_drain(&bucket_name("bucket"))
-        .unwrap();
     store.mark_bucket_deleting(&bucket_name("bucket")).unwrap();
     store
         .delete_finalized_bucket(&bucket_name("bucket"))
@@ -1603,9 +1590,6 @@ fn list_buckets_with_lifecycle_returns_only_active_lifecycle_buckets() {
             )
             .unwrap();
     }
-    store
-        .begin_bucket_write_drain(&bucket_name("beta"))
-        .unwrap();
     store.mark_bucket_deleting(&bucket_name("beta")).unwrap();
 
     let buckets = store.list_buckets_with_lifecycle().unwrap();
@@ -8187,12 +8171,6 @@ fn mark_bucket_deleting_and_head_bucket_raw() {
     // head_bucket_raw also sees it
     let raw = store.head_bucket_raw(&bucket_name("mybucket")).unwrap();
     assert_eq!(raw.state, BucketState::Active);
-    assert!(!raw.write_reservations_blocked);
-    assert_eq!(raw.active_write_reservations, 0);
-
-    store
-        .begin_bucket_write_drain(&bucket_name("mybucket"))
-        .unwrap();
 
     // Mark as deleting
     store
@@ -8209,8 +8187,6 @@ fn mark_bucket_deleting_and_head_bucket_raw() {
     // head_bucket_raw SHOULD still find it (includes Deleting)
     let raw = store.head_bucket_raw(&bucket_name("mybucket")).unwrap();
     assert_eq!(raw.state, BucketState::Deleting);
-    assert!(raw.write_reservations_blocked);
-    assert_eq!(raw.active_write_reservations, 0);
 }
 
 #[test]
@@ -8257,60 +8233,6 @@ fn object_key_validation_rejects_invalid_inputs() {
         ObjectKey::try_from("\0"),
         Err(ObjectKeyError::ContainsNullByte)
     ));
-}
-
-#[test]
-fn bucket_write_reservations_and_drain_round_trip() {
-    let (_dir, store) = make_pg_store();
-    store
-        .create_bucket(
-            &bucket_name("mybucket"),
-            "owner",
-            &CanonicalUserId::from_principal("owner"),
-            &AclGrants::default(),
-            false,
-            false,
-        )
-        .unwrap();
-
-    let reserved = store
-        .acquire_bucket_write_reservation(&bucket_name("mybucket"))
-        .unwrap();
-    assert_eq!(reserved.state, BucketState::Active);
-    assert_eq!(reserved.active_write_reservations, 1);
-    assert!(!reserved.write_reservations_blocked);
-
-    let raw = store.head_bucket_raw(&bucket_name("mybucket")).unwrap();
-    assert_eq!(raw.active_write_reservations, 1);
-    assert!(!raw.write_reservations_blocked);
-
-    store
-        .release_bucket_write_reservation(&bucket_name("mybucket"))
-        .unwrap();
-    let raw = store.head_bucket_raw(&bucket_name("mybucket")).unwrap();
-    assert_eq!(raw.active_write_reservations, 0);
-
-    store
-        .begin_bucket_write_drain(&bucket_name("mybucket"))
-        .unwrap();
-    let raw = store.head_bucket_raw(&bucket_name("mybucket")).unwrap();
-    assert!(raw.write_reservations_blocked);
-    assert_eq!(raw.active_write_reservations, 0);
-
-    let err = store
-        .acquire_bucket_write_reservation(&bucket_name("mybucket"))
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        crate::error::MetadataError::BucketWriteDraining
-    ));
-
-    store
-        .end_bucket_write_drain(&bucket_name("mybucket"))
-        .unwrap();
-    let raw = store.head_bucket_raw(&bucket_name("mybucket")).unwrap();
-    assert!(!raw.write_reservations_blocked);
-    assert_eq!(raw.active_write_reservations, 0);
 }
 
 #[test]
@@ -8533,62 +8455,6 @@ fn durable_bucket_write_drain_blocks_reservations_and_requires_exact_identity() 
             None,
             None,
         )
-        .unwrap();
-}
-
-#[test]
-fn mark_bucket_deleting_requires_drained_reservations() {
-    let (_dir, store) = make_pg_store();
-    store
-        .create_bucket(
-            &bucket_name("mybucket"),
-            "owner",
-            &CanonicalUserId::from_principal("owner"),
-            &AclGrants::default(),
-            false,
-            false,
-        )
-        .unwrap();
-
-    let err = store
-        .mark_bucket_deleting(&bucket_name("mybucket"))
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        crate::error::MetadataError::BucketNotFound { .. }
-    ));
-
-    store
-        .begin_bucket_write_drain(&bucket_name("mybucket"))
-        .unwrap();
-    store
-        .acquire_bucket_write_reservation(&bucket_name("mybucket"))
-        .err();
-    let reservation = store.head_bucket_raw(&bucket_name("mybucket")).unwrap();
-    assert_eq!(reservation.active_write_reservations, 0);
-
-    store
-        .end_bucket_write_drain(&bucket_name("mybucket"))
-        .unwrap();
-    store
-        .acquire_bucket_write_reservation(&bucket_name("mybucket"))
-        .unwrap();
-    store
-        .begin_bucket_write_drain(&bucket_name("mybucket"))
-        .unwrap();
-    let err = store
-        .mark_bucket_deleting(&bucket_name("mybucket"))
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        crate::error::MetadataError::BucketNotFound { .. }
-    ));
-
-    store
-        .release_bucket_write_reservation(&bucket_name("mybucket"))
-        .unwrap();
-    store
-        .mark_bucket_deleting(&bucket_name("mybucket"))
         .unwrap();
 }
 

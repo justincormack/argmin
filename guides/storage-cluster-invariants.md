@@ -58,11 +58,9 @@ Every public `StorageCluster` operation must fit one of these classes:
   local row still exists in any state other than `Deleting`.
 - Bucket write-drain authority is durable and bucket-PG-primary owned.
   Production write admission uses `bucket_write_reservations`; DeleteBucket
-  begin uses `bucket_write_drains`. The legacy bucket-row counters,
-  `write_reservations_blocked` and `active_write_reservations`, are retired
-  compatibility/test-only state during Phase 9.4.6 removal and are not
-  production fence authority. The Phase 9.4 model and publisher audit live in
-  [bucket-write-drain.md](bucket-write-drain.md).
+  begin uses `bucket_write_drains`. The legacy bucket-row write-drain counters
+  have been removed and are not production fence authority. The Phase 9.4 model
+  and publisher audit live in [bucket-write-drain.md](bucket-write-drain.md).
 - Best-effort cleanup may suppress cleanup errors, but typed route/control-plane
   errors must not collapse into `NotFound` or generic IO before the suppression
   point.

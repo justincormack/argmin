@@ -75,7 +75,9 @@ Do not open-code this pattern in object paths:
 - `get_pg(meta)` then `get_pg(shard)`
 - manual lock-order branching
 - ad-hoc relock/retry loops
-- open-coded `acquire_bucket_write_reservation(...)` / `release_bucket_write_reservation(...)` pairs in migrated production paths; use a shared storage wrapper that owns acquire, snapshot load, protected action, and release
+- open-coded durable bucket write reservation acquire/release pairs in migrated
+  production paths; use a shared storage wrapper that owns acquire, snapshot
+  load, protected action, and release
 - lock-holding network reads in streaming paths
 - shard-file visibility that bypasses metadata publication
 - shard-file writes while holding a PG mutex unless the code is intentionally changing the write visibility model

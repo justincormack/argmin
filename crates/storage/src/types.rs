@@ -2083,8 +2083,6 @@ pub struct BucketInfo {
     pub acl_grants: AclGrants,
     pub public_read: bool,
     pub public_write: bool,
-    pub write_reservations_blocked: bool,
-    pub active_write_reservations: u32,
     /// Typed public access block configuration (None = no config).
     pub public_access_block: Option<PublicAccessBlockConfig>,
     /// Typed ownership controls value (None = not set).
@@ -2214,11 +2212,6 @@ impl std::fmt::Debug for BucketInfo {
             .field("acl_grants", &self.acl_grants)
             .field("public_read", &self.public_read)
             .field("public_write", &self.public_write)
-            .field(
-                "write_reservations_blocked",
-                &self.write_reservations_blocked,
-            )
-            .field("active_write_reservations", &self.active_write_reservations)
             .field("public_access_block", &self.public_access_block)
             .field("ownership_controls", &self.ownership_controls)
             .field("bucket_policy_present", &self.bucket_policy_present)
@@ -3543,8 +3536,6 @@ mod tests {
             acl_grants: AclGrants::default(),
             public_read: false,
             public_write: false,
-            write_reservations_blocked: false,
-            active_write_reservations: 0,
             public_access_block: Some(PublicAccessBlockConfig {
                 block_public_acls: true,
                 ignore_public_acls: false,

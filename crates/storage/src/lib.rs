@@ -56,8 +56,8 @@ pub use node::{
     install_bucket_scoped_test_hooks, BucketScopedTestHookGuard, BucketScopedTestHooks,
 };
 pub use node::{
-    BucketCreateAttemptOutcome, BucketDeleteFinalizeOutcome, BucketPairPgGuards,
-    BucketWriteDrainGuard, LocalStorageNode, ReclaimWorkItem, SharedStorageNode,
+    BucketCreateAttemptOutcome, BucketDeleteFinalizeOutcome, BucketPairPgGuards, LocalStorageNode,
+    ReclaimWorkItem, SharedStorageNode,
 };
 pub use pg_store::{MetadataCommandLogCompactionStatus, MetadataCommandLogStats, PgStore};
 pub use pg_topology::PgTopology;
