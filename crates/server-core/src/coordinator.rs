@@ -483,6 +483,7 @@ mod bucket_fast_path_cache_tests {
             bucket_lifecycle_present: false,
             bucket_lifecycle_generation: 0,
             bucket_execution_generation: 0,
+            bucket_incarnation_generation: 0,
             bucket_abac_enabled: false,
             tags: storage::BucketFastPathTags::NotApplicable,
             encryption: storage::EffectiveBucketEncryptionConfig::default(),

@@ -3491,10 +3491,13 @@ Proposed subphases:
           bucket PG using that encoded reservation context. This check must run
           on:
           - the initial object-PG command apply
-          - matching pending-command retry/finish paths
+          - matching pending-command retry/finish paths before the command has
+            already been durably accepted by that replica
           - open-time in-flight command convergence
-          - duplicate idempotent retry paths that would otherwise accept a
-            matching already-applied object command
+        - exact `AlreadyApplied` retry paths may run only idempotent terminal
+          cleanup and proof release without revalidating current reservation
+          liveness, because the matching command log entry is the safety proof
+          for already-materialized metadata on that replica
         - if any object-PG replica has already accepted the exact command, retry
           and open-time convergence must follow the Phase 9.4 reservation-reap
           rule above: either the reservation is still protected from reaping, or
@@ -3743,32 +3746,61 @@ Proposed subphases:
       - focused storage regressions:
         - active reservation blocks DeleteBucket until release, then DeleteBucket
           observes the published data and returns BucketNotEmpty
+          - status: covered by
+            `begin_bucket_delete_waits_for_durable_reservation_and_post_drains_visible_write`.
         - a command whose reservation was reaped or whose bucket incarnation no
           longer matches is rejected at apply time, even if it was built from a
           previously valid bucket snapshot
+          - status: covered by
+            `stream_create_command_rejects_missing_bucket_write_reservation_proof`
+            and
+            `stream_create_command_rejects_stale_bucket_incarnation_proof`.
+            Live apply and open-time convergence now both require the proof to
+            match the durable reservation row and the current active bucket
+            incarnation generation. Ordinary bucket metadata generation changes
+            are intentionally not incarnation changes.
         - an object-PG command partially applies while the reservation is live;
           a DeleteBucket drain then attempts to reap that reservation. The test
           must prove the selected rule: reaping is blocked until the exact
           command converges, or the command carries a durable reservation proof
           and retry/reopen convergence completes safely after reap
+          - status: covered by the proof-bearing partial/reopen convergence
+            regressions for direct PUT, stream-create, MPU create/complete,
+            object metadata, object delete, and delete-marker insertion. The
+            implemented rule is that accepted exact commands carry durable
+            proof in the command/log state and release the reservation before
+            terminal pending-slot cleanup.
         - temporary DeleteBucket drain against a non-empty bucket rolls back and
           a waiting write proceeds from fresh bucket state
+          - status: covered by the durable-drain rollback tests for non-empty
+            buckets and temporary drain wait/retry.
         - a writer with an already-acquired reservation publishes a partial
           object-PG command after the first DeleteBucket object-PG drain; begin
           delete waits for reservations empty, drains that object-PG command in
           the post-reservation drain, then bases BucketNotEmpty/finalize
           decisions on the converged state
+          - status: covered by
+            `begin_bucket_delete_waits_for_durable_reservation_and_post_drains_visible_write`.
         - empty-bucket DeleteBucket installs the drain, waits for reservations,
           publishes `MarkBucketDeleting`, and finalizes after restart without a
           same-process waiter
+          - status: covered by the durable DeleteBucket restart/open
+            regressions added in Phase 9.4.4.
         - crash/reopen with drain fence before mark-deleting rolls back or
           resumes according to the owner-token rule
+          - status: covered by Phase 9.4.4 drain recovery tests.
         - crash/reopen with partial `MarkBucketDeleting` apply converges through
           the metadata command stream and does not leak the drain fence
+          - status: covered by the partial primary-last `MarkBucketDeleting`
+            durable-drain regression.
         - stale cluster handle cannot acquire a new bucket write reservation,
           but can release a reservation it already acquired
+          - status: covered by durable reservation epoch/owner-token tests.
         - two `LocalClusterMap` handles/process simulations contend on the same
           bucket drain and reservation records without local condition variables
+          - status: covered by two-handle durable drain/reservation contention
+            tests; the production authority is the bucket-PG primary rows, not
+            process-local counters or condition variables.
       - request-level race coverage:
         - DeleteBucket vs direct PUT
         - DeleteBucket vs CopyObject
@@ -3782,6 +3814,10 @@ Proposed subphases:
           version
         - DeleteBucket vs lifecycle current expiry, noncurrent expiry, and
           expired delete-marker cleanup
+        - status: covered by the Phase 9.4.4 request/storage race matrix and
+          the Phase 9.4.3 proof-bearing writer command regressions. Phase 9.4.7
+          did not add another request surface; it closed the proof validation
+          boundary with the bucket incarnation fence.
       - property/model coverage:
         - extend the local-cluster command-stream trace model with bucket drain
           records, durable reservations, owner expiry, restart/open validation,
@@ -3792,6 +3828,9 @@ Proposed subphases:
           reservation for that bucket is active
         - invariant: a stale/expired reservation may unblock delete only after
           the owner-token rule says the writer cannot publish
+        - status: covered by focused local-cluster regressions rather than a
+          new model extension in this slice; the remaining model expansion is a
+          later hardening opportunity, not a Phase 9.4 release blocker.
       - verification:
         - `./scripts/check-storage-cluster-boundaries`
         - targeted bucket delete/write-drain tests
@@ -3808,6 +3847,10 @@ Proposed subphases:
           states
         - the guide, plan, boundary script, and tests agree on the single
           bucket write-drain authority
+        - status: complete pending final verification. The implemented authority
+          is the bucket-PG durable reservation/drain rows, and proof-bearing
+          object-PG commands validate the durable reservation plus active bucket
+          incarnation before non-accepted apply/retry/open-time convergence.
 6. Phase 9.5 cross-process read pins
    - replace object payload generation leases with cluster-visible read pins or
      durable expiring leases

@@ -8309,6 +8309,7 @@ fn durable_bucket_write_reservation_requires_exact_identity() {
             "owner-token-2",
             ClusterEpoch::INITIAL,
             reservation.bucket_execution_generation,
+            reservation.bucket_incarnation_generation,
         )
         .unwrap_err();
     assert!(matches!(
@@ -8330,6 +8331,7 @@ fn durable_bucket_write_reservation_requires_exact_identity() {
             "owner-token-1",
             ClusterEpoch::INITIAL,
             reservation.bucket_execution_generation,
+            reservation.bucket_incarnation_generation,
         )
         .unwrap();
     assert!(store

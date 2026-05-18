@@ -114,10 +114,20 @@ Object-PG command apply must re-read and validate that bucket-PG reference. The
 validation must run for:
 
 - initial object-PG command apply
-- matching pending-command retry and finish paths
+- matching pending-command retry and finish paths before the command has already
+  been durably accepted by that replica
 - open-time in-flight command convergence
-- duplicate idempotent retry paths that would otherwise accept an already
-  applied object command
+
+Validation requires both the durable reservation row and the current bucket row:
+the proof must match the reservation identity, and the bucket must still be the
+same active bucket incarnation generation recorded in the proof. A stale
+reservation row is not authority for a recreated or terminal bucket.
+
+When a replica reports `AlreadyApplied` for the exact command bytes/hash chain,
+the live request path may run only idempotent terminal cleanup and proof release
+without revalidating the still-live reservation row. At that point the metadata
+mutation is already materialized on that replica; the safety proof is the
+accepted command log entry, not current reservation liveness.
 
 If no object-PG replica has accepted the command yet, a missing, reaped,
 expired, wrong-owner, wrong-incarnation, or terminal-drain reservation must make

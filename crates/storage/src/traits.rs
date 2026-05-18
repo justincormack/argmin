@@ -124,6 +124,7 @@ pub(crate) trait PgMetadataStore {
         owner_token: &str,
         cluster_epoch: ClusterEpoch,
         bucket_execution_generation: u64,
+        bucket_incarnation_generation: u64,
     ) -> Result<(), MetadataError>;
 
     /// Release a metadata-command bucket write proof.
@@ -139,6 +140,7 @@ pub(crate) trait PgMetadataStore {
         owner_token: &str,
         cluster_epoch: ClusterEpoch,
         bucket_execution_generation: u64,
+        bucket_incarnation_generation: u64,
     ) -> Result<(), MetadataError>;
 
     /// Begin a durable bucket write drain for one bucket incarnation.

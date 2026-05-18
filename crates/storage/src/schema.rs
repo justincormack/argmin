@@ -384,6 +384,7 @@ CREATE TABLE IF NOT EXISTS buckets (
     bucket_policy_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_policy_generation >= 0),
     bucket_lifecycle_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_lifecycle_generation >= 0),
     bucket_execution_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_execution_generation >= 0),
+    bucket_incarnation_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_incarnation_generation >= 0),
     completed_multipart_upload_sequence INTEGER NOT NULL DEFAULT 0 CHECK (completed_multipart_upload_sequence >= 0),
     bucket_abac_enabled INTEGER NOT NULL DEFAULT 0 CHECK (bucket_abac_enabled IN (0, 1)),
     default_encryption_type INTEGER CHECK (
@@ -411,6 +412,7 @@ CREATE TABLE IF NOT EXISTS bucket_write_reservations (
     owner_token      TEXT NOT NULL CHECK (length(owner_token) BETWEEN 1 AND 256),
     cluster_epoch    INTEGER NOT NULL CHECK (cluster_epoch > 0),
     bucket_execution_generation INTEGER NOT NULL CHECK (bucket_execution_generation >= 0),
+    bucket_incarnation_generation INTEGER NOT NULL CHECK (bucket_incarnation_generation >= 0),
     operation_kind   TEXT NOT NULL CHECK (length(operation_kind) BETWEEN 1 AND 64),
     created_at       INTEGER NOT NULL CHECK (created_at >= 0),
     lease_deadline   INTEGER CHECK (lease_deadline IS NULL OR lease_deadline >= 0),

@@ -152,6 +152,7 @@ pub struct BucketRecord {
     pub(crate) bucket_policy_generation: u64,
     pub(crate) bucket_lifecycle_generation: u64,
     pub(crate) bucket_execution_generation: u64,
+    pub(crate) bucket_incarnation_generation: u64,
     pub(crate) completed_multipart_upload_sequence: u64,
     pub(crate) bucket_abac_enabled: bool,
     pub(crate) encryption: BucketEncryptionConfig,
@@ -183,6 +184,7 @@ impl BucketRecord {
             bucket_policy_generation: 0,
             bucket_lifecycle_generation: 0,
             bucket_execution_generation,
+            bucket_incarnation_generation: bucket_execution_generation,
             completed_multipart_upload_sequence: 0,
             bucket_abac_enabled: false,
             encryption: BucketEncryptionConfig {
@@ -807,6 +809,7 @@ pub struct BucketWriteReservationProof {
     pub(crate) owner_token: String,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) bucket_execution_generation: u64,
+    pub(crate) bucket_incarnation_generation: u64,
     pub(crate) operation_kind: String,
     pub(crate) created_at: u64,
     pub(crate) lease_deadline: Option<u64>,
@@ -821,6 +824,7 @@ impl From<&BucketWriteReservationRecord> for BucketWriteReservationProof {
             owner_token: record.owner_token.clone(),
             cluster_epoch: record.cluster_epoch,
             bucket_execution_generation: record.bucket_execution_generation,
+            bucket_incarnation_generation: record.bucket_incarnation_generation,
             operation_kind: record.operation_kind.clone(),
             created_at: record.created_at,
             lease_deadline: record.lease_deadline,
@@ -836,6 +840,7 @@ impl BucketWriteReservationProof {
             && self.owner_token == record.owner_token
             && self.cluster_epoch == record.cluster_epoch
             && self.bucket_execution_generation == record.bucket_execution_generation
+            && self.bucket_incarnation_generation == record.bucket_incarnation_generation
             && self.operation_kind == record.operation_kind
             && self.created_at == record.created_at
             && self.lease_deadline == record.lease_deadline
@@ -1852,6 +1857,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_u64()?;
         self.read_u64()?;
         self.read_u64()?;
+        self.read_u64()?;
         self.skip_bool()?;
         self.skip_bucket_encryption()
     }
@@ -1877,6 +1883,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             bucket_policy_generation: self.read_u64()?,
             bucket_lifecycle_generation: self.read_u64()?,
             bucket_execution_generation: self.read_u64()?,
+            bucket_incarnation_generation: self.read_u64()?,
             completed_multipart_upload_sequence: self.read_u64()?,
             bucket_abac_enabled: self.read_bool()?,
             encryption: self.read_bucket_encryption()?,
@@ -2138,6 +2145,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.skip_str()?;
         self.skip_str()?;
         self.skip_str()?;
+        self.read_u64()?;
         self.read_u64()?;
         self.read_u64()?;
         self.skip_str()?;
@@ -2670,6 +2678,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             cluster_epoch: ClusterEpoch::new(self.read_u64()?)
                 .ok_or_else(|| "invalid bucket write reservation cluster epoch".to_string())?,
             bucket_execution_generation: self.read_u64()?,
+            bucket_incarnation_generation: self.read_u64()?,
             operation_kind: self.read_string("bucket write reservation operation kind")?,
             created_at: self.read_u64()?,
             lease_deadline: self.read_optional_u64_value()?,
@@ -3295,6 +3304,7 @@ fn encode_bucket_record(out: &mut Vec<u8>, bucket: &BucketRecord) {
     put_u64(out, bucket.bucket_policy_generation);
     put_u64(out, bucket.bucket_lifecycle_generation);
     put_u64(out, bucket.bucket_execution_generation);
+    put_u64(out, bucket.bucket_incarnation_generation);
     put_u64(out, bucket.completed_multipart_upload_sequence);
     put_bool(out, bucket.bucket_abac_enabled);
     encode_bucket_encryption(out, bucket.encryption);
@@ -3579,6 +3589,7 @@ fn encode_bucket_write_reservation_proof(out: &mut Vec<u8>, proof: &BucketWriteR
     put_str(out, &proof.owner_token);
     put_u64(out, proof.cluster_epoch.get());
     put_u64(out, proof.bucket_execution_generation);
+    put_u64(out, proof.bucket_incarnation_generation);
     put_str(out, &proof.operation_kind);
     put_u64(out, proof.created_at);
     encode_optional_u64(out, proof.lease_deadline);
@@ -3772,6 +3783,7 @@ mod tests {
             owner_token: "owner-token".to_string(),
             cluster_epoch: ClusterEpoch::INITIAL,
             bucket_execution_generation: 7,
+            bucket_incarnation_generation: 7,
             operation_kind: "direct-put-commit".to_string(),
             created_at: 10,
             lease_deadline: Some(20),
@@ -3837,6 +3849,7 @@ mod tests {
             owner_token: "owner-token".to_string(),
             cluster_epoch: ClusterEpoch::INITIAL,
             bucket_execution_generation: 7,
+            bucket_incarnation_generation: 7,
             operation_kind: "put-object-stream-create".to_string(),
             created_at: 10,
             lease_deadline: Some(20),
@@ -3889,6 +3902,7 @@ mod tests {
             owner_token: "owner-token".to_string(),
             cluster_epoch: ClusterEpoch::INITIAL,
             bucket_execution_generation: 7,
+            bucket_incarnation_generation: 7,
             operation_kind: "complete-multipart-upload".to_string(),
             created_at: 10,
             lease_deadline: Some(20),
@@ -3966,6 +3980,7 @@ mod tests {
             owner_token: "owner-token".to_string(),
             cluster_epoch: ClusterEpoch::INITIAL,
             bucket_execution_generation: 7,
+            bucket_incarnation_generation: 7,
             operation_kind: "put-object-metadata".to_string(),
             created_at: 10,
             lease_deadline: Some(20),
@@ -4029,6 +4044,7 @@ mod tests {
             owner_token: "owner-token".to_string(),
             cluster_epoch: ClusterEpoch::INITIAL,
             bucket_execution_generation: 7,
+            bucket_incarnation_generation: 7,
             operation_kind: "delete-object-version".to_string(),
             created_at: 10,
             lease_deadline: Some(20),
@@ -4075,6 +4091,7 @@ mod tests {
             owner_token: "owner-token".to_string(),
             cluster_epoch: ClusterEpoch::INITIAL,
             bucket_execution_generation: 7,
+            bucket_incarnation_generation: 7,
             operation_kind: "insert-delete-marker".to_string(),
             created_at: 10,
             lease_deadline: Some(20),
@@ -4148,7 +4165,7 @@ mod tests {
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
-        assert_eq!(envelope.checksum_crc64(), 0xb946d8ee1f29e72d);
+        assert_eq!(envelope.checksum_crc64(), 0x5b8043f7c37bffc9);
     }
 
     #[test]
@@ -4231,7 +4248,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x0c1951d65edbd251);
+        assert_eq!(envelope.checksum_crc64(), 0xe6286a7b17defac2);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -4257,7 +4274,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x06ba0a6e63da3c40);
+        assert_eq!(envelope.checksum_crc64(), 0x9bd85f22eb0bceff);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -4314,7 +4331,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x8d2d435216256076);
+        assert_eq!(envelope.checksum_crc64(), 0x5c48aa22f20a2615);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -4395,13 +4412,13 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0x095cf1d0417e611c,
-                0x4711437e605b526e,
-                0xe610caa6d4b779ba,
-                0x711d9104009568b9,
-                0x23c58b23008c3a11,
-                0xd6c41b2d75142020,
-                0xe1c94f024274c273,
+                0xcd86b7559cc652cf,
+                0xaf6399dc2142e9e9,
+                0x3324d84173aa90f7,
+                0x27d78e090540a726,
+                0x1b0b799a9d4141e7,
+                0xca47a94065b4d9aa,
+                0x877b71eb747e4066,
             ]
         );
     }
@@ -4692,6 +4709,7 @@ mod tests {
             owner_token: "owner-token".to_string(),
             cluster_epoch: ClusterEpoch::INITIAL,
             bucket_execution_generation: 9,
+            bucket_incarnation_generation: 9,
             operation_kind: "direct-put-commit".to_string(),
             created_at: 444,
             lease_deadline: Some(555),
@@ -5047,31 +5065,31 @@ mod tests {
                 0x5fc3fd9935e6b23a,
                 0x56db6be41cc9a89c,
                 0x3acf49df359790d4,
-                0x1709498196ee0830,
-                0xbcb5caaa0f53392e,
-                0x0fd434d65722acdf,
-                0xbb25f6244db4157a,
-                0x9b1f0763fadb4394,
-                0x29319fa2320b5fe6,
-                0xdb4c50b38f78ad70,
-                0x7b3ca1162beb9003,
-                0xbc28df17e8e3b46b,
-                0x3c180aad45432e94,
-                0x148d763dc19749f9,
-                0x74269a8640f6cc38,
-                0xf202bed248d94901,
-                0x18628b4680d19eea,
-                0x4842e9828aac6523,
+                0x953a2d6c99cdaddb,
+                0xf06b16288bdaeb8e,
+                0xd44aa9d008b3d4a6,
+                0x70c0e0b11a697a0f,
+                0x22e816661cec7274,
+                0xe7353d51b6609ac8,
+                0x58f5eb1a4f60971b,
+                0xef0bd51e556f76ef,
+                0x6ad75e4de92c2dcb,
+                0x70d5502b442bdef6,
+                0x9ce4e01e6a487491,
+                0x0a8d33e1be16239d,
+                0x48fb53d34217c071,
+                0x60d07b32ba40633a,
+                0x5905759308d55e48,
                 0x8f0590d0286f0dc4,
-                0x81840bc9d613bfcc,
-                0xf65437e673629d78,
-                0x531372a5ef60100f,
+                0x2d6608601fded1d8,
+                0xe3226a0437ce53d4,
+                0x85aa88f98640917b,
                 0x8d3e5d6cb995e021,
                 0x873424a13234f823,
-                0xd791c495e8ce2c3e,
+                0x386d1fe2b146db69,
                 0xa9cde2110916a8a6,
                 0x0e53aa8cb595ea77,
-                0x1fb89915efec6e7a,
+                0xba43f79ea2af20cb,
                 0x13ddd49bdbc91001,
                 0x1946524188e07bbb,
             ]

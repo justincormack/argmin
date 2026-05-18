@@ -1567,6 +1567,7 @@ impl super::StorageCluster {
             &reservation.record.owner_token,
             reservation.record.cluster_epoch,
             reservation.record.bucket_execution_generation,
+            reservation.record.bucket_incarnation_generation,
         );
         durable_result?;
         Ok(())

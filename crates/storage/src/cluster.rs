@@ -20,7 +20,7 @@ use crate::metadata_command::{
 use crate::node::SharedStorageNode;
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
-    BucketName, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
+    BucketName, BucketState, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
     CommitDirectPutObjectReq, CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot,
     DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
     MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
@@ -1672,7 +1672,18 @@ impl StorageCluster {
             .into());
         };
         if proof.matches_record(&record) {
-            Ok(())
+            let current_bucket = PgMetadataStore::head_bucket_raw(&*bucket_pg, &proof.bucket)?;
+            if current_bucket.state == BucketState::Active
+                && current_bucket.bucket_incarnation_generation
+                    == proof.bucket_incarnation_generation
+            {
+                Ok(())
+            } else {
+                Err(MetadataError::BucketWriteReservationConflict {
+                    reservation_id: proof.reservation_id.clone(),
+                }
+                .into())
+            }
         } else {
             Err(MetadataError::BucketWriteReservationConflict {
                 reservation_id: proof.reservation_id.clone(),
@@ -1717,6 +1728,7 @@ impl StorageCluster {
             &proof.owner_token,
             proof.cluster_epoch,
             proof.bucket_execution_generation,
+            proof.bucket_incarnation_generation,
         )?;
         node.notify_bucket_coordination_change(&proof.bucket);
         Ok(())

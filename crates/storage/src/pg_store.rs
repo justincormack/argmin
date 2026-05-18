@@ -56,7 +56,7 @@ SELECT name, owner_principal, owner_canonical_id, created_at, region, state, ver
        EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 4 AND body IS NOT NULL) AS bucket_policy_present, \
        bucket_policy_public, bucket_policy_generation, \
        EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 5 AND body IS NOT NULL) AS bucket_lifecycle_present, \
-       bucket_lifecycle_generation, bucket_execution_generation, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
+       bucket_lifecycle_generation, bucket_execution_generation, bucket_incarnation_generation, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
 FROM buckets";
 const BUCKET_INFO_BY_NAME_SELECT: &str = "\
 SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, \
@@ -64,13 +64,13 @@ SELECT name, owner_principal, owner_canonical_id, created_at, region, state, ver
        EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 4 AND body IS NOT NULL) AS bucket_policy_present, \
        bucket_policy_public, bucket_policy_generation, \
        EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 5 AND body IS NOT NULL) AS bucket_lifecycle_present, \
-       bucket_lifecycle_generation, bucket_execution_generation, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
+       bucket_lifecycle_generation, bucket_execution_generation, bucket_incarnation_generation, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
 FROM buckets WHERE name = ?1";
 
 const BUCKET_RECORD_BY_NAME_SELECT: &str = "\
 SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, \
        public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls_mode, \
-       bucket_policy_public, bucket_policy_generation, bucket_lifecycle_generation, bucket_execution_generation, completed_multipart_upload_sequence, bucket_abac_enabled, default_encryption_type, sse_c_blocked, \
+       bucket_policy_public, bucket_policy_generation, bucket_lifecycle_generation, bucket_execution_generation, bucket_incarnation_generation, completed_multipart_upload_sequence, bucket_abac_enabled, default_encryption_type, sse_c_blocked, \
        object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
 FROM buckets WHERE name = ?1";
 
@@ -178,6 +178,7 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "bucket_policy_generation",
             "bucket_lifecycle_generation",
             "bucket_execution_generation",
+            "bucket_incarnation_generation",
             "completed_multipart_upload_sequence",
             "bucket_abac_enabled",
             "default_encryption_type",
@@ -4069,12 +4070,12 @@ impl PgStore {
         let ownership_controls = Self::parse_ownership_controls(row.get(15)?, 15)?;
         let object_lock = Self::parse_bucket_object_lock(
             (
-                row.get::<_, i64>(25)?,
-                row.get::<_, Option<u8>>(26)?,
-                row.get::<_, Option<i64>>(27)?,
+                row.get::<_, i64>(26)?,
+                row.get::<_, Option<u8>>(27)?,
                 row.get::<_, Option<i64>>(28)?,
+                row.get::<_, Option<i64>>(29)?,
             ),
-            [25, 26, 27, 28],
+            [26, 27, 28, 29],
         )?;
         let acl_grants = Self::parse_acl_grants(row.get::<_, String>(7)?, 7, "acl_grants")?;
         Ok(BucketInfo {
@@ -4102,21 +4103,22 @@ impl PgStore {
             bucket_lifecycle_present: row.get::<_, i64>(19)? != 0,
             bucket_lifecycle_generation: row.get::<_, i64>(20)? as u64,
             bucket_execution_generation: row.get::<_, i64>(21)? as u64,
-            bucket_abac_enabled: row.get::<_, i64>(22)? != 0,
+            bucket_incarnation_generation: row.get::<_, i64>(22)? as u64,
+            bucket_abac_enabled: row.get::<_, i64>(23)? != 0,
             encryption: BucketEncryptionConfig {
                 default_encryption: row
-                    .get::<_, Option<u8>>(23)?
+                    .get::<_, Option<u8>>(24)?
                     .map(|value| {
                         ManagedEncryptionAlgorithm::from_u8(value).ok_or_else(|| {
                             rusqlite::Error::FromSqlConversionFailure(
-                                23,
+                                24,
                                 rusqlite::types::Type::Integer,
                                 Box::from(format!("invalid default_encryption_type: {value}")),
                             )
                         })
                     })
                     .transpose()?,
-                sse_c_blocked: row.get::<_, i64>(24)? != 0,
+                sse_c_blocked: row.get::<_, i64>(25)? != 0,
             }
             .effective(),
         })
@@ -4139,12 +4141,12 @@ impl PgStore {
         let ownership_controls = Self::parse_ownership_controls(row.get(15)?, 15)?;
         let object_lock = Self::parse_bucket_object_lock(
             (
-                row.get::<_, i64>(24)?,
-                row.get::<_, Option<u8>>(25)?,
-                row.get::<_, Option<i64>>(26)?,
+                row.get::<_, i64>(25)?,
+                row.get::<_, Option<u8>>(26)?,
                 row.get::<_, Option<i64>>(27)?,
+                row.get::<_, Option<i64>>(28)?,
             ),
-            [24, 25, 26, 27],
+            [25, 26, 27, 28],
         )?;
         let acl_grants = Self::parse_acl_grants(row.get::<_, String>(7)?, 7, "acl_grants")?;
         Ok(BucketRecord {
@@ -4170,22 +4172,23 @@ impl PgStore {
             bucket_policy_generation: row.get::<_, i64>(17)? as u64,
             bucket_lifecycle_generation: row.get::<_, i64>(18)? as u64,
             bucket_execution_generation: row.get::<_, i64>(19)? as u64,
-            completed_multipart_upload_sequence: row.get::<_, i64>(20)? as u64,
-            bucket_abac_enabled: row.get::<_, i64>(21)? != 0,
+            bucket_incarnation_generation: row.get::<_, i64>(20)? as u64,
+            completed_multipart_upload_sequence: row.get::<_, i64>(21)? as u64,
+            bucket_abac_enabled: row.get::<_, i64>(22)? != 0,
             encryption: BucketEncryptionConfig {
                 default_encryption: row
-                    .get::<_, Option<u8>>(22)?
+                    .get::<_, Option<u8>>(23)?
                     .map(|value| {
                         ManagedEncryptionAlgorithm::from_u8(value).ok_or_else(|| {
                             rusqlite::Error::FromSqlConversionFailure(
-                                22,
+                                23,
                                 rusqlite::types::Type::Integer,
                                 Box::from(format!("invalid default_encryption_type: {value}")),
                             )
                         })
                     })
                     .transpose()?,
-                sse_c_blocked: row.get::<_, i64>(23)? != 0,
+                sse_c_blocked: row.get::<_, i64>(24)? != 0,
             },
         })
     }
@@ -5185,8 +5188,8 @@ impl PgStore {
                 };
                 match store.conn.execute(
                     "INSERT INTO buckets \
-                     (name, owner_principal, owner_canonical_id, created_at, state, versioning, acl_grants, public_read, public_write, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years, bucket_execution_generation) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?15)",
+                     (name, owner_principal, owner_canonical_id, created_at, state, versioning, acl_grants, public_read, public_write, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years, bucket_execution_generation, bucket_incarnation_generation) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?15, ?16)",
                     params![
                         config.name,
                         config.owner_principal,
@@ -5202,6 +5205,7 @@ impl PgStore {
                         object_lock_default_mode,
                         object_lock_default_days,
                         object_lock_default_years,
+                        generation as i64,
                         generation as i64,
                     ],
                 ) {
@@ -5266,8 +5270,8 @@ impl PgStore {
                 )?;
                 match store.conn.execute(
                     "INSERT INTO buckets \
-                     (name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls_mode, bucket_policy_public, bucket_policy_generation, bucket_lifecycle_generation, bucket_execution_generation, completed_multipart_upload_sequence, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+                     (name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls_mode, bucket_policy_public, bucket_policy_generation, bucket_lifecycle_generation, bucket_execution_generation, bucket_incarnation_generation, completed_multipart_upload_sequence, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
                     params![
                         bucket.name.as_str(),
                         &bucket.owner_principal,
@@ -5289,6 +5293,7 @@ impl PgStore {
                         bucket.bucket_policy_generation as i64,
                         bucket.bucket_lifecycle_generation as i64,
                         bucket.bucket_execution_generation as i64,
+                        bucket.bucket_incarnation_generation as i64,
                         completed_multipart_upload_sequence,
                         i32::from(bucket.bucket_abac_enabled),
                         bucket.encryption.default_encryption.map(|value| value as u8),
@@ -9005,8 +9010,9 @@ fn bucket_write_reservation_from_row(
     let bucket_raw: String = row.get(0)?;
     let cluster_epoch_raw: i64 = row.get(3)?;
     let bucket_execution_generation_raw: i64 = row.get(4)?;
-    let created_at_raw: i64 = row.get(6)?;
-    let lease_deadline_raw: Option<i64> = row.get(7)?;
+    let bucket_incarnation_generation_raw: i64 = row.get(5)?;
+    let created_at_raw: i64 = row.get(7)?;
+    let lease_deadline_raw: Option<i64> = row.get(8)?;
     Ok(BucketWriteReservationRecord {
         bucket: BucketName::new(bucket_raw).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
@@ -9038,16 +9044,27 @@ fn bucket_write_reservation_from_row(
                 )
             },
         )?,
-        operation_kind: row.get(5)?,
+        bucket_incarnation_generation: u64::try_from(bucket_incarnation_generation_raw).map_err(
+            |_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Integer,
+                    Box::from(format!(
+                        "invalid bucket_incarnation_generation: {bucket_incarnation_generation_raw}"
+                    )),
+                )
+            },
+        )?,
+        operation_kind: row.get(6)?,
         created_at: u64::try_from(created_at_raw).map_err(|_| {
             rusqlite::Error::FromSqlConversionFailure(
-                6,
+                7,
                 rusqlite::types::Type::Integer,
                 Box::from(format!("invalid created_at: {created_at_raw}")),
             )
         })?,
-        lease_deadline: PgStore::parse_optional_u64(lease_deadline_raw, 7, "lease_deadline")?,
-        target_context: row.get(8)?,
+        lease_deadline: PgStore::parse_optional_u64(lease_deadline_raw, 8, "lease_deadline")?,
+        target_context: row.get(9)?,
     })
 }
 
@@ -9458,8 +9475,8 @@ impl PgMetadataStore for PgStore {
             .execute(
                 "INSERT INTO bucket_write_reservations \
              (bucket_name, reservation_id, owner_token, cluster_epoch, bucket_execution_generation, \
-              operation_kind, created_at, lease_deadline, target_context) \
-             SELECT name, ?1, ?2, ?3, bucket_execution_generation, ?4, ?5, ?6, ?7 \
+              bucket_incarnation_generation, operation_kind, created_at, lease_deadline, target_context) \
+             SELECT name, ?1, ?2, ?3, bucket_execution_generation, bucket_incarnation_generation, ?4, ?5, ?6, ?7 \
              FROM buckets \
              WHERE name = ?8 AND state = ?9 \
                AND NOT EXISTS (\
@@ -9521,7 +9538,7 @@ impl PgMetadataStore for PgStore {
     ) -> Result<Option<BucketWriteReservationRecord>, MetadataError> {
         match self.conn.query_row(
             "SELECT bucket_name, reservation_id, owner_token, \
-                    cluster_epoch, bucket_execution_generation, operation_kind, created_at, \
+                    cluster_epoch, bucket_execution_generation, bucket_incarnation_generation, operation_kind, created_at, \
                     lease_deadline, target_context \
              FROM bucket_write_reservations \
              WHERE bucket_name = ?1 AND reservation_id = ?2",
@@ -9545,7 +9562,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare(
                 "SELECT bucket_name, reservation_id, owner_token, \
-                        cluster_epoch, bucket_execution_generation, operation_kind, created_at, \
+                        cluster_epoch, bucket_execution_generation, bucket_incarnation_generation, operation_kind, created_at, \
                         lease_deadline, target_context \
                  FROM bucket_write_reservations \
                  WHERE bucket_name = ?1 \
@@ -9575,10 +9592,16 @@ impl PgMetadataStore for PgStore {
         owner_token: &str,
         cluster_epoch: ClusterEpoch,
         bucket_execution_generation: u64,
+        bucket_incarnation_generation: u64,
     ) -> Result<(), MetadataError> {
         let generation =
             i64::try_from(bucket_execution_generation).map_err(|source| MetadataError::Db {
                 context: "release durable bucket write reservation generation",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        let incarnation =
+            i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
+                context: "release durable bucket write reservation incarnation",
                 source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
             })?;
         let deleted = self
@@ -9587,13 +9610,15 @@ impl PgMetadataStore for PgStore {
                 "DELETE FROM bucket_write_reservations \
                  WHERE bucket_name = ?1 AND reservation_id = ?2 \
                    AND owner_token = ?3 AND cluster_epoch = ?4 \
-                   AND bucket_execution_generation = ?5",
+                   AND bucket_execution_generation = ?5 \
+                   AND bucket_incarnation_generation = ?6",
                 params![
                     name.as_str(),
                     reservation_id,
                     owner_token,
                     cluster_epoch.get(),
-                    generation
+                    generation,
+                    incarnation,
                 ],
             )
             .map_err(|source| MetadataError::Db {
@@ -9615,10 +9640,16 @@ impl PgMetadataStore for PgStore {
         owner_token: &str,
         cluster_epoch: ClusterEpoch,
         bucket_execution_generation: u64,
+        bucket_incarnation_generation: u64,
     ) -> Result<(), MetadataError> {
         let generation =
             i64::try_from(bucket_execution_generation).map_err(|source| MetadataError::Db {
                 context: "release metadata command bucket write reservation generation",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        let incarnation =
+            i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
+                context: "release metadata command bucket write reservation incarnation",
                 source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
             })?;
 
@@ -9635,7 +9666,9 @@ impl PgMetadataStore for PgStore {
                 Some(record)
                     if record.owner_token == owner_token
                         && record.cluster_epoch == cluster_epoch
-                        && record.bucket_execution_generation == bucket_execution_generation =>
+                        && record.bucket_execution_generation == bucket_execution_generation
+                        && record.bucket_incarnation_generation
+                            == bucket_incarnation_generation =>
                 {
                     let deleted = self
                         .conn
@@ -9643,13 +9676,15 @@ impl PgMetadataStore for PgStore {
                             "DELETE FROM bucket_write_reservations \
                              WHERE bucket_name = ?1 AND reservation_id = ?2 \
                                AND owner_token = ?3 AND cluster_epoch = ?4 \
-                               AND bucket_execution_generation = ?5",
+                               AND bucket_execution_generation = ?5 \
+                               AND bucket_incarnation_generation = ?6",
                             params![
                                 name.as_str(),
                                 reservation_id,
                                 owner_token,
                                 cluster_epoch.get(),
-                                generation
+                                generation,
+                                incarnation,
                             ],
                         )
                         .map_err(|source| MetadataError::Db {
@@ -11674,6 +11709,7 @@ impl PgMetadataStore for PgStore {
                 owner_token: "test-owner-token".to_string(),
                 cluster_epoch: ClusterEpoch::INITIAL,
                 bucket_execution_generation: 1,
+                bucket_incarnation_generation: 1,
                 operation_kind: "create-multipart-upload".to_string(),
                 created_at: PgStore::now_millis(),
                 lease_deadline: None,
@@ -15350,6 +15386,7 @@ mod tests {
             owner_token: "pending-slot-owner".to_string(),
             cluster_epoch: ClusterEpoch::INITIAL,
             bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
             operation_kind: "direct-put-commit".to_string(),
             created_at: 1,
             lease_deadline: Some(2),
@@ -15442,6 +15479,7 @@ mod tests {
             owner_token: "owner-token".to_string(),
             cluster_epoch: ClusterEpoch::INITIAL,
             bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
             operation_kind: "create-multipart-upload".to_string(),
             created_at: 2,
             lease_deadline: None,
@@ -16761,6 +16799,7 @@ mod tests {
                 "owner-token-1",
                 ClusterEpoch::INITIAL,
                 reservation.bucket_execution_generation,
+                reservation.bucket_incarnation_generation,
             )
             .unwrap();
         assert_eq!(
@@ -17002,6 +17041,7 @@ mod tests {
                     owner_token: "direct-put-proof-owner".to_string(),
                     cluster_epoch: ClusterEpoch::INITIAL,
                     bucket_execution_generation: 1,
+                    bucket_incarnation_generation: 1,
                     operation_kind: "direct-put-commit".to_string(),
                     created_at: 1,
                     lease_deadline: Some(2),
@@ -17101,6 +17141,7 @@ mod tests {
                     owner_token: "direct-put-proof-owner".to_string(),
                     cluster_epoch: ClusterEpoch::INITIAL,
                     bucket_execution_generation: 1,
+                    bucket_incarnation_generation: 1,
                     operation_kind: "direct-put-commit".to_string(),
                     created_at: 1,
                     lease_deadline: Some(2),
