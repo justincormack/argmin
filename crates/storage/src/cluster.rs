@@ -411,6 +411,7 @@ impl ShardLocation {
 
 pub struct ObjectPayloadLease {
     cluster: Weak<StorageCluster>,
+    storage_nodes: Vec<Arc<SharedStorageNode>>,
     runtime_state: Arc<LocalClusterRuntimeState>,
     bucket: BucketName,
     key: ObjectKey,
@@ -421,6 +422,7 @@ pub struct ObjectPayloadLease {
 impl ObjectPayloadLease {
     fn new(
         cluster: Weak<StorageCluster>,
+        storage_nodes: Vec<Arc<SharedStorageNode>>,
         runtime_state: Arc<LocalClusterRuntimeState>,
         bucket: BucketName,
         key: ObjectKey,
@@ -428,6 +430,7 @@ impl ObjectPayloadLease {
     ) -> Self {
         Self {
             cluster,
+            storage_nodes,
             runtime_state,
             bucket,
             key,
@@ -437,7 +440,8 @@ impl ObjectPayloadLease {
     }
 
     pub fn release(mut self) -> ReleasedObjectPayloadLease {
-        let remaining = self.runtime_state.release_object_payload_lease(
+        let remaining = release_object_payload_lease_from_storage_nodes(
+            &self.storage_nodes,
             &self.bucket,
             &self.key,
             self.generation_id,
@@ -457,13 +461,27 @@ impl ObjectPayloadLease {
 impl Drop for ObjectPayloadLease {
     fn drop(&mut self) {
         if !self.released {
-            let _ = self.runtime_state.release_object_payload_lease(
+            let _ = release_object_payload_lease_from_storage_nodes(
+                &self.storage_nodes,
                 &self.bucket,
                 &self.key,
                 self.generation_id,
             );
         }
     }
+}
+
+fn release_object_payload_lease_from_storage_nodes(
+    storage_nodes: &[Arc<SharedStorageNode>],
+    bucket: &BucketName,
+    key: &ObjectKey,
+    generation_id: GenerationId,
+) -> usize {
+    storage_nodes
+        .iter()
+        .map(|storage_node| storage_node.release_object_payload_lease(bucket, key, generation_id))
+        .max()
+        .unwrap_or(0)
 }
 
 pub struct ReleasedObjectPayloadLease {

@@ -214,19 +214,11 @@ impl LocalPgRoute {
 
 #[derive(Debug)]
 pub(crate) struct LocalClusterRuntimeState {
-    object_payload_leases: Mutex<LocalObjectPayloadLeaseState>,
     reclaim_queue: (Mutex<LocalReclaimQueueState>, Condvar),
     metadata_command_pg_locks: Mutex<HashMap<PgId, Arc<Mutex<()>>>>,
 }
 
 type LocalReclaimRoot = (BucketName, ObjectKey, GenerationId);
-
-#[derive(Debug, Default)]
-struct LocalObjectPayloadLeaseState {
-    leases: HashMap<LocalReclaimRoot, usize>,
-    reclaim_fences: HashSet<LocalReclaimRoot>,
-    active_reclaims: HashSet<LocalReclaimRoot>,
-}
 
 #[derive(Debug)]
 struct LocalReclaimQueueState {
@@ -239,7 +231,6 @@ struct LocalReclaimQueueState {
 impl LocalClusterRuntimeState {
     fn new() -> Self {
         Self {
-            object_payload_leases: Mutex::new(LocalObjectPayloadLeaseState::default()),
             reclaim_queue: (
                 Mutex::new(LocalReclaimQueueState {
                     object_queue: VecDeque::new(),
@@ -263,129 +254,6 @@ impl LocalClusterRuntimeState {
                 .entry(pg_id)
                 .or_insert_with(|| Arc::new(Mutex::new(()))),
         )
-    }
-
-    pub(crate) fn acquire_object_payload_lease(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> bool {
-        let root = (bucket.clone(), key.clone(), generation_id);
-        let mut state = self
-            .object_payload_leases
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if state.reclaim_fences.contains(&root) {
-            return false;
-        }
-        *state.leases.entry(root).or_insert(0) += 1;
-        true
-    }
-
-    pub(crate) fn release_object_payload_lease(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> usize {
-        let mut state = self
-            .object_payload_leases
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let root = (bucket.clone(), key.clone(), generation_id);
-        let entry = state
-            .leases
-            .get_mut(&root)
-            .expect("object payload lease release without acquire");
-        *entry -= 1;
-        let remaining = *entry;
-        if remaining == 0 {
-            state.leases.remove(&root);
-        }
-        remaining
-    }
-
-    pub(crate) fn try_begin_object_payload_reclaim(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> bool {
-        let root = (bucket.clone(), key.clone(), generation_id);
-        let mut state = self
-            .object_payload_leases
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if state.leases.get(&root).copied().unwrap_or(0) != 0
-            || state.active_reclaims.contains(&root)
-        {
-            return false;
-        }
-        state.active_reclaims.insert(root.clone());
-        state.reclaim_fences.insert(root);
-        true
-    }
-
-    pub(crate) fn finish_object_payload_reclaim(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-        keep_fence: bool,
-    ) {
-        let mut state = self
-            .object_payload_leases
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let root = (bucket.clone(), key.clone(), generation_id);
-        state.active_reclaims.remove(&root);
-        if !keep_fence {
-            state.reclaim_fences.remove(&root);
-        }
-    }
-
-    pub(crate) fn clear_object_payload_reclaim_fence(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) {
-        self.object_payload_leases
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .reclaim_fences
-            .remove(&(bucket.clone(), key.clone(), generation_id));
-    }
-
-    pub(crate) fn object_payload_lease_count(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> usize {
-        let state = self
-            .object_payload_leases
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        state
-            .leases
-            .get(&(bucket.clone(), key.clone(), generation_id))
-            .copied()
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize {
-        let state = self
-            .object_payload_leases
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        state
-            .leases
-            .iter()
-            .filter(|((lease_bucket, _, _), _)| lease_bucket == bucket)
-            .map(|(_, count)| *count)
-            .sum()
     }
 
     pub(crate) fn enqueue_object_payload_reclaim(
@@ -618,6 +486,116 @@ impl LocalClusterMap {
 
     pub(crate) fn runtime_state(&self) -> Arc<LocalClusterRuntimeState> {
         Arc::clone(&self.runtime_state)
+    }
+
+    pub(crate) fn object_payload_lease_storage_nodes(&self) -> Vec<Arc<SharedStorageNode>> {
+        self.nodes
+            .values()
+            .map(|node| Arc::clone(node.storage_node()))
+            .collect()
+    }
+
+    pub(crate) fn try_acquire_object_payload_lease(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> bool {
+        let mut acquired = Vec::with_capacity(self.nodes.len());
+        for node in self.nodes.values() {
+            if node
+                .storage_node()
+                .try_acquire_object_payload_lease(bucket, key, generation_id)
+            {
+                acquired.push(Arc::clone(node.storage_node()));
+                continue;
+            }
+            for storage_node in acquired {
+                storage_node.release_object_payload_lease(bucket, key, generation_id);
+            }
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn try_begin_object_payload_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> bool {
+        let mut acquired = Vec::with_capacity(self.nodes.len());
+        for node in self.nodes.values() {
+            if node
+                .storage_node()
+                .try_begin_object_payload_reclaim(bucket, key, generation_id)
+            {
+                acquired.push(Arc::clone(node.storage_node()));
+                continue;
+            }
+            for storage_node in acquired {
+                storage_node.finish_object_payload_reclaim(bucket, key, generation_id, false);
+            }
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn finish_object_payload_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        keep_fence: bool,
+    ) {
+        for node in self.nodes.values() {
+            node.storage_node().finish_object_payload_reclaim(
+                bucket,
+                key,
+                generation_id,
+                keep_fence,
+            );
+        }
+    }
+
+    pub(crate) fn clear_object_payload_reclaim_fence(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) {
+        for node in self.nodes.values() {
+            node.storage_node()
+                .clear_object_payload_reclaim_fence(bucket, key, generation_id);
+        }
+    }
+
+    pub(crate) fn object_payload_lease_count(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> usize {
+        self.nodes
+            .values()
+            .map(|node| {
+                node.storage_node()
+                    .object_payload_lease_count(bucket, key, generation_id)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize {
+        self.nodes
+            .values()
+            .map(|node| {
+                node.storage_node()
+                    .bucket_object_payload_lease_count(bucket)
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     #[cfg(test)]
@@ -25423,6 +25401,65 @@ mod tests {
     }
 
     #[test]
+    fn payload_lease_blocks_reclaim_across_cluster_handles() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+        let map = Arc::new(map);
+        let reader_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let reclaim_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let committed =
+            write_committed_direct_segment_for(&reader_cluster, &bucket, &key, b"shared lease");
+
+        let lease = reader_cluster
+            .acquire_object_payload_lease(&bucket, &key, committed.generation_id)
+            .unwrap();
+        assert_eq!(
+            reclaim_cluster.object_payload_lease_count(&bucket, &key, committed.generation_id),
+            1,
+            "lease count must be visible through another cluster handle"
+        );
+        reclaim_cluster
+            .delete_current_object_if(&bucket, &key, |stored| {
+                assert!(matches!(stored, Some(crate::StoredObject::Live(_))));
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+            .unwrap();
+        assert!(
+            !reclaim_cluster
+                .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
+                .unwrap(),
+            "storage-node-owned lease should block reclaim from another cluster handle"
+        );
+
+        drop(lease);
+        assert_eq!(
+            reader_cluster.object_payload_lease_count(&bucket, &key, committed.generation_id),
+            0
+        );
+        assert!(
+            reclaim_cluster
+                .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
+                .unwrap(),
+            "reclaim should proceed after the cross-handle lease is released"
+        );
+    }
+
+    #[test]
     fn payload_reclaim_in_progress_blocks_new_payload_leases() {
         let _serial = lock_payload_cleanup_hook_test();
         let tmp = test_util::tempdir();
@@ -28283,7 +28320,7 @@ mod tests {
         assert_eq!(
             cluster.try_finalize_bucket_delete(&bucket).unwrap(),
             crate::BucketDeleteFinalizeOutcome::Pending,
-            "finalization must wait while reclaim metadata or read leases remain"
+            "finalization must wait while reclaim metadata remains"
         );
 
         let released = lease.release();
@@ -28299,6 +28336,43 @@ mod tests {
             crate::BucketDeleteFinalizeOutcome::Finalized
         );
         assert_clean_metadata_command_stream(&map, &[1, object_pg]);
+    }
+
+    #[test]
+    fn finalized_bucket_delete_ignores_volatile_read_lease_without_reclaim_root() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "delete-phantom-lease-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let phantom_key = crate::ObjectKey::try_from("phantom-read".to_string()).unwrap();
+        let phantom_lease = cluster
+            .acquire_object_payload_lease(&bucket, &phantom_key, crate::GenerationId::MIN)
+            .unwrap();
+        assert_eq!(cluster.bucket_object_payload_lease_count(&bucket), 1);
+
+        cluster.begin_bucket_delete(&bucket).unwrap();
+        assert_eq!(
+            cluster.try_finalize_bucket_delete(&bucket).unwrap(),
+            crate::BucketDeleteFinalizeOutcome::Finalized,
+            "volatile read handles without durable reclaim roots must not wedge bucket finalization"
+        );
+        drop(phantom_lease);
+        assert_clean_metadata_command_stream(&map, &[1]);
     }
 
     #[test]

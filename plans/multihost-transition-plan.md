@@ -1118,9 +1118,9 @@ Work items:
      - preserve bucket write-drain behavior on the bucket PG primary and fan out
        bucket emptiness, reclaim-root, and completed-upload cleanup checks
        across routed PG primaries
-     - keep finalization's lease-count checks and reclaim/finalize worker queues
-       on the bridge until queue ownership is split into explicit coordination
-       paths
+     - keep finalization's reclaim-root checks and reclaim/finalize worker
+       queues on the bridge until queue ownership is split into explicit
+       coordination paths
    - sixth slice:
      - move payload lease bookkeeping and reclaim/finalize worker queues from
        the metadata-primary bridge into local-cluster runtime state shared by
@@ -3855,6 +3855,15 @@ Proposed subphases:
           object-PG commands validate the durable reservation plus active bucket
           incarnation before non-accepted apply/retry/open-time convergence.
 6. Phase 9.5 storage-node-owned read handles
+   - status: started. The first slice moved object payload generation
+     lease/reclaim-fence authority out of the local-cluster runtime state and
+     onto `SharedStorageNode`; `LocalClusterMap` now acquires those volatile
+     handles across the local storage nodes with all-or-release semantics,
+     tokens release the captured storage-node handles without depending on the
+     current map epoch, and object reclaim uses the storage-node-owned fence
+     before physical shard deletion. The current implementation still uses a
+     coarse generation handle across all local storage nodes; exact
+     per-selected-shard handles for EC reads remain open in this phase.
    - decision: do not add a metadata/database write on each object read. Reads
      are ephemeral request state; if the host handling the read fails, the
      client can retry from a fresh metadata snapshot. The durable state should

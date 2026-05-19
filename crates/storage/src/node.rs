@@ -362,12 +362,19 @@ pub struct SharedStorageNode {
     bucket_locks: Vec<Mutex<()>>,
     bucket_coordination: Vec<(Mutex<u64>, Condvar)>,
     multipart_completion_locks: Vec<Mutex<()>>,
-    object_payload_leases: Mutex<HashMap<(BucketName, ObjectKey, GenerationId), usize>>,
+    object_payload_leases: Mutex<ObjectPayloadLeaseState>,
     reclaim_queue: (Mutex<ReclaimQueueState>, Condvar),
     ec_write_states: Mutex<HashMap<EcShape, Arc<StorageEcWriteState>>>,
 }
 
 type ReclaimRoot = (BucketName, ObjectKey, GenerationId);
+
+#[derive(Debug, Default)]
+struct ObjectPayloadLeaseState {
+    leases: HashMap<ReclaimRoot, usize>,
+    reclaim_fences: HashSet<ReclaimRoot>,
+    active_reclaims: HashSet<ReclaimRoot>,
+}
 
 pub enum ReclaimWorkItem {
     ObjectPayload(ReclaimRoot),
@@ -466,7 +473,7 @@ impl SharedStorageNode {
             bucket_locks,
             bucket_coordination,
             multipart_completion_locks,
-            object_payload_leases: Mutex::new(HashMap::new()),
+            object_payload_leases: Mutex::new(ObjectPayloadLeaseState::default()),
             reclaim_queue: (
                 Mutex::new(ReclaimQueueState {
                     object_queue: VecDeque::new(),
@@ -1274,19 +1281,25 @@ impl SharedStorageNode {
     }
 
     /// Acquire an in-memory lease on an object payload generation.
-    pub fn acquire_object_payload_lease(
+    ///
+    /// Returns false if this storage node has fenced the generation for
+    /// physical reclaim.
+    pub fn try_acquire_object_payload_lease(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-    ) {
-        let mut leases = self
+    ) -> bool {
+        let root = (bucket.clone(), key.clone(), generation_id);
+        let mut state = self
             .object_payload_leases
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        *leases
-            .entry((bucket.clone(), key.clone(), generation_id))
-            .or_insert(0) += 1;
+        if state.reclaim_fences.contains(&root) {
+            return false;
+        }
+        *state.leases.entry(root).or_insert(0) += 1;
+        true
     }
 
     /// Release an in-memory lease on an object payload generation.
@@ -1298,19 +1311,78 @@ impl SharedStorageNode {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> usize {
-        let mut leases = self
+        let mut state = self
             .object_payload_leases
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let entry = leases
+        let root = (bucket.clone(), key.clone(), generation_id);
+        let entry = state
+            .leases
             .get_mut(&(bucket.clone(), key.clone(), generation_id))
             .expect("object payload lease release without acquire");
         *entry -= 1;
         let remaining = *entry;
         if remaining == 0 {
-            leases.remove(&(bucket.clone(), key.clone(), generation_id));
+            state.leases.remove(&root);
         }
         remaining
+    }
+
+    /// Fence an object payload generation for physical reclaim.
+    ///
+    /// Returns false if any read lease or another reclaim is active.
+    pub fn try_begin_object_payload_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> bool {
+        let root = (bucket.clone(), key.clone(), generation_id);
+        let mut state = self
+            .object_payload_leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if state.leases.get(&root).copied().unwrap_or(0) != 0
+            || state.active_reclaims.contains(&root)
+        {
+            return false;
+        }
+        state.active_reclaims.insert(root.clone());
+        state.reclaim_fences.insert(root);
+        true
+    }
+
+    /// Finish physical reclaim fencing for a generation.
+    pub fn finish_object_payload_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        keep_fence: bool,
+    ) {
+        let root = (bucket.clone(), key.clone(), generation_id);
+        let mut state = self
+            .object_payload_leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state.active_reclaims.remove(&root);
+        if !keep_fence {
+            state.reclaim_fences.remove(&root);
+        }
+    }
+
+    /// Clear a reclaim fence after a matching terminal reclaim command has converged.
+    pub fn clear_object_payload_reclaim_fence(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) {
+        self.object_payload_leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reclaim_fences
+            .remove(&(bucket.clone(), key.clone(), generation_id));
     }
 
     /// Return the number of active object-payload leases for a generation.
@@ -1320,11 +1392,12 @@ impl SharedStorageNode {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> usize {
-        let leases = self
+        let state = self
             .object_payload_leases
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        leases
+        state
+            .leases
             .get(&(bucket.clone(), key.clone(), generation_id))
             .copied()
             .unwrap_or(0)
@@ -1332,11 +1405,12 @@ impl SharedStorageNode {
 
     /// Return the number of active object-payload leases for a bucket.
     pub fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize {
-        let leases = self
+        let state = self
             .object_payload_leases
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        leases
+        state
+            .leases
             .iter()
             .filter(|((lease_bucket, _, _), _)| lease_bucket == bucket)
             .map(|(_, count)| *count)

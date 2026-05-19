@@ -613,11 +613,7 @@ impl TwoGenerationReclaimTraceModel {
                         }
                         _ => {}
                     }
-                    if !self.old_metadata_exists
-                        && !self.new_metadata_exists
-                        && !self.old_lease_held
-                        && !self.new_lease_held
-                    {
+                    if !self.old_metadata_exists && !self.new_metadata_exists {
                         self.bucket_exists = false;
                         self.bucket_deleting = false;
                     }
@@ -750,11 +746,7 @@ impl TwoKeyReclaimTraceModel {
                         }
                         _ => {}
                     }
-                    if !self.key_a_metadata_exists
-                        && !self.key_b_metadata_exists
-                        && !self.key_a_lease_held
-                        && !self.key_b_lease_held
-                    {
+                    if !self.key_a_metadata_exists && !self.key_b_metadata_exists {
                         self.bucket_exists = false;
                         self.bucket_deleting = false;
                     }

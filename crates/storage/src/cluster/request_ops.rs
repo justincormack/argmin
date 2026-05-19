@@ -2077,7 +2077,7 @@ impl super::StorageCluster {
 
         let reclaim_roots = self.bucket_payload_reclaim_roots(bucket)?;
         for root in &reclaim_roots {
-            if self.local_map.runtime_state().object_payload_lease_count(
+            if self.local_map.object_payload_lease_count(
                 &root.bucket,
                 &root.key,
                 root.generation_id,
@@ -2087,24 +2087,15 @@ impl super::StorageCluster {
             }
         }
 
-        if !reclaim_roots.is_empty()
-            || self
-                .local_map
-                .runtime_state()
-                .bucket_object_payload_lease_count(bucket)
-                != 0
-        {
+        if !reclaim_roots.is_empty() {
             let _ = observability::event(
                 super::TRACE_TARGET,
                 "bucket_finalize_pending_reclaim",
                 Some(format_args!(
-                    "bucket={:?} pg_id={} reclaim_roots={} lease_count={}",
+                    "bucket={:?} pg_id={} reclaim_roots={}",
                     bucket,
                     bucket_pg_id,
-                    reclaim_roots.len(),
-                    self.local_map
-                        .runtime_state()
-                        .bucket_object_payload_lease_count(bucket)
+                    reclaim_roots.len()
                 )),
             );
             return Ok(BucketDeleteFinalizeOutcome::Pending);
@@ -5419,11 +5410,15 @@ impl super::StorageCluster {
         {
             return Err(StoreError::NotFound);
         }
-        if !runtime_state.acquire_object_payload_lease(bucket, key, generation_id) {
+        if !self
+            .local_map
+            .try_acquire_object_payload_lease(bucket, key, generation_id)
+        {
             return Err(StoreError::NotFound);
         }
         Ok(ObjectPayloadLease::new(
             std::sync::Arc::downgrade(self),
+            self.local_map.object_payload_lease_storage_nodes(),
             runtime_state,
             bucket.clone(),
             key.clone(),
@@ -5442,7 +5437,6 @@ impl super::StorageCluster {
             return 0;
         }
         self.local_map
-            .runtime_state()
             .object_payload_lease_count(bucket, key, generation_id)
     }
 
@@ -5451,9 +5445,7 @@ impl super::StorageCluster {
         if self.operation_epoch() != self.cluster_epoch() {
             return 0;
         }
-        self.local_map
-            .runtime_state()
-            .bucket_object_payload_lease_count(bucket)
+        self.local_map.bucket_object_payload_lease_count(bucket)
     }
 
     pub fn enqueue_object_payload_reclaim(
@@ -5508,8 +5500,11 @@ impl super::StorageCluster {
         generation_id: GenerationId,
     ) -> Result<bool, ObjectPgActionError> {
         let node = self.object_metadata_primary_node(bucket, key)?;
-        let runtime_state = self.local_map.runtime_state();
-        if runtime_state.object_payload_lease_count(bucket, key, generation_id) != 0 {
+        if self
+            .local_map
+            .object_payload_lease_count(bucket, key, generation_id)
+            != 0
+        {
             return Ok(false);
         }
 
@@ -5526,7 +5521,7 @@ impl super::StorageCluster {
                     super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
                 )? {
                     super::PendingMetadataCommandOutcome::Applied => {
-                        runtime_state.clear_object_payload_reclaim_fence(
+                        self.local_map.clear_object_payload_reclaim_fence(
                             bucket,
                             key,
                             generation_id,
@@ -5542,7 +5537,11 @@ impl super::StorageCluster {
 
         let reclaim = {
             let meta_pg = node.get_pg(pg_id.get())?;
-            if runtime_state.object_payload_lease_count(bucket, key, generation_id) != 0 {
+            if self
+                .local_map
+                .object_payload_lease_count(bucket, key, generation_id)
+                != 0
+            {
                 return Ok(false);
             }
 
@@ -5560,7 +5559,10 @@ impl super::StorageCluster {
             return Ok(false);
         };
 
-        if !runtime_state.try_begin_object_payload_reclaim(bucket, key, generation_id) {
+        if !self
+            .local_map
+            .try_begin_object_payload_reclaim(bucket, key, generation_id)
+        {
             return Ok(false);
         }
 
@@ -5665,7 +5667,12 @@ impl super::StorageCluster {
             }
         })();
         let keep_reclaim_fence = result.is_err() && payload_delete_started;
-        runtime_state.finish_object_payload_reclaim(bucket, key, generation_id, keep_reclaim_fence);
+        self.local_map.finish_object_payload_reclaim(
+            bucket,
+            key,
+            generation_id,
+            keep_reclaim_fence,
+        );
         result
     }
 
