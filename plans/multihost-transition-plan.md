@@ -157,7 +157,7 @@ cluster-owned or PG-primary-owned mechanisms:
 2. ordered two-PG locking helpers
 3. bucket write drain waits
 4. multipart completion locks
-5. object payload generation leases
+5. coordinator-local object payload generation leases
 6. in-memory reclaim work queue
 7. bucket cache invalidation and freshness paths
 8. any tests that inspect or mutate raw local PG state as if it were global
@@ -1081,7 +1081,7 @@ Work items:
      - keep payload lease release and worker enqueue on the bridge, but route
        the release-time reclaim-existence check through the object PG primary so
        a deferred reclaim row published off-bridge is requeued after the last
-       read lease drops
+       local payload lease drops
      - use `StoreError::StaleMetadataOperation` for routed metadata stale-handle
        failures; keep `StoreError::StaleMetadataPrimaryBridge` only for the
        temporary bridge surfaces that remain during 6.1
@@ -2462,8 +2462,8 @@ Work items:
 3. replace multipart completion locks with PG-primary serialization
 4. replace bucket write drain waits with durable reservation or primary-owned
    state
-5. replace object payload generation leases with cluster-visible read pins or a
-   durable expiring lease table
+5. replace coordinator-local object payload generation leases with volatile
+   storage-node-owned read handles and storage-node physical delete fences
 6. make reclaim work claiming durable and idempotent
 7. add a physical shard scavenger for unreferenced shard files that can be left
    by crashes or persistent delete failures after metadata has already stopped
@@ -2927,7 +2927,8 @@ Proposed subphases:
        is still a single process, but correctness must not depend on them
    - non-goals:
      - durable bucket write-drain state remains Phase 9.4
-     - cross-process read pins remain Phase 9.5
+     - storage-node-owned read handles and physical delete fences remain Phase
+       9.5
      - durable reclaim worker claiming and physical shard scavenging remain
        Phases 9.6 and 9.7
      - broad test-harness de-single-process cleanup remains Phase 9.10, except
@@ -3589,8 +3590,8 @@ Proposed subphases:
       - explicitly define and audit the synchronous DeleteBucket return
         boundary. The request may return after the durable drain, fresh
         emptiness proof, and terminal `MarkBucketDeleting` are complete; it
-        must not wait for async finalization, payload reclaim, read-lease
-        expiry, or final row deletion. During the rewrite, classify every wait
+        must not wait for async finalization, payload reclaim, storage-node read
+        handles, or final row deletion. During the rewrite, classify every wait
         in `begin_bucket_delete` as response-correctness required,
         transitional-implementation required, or deferrable background work,
         and remove or move waits that are not needed to make the S3 response
@@ -3630,7 +3631,7 @@ Proposed subphases:
            result: admitted writers that can still publish visible data,
            bucket-relevant pending metadata commands, fresh visible-data/MPU
            checks, and terminal `MarkBucketDeleting` convergence. Confirm that
-           finalization, physical reclaim, read-pin/read-lease waits, completed
+           finalization, physical reclaim, storage-node read-handle waits, completed
            async cleanup, and final metadata row deletion remain behind the
            async finalizer.
         4. Wire bucket control-plane publishers into the durable drain
@@ -3706,20 +3707,22 @@ Proposed subphases:
       - status: complete. The cluster finalizer is process-independent: a
         reopened cluster handle can finalize a bucket that another process moved
         to terminal `Deleting`, and finalization remains pending while reclaim
-        metadata or in-memory read leases block physical cleanup. A focused
+        metadata or storage-node read handles block physical cleanup. A focused
         regression now proves worker progress can clear the reclaim root and a
         later finalizer retry removes the bucket row without relying on the
         original DeleteBucket process.
       - `try_finalize_bucket_delete` must not rely on the process that began
         the delete:
         - any process/worker can observe a Deleting bucket and attempt finalize
-        - finalization still checks visible data, reclaim roots, and read pins
-          before calling the finalized-delete acting-set fanout
+        - finalization still checks visible data and reclaim roots before
+          calling the finalized-delete acting-set fanout. It does not inspect
+          reader lifetime directly; active storage-node read handles block
+          finalization by making reclaim roots remain uncleared
         - missing local queue wakeups are performance issues only; progress can
           be made by polling/listing Deleting buckets or by a durable work item
-      - keep durable reclaim/read-pin work in Phase 9.5-9.7 scope, but make
-        Phase 9.4 finalization robust when the only remaining blocker is the
-        write-drain state
+      - keep storage-node read-handle work and durable reclaim/scavenger work
+        in Phase 9.5-9.7 scope, but make Phase 9.4 finalization robust when
+        the only remaining blocker is the write-drain state
       - add trace events for every terminal and retryable outcome:
         drain installed, drain wait, stale reservation ignored/reaped, rollback,
         mark-deleting command install/apply, finalize pending, and finalized
@@ -3851,14 +3854,53 @@ Proposed subphases:
           is the bucket-PG durable reservation/drain rows, and proof-bearing
           object-PG commands validate the durable reservation plus active bucket
           incarnation before non-accepted apply/retry/open-time convergence.
-6. Phase 9.5 cross-process read pins
-   - replace object payload generation leases with cluster-visible read pins or
-     durable expiring leases
-   - reclaim must not physically delete payload shards while another process is
-     reading them
-   - define stale-process expiry or recovery for abandoned read pins
-   - exit when read-pin acquire/release is visible to the reclaim owner across
-     process boundaries
+6. Phase 9.5 storage-node-owned read handles
+   - decision: do not add a metadata/database write on each object read. Reads
+     are ephemeral request state; if the host handling the read fails, the
+     client can retry from a fresh metadata snapshot. The durable state should
+     describe reclaim work, not every active reader.
+   - replace coordinator/local-cluster object payload generation leases with
+     volatile read handles owned by the shard-owning storage node
+   - every read path must obtain shard read handles from the nodes that own the
+     selected shard files before streaming payload bytes
+   - multi-shard reads must use all-or-release acquisition semantics. If handle
+     acquisition succeeds for only part of the selected EC/recovery shard set,
+     the read path must release every partial handle before retrying from a
+     fresh metadata snapshot or selecting/acquiring a replacement shard set. A
+     read may not stream until it owns handles for the complete shard set it will
+     read from
+   - every physical shard delete path must go through the shard-owning storage
+     node delete/reclaim API, which refuses or defers deletion while local read
+     handles are active
+   - reclaim must fence new read-handle acquisition before physical deletion,
+     and must leave durable reclaim metadata retryable when deletion is deferred
+     by active read handles
+   - bucket finalization waits on durable reclaim roots, not on reader lifetime
+     directly. Active reads block finalization only by keeping reclaim roots
+     from being physically cleared
+   - crash semantics: storage-node read handles are volatile and disappear with
+     the serving process/node; the read fails and the client retries. There is
+     no durable reader cleanup path in this phase
+   - guardrail: no production path may directly remove shard files without the
+     storage-node read-handle/delete fence
+   - required regressions:
+     - two cluster handles/process simulations where one handle streams from a
+       shard-owning node read handle and another handle's reclaim defers
+     - dropping the read handle lets the same durable reclaim row complete
+     - partial multi-shard acquisition failure releases already-acquired
+       handles and leaves no leaked read handle state
+     - EC recovery/read-repair replacement selection acquires handles for the
+       replacement shard set before reading, and releases the abandoned partial
+       set
+     - reclaim that has started physical deletion rejects a new read handle and
+       the read path retries/fails from a fresh metadata snapshot
+     - bucket finalization remains pending while reclaim roots are blocked by
+       active storage-node read handles and completes after reclaim progress
+     - injected shard-delete failure keeps the delete fence/reclaim metadata
+       retryable without allowing new reads of the reclaimed generation
+   - exit when every production read and every physical shard delete uses the
+     storage-node read-handle/delete API, and the old coordinator-local payload
+     lease state is removed or test-only
 7. Phase 9.6 durable reclaim claiming
    - make reclaim worker ownership durable and idempotent
    - multiple workers must not corrupt or double-finalize the same reclaim row
@@ -3985,8 +4027,9 @@ Phase 9.1 audit checklist:
    - classification: read/write lifetime protection
    - risk: another process can reclaim payload shards without seeing active
      readers or an in-progress reclaim fence
-   - replacement owner: Phase 9.5 cluster-visible read pins or durable expiring
-     leases
+   - replacement owner: Phase 9.5 shard-owning storage-node read handles and
+     storage-node physical delete fences. Reads remain volatile; durable
+     metadata tracks reclaim, not active readers
 11. node-local payload leases, reclaim queue, and bucket-finalize queue
     - current process-local mechanism:
       `SharedStorageNode::object_payload_leases`,
@@ -3997,8 +4040,9 @@ Phase 9.1 audit checklist:
     - risk: any production path that still uses these node-local queues or
       leases bypasses the cluster-level replacement work and cannot coordinate
       with another process
-    - replacement owner: remove or test-gate remaining node-local paths, or
-      route them through Phase 9.5 read pins and Phase 9.6 durable reclaim
+    - replacement owner: keep storage-node-local read handles as the authority
+      for local shard file lifetime, remove/test-gate coordinator-local lease
+      state, and route reclaim ownership through Phase 9.6 durable reclaim
       claiming
 12. cluster object and bucket reclaim queues
     - current process-local mechanism:
@@ -4222,8 +4266,9 @@ failure-domain constraints.
 ### Reclaim Safety
 
 Physical shard deletion is intentionally decoupled from S3 metadata visibility.
-That model should remain, but read pins and reclaim claims must become
-cluster-visible before cleanup can run on multiple nodes.
+That model should remain, but shard-owning storage nodes must own volatile read
+handles/delete fences, and reclaim claims must become cluster-visible before
+cleanup can run on multiple nodes.
 
 ### LIST Semantics Under Failure
 

@@ -99,9 +99,9 @@ script in the same change.
 | `try_probe_object_pg_available`, `load_object_if`, `load_existing_live_object`, `load_object_read_snapshot_if`, `payload_reclaim_exists`, `get_object_tags_if`, `get_object_legal_hold_if`, `get_object_retention_if` | Epoch-fenced routed metadata PG |
 | `put_object_tags_if`, `delete_object_tags_if`, `put_object_retention_if`, `put_object_legal_hold_if`, `put_object_acl_if`, `delete_specific_object_version_if`, `delete_current_object_if`, `insert_current_delete_marker_if`, `expire_current_object_if_due`, `delete_noncurrent_live_versions_if_due`, `delete_expired_delete_marker_if_due` | Epoch-fenced routed metadata PG command apply |
 | `list_all_objects_for_bucket`, `list_all_object_versions_for_bucket`, `list_all_multipart_uploads_for_bucket`, `list_objects_for_bucket`, `list_object_versions_for_bucket` | Epoch-fenced routed metadata PG fanout |
-| `acquire_object_payload_lease` | Epoch-fenced routed metadata PG plus local runtime lease bookkeeping |
+| `acquire_object_payload_lease` | Transitional epoch-fenced routed metadata PG plus coordinator-local runtime lease bookkeeping. Phase 9.5 replaces this as production authority with shard-owning storage-node read handles |
 | `enqueue_object_payload_reclaim`, `enqueue_bucket_delete_finalize`, `wait_for_reclaim_work`, `wake_reclaim_workers` | Best-effort local runtime worker queue |
-| `reclaim_object_payload_if_unleased` | Epoch-fenced routed object metadata PG command apply for reclaim-row deletion, local runtime lease bookkeeping, and placed payload cleanup. Payload files are deleted before the retryable metadata command removes reclaim rows from the acting set |
+| `reclaim_object_payload_if_unleased` | Epoch-fenced routed object metadata PG command apply for reclaim-row deletion, transitional local runtime lease bookkeeping, and placed payload cleanup. Phase 9.5 requires physical payload deletion to go through the shard-owning storage-node delete fence so active storage-node read handles defer reclaim before shard files are removed |
 | `complete_multipart_upload_commit_serialized` | Bucket-PG-primary serialized completed-upload order allocation, then epoch-fenced routed object metadata PG command apply for completed-object publication, deterministic object write sequencing, selected streamed part segment metadata, completed-upload idempotence rows, replica bucket completed-upload sequence advancement, and omitted staging cleanup |
 | `create_multipart_upload` | Epoch-fenced routed object metadata PG command apply for multipart upload row creation and upload generation reservation |
 | `abort_multipart_upload` | Epoch-fenced routed object metadata PG command apply for multipart upload row deletion, upload generation reservation release, and part staging metadata removal; the command carries the abort-preparation cleanup snapshot, and cluster-owned best-effort payload cleanup uses those retryable refs |
@@ -114,9 +114,11 @@ script in the same change.
 
 ## Associated Token Types
 
-`ObjectPayloadLease::release` is the active token release path. It must release
-against the local-cluster runtime state captured at acquisition time and must
-not depend on the current cluster epoch.
+`ObjectPayloadLease::release` is the current active token release path. It must
+release against the local-cluster runtime state captured at acquisition time and
+must not depend on the current cluster epoch. This is transitional read lifetime
+authority; Phase 9.5 moves production read protection to volatile handles owned
+by the shard-owning storage node.
 
 `ReleasedObjectPayloadLease::remaining`, `ReleasedObjectPayloadLease::payload_reclaim_exists`,
 and `ReleasedObjectPayloadLease::enqueue_object_payload_reclaim` are release
@@ -125,4 +127,6 @@ routes through the object PG primary for the handle epoch captured at acquire
 time; stale or unavailable routing is treated by callers as a conservative
 reason to enqueue. `enqueue_object_payload_reclaim` uses the captured
 local-cluster runtime state because enqueueing after the final release is part
-of the already-acquired token workflow, not new metadata work.
+of the already-acquired token workflow, not new metadata work. After Phase 9.5,
+durable reclaim metadata remains the retry source, and read handles only decide
+whether the shard-owning storage node may physically delete local files now.
