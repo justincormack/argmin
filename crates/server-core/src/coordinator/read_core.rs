@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use storage::{
     BucketName, GenerationId, MultipartPartSegmentRecord, ObjectEncryption, ObjectKey,
-    ObjectPartRecord, ObjectPayloadLease, ObjectSegmentRecord, StorageCluster,
+    ObjectPartRecord, ObjectPayloadLease, ObjectSegmentRecord, ShardLocation, StorageCluster,
 };
 
 use super::object_state::SnapshottedMultipartPart;
@@ -140,6 +140,43 @@ impl std::fmt::Debug for ReadHandle {
 }
 
 impl ReadHandle {
+    fn shard_locations_for_segment_slices(
+        runtime: &ReadRuntime,
+        slices: &[SegmentSliceRecord],
+    ) -> Result<Vec<ShardLocation>, ServerError> {
+        let mut locations = Vec::new();
+        for slice in slices {
+            if slice.payload.stored_size() == 0 {
+                continue;
+            }
+            let segment_locations = runtime.storage_node.segment_payload_shard_locations(
+                slice.payload.data_pg_id,
+                storage::EcShape {
+                    k: slice.payload.ec_k,
+                    m: slice.payload.ec_m,
+                },
+                &slice.payload.segment_okh,
+                slice.payload.segment_vid,
+            )?;
+            locations.extend(segment_locations);
+        }
+        Ok(locations)
+    }
+
+    fn shard_locations_for_multipart_ranges(
+        runtime: &ReadRuntime,
+        ranges: &[SnapshottedMultipartPartRange],
+    ) -> Result<Vec<ShardLocation>, ServerError> {
+        let mut locations = Vec::new();
+        for range in ranges {
+            locations.extend(Self::shard_locations_for_segment_slices(
+                runtime,
+                &range.segments,
+            )?);
+        }
+        Ok(locations)
+    }
+
     fn segment_slices_for_range(
         segments: Vec<SegmentPayloadRecord>,
         start: usize,
@@ -233,7 +270,15 @@ impl ReadHandle {
         } = ctx;
         let bucket_owned = bucket.as_str().to_string();
         let key_owned = key.as_str().to_string();
-        let lease = runtime.acquire_object_payload_lease_for(bucket, key, generation_id)?;
+        let segments =
+            Self::segment_slices_for_range(segments, 0, expected_size.saturating_sub(1), 0, None);
+        let locations = Self::shard_locations_for_segment_slices(&runtime, &segments)?;
+        let lease = runtime.acquire_object_payload_lease_for_shard_locations(
+            bucket,
+            key,
+            generation_id,
+            &locations,
+        )?;
         Ok(Self {
             bucket: bucket_owned.clone(),
             key: key_owned.clone(),
@@ -247,13 +292,7 @@ impl ReadHandle {
                 runtime,
                 bucket: bucket_owned,
                 key: key_owned,
-                segments: Self::segment_slices_for_range(
-                    segments,
-                    0,
-                    expected_size.saturating_sub(1),
-                    0,
-                    None,
-                ),
+                segments,
                 next_segment_index: 0,
                 loaded_segment: None,
                 sse_customer_request,
@@ -277,7 +316,14 @@ impl ReadHandle {
         let expected_size = end - start + 1;
         let bucket_owned = bucket.as_str().to_string();
         let key_owned = key.as_str().to_string();
-        let lease = runtime.acquire_object_payload_lease_for(bucket, key, generation_id)?;
+        let segments = Self::segment_slices_for_range(segments, start, end, 0, None);
+        let locations = Self::shard_locations_for_segment_slices(&runtime, &segments)?;
+        let lease = runtime.acquire_object_payload_lease_for_shard_locations(
+            bucket,
+            key,
+            generation_id,
+            &locations,
+        )?;
         Ok(Self {
             bucket: bucket_owned.clone(),
             key: key_owned.clone(),
@@ -291,7 +337,7 @@ impl ReadHandle {
                 runtime,
                 bucket: bucket_owned,
                 key: key_owned,
-                segments: Self::segment_slices_for_range(segments, start, end, 0, None),
+                segments,
                 next_segment_index: 0,
                 loaded_segment: None,
                 sse_customer_request,
@@ -308,7 +354,14 @@ impl ReadHandle {
         expected_size: usize,
         sse_customer_request: Option<SseCustomerRequest>,
     ) -> Result<Self, ServerError> {
-        let lease = runtime.acquire_object_payload_lease_for(bucket, key, generation_id)?;
+        let ranges = Self::multipart_ranges_for_range(parts, 0, expected_size.saturating_sub(1));
+        let locations = Self::shard_locations_for_multipart_ranges(&runtime, &ranges)?;
+        let lease = runtime.acquire_object_payload_lease_for_shard_locations(
+            bucket,
+            key,
+            generation_id,
+            &locations,
+        )?;
         Ok(Self {
             bucket: bucket.as_str().to_string(),
             key: key.as_str().to_string(),
@@ -322,7 +375,7 @@ impl ReadHandle {
                 runtime,
                 bucket: bucket.as_str().to_string(),
                 key: key.as_str().to_string(),
-                parts: Self::multipart_ranges_for_range(parts, 0, expected_size.saturating_sub(1)),
+                parts: ranges,
                 next_part_index: 0,
                 current_part: None,
                 sse_customer_request,
@@ -341,7 +394,14 @@ impl ReadHandle {
     ) -> Result<Self, ServerError> {
         let (start, end) = range;
         let expected_size = end - start + 1;
-        let lease = runtime.acquire_object_payload_lease_for(bucket, key, generation_id)?;
+        let ranges = Self::multipart_ranges_for_range(parts, start, end);
+        let locations = Self::shard_locations_for_multipart_ranges(&runtime, &ranges)?;
+        let lease = runtime.acquire_object_payload_lease_for_shard_locations(
+            bucket,
+            key,
+            generation_id,
+            &locations,
+        )?;
         Ok(Self {
             bucket: bucket.as_str().to_string(),
             key: key.as_str().to_string(),
@@ -355,7 +415,7 @@ impl ReadHandle {
                 runtime,
                 bucket: bucket.as_str().to_string(),
                 key: key.as_str().to_string(),
-                parts: Self::multipart_ranges_for_range(parts, start, end),
+                parts: ranges,
                 next_part_index: 0,
                 current_part: None,
                 sse_customer_request,

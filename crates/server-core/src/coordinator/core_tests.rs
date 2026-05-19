@@ -5,6 +5,7 @@ use super::*;
 use crate::conditional::{DeleteCondition, SpecificEtag, WriteCondition};
 use crate::coordinator::bucket_handles::BucketHandleRequest;
 use crate::sse::SSE_CUSTOMER_ALGORITHM;
+use std::collections::BTreeSet;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6370,6 +6371,92 @@ fn get_object_range_basic() {
     assert_eq!(result.range_start, 0);
     assert_eq!(result.range_end, 4);
     assert_eq!(result.size, 13);
+}
+
+#[test]
+fn get_object_range_holds_payload_lease_on_selected_shard_nodes() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster_with_ec_shape(
+        tmp.path(),
+        &[0, 1, 2, 3],
+        storage::EcShape { k: 2, m: 1 },
+    );
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let data = b"read handles should only pin selected shard owners";
+    let put = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data,
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let generation_id = storage_cluster
+        .test_get_object_meta(&bucket, &key)
+        .unwrap()
+        .into_live()
+        .expect("put object should create a live object")
+        .generation_id;
+    let segment = storage_cluster
+        .test_get_object_segments(&bucket, &key, put.version_id)
+        .unwrap()
+        .pop()
+        .expect("direct put should create one object segment");
+    let expected_selected_nodes = storage_cluster
+        .segment_payload_shard_locations(
+            segment.data_pg_id,
+            storage::EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            },
+            &segment.segment_okh,
+            segment.segment_vid,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|location| location.node_id())
+        .collect::<BTreeSet<_>>()
+        .len();
+
+    let result = coord
+        .get_object_range(&GetObjectRangeRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            range: ByteRange::Range { start: 0, end: 4 },
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(
+        storage_cluster.object_payload_lease_holder_node_count(&bucket, &key, generation_id),
+        expected_selected_nodes,
+        "range read should hold payload leases only on selected shard-owner nodes"
+    );
+    assert_eq!(result.body.read_all().unwrap(), b"read ");
+    assert_eq!(
+        storage_cluster.object_payload_lease_holder_node_count(&bucket, &key, generation_id),
+        0,
+        "read handle drop should release selected shard-owner payload leases"
+    );
 }
 
 #[test]

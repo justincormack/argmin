@@ -301,7 +301,7 @@ impl SharedStorageNode {
             }
         }
 
-        if found_reclaim_root || self.bucket_object_payload_lease_count(bucket) != 0 {
+        if found_reclaim_root {
             return Ok(BucketDeleteFinalizeOutcome::Pending);
         }
 

@@ -8,6 +8,7 @@ use std::sync::{Mutex, OnceLock};
 
 use placement::NodeId;
 
+use super::LocalClusterRuntimeState;
 #[cfg(any(test, feature = "test-hooks"))]
 use super::{
     MetadataCommandApplyContextTestHook, MetadataCommandApplyContextTestHookGuard,
@@ -5395,21 +5396,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<ObjectPayloadLease, StoreError> {
-        self.object_metadata_primary_node(bucket, key)?;
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let runtime_state = self.local_map.runtime_state();
-        if self
-            .pending_metadata_command_for_bucket(pg_id, bucket)?
-            .is_some_and(|command| {
-                matches!(
-                    command.payload(),
-                    MetadataCommandPayload::DeleteObjectPayloadReclaim(delete)
-                        if delete.matches_request(bucket, key, generation_id)
-                )
-            })
-        {
-            return Err(StoreError::NotFound);
-        }
+        let runtime_state = self.ensure_object_payload_lease_allowed(bucket, key, generation_id)?;
         if !self
             .local_map
             .try_acquire_object_payload_lease(bucket, key, generation_id)
@@ -5426,6 +5413,54 @@ impl super::StorageCluster {
         ))
     }
 
+    pub fn acquire_object_payload_lease_for_shard_locations(
+        self: &std::sync::Arc<Self>,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        locations: &[super::ShardLocation],
+    ) -> Result<ObjectPayloadLease, StoreError> {
+        let runtime_state = self.ensure_object_payload_lease_allowed(bucket, key, generation_id)?;
+        let storage_nodes = self
+            .local_map
+            .try_acquire_object_payload_lease_on_locations(bucket, key, generation_id, locations)?;
+        if !locations.is_empty() && storage_nodes.is_empty() {
+            return Err(StoreError::NotFound);
+        }
+        Ok(ObjectPayloadLease::new(
+            std::sync::Arc::downgrade(self),
+            storage_nodes,
+            runtime_state,
+            bucket.clone(),
+            key.clone(),
+            generation_id,
+        ))
+    }
+
+    fn ensure_object_payload_lease_allowed(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<std::sync::Arc<LocalClusterRuntimeState>, StoreError> {
+        self.object_metadata_primary_node(bucket, key)?;
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let runtime_state = self.local_map.runtime_state();
+        if self
+            .pending_metadata_command_for_bucket(pg_id, bucket)?
+            .is_some_and(|command| {
+                matches!(
+                    command.payload(),
+                    MetadataCommandPayload::DeleteObjectPayloadReclaim(delete)
+                        if delete.matches_request(bucket, key, generation_id)
+                )
+            })
+        {
+            return Err(StoreError::NotFound);
+        }
+        Ok(runtime_state)
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn object_payload_lease_count(
         &self,
@@ -5438,6 +5473,20 @@ impl super::StorageCluster {
         }
         self.local_map
             .object_payload_lease_count(bucket, key, generation_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn object_payload_lease_holder_node_count(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> usize {
+        if self.operation_epoch() != self.cluster_epoch() {
+            return 0;
+        }
+        self.local_map
+            .object_payload_lease_holder_node_count(bucket, key, generation_id)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

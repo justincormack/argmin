@@ -4379,9 +4379,24 @@ impl StorageCluster {
         &self,
         req: &SegmentStoredBytesRequest,
     ) -> Result<Vec<ShardLocation>, StoreError> {
-        let data_pg_id = DataPgId::new(PgId::new(req.data_pg_id));
-        let placement_key = segment_payload_placement_key(&req.segment_okh, req.segment_vid);
-        self.place_payload_shards(data_pg_id, req.ec, &placement_key)
+        self.segment_payload_shard_locations(
+            req.data_pg_id,
+            req.ec,
+            &req.segment_okh,
+            req.segment_vid,
+        )
+    }
+
+    pub fn segment_payload_shard_locations(
+        &self,
+        data_pg_id: u32,
+        ec: EcShape,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+    ) -> Result<Vec<ShardLocation>, StoreError> {
+        let data_pg_id = DataPgId::new(PgId::new(data_pg_id));
+        let placement_key = segment_payload_placement_key(segment_okh, segment_vid);
+        self.place_payload_shards(data_pg_id, ec, &placement_key)
             .map_err(cluster_build_error_to_store)
     }
 

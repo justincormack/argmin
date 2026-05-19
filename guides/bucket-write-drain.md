@@ -192,13 +192,14 @@ DeleteBucket response boundary:
 
 - visible object versions and in-progress multipart uploads
 - payload reclaim roots
-- active in-memory object payload leases
 - completed multipart-upload idempotence rows that must be pruned before the
   bucket row is removed
 
 Missing local queue wakeups are therefore performance issues, not correctness
 issues. A worker can make progress by polling/listing deleting buckets and
-calling finalization again after reclaim or lease blockers clear.
+calling finalization again after reclaim blockers clear. Active in-memory read
+handles are not a direct finalization blocker; they only defer physical payload
+reclaim, which leaves the durable reclaim roots visible.
 
 ## Required Tests
 

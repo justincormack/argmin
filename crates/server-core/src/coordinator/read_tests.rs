@@ -150,20 +150,20 @@ fn get_object_payload_route_error_does_not_become_object_not_found() {
         .test_replace_live_object_segments(&bucket, &key, put.version_id, &segments)
         .unwrap();
 
-    let result = coord
-        .get_object(&GetObjectRequest {
-            sse_customer: None,
-            object: object_version_request_with_expected_owner(
-                "bucket",
-                "key",
-                None,
-                test_requester(),
-                None,
-            ),
-            cond: NO_READ,
-        })
-        .unwrap();
-    let err = result.body.read_all().unwrap_err();
+    let err = match coord.get_object(&GetObjectRequest {
+        sse_customer: None,
+        object: object_version_request_with_expected_owner(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            None,
+        ),
+        cond: NO_READ,
+    }) {
+        Ok(result) => result.body.read_all().unwrap_err(),
+        Err(err) => err,
+    };
 
     assert!(
         matches!(

@@ -3855,15 +3855,17 @@ Proposed subphases:
           object-PG commands validate the durable reservation plus active bucket
           incarnation before non-accepted apply/retry/open-time convergence.
 6. Phase 9.5 storage-node-owned read handles
-   - status: started. The first slice moved object payload generation
+   - status: in progress. The first slice moved object payload generation
      lease/reclaim-fence authority out of the local-cluster runtime state and
-     onto `SharedStorageNode`; `LocalClusterMap` now acquires those volatile
-     handles across the local storage nodes with all-or-release semantics,
-     tokens release the captured storage-node handles without depending on the
-     current map epoch, and object reclaim uses the storage-node-owned fence
-     before physical shard deletion. The current implementation still uses a
-     coarse generation handle across all local storage nodes; exact
-     per-selected-shard handles for EC reads remain open in this phase.
+     onto `SharedStorageNode`; tokens release the captured storage-node handles
+     without depending on the current map epoch, and object reclaim uses the
+     storage-node-owned fence before physical shard deletion. Production
+     `ReadHandle` construction now computes the shard owners for each selected
+     segment, including parity/recovery candidates, and acquires volatile
+     handles from those storage nodes with all-or-release semantics instead of
+     taking a coarse all-node handle. The older coarse generation acquisition
+     remains for focused tests and direct storage-cluster callers until the
+     remaining reclaim/delete API cleanup is closed.
    - decision: do not add a metadata/database write on each object read. Reads
      are ephemeral request state; if the host handling the read fails, the
      client can retry from a fresh metadata snapshot. The durable state should

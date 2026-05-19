@@ -637,6 +637,7 @@ impl ReadRuntime {
             .map_err(Coordinator::map_object_pg_action_error)
     }
 
+    #[cfg(test)]
     pub(super) fn acquire_object_payload_lease_for(
         &self,
         bucket: &BucketName,
@@ -646,6 +647,24 @@ impl ReadRuntime {
         let lease = self
             .storage_node
             .acquire_object_payload_lease(bucket, key, generation_id)?;
+        Ok(PayloadLease { lease: Some(lease) })
+    }
+
+    pub(super) fn acquire_object_payload_lease_for_shard_locations(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        locations: &[storage::ShardLocation],
+    ) -> Result<PayloadLease, ServerError> {
+        let lease = self
+            .storage_node
+            .acquire_object_payload_lease_for_shard_locations(
+                bucket,
+                key,
+                generation_id,
+                locations,
+            )?;
         Ok(PayloadLease { lease: Some(lease) })
     }
 

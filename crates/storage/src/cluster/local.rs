@@ -518,6 +518,78 @@ impl LocalClusterMap {
         true
     }
 
+    pub(crate) fn try_acquire_object_payload_lease_on_locations(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        locations: &[ShardLocation],
+    ) -> Result<Vec<Arc<SharedStorageNode>>, StoreError> {
+        let mut node_ids = BTreeMap::new();
+        for location in locations {
+            if location.cluster_epoch() != self.epoch {
+                return Err(StoreError::StaleMetadataOperation {
+                    pg_id: location.data_pg_id().get(),
+                    operation_epoch: location.cluster_epoch(),
+                    current_epoch: self.epoch,
+                });
+            }
+            let route = self.pg_routes.get(&location.data_pg_id().pg_id()).ok_or(
+                StoreError::ClusterPgNotFound {
+                    pg_id: location.data_pg_id().get(),
+                    cluster_epoch: self.epoch,
+                },
+            )?;
+            if route.cluster_epoch() != self.epoch {
+                return Err(StoreError::StaleMetadataRoute {
+                    pg_id: location.data_pg_id().get(),
+                    route_epoch: route.cluster_epoch(),
+                    current_epoch: self.epoch,
+                });
+            }
+            if !route.is_active() {
+                return Err(StoreError::PgNotActive {
+                    pg_id: location.data_pg_id().get(),
+                    cluster_epoch: self.epoch,
+                    state: route.state(),
+                });
+            }
+            if !route.contains_node(location.node_id()) {
+                return Err(StoreError::NodeNotInActingSet {
+                    node_id: location.node_id().as_u32(),
+                    pg_id: location.data_pg_id().get(),
+                    cluster_epoch: self.epoch,
+                });
+            }
+            node_ids
+                .entry(location.node_id())
+                .or_insert_with(|| location.data_pg_id().get());
+        }
+
+        let mut storage_nodes = Vec::with_capacity(node_ids.len());
+        for (node_id, pg_id) in node_ids {
+            let node = self.nodes.get(&node_id).ok_or(StoreError::NodeNotFound {
+                node_id: node_id.as_u32(),
+                pg_id,
+                cluster_epoch: self.epoch,
+            })?;
+            storage_nodes.push(Arc::clone(node.storage_node()));
+        }
+
+        let mut acquired = Vec::with_capacity(storage_nodes.len());
+        for storage_node in storage_nodes {
+            if storage_node.try_acquire_object_payload_lease(bucket, key, generation_id) {
+                acquired.push(storage_node);
+                continue;
+            }
+            for storage_node in acquired {
+                storage_node.release_object_payload_lease(bucket, key, generation_id);
+            }
+            return Ok(Vec::new());
+        }
+        Ok(acquired)
+    }
+
     pub(crate) fn try_begin_object_payload_reclaim(
         &self,
         bucket: &BucketName,
@@ -584,6 +656,23 @@ impl LocalClusterMap {
             })
             .max()
             .unwrap_or(0)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn object_payload_lease_holder_node_count(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> usize {
+        self.nodes
+            .values()
+            .filter(|node| {
+                node.storage_node()
+                    .object_payload_lease_count(bucket, key, generation_id)
+                    != 0
+            })
+            .count()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -25456,6 +25545,178 @@ mod tests {
                 .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
                 .unwrap(),
             "reclaim should proceed after the cross-handle lease is released"
+        );
+    }
+
+    #[test]
+    fn payload_lease_for_shard_locations_only_acquires_selected_storage_nodes() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let committed =
+            write_committed_direct_segment_for(&cluster, &bucket, &key, b"selected shard lease");
+        let selected = committed.locations[0];
+
+        let lease = cluster
+            .acquire_object_payload_lease_for_shard_locations(
+                &bucket,
+                &key,
+                committed.generation_id,
+                &[selected],
+            )
+            .unwrap();
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let expected = usize::from(node_id == selected.node_id());
+            assert_eq!(
+                node.object_payload_lease_count(&bucket, &key, committed.generation_id),
+                expected,
+                "unexpected selected-shard lease count on node {node_id:?}"
+            );
+        }
+
+        cluster
+            .delete_current_object_if(&bucket, &key, |stored| {
+                assert!(matches!(stored, Some(crate::StoredObject::Live(_))));
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+            .unwrap();
+        assert!(
+            !cluster
+                .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
+                .unwrap(),
+            "a lease on one selected shard owner must block whole-generation reclaim"
+        );
+        drop(lease);
+        assert!(cluster
+            .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
+            .unwrap());
+    }
+
+    #[test]
+    fn payload_lease_for_shard_locations_releases_partial_acquire_on_fence() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let committed =
+            write_committed_direct_segment_for(&cluster, &bucket, &key, b"partial acquire");
+        let first = committed.locations[0];
+        let fenced = committed
+            .locations
+            .iter()
+            .copied()
+            .find(|location| location.node_id() != first.node_id())
+            .expect("EC placement should use at least two storage nodes");
+        let fenced_node = map.node(fenced.node_id()).unwrap().storage_node();
+        assert!(fenced_node.try_begin_object_payload_reclaim(
+            &bucket,
+            &key,
+            committed.generation_id
+        ));
+
+        match cluster.acquire_object_payload_lease_for_shard_locations(
+            &bucket,
+            &key,
+            committed.generation_id,
+            &[first, fenced],
+        ) {
+            Ok(_) => panic!("fenced shard location unexpectedly acquired a payload lease"),
+            Err(error) => assert!(matches!(error, crate::StoreError::NotFound)),
+        }
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            assert_eq!(
+                node.object_payload_lease_count(&bucket, &key, committed.generation_id),
+                0,
+                "failed all-or-release acquisition leaked a lease on node {node_id:?}"
+            );
+        }
+        fenced_node.finish_object_payload_reclaim(&bucket, &key, committed.generation_id, false);
+    }
+
+    #[test]
+    fn payload_lease_for_shard_locations_prevalidates_nodes_before_acquire() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
+        let route = map.pg_routes.get_mut(&PgId::new(0)).unwrap();
+        route.primary_node_id = NodeId::new(0);
+        route.acting_set = Arc::from([NodeId::new(0), NodeId::new(99)]);
+
+        let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+        let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+        let generation_id = crate::GenerationId::MIN;
+        let locations = [
+            ShardLocation::new(
+                ClusterEpoch::INITIAL,
+                DataPgId::new(PgId::new(0)),
+                ShardIndex::new(0),
+                NodeId::new(0),
+            ),
+            ShardLocation::new(
+                ClusterEpoch::INITIAL,
+                DataPgId::new(PgId::new(0)),
+                ShardIndex::new(1),
+                NodeId::new(99),
+            ),
+        ];
+
+        let err = match map.try_acquire_object_payload_lease_on_locations(
+            &bucket,
+            &key,
+            generation_id,
+            &locations,
+        ) {
+            Ok(_) => panic!("missing selected node unexpectedly acquired read handles"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            err,
+            StoreError::NodeNotFound {
+                node_id: 99,
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+            }
+        ));
+        assert_eq!(
+            map.node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .object_payload_lease_count(&bucket, &key, generation_id),
+            0,
+            "missing later selected node must not leak an earlier acquired read handle"
         );
     }
 
