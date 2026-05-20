@@ -488,6 +488,7 @@ impl LocalClusterMap {
         Arc::clone(&self.runtime_state)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn object_payload_lease_storage_nodes(&self) -> Vec<Arc<SharedStorageNode>> {
         self.nodes
             .values()
@@ -495,6 +496,7 @@ impl LocalClusterMap {
             .collect()
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn try_acquire_object_payload_lease(
         &self,
         bucket: &BucketName,
@@ -1048,7 +1050,7 @@ impl LocalClusterMap {
             .write_shard(key, data)
     }
 
-    pub fn read_payload_shard(
+    pub(crate) fn read_payload_shard(
         &self,
         operation_epoch: ClusterEpoch,
         location: ShardLocation,
@@ -1059,7 +1061,7 @@ impl LocalClusterMap {
             .read_shard(key, expected)
     }
 
-    pub fn read_payload_shard_into(
+    pub(crate) fn read_payload_shard_into(
         &self,
         operation_epoch: ClusterEpoch,
         location: ShardLocation,

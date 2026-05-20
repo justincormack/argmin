@@ -1963,7 +1963,7 @@ impl StorageCluster {
             .write_payload_shard(self.operation_epoch(), location, key, data)
     }
 
-    pub fn read_payload_shard(
+    pub(crate) fn read_payload_shard(
         &self,
         location: ShardLocation,
         key: &ShardKey,
@@ -1973,7 +1973,7 @@ impl StorageCluster {
             .read_payload_shard(self.operation_epoch(), location, key, expected)
     }
 
-    pub fn read_payload_shard_into(
+    pub(crate) fn read_payload_shard_into(
         &self,
         location: ShardLocation,
         key: &ShardKey,

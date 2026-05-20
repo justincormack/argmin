@@ -5390,6 +5390,7 @@ impl super::StorageCluster {
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn acquire_object_payload_lease(
         self: &std::sync::Arc<Self>,
         bucket: &BucketName,
