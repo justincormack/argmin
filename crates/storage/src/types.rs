@@ -1810,6 +1810,58 @@ pub struct PayloadReclaimRoot {
     pub generation_id: GenerationId,
 }
 
+/// Durable object payload reclaim kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ObjectPayloadReclaimKind {
+    ObjectSegments = 0,
+    Multipart = 1,
+}
+
+impl ObjectPayloadReclaimKind {
+    #[must_use]
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::ObjectSegments),
+            1 => Some(Self::Multipart),
+            _ => None,
+        }
+    }
+}
+
+/// Durable object payload reclaim worker claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectPayloadReclaimClaimRecord {
+    pub bucket: BucketName,
+    pub bucket_incarnation_generation: u64,
+    pub key: ObjectKey,
+    pub generation_id: GenerationId,
+    pub reclaim_kind: ObjectPayloadReclaimKind,
+    pub claim_id: String,
+    pub owner_token: String,
+    pub cluster_epoch: ClusterEpoch,
+    pub pg_id: u32,
+    pub claimed_at: u64,
+    pub lease_deadline: Option<u64>,
+    pub attempt_count: u64,
+    pub last_error: Option<String>,
+}
+
+/// Durable bucket delete finalizer worker claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketDeleteFinalizeClaimRecord {
+    pub bucket: BucketName,
+    pub bucket_incarnation_generation: u64,
+    pub claim_id: String,
+    pub owner_token: String,
+    pub cluster_epoch: ClusterEpoch,
+    pub pg_id: u32,
+    pub claimed_at: u64,
+    pub lease_deadline: Option<u64>,
+    pub attempt_count: u64,
+    pub last_error: Option<String>,
+}
+
 /// Segment entry for a durable standard-object reclaim record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectSegmentsReclaimSegmentRecord {

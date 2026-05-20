@@ -9131,6 +9131,158 @@ fn bucket_write_drain_from_row(
     })
 }
 
+#[cfg(test)]
+fn object_payload_reclaim_claim_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<ObjectPayloadReclaimClaimRecord, rusqlite::Error> {
+    let bucket_raw: String = row.get(0)?;
+    let bucket_incarnation_raw: i64 = row.get(1)?;
+    let key_raw: String = row.get(2)?;
+    let generation_raw: i64 = row.get(3)?;
+    let reclaim_kind_raw: u8 = row.get(4)?;
+    let cluster_epoch_raw: i64 = row.get(7)?;
+    let pg_id_raw: i64 = row.get(8)?;
+    let claimed_at_raw: i64 = row.get(9)?;
+    let lease_deadline_raw: Option<i64> = row.get(10)?;
+    let attempt_count_raw: i64 = row.get(11)?;
+    Ok(ObjectPayloadReclaimClaimRecord {
+        bucket: BucketName::new(bucket_raw).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::from(error),
+            )
+        })?,
+        bucket_incarnation_generation: u64::try_from(bucket_incarnation_raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Integer,
+                Box::from(format!(
+                    "invalid bucket_incarnation_generation: {bucket_incarnation_raw}"
+                )),
+            )
+        })?,
+        key: ObjectKey::try_from(key_raw).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                Box::from(error),
+            )
+        })?,
+        generation_id: PgStore::parse_generation_id(generation_raw, 3, "generation_id")?,
+        reclaim_kind: ObjectPayloadReclaimKind::from_u8(reclaim_kind_raw).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Integer,
+                Box::from(format!(
+                    "invalid object payload reclaim kind: {reclaim_kind_raw}"
+                )),
+            )
+        })?,
+        claim_id: row.get(5)?,
+        owner_token: row.get(6)?,
+        cluster_epoch: u64::try_from(cluster_epoch_raw)
+            .ok()
+            .and_then(ClusterEpoch::new)
+            .ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    7,
+                    rusqlite::types::Type::Integer,
+                    Box::from(format!("invalid cluster_epoch: {cluster_epoch_raw}")),
+                )
+            })?,
+        pg_id: u32::try_from(pg_id_raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                8,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid pg_id: {pg_id_raw}")),
+            )
+        })?,
+        claimed_at: u64::try_from(claimed_at_raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                9,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid claimed_at: {claimed_at_raw}")),
+            )
+        })?,
+        lease_deadline: PgStore::parse_optional_u64(lease_deadline_raw, 10, "lease_deadline")?,
+        attempt_count: u64::try_from(attempt_count_raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                11,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid attempt_count: {attempt_count_raw}")),
+            )
+        })?,
+        last_error: row.get(12)?,
+    })
+}
+
+#[cfg(test)]
+fn bucket_delete_finalize_claim_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<BucketDeleteFinalizeClaimRecord, rusqlite::Error> {
+    let bucket_raw: String = row.get(0)?;
+    let bucket_incarnation_raw: i64 = row.get(1)?;
+    let cluster_epoch_raw: i64 = row.get(4)?;
+    let pg_id_raw: i64 = row.get(5)?;
+    let claimed_at_raw: i64 = row.get(6)?;
+    let lease_deadline_raw: Option<i64> = row.get(7)?;
+    let attempt_count_raw: i64 = row.get(8)?;
+    Ok(BucketDeleteFinalizeClaimRecord {
+        bucket: BucketName::new(bucket_raw).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::from(error),
+            )
+        })?,
+        bucket_incarnation_generation: u64::try_from(bucket_incarnation_raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Integer,
+                Box::from(format!(
+                    "invalid bucket_incarnation_generation: {bucket_incarnation_raw}"
+                )),
+            )
+        })?,
+        claim_id: row.get(2)?,
+        owner_token: row.get(3)?,
+        cluster_epoch: u64::try_from(cluster_epoch_raw)
+            .ok()
+            .and_then(ClusterEpoch::new)
+            .ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Integer,
+                    Box::from(format!("invalid cluster_epoch: {cluster_epoch_raw}")),
+                )
+            })?,
+        pg_id: u32::try_from(pg_id_raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid pg_id: {pg_id_raw}")),
+            )
+        })?,
+        claimed_at: u64::try_from(claimed_at_raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid claimed_at: {claimed_at_raw}")),
+            )
+        })?,
+        lease_deadline: PgStore::parse_optional_u64(lease_deadline_raw, 7, "lease_deadline")?,
+        attempt_count: u64::try_from(attempt_count_raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                8,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid attempt_count: {attempt_count_raw}")),
+            )
+        })?,
+        last_error: row.get(9)?,
+    })
+}
+
 impl PgMetadataStore for PgStore {
     #[cfg(test)]
     fn create_bucket(
@@ -11606,6 +11758,462 @@ impl PgMetadataStore for PgStore {
                         "generation_id",
                     )?,
                 })
+            },
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_object_payload_reclaim_claim(
+        &self,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        reclaim_kind: ObjectPayloadReclaimKind,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, MetadataError> {
+        let bucket_incarnation_generation =
+            i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
+                context: "acquire object payload reclaim claim incarnation",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        let claimed_at = i64::try_from(claimed_at).map_err(|source| MetadataError::Db {
+            context: "acquire object payload reclaim claim claimed_at",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
+        let lease_deadline = lease_deadline
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|source| MetadataError::Db {
+                context: "acquire object payload reclaim claim lease_deadline",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+
+        self.with_immediate_txn(
+            "acquire object payload reclaim claim (begin txn)",
+            "acquire object payload reclaim claim (commit txn)",
+            |store| {
+                let existing = store
+                    .conn
+                    .query_row(
+                        "SELECT bucket, bucket_incarnation_generation, key, generation_id, reclaim_kind, \
+                                claim_id, owner_token, cluster_epoch, pg_id, claimed_at, \
+                                lease_deadline, attempt_count, last_error \
+                         FROM object_payload_reclaim_claims \
+                         WHERE singleton = 0",
+                        [],
+                        object_payload_reclaim_claim_from_row,
+                    )
+                    .optional()
+                    .map_err(|source| MetadataError::Db {
+                        context: "load object payload reclaim claim",
+                        source,
+                    })?;
+                let mut attempt_count = 1_i64;
+                if let Some(existing) = existing {
+                    let same_work = existing.bucket == *bucket
+                        && existing.bucket_incarnation_generation
+                            == bucket_incarnation_generation as u64
+                        && existing.key == *key
+                        && existing.generation_id == generation_id
+                        && existing.reclaim_kind == reclaim_kind;
+                    if same_work
+                        && existing.claim_id == claim_id
+                        && existing.owner_token == owner_token
+                        && existing.cluster_epoch == cluster_epoch
+                    {
+                        return Ok(Some(existing));
+                    }
+                    if existing.lease_deadline.is_none_or(|deadline| deadline > now) {
+                        return Ok(None);
+                    }
+                    if !same_work {
+                        return Ok(None);
+                    }
+                    attempt_count =
+                        i64::try_from(existing.attempt_count.saturating_add(1)).map_err(
+                            |source| MetadataError::Db {
+                                context: "acquire object payload reclaim claim attempt_count",
+                                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                            },
+                        )?;
+                    store
+                        .conn
+                        .execute(
+                            "DELETE FROM object_payload_reclaim_claims WHERE singleton = 0",
+                            [],
+                        )
+                        .map_err(|source| MetadataError::Db {
+                            context: "clear expired object payload reclaim claim",
+                            source,
+                        })?;
+                }
+
+                let root_exists = match reclaim_kind {
+                    ObjectPayloadReclaimKind::ObjectSegments => store.conn.query_row(
+                        "SELECT 1 FROM object_segments_reclaims \
+                         WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3",
+                        params![bucket, key, generation_id.get() as i64],
+                        |_| Ok(()),
+                    ),
+                    ObjectPayloadReclaimKind::Multipart => store.conn.query_row(
+                        "SELECT 1 FROM multipart_reclaims \
+                         WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3",
+                        params![bucket, key, generation_id.get() as i64],
+                        |_| Ok(()),
+                    ),
+                }
+                .optional()
+                .map_err(|source| MetadataError::Db {
+                    context: "acquire object payload reclaim claim (check root)",
+                    source,
+                })?
+                .is_some();
+                if !root_exists {
+                    return Ok(None);
+                }
+
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO object_payload_reclaim_claims \
+                         (singleton, bucket, bucket_incarnation_generation, key, generation_id, \
+                          reclaim_kind, claim_id, owner_token, cluster_epoch, pg_id, claimed_at, \
+                          lease_deadline, attempt_count, last_error) \
+                         VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL)",
+                        params![
+                            bucket,
+                            bucket_incarnation_generation,
+                            key,
+                            generation_id.get() as i64,
+                            reclaim_kind as u8,
+                            claim_id,
+                            owner_token,
+                            cluster_epoch.get(),
+                            store.pg_id,
+                            claimed_at,
+                            lease_deadline,
+                            attempt_count,
+                        ],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "insert object payload reclaim claim",
+                        source,
+                    })?;
+
+                store
+                    .conn
+                    .query_row(
+                        "SELECT bucket, bucket_incarnation_generation, key, generation_id, reclaim_kind, \
+                                claim_id, owner_token, cluster_epoch, pg_id, claimed_at, \
+                                lease_deadline, attempt_count, last_error \
+                         FROM object_payload_reclaim_claims \
+                         WHERE singleton = 0",
+                        [],
+                        object_payload_reclaim_claim_from_row,
+                    )
+                    .optional()
+                    .map_err(|source| MetadataError::Db {
+                        context: "reload object payload reclaim claim",
+                        source,
+                    })
+            },
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn release_object_payload_reclaim_claim(
+        &self,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        reclaim_kind: ObjectPayloadReclaimKind,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<(), MetadataError> {
+        let bucket_incarnation_generation =
+            i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
+                context: "release object payload reclaim claim incarnation",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        self.with_immediate_txn(
+            "release object payload reclaim claim (begin txn)",
+            "release object payload reclaim claim (commit txn)",
+            |store| {
+                let deleted = store
+                    .conn
+                    .execute(
+                        "DELETE FROM object_payload_reclaim_claims \
+                         WHERE singleton = 0 AND bucket = ?1 AND bucket_incarnation_generation = ?2 \
+                           AND key = ?3 AND generation_id = ?4 AND reclaim_kind = ?5 \
+                           AND claim_id = ?6 AND owner_token = ?7 AND cluster_epoch = ?8",
+                        params![
+                            bucket,
+                            bucket_incarnation_generation,
+                            key,
+                            generation_id.get() as i64,
+                            reclaim_kind as u8,
+                            claim_id,
+                            owner_token,
+                            cluster_epoch.get(),
+                        ],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "release object payload reclaim claim",
+                        source,
+                    })?;
+                if deleted == 0 {
+                    let claim_exists = store
+                        .conn
+                        .query_row(
+                            "SELECT 1 FROM object_payload_reclaim_claims WHERE singleton = 0",
+                            [],
+                            |_| Ok(()),
+                        )
+                        .optional()
+                        .map_err(|source| MetadataError::Db {
+                            context: "release object payload reclaim claim (check existing)",
+                            source,
+                        })?
+                        .is_some();
+                    let error = if claim_exists {
+                        MetadataError::ReclaimClaimConflict {
+                            claim_id: claim_id.to_string(),
+                        }
+                    } else {
+                        MetadataError::ReclaimClaimNotFound {
+                            claim_id: claim_id.to_string(),
+                        }
+                    };
+                    return Err(error);
+                }
+                Ok(())
+            },
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_bucket_delete_finalize_claim(
+        &self,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, MetadataError> {
+        let bucket_incarnation_generation =
+            i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
+                context: "acquire bucket delete finalize claim incarnation",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        let claimed_at = i64::try_from(claimed_at).map_err(|source| MetadataError::Db {
+            context: "acquire bucket delete finalize claim claimed_at",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
+        let lease_deadline = lease_deadline
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|source| MetadataError::Db {
+                context: "acquire bucket delete finalize claim lease_deadline",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+
+        self.with_immediate_txn(
+            "acquire bucket delete finalize claim (begin txn)",
+            "acquire bucket delete finalize claim (commit txn)",
+            |store| {
+                let existing = store
+                    .conn
+                    .query_row(
+                        "SELECT bucket, bucket_incarnation_generation, claim_id, owner_token, \
+                                cluster_epoch, pg_id, claimed_at, lease_deadline, attempt_count, last_error \
+                         FROM bucket_delete_finalize_claims \
+                         WHERE singleton = 0",
+                        [],
+                        bucket_delete_finalize_claim_from_row,
+                    )
+                    .optional()
+                    .map_err(|source| MetadataError::Db {
+                        context: "load bucket delete finalize claim",
+                        source,
+                    })?;
+                let mut attempt_count = 1_i64;
+                if let Some(existing) = existing {
+                    let same_work = existing.bucket == *bucket
+                        && existing.bucket_incarnation_generation
+                            == bucket_incarnation_generation as u64;
+                    if same_work
+                        && existing.claim_id == claim_id
+                        && existing.owner_token == owner_token
+                        && existing.cluster_epoch == cluster_epoch
+                    {
+                        return Ok(Some(existing));
+                    }
+                    if existing.lease_deadline.is_none_or(|deadline| deadline > now) {
+                        return Ok(None);
+                    }
+                    if !same_work {
+                        return Ok(None);
+                    }
+                    attempt_count =
+                        i64::try_from(existing.attempt_count.saturating_add(1)).map_err(
+                            |source| MetadataError::Db {
+                                context: "acquire bucket delete finalize claim attempt_count",
+                                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                            },
+                        )?;
+                    store
+                        .conn
+                        .execute(
+                            "DELETE FROM bucket_delete_finalize_claims WHERE singleton = 0",
+                            [],
+                        )
+                        .map_err(|source| MetadataError::Db {
+                            context: "clear expired bucket delete finalize claim",
+                            source,
+                        })?;
+                }
+
+                let deleting_bucket_exists = store
+                    .conn
+                    .query_row(
+                        "SELECT 1 FROM buckets \
+                         WHERE name = ?1 AND state = ?2 AND bucket_incarnation_generation = ?3",
+                        params![
+                            bucket,
+                            BucketState::Deleting as u8,
+                            bucket_incarnation_generation,
+                        ],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(|source| MetadataError::Db {
+                        context: "acquire bucket delete finalize claim (check bucket)",
+                        source,
+                    })?
+                    .is_some();
+                if !deleting_bucket_exists {
+                    return Ok(None);
+                }
+
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO bucket_delete_finalize_claims \
+                         (singleton, bucket, bucket_incarnation_generation, claim_id, owner_token, \
+                          cluster_epoch, pg_id, claimed_at, lease_deadline, attempt_count, last_error) \
+                         VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+                        params![
+                            bucket,
+                            bucket_incarnation_generation,
+                            claim_id,
+                            owner_token,
+                            cluster_epoch.get(),
+                            store.pg_id,
+                            claimed_at,
+                            lease_deadline,
+                            attempt_count,
+                        ],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "insert bucket delete finalize claim",
+                        source,
+                    })?;
+
+                store
+                    .conn
+                    .query_row(
+                        "SELECT bucket, bucket_incarnation_generation, claim_id, owner_token, \
+                                cluster_epoch, pg_id, claimed_at, lease_deadline, attempt_count, last_error \
+                         FROM bucket_delete_finalize_claims \
+                         WHERE singleton = 0",
+                        [],
+                        bucket_delete_finalize_claim_from_row,
+                    )
+                    .optional()
+                    .map_err(|source| MetadataError::Db {
+                        context: "reload bucket delete finalize claim",
+                        source,
+                    })
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn release_bucket_delete_finalize_claim(
+        &self,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<(), MetadataError> {
+        let bucket_incarnation_generation =
+            i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
+                context: "release bucket delete finalize claim incarnation",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        self.with_immediate_txn(
+            "release bucket delete finalize claim (begin txn)",
+            "release bucket delete finalize claim (commit txn)",
+            |store| {
+                let deleted = store
+                    .conn
+                    .execute(
+                        "DELETE FROM bucket_delete_finalize_claims \
+                         WHERE singleton = 0 AND bucket = ?1 AND bucket_incarnation_generation = ?2 \
+                           AND claim_id = ?3 AND owner_token = ?4 AND cluster_epoch = ?5",
+                        params![
+                            bucket,
+                            bucket_incarnation_generation,
+                            claim_id,
+                            owner_token,
+                            cluster_epoch.get(),
+                        ],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "release bucket delete finalize claim",
+                        source,
+                    })?;
+                if deleted == 0 {
+                    let claim_exists = store
+                        .conn
+                        .query_row(
+                            "SELECT 1 FROM bucket_delete_finalize_claims WHERE singleton = 0",
+                            [],
+                            |_| Ok(()),
+                        )
+                        .optional()
+                        .map_err(|source| MetadataError::Db {
+                            context: "release bucket delete finalize claim (check existing)",
+                            source,
+                        })?
+                        .is_some();
+                    let error = if claim_exists {
+                        MetadataError::ReclaimClaimConflict {
+                            claim_id: claim_id.to_string(),
+                        }
+                    } else {
+                        MetadataError::ReclaimClaimNotFound {
+                            claim_id: claim_id.to_string(),
+                        }
+                    };
+                    return Err(error);
+                }
+                Ok(())
             },
         )
     }
@@ -14670,6 +15278,496 @@ mod tests {
                 versioning: BucketVersioningState::Disabled,
                 object_lock: BucketObjectLockConfig::default(),
             })
+            .unwrap();
+    }
+
+    #[test]
+    fn object_payload_reclaim_claim_is_single_owner_and_expires() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 9).unwrap();
+        let bucket = trusted_bucket_name("claim-bucket");
+        let key = trusted_object_key("object");
+        let generation_id = GenerationId::new(11).unwrap();
+
+        assert!(
+            store
+                .acquire_object_payload_reclaim_claim(
+                    &bucket,
+                    3,
+                    &key,
+                    generation_id,
+                    ObjectPayloadReclaimKind::ObjectSegments,
+                    "claim-a",
+                    "owner-a",
+                    ClusterEpoch::INITIAL,
+                    10,
+                    Some(20),
+                    10,
+                )
+                .unwrap()
+                .is_none(),
+            "claim must not be acquired without a durable reclaim root"
+        );
+
+        store
+            .put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                generation_id,
+                created_at: 1,
+                segments: Vec::new(),
+            })
+            .unwrap();
+
+        let first = store
+            .acquire_object_payload_reclaim_claim(
+                &bucket,
+                3,
+                &key,
+                generation_id,
+                ObjectPayloadReclaimKind::ObjectSegments,
+                "claim-a",
+                "owner-a",
+                ClusterEpoch::INITIAL,
+                10,
+                Some(20),
+                10,
+            )
+            .unwrap()
+            .expect("first worker should acquire claim");
+        assert_eq!(first.claim_id, "claim-a");
+        assert_eq!(first.pg_id, 9);
+        assert_eq!(first.attempt_count, 1);
+
+        assert!(
+            store
+                .acquire_object_payload_reclaim_claim(
+                    &bucket,
+                    3,
+                    &key,
+                    generation_id,
+                    ObjectPayloadReclaimKind::ObjectSegments,
+                    "claim-b",
+                    "owner-b",
+                    ClusterEpoch::INITIAL,
+                    11,
+                    Some(30),
+                    11,
+                )
+                .unwrap()
+                .is_none(),
+            "non-expired claim must block another owner"
+        );
+
+        let idempotent = store
+            .acquire_object_payload_reclaim_claim(
+                &bucket,
+                3,
+                &key,
+                generation_id,
+                ObjectPayloadReclaimKind::ObjectSegments,
+                "claim-a",
+                "owner-a",
+                ClusterEpoch::INITIAL,
+                12,
+                Some(40),
+                12,
+            )
+            .unwrap()
+            .expect("same owner should reacquire idempotently");
+        assert_eq!(idempotent, first);
+
+        let stolen = store
+            .acquire_object_payload_reclaim_claim(
+                &bucket,
+                3,
+                &key,
+                generation_id,
+                ObjectPayloadReclaimKind::ObjectSegments,
+                "claim-b",
+                "owner-b",
+                ClusterEpoch::INITIAL,
+                21,
+                Some(40),
+                21,
+            )
+            .unwrap()
+            .expect("expired claim should be stealable");
+        assert_eq!(stolen.claim_id, "claim-b");
+        assert_eq!(stolen.attempt_count, 2);
+
+        let stale_release = store
+            .release_object_payload_reclaim_claim(
+                &bucket,
+                3,
+                &key,
+                generation_id,
+                ObjectPayloadReclaimKind::ObjectSegments,
+                "claim-a",
+                "owner-a",
+                ClusterEpoch::INITIAL,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            stale_release,
+            MetadataError::ReclaimClaimConflict { .. }
+        ));
+
+        store
+            .release_object_payload_reclaim_claim(
+                &bucket,
+                3,
+                &key,
+                generation_id,
+                ObjectPayloadReclaimKind::ObjectSegments,
+                "claim-b",
+                "owner-b",
+                ClusterEpoch::INITIAL,
+            )
+            .unwrap();
+        let missing_release = store
+            .release_object_payload_reclaim_claim(
+                &bucket,
+                3,
+                &key,
+                generation_id,
+                ObjectPayloadReclaimKind::ObjectSegments,
+                "claim-b",
+                "owner-b",
+                ClusterEpoch::INITIAL,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            missing_release,
+            MetadataError::ReclaimClaimNotFound { .. }
+        ));
+    }
+
+    #[test]
+    fn object_payload_reclaim_claim_release_is_bucket_incarnation_fenced() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 10).unwrap();
+        let bucket = trusted_bucket_name("claim-incarnation-bucket");
+        let key = trusted_object_key("object");
+        let generation_id = GenerationId::new(12).unwrap();
+        store
+            .put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                generation_id,
+                created_at: 1,
+                segments: Vec::new(),
+            })
+            .unwrap();
+
+        store
+            .acquire_object_payload_reclaim_claim(
+                &bucket,
+                7,
+                &key,
+                generation_id,
+                ObjectPayloadReclaimKind::ObjectSegments,
+                "claim",
+                "owner",
+                ClusterEpoch::INITIAL,
+                10,
+                None,
+                10,
+            )
+            .unwrap()
+            .expect("claim should be acquired");
+
+        let wrong_incarnation = store
+            .release_object_payload_reclaim_claim(
+                &bucket,
+                8,
+                &key,
+                generation_id,
+                ObjectPayloadReclaimKind::ObjectSegments,
+                "claim",
+                "owner",
+                ClusterEpoch::INITIAL,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            wrong_incarnation,
+            MetadataError::ReclaimClaimConflict { .. }
+        ));
+
+        store
+            .release_object_payload_reclaim_claim(
+                &bucket,
+                7,
+                &key,
+                generation_id,
+                ObjectPayloadReclaimKind::ObjectSegments,
+                "claim",
+                "owner",
+                ClusterEpoch::INITIAL,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn object_payload_reclaim_claim_does_not_clear_expired_different_root() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 10).unwrap();
+        let bucket = trusted_bucket_name("claim-different-root-bucket");
+        let key_a = trusted_object_key("object-a");
+        let key_b = trusted_object_key("object-b");
+        let generation_id = GenerationId::new(12).unwrap();
+        for key in [&key_a, &key_b] {
+            store
+                .put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    generation_id,
+                    created_at: 1,
+                    segments: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let first = store
+            .acquire_object_payload_reclaim_claim(
+                &bucket,
+                7,
+                &key_a,
+                generation_id,
+                ObjectPayloadReclaimKind::ObjectSegments,
+                "claim-a",
+                "owner-a",
+                ClusterEpoch::INITIAL,
+                10,
+                Some(20),
+                10,
+            )
+            .unwrap()
+            .expect("first root should be claimable");
+        assert_eq!(first.claim_id, "claim-a");
+
+        assert!(
+            store
+                .acquire_object_payload_reclaim_claim(
+                    &bucket,
+                    7,
+                    &key_b,
+                    generation_id,
+                    ObjectPayloadReclaimKind::ObjectSegments,
+                    "claim-b",
+                    "owner-b",
+                    ClusterEpoch::INITIAL,
+                    21,
+                    Some(40),
+                    21,
+                )
+                .unwrap()
+                .is_none(),
+            "expired different-root claim must remain the PG work-class owner"
+        );
+
+        let still_owned = store
+            .acquire_object_payload_reclaim_claim(
+                &bucket,
+                7,
+                &key_a,
+                generation_id,
+                ObjectPayloadReclaimKind::ObjectSegments,
+                "claim-a",
+                "owner-a",
+                ClusterEpoch::INITIAL,
+                22,
+                Some(50),
+                22,
+            )
+            .unwrap()
+            .expect("original claim identity must remain visible");
+        assert_eq!(still_owned, first);
+
+        store
+            .release_object_payload_reclaim_claim(
+                &bucket,
+                7,
+                &key_a,
+                generation_id,
+                ObjectPayloadReclaimKind::ObjectSegments,
+                "claim-a",
+                "owner-a",
+                ClusterEpoch::INITIAL,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn bucket_delete_finalize_claim_requires_deleting_bucket_and_incarnation() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 11).unwrap();
+        let bucket = trusted_bucket_name("finalize-claim-bucket");
+        create_probe_bucket_direct(&store, &bucket);
+        let active = store.head_bucket_record_raw(&bucket).unwrap();
+
+        assert!(
+            store
+                .acquire_bucket_delete_finalize_claim(
+                    &bucket,
+                    active.bucket_incarnation_generation,
+                    "claim-a",
+                    "owner-a",
+                    ClusterEpoch::INITIAL,
+                    10,
+                    Some(20),
+                    10,
+                )
+                .unwrap()
+                .is_none(),
+            "active buckets must not be finalizer-claimable"
+        );
+
+        store.mark_bucket_deleting(&bucket).unwrap();
+        let deleting = store.head_bucket_record_raw(&bucket).unwrap();
+        let first = store
+            .acquire_bucket_delete_finalize_claim(
+                &bucket,
+                deleting.bucket_incarnation_generation,
+                "claim-a",
+                "owner-a",
+                ClusterEpoch::INITIAL,
+                10,
+                Some(20),
+                10,
+            )
+            .unwrap()
+            .expect("deleting bucket should be finalizer-claimable");
+        assert_eq!(first.claim_id, "claim-a");
+        assert_eq!(first.pg_id, 11);
+        assert_eq!(first.attempt_count, 1);
+
+        assert!(
+            store
+                .acquire_bucket_delete_finalize_claim(
+                    &bucket,
+                    deleting.bucket_incarnation_generation,
+                    "claim-b",
+                    "owner-b",
+                    ClusterEpoch::INITIAL,
+                    11,
+                    Some(30),
+                    11,
+                )
+                .unwrap()
+                .is_none(),
+            "non-expired finalizer claim must block another owner"
+        );
+
+        let wrong_incarnation = store
+            .release_bucket_delete_finalize_claim(
+                &bucket,
+                deleting.bucket_incarnation_generation + 1,
+                "claim-a",
+                "owner-a",
+                ClusterEpoch::INITIAL,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            wrong_incarnation,
+            MetadataError::ReclaimClaimConflict { .. }
+        ));
+
+        let stolen = store
+            .acquire_bucket_delete_finalize_claim(
+                &bucket,
+                deleting.bucket_incarnation_generation,
+                "claim-b",
+                "owner-b",
+                ClusterEpoch::INITIAL,
+                21,
+                Some(40),
+                21,
+            )
+            .unwrap()
+            .expect("expired finalizer claim should be stealable");
+        assert_eq!(stolen.claim_id, "claim-b");
+        assert_eq!(stolen.attempt_count, 2);
+
+        store
+            .release_bucket_delete_finalize_claim(
+                &bucket,
+                deleting.bucket_incarnation_generation,
+                "claim-b",
+                "owner-b",
+                ClusterEpoch::INITIAL,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn bucket_delete_finalize_claim_does_not_clear_expired_different_bucket() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 11).unwrap();
+        let bucket_a = trusted_bucket_name("finalize-claim-bucket-a");
+        let bucket_b = trusted_bucket_name("finalize-claim-bucket-b");
+        create_probe_bucket_direct(&store, &bucket_a);
+        create_probe_bucket_direct(&store, &bucket_b);
+        store.mark_bucket_deleting(&bucket_a).unwrap();
+        store.mark_bucket_deleting(&bucket_b).unwrap();
+        let bucket_a_record = store.head_bucket_record_raw(&bucket_a).unwrap();
+        let bucket_b_record = store.head_bucket_record_raw(&bucket_b).unwrap();
+
+        let first = store
+            .acquire_bucket_delete_finalize_claim(
+                &bucket_a,
+                bucket_a_record.bucket_incarnation_generation,
+                "claim-a",
+                "owner-a",
+                ClusterEpoch::INITIAL,
+                10,
+                Some(20),
+                10,
+            )
+            .unwrap()
+            .expect("first bucket finalizer should be claimable");
+        assert_eq!(first.claim_id, "claim-a");
+
+        assert!(
+            store
+                .acquire_bucket_delete_finalize_claim(
+                    &bucket_b,
+                    bucket_b_record.bucket_incarnation_generation,
+                    "claim-b",
+                    "owner-b",
+                    ClusterEpoch::INITIAL,
+                    21,
+                    Some(40),
+                    21,
+                )
+                .unwrap()
+                .is_none(),
+            "expired different-bucket finalizer claim must remain the PG work-class owner"
+        );
+
+        let still_owned = store
+            .acquire_bucket_delete_finalize_claim(
+                &bucket_a,
+                bucket_a_record.bucket_incarnation_generation,
+                "claim-a",
+                "owner-a",
+                ClusterEpoch::INITIAL,
+                22,
+                Some(50),
+                22,
+            )
+            .unwrap()
+            .expect("original finalizer claim identity must remain visible");
+        assert_eq!(still_owned, first);
+
+        store
+            .release_bucket_delete_finalize_claim(
+                &bucket_a,
+                bucket_a_record.bucket_incarnation_generation,
+                "claim-a",
+                "owner-a",
+                ClusterEpoch::INITIAL,
+            )
             .unwrap();
     }
 

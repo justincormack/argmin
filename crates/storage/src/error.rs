@@ -474,6 +474,12 @@ pub enum MetadataError {
     #[error("bucket write drain not found: {drain_id}")]
     BucketWriteDrainNotFound { drain_id: String },
 
+    #[error("reclaim claim conflict: {claim_id}")]
+    ReclaimClaimConflict { claim_id: String },
+
+    #[error("reclaim claim not found: {claim_id}")]
+    ReclaimClaimNotFound { claim_id: String },
+
     #[error("object not found")]
     ObjectNotFound,
 

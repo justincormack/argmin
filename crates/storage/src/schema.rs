@@ -325,6 +325,42 @@ CREATE TABLE IF NOT EXISTS multipart_reclaim_part_segments (
         ON DELETE CASCADE
 )";
 
+/// Durable object payload reclaim worker claim.
+const CREATE_OBJECT_PAYLOAD_RECLAIM_CLAIMS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS object_payload_reclaim_claims (
+    singleton       INTEGER PRIMARY KEY CHECK (singleton = 0),
+    bucket          TEXT NOT NULL,
+    bucket_incarnation_generation INTEGER NOT NULL CHECK (bucket_incarnation_generation >= 0),
+    key             TEXT NOT NULL,
+    generation_id   INTEGER NOT NULL CHECK (generation_id > 0),
+    reclaim_kind    INTEGER NOT NULL CHECK (reclaim_kind IN (0, 1)),
+    claim_id        TEXT NOT NULL CHECK (length(claim_id) BETWEEN 1 AND 256),
+    owner_token     TEXT NOT NULL CHECK (length(owner_token) BETWEEN 1 AND 256),
+    cluster_epoch   INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    pg_id           INTEGER NOT NULL CHECK (pg_id >= 0),
+    claimed_at      INTEGER NOT NULL CHECK (claimed_at >= 0),
+    lease_deadline  INTEGER CHECK (lease_deadline IS NULL OR lease_deadline >= 0),
+    attempt_count   INTEGER NOT NULL CHECK (attempt_count >= 0),
+    last_error      TEXT
+)";
+
+/// Durable bucket delete finalizer worker claim.
+const CREATE_BUCKET_DELETE_FINALIZE_CLAIMS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS bucket_delete_finalize_claims (
+    singleton       INTEGER PRIMARY KEY CHECK (singleton = 0),
+    bucket          TEXT NOT NULL,
+    bucket_incarnation_generation INTEGER NOT NULL CHECK (bucket_incarnation_generation >= 0),
+    claim_id        TEXT NOT NULL CHECK (length(claim_id) BETWEEN 1 AND 256),
+    owner_token     TEXT NOT NULL CHECK (length(owner_token) BETWEEN 1 AND 256),
+    cluster_epoch   INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    pg_id           INTEGER NOT NULL CHECK (pg_id >= 0),
+    claimed_at      INTEGER NOT NULL CHECK (claimed_at >= 0),
+    lease_deadline  INTEGER CHECK (lease_deadline IS NULL OR lease_deadline >= 0),
+    attempt_count   INTEGER NOT NULL CHECK (attempt_count >= 0),
+    last_error      TEXT,
+    FOREIGN KEY (bucket) REFERENCES buckets(name) ON DELETE CASCADE
+)";
+
 /// Committed multipart part segments.
 const CREATE_MULTIPART_PART_CHUNKS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS multipart_part_segments (
@@ -569,11 +605,13 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_MULTIPART_RECLAIMS_TABLE, [])?;
     conn.execute(CREATE_MULTIPART_RECLAIM_PARTS_TABLE, [])?;
     conn.execute(CREATE_MULTIPART_RECLAIM_PART_CHUNKS_TABLE, [])?;
+    conn.execute(CREATE_OBJECT_PAYLOAD_RECLAIM_CLAIMS_TABLE, [])?;
     conn.execute(CREATE_MULTIPART_PART_CHUNKS_TABLE, [])?;
     conn.execute(CREATE_MULTIPART_PART_CHUNKS_VERSION_INDEX, [])?;
     conn.execute(CREATE_BUCKETS_TABLE, [])?;
     conn.execute(CREATE_BUCKET_WRITE_RESERVATIONS_TABLE, [])?;
     conn.execute(CREATE_BUCKET_WRITE_DRAINS_TABLE, [])?;
+    conn.execute(CREATE_BUCKET_DELETE_FINALIZE_CLAIMS_TABLE, [])?;
     conn.execute(CREATE_BUCKETS_OWNER_LIST_INDEX, [])?;
     conn.execute(CREATE_PG_COUNTERS_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_LOG_TABLE, [])?;

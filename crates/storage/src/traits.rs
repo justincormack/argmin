@@ -500,6 +500,68 @@ pub(crate) trait PgMetadataStore {
         bucket: &BucketName,
     ) -> Result<Option<PayloadReclaimRoot>, MetadataError>;
 
+    /// Acquire the single durable object-payload reclaim claim for this PG.
+    ///
+    /// Returns `Ok(None)` when the reclaim root is absent or a non-expired
+    /// claim owned by another worker is active.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_object_payload_reclaim_claim(
+        &self,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        reclaim_kind: ObjectPayloadReclaimKind,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, MetadataError>;
+
+    /// Release a durable object-payload reclaim claim by exact token-fenced identity.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn release_object_payload_reclaim_claim(
+        &self,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        reclaim_kind: ObjectPayloadReclaimKind,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<(), MetadataError>;
+
+    /// Acquire the single durable bucket-delete finalizer claim for this PG.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_bucket_delete_finalize_claim(
+        &self,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, MetadataError>;
+
+    /// Release a durable bucket-delete finalizer claim by exact token-fenced identity.
+    #[cfg(test)]
+    fn release_bucket_delete_finalize_claim(
+        &self,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<(), MetadataError>;
+
     /// Store tags for an object version (serialized XML string).
     #[cfg(test)]
     fn put_object_tags(
