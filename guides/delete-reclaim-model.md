@@ -86,6 +86,33 @@ Durable metadata records reclaim work. It does not record every active reader.
 This keeps reads cheap while preserving the rule that no shard-owning node
 deletes a file it is currently serving.
 
+## Worker Ownership
+
+Payload reclaim workers must not depend on the process-local wakeup queue for
+correctness. The queue is a latency hint; durable reclaim metadata is the source
+of truth.
+
+The Phase 9.6 model uses one durable reclaim owner per PG/work-class at a time:
+
+- object payload reclaim is claimed on the object metadata PG that owns the
+  reclaim root; the claim identity includes the bucket incarnation so stale
+  workers cannot release or steal a newer claim after bucket delete/recreate
+- bucket delete finalization is claimed on the bucket PG that owns the deleting
+  bucket row
+- a claim is token-fenced, expires if its worker stops, and can be stolen only
+  after re-reading the durable root on the PG primary
+
+This avoids same-PG duplicate cleanup races while still allowing independent
+PGs to reclaim in parallel. Physical deletion remains idempotent because a
+worker can crash after deleting some shard files but before clearing reclaim
+metadata.
+
+Terminal cleanup is retryable protocol state, not best-effort cleanup. If a
+reclaim or bucket-finalizer metadata command has already become terminal but
+the matching durable claim or pending cleanup marker survives a crash, startup
+and reopen recovery must preserve enough token-fenced identity to clear the
+matching claim before unrelated work on that PG is blocked indefinitely.
+
 ## Operational Consequences
 
 - `DeleteObject` success means future reads observe the object as deleted

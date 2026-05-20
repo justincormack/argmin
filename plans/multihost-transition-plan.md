@@ -3928,12 +3928,159 @@ Proposed subphases:
      payload reads, direct payload deletes, public low-level read APIs, and
      public storage-node handle/fence APIs
 7. Phase 9.6 durable reclaim claiming
-   - make reclaim worker ownership durable and idempotent
-   - multiple workers must not corrupt or double-finalize the same reclaim row
-   - crash after claim must be retryable, and failed cleanup must remain
-     observable and retryable
-   - exit when reclaim can resume after process restart without local worker
-     state
+   - status: planned. Phase 9.6 replaces process-local reclaim queue ownership
+     with durable PG-primary claims. Durable reclaim rows remain the source of
+     truth; local queues and condition variables become wakeup hints only.
+   - concurrency decision: start with one active durable reclaim owner per
+     PG/work-class, not multiple workers on the same PG. Object payload reclaim
+     is claimed on the object metadata PG that owns the reclaim root. Bucket
+     delete finalization is claimed on the bucket PG that owns the deleting
+     bucket row. This deliberately trades reclaim parallelism within one PG for
+     a smaller correctness surface: no two workers race the same reclaim
+     metadata command stream, no duplicate bucket finalizer runs, and physical
+     cleanup remains idempotent. Crash recovery, claim expiry, and retryable
+     failed cleanup are still required because the single owner can stop at any
+     point.
+   - durable authority:
+     - object payload reclaim roots are already durable in
+       `object_segments_reclaim` and `multipart_reclaim`; Phase 9.6 adds
+       durable claim state either directly to those rows or through an explicit
+       object-PG reclaim-claim table keyed by
+       `(bucket, bucket_incarnation, key, generation_id, reclaim_kind)`.
+       Bucket incarnation is part of claim identity even though generation IDs
+       are normally allocated from bucket-scoped metadata, because stale
+       release/steal must fail closed across delete/recreate boundaries and may
+       not rely on allocator assumptions
+     - bucket delete finalization roots are deleting bucket rows; Phase 9.6 adds
+       durable finalizer claim state keyed by bucket name plus bucket
+       incarnation on the bucket PG
+     - claim identity must include owner node/process identity, a unique claim
+       token, cluster epoch, PG id, work kind, claimed_at, expires_at, attempt
+       count, and last error/status fields useful for debugging stuck cleanup
+   - object reclaim claim loop:
+     1. a worker wakes from a local hint, a periodic poll, or startup scan
+     2. it routes to the object PG primary and atomically claims one eligible
+        reclaim root only if no non-expired object-reclaim claim is active for
+        that PG/work-class
+     3. if the local hint refers to work already gone, claimed elsewhere, or
+        blocked by an active non-expired PG claim, the worker returns without
+        treating that as success
+     4. once claimed, the worker calls the existing physical reclaim path, which
+        must still fence storage-node read handles before deleting shard files
+     5. successful physical cleanup installs/applies the existing
+        `DeleteObjectPayloadReclaim` metadata command and clears the durable
+        reclaim row plus durable claim atomically with command convergence or in
+        a retryable terminal cleanup step that preserves enough identity to
+        retry
+     6. if cleanup defers because read handles are active, the durable reclaim
+        row remains, the claim is released or allowed to expire, and a later
+        worker can retry
+     7. if physical deletion starts and then fails, the storage-node reclaim
+        fence remains closed as today, the durable row remains observable, and
+        the claim records the failure before becoming retryable
+     8. if the `DeleteObjectPayloadReclaim` command becomes terminal/applied but
+        the durable claim or pending slot survives a crash or cleanup failure,
+        the terminal cleanup remains retryable and must run before the PG's
+        object-reclaim work-class can be considered unblocked. Reopen/startup
+        scans must recognize terminal reclaim cleanup work, clear only the
+        matching token-fenced claim, clean the pending slot, and then allow
+        unrelated reclaim on the PG to proceed
+   - bucket finalizer claim loop:
+     1. a worker wakes from a bucket-finalize hint, periodic poll, or startup
+        scan
+     2. it routes to the bucket PG primary and atomically claims one deleting
+        bucket finalization only if no non-expired bucket-finalizer claim is
+        active for that bucket PG/work-class
+     3. the claimed worker runs `try_finalize_bucket_delete`; if reclaim roots
+        still exist, finalization remains pending and the claim is released or
+        expires for later retry
+     4. if metadata row deletion or completed-MPU cleanup partially applies, the
+        existing command-stream convergence rules must make retry/open-time
+        recovery idempotent before the claim is cleared
+     5. if bucket finalization reaches terminal metadata state but the durable
+        finalizer claim or pending terminal cleanup survives a crash/failure,
+        startup/reopen must retry the terminal cleanup before treating the
+        bucket-PG finalizer work-class as unblocked. Cleanup must be fenced by
+        finalizer claim token and bucket incarnation
+   - claim expiry and stealing:
+     - claims are volatile ownership records backed by durable metadata, not
+       proof that work completed
+     - a worker may steal only an expired claim, and only after re-reading the
+       current durable reclaim root/bucket incarnation on the PG primary
+     - stale release must be fenced by claim token and bucket/object
+       incarnation so an old worker cannot clear a newer claim
+     - expiry should be long enough to avoid stealing live workers during normal
+       large payload deletion, and workers may heartbeat/extend claims before
+       expiry while making progress
+   - startup and polling:
+     - worker startup must scan durable reclaim roots and deleting buckets, so
+       process restart does not depend on in-memory queue contents
+     - local enqueue remains a latency optimization that wakes workers after
+       request-path metadata changes or read-handle release; correctness must
+       not depend on enqueue delivery
+     - lost local hints, stopped workers, and process restart must eventually
+       recover through durable scans
+   - failure semantics:
+     - multiple workers may race to claim, but only one durable claim wins per
+       PG/work-class
+     - duplicate physical delete attempts must remain idempotent because crash
+       may occur after deleting some shard files but before clearing reclaim
+       metadata
+     - cleanup errors must not be swallowed as success; they remain observable
+       on the claim/root and leave work retryable
+     - terminal command cleanup is part of the durable reclaim protocol, not
+       best-effort background tidying. If command convergence succeeds but claim
+       release, pending-slot cleanup, or finalizer cleanup fails, enough durable
+       identity must remain to retry the cleanup after restart; the surviving
+       claim must not indefinitely block unrelated work on the same PG
+     - bucket finalization must not complete while any durable payload reclaim
+       root for that bucket remains
+   - required regressions:
+     - two workers race object reclaim on the same object PG; exactly one
+       durable claim wins and the other observes claimed/no work
+     - two workers race reclaim roots on different object PGs; both may proceed
+       concurrently
+     - two workers race reclaim roots on the same object PG; the second waits,
+       skips, or retries after the first claim clears/expires
+     - crash/reopen after claiming an object reclaim root but before physical
+       cleanup; startup scan reclaims the expired claim and completes cleanup
+     - crash/reopen after partial physical shard deletion but before reclaim
+       metadata cleanup; retry completes idempotently and clears the durable row
+     - `DeleteObjectPayloadReclaim` reaches terminal/applied, then claim release
+       or terminal pending-slot cleanup fails; retry/reopen clears the matching
+       claim and slot before allowing another same-PG object reclaim claim
+     - injected physical delete failure records observable retry state and keeps
+       the storage-node read-handle fence closed until retry converges
+     - lost local queue after restart still discovers and completes object
+       reclaim roots from durable metadata alone
+     - stale object-reclaim worker release/steal cannot clear a newer claim for
+       a recreated bucket with the same key/generation shape
+     - two workers race bucket finalization on the same bucket PG; exactly one
+       finalizer claim wins and no double-finalize/corruption occurs
+     - crash/reopen after claiming bucket finalization; expired claim is
+       reclaimed and `try_finalize_bucket_delete` resumes from durable state
+     - bucket finalization reaches terminal metadata state, then finalizer claim
+       cleanup fails; retry/reopen clears the matching claim before allowing
+       another same-PG bucket-finalizer claim
+     - stale worker release cannot clear a newer claim or a recreated bucket's
+       finalizer claim
+   - implementation slices:
+     1. add claim schema/types, digest/replay coverage if the rows are
+        replica-visible, and low-level claim acquire/heartbeat/release/expire
+        helpers on the relevant PG primary
+     2. wire object payload reclaim workers to claim durable object-PG work and
+        treat the local queue as a hint
+     3. add startup/periodic scans for durable object reclaim roots so restart
+        without local queue state makes progress
+     4. wire bucket delete finalization workers to durable bucket-PG claims and
+        add startup/periodic scans for deleting buckets
+     5. remove or test-gate production reliance on `LocalReclaimQueueState`
+        ordering, leaving it only as wakeup/backpressure plumbing until Phase
+        9.7/9.8 replace broader scavenger/lifecycle scheduling
+   - exit when reclaim and bucket finalization can resume after process restart
+     without local worker state, worker ownership is durable and token-fenced,
+     cleanup is idempotent across claim expiry/steal, and local queues are only
+     wakeup hints
 8. Phase 9.7 physical shard scavenger
    - add the eventual cleanup process for shard files no longer referenced by
      metadata
