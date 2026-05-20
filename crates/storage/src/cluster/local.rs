@@ -1071,7 +1071,7 @@ impl LocalClusterMap {
             .read_shard_into(key, expected, dst)
     }
 
-    pub fn delete_payload_shard(
+    pub(crate) fn delete_payload_shard(
         &self,
         operation_epoch: ClusterEpoch,
         location: ShardLocation,

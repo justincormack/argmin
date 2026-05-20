@@ -129,6 +129,60 @@ fail_with_matches \
     "Production shard IO bypasses StorageCluster placed IO" \
     "$unexpected_direct_shard"
 
+payload_shard_delete_callers=$(
+    awk '
+    FNR == 1 {
+        current_fn = ""
+        pending_test_cfg = 0
+        in_test_module = 0
+    }
+    /^#\[cfg\(test\)\]/ || /^#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ {
+        pending_test_cfg = 1
+        next
+    }
+    /^mod tests[[:space:]]*\{/ && pending_test_cfg {
+        in_test_module = 1
+        pending_test_cfg = 0
+        next
+    }
+    pending_test_cfg && $0 !~ /^[[:space:]]*$/ && $0 !~ /^#\[/ {
+        pending_test_cfg = 0
+    }
+    in_test_module {
+        next
+    }
+    function update_function_context() {
+        if ($0 ~ /^    (pub(\([^)]*\))? |pub\(crate\) |pub\(super\) )?fn [A-Za-z0-9_]+/) {
+            current_fn = $0
+            sub(/^.*fn /, "", current_fn)
+            sub(/\(.*/, "", current_fn)
+        }
+    }
+    {
+        update_function_context()
+        if ($0 ~ /\.[[:space:]]*delete_payload_shard\(/ && current_fn != "delete_payload_shard") {
+            print FILENAME ":" current_fn
+        }
+    }
+    ' $(find crates/storage/src -type f -name '*.rs' \
+        ! -path 'crates/storage/src/tests/*' \
+        ! -name '*_tests.rs' \
+        | sort) \
+        | sort \
+        | uniq -c \
+        | sed 's/^ *//'
+)
+expected_payload_shard_delete_callers=$(cat <<'EOF'
+1 crates/storage/src/cluster.rs:delete_placed_payload_shard_keys
+1 crates/storage/src/cluster.rs:delete_placed_payload_shard_keys_best_effort
+EOF
+)
+if [[ "$payload_shard_delete_callers" != "$expected_payload_shard_delete_callers" ]]; then
+    fail_with_matches \
+        "Physical payload shard deletes must stay behind the placed-delete reclaim fence helper" \
+        "$payload_shard_delete_callers"
+fi
+
 legacy_payload_matches=$(
     rg -n --color=never \
         'write_direct_put_segment_shards|PayloadShardStorage::MetadataPrimary|payload_storage:[[:space:]]*PayloadShardStorage::MetadataPrimary|write_erasure_coded_segment_shards\(' \

@@ -3865,7 +3865,11 @@ Proposed subphases:
      handles from those storage nodes with all-or-release semantics instead of
      taking a coarse all-node handle. The older coarse generation acquisition
      remains for focused tests and direct storage-cluster callers until the
-     remaining reclaim/delete API cleanup is closed.
+     remaining reclaim/delete API cleanup is closed. Physical payload shard
+     deletion is crate-local and boundary-checked so production deletes stay
+     behind the placed-delete reclaim/read-handle fence helper. Request-level
+     degraded EC range coverage now asserts that recovery reads acquire and
+     release the selected shard-owner handle set.
    - decision: do not add a metadata/database write on each object read. Reads
      are ephemeral request state; if the host handling the read fails, the
      client can retry from a fresh metadata snapshot. The durable state should

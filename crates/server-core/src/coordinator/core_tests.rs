@@ -4809,7 +4809,7 @@ fn ec_range_get_with_missing_shard() {
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
     let data = b"Hello, World! Range test with EC recovery";
-    test_helpers::put_object(
+    let put = test_helpers::put_object(
         &coord,
         &PutObjectRequest {
             encryption: WriteEncryptionRequest::none(),
@@ -4826,6 +4826,37 @@ fn ec_range_get_with_missing_shard() {
         },
     )
     .unwrap();
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("obj5");
+    let generation_id = coord
+        .storage_node
+        .test_get_object_meta(&bucket, &key)
+        .unwrap()
+        .into_live()
+        .expect("put object should create a live object")
+        .generation_id;
+    let segment = coord
+        .storage_node
+        .test_get_object_segments(&bucket, &key, put.version_id)
+        .unwrap()
+        .pop()
+        .expect("put object should create one object segment");
+    let expected_selected_nodes = coord
+        .storage_node
+        .segment_payload_shard_locations(
+            segment.data_pg_id,
+            storage::EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            },
+            &segment.segment_okh,
+            segment.segment_vid,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|location| location.node_id())
+        .collect::<BTreeSet<_>>()
+        .len();
 
     // Delete shard 0 (covers the beginning of the data)
     delete_shard_on_disk(&coord, "bucket", "obj5", 0);
@@ -4845,7 +4876,21 @@ fn ec_range_get_with_missing_shard() {
             cond: NO_READ,
         })
         .unwrap();
+    assert_eq!(
+        coord
+            .storage_node
+            .object_payload_lease_holder_node_count(&bucket, &key, generation_id),
+        expected_selected_nodes,
+        "degraded EC range read should hold handles for the selected recovery shard-owner set"
+    );
     assert_eq!(result.body.read_all().unwrap(), b"Hello");
+    assert_eq!(
+        coord
+            .storage_node
+            .object_payload_lease_holder_node_count(&bucket, &key, generation_id),
+        0,
+        "degraded EC range read should release shard-owner handles after body consumption"
+    );
 }
 
 #[test]
