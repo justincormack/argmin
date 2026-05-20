@@ -120,6 +120,11 @@ and must not depend on the current cluster epoch. Phase 9.5 keeps these handles
 volatile: if the process/node serving the read fails, the client retries from a
 fresh snapshot.
 
+Storage-node read-handle and reclaim-fence primitives are crate-local. The
+production surface is `StorageCluster` read-handle acquisition plus the
+placed-delete reclaim helper; boundary checks reject public low-level payload
+read APIs and public storage-node handle/fence APIs.
+
 `ReleasedObjectPayloadLease::remaining`, `ReleasedObjectPayloadLease::payload_reclaim_exists`,
 and `ReleasedObjectPayloadLease::enqueue_object_payload_reclaim` are release
 follow-up helpers for the already-acquired token. `payload_reclaim_exists`

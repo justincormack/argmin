@@ -1284,7 +1284,7 @@ impl SharedStorageNode {
     ///
     /// Returns false if this storage node has fenced the generation for
     /// physical reclaim.
-    pub fn try_acquire_object_payload_lease(
+    pub(crate) fn try_acquire_object_payload_lease(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1305,7 +1305,7 @@ impl SharedStorageNode {
     /// Release an in-memory lease on an object payload generation.
     ///
     /// Returns the remaining active lease count after release.
-    pub fn release_object_payload_lease(
+    pub(crate) fn release_object_payload_lease(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1331,7 +1331,7 @@ impl SharedStorageNode {
     /// Fence an object payload generation for physical reclaim.
     ///
     /// Returns false if any read lease or another reclaim is active.
-    pub fn try_begin_object_payload_reclaim(
+    pub(crate) fn try_begin_object_payload_reclaim(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1353,7 +1353,7 @@ impl SharedStorageNode {
     }
 
     /// Finish physical reclaim fencing for a generation.
-    pub fn finish_object_payload_reclaim(
+    pub(crate) fn finish_object_payload_reclaim(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1372,7 +1372,7 @@ impl SharedStorageNode {
     }
 
     /// Clear a reclaim fence after a matching terminal reclaim command has converged.
-    pub fn clear_object_payload_reclaim_fence(
+    pub(crate) fn clear_object_payload_reclaim_fence(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1386,7 +1386,7 @@ impl SharedStorageNode {
     }
 
     /// Return the number of active object-payload leases for a generation.
-    pub fn object_payload_lease_count(
+    pub(crate) fn object_payload_lease_count(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1404,7 +1404,8 @@ impl SharedStorageNode {
     }
 
     /// Return the number of active object-payload leases for a bucket.
-    pub fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize {
         let state = self
             .object_payload_leases
             .lock()

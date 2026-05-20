@@ -259,6 +259,16 @@ fail_with_matches \
     "Low-level placed payload read APIs must remain crate-local or test-only" \
     "$public_payload_shard_read_apis"
 
+public_storage_node_read_handle_apis=$(
+    rg -n --color=never \
+        '^[[:space:]]*pub fn (try_acquire_object_payload_lease|release_object_payload_lease|try_begin_object_payload_reclaim|finish_object_payload_reclaim|clear_object_payload_reclaim_fence|object_payload_lease_count|bucket_object_payload_lease_count)\(' \
+        crates/storage/src/node.rs \
+        || true
+)
+fail_with_matches \
+    "Storage-node payload read-handle and reclaim-fence APIs must remain crate-local" \
+    "$public_storage_node_read_handle_apis"
+
 segment_payload_read_callers=$(
     awk '
     FNR == 1 {

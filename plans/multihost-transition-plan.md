@@ -2927,8 +2927,8 @@ Proposed subphases:
        is still a single process, but correctness must not depend on them
    - non-goals:
      - durable bucket write-drain state remains Phase 9.4
-     - storage-node-owned read handles and physical delete fences remain Phase
-       9.5
+     - storage-node-owned read handles and physical delete fences completed in
+       Phase 9.5
      - durable reclaim worker claiming and physical shard scavenging remain
        Phases 9.6 and 9.7
      - broad test-harness de-single-process cleanup remains Phase 9.10, except
@@ -3855,7 +3855,7 @@ Proposed subphases:
           object-PG commands validate the durable reservation plus active bucket
           incarnation before non-accepted apply/retry/open-time convergence.
 6. Phase 9.5 storage-node-owned read handles
-   - status: in progress. The first slice moved object payload generation
+   - status: complete. Phase 9.5 moved object payload generation
      lease/reclaim-fence authority out of the local-cluster runtime state and
      onto `SharedStorageNode`; tokens release the captured storage-node handles
      without depending on the current map epoch, and object reclaim uses the
@@ -3873,7 +3873,9 @@ Proposed subphases:
      crate-local and boundary-checked so production deletes stay behind the
      placed-delete reclaim/read-handle fence helper. Request-level degraded EC
      range coverage now asserts that recovery reads acquire and release the
-     selected shard-owner handle set.
+     selected shard-owner handle set. The storage-node read-handle/reclaim
+     methods are crate-local and boundary-checked so external production code
+     cannot bypass the cluster read-handle and placed-delete APIs.
    - decision: do not add a metadata/database write on each object read. Reads
      are ephemeral request state; if the host handling the read fails, the
      client can retry from a fresh metadata snapshot. The durable state should
@@ -3919,7 +3921,12 @@ Proposed subphases:
        retryable without allowing new reads of the reclaimed generation
    - exit when every production read and every physical shard delete uses the
      storage-node read-handle/delete API, and the old coarse payload lease API
-     is removed from production surfaces or test-only
+     is removed from production surfaces or test-only. Exit criteria are
+     satisfied: production reads acquire selected shard-owner handles,
+     production physical deletes go through the placed-delete reclaim fence, the
+     coarse lease API is test-hooks-only, and boundary checks cover direct
+     payload reads, direct payload deletes, public low-level read APIs, and
+     public storage-node handle/fence APIs
 7. Phase 9.6 durable reclaim claiming
    - make reclaim worker ownership durable and idempotent
    - multiple workers must not corrupt or double-finalize the same reclaim row
