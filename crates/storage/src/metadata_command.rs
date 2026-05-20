@@ -15,9 +15,9 @@ use crate::types::{
     ManagedEncryptionAlgorithm, MultipartChecksumConfig, MultipartPartRecord,
     MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
     MultipartReclaimRecord, MultipartUploadRecord, ObjectEncryption, ObjectEncryptionType,
-    ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord,
-    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PgId,
-    PublicAccessBlockConfig, PutLiveObjectReq, SerializedMetadataBlob,
+    ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord, ObjectPayloadReclaimKind,
+    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
+    OwnerIdentity, PgId, PublicAccessBlockConfig, PutLiveObjectReq, SerializedMetadataBlob,
     SerializedSystemMetadataBlob, SerializedTagSet, SessionId, StorageClass,
     StreamUploadCommandRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
     TerminalStreamCleanupRecord, UploadId, UploadState, VersionId,
@@ -665,12 +665,31 @@ pub(crate) enum ObjectPayloadReclaimCommand {
     Multipart(MultipartReclaimRecord),
 }
 
+impl ObjectPayloadReclaimCommand {
+    pub(crate) fn kind(&self) -> ObjectPayloadReclaimKind {
+        match self {
+            Self::Segments(_) => ObjectPayloadReclaimKind::ObjectSegments,
+            Self::Multipart(_) => ObjectPayloadReclaimKind::Multipart,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObjectPayloadReclaimClaimProof {
+    pub(crate) bucket_incarnation_generation: u64,
+    pub(crate) reclaim_kind: ObjectPayloadReclaimKind,
+    pub(crate) claim_id: String,
+    pub(crate) owner_token: String,
+    pub(crate) cluster_epoch: ClusterEpoch,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeleteObjectPayloadReclaimCommand {
     pub(crate) bucket: BucketName,
     pub(crate) key: ObjectKey,
     pub(crate) generation_id: GenerationId,
     pub(crate) payload: ObjectPayloadReclaimCommand,
+    pub(crate) reclaim_claim: ObjectPayloadReclaimClaimProof,
 }
 
 impl DeleteObjectPayloadReclaimCommand {
@@ -679,12 +698,14 @@ impl DeleteObjectPayloadReclaimCommand {
         key: ObjectKey,
         generation_id: GenerationId,
         payload: ObjectPayloadReclaimCommand,
+        reclaim_claim: ObjectPayloadReclaimClaimProof,
     ) -> Self {
         Self {
             bucket,
             key,
             generation_id,
             payload,
+            reclaim_claim,
         }
     }
 
@@ -1407,7 +1428,8 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 self.skip_str()?;
                 self.skip_str()?;
                 self.read_nonzero_u64("payload reclaim generation")?;
-                self.skip_object_payload_reclaim()
+                self.skip_object_payload_reclaim()?;
+                self.skip_object_payload_reclaim_claim_proof()
             }
             METADATA_COMMAND_DELETE_COMPLETED_MULTIPART_UPLOAD => {
                 self.skip_completed_multipart_upload()
@@ -1627,6 +1649,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                         self.read_object_key()?,
                         self.read_generation_id("payload reclaim generation")?,
                         self.read_object_payload_reclaim()?,
+                        self.read_object_payload_reclaim_claim_proof()?,
                     )),
                 ))
             }
@@ -2686,6 +2709,34 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         })
     }
 
+    fn skip_object_payload_reclaim_claim_proof(&mut self) -> Result<(), String> {
+        self.read_u64()?;
+        self.read_u8()?;
+        self.skip_str()?;
+        self.skip_str()?;
+        self.read_u64()?;
+        Ok(())
+    }
+
+    fn read_object_payload_reclaim_claim_proof(
+        &mut self,
+    ) -> Result<ObjectPayloadReclaimClaimProof, String> {
+        let bucket_incarnation_generation = self.read_u64()?;
+        let reclaim_kind = ObjectPayloadReclaimKind::from_u8(self.read_u8()?)
+            .ok_or_else(|| "invalid object payload reclaim claim kind".to_string())?;
+        let claim_id = self.read_string("object payload reclaim claim id")?;
+        let owner_token = self.read_string("object payload reclaim owner token")?;
+        let cluster_epoch = ClusterEpoch::new(self.read_u64()?)
+            .ok_or_else(|| "invalid object payload reclaim claim cluster epoch".to_string())?;
+        Ok(ObjectPayloadReclaimClaimProof {
+            bucket_incarnation_generation,
+            reclaim_kind,
+            claim_id,
+            owner_token,
+            cluster_epoch,
+        })
+    }
+
     fn skip_bucket_subresource_mutation(&mut self) -> Result<(), String> {
         match self.read_u8()? {
             1 => {
@@ -3125,6 +3176,7 @@ fn encode_delete_object_payload_reclaim(
     put_str(out, command.key.as_str());
     put_u64(out, command.generation_id.get());
     encode_object_payload_reclaim(out, &command.payload);
+    encode_object_payload_reclaim_claim_proof(out, &command.reclaim_claim);
 }
 
 fn encode_delete_completed_multipart_upload(
@@ -3594,6 +3646,17 @@ fn encode_bucket_write_reservation_proof(out: &mut Vec<u8>, proof: &BucketWriteR
     put_u64(out, proof.created_at);
     encode_optional_u64(out, proof.lease_deadline);
     encode_optional_string(out, proof.target_context.as_deref());
+}
+
+fn encode_object_payload_reclaim_claim_proof(
+    out: &mut Vec<u8>,
+    proof: &ObjectPayloadReclaimClaimProof,
+) {
+    put_u64(out, proof.bucket_incarnation_generation);
+    put_u8(out, proof.reclaim_kind as u8);
+    put_str(out, &proof.claim_id);
+    put_str(out, &proof.owner_token);
+    put_u64(out, proof.cluster_epoch.get());
 }
 
 fn encode_bucket_subresource_mutation(out: &mut Vec<u8>, mutation: &BucketSubresourceMutation) {
@@ -4715,6 +4778,20 @@ mod tests {
             lease_deadline: Some(555),
             target_context: Some(key.as_str().to_string()),
         };
+        let segment_reclaim_claim = ObjectPayloadReclaimClaimProof {
+            bucket_incarnation_generation: 9,
+            reclaim_kind: ObjectPayloadReclaimKind::ObjectSegments,
+            claim_id: "segment-reclaim-claim".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+        };
+        let multipart_reclaim_claim = ObjectPayloadReclaimClaimProof {
+            bucket_incarnation_generation: 9,
+            reclaim_kind: ObjectPayloadReclaimKind::Multipart,
+            claim_id: "multipart-reclaim-claim".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+        };
         let payloads = [
             MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
                 bucket.clone(),
@@ -5000,6 +5077,7 @@ mod tests {
                     key.clone(),
                     generation_id,
                     segment_reclaim,
+                    segment_reclaim_claim,
                 ),
             )),
             MetadataCommandPayload::DeleteObjectPayloadReclaim(Box::new(
@@ -5008,6 +5086,7 @@ mod tests {
                     key.clone(),
                     generation_id,
                     multipart_reclaim,
+                    multipart_reclaim_claim,
                 ),
             )),
             MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
@@ -5087,8 +5166,8 @@ mod tests {
                 0x8d3e5d6cb995e021,
                 0x873424a13234f823,
                 0x386d1fe2b146db69,
-                0xa9cde2110916a8a6,
-                0x0e53aa8cb595ea77,
+                0x6c3b4b7d0a8ce150,
+                0x48a90205c35a066d,
                 0xba43f79ea2af20cb,
                 0x13ddd49bdbc91001,
                 0x1946524188e07bbb,

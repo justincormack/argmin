@@ -504,7 +504,6 @@ pub(crate) trait PgMetadataStore {
     ///
     /// Returns `Ok(None)` when the reclaim root is absent or a non-expired
     /// claim owned by another worker is active.
-    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn acquire_object_payload_reclaim_claim(
         &self,
@@ -522,7 +521,6 @@ pub(crate) trait PgMetadataStore {
     ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, MetadataError>;
 
     /// Release a durable object-payload reclaim claim by exact token-fenced identity.
-    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn release_object_payload_reclaim_claim(
         &self,

@@ -6415,6 +6415,76 @@ impl PgStore {
         }
     }
 
+    fn clear_object_payload_reclaim_claim_if_matches_in_open_txn(
+        &self,
+        command: &DeleteObjectPayloadReclaimCommand,
+    ) -> Result<bool, MetadataError> {
+        if command.payload.kind() != command.reclaim_claim.reclaim_kind {
+            return Err(MetadataError::Db {
+                context: "delete object payload reclaim command claim kind mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        let bucket_incarnation_generation = i64::try_from(
+            command.reclaim_claim.bucket_incarnation_generation,
+        )
+        .map_err(|source| MetadataError::Db {
+            context: "delete object payload reclaim command claim incarnation",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM object_payload_reclaim_claims \
+                 WHERE singleton = 0 AND bucket = ?1 AND bucket_incarnation_generation = ?2 \
+                   AND key = ?3 AND generation_id = ?4 AND reclaim_kind = ?5 \
+                   AND claim_id = ?6 AND owner_token = ?7 AND cluster_epoch = ?8",
+                params![
+                    &command.bucket,
+                    bucket_incarnation_generation,
+                    &command.key,
+                    command.generation_id.get() as i64,
+                    command.reclaim_claim.reclaim_kind as u8,
+                    &command.reclaim_claim.claim_id,
+                    &command.reclaim_claim.owner_token,
+                    command.reclaim_claim.cluster_epoch.get(),
+                ],
+            )
+            .map_err(|source| MetadataError::Db {
+                context: "delete object payload reclaim command claim release",
+                source,
+            })?;
+        Ok(deleted != 0)
+    }
+
+    fn clear_object_payload_reclaim_claim_for_existing_root_in_open_txn(
+        &self,
+        command: &DeleteObjectPayloadReclaimCommand,
+    ) -> Result<(), MetadataError> {
+        if self.clear_object_payload_reclaim_claim_if_matches_in_open_txn(command)? {
+            return Ok(());
+        }
+        let claim_exists = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM object_payload_reclaim_claims WHERE singleton = 0",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|source| MetadataError::Db {
+                context: "delete object payload reclaim command claim conflict check",
+                source,
+            })?
+            .is_some();
+        if claim_exists {
+            return Err(MetadataError::ReclaimClaimConflict {
+                claim_id: command.reclaim_claim.claim_id.clone(),
+            });
+        }
+        Ok(())
+    }
+
     fn apply_delete_object_payload_reclaim_command(
         &self,
         command: &DeleteObjectPayloadReclaimCommand,
@@ -6427,12 +6497,16 @@ impl PgStore {
                     &command.key,
                     command.generation_id,
                 )? {
-                    Some(existing) if existing == *expected => self
-                        .delete_object_segments_reclaim_direct(
+                    Some(existing) if existing == *expected => {
+                        self.clear_object_payload_reclaim_claim_for_existing_root_in_open_txn(
+                            command,
+                        )?;
+                        self.delete_object_segments_reclaim_direct(
                             &command.bucket,
                             &command.key,
                             command.generation_id,
-                        ),
+                        )
+                    }
                     Some(_) => Err(MetadataError::Db {
                         context: "delete object payload reclaim command segment mismatch",
                         source: rusqlite::Error::InvalidQuery,
@@ -6461,12 +6535,16 @@ impl PgStore {
                     &command.key,
                     command.generation_id,
                 )? {
-                    Some(existing) if existing == *expected => self
-                        .delete_multipart_reclaim_direct(
+                    Some(existing) if existing == *expected => {
+                        self.clear_object_payload_reclaim_claim_for_existing_root_in_open_txn(
+                            command,
+                        )?;
+                        self.delete_multipart_reclaim_direct(
                             &command.bucket,
                             &command.key,
                             command.generation_id,
-                        ),
+                        )
+                    }
                     Some(_) => Err(MetadataError::Db {
                         context: "delete object payload reclaim command multipart mismatch",
                         source: rusqlite::Error::InvalidQuery,
@@ -6489,7 +6567,9 @@ impl PgStore {
                     }
                 }
             }
-        }
+        }?;
+        self.clear_object_payload_reclaim_claim_if_matches_in_open_txn(command)
+            .map(|_| ())
     }
 
     fn apply_delete_completed_multipart_upload_command(
@@ -9131,7 +9211,6 @@ fn bucket_write_drain_from_row(
     })
 }
 
-#[cfg(test)]
 fn object_payload_reclaim_claim_from_row(
     row: &rusqlite::Row<'_>,
 ) -> Result<ObjectPayloadReclaimClaimRecord, rusqlite::Error> {
@@ -11762,7 +11841,6 @@ impl PgMetadataStore for PgStore {
         )
     }
 
-    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn acquire_object_payload_reclaim_claim(
         &self,
@@ -11927,7 +12005,6 @@ impl PgMetadataStore for PgStore {
         )
     }
 
-    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn release_object_payload_reclaim_claim(
         &self,

@@ -3928,9 +3928,12 @@ Proposed subphases:
      payload reads, direct payload deletes, public low-level read APIs, and
      public storage-node handle/fence APIs
 7. Phase 9.6 durable reclaim claiming
-   - status: planned. Phase 9.6 replaces process-local reclaim queue ownership
-     with durable PG-primary claims. Durable reclaim rows remain the source of
-     truth; local queues and condition variables become wakeup hints only.
+   - status: in progress. Phase 9.6 replaces process-local reclaim queue
+     ownership with durable PG-primary claims. Durable reclaim rows remain the
+     source of truth; local queues and condition variables become wakeup hints
+     only. Object payload reclaim now claims object-PG work before physical
+     deletion and transfers the claim proof into the terminal
+     `DeleteObjectPayloadReclaim` command.
    - concurrency decision: start with one active durable reclaim owner per
      PG/work-class, not multiple workers on the same PG. Object payload reclaim
      is claimed on the object metadata PG that owns the reclaim root. Bucket
@@ -3961,17 +3964,22 @@ Proposed subphases:
      1. a worker wakes from a local hint, a periodic poll, or startup scan
      2. it routes to the object PG primary and atomically claims one eligible
         reclaim root only if no non-expired object-reclaim claim is active for
-        that PG/work-class
+        that PG/work-class. If the bucket row is already absent, the claim uses
+        reserved bucket incarnation `0` for orphan root cleanup; live and
+        deleting buckets use the bucket row's incarnation, so stale orphan
+        workers cannot clear a claim for a recreated bucket.
      3. if the local hint refers to work already gone, claimed elsewhere, or
         blocked by an active non-expired PG claim, the worker returns without
         treating that as success
      4. once claimed, the worker calls the existing physical reclaim path, which
         must still fence storage-node read handles before deleting shard files
      5. successful physical cleanup installs/applies the existing
-        `DeleteObjectPayloadReclaim` metadata command and clears the durable
-        reclaim row plus durable claim atomically with command convergence or in
-        a retryable terminal cleanup step that preserves enough identity to
-        retry
+        `DeleteObjectPayloadReclaim` metadata command with the durable claim
+        proof. Command apply clears the durable reclaim row plus the matching
+        token-fenced claim in the same object-PG metadata transaction. If the
+        command is already terminal/applied and the claim or pending slot
+        survives, retrying the exact pending command re-runs the terminal
+        cleanup using the proof carried by the command.
      6. if cleanup defers because read handles are active, the durable reclaim
         row remains, the claim is released or allowed to expire, and a later
         worker can retry
@@ -4067,9 +4075,11 @@ Proposed subphases:
    - implementation slices:
      1. add claim schema/types, digest/replay coverage if the rows are
         replica-visible, and low-level claim acquire/heartbeat/release/expire
-        helpers on the relevant PG primary
+        helpers on the relevant PG primary (done for object reclaim and bucket
+        finalizer claim tables; bucket finalizer helpers are not yet wired)
      2. wire object payload reclaim workers to claim durable object-PG work and
-        treat the local queue as a hint
+        treat the local queue as a hint (done for local-hint execution; startup
+        and periodic durable scans remain)
      3. add startup/periodic scans for durable object reclaim roots so restart
         without local queue state makes progress
      4. wire bucket delete finalization workers to durable bucket-PG claims and

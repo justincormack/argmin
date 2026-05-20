@@ -439,6 +439,8 @@ production_metadata_methods=$(
             || name == "get_multipart_reclaim" \
             || name == "payload_reclaim_exists" \
             || name == "get_bucket_payload_reclaim_root" \
+            || name == "acquire_object_payload_reclaim_claim" \
+            || name == "release_object_payload_reclaim_claim" \
             || name == "get_object_tags" \
             || name == "get_multipart_upload" \
             || name == "get_completed_multipart_upload" \

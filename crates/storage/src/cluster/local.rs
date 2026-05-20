@@ -2566,6 +2566,20 @@ mod tests {
         command
     }
 
+    fn object_payload_reclaim_claim_count_for_test(map: &LocalClusterMap, pg_id: PgId) -> usize {
+        let primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+            .unwrap();
+        let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+        pg.connection()
+            .query_row(
+                "SELECT COUNT(*) FROM object_payload_reclaim_claims",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap() as usize
+    }
+
     fn insert_pending_metadata_command_for_test(
         map: &LocalClusterMap,
         pg_id: PgId,
@@ -25489,6 +25503,160 @@ mod tests {
                 "retried reclaim should delete placed shard {shard_index}"
             );
         }
+    }
+
+    #[test]
+    fn object_payload_reclaim_acquires_and_releases_durable_claim() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let committed =
+            write_committed_direct_segment_for(&cluster, &bucket, &key, b"claim payload");
+        cluster
+            .delete_current_object_if(&bucket, &key, |stored| {
+                assert!(matches!(stored, Some(crate::StoredObject::Live(_))));
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+            .unwrap();
+
+        let saw_claim = Arc::new(AtomicBool::new(false));
+        let hook_map = Arc::clone(&map);
+        let saw_claim_hook = Arc::clone(&saw_claim);
+        let _hook_guard = cluster.test_install_before_metadata_command_pending_install_hook(
+            Arc::new(move || {
+                assert_eq!(
+                    object_payload_reclaim_claim_count_for_test(&hook_map, PgId::new(object_pg)),
+                    1,
+                    "reclaim worker must hold a durable claim before publishing terminal cleanup"
+                );
+                saw_claim_hook.store(true, Ordering::SeqCst);
+            }),
+        );
+
+        assert!(
+            cluster
+                .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
+                .unwrap(),
+            "unleased reclaim should complete"
+        );
+        assert!(saw_claim.load(Ordering::SeqCst));
+        assert_eq!(
+            object_payload_reclaim_claim_count_for_test(&map, PgId::new(object_pg)),
+            0,
+            "terminal reclaim command should release the durable claim"
+        );
+        assert!(!cluster
+            .payload_reclaim_exists(&bucket, &key, committed.generation_id)
+            .unwrap());
+    }
+
+    #[test]
+    fn object_payload_reclaim_retry_releases_surviving_terminal_claim() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let committed =
+            write_committed_direct_segment_for(&cluster, &bucket, &key, b"retry claim payload");
+        let generation_id = committed.generation_id;
+        cluster
+            .delete_current_object_if(&bucket, &key, |_| Ok::<(), ()>(()))
+            .unwrap()
+            .unwrap();
+
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let fail_once_hook = Arc::clone(&fail_once);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                match command.payload() {
+                    MetadataCommandPayload::DeleteObjectPayloadReclaim(reclaim)
+                        if reclaim.matches_request(&hook_bucket, &hook_key, generation_id)
+                            && node_id == NodeId::new(1)
+                            && fail_once_hook.swap(false, Ordering::SeqCst) =>
+                    {
+                        return Err(StoreError::Io {
+                            context: "injected reclaim apply failure",
+                            source: std::io::Error::other("injected reclaim apply failure"),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+        let err = cluster
+            .reclaim_object_payload_if_unleased(&bucket, &key, generation_id)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::ObjectPgActionError::Store(StoreError::Io {
+                context: "injected reclaim apply failure",
+                ..
+            })
+        ));
+        drop(hook_guard);
+        assert!(
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
+            "failed terminal cleanup must keep the pending command"
+        );
+        assert_eq!(
+            object_payload_reclaim_claim_count_for_test(&map, PgId::new(object_pg)),
+            1,
+            "failed terminal cleanup must keep the durable claim for retry"
+        );
+
+        assert!(
+            cluster
+                .reclaim_object_payload_if_unleased(&bucket, &key, generation_id)
+                .unwrap(),
+            "retry should finish the exact pending reclaim command"
+        );
+        assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+        assert_eq!(
+            object_payload_reclaim_claim_count_for_test(&map, PgId::new(object_pg)),
+            0,
+            "retrying the terminal command must release the surviving durable claim"
+        );
+        assert!(!cluster
+            .payload_reclaim_exists(&bucket, &key, generation_id)
+            .unwrap());
     }
 
     #[test]

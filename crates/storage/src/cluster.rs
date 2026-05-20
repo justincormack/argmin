@@ -1776,6 +1776,13 @@ impl StorageCluster {
         self.next_bucket_write_coordination_id("bucket-drain-", "generate bucket write drain id")
     }
 
+    fn next_object_payload_reclaim_claim_id(&self) -> Result<String, StoreError> {
+        self.next_bucket_write_coordination_id(
+            "object-reclaim-",
+            "generate object payload reclaim claim id",
+        )
+    }
+
     fn next_bucket_write_coordination_id(
         &self,
         prefix: &'static str,

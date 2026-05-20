@@ -22,14 +22,16 @@ use crate::metadata_command::{
     DeleteCompletedMultipartUploadCommand, DeleteObjectPayloadReclaimCommand,
     DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
     MarkBucketDeletingCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
-    MetadataCommandId, MetadataCommandPayload, ObjectPayloadReclaimCommand, PutBucketAclCommand,
-    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
-    PutObjectMetadataCommand, PutObjectMetadataMutation,
+    MetadataCommandId, MetadataCommandPayload, ObjectPayloadReclaimClaimProof,
+    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
+    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
+    PutObjectMetadataMutation,
 };
 use crate::traits::PgMetadataStore;
 use crate::*;
 
 const INTERNAL_LIST_PAGE_SIZE: u32 = 1_000;
+const ORPHAN_OBJECT_PAYLOAD_RECLAIM_BUCKET_INCARNATION: u64 = 0;
 
 struct InsertDeleteMarkerDraft<'a> {
     bucket: &'a BucketName,
@@ -5609,14 +5611,68 @@ impl super::StorageCluster {
             return Ok(false);
         };
 
+        let bucket_incarnation_generation = {
+            let bucket_node = self.bucket_metadata_primary_node(bucket)?;
+            let bucket_pg = bucket_node.get_pg(self.bucket_metadata_pg_id(bucket))?;
+            match PgMetadataStore::head_bucket_record_raw(&*bucket_pg, bucket) {
+                Ok(bucket) => bucket.bucket_incarnation_generation,
+                Err(MetadataError::BucketNotFound { .. }) => {
+                    ORPHAN_OBJECT_PAYLOAD_RECLAIM_BUCKET_INCARNATION
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let reclaim_kind = reclaim.kind();
+        let claim_id = self.next_object_payload_reclaim_claim_id()?;
+        let owner_token = self.bucket_write_owner_token();
+        let claimed_at = crate::clock::current_time_millis();
+        let claim = {
+            let meta_pg = node.get_pg(pg_id.get())?;
+            PgMetadataStore::acquire_object_payload_reclaim_claim(
+                &*meta_pg,
+                bucket,
+                bucket_incarnation_generation,
+                key,
+                generation_id,
+                reclaim_kind,
+                &claim_id,
+                &owner_token,
+                self.operation_epoch(),
+                claimed_at,
+                claimed_at.checked_add(60_000),
+                claimed_at,
+            )?
+        };
+        let Some(claim) = claim else {
+            return Ok(false);
+        };
+
+        let release_reclaim_claim = || -> Result<(), ObjectPgActionError> {
+            let meta_pg = node.get_pg(pg_id.get())?;
+            PgMetadataStore::release_object_payload_reclaim_claim(
+                &*meta_pg,
+                bucket,
+                bucket_incarnation_generation,
+                key,
+                generation_id,
+                reclaim_kind,
+                &claim.claim_id,
+                &claim.owner_token,
+                claim.cluster_epoch,
+            )?;
+            Ok(())
+        };
+
         if !self
             .local_map
             .try_begin_object_payload_reclaim(bucket, key, generation_id)
         {
+            release_reclaim_claim()?;
             return Ok(false);
         }
 
         let mut payload_delete_started = false;
+        let mut command_owns_reclaim_claim = false;
         let result = (|| -> Result<bool, ObjectPgActionError> {
             match &reclaim {
                 ObjectPayloadReclaimCommand::Segments(reclaim) => {
@@ -5706,16 +5762,31 @@ impl super::StorageCluster {
                             key.clone(),
                             generation_id,
                             reclaim.clone(),
+                            ObjectPayloadReclaimClaimProof {
+                                bucket_incarnation_generation,
+                                reclaim_kind,
+                                claim_id: claim.claim_id.clone(),
+                                owner_token: claim.owner_token.clone(),
+                                cluster_epoch: claim.cluster_epoch,
+                            },
                         ),
                     )),
                 );
                 if !self.try_install_object_pg_pending_command_or_drain(pg_id, bucket, &command)? {
                     continue;
                 }
+                command_owns_reclaim_claim = true;
                 self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
                 return Ok(true);
             }
         })();
+        let result = match result {
+            Err(error) if !command_owns_reclaim_claim => {
+                release_reclaim_claim()?;
+                Err(error)
+            }
+            result => result,
+        };
         let keep_reclaim_fence = result.is_err() && payload_delete_started;
         self.local_map.finish_object_payload_reclaim(
             bucket,
