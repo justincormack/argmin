@@ -4028,6 +4028,9 @@ Proposed subphases:
        not depend on enqueue delivery
      - lost local hints, stopped workers, and process restart must eventually
        recover through durable scans
+     - durable scans are best-effort per PG: an unavailable or corrupt PG must
+       emit typed scan context but must not block discovery of reclaim roots on
+       later healthy PGs
    - failure semantics:
      - multiple workers may race to claim, but only one durable claim wins per
        PG/work-class
@@ -4078,10 +4081,9 @@ Proposed subphases:
         helpers on the relevant PG primary (done for object reclaim and bucket
         finalizer claim tables; bucket finalizer helpers are not yet wired)
      2. wire object payload reclaim workers to claim durable object-PG work and
-        treat the local queue as a hint (done for local-hint execution; startup
-        and periodic durable scans remain)
+        treat the local queue as a hint (done)
      3. add startup/periodic scans for durable object reclaim roots so restart
-        without local queue state makes progress
+        without local queue state makes progress (done)
      4. wire bucket delete finalization workers to durable bucket-PG claims and
         add startup/periodic scans for deleting buckets
      5. remove or test-gate production reliance on `LocalReclaimQueueState`

@@ -11841,6 +11841,31 @@ impl PgMetadataStore for PgStore {
         )
     }
 
+    fn get_payload_reclaim_root(&self) -> Result<Option<PayloadReclaimRoot>, MetadataError> {
+        self.query_row_cached_optional_metadata(
+            "SELECT bucket, key, generation_id FROM (
+                 SELECT bucket, key, generation_id FROM object_segments_reclaims
+                 UNION ALL
+                 SELECT bucket, key, generation_id FROM multipart_reclaims
+             )
+             ORDER BY bucket ASC, key ASC, generation_id ASC
+             LIMIT 1",
+            [],
+            "get payload reclaim root",
+            |row| {
+                Ok(PayloadReclaimRoot {
+                    bucket: row.get(0)?,
+                    key: row.get(1)?,
+                    generation_id: Self::parse_generation_id(
+                        row.get::<_, i64>(2)?,
+                        2,
+                        "generation_id",
+                    )?,
+                })
+            },
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn acquire_object_payload_reclaim_claim(
         &self,

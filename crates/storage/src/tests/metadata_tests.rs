@@ -6645,6 +6645,50 @@ fn get_bucket_payload_reclaim_root_returns_first_root() {
 }
 
 #[test]
+fn get_payload_reclaim_root_returns_first_pg_root() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .put_multipart_reclaim(&MultipartReclaimRecord {
+            bucket: bucket_name("z-bucket"),
+            key: object_key("z"),
+            generation_id: GenerationId::new(9).unwrap(),
+            created_at: 1,
+            parts: vec![MultipartReclaimPartRecord::ShardSet {
+                part_number: 1,
+                part_okh: [0x11; 16],
+                part_vid: GenerationId::new(21).unwrap(),
+                data_pg_id: 0,
+                ec: EcShape { k: 4, m: 2 },
+            }],
+        })
+        .unwrap();
+    store
+        .put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
+            bucket: bucket_name("a-bucket"),
+            key: object_key("k"),
+            generation_id: GenerationId::new(3).unwrap(),
+            created_at: 1,
+            segments: vec![ObjectSegmentsReclaimSegmentRecord {
+                segment_index: 0,
+                segment_okh: [0x22; 16],
+                segment_vid: GenerationId::new(21).unwrap(),
+                data_pg_id: 0,
+                ec: EcShape { k: 4, m: 2 },
+            }],
+        })
+        .unwrap();
+
+    let root = store
+        .get_payload_reclaim_root()
+        .unwrap()
+        .expect("pg reclaim root should exist");
+    assert_eq!(root.bucket, "a-bucket");
+    assert_eq!(root.key, "k");
+    assert_eq!(root.generation_id, GenerationId::new(3).unwrap());
+}
+
+#[test]
 fn payload_reclaim_exists_checks_segment_and_multipart_reclaims() {
     let (_dir, store) = make_pg_store();
 

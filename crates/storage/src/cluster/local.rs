@@ -282,7 +282,7 @@ impl LocalClusterRuntimeState {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn try_take_reclaim_work(&self) -> Option<ReclaimWorkItem> {
+    fn try_take_reclaim_work(&self) -> Option<ReclaimWorkItem> {
         let mut state = self
             .reclaim_queue
             .0
@@ -297,10 +297,15 @@ impl LocalClusterRuntimeState {
         Some(ReclaimWorkItem::BucketDelete(bucket))
     }
 
-    pub(crate) fn wait_for_reclaim_work(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn try_take_reclaim_work_for_test(&self) -> Option<ReclaimWorkItem> {
+        self.try_take_reclaim_work()
+    }
+
+    pub(crate) fn wait_for_reclaim_work_poll(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
-        while state.object_queue.is_empty()
+        if state.object_queue.is_empty()
             && state.bucket_delete_queue.is_empty()
             && !stop.load(Ordering::SeqCst)
         {
@@ -25657,6 +25662,131 @@ mod tests {
         assert!(!cluster
             .payload_reclaim_exists(&bucket, &key, generation_id)
             .unwrap());
+    }
+
+    #[test]
+    fn durable_reclaim_scan_recovers_lost_local_queue_after_reopen() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let pg_ids = [0, 1, 2, 3];
+
+        let (bucket, key, generation_id) = {
+            let map =
+                Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap());
+            let (bucket, key, _, _) = {
+                let topology = map
+                    .nodes
+                    .get(&NodeId::new(0))
+                    .unwrap()
+                    .storage_node()
+                    .pg_topology();
+                bucket_key_with_distinct_object_and_data_pg(topology)
+            };
+            let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            let committed =
+                write_committed_direct_segment_for(&cluster, &bucket, &key, b"lost hint payload");
+            cluster
+                .delete_current_object_if(&bucket, &key, |stored| {
+                    assert!(matches!(stored, Some(crate::StoredObject::Live(_))));
+                    Ok::<(), ()>(())
+                })
+                .unwrap()
+                .unwrap();
+            assert!(
+                cluster
+                    .payload_reclaim_exists(&bucket, &key, committed.generation_id)
+                    .unwrap(),
+                "delete should leave a durable reclaim root"
+            );
+            (bucket, key, committed.generation_id)
+        };
+
+        let reopened_map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap());
+        let reopened_cluster =
+            crate::StorageCluster::from_local_map(Arc::clone(&reopened_map)).unwrap();
+        assert_eq!(
+            reopened_cluster
+                .enqueue_durable_object_payload_reclaim_roots()
+                .queued,
+            1,
+            "startup scan should rediscover the durable root without an in-memory hint"
+        );
+        assert!(matches!(
+            reopened_cluster.try_take_reclaim_work(),
+            Some(crate::ReclaimWorkItem::ObjectPayload((
+                queued_bucket,
+                queued_key,
+                queued_generation_id
+            ))) if queued_bucket == bucket
+                && queued_key == key
+                && queued_generation_id == generation_id
+        ));
+        assert!(
+            reopened_cluster
+                .reclaim_object_payload_if_unleased(&bucket, &key, generation_id)
+                .unwrap(),
+            "reopened worker should complete durable reclaim"
+        );
+        assert!(!reopened_cluster
+            .payload_reclaim_exists(&bucket, &key, generation_id)
+            .unwrap());
+    }
+
+    #[test]
+    fn durable_reclaim_scan_continues_after_unavailable_pg() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let pg_ids = [0, 1, 2, 3];
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+        let key = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            key_for_object_pg(topology, &bucket, 1, "scan-key-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let committed =
+            write_committed_direct_segment_for(&cluster, &bucket, &key, b"later pg reclaim");
+        cluster
+            .delete_current_object_if(&bucket, &key, |_| Ok::<(), ()>(()))
+            .unwrap()
+            .unwrap();
+        drop(cluster);
+
+        let mut map = Arc::try_unwrap(map).expect("test should hold the only map reference");
+        map.pg_routes.get_mut(&PgId::new(0)).unwrap().state = PgState::Peering;
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+        let scan = cluster.enqueue_durable_object_payload_reclaim_roots();
+        assert_eq!(
+            scan.errors, 1,
+            "unavailable PG should be reported in scan stats"
+        );
+        assert_eq!(
+            scan.queued, 1,
+            "scan should continue and enqueue the later healthy PG root"
+        );
+        assert!(matches!(
+            cluster.try_take_reclaim_work(),
+            Some(crate::ReclaimWorkItem::ObjectPayload((
+                queued_bucket,
+                queued_key,
+                queued_generation_id
+            ))) if queued_bucket == bucket
+                && queued_key == key
+                && queued_generation_id == committed.generation_id
+        ));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::Arc;
 use std::sync::MutexGuard;
@@ -32,6 +32,12 @@ use crate::*;
 
 const INTERNAL_LIST_PAGE_SIZE: u32 = 1_000;
 const ORPHAN_OBJECT_PAYLOAD_RECLAIM_BUCKET_INCARNATION: u64 = 0;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DurableObjectPayloadReclaimScan {
+    pub queued: usize,
+    pub errors: usize,
+}
 
 struct InsertDeleteMarkerDraft<'a> {
     bucket: &'a BucketName,
@@ -5528,14 +5534,26 @@ impl super::StorageCluster {
         if self.operation_epoch() != self.cluster_epoch() {
             return None;
         }
-        self.local_map.runtime_state().try_take_reclaim_work()
+        self.local_map
+            .runtime_state()
+            .try_take_reclaim_work_for_test()
     }
 
     pub fn wait_for_reclaim_work(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
         if self.operation_epoch() != self.cluster_epoch() {
             return None;
         }
-        self.local_map.runtime_state().wait_for_reclaim_work(stop)
+        while !stop.load(Ordering::SeqCst) {
+            self.enqueue_durable_object_payload_reclaim_roots();
+            if let Some(work) = self
+                .local_map
+                .runtime_state()
+                .wait_for_reclaim_work_poll(stop)
+            {
+                return Some(work);
+            }
+        }
+        None
     }
 
     pub fn wake_reclaim_workers(&self) {
@@ -5795,6 +5813,56 @@ impl super::StorageCluster {
             keep_reclaim_fence,
         );
         result
+    }
+
+    pub(crate) fn enqueue_durable_object_payload_reclaim_roots(
+        &self,
+    ) -> DurableObjectPayloadReclaimScan {
+        if self.operation_epoch() != self.cluster_epoch() {
+            return DurableObjectPayloadReclaimScan::default();
+        }
+
+        let mut scan = DurableObjectPayloadReclaimScan::default();
+        for pg_id in self.metadata_pg_ids() {
+            let pg = match self.metadata_pg(pg_id) {
+                Ok(pg) => pg,
+                Err(error) => {
+                    scan.errors += 1;
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "object_reclaim_durable_scan_pg_error",
+                        Some(format_args!("pg_id={} error={:?}", pg_id, error)),
+                    );
+                    continue;
+                }
+            };
+            let root = match PgMetadataStore::get_payload_reclaim_root(&*pg) {
+                Ok(root) => root,
+                Err(error) => {
+                    scan.errors += 1;
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "object_reclaim_durable_scan_pg_error",
+                        Some(format_args!("pg_id={} error={:?}", pg_id, error)),
+                    );
+                    continue;
+                }
+            };
+            let Some(root) = root else {
+                continue;
+            };
+            if self.local_map.object_payload_lease_count(
+                &root.bucket,
+                &root.key,
+                root.generation_id,
+            ) != 0
+            {
+                continue;
+            }
+            self.enqueue_object_payload_reclaim(&root.bucket, &root.key, root.generation_id);
+            scan.queued += 1;
+        }
+        scan
     }
 
     pub(super) fn delete_complete_multipart_cleanup_best_effort(

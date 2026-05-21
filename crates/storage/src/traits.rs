@@ -500,6 +500,12 @@ pub(crate) trait PgMetadataStore {
         bucket: &BucketName,
     ) -> Result<Option<PayloadReclaimRoot>, MetadataError>;
 
+    /// Return one reclaim root on this metadata PG, if any exist.
+    ///
+    /// Used by reclaim workers to recover durable roots when local wakeup hints
+    /// were lost across process restart.
+    fn get_payload_reclaim_root(&self) -> Result<Option<PayloadReclaimRoot>, MetadataError>;
+
     /// Acquire the single durable object-payload reclaim claim for this PG.
     ///
     /// Returns `Ok(None)` when the reclaim root is absent or a non-expired
