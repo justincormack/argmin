@@ -10,7 +10,7 @@
 ///   shards/<hex_prefix>/<shard_key_hex>
 ///   tmp/
 /// ```
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -793,6 +793,32 @@ struct MetadataTableDigestStats {
     row_hash_sum: u64,
 }
 
+#[derive(Debug, Clone)]
+struct ScavengerShardRow {
+    key: ShardKey,
+    ack: WriteAck,
+}
+
+#[derive(Debug, Clone)]
+struct ScavengerShardFile {
+    key: ShardKey,
+    size: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ScavengerShardFileScan {
+    files: Vec<ScavengerShardFile>,
+    errors: Vec<String>,
+}
+
+fn is_canonical_shard_prefix(prefix: &str) -> bool {
+    prefix.len() == SHARD_KEY_HEX_PREFIX_LEN
+        && prefix
+            .as_bytes()
+            .iter()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 impl PgStore {
     /// Open (or create) a PG store at the given directory.
     ///
@@ -1034,6 +1060,228 @@ impl PgStore {
             });
         }
         Ok(observations)
+    }
+
+    /// Audit local shard file/index mismatches for this data PG.
+    ///
+    /// This is intentionally non-destructive. It records only local file/row
+    /// inconsistencies and resolves prior observations of those classes once
+    /// the mismatch disappears.
+    pub fn audit_local_shard_storage_for_scavenger(
+        &self,
+        node_id: u32,
+    ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
+        let shard_rows = self.list_scavenger_shard_rows()?;
+        let shard_file_scan = self.list_scavenger_shard_files()?;
+        let shard_files = shard_file_scan.files;
+        let row_keys: HashSet<ShardKey> = shard_rows.iter().map(|row| row.key.clone()).collect();
+        let file_keys: HashSet<ShardKey> =
+            shard_files.iter().map(|file| file.key.clone()).collect();
+        let mut active_mismatch_keys = HashSet::new();
+
+        for row in &shard_rows {
+            let observation_key = ShardScavengerObservationKey {
+                node_id,
+                data_pg_id: self.pg_id,
+                shard_index: row.key.shard_index(),
+                shard_key: row.key.clone(),
+            };
+            if !file_keys.contains(&row.key) {
+                active_mismatch_keys.insert(observation_key.clone());
+                self.record_shard_scavenger_observation(&ShardScavengerObservationRecord {
+                    key: observation_key,
+                    data_size: Some(row.ack.stored_size),
+                    crc64: Some(row.ack.crc64),
+                    file_exists: false,
+                    shard_row_exists: true,
+                    reason: ShardScavengerObservationReason::ShardRowWithoutFile,
+                    last_error: None,
+                })?;
+            }
+        }
+
+        for file in &shard_files {
+            let observation_key = ShardScavengerObservationKey {
+                node_id,
+                data_pg_id: self.pg_id,
+                shard_index: file.key.shard_index(),
+                shard_key: file.key.clone(),
+            };
+            if !row_keys.contains(&file.key) {
+                active_mismatch_keys.insert(observation_key.clone());
+                self.record_shard_scavenger_observation(&ShardScavengerObservationRecord {
+                    key: observation_key,
+                    data_size: Some(file.size),
+                    crc64: None,
+                    file_exists: true,
+                    shard_row_exists: false,
+                    reason: ShardScavengerObservationReason::FileWithoutShardRow,
+                    last_error: None,
+                })?;
+            }
+        }
+
+        if shard_file_scan.errors.is_empty() {
+            for observation in self.list_shard_scavenger_observations()? {
+                if observation.key.node_id != node_id || observation.key.data_pg_id != self.pg_id {
+                    continue;
+                }
+                if observation.resolved_at.is_some()
+                    || active_mismatch_keys.contains(&observation.key)
+                {
+                    continue;
+                }
+                if matches!(
+                    observation.reason,
+                    ShardScavengerObservationReason::FileWithoutShardRow
+                        | ShardScavengerObservationReason::ShardRowWithoutFile
+                ) {
+                    self.resolve_shard_scavenger_observation(&observation.key)?;
+                }
+            }
+        }
+
+        if !shard_file_scan.errors.is_empty() {
+            return Err(StoreError::ShardScavengerScanIncomplete {
+                context: "local shard file scan",
+                errors: shard_file_scan.errors.join("; "),
+            });
+        }
+
+        self.list_shard_scavenger_observations()
+    }
+
+    fn list_scavenger_shard_rows(&self) -> Result<Vec<ScavengerShardRow>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT shard_key, data_size, crc64_nvme \
+                 FROM shards \
+                 ORDER BY shard_key",
+            )
+            .map_err(|source| StoreError::Db {
+                context: "list scavenger shard rows (prepare)",
+                source,
+            })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|source| StoreError::Db {
+                context: "list scavenger shard rows",
+                source,
+            })?;
+        let mut shard_rows = Vec::new();
+        for row in rows {
+            let (key, stored_size, crc64) = row.map_err(|source| StoreError::Db {
+                context: "read scavenger shard row",
+                source,
+            })?;
+            shard_rows.push(ScavengerShardRow {
+                key: ShardKey::from_bytes(&key)?,
+                ack: WriteAck {
+                    stored_size: stored_size as u64,
+                    crc64: crc64 as u64,
+                },
+            });
+        }
+        Ok(shard_rows)
+    }
+
+    fn list_scavenger_shard_files(&self) -> Result<ScavengerShardFileScan, StoreError> {
+        let mut files = Vec::new();
+        let mut errors = Vec::new();
+        for prefix in fs::read_dir(&self.shards_dir).map_err(|source| StoreError::Io {
+            context: "scan shard prefix directory",
+            source,
+        })? {
+            let prefix = prefix.map_err(|source| StoreError::Io {
+                context: "read shard prefix directory entry",
+                source,
+            })?;
+            let file_type = prefix.file_type().map_err(|source| StoreError::Io {
+                context: "read shard prefix directory entry type",
+                source,
+            })?;
+            let prefix_path = prefix.path();
+            if !file_type.is_dir() {
+                errors.push(format!(
+                    "unexpected non-directory entry under shard root {}",
+                    prefix_path.display()
+                ));
+                continue;
+            }
+            let prefix_name = prefix.file_name();
+            let Some(prefix_name) = prefix_name.to_str() else {
+                errors.push(format!(
+                    "non-UTF8 shard prefix directory {}",
+                    prefix_path.display()
+                ));
+                continue;
+            };
+            if !is_canonical_shard_prefix(prefix_name) {
+                errors.push(format!(
+                    "invalid shard prefix directory {}",
+                    prefix_path.display()
+                ));
+                continue;
+            }
+            for entry in fs::read_dir(prefix.path()).map_err(|source| StoreError::Io {
+                context: "scan shard directory",
+                source,
+            })? {
+                let entry = entry.map_err(|source| StoreError::Io {
+                    context: "read shard directory entry",
+                    source,
+                })?;
+                let file_type = entry.file_type().map_err(|source| StoreError::Io {
+                    context: "read shard directory entry type",
+                    source,
+                })?;
+                let path = entry.path();
+                if !file_type.is_file() {
+                    errors.push(format!(
+                        "unexpected non-file entry under shard prefix {}",
+                        path.display()
+                    ));
+                    continue;
+                }
+                let file_name = entry.file_name();
+                let Some(file_name) = file_name.to_str() else {
+                    errors.push(format!("non-UTF8 shard file {}", path.display()));
+                    continue;
+                };
+                let Ok(key) = ShardKey::from_hex(file_name) else {
+                    errors.push(format!("invalid shard file name {}", path.display()));
+                    continue;
+                };
+                let canonical_prefix = key.hex_prefix();
+                let canonical_file_name = key.to_string();
+                if prefix_name != canonical_prefix || file_name != canonical_file_name {
+                    errors.push(format!(
+                        "non-canonical shard file {} expected shards/{}/{}",
+                        path.display(),
+                        canonical_prefix,
+                        canonical_file_name
+                    ));
+                    continue;
+                };
+                let metadata = entry.metadata().map_err(|source| StoreError::Io {
+                    context: "stat shard file during scavenger scan",
+                    source,
+                })?;
+                files.push(ScavengerShardFile {
+                    key,
+                    size: metadata.len(),
+                });
+            }
+        }
+        files.sort_by(|left, right| left.key.as_bytes().cmp(right.key.as_bytes()));
+        Ok(ScavengerShardFileScan { files, errors })
     }
 
     fn validate_shard_scavenger_observation_key(
@@ -19386,6 +19634,167 @@ mod tests {
             observations[0].reason,
             ShardScavengerObservationReason::ScanIncomplete
         );
+    }
+
+    #[test]
+    fn shard_scavenger_local_audit_records_file_row_mismatches_without_deleting() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let file_without_row = ShardKey::new(&[0xCD; 16], 42, 1);
+        let row_without_file = ShardKey::new(&[0xCE; 16], 42, 2);
+
+        let file_without_row_ack = store.write_shard(&file_without_row, b"file-only").unwrap();
+        store.delete_shard_record(&file_without_row).unwrap();
+        let row_without_file_ack = store.write_shard(&row_without_file, b"row-only").unwrap();
+        fs::remove_file(store.shard_path(&row_without_file)).unwrap();
+
+        let observations = store.audit_local_shard_storage_for_scavenger(9).unwrap();
+        assert_eq!(observations.len(), 2);
+        let file_observation = observations
+            .iter()
+            .find(|observation| observation.key.shard_key == file_without_row)
+            .unwrap();
+        assert_eq!(
+            file_observation.reason,
+            ShardScavengerObservationReason::FileWithoutShardRow
+        );
+        assert!(file_observation.file_exists);
+        assert!(!file_observation.shard_row_exists);
+        assert_eq!(
+            file_observation.data_size,
+            Some(file_without_row_ack.stored_size)
+        );
+
+        let row_observation = observations
+            .iter()
+            .find(|observation| observation.key.shard_key == row_without_file)
+            .unwrap();
+        assert_eq!(
+            row_observation.reason,
+            ShardScavengerObservationReason::ShardRowWithoutFile
+        );
+        assert!(!row_observation.file_exists);
+        assert!(row_observation.shard_row_exists);
+        assert_eq!(row_observation.crc64, Some(row_without_file_ack.crc64));
+
+        assert!(
+            store.shard_path(&file_without_row).exists(),
+            "audit-only scan must not delete file-only candidates"
+        );
+
+        store
+            .register_written_shard(&file_without_row, file_without_row_ack)
+            .unwrap();
+        PgStore::write_shard_file_durable(
+            &store.tmp_dir,
+            &store.shards_dir,
+            &row_without_file,
+            b"row-only",
+        )
+        .unwrap();
+
+        let observations = store.audit_local_shard_storage_for_scavenger(9).unwrap();
+        assert_eq!(observations.len(), 2);
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.resolved_at.is_some()),
+            "later local consistency should resolve prior local mismatch observations"
+        );
+    }
+
+    #[test]
+    fn shard_scavenger_local_audit_requires_canonical_shard_file_paths() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let row_key = ShardKey::new(&[0xCF; 16], 42, 3);
+        store.write_shard(&row_key, b"row").unwrap();
+        fs::remove_file(store.shard_path(&row_key)).unwrap();
+
+        let wrong_prefix = if row_key.hex_prefix() == "00" {
+            "01"
+        } else {
+            "00"
+        };
+        let wrong_prefix_dir = store.shards_dir.join(wrong_prefix);
+        fs::create_dir_all(&wrong_prefix_dir).unwrap();
+        fs::write(wrong_prefix_dir.join(row_key.to_string()), b"wrong-prefix").unwrap();
+
+        let err = store
+            .audit_local_shard_storage_for_scavenger(9)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::ShardScavengerScanIncomplete {
+                context: "local shard file scan",
+                ..
+            }
+        ));
+        let observations = store.list_shard_scavenger_observations().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].key.shard_key, row_key);
+        assert_eq!(
+            observations[0].reason,
+            ShardScavengerObservationReason::ShardRowWithoutFile
+        );
+        assert!(
+            observations[0].resolved_at.is_none(),
+            "non-canonical file must not satisfy or resolve the canonical shard row"
+        );
+    }
+
+    #[test]
+    fn shard_scavenger_local_audit_surfaces_malformed_shard_files() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let malformed_dir = store.shards_dir.join("aa");
+        fs::create_dir_all(&malformed_dir).unwrap();
+        fs::write(malformed_dir.join("not-a-shard-key"), b"junk").unwrap();
+
+        let err = store
+            .audit_local_shard_storage_for_scavenger(9)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::ShardScavengerScanIncomplete {
+                context: "local shard file scan",
+                ..
+            }
+        ));
+        assert!(store
+            .list_shard_scavenger_observations()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn shard_scavenger_local_audit_surfaces_unexpected_shard_tree_entries() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let misplaced_key = ShardKey::new(&[0xD0; 16], 42, 4);
+        fs::write(
+            store.shards_dir.join(misplaced_key.to_string()),
+            b"misplaced",
+        )
+        .unwrap();
+        let canonical_dir = store.shards_dir.join(misplaced_key.hex_prefix());
+        fs::create_dir_all(&canonical_dir).unwrap();
+        fs::create_dir(canonical_dir.join("nested")).unwrap();
+
+        let err = store
+            .audit_local_shard_storage_for_scavenger(9)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::ShardScavengerScanIncomplete {
+                context: "local shard file scan",
+                ..
+            }
+        ));
+        assert!(store
+            .list_shard_scavenger_observations()
+            .unwrap()
+            .is_empty());
     }
 
     // ── connection accessor ───────────────────────────────────────────

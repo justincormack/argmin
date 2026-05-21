@@ -285,6 +285,15 @@ pub enum StoreError {
     #[error("invalid shard key length: {len} (expected {expected})")]
     InvalidKeyLength { len: usize, expected: usize },
 
+    #[error("invalid shard key hex")]
+    InvalidShardKeyHex,
+
+    #[error("shard scavenger scan incomplete during {context}: {errors}")]
+    ShardScavengerScanIncomplete {
+        context: &'static str,
+        errors: String,
+    },
+
     #[error("IO error: {context}")]
     Io {
         context: &'static str,

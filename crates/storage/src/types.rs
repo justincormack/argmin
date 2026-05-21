@@ -1294,6 +1294,20 @@ impl ShardKey {
             .to_owned()
     }
 
+    /// Parse a shard key from its fixed-width lowercase or uppercase hex form.
+    pub fn from_hex(hex: &str) -> Result<Self, StoreError> {
+        if hex.len() != SHARD_KEY_HEX_LEN {
+            return Err(StoreError::InvalidShardKeyHex);
+        }
+        let mut bytes = [0u8; SHARD_KEY_LEN];
+        for (index, out) in bytes.iter_mut().enumerate() {
+            let high = hex_nibble(hex.as_bytes()[index * 2])?;
+            let low = hex_nibble(hex.as_bytes()[index * 2 + 1])?;
+            *out = (high << 4) | low;
+        }
+        Ok(Self(bytes))
+    }
+
     /// Return the first byte's hex representation as a two-character prefix.
     /// Used for directory fan-out: `shards/<prefix>/<full_hex>`.
     pub fn hex_prefix(&self) -> String {
@@ -1301,6 +1315,15 @@ impl ShardKey {
         std::str::from_utf8(&prefix)
             .expect("shard key prefix hex is ASCII")
             .to_owned()
+    }
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, StoreError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(StoreError::InvalidShardKeyHex),
     }
 }
 
@@ -1397,7 +1420,7 @@ impl ShardScavengerObservationReason {
 }
 
 /// Physical location identity for a shard scavenger audit observation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ShardScavengerObservationKey {
     pub node_id: u32,
     pub data_pg_id: u32,
