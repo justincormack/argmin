@@ -4097,13 +4097,68 @@ Proposed subphases:
      cleanup is idempotent across claim expiry/steal, and local queues are only
      wakeup hints
 8. Phase 9.7 physical shard scavenger
-   - add the eventual cleanup process for shard files no longer referenced by
-     metadata
-   - cover crash leftovers and omitted multipart payload shards left by
-     post-commit best-effort cleanup failures
-   - do not rely on request-path best-effort cleanup or process-local state to
-     remove these files
-   - exit when unreferenced shard files are eventually detected and removed
+   - start with audit-only orphan detection, not deletion. Negative reference
+     scans are too dangerous to use as delete authority while slow writers can
+     have acknowledged shard files that are not yet published by metadata. A
+     candidate row means only "this scan could not prove a durable reference";
+     it must never mean "safe to delete".
+   - add a per-data-PG persisted scavenger observation table for apparent
+     orphan candidates, keyed by shard key and carrying `first_seen_at`,
+     `last_seen_at`, scan/observation count, data size/checksum when known,
+     whether the shard file exists, whether the `shards` row exists, reason,
+     and last scan error/context. Candidate rows are operational visibility and
+     regression evidence only.
+   - enumerate both local shard files and the data-PG `shards` table. Build the
+     referenced set from every durable metadata source that can still make a
+     payload reachable: live object segments, committed MPU part segments,
+     staged stream upload segments, object/multipart reclaim roots, durable
+     pending metadata commands, and terminal cleanup state that still owns
+     payload cleanup.
+   - classify observations at least as:
+     - `file_without_shard_row`: a shard file exists but the data-PG `shards`
+       row is missing
+     - `shard_row_without_file`: a data-PG `shards` row exists but the shard
+       file is missing; this is corruption/audit signal, not a cleanup target
+     - `unreferenced_shard_row_and_file`: both local row and file exist, but the
+       completed scan found no durable metadata reference
+     - `scan_incomplete`: at least one metadata PG/reference source failed; no
+       new candidate from that scan may be treated as stable
+   - clear or mark resolved observations when a later scan finds a durable
+     reference or the local file/row is gone. If any reference scan fails, emit
+     typed context and leave existing candidate rows as observations rather than
+     promoting them.
+   - deletion remains limited to positive-proof paths from earlier phases:
+     durable reclaim roots, terminal abandoned/cleanup commands that carry the
+     exact payload identity, or other explicit durable evidence that the payload
+     can no longer be published. Do not delete solely because a shard is absent
+     from the reference set.
+   - add writer-side safety-net validation before publishing metadata for
+     payloads already written to storage nodes: if an acknowledged shard has
+     disappeared before metadata publish, fail closed rather than publishing
+     metadata pointing at missing bytes. This does not authorize scavenger
+     deletion; it only prevents corruption if another bug removes a shard.
+   - required regressions:
+     - a shard file plus `shards` row with no metadata reference creates an
+       `unreferenced_shard_row_and_file` observation and leaves the file intact
+     - a file without a `shards` row creates a `file_without_shard_row`
+       observation and leaves the file intact
+     - a `shards` row without a file creates a `shard_row_without_file`
+       observation and surfaces an audit/corruption signal
+     - if any metadata PG/reference scan fails, the scan records
+       `scan_incomplete`, keeps existing observations conservative, and does
+       not report anything as stable/deletable
+     - a later durable metadata reference clears or resolves a prior apparent
+       orphan observation
+     - slow-writer simulation: shard files are written and acknowledged before
+       metadata publish; the audit scan may observe them but must not delete or
+       block the later successful publish
+     - metadata publish fails closed if a previously acknowledged shard file is
+       missing at final publish validation
+   - exit when apparent unreferenced shard files are detected, persisted,
+     surfaced through logs/metrics/tests, and never deleted without positive
+     durable abandonment/reclaim proof. Negative-reference deletion is deferred
+     until a later phase adds durable write intents or an equivalent publish
+     fence.
 9. Phase 9.8 lifecycle/background mutation ownership
    - make lifecycle sweeper ownership, progress, and retry state durable or
      otherwise cluster-visible
