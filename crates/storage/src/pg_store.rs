@@ -19741,6 +19741,27 @@ mod tests {
     }
 
     #[test]
+    fn shard_scavenger_local_audit_does_not_make_negative_reference_claims() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let candidate_key = ShardKey::new(&[0xD1; 16], 42, 0);
+        store
+            .write_shard(&candidate_key, b"orphan-candidate")
+            .unwrap();
+
+        let observations = store.audit_local_shard_storage_for_scavenger(9).unwrap();
+        assert!(
+            observations.is_empty(),
+            "PgStore-local audit can only prove local row/file mismatches; negative reference \
+             classification needs a cluster-wide metadata PG scan"
+        );
+        assert!(
+            store.shard_path(&candidate_key).exists(),
+            "local audit must not delete row+file candidates"
+        );
+    }
+
+    #[test]
     fn shard_scavenger_local_audit_requires_canonical_shard_file_paths() {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 7).unwrap();
