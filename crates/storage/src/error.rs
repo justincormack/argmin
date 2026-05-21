@@ -12,6 +12,20 @@ pub enum StoreError {
     #[error("integrity error: expected CRC {expected:#018X}, got {actual:#018X}")]
     IntegrityError { expected: u64, actual: u64 },
 
+    #[error(
+        "shard {shard} ack mismatch: expected size {expected_size} CRC {expected_crc:#018X}, got size {actual_size} CRC {actual_crc:#018X}"
+    )]
+    ShardAckMismatch {
+        shard: crate::types::ShardKey,
+        expected_size: u64,
+        expected_crc: u64,
+        actual_size: u64,
+        actual_crc: u64,
+    },
+
+    #[error("payload shard set mismatch: {reason}")]
+    PayloadShardSetMismatch { reason: String },
+
     #[error("PG {pg_id} not found on this node")]
     PgNotFound { pg_id: u32 },
 

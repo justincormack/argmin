@@ -3249,6 +3249,34 @@ impl StorageCluster {
                 }
                 return Err(error);
             }
+            if let Err(error) = self.validate_payload_shard_acks(
+                req.data_pg_id,
+                req.ec,
+                &req.segment_okh,
+                req.segment_vid,
+                &shard_batch,
+            ) {
+                if new_pending_command {
+                    drop(_bucket_guard);
+                    let release_result =
+                        self.release_metadata_command_bucket_write_reservation(&command);
+                    self.release_object_generation_reservation_after_pending_drain_best_effort(
+                        pg_id,
+                        &req.bucket,
+                        &req.key,
+                        &req.generation_reservation_id,
+                    );
+                    self.delete_direct_put_segment_payload_shards(
+                        req.data_pg_id,
+                        req.ec,
+                        &req.segment_okh,
+                        req.segment_vid,
+                        written_shards,
+                    );
+                    release_result.map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+                }
+                return Err(error);
+            }
             if new_pending_command {
                 let installed = match self.try_install_object_pg_pending_command_or_drain(
                     pg_id,
@@ -4013,6 +4041,28 @@ impl StorageCluster {
                 );
                 return Err(error);
             }
+            if let Err(error) = self.validate_payload_shard_acks(
+                segment_record.data_pg_id,
+                EcShape {
+                    k: segment_record.ec_k,
+                    m: segment_record.ec_m,
+                },
+                &segment_record.segment_okh,
+                segment_record.segment_vid,
+                shard_batch,
+            ) {
+                self.delete_payload_shard_keys_best_effort(
+                    segment_record.data_pg_id,
+                    EcShape {
+                        k: segment_record.ec_k,
+                        m: segment_record.ec_m,
+                    },
+                    &segment_record.segment_okh,
+                    segment_record.segment_vid,
+                    shard_batch.iter().map(|(key, _)| (*key).clone()),
+                );
+                return Err(error);
+            }
 
             let command = MetadataCommandEnvelope::new(
                 command_id,
@@ -4061,6 +4111,65 @@ impl StorageCluster {
             .metadata_pg_primary_node(data_pg_id)?
             .get_pg(data_pg_id)?;
         data_pg.register_written_shards_batch(shard_batch)?;
+        Ok(())
+    }
+
+    fn validate_payload_shard_acks(
+        &self,
+        data_pg_id: u32,
+        ec: EcShape,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        shard_batch: &[(&ShardKey, WriteAck)],
+    ) -> Result<(), ObjectPgActionError> {
+        let expected_keys = Self::payload_shard_set_keys(segment_okh, segment_vid, ec);
+        if shard_batch.len() != expected_keys.len() {
+            return Err(ObjectPgActionError::Store(
+                StoreError::PayloadShardSetMismatch {
+                    reason: format!(
+                        "expected {} shards for EC {}+{}, got {}",
+                        expected_keys.len(),
+                        ec.k,
+                        ec.m,
+                        shard_batch.len()
+                    ),
+                },
+            ));
+        }
+        for (expected_key, (actual_key, _)) in expected_keys.iter().zip(shard_batch.iter()) {
+            if expected_key != *actual_key {
+                return Err(ObjectPgActionError::Store(
+                    StoreError::PayloadShardSetMismatch {
+                        reason: format!(
+                            "expected shard {} at index {}, got {}",
+                            expected_key,
+                            expected_key.shard_index().get(),
+                            actual_key
+                        ),
+                    },
+                ));
+            }
+        }
+
+        let data_pg = self
+            .metadata_pg_primary_node(data_pg_id)?
+            .get_pg(data_pg_id)?;
+        for (key, ack) in shard_batch {
+            data_pg.validate_written_shard_ack(key, *ack)?;
+        }
+        drop(data_pg);
+
+        let data_pg = DataPgId::new(PgId::new(data_pg_id));
+        let placement_key = segment_payload_placement_key(segment_okh, segment_vid);
+        let locations = self
+            .place_payload_shards(data_pg, ec, &placement_key)
+            .map_err(|error| ObjectPgActionError::Store(cluster_build_error_to_store(error)))?;
+        for (key, ack) in shard_batch {
+            let location = Self::placed_payload_shard_location(&locations, key)
+                .map_err(ObjectPgActionError::Store)?;
+            self.read_payload_shard(location, key, *ack)
+                .map_err(|error| ObjectPgActionError::Store(shard_io_error_to_store(error)))?;
+        }
         Ok(())
     }
 

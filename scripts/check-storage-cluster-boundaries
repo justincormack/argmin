@@ -240,11 +240,12 @@ payload_shard_read_callers=$(
 expected_payload_shard_read_callers=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:try_load_placed_segment_shard
 1 crates/storage/src/cluster.rs:try_read_placed_segment_direct_into
+1 crates/storage/src/cluster.rs:validate_payload_shard_acks
 EOF
 )
 if [[ "$payload_shard_read_callers" != "$expected_payload_shard_read_callers" ]]; then
     fail_with_matches \
-        "Placed payload shard reads must stay inside the storage segment reader" \
+        "Placed payload shard reads must stay inside the storage segment reader or publish validator" \
         "$payload_shard_read_callers"
 fi
 

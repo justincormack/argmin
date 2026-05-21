@@ -8003,6 +8003,192 @@ mod tests {
     }
 
     #[test]
+    fn direct_put_publish_validation_fails_closed_when_acknowledged_shard_file_is_missing() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut local_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = local_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "direct-put-publish-validation-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut local_map, 1, NodeId::new(1));
+        set_route_primary(&mut local_map, 2, NodeId::new(1));
+        let map = Arc::new(local_map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let reservation_id =
+            crate::SessionId::try_from("64646464646464646464646464646464".to_string()).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        let payload = b"direct put publish validation";
+        let segment_okh = [0xd1; 16];
+        let written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                payload,
+            )
+            .unwrap();
+        let data_pg_id = DataPgId::new(PgId::new(written.data_pg_id));
+        let placement_key =
+            super::super::segment_payload_placement_key(&segment_okh, generation_id);
+        let locations = cluster
+            .place_payload_shards(data_pg_id, written.ec, &placement_key)
+            .unwrap();
+        let missing_shard = written.written_shards[0].key.clone();
+        let missing_location = locations[usize::from(missing_shard.shard_index().get())];
+        let hook_map = Arc::clone(&map);
+        let hook_missing_shard = missing_shard.clone();
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let hook_ran_for_closure = Arc::clone(&hook_ran);
+        let _hook_guard =
+            cluster.test_install_before_direct_put_command_id_hook(Arc::new(move || {
+                if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                hook_map
+                    .node(missing_location.node_id())
+                    .unwrap()
+                    .storage_node()
+                    .delete_shard_file(missing_location.data_pg_id().get(), &hook_missing_shard)
+                    .unwrap();
+            }));
+
+        let commit_req = direct_put_commit_req(
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id,
+                generation_id,
+                payload,
+                segment_okh,
+                written: &written,
+            },
+        );
+        let err = cluster
+            .commit_direct_put_object_from_payload_shards(
+                &commit_req,
+                &written.written_shards,
+                |_| Ok::<(), ()>(()),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::ShardStore {
+                    ref source,
+                    ..
+                }) if matches!(**source, StoreError::NotFound)
+            ),
+            "missing acknowledged shard file should fail closed before metadata publish, got {err:?}"
+        );
+        assert!(hook_ran.load(Ordering::SeqCst));
+        assert_bucket_write_reservations_released(&map, &bucket);
+        assert_clean_metadata_command_stream(&map, &[2]);
+        let object_pg = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
+            .unwrap()
+            .storage_node()
+            .get_pg(2)
+            .unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_meta(&*object_pg, &bucket, &key),
+            Err(crate::MetadataError::ObjectNotFound)
+        ));
+    }
+
+    #[test]
+    fn direct_put_publish_validation_rejects_truncated_shard_batch() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut local_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = local_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "direct-put-truncated-shards-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut local_map, 1, NodeId::new(1));
+        set_route_primary(&mut local_map, 2, NodeId::new(1));
+        let map = Arc::new(local_map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let reservation_id =
+            crate::SessionId::try_from("65656565656565656565656565656565".to_string()).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        let payload = b"direct put truncated shard batch";
+        let segment_okh = [0xd3; 16];
+        let written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                payload,
+            )
+            .unwrap();
+        let truncated = written.written_shards[..written.written_shards.len() - 1].to_vec();
+        let commit_req = direct_put_commit_req(
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id,
+                generation_id,
+                payload,
+                segment_okh,
+                written: &written,
+            },
+        );
+        let err = cluster
+            .commit_direct_put_object_from_payload_shards(&commit_req, &truncated, |_| {
+                Ok::<(), ()>(())
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::PayloadShardSetMismatch { .. })
+            ),
+            "truncated shard batch should fail closed before metadata publish, got {err:?}"
+        );
+        assert_bucket_write_reservations_released(&map, &bucket);
+        assert_clean_metadata_command_stream(&map, &[2]);
+        let object_pg = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
+            .unwrap()
+            .storage_node()
+            .get_pg(2)
+            .unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_meta(&*object_pg, &bucket, &key),
+            Err(crate::MetadataError::ObjectNotFound)
+        ));
+    }
+
+    #[test]
     fn direct_put_command_id_race_drains_winner_and_reruns_precondition_action() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -17865,6 +18051,115 @@ mod tests {
                 vec![segment.clone()]
             );
         }
+    }
+
+    #[test]
+    fn stream_append_publish_validation_fails_closed_when_acknowledged_shard_file_is_missing() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let session_id = crate::SessionId::try_from("37".repeat(16)).unwrap();
+        cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                &session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap();
+        let payload = b"stream append publish validation";
+        let (_target, segment) = cluster
+            .prepare_stream_segment_append(
+                &bucket,
+                &key,
+                &crate::PrepareStreamUploadSegmentAppendReq {
+                    session_id: session_id.clone(),
+                    segment_index: 0,
+                    size: payload.len() as u64,
+                    segment_crc64: Some(checksum::crc64::checksum(payload)),
+                    segment_okh: [0xd4; 16],
+                },
+            )
+            .unwrap();
+        let written_shards = cluster
+            .write_stream_segment_payload_shards(&segment, payload)
+            .unwrap();
+        let data_pg_id = DataPgId::new(PgId::new(segment.data_pg_id));
+        let placement_key =
+            super::super::segment_payload_placement_key(&segment.segment_okh, segment.segment_vid);
+        let locations = cluster
+            .place_payload_shards(
+                data_pg_id,
+                EcShape {
+                    k: segment.ec_k,
+                    m: segment.ec_m,
+                },
+                &placement_key,
+            )
+            .unwrap();
+        let missing_shard = written_shards[0].key.clone();
+        let missing_location = locations[usize::from(missing_shard.shard_index().get())];
+        map.node(missing_location.node_id())
+            .unwrap()
+            .storage_node()
+            .delete_shard_file(missing_location.data_pg_id().get(), &missing_shard)
+            .unwrap();
+
+        let shard_batch: Vec<(&crate::ShardKey, crate::WriteAck)> = written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect();
+        let err = cluster
+            .commit_stream_segment_append(
+                &bucket,
+                &key,
+                &session_id,
+                segment.segment_index,
+                &segment,
+                &shard_batch,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::ShardStore {
+                    ref source,
+                    ..
+                }) if matches!(**source, StoreError::NotFound)
+            ),
+            "missing acknowledged stream shard file should fail closed before segment publish, got {err:?}"
+        );
+        assert_clean_metadata_command_stream(&map, &[object_pg]);
+        let object_pg_store = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(object_pg))
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::list_stream_segments(&*object_pg_store, &session_id)
+                .unwrap()
+                .is_empty(),
+            "failed stream append publish validation must not publish segment metadata"
+        );
     }
 
     #[test]

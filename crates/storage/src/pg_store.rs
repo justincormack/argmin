@@ -3873,6 +3873,43 @@ impl PgStore {
         Ok(())
     }
 
+    pub fn validate_written_shard_ack(
+        &self,
+        key: &ShardKey,
+        expected: WriteAck,
+    ) -> Result<(), StoreError> {
+        let row: Option<(i64, i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT data_size, crc64_nvme, status FROM shards WHERE shard_key = ?1",
+                params![key.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| StoreError::Db {
+                context: "validate written shard ack",
+                source: e,
+            })?;
+        let Some((actual_size, actual_crc, status)) = row else {
+            return Err(StoreError::NotFound);
+        };
+        if status != ShardStatus::Live as i64 {
+            return Err(StoreError::NotFound);
+        }
+        let actual_size = actual_size as u64;
+        let actual_crc = actual_crc as u64;
+        if actual_size != expected.stored_size || actual_crc != expected.crc64 {
+            return Err(StoreError::ShardAckMismatch {
+                shard: key.clone(),
+                expected_size: expected.stored_size,
+                expected_crc: expected.crc64,
+                actual_size,
+                actual_crc,
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn delete_shard_record(&self, key: &ShardKey) -> Result<(), StoreError> {
         self.conn
             .execute(
@@ -19795,6 +19832,38 @@ mod tests {
             .list_shard_scavenger_observations()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn validate_written_shard_ack_rejects_missing_or_mismatched_rows() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let key = ShardKey::new(&[0xD2; 16], 42, 5);
+        let ack = store.write_shard(&key, b"payload").unwrap();
+        store.validate_written_shard_ack(&key, ack).unwrap();
+
+        store
+            .conn
+            .execute(
+                "UPDATE shards SET data_size = ?1 WHERE shard_key = ?2",
+                rusqlite::params![(ack.stored_size + 1) as i64, key.as_bytes().as_slice()],
+            )
+            .unwrap();
+        let err = store.validate_written_shard_ack(&key, ack).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::ShardAckMismatch {
+                expected_size,
+                actual_size,
+                ..
+            } if expected_size == ack.stored_size && actual_size == ack.stored_size + 1
+        ));
+
+        store.delete_shard_record(&key).unwrap();
+        assert!(matches!(
+            store.validate_written_shard_ack(&key, ack),
+            Err(StoreError::NotFound)
+        ));
     }
 
     // ── connection accessor ───────────────────────────────────────────

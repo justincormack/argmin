@@ -123,7 +123,11 @@ fresh snapshot.
 Storage-node read-handle and reclaim-fence primitives are crate-local. The
 production surface is `StorageCluster` read-handle acquisition plus the
 placed-delete reclaim helper; boundary checks reject public low-level payload
-read APIs and public storage-node handle/fence APIs.
+read APIs and public storage-node handle/fence APIs. Production payload-byte
+reads stay inside segment readers after acquiring read handles, except for the
+write-side publish validator, which performs an explicit placed read to prove
+acknowledged shard files still match their `WriteAck` before publishing
+metadata.
 
 `ReleasedObjectPayloadLease::remaining`, `ReleasedObjectPayloadLease::payload_reclaim_exists`,
 and `ReleasedObjectPayloadLease::enqueue_object_payload_reclaim` are release
