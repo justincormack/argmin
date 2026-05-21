@@ -222,9 +222,8 @@ type LocalReclaimRoot = (BucketName, ObjectKey, GenerationId);
 
 #[derive(Debug)]
 struct LocalReclaimQueueState {
-    object_queue: VecDeque<LocalReclaimRoot>,
+    work_queue: VecDeque<ReclaimWorkItem>,
     queued_objects: HashSet<LocalReclaimRoot>,
-    bucket_delete_queue: VecDeque<BucketName>,
     queued_bucket_deletes: HashSet<BucketName>,
 }
 
@@ -233,9 +232,8 @@ impl LocalClusterRuntimeState {
         Self {
             reclaim_queue: (
                 Mutex::new(LocalReclaimQueueState {
-                    object_queue: VecDeque::new(),
+                    work_queue: VecDeque::new(),
                     queued_objects: HashSet::new(),
-                    bucket_delete_queue: VecDeque::new(),
                     queued_bucket_deletes: HashSet::new(),
                 }),
                 Condvar::new(),
@@ -266,7 +264,9 @@ impl LocalClusterRuntimeState {
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
         if state.queued_objects.insert(root.clone()) {
-            state.object_queue.push_back(root);
+            state
+                .work_queue
+                .push_back(ReclaimWorkItem::ObjectPayload(root));
             cv.notify_one();
         }
     }
@@ -276,7 +276,9 @@ impl LocalClusterRuntimeState {
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
         let bucket = bucket.clone();
         if state.queued_bucket_deletes.insert(bucket.clone()) {
-            state.bucket_delete_queue.push_back(bucket);
+            state
+                .work_queue
+                .push_back(ReclaimWorkItem::BucketDelete(bucket));
             cv.notify_one();
         }
     }
@@ -288,13 +290,7 @@ impl LocalClusterRuntimeState {
             .0
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(root) = state.object_queue.pop_front() {
-            state.queued_objects.remove(&root);
-            return Some(ReclaimWorkItem::ObjectPayload(root));
-        }
-        let bucket = state.bucket_delete_queue.pop_front()?;
-        state.queued_bucket_deletes.remove(&bucket);
-        Some(ReclaimWorkItem::BucketDelete(bucket))
+        Self::pop_reclaim_work(&mut state)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -305,10 +301,7 @@ impl LocalClusterRuntimeState {
     pub(crate) fn wait_for_reclaim_work_poll(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
-        if state.object_queue.is_empty()
-            && state.bucket_delete_queue.is_empty()
-            && !stop.load(Ordering::SeqCst)
-        {
+        if state.work_queue.is_empty() && !stop.load(Ordering::SeqCst) {
             let (next_state, _) = cv
                 .wait_timeout(
                     state,
@@ -320,17 +313,24 @@ impl LocalClusterRuntimeState {
         if stop.load(Ordering::SeqCst) {
             return None;
         }
-        if let Some(root) = state.object_queue.pop_front() {
-            state.queued_objects.remove(&root);
-            return Some(ReclaimWorkItem::ObjectPayload(root));
-        }
-        let bucket = state.bucket_delete_queue.pop_front()?;
-        state.queued_bucket_deletes.remove(&bucket);
-        Some(ReclaimWorkItem::BucketDelete(bucket))
+        Self::pop_reclaim_work(&mut state)
     }
 
     pub(crate) fn wake_reclaim_workers(&self) {
         self.reclaim_queue.1.notify_all();
+    }
+
+    fn pop_reclaim_work(state: &mut LocalReclaimQueueState) -> Option<ReclaimWorkItem> {
+        let work = state.work_queue.pop_front()?;
+        match &work {
+            ReclaimWorkItem::ObjectPayload(root) => {
+                state.queued_objects.remove(root);
+            }
+            ReclaimWorkItem::BucketDelete(bucket) => {
+                state.queued_bucket_deletes.remove(bucket);
+            }
+        }
+        Some(work)
     }
 }
 

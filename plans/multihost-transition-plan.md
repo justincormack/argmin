@@ -3928,12 +3928,15 @@ Proposed subphases:
      payload reads, direct payload deletes, public low-level read APIs, and
      public storage-node handle/fence APIs
 7. Phase 9.6 durable reclaim claiming
-   - status: in progress. Phase 9.6 replaces process-local reclaim queue
+   - status: implemented. Phase 9.6 replaces process-local reclaim queue
      ownership with durable PG-primary claims. Durable reclaim rows remain the
      source of truth; local queues and condition variables become wakeup hints
-     only. Object payload reclaim now claims object-PG work before physical
-     deletion and transfers the claim proof into the terminal
-     `DeleteObjectPayloadReclaim` command.
+     only; they are FIFO latency hints and no longer encode production
+     correctness ordering between object reclaim and bucket finalization.
+     Object payload reclaim now claims object-PG work before physical deletion
+     and transfers the claim proof into the terminal
+     `DeleteObjectPayloadReclaim` command. Bucket delete finalization claims
+     bucket-PG work before attempting terminal cleanup.
    - concurrency decision: start with one active durable reclaim owner per
      PG/work-class, not multiple workers on the same PG. Object payload reclaim
      is claimed on the object metadata PG that owns the reclaim root. Bucket
@@ -4088,7 +4091,7 @@ Proposed subphases:
         add startup/periodic scans for deleting buckets (done)
      5. remove or test-gate production reliance on `LocalReclaimQueueState`
         ordering, leaving it only as wakeup/backpressure plumbing until Phase
-        9.7/9.8 replace broader scavenger/lifecycle scheduling
+        9.7/9.8 replace broader scavenger/lifecycle scheduling (done)
    - exit when reclaim and bucket finalization can resume after process restart
      without local worker state, worker ownership is durable and token-fenced,
      cleanup is idempotent across claim expiry/steal, and local queues are only

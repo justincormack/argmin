@@ -170,6 +170,24 @@ enum ReclaimKindTraceOp {
     ExpectNoWork,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReclaimHint {
+    Object,
+    BucketDelete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationReclaimHint {
+    Object(TraceGeneration),
+    BucketDelete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyReclaimHint {
+    Object(TraceKey),
+    BucketDelete,
+}
+
 impl std::fmt::Display for ReclaimTraceOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -203,16 +221,14 @@ impl std::fmt::Display for ReclaimKindTraceOp {
 struct ReclaimTraceModel {
     metadata_exists: bool,
     lease_held: bool,
-    object_work_queued: bool,
-    bucket_delete_queued: bool,
+    queue: Vec<ReclaimHint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReclaimKindTraceModel {
     reclaim_kind: Option<TraceReclaimKind>,
     lease_held: bool,
-    object_work_queued: bool,
-    bucket_delete_queued: bool,
+    queue: Vec<ReclaimHint>,
 }
 
 impl ReclaimTraceModel {
@@ -220,8 +236,7 @@ impl ReclaimTraceModel {
         Self {
             metadata_exists: false,
             lease_held: false,
-            object_work_queued: false,
-            bucket_delete_queued: false,
+            queue: Vec::new(),
         }
     }
 
@@ -239,16 +254,18 @@ impl ReclaimTraceModel {
         if self.metadata_exists {
             ops.push(EnqueueObjectReclaim);
         }
-        if self.object_work_queued {
-            ops.push(WorkerObjectStep);
-        }
-        if self.bucket_delete_queued && !self.object_work_queued {
-            ops.push(WorkerBucketDeleteStep);
-        }
-        if !self.object_work_queued && !self.bucket_delete_queued {
-            ops.push(ExpectNoWork);
+        match self.queue.first() {
+            Some(ReclaimHint::Object) => ops.push(WorkerObjectStep),
+            Some(ReclaimHint::BucketDelete) => ops.push(WorkerBucketDeleteStep),
+            None => ops.push(ExpectNoWork),
         }
         ops
+    }
+
+    fn enqueue_hint(&mut self, hint: ReclaimHint) {
+        if !self.queue.contains(&hint) {
+            self.queue.push(hint);
+        }
     }
 
     fn apply(&mut self, op: &ReclaimTraceOp) {
@@ -263,21 +280,21 @@ impl ReclaimTraceModel {
             ReleaseLease => {
                 self.lease_held = false;
                 if self.metadata_exists {
-                    self.object_work_queued = true;
+                    self.enqueue_hint(ReclaimHint::Object);
                 }
             }
             EnqueueObjectReclaim => {
-                self.object_work_queued = true;
+                self.enqueue_hint(ReclaimHint::Object);
             }
             WorkerObjectStep => {
-                self.object_work_queued = false;
+                assert_eq!(self.queue.remove(0), ReclaimHint::Object);
                 if self.metadata_exists && !self.lease_held {
                     self.metadata_exists = false;
-                    self.bucket_delete_queued = true;
+                    self.enqueue_hint(ReclaimHint::BucketDelete);
                 }
             }
             WorkerBucketDeleteStep => {
-                self.bucket_delete_queued = false;
+                assert_eq!(self.queue.remove(0), ReclaimHint::BucketDelete);
             }
             ExpectNoWork => {}
         }
@@ -289,8 +306,7 @@ impl ReclaimKindTraceModel {
         Self {
             reclaim_kind: None,
             lease_held: false,
-            object_work_queued: false,
-            bucket_delete_queued: false,
+            queue: Vec::new(),
         }
     }
 
@@ -309,16 +325,18 @@ impl ReclaimKindTraceModel {
         if self.reclaim_kind.is_some() {
             ops.push(EnqueueObjectReclaim);
         }
-        if self.object_work_queued {
-            ops.push(WorkerObjectStep);
-        }
-        if self.bucket_delete_queued && !self.object_work_queued {
-            ops.push(WorkerBucketDeleteStep);
-        }
-        if !self.object_work_queued && !self.bucket_delete_queued {
-            ops.push(ExpectNoWork);
+        match self.queue.first() {
+            Some(ReclaimHint::Object) => ops.push(WorkerObjectStep),
+            Some(ReclaimHint::BucketDelete) => ops.push(WorkerBucketDeleteStep),
+            None => ops.push(ExpectNoWork),
         }
         ops
+    }
+
+    fn enqueue_hint(&mut self, hint: ReclaimHint) {
+        if !self.queue.contains(&hint) {
+            self.queue.push(hint);
+        }
     }
 
     fn apply(&mut self, op: &ReclaimKindTraceOp) {
@@ -330,18 +348,20 @@ impl ReclaimKindTraceModel {
             ReleaseLease => {
                 self.lease_held = false;
                 if self.reclaim_kind.is_some() {
-                    self.object_work_queued = true;
+                    self.enqueue_hint(ReclaimHint::Object);
                 }
             }
-            EnqueueObjectReclaim => self.object_work_queued = true,
+            EnqueueObjectReclaim => self.enqueue_hint(ReclaimHint::Object),
             WorkerObjectStep => {
-                self.object_work_queued = false;
+                assert_eq!(self.queue.remove(0), ReclaimHint::Object);
                 if self.reclaim_kind.is_some() && !self.lease_held {
                     self.reclaim_kind = None;
-                    self.bucket_delete_queued = true;
+                    self.enqueue_hint(ReclaimHint::BucketDelete);
                 }
             }
-            WorkerBucketDeleteStep => self.bucket_delete_queued = false,
+            WorkerBucketDeleteStep => {
+                assert_eq!(self.queue.remove(0), ReclaimHint::BucketDelete);
+            }
             ExpectNoWork => {}
         }
     }
@@ -475,8 +495,7 @@ struct TwoGenerationReclaimTraceModel {
     new_metadata_exists: bool,
     old_lease_held: bool,
     new_lease_held: bool,
-    object_queue: Vec<TraceGeneration>,
-    bucket_delete_queued: bool,
+    queue: Vec<GenerationReclaimHint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -487,8 +506,7 @@ struct TwoKeyReclaimTraceModel {
     key_b_metadata_exists: bool,
     key_a_lease_held: bool,
     key_b_lease_held: bool,
-    object_queue: Vec<TraceKey>,
-    bucket_delete_queued: bool,
+    queue: Vec<KeyReclaimHint>,
 }
 
 impl TwoGenerationReclaimTraceModel {
@@ -500,15 +518,14 @@ impl TwoGenerationReclaimTraceModel {
             new_metadata_exists: false,
             old_lease_held: false,
             new_lease_held: false,
-            object_queue: Vec::new(),
-            bucket_delete_queued: false,
+            queue: Vec::new(),
         }
     }
 
     fn legal_ops(&self) -> Vec<TwoGenerationReclaimTraceOp> {
         use TwoGenerationReclaimTraceOp::*;
         let mut ops = Vec::new();
-        if !self.bucket_exists && !self.bucket_delete_queued {
+        if !self.bucket_exists && !self.queue.contains(&GenerationReclaimHint::BucketDelete) {
             ops.push(SeedBucketDelete);
         }
         if !self.old_metadata_exists {
@@ -533,21 +550,24 @@ impl TwoGenerationReclaimTraceModel {
         if self.new_metadata_exists {
             ops.push(EnqueueNewReclaim);
         }
-        if !self.object_queue.is_empty() {
-            ops.push(WorkerObjectStep);
-        }
-        if self.bucket_delete_queued && self.object_queue.is_empty() {
-            ops.push(WorkerBucketDeleteStep);
-        }
-        if self.object_queue.is_empty() && !self.bucket_delete_queued {
-            ops.push(ExpectNoWork);
+        match self.queue.first() {
+            Some(GenerationReclaimHint::Object(_)) => ops.push(WorkerObjectStep),
+            Some(GenerationReclaimHint::BucketDelete) => ops.push(WorkerBucketDeleteStep),
+            None => ops.push(ExpectNoWork),
         }
         ops
     }
 
     fn enqueue_generation(&mut self, generation: TraceGeneration) {
-        if !self.object_queue.contains(&generation) {
-            self.object_queue.push(generation);
+        let hint = GenerationReclaimHint::Object(generation);
+        if !self.queue.contains(&hint) {
+            self.queue.push(hint);
+        }
+    }
+
+    fn enqueue_bucket_delete(&mut self) {
+        if !self.queue.contains(&GenerationReclaimHint::BucketDelete) {
+            self.queue.push(GenerationReclaimHint::BucketDelete);
         }
     }
 
@@ -567,7 +587,7 @@ impl TwoGenerationReclaimTraceModel {
             SeedBucketDelete => {
                 self.bucket_exists = true;
                 self.bucket_deleting = true;
-                self.bucket_delete_queued = true;
+                self.enqueue_bucket_delete();
             }
             SeedOldMetadata => self.old_metadata_exists = true,
             SeedNewMetadata => self.new_metadata_exists = true,
@@ -588,21 +608,23 @@ impl TwoGenerationReclaimTraceModel {
             EnqueueOldReclaim => self.enqueue_generation(TraceGeneration::Old),
             EnqueueNewReclaim => self.enqueue_generation(TraceGeneration::New),
             WorkerObjectStep => {
-                let generation = self.object_queue.remove(0);
+                let GenerationReclaimHint::Object(generation) = self.queue.remove(0) else {
+                    unreachable!("model only schedules worker-object-step for object hints")
+                };
                 match generation {
                     TraceGeneration::Old if self.old_metadata_exists && !self.old_lease_held => {
                         self.old_metadata_exists = false;
-                        self.bucket_delete_queued = true;
+                        self.enqueue_bucket_delete();
                     }
                     TraceGeneration::New if self.new_metadata_exists && !self.new_lease_held => {
                         self.new_metadata_exists = false;
-                        self.bucket_delete_queued = true;
+                        self.enqueue_bucket_delete();
                     }
                     _ => {}
                 }
             }
             WorkerBucketDeleteStep => {
-                self.bucket_delete_queued = false;
+                assert_eq!(self.queue.remove(0), GenerationReclaimHint::BucketDelete);
                 if self.bucket_deleting {
                     match self.current_bucket_root() {
                         Some(TraceGeneration::Old) if !self.old_lease_held => {
@@ -633,15 +655,14 @@ impl TwoKeyReclaimTraceModel {
             key_b_metadata_exists: false,
             key_a_lease_held: false,
             key_b_lease_held: false,
-            object_queue: Vec::new(),
-            bucket_delete_queued: false,
+            queue: Vec::new(),
         }
     }
 
     fn legal_ops(&self) -> Vec<TwoKeyReclaimTraceOp> {
         use TwoKeyReclaimTraceOp::*;
         let mut ops = Vec::new();
-        if !self.bucket_exists && !self.bucket_delete_queued {
+        if !self.bucket_exists && !self.queue.contains(&KeyReclaimHint::BucketDelete) {
             ops.push(SeedBucketDelete);
         }
         if !self.key_a_metadata_exists {
@@ -666,21 +687,24 @@ impl TwoKeyReclaimTraceModel {
         if self.key_b_metadata_exists {
             ops.push(EnqueueKeyBReclaim);
         }
-        if !self.object_queue.is_empty() {
-            ops.push(WorkerObjectStep);
-        }
-        if self.bucket_delete_queued && self.object_queue.is_empty() {
-            ops.push(WorkerBucketDeleteStep);
-        }
-        if self.object_queue.is_empty() && !self.bucket_delete_queued {
-            ops.push(ExpectNoWork);
+        match self.queue.first() {
+            Some(KeyReclaimHint::Object(_)) => ops.push(WorkerObjectStep),
+            Some(KeyReclaimHint::BucketDelete) => ops.push(WorkerBucketDeleteStep),
+            None => ops.push(ExpectNoWork),
         }
         ops
     }
 
     fn enqueue_key(&mut self, key: TraceKey) {
-        if !self.object_queue.contains(&key) {
-            self.object_queue.push(key);
+        let hint = KeyReclaimHint::Object(key);
+        if !self.queue.contains(&hint) {
+            self.queue.push(hint);
+        }
+    }
+
+    fn enqueue_bucket_delete(&mut self) {
+        if !self.queue.contains(&KeyReclaimHint::BucketDelete) {
+            self.queue.push(KeyReclaimHint::BucketDelete);
         }
     }
 
@@ -700,7 +724,7 @@ impl TwoKeyReclaimTraceModel {
             SeedBucketDelete => {
                 self.bucket_exists = true;
                 self.bucket_deleting = true;
-                self.bucket_delete_queued = true;
+                self.enqueue_bucket_delete();
             }
             SeedKeyAMetadata => self.key_a_metadata_exists = true,
             SeedKeyBMetadata => self.key_b_metadata_exists = true,
@@ -721,21 +745,23 @@ impl TwoKeyReclaimTraceModel {
             EnqueueKeyAReclaim => self.enqueue_key(TraceKey::A),
             EnqueueKeyBReclaim => self.enqueue_key(TraceKey::B),
             WorkerObjectStep => {
-                let key = self.object_queue.remove(0);
+                let KeyReclaimHint::Object(key) = self.queue.remove(0) else {
+                    unreachable!("model only schedules worker-object-step for object hints")
+                };
                 match key {
                     TraceKey::A if self.key_a_metadata_exists && !self.key_a_lease_held => {
                         self.key_a_metadata_exists = false;
-                        self.bucket_delete_queued = true;
+                        self.enqueue_bucket_delete();
                     }
                     TraceKey::B if self.key_b_metadata_exists && !self.key_b_lease_held => {
                         self.key_b_metadata_exists = false;
-                        self.bucket_delete_queued = true;
+                        self.enqueue_bucket_delete();
                     }
                     _ => {}
                 }
             }
             WorkerBucketDeleteStep => {
-                self.bucket_delete_queued = false;
+                assert_eq!(self.queue.remove(0), KeyReclaimHint::BucketDelete);
                 if self.bucket_deleting {
                     match self.current_bucket_root() {
                         Some(TraceKey::A) if !self.key_a_lease_held => {
@@ -1681,10 +1707,10 @@ proptest! {
                 render_two_generation_reclaim_trace(&ops[..=index]),
             );
             if matches!(op, TwoGenerationReclaimTraceOp::WorkerObjectStep) {
-                let expected = *model
-                    .object_queue
-                    .first()
-                    .expect("legal worker step must have queued object work");
+                let Some(GenerationReclaimHint::Object(expected)) = model.queue.first().copied()
+                else {
+                    panic!("legal worker step must have queued object work")
+                };
                 harness.execute_worker_object_step(expected)?;
             } else {
                 harness.execute(op)?;
@@ -1709,10 +1735,9 @@ proptest! {
                 render_two_key_reclaim_trace(&ops[..=index]),
             );
             if matches!(op, TwoKeyReclaimTraceOp::WorkerObjectStep) {
-                let expected = *model
-                    .object_queue
-                    .first()
-                    .expect("legal worker step must have queued object work");
+                let Some(KeyReclaimHint::Object(expected)) = model.queue.first().copied() else {
+                    panic!("legal worker step must have queued object work")
+                };
                 harness.execute_worker_object_step(expected)?;
             } else {
                 harness.execute(op)?;
@@ -1724,7 +1749,7 @@ proptest! {
 }
 
 #[test]
-fn object_reclaim_work_takes_priority_over_stale_bucket_delete_follow_on() {
+fn stale_bucket_delete_follow_on_does_not_skip_new_object_reclaim() {
     let tmp = test_util::tempdir();
     let runtime = make_test_read_runtime(tmp.path());
     let mut harness = ReclaimTraceHarness::new(runtime);
@@ -1739,14 +1764,30 @@ fn object_reclaim_work_takes_priority_over_stale_bucket_delete_follow_on() {
         .unwrap();
 
     match harness.take_next_work().unwrap() {
+        Some(ReclaimWorkItem::BucketDelete(bucket))
+            if bucket == trusted_bucket_name(TRACE_BUCKET) => {}
+        Some(ReclaimWorkItem::BucketDelete(bucket)) => panic!(
+            "expected bucket-delete follow-on for the trace bucket, got bucket delete for {bucket}"
+        ),
+        None => panic!("expected stale bucket-delete follow-on before new object reclaim work"),
+        Some(ReclaimWorkItem::ObjectPayload(_)) => {
+            panic!("FIFO local hints should not let object reclaim jump the stale bucket-delete follow-on")
+        }
+    }
+
+    harness
+        .runtime
+        .try_finalize_bucket_delete_for(&trusted_bucket_name(TRACE_BUCKET))
+        .unwrap();
+    match harness.take_next_work().unwrap() {
         Some(ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)))
             if bucket == trusted_bucket_name(TRACE_BUCKET)
                 && key == trusted_object_key(TRACE_KEY)
                 && generation_id == trace_generation_id() => {}
         Some(ReclaimWorkItem::BucketDelete(bucket)) => panic!(
-            "new object reclaim work must outrank stale bucket-delete follow-on, got bucket delete for {bucket}"
+            "bucket-delete follow-on must leave queued object reclaim visible, got bucket delete for {bucket}"
         ),
-        None => panic!("expected object reclaim work after reseeding metadata"),
+        None => panic!("expected object reclaim work after bucket-delete follow-on observes root"),
         Some(ReclaimWorkItem::ObjectPayload(_)) => {
             panic!("expected object reclaim work for the traced generation")
         }
@@ -1770,6 +1811,9 @@ fn deleting_bucket_finalize_advances_from_old_generation_to_new_generation_root(
         .unwrap();
     harness
         .execute(&TwoGenerationReclaimTraceOp::EnqueueOldReclaim)
+        .unwrap();
+    harness
+        .execute(&TwoGenerationReclaimTraceOp::WorkerBucketDeleteStep)
         .unwrap();
     harness
         .execute_worker_object_step(TraceGeneration::Old)

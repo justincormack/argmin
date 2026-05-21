@@ -199,7 +199,9 @@ Missing local queue wakeups are therefore performance issues, not correctness
 issues. A worker can make progress by polling/listing deleting buckets and
 calling finalization again after reclaim blockers clear. Active in-memory read
 handles are not a direct finalization blocker; they only defer physical payload
-reclaim, which leaves the durable reclaim roots visible.
+reclaim, which leaves the durable reclaim roots visible. Local reclaim queues
+are FIFO wakeup hints only; they must not be used as the authority for whether
+object reclaim or bucket finalization is safe to run next.
 
 ## Required Tests
 

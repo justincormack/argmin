@@ -376,6 +376,7 @@ struct ObjectPayloadLeaseState {
     active_reclaims: HashSet<ReclaimRoot>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReclaimWorkItem {
     ObjectPayload(ReclaimRoot),
     BucketDelete(BucketName),
@@ -396,9 +397,8 @@ pub enum BucketCreateAttemptOutcome {
 }
 
 struct ReclaimQueueState {
-    object_queue: VecDeque<ReclaimRoot>,
+    work_queue: VecDeque<ReclaimWorkItem>,
     queued_objects: HashSet<ReclaimRoot>,
-    bucket_delete_queue: VecDeque<BucketName>,
     queued_bucket_deletes: HashSet<BucketName>,
 }
 
@@ -476,9 +476,8 @@ impl SharedStorageNode {
             object_payload_leases: Mutex::new(ObjectPayloadLeaseState::default()),
             reclaim_queue: (
                 Mutex::new(ReclaimQueueState {
-                    object_queue: VecDeque::new(),
+                    work_queue: VecDeque::new(),
                     queued_objects: HashSet::new(),
-                    bucket_delete_queue: VecDeque::new(),
                     queued_bucket_deletes: HashSet::new(),
                 }),
                 Condvar::new(),
@@ -1429,7 +1428,9 @@ impl SharedStorageNode {
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
         if state.queued_objects.insert(root.clone()) {
-            state.object_queue.push_back(root);
+            state
+                .work_queue
+                .push_back(ReclaimWorkItem::ObjectPayload(root));
             cv.notify_one();
         }
     }
@@ -1440,7 +1441,9 @@ impl SharedStorageNode {
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
         let bucket = bucket.clone();
         if state.queued_bucket_deletes.insert(bucket.clone()) {
-            state.bucket_delete_queue.push_back(bucket);
+            state
+                .work_queue
+                .push_back(ReclaimWorkItem::BucketDelete(bucket));
             cv.notify_one();
         }
     }
@@ -1452,23 +1455,14 @@ impl SharedStorageNode {
             .0
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(root) = state.object_queue.pop_front() {
-            state.queued_objects.remove(&root);
-            return Some(ReclaimWorkItem::ObjectPayload(root));
-        }
-        let bucket = state.bucket_delete_queue.pop_front()?;
-        state.queued_bucket_deletes.remove(&bucket);
-        Some(ReclaimWorkItem::BucketDelete(bucket))
+        Self::pop_reclaim_work(&mut state)
     }
 
     /// Block until reclaim work is available, or stop has been requested.
     pub fn wait_for_reclaim_work(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
-        while state.object_queue.is_empty()
-            && state.bucket_delete_queue.is_empty()
-            && !stop.load(Ordering::SeqCst)
-        {
+        while state.work_queue.is_empty() && !stop.load(Ordering::SeqCst) {
             let (next_state, _) = cv
                 .wait_timeout(
                     state,
@@ -1480,18 +1474,25 @@ impl SharedStorageNode {
         if stop.load(Ordering::SeqCst) {
             return None;
         }
-        if let Some(root) = state.object_queue.pop_front() {
-            state.queued_objects.remove(&root);
-            return Some(ReclaimWorkItem::ObjectPayload(root));
-        }
-        let bucket = state.bucket_delete_queue.pop_front()?;
-        state.queued_bucket_deletes.remove(&bucket);
-        Some(ReclaimWorkItem::BucketDelete(bucket))
+        Self::pop_reclaim_work(&mut state)
     }
 
     /// Wake reclaim workers so they can observe shutdown or new work.
     pub fn wake_reclaim_workers(&self) {
         self.reclaim_queue.1.notify_all();
+    }
+
+    fn pop_reclaim_work(state: &mut ReclaimQueueState) -> Option<ReclaimWorkItem> {
+        let work = state.work_queue.pop_front()?;
+        match &work {
+            ReclaimWorkItem::ObjectPayload(root) => {
+                state.queued_objects.remove(root);
+            }
+            ReclaimWorkItem::BucketDelete(bucket) => {
+                state.queued_bucket_deletes.remove(bucket);
+            }
+        }
+        Some(work)
     }
 
     /// Lock two PGs for operations that span a metadata PG and a shard PG.
