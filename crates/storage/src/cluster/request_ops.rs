@@ -39,6 +39,12 @@ pub(crate) struct DurableObjectPayloadReclaimScan {
     pub errors: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DurableBucketDeleteFinalizeScan {
+    pub queued: usize,
+    pub errors: usize,
+}
+
 struct InsertDeleteMarkerDraft<'a> {
     bucket: &'a BucketName,
     key: &'a ObjectKey,
@@ -2048,7 +2054,7 @@ impl super::StorageCluster {
         );
         let _bucket_guard = bucket_node.lock_bucket(bucket);
         let bucket_pg_id = self.bucket_metadata_pg_id(bucket);
-        {
+        let bucket_incarnation_generation = {
             let bucket_pg = self.metadata_pg(bucket_pg_id)?;
             let info = match PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket) {
                 Ok(info) => info,
@@ -2073,8 +2079,69 @@ impl super::StorageCluster {
                 );
                 return Ok(BucketDeleteFinalizeOutcome::NotDeleting);
             }
-        }
+            info.bucket_incarnation_generation
+        };
 
+        let claim_id = self.next_bucket_delete_finalize_claim_id()?;
+        let owner_token = self.bucket_write_owner_token();
+        let claimed_at = crate::clock::current_time_millis();
+        let claim = {
+            let bucket_pg = self.metadata_pg(bucket_pg_id)?;
+            PgMetadataStore::acquire_bucket_delete_finalize_claim(
+                &*bucket_pg,
+                bucket,
+                bucket_incarnation_generation,
+                &claim_id,
+                &owner_token,
+                self.operation_epoch(),
+                claimed_at,
+                claimed_at.checked_add(60_000),
+                claimed_at,
+            )?
+        };
+        let Some(claim) = claim else {
+            let _ = observability::event(
+                super::TRACE_TARGET,
+                "bucket_finalize_claim_busy",
+                Some(format_args!("bucket={:?} pg_id={}", bucket, bucket_pg_id)),
+            );
+            return Ok(BucketDeleteFinalizeOutcome::Pending);
+        };
+
+        let release_finalizer_claim = || -> Result<(), BucketWriteDrainError> {
+            let bucket_pg = self.metadata_pg(bucket_pg_id)?;
+            PgMetadataStore::release_bucket_delete_finalize_claim(
+                &*bucket_pg,
+                bucket,
+                bucket_incarnation_generation,
+                &claim.claim_id,
+                &claim.owner_token,
+                claim.cluster_epoch,
+            )?;
+            Ok(())
+        };
+
+        let result = self.try_finalize_bucket_delete_claimed(bucket, bucket_pg_id);
+        match result {
+            Ok(BucketDeleteFinalizeOutcome::Finalized | BucketDeleteFinalizeOutcome::NotFound) => {
+                result
+            }
+            Ok(outcome) => {
+                release_finalizer_claim()?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                release_finalizer_claim()?;
+                Err(error)
+            }
+        }
+    }
+
+    fn try_finalize_bucket_delete_claimed(
+        &self,
+        bucket: &BucketName,
+        bucket_pg_id: u32,
+    ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
         if self.bucket_has_visible_data(bucket, false)? {
             let _ = observability::event(
                 super::TRACE_TARGET,
@@ -5545,6 +5612,7 @@ impl super::StorageCluster {
         }
         while !stop.load(Ordering::SeqCst) {
             self.enqueue_durable_object_payload_reclaim_roots();
+            self.enqueue_durable_bucket_delete_finalize_roots();
             if let Some(work) = self
                 .local_map
                 .runtime_state()
@@ -5860,6 +5928,48 @@ impl super::StorageCluster {
                 continue;
             }
             self.enqueue_object_payload_reclaim(&root.bucket, &root.key, root.generation_id);
+            scan.queued += 1;
+        }
+        scan
+    }
+
+    pub(crate) fn enqueue_durable_bucket_delete_finalize_roots(
+        &self,
+    ) -> DurableBucketDeleteFinalizeScan {
+        if self.operation_epoch() != self.cluster_epoch() {
+            return DurableBucketDeleteFinalizeScan::default();
+        }
+
+        let mut scan = DurableBucketDeleteFinalizeScan::default();
+        for pg_id in self.metadata_pg_ids() {
+            let pg = match self.metadata_pg(pg_id) {
+                Ok(pg) => pg,
+                Err(error) => {
+                    scan.errors += 1;
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "bucket_finalize_durable_scan_pg_error",
+                        Some(format_args!("pg_id={} error={:?}", pg_id, error)),
+                    );
+                    continue;
+                }
+            };
+            let root = match PgMetadataStore::get_bucket_delete_finalize_root(&*pg) {
+                Ok(root) => root,
+                Err(error) => {
+                    scan.errors += 1;
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "bucket_finalize_durable_scan_pg_error",
+                        Some(format_args!("pg_id={} error={:?}", pg_id, error)),
+                    );
+                    continue;
+                }
+            };
+            let Some(root) = root else {
+                continue;
+            };
+            self.enqueue_bucket_delete_finalize(&root.bucket);
             scan.queued += 1;
         }
         scan

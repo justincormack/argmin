@@ -28829,6 +28829,180 @@ mod tests {
     }
 
     #[test]
+    fn durable_bucket_finalize_scan_recovers_lost_local_queue_after_reopen() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let bucket = {
+            let mut map =
+                LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+            let bucket = {
+                let topology = map
+                    .nodes
+                    .get(&NodeId::new(0))
+                    .unwrap()
+                    .storage_node()
+                    .pg_topology();
+                bucket_for_pg(topology, 1, "delete-finalize-scan-")
+            };
+            set_route_primary(&mut map, 1, NodeId::new(1));
+            let map = Arc::new(map);
+            let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            create_test_bucket(&cluster, &bucket);
+            cluster.begin_bucket_delete(&bucket).unwrap();
+            bucket
+        };
+
+        let mut reopened =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        set_route_primary(&mut reopened, 1, NodeId::new(1));
+        let reopened = Arc::new(reopened);
+        let reopened_cluster =
+            crate::StorageCluster::from_local_map(Arc::clone(&reopened)).unwrap();
+
+        let scan = reopened_cluster.enqueue_durable_bucket_delete_finalize_roots();
+        assert_eq!(scan.errors, 0);
+        assert_eq!(
+            scan.queued, 1,
+            "startup scan should rediscover the deleting bucket without an in-memory hint"
+        );
+        assert!(matches!(
+            reopened_cluster.try_take_reclaim_work(),
+            Some(crate::ReclaimWorkItem::BucketDelete(queued_bucket))
+                if queued_bucket == bucket
+        ));
+        assert_eq!(
+            reopened_cluster
+                .try_finalize_bucket_delete(&bucket)
+                .unwrap(),
+            crate::BucketDeleteFinalizeOutcome::Finalized
+        );
+        assert_clean_metadata_command_stream(&reopened, &[1]);
+    }
+
+    #[test]
+    fn durable_bucket_finalize_scan_continues_after_unavailable_pg() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "delete-finalize-scan-later-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        cluster.begin_bucket_delete(&bucket).unwrap();
+        drop(cluster);
+
+        let mut map = Arc::try_unwrap(map).expect("test should hold the only map reference");
+        map.pg_routes.get_mut(&PgId::new(0)).unwrap().state = PgState::Peering;
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+        let scan = cluster.enqueue_durable_bucket_delete_finalize_roots();
+        assert_eq!(
+            scan.errors, 1,
+            "unavailable PG should be reported in scan stats"
+        );
+        assert_eq!(
+            scan.queued, 1,
+            "scan should continue and enqueue the later healthy deleting bucket"
+        );
+        assert!(matches!(
+            cluster.try_take_reclaim_work(),
+            Some(crate::ReclaimWorkItem::BucketDelete(queued_bucket))
+                if queued_bucket == bucket
+        ));
+    }
+
+    #[test]
+    fn bucket_finalize_durable_claim_blocks_second_worker_until_released() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "delete-finalize-claim-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        cluster.begin_bucket_delete(&bucket).unwrap();
+
+        let primary_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        let deleting =
+            crate::PgMetadataStore::head_bucket_record_raw(&*primary_pg, &bucket).unwrap();
+        let claimed_at = crate::clock::current_time_millis();
+        let held = crate::PgMetadataStore::acquire_bucket_delete_finalize_claim(
+            &*primary_pg,
+            &bucket,
+            deleting.bucket_incarnation_generation,
+            "held-finalizer-claim",
+            "external-worker",
+            ClusterEpoch::INITIAL,
+            claimed_at,
+            claimed_at.checked_add(60_000),
+            claimed_at,
+        )
+        .unwrap()
+        .expect("test should be able to hold the finalizer claim");
+        drop(primary_pg);
+
+        assert_eq!(
+            cluster.try_finalize_bucket_delete(&bucket).unwrap(),
+            crate::BucketDeleteFinalizeOutcome::Pending,
+            "a non-expired durable finalizer claim should block a second worker"
+        );
+        let primary_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket)
+                .unwrap()
+                .state,
+            crate::BucketState::Deleting
+        );
+
+        crate::PgMetadataStore::release_bucket_delete_finalize_claim(
+            &*primary_pg,
+            &bucket,
+            deleting.bucket_incarnation_generation,
+            &held.claim_id,
+            &held.owner_token,
+            held.cluster_epoch,
+        )
+        .unwrap();
+        drop(primary_pg);
+        assert_eq!(
+            cluster.try_finalize_bucket_delete(&bucket).unwrap(),
+            crate::BucketDeleteFinalizeOutcome::Finalized
+        );
+    }
+
+    #[test]
     fn finalized_bucket_delete_waits_for_reclaim_then_finalizes_after_worker_progress() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

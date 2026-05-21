@@ -1862,6 +1862,13 @@ pub struct BucketDeleteFinalizeClaimRecord {
     pub last_error: Option<String>,
 }
 
+/// Durable bucket delete finalization root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketDeleteFinalizeRoot {
+    pub bucket: BucketName,
+    pub bucket_incarnation_generation: u64,
+}
+
 /// Segment entry for a durable standard-object reclaim record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectSegmentsReclaimSegmentRecord {

@@ -506,6 +506,14 @@ pub(crate) trait PgMetadataStore {
     /// were lost across process restart.
     fn get_payload_reclaim_root(&self) -> Result<Option<PayloadReclaimRoot>, MetadataError>;
 
+    /// Return one deleting bucket on this metadata PG, if any exists.
+    ///
+    /// Used by bucket finalizer workers to recover durable roots when local
+    /// wakeup hints were lost across process restart.
+    fn get_bucket_delete_finalize_root(
+        &self,
+    ) -> Result<Option<BucketDeleteFinalizeRoot>, MetadataError>;
+
     /// Acquire the single durable object-payload reclaim claim for this PG.
     ///
     /// Returns `Ok(None)` when the reclaim root is absent or a non-expired
@@ -541,7 +549,6 @@ pub(crate) trait PgMetadataStore {
     ) -> Result<(), MetadataError>;
 
     /// Acquire the single durable bucket-delete finalizer claim for this PG.
-    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn acquire_bucket_delete_finalize_claim(
         &self,
@@ -556,7 +563,6 @@ pub(crate) trait PgMetadataStore {
     ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, MetadataError>;
 
     /// Release a durable bucket-delete finalizer claim by exact token-fenced identity.
-    #[cfg(test)]
     fn release_bucket_delete_finalize_claim(
         &self,
         bucket: &BucketName,

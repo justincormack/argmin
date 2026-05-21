@@ -9296,7 +9296,6 @@ fn object_payload_reclaim_claim_from_row(
     })
 }
 
-#[cfg(test)]
 fn bucket_delete_finalize_claim_from_row(
     row: &rusqlite::Row<'_>,
 ) -> Result<BucketDeleteFinalizeClaimRecord, rusqlite::Error> {
@@ -11866,6 +11865,35 @@ impl PgMetadataStore for PgStore {
         )
     }
 
+    fn get_bucket_delete_finalize_root(
+        &self,
+    ) -> Result<Option<BucketDeleteFinalizeRoot>, MetadataError> {
+        self.query_row_cached_optional_metadata(
+            "SELECT name, bucket_incarnation_generation
+             FROM buckets
+             WHERE state = ?1
+             ORDER BY name ASC
+             LIMIT 1",
+            params![BucketState::Deleting as u8],
+            "get bucket delete finalize root",
+            |row| {
+                let incarnation = row.get::<_, i64>(1)?;
+                let bucket_incarnation_generation =
+                    u64::try_from(incarnation).map_err(|source| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Integer,
+                            Box::new(source),
+                        )
+                    })?;
+                Ok(BucketDeleteFinalizeRoot {
+                    bucket: row.get(0)?,
+                    bucket_incarnation_generation,
+                })
+            },
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn acquire_object_payload_reclaim_claim(
         &self,
@@ -12103,7 +12131,6 @@ impl PgMetadataStore for PgStore {
         )
     }
 
-    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn acquire_bucket_delete_finalize_claim(
         &self,
@@ -12254,7 +12281,6 @@ impl PgMetadataStore for PgStore {
         )
     }
 
-    #[cfg(test)]
     fn release_bucket_delete_finalize_claim(
         &self,
         bucket: &BucketName,
@@ -15800,6 +15826,42 @@ mod tests {
                 ClusterEpoch::INITIAL,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn get_bucket_delete_finalize_root_returns_first_deleting_bucket() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 11).unwrap();
+        let bucket_a = trusted_bucket_name("finalize-root-a");
+        let bucket_b = trusted_bucket_name("finalize-root-b");
+        create_probe_bucket_direct(&store, &bucket_a);
+        create_probe_bucket_direct(&store, &bucket_b);
+
+        assert!(
+            store.get_bucket_delete_finalize_root().unwrap().is_none(),
+            "active buckets are not finalizer roots"
+        );
+
+        store.mark_bucket_deleting(&bucket_b).unwrap();
+        let bucket_b_record = store.head_bucket_record_raw(&bucket_b).unwrap();
+        assert_eq!(
+            store.get_bucket_delete_finalize_root().unwrap(),
+            Some(BucketDeleteFinalizeRoot {
+                bucket: bucket_b.clone(),
+                bucket_incarnation_generation: bucket_b_record.bucket_incarnation_generation,
+            })
+        );
+
+        store.mark_bucket_deleting(&bucket_a).unwrap();
+        let bucket_a_record = store.head_bucket_record_raw(&bucket_a).unwrap();
+        assert_eq!(
+            store.get_bucket_delete_finalize_root().unwrap(),
+            Some(BucketDeleteFinalizeRoot {
+                bucket: bucket_a,
+                bucket_incarnation_generation: bucket_a_record.bucket_incarnation_generation,
+            }),
+            "scan root should be deterministic when multiple deleting buckets exist"
+        );
     }
 
     #[test]

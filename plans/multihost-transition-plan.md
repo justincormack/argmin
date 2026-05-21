@@ -4079,13 +4079,13 @@ Proposed subphases:
      1. add claim schema/types, digest/replay coverage if the rows are
         replica-visible, and low-level claim acquire/heartbeat/release/expire
         helpers on the relevant PG primary (done for object reclaim and bucket
-        finalizer claim tables; bucket finalizer helpers are not yet wired)
+        finalizer claim tables)
      2. wire object payload reclaim workers to claim durable object-PG work and
         treat the local queue as a hint (done)
      3. add startup/periodic scans for durable object reclaim roots so restart
         without local queue state makes progress (done)
      4. wire bucket delete finalization workers to durable bucket-PG claims and
-        add startup/periodic scans for deleting buckets
+        add startup/periodic scans for deleting buckets (done)
      5. remove or test-gate production reliance on `LocalReclaimQueueState`
         ordering, leaving it only as wakeup/backpressure plumbing until Phase
         9.7/9.8 replace broader scavenger/lifecycle scheduling

@@ -1783,6 +1783,13 @@ impl StorageCluster {
         )
     }
 
+    fn next_bucket_delete_finalize_claim_id(&self) -> Result<String, StoreError> {
+        self.next_bucket_write_coordination_id(
+            "bucket-finalize-",
+            "generate bucket delete finalize claim id",
+        )
+    }
+
     fn next_bucket_write_coordination_id(
         &self,
         prefix: &'static str,
