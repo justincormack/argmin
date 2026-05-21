@@ -4102,18 +4102,23 @@ Proposed subphases:
      have acknowledged shard files that are not yet published by metadata. A
      candidate row means only "this scan could not prove a durable reference";
      it must never mean "safe to delete".
-   - add a per-data-PG persisted scavenger observation table for apparent
-     orphan candidates, keyed by shard key and carrying `first_seen_at`,
+   - add a per-storage-node/per-data-PG persisted scavenger observation table
+     for apparent orphan candidates, keyed by physical location identity:
+     storage node id (or equivalent `ShardLocation` node context), data PG id,
+     shard index/location, and shard key. The same `ShardKey` can exist on
+     multiple storage nodes or on a stale wrong-node path, so observation
+     identity must not collapse distinct physical files. Carry `first_seen_at`,
      `last_seen_at`, scan/observation count, data size/checksum when known,
      whether the shard file exists, whether the `shards` row exists, reason,
      and last scan error/context. Candidate rows are operational visibility and
      regression evidence only.
    - enumerate both local shard files and the data-PG `shards` table. Build the
      referenced set from every durable metadata source that can still make a
-     payload reachable: live object segments, committed MPU part segments,
-     staged stream upload segments, object/multipart reclaim roots, durable
-     pending metadata commands, and terminal cleanup state that still owns
-     payload cleanup.
+     payload reachable: live object segments, completed-object part manifests
+     in `object_parts`, in-progress MPU part descriptors in `multipart_parts`,
+     MPU shard-set segment rows in `multipart_part_segments`, staged stream
+     upload segments, object/multipart reclaim roots, durable pending metadata
+     commands, and terminal cleanup state that still owns payload cleanup.
    - classify observations at least as:
      - `file_without_shard_row`: a shard file exists but the data-PG `shards`
        row is missing
@@ -4133,10 +4138,12 @@ Proposed subphases:
      can no longer be published. Do not delete solely because a shard is absent
      from the reference set.
    - add writer-side safety-net validation before publishing metadata for
-     payloads already written to storage nodes: if an acknowledged shard has
-     disappeared before metadata publish, fail closed rather than publishing
-     metadata pointing at missing bytes. This does not authorize scavenger
-     deletion; it only prevents corruption if another bug removes a shard.
+     payloads already written to storage nodes: every acknowledged shard must
+     still have its physical file plus the data-PG `shards` ack row, and the row
+     must match the expected `WriteAck` size/CRC. If validation fails, fail
+     closed rather than publishing metadata pointing at missing or mismatched
+     bytes. This does not authorize scavenger deletion; it only prevents
+     corruption if another bug removes or rewrites a shard.
    - required regressions:
      - a shard file plus `shards` row with no metadata reference creates an
        `unreferenced_shard_row_and_file` observation and leaves the file intact
