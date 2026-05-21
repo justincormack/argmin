@@ -12,6 +12,30 @@ CREATE TABLE IF NOT EXISTS shards (
     status          INTEGER NOT NULL DEFAULT 0
 )";
 
+/// Per-data-PG audit observations for apparent physical shard orphans.
+///
+/// These rows are non-authoritative telemetry. They must never be used as
+/// deletion proof; they record only that one scan could not prove a durable
+/// reference for a physical shard location.
+const CREATE_SHARD_SCAVENGER_OBSERVATIONS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS shard_scavenger_observations (
+    node_id             INTEGER NOT NULL CHECK (node_id >= 0),
+    data_pg_id          INTEGER NOT NULL CHECK (data_pg_id >= 0),
+    shard_index         INTEGER NOT NULL CHECK (shard_index >= 0 AND shard_index <= 255),
+    shard_key           BLOB NOT NULL,
+    first_seen_at       INTEGER NOT NULL CHECK (first_seen_at >= 0),
+    last_seen_at        INTEGER NOT NULL CHECK (last_seen_at >= 0),
+    observation_count   INTEGER NOT NULL CHECK (observation_count > 0),
+    data_size           INTEGER CHECK (data_size IS NULL OR data_size >= 0),
+    crc64_nvme          INTEGER,
+    file_exists         INTEGER NOT NULL CHECK (file_exists IN (0, 1)),
+    shard_row_exists    INTEGER NOT NULL CHECK (shard_row_exists IN (0, 1)),
+    reason              INTEGER NOT NULL CHECK (reason IN (0, 1, 2, 3)),
+    last_error          TEXT,
+    resolved_at         INTEGER CHECK (resolved_at IS NULL OR resolved_at >= 0),
+    PRIMARY KEY (node_id, data_pg_id, shard_index, shard_key)
+)";
+
 /// Per-PG object metadata table.
 const CREATE_OBJECTS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS objects (
@@ -585,6 +609,7 @@ PRAGMA foreign_keys=ON;
 pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(PG_PRAGMAS)?;
     conn.execute(CREATE_SHARDS_TABLE, [])?;
+    conn.execute(CREATE_SHARD_SCAVENGER_OBSERVATIONS_TABLE, [])?;
     conn.execute(CREATE_OBJECTS_TABLE, [])?;
     conn.execute(CREATE_OBJECT_VERSION_COUNTERS_TABLE, [])?;
     conn.execute(CREATE_OBJECTS_LIST_INDEX, [])?;

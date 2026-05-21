@@ -4097,6 +4097,11 @@ Proposed subphases:
      cleanup is idempotent across claim expiry/steal, and local queues are only
      wakeup hints
 8. Phase 9.7 physical shard scavenger
+   - status: in progress. The persisted per-physical-location observation
+     table, record/resolve/list helpers, and low-level non-authoritative
+     location-keyed regression are implemented. Reference-set scanning,
+     scan-incomplete handling, writer-side publish validation, metrics/log
+     surfacing, and worker wiring remain.
    - start with audit-only orphan detection, not deletion. Negative reference
      scans are too dangerous to use as delete authority while slow writers can
      have acknowledged shard files that are not yet published by metadata. A

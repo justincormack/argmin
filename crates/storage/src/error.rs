@@ -257,6 +257,31 @@ pub enum StoreError {
         key_shard_index: u8,
     },
 
+    #[error(
+        "shard scavenger observation targets data PG {observation_pg_id}, but was recorded on PG {store_pg_id}"
+    )]
+    ShardScavengerObservationWrongPg {
+        store_pg_id: u32,
+        observation_pg_id: u32,
+    },
+
+    #[error(
+        "shard scavenger observation shard index {observation_shard_index} does not match shard key index {key_shard_index}"
+    )]
+    ShardScavengerObservationShardIndexMismatch {
+        observation_shard_index: u8,
+        key_shard_index: u8,
+    },
+
+    #[error(
+        "shard scavenger observation reason {reason:?} is inconsistent with file_exists={file_exists} shard_row_exists={shard_row_exists}"
+    )]
+    ShardScavengerObservationInconsistentReason {
+        reason: crate::types::ShardScavengerObservationReason,
+        file_exists: bool,
+        shard_row_exists: bool,
+    },
+
     #[error("invalid shard key length: {len} (expected {expected})")]
     InvalidKeyLength { len: usize, expected: usize },
 

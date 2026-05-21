@@ -1370,6 +1370,69 @@ impl ShardStatus {
     }
 }
 
+/// Non-authoritative reason for a physical shard scavenger audit observation.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardScavengerObservationReason {
+    /// A shard file exists on disk but the data-PG `shards` row is absent.
+    FileWithoutShardRow = 0,
+    /// A data-PG `shards` row exists but the shard file is absent.
+    ShardRowWithoutFile = 1,
+    /// Both row and file exist, but a completed scan found no durable reference.
+    UnreferencedShardRowAndFile = 2,
+    /// The reference scan did not complete, so no candidate from it is stable.
+    ScanIncomplete = 3,
+}
+
+impl ShardScavengerObservationReason {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::FileWithoutShardRow),
+            1 => Some(Self::ShardRowWithoutFile),
+            2 => Some(Self::UnreferencedShardRowAndFile),
+            3 => Some(Self::ScanIncomplete),
+            _ => None,
+        }
+    }
+}
+
+/// Physical location identity for a shard scavenger audit observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardScavengerObservationKey {
+    pub node_id: u32,
+    pub data_pg_id: u32,
+    pub shard_index: ShardIndex,
+    pub shard_key: ShardKey,
+}
+
+/// Input for recording one shard scavenger audit observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardScavengerObservationRecord {
+    pub key: ShardScavengerObservationKey,
+    pub data_size: Option<u64>,
+    pub crc64: Option<u64>,
+    pub file_exists: bool,
+    pub shard_row_exists: bool,
+    pub reason: ShardScavengerObservationReason,
+    pub last_error: Option<String>,
+}
+
+/// Non-authoritative audit row for an apparent physical shard orphan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardScavengerObservation {
+    pub key: ShardScavengerObservationKey,
+    pub first_seen_at: u64,
+    pub last_seen_at: u64,
+    pub observation_count: u64,
+    pub data_size: Option<u64>,
+    pub crc64: Option<u64>,
+    pub file_exists: bool,
+    pub shard_row_exists: bool,
+    pub reason: ShardScavengerObservationReason,
+    pub last_error: Option<String>,
+    pub resolved_at: Option<u64>,
+}
+
 /// Object lifecycle state.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

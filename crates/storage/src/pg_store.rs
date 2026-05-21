@@ -871,6 +871,218 @@ impl PgStore {
         &self.conn
     }
 
+    /// Record a non-authoritative shard scavenger audit observation.
+    pub fn record_shard_scavenger_observation(
+        &self,
+        observation: &ShardScavengerObservationRecord,
+    ) -> Result<(), StoreError> {
+        self.validate_shard_scavenger_observation_record(observation)?;
+        let now = Self::now_secs();
+        self.conn
+            .execute(
+                "INSERT INTO shard_scavenger_observations \
+                 (node_id, data_pg_id, shard_index, shard_key, first_seen_at, last_seen_at, \
+                  observation_count, data_size, crc64_nvme, file_exists, shard_row_exists, \
+                  reason, last_error, resolved_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, ?6, ?7, ?8, ?9, ?10, ?11, NULL) \
+                 ON CONFLICT(node_id, data_pg_id, shard_index, shard_key) DO UPDATE SET \
+                  last_seen_at = excluded.last_seen_at, \
+                  observation_count = shard_scavenger_observations.observation_count + 1, \
+                  data_size = excluded.data_size, \
+                  crc64_nvme = excluded.crc64_nvme, \
+                  file_exists = excluded.file_exists, \
+                  shard_row_exists = excluded.shard_row_exists, \
+                  reason = excluded.reason, \
+                  last_error = excluded.last_error, \
+                  resolved_at = NULL",
+                params![
+                    observation.key.node_id as i64,
+                    observation.key.data_pg_id as i64,
+                    observation.key.shard_index.get() as i64,
+                    observation.key.shard_key.as_bytes().as_slice(),
+                    now as i64,
+                    observation.data_size.map(|size| size as i64),
+                    observation.crc64.map(|crc| crc as i64),
+                    if observation.file_exists {
+                        1_i64
+                    } else {
+                        0_i64
+                    },
+                    if observation.shard_row_exists {
+                        1_i64
+                    } else {
+                        0_i64
+                    },
+                    observation.reason as u8 as i64,
+                    observation.last_error.as_deref(),
+                ],
+            )
+            .map_err(|source| StoreError::Db {
+                context: "record shard scavenger observation",
+                source,
+            })?;
+        Ok(())
+    }
+
+    /// Mark a shard scavenger audit observation as resolved.
+    pub fn resolve_shard_scavenger_observation(
+        &self,
+        key: &ShardScavengerObservationKey,
+    ) -> Result<bool, StoreError> {
+        self.validate_shard_scavenger_observation_key(key)?;
+        let now = Self::now_secs();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE shard_scavenger_observations \
+                 SET resolved_at = ?1 \
+                 WHERE node_id = ?2 AND data_pg_id = ?3 AND shard_index = ?4 AND shard_key = ?5",
+                params![
+                    now as i64,
+                    key.node_id as i64,
+                    key.data_pg_id as i64,
+                    key.shard_index.get() as i64,
+                    key.shard_key.as_bytes().as_slice(),
+                ],
+            )
+            .map_err(|source| StoreError::Db {
+                context: "resolve shard scavenger observation",
+                source,
+            })?;
+        Ok(updated > 0)
+    }
+
+    pub fn list_shard_scavenger_observations(
+        &self,
+    ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT node_id, data_pg_id, shard_index, shard_key, first_seen_at, last_seen_at, \
+                        observation_count, data_size, crc64_nvme, file_exists, shard_row_exists, \
+                        reason, last_error, resolved_at \
+                 FROM shard_scavenger_observations \
+                 ORDER BY node_id, data_pg_id, shard_index, shard_key",
+            )
+            .map_err(|source| StoreError::Db {
+                context: "list shard scavenger observations (prepare)",
+                source,
+            })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<i64>>(13)?,
+                ))
+            })
+            .map_err(|source| StoreError::Db {
+                context: "list shard scavenger observations",
+                source,
+            })?;
+
+        let mut observations = Vec::new();
+        for row in rows {
+            let (
+                node_id,
+                data_pg_id,
+                shard_index,
+                shard_key,
+                first_seen_at,
+                last_seen_at,
+                observation_count,
+                data_size,
+                crc64,
+                file_exists,
+                shard_row_exists,
+                reason,
+                last_error,
+                resolved_at,
+            ) = row.map_err(|source| StoreError::Db {
+                context: "read shard scavenger observation",
+                source,
+            })?;
+            observations.push(ShardScavengerObservation {
+                key: ShardScavengerObservationKey {
+                    node_id: node_id as u32,
+                    data_pg_id: data_pg_id as u32,
+                    shard_index: ShardIndex::new(shard_index as u8),
+                    shard_key: ShardKey::from_bytes(&shard_key)?,
+                },
+                first_seen_at: first_seen_at as u64,
+                last_seen_at: last_seen_at as u64,
+                observation_count: observation_count as u64,
+                data_size: data_size.map(|size| size as u64),
+                crc64: crc64.map(|crc| crc as u64),
+                file_exists: file_exists != 0,
+                shard_row_exists: shard_row_exists != 0,
+                reason: ShardScavengerObservationReason::from_u8(reason as u8)
+                    .expect("schema restricts shard scavenger observation reasons"),
+                last_error,
+                resolved_at: resolved_at.map(|value| value as u64),
+            });
+        }
+        Ok(observations)
+    }
+
+    fn validate_shard_scavenger_observation_key(
+        &self,
+        key: &ShardScavengerObservationKey,
+    ) -> Result<(), StoreError> {
+        if key.data_pg_id != self.pg_id {
+            return Err(StoreError::ShardScavengerObservationWrongPg {
+                store_pg_id: self.pg_id,
+                observation_pg_id: key.data_pg_id,
+            });
+        }
+        let key_shard_index = key.shard_key.shard_index();
+        if key.shard_index != key_shard_index {
+            return Err(StoreError::ShardScavengerObservationShardIndexMismatch {
+                observation_shard_index: key.shard_index.get(),
+                key_shard_index: key_shard_index.get(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_shard_scavenger_observation_record(
+        &self,
+        observation: &ShardScavengerObservationRecord,
+    ) -> Result<(), StoreError> {
+        self.validate_shard_scavenger_observation_key(&observation.key)?;
+        let state_matches_reason = match observation.reason {
+            ShardScavengerObservationReason::FileWithoutShardRow => {
+                observation.file_exists && !observation.shard_row_exists
+            }
+            ShardScavengerObservationReason::ShardRowWithoutFile => {
+                !observation.file_exists && observation.shard_row_exists
+            }
+            ShardScavengerObservationReason::UnreferencedShardRowAndFile => {
+                observation.file_exists && observation.shard_row_exists
+            }
+            ShardScavengerObservationReason::ScanIncomplete => true,
+        };
+        if !state_matches_reason {
+            return Err(StoreError::ShardScavengerObservationInconsistentReason {
+                reason: observation.reason,
+                file_exists: observation.file_exists,
+                shard_row_exists: observation.shard_row_exists,
+            });
+        }
+        Ok(())
+    }
+
     fn query_row_cached<T, P, F>(
         &self,
         sql: &str,
@@ -18982,6 +19194,198 @@ mod tests {
         let stat = store.stat_shard(&key).unwrap();
         assert_eq!(stat.size, 4);
         assert_eq!(stat.crc64, checksum::crc64::checksum(b"data"));
+    }
+
+    #[test]
+    fn shard_scavenger_observation_is_location_keyed_and_non_authoritative() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+
+        let shard_key = ShardKey::new(&[0xCA; 16], 42, 3);
+        let ack = store.write_shard(&shard_key, b"candidate").unwrap();
+        let node_zero = ShardScavengerObservationKey {
+            node_id: 0,
+            data_pg_id: 7,
+            shard_index: shard_key.shard_index(),
+            shard_key: shard_key.clone(),
+        };
+        let node_one = ShardScavengerObservationKey {
+            node_id: 1,
+            data_pg_id: 7,
+            shard_index: shard_key.shard_index(),
+            shard_key: shard_key.clone(),
+        };
+
+        store
+            .record_shard_scavenger_observation(&ShardScavengerObservationRecord {
+                key: node_zero.clone(),
+                data_size: Some(ack.stored_size),
+                crc64: Some(ack.crc64),
+                file_exists: true,
+                shard_row_exists: true,
+                reason: ShardScavengerObservationReason::UnreferencedShardRowAndFile,
+                last_error: None,
+            })
+            .unwrap();
+        store
+            .record_shard_scavenger_observation(&ShardScavengerObservationRecord {
+                key: node_zero.clone(),
+                data_size: Some(ack.stored_size),
+                crc64: Some(ack.crc64),
+                file_exists: true,
+                shard_row_exists: true,
+                reason: ShardScavengerObservationReason::UnreferencedShardRowAndFile,
+                last_error: Some("second scan".to_owned()),
+            })
+            .unwrap();
+        store
+            .record_shard_scavenger_observation(&ShardScavengerObservationRecord {
+                key: node_one.clone(),
+                data_size: Some(ack.stored_size),
+                crc64: Some(ack.crc64),
+                file_exists: true,
+                shard_row_exists: true,
+                reason: ShardScavengerObservationReason::UnreferencedShardRowAndFile,
+                last_error: None,
+            })
+            .unwrap();
+
+        let observations = store.list_shard_scavenger_observations().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].key, node_zero);
+        assert_eq!(observations[0].observation_count, 2);
+        assert_eq!(observations[0].last_error.as_deref(), Some("second scan"));
+        assert_eq!(observations[1].key, node_one);
+        assert_eq!(observations[1].observation_count, 1);
+
+        let stat = store.stat_shard(&shard_key).unwrap();
+        assert_eq!(stat.size, ack.stored_size);
+        assert_eq!(stat.crc64, ack.crc64);
+
+        assert!(store
+            .resolve_shard_scavenger_observation(&node_zero)
+            .unwrap());
+        let observations = store.list_shard_scavenger_observations().unwrap();
+        assert!(observations[0].resolved_at.is_some());
+        assert!(observations[1].resolved_at.is_none());
+    }
+
+    #[test]
+    fn shard_scavenger_observation_rejects_inconsistent_location_identity() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let shard_key = ShardKey::new(&[0xCB; 16], 42, 3);
+
+        let wrong_pg = ShardScavengerObservationRecord {
+            key: ShardScavengerObservationKey {
+                node_id: 0,
+                data_pg_id: 8,
+                shard_index: shard_key.shard_index(),
+                shard_key: shard_key.clone(),
+            },
+            data_size: None,
+            crc64: None,
+            file_exists: true,
+            shard_row_exists: false,
+            reason: ShardScavengerObservationReason::FileWithoutShardRow,
+            last_error: None,
+        };
+        let err = store
+            .record_shard_scavenger_observation(&wrong_pg)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::ShardScavengerObservationWrongPg {
+                store_pg_id: 7,
+                observation_pg_id: 8
+            }
+        ));
+
+        let wrong_index = ShardScavengerObservationRecord {
+            key: ShardScavengerObservationKey {
+                node_id: 0,
+                data_pg_id: 7,
+                shard_index: ShardIndex::new(4),
+                shard_key,
+            },
+            data_size: None,
+            crc64: None,
+            file_exists: true,
+            shard_row_exists: false,
+            reason: ShardScavengerObservationReason::FileWithoutShardRow,
+            last_error: None,
+        };
+        let err = store
+            .record_shard_scavenger_observation(&wrong_index)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::ShardScavengerObservationShardIndexMismatch {
+                observation_shard_index: 4,
+                key_shard_index: 3
+            }
+        ));
+        assert!(store
+            .list_shard_scavenger_observations()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn shard_scavenger_observation_rejects_inconsistent_reason_state() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let shard_key = ShardKey::new(&[0xCC; 16], 42, 3);
+
+        let inconsistent = ShardScavengerObservationRecord {
+            key: ShardScavengerObservationKey {
+                node_id: 0,
+                data_pg_id: 7,
+                shard_index: shard_key.shard_index(),
+                shard_key: shard_key.clone(),
+            },
+            data_size: None,
+            crc64: None,
+            file_exists: true,
+            shard_row_exists: true,
+            reason: ShardScavengerObservationReason::FileWithoutShardRow,
+            last_error: None,
+        };
+        let err = store
+            .record_shard_scavenger_observation(&inconsistent)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::ShardScavengerObservationInconsistentReason {
+                reason: ShardScavengerObservationReason::FileWithoutShardRow,
+                file_exists: true,
+                shard_row_exists: true
+            }
+        ));
+
+        let scan_incomplete = ShardScavengerObservationRecord {
+            key: ShardScavengerObservationKey {
+                node_id: 0,
+                data_pg_id: 7,
+                shard_index: shard_key.shard_index(),
+                shard_key,
+            },
+            data_size: None,
+            crc64: None,
+            file_exists: true,
+            shard_row_exists: true,
+            reason: ShardScavengerObservationReason::ScanIncomplete,
+            last_error: Some("metadata pg unavailable".to_owned()),
+        };
+        store
+            .record_shard_scavenger_observation(&scan_incomplete)
+            .unwrap();
+        let observations = store.list_shard_scavenger_observations().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].reason,
+            ShardScavengerObservationReason::ScanIncomplete
+        );
     }
 
     // ── connection accessor ───────────────────────────────────────────
