@@ -17,7 +17,6 @@ use super::read_core::{
 };
 #[cfg(test)]
 use super::test_hooks::maybe_run_object_segments_first_segment_hook;
-#[cfg(feature = "deep-tracing")]
 use super::TRACE_TARGET;
 use super::{lock_mutex_unpoisoned, Coordinator, LIFECYCLE_SWEEP_INTERVAL_MILLIS};
 #[cfg(test)]
@@ -30,6 +29,9 @@ use crate::sse::{
 
 static LIFECYCLE_SWEEPER_REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<LifecycleSweeper>>>> =
     OnceLock::new();
+static SHARD_SCAVENGER_SWEEPER_REGISTRY: OnceLock<
+    Mutex<HashMap<usize, Weak<ShardScavengerSweeper>>>,
+> = OnceLock::new();
 
 /// The coordinator ties together EC, storage, and metadata.
 pub(super) struct ReclaimSweeper {
@@ -39,6 +41,12 @@ pub(super) struct ReclaimSweeper {
 }
 
 pub(super) struct LifecycleSweeper {
+    pub(super) stop: Arc<AtomicBool>,
+    pub(super) wake: Arc<(Mutex<bool>, Condvar)>,
+    pub(super) handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+pub(super) struct ShardScavengerSweeper {
     pub(super) stop: Arc<AtomicBool>,
     pub(super) wake: Arc<(Mutex<bool>, Condvar)>,
     pub(super) handle: Mutex<Option<JoinHandle<()>>>,
@@ -64,6 +72,17 @@ impl Drop for ReclaimSweeper {
 }
 
 impl Drop for LifecycleSweeper {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        *lock_mutex_unpoisoned(&self.wake.0) = true;
+        self.wake.1.notify_all();
+        if let Some(handle) = lock_mutex_unpoisoned(&self.handle).take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for ShardScavengerSweeper {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         *lock_mutex_unpoisoned(&self.wake.0) = true;
@@ -138,6 +157,69 @@ impl LifecycleSweeper {
             wake: Arc::new((Mutex::new(true), Condvar::new())),
             handle: Mutex::new(None),
         })
+    }
+}
+
+impl ShardScavengerSweeper {
+    pub(super) fn acquire_shared(
+        storage_cluster: &Arc<StorageCluster>,
+    ) -> Result<Arc<Self>, ServerError> {
+        let registry = SHARD_SCAVENGER_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut registry: std::sync::MutexGuard<'_, HashMap<usize, Weak<ShardScavengerSweeper>>> =
+            lock_mutex_unpoisoned(registry);
+        registry.retain(|_, sweeper| sweeper.upgrade().is_some());
+
+        let key = storage_cluster.process_local_registry_key();
+        if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+            return Ok(existing);
+        }
+
+        let sweeper = Self::spawn(Arc::clone(storage_cluster))?;
+        registry.insert(key, Arc::downgrade(&sweeper));
+        Ok(sweeper)
+    }
+
+    fn spawn(storage_cluster: Arc<StorageCluster>) -> Result<Arc<Self>, ServerError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new((Mutex::new(false), Condvar::new()));
+        let sweeper = Arc::new(Self {
+            stop: Arc::clone(&stop),
+            wake: Arc::clone(&wake),
+            handle: Mutex::new(None),
+        });
+        let handle = std::thread::Builder::new()
+            .name("argmin-shard-scavenger".to_string())
+            .spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    if let Err(error) = storage_cluster.audit_shard_storage_for_scavenger() {
+                        let _ = observability::event(
+                            TRACE_TARGET,
+                            "shard_scavenger_audit_error",
+                            Some(format_args!("error={error}")),
+                        );
+                    }
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let stop_guard = lock_mutex_unpoisoned(&wake.0);
+                    if *stop_guard {
+                        break;
+                    }
+                    let _ = wake
+                        .1
+                        .wait_timeout_while(
+                            stop_guard,
+                            Duration::from_millis(super::SHARD_SCAVENGER_SWEEP_INTERVAL_MILLIS),
+                            |stop_requested| !*stop_requested,
+                        )
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+            })
+            .map_err(|e| ServerError::InternalError {
+                reason: format!("failed to start shard scavenger worker: {e}"),
+            })?;
+        *lock_mutex_unpoisoned(&sweeper.handle) = Some(handle);
+        Ok(sweeper)
     }
 }
 

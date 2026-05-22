@@ -4097,7 +4097,7 @@ Proposed subphases:
      cleanup is idempotent across claim expiry/steal, and local queues are only
      wakeup hints
 8. Phase 9.7 physical shard scavenger
-   - status: in progress. The persisted per-physical-location observation
+   - status: done. The persisted per-physical-location observation
      table, record/resolve/list helpers, low-level non-authoritative
      location-keyed regression, local file/row mismatch audit scan, and
      writer-side publish validation of acknowledged shard files plus data-PG
@@ -4114,7 +4114,13 @@ Proposed subphases:
      pending command references; observation metrics and trace events are
      emitted from the durable observation write path. Pending-command reference
      suppression is covered for both direct PUT and multipart completion.
-     Worker wiring remains.
+     Coordinator worker wiring is implemented as a shared audit-only background
+     sweeper. Embedded local S3 test servers expose an explicit final
+     shard-scavenger clean assertion for focused tests, including an async
+     settling helper that wakes reclaim workers and polls the final audit until
+     cleanup converges. Automatic process-exit enforcement is deferred because
+     one-test `s3-tests` processes can exit before asynchronous reclaim has
+     settled.
    - start with audit-only orphan detection, not deletion. Negative reference
      scans are too dangerous to use as delete authority while slow writers can
      have acknowledged shard files that are not yet published by metadata. A
@@ -4188,11 +4194,14 @@ Proposed subphases:
        (covered for multipart completion)
      - metadata publish fails closed if a previously acknowledged shard file is
        missing at final publish validation
+     - focused local S3 harness tests can wait for async reclaim to settle,
+       then run a final shard-scavenger audit and fail on unresolved
+       observations
    - exit when apparent unreferenced shard files are detected, persisted,
      surfaced through logs/metrics/tests, and never deleted without positive
      durable abandonment/reclaim proof. Negative-reference deletion is deferred
      until a later phase adds durable write intents or an equivalent publish
-     fence.
+     fence. Full suite passed after the final harness settling adjustment.
 9. Phase 9.8 lifecycle/background mutation ownership
    - make lifecycle sweeper ownership, progress, and retry state durable or
      otherwise cluster-visible

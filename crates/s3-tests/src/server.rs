@@ -1,6 +1,7 @@
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use auth::AccountIdentity;
 use rustls::pki_types::pem::PemObject;
@@ -34,6 +35,7 @@ const TEST_TLS_KEY_PEM: &[u8] = include_bytes!("../testdata/localhost-key.pem");
 const POOL_SIZE: usize = 4;
 const TEST_MAX_CONNECTIONS: u32 = 512;
 const TEST_MAX_INFLIGHT_REQUESTS: u32 = 32;
+const SHARD_SCAVENGER_CLEAN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TestServerTransport {
@@ -70,6 +72,7 @@ struct LocalTraceEnvInputs {
 pub struct TestServer {
     endpoint: String,
     tls_ca_pem: Option<&'static [u8]>,
+    storage_cluster: Arc<storage::StorageCluster>,
     control_coordinator: server_core::coordinator::Coordinator,
     _temp_dir: test_util::TempDir,
     _server_task: tokio::task::JoinHandle<()>,
@@ -273,6 +276,7 @@ impl TestServer {
         TestServer {
             endpoint,
             tls_ca_pem: (transport == TestServerTransport::Https).then_some(TEST_TLS_CA_CERT_PEM),
+            storage_cluster,
             control_coordinator,
             _temp_dir: temp_dir,
             _server_task: server_task,
@@ -296,12 +300,98 @@ impl TestServer {
         self.control_coordinator
             .run_lifecycle_sweep_for_test(now_millis)
     }
+
+    pub fn assert_shard_scavenger_clean(&self) {
+        assert_shard_scavenger_clean(&self.storage_cluster, "local test server")
+    }
+
+    pub async fn wait_for_shard_scavenger_clean(&self, timeout: Duration) -> Result<(), String> {
+        wait_for_shard_scavenger_clean(&self.storage_cluster, "local test server", timeout).await
+    }
+
+    pub async fn assert_shard_scavenger_clean_after_async_cleanup(&self, timeout: Duration) {
+        if let Err(message) = self.wait_for_shard_scavenger_clean(timeout).await {
+            panic!("{message}");
+        }
+    }
 }
 
 impl Drop for TestServer {
     fn drop(&mut self) {
         self._server_task.abort();
     }
+}
+
+fn assert_shard_scavenger_clean(storage_cluster: &storage::StorageCluster, context: &str) {
+    if let Err(message) = shard_scavenger_clean_check_message(storage_cluster, context) {
+        panic!("{message}");
+    }
+}
+
+async fn wait_for_shard_scavenger_clean(
+    storage_cluster: &storage::StorageCluster,
+    context: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    storage_cluster.wake_reclaim_workers();
+    let mut last_error = match shard_scavenger_clean_check_message(storage_cluster, context) {
+        Ok(()) => return Ok(()),
+        Err(message) => message,
+    };
+    loop {
+        if Instant::now() >= deadline {
+            return Err(last_error);
+        }
+        tokio::time::sleep(SHARD_SCAVENGER_CLEAN_POLL_INTERVAL).await;
+        storage_cluster.wake_reclaim_workers();
+        match shard_scavenger_clean_check_message(storage_cluster, context) {
+            Ok(()) => return Ok(()),
+            Err(message) => last_error = message,
+        }
+    }
+}
+
+fn shard_scavenger_clean_check_message(
+    storage_cluster: &storage::StorageCluster,
+    context: &str,
+) -> Result<(), String> {
+    let observations = storage_cluster
+        .audit_shard_storage_for_scavenger()
+        .map_err(|error| format!("shard scavenger final audit failed for {context}: {error}"))?;
+    let unresolved: Vec<_> = observations
+        .iter()
+        .filter(|observation| observation.resolved_at.is_none())
+        .collect();
+    if unresolved.is_empty() {
+        return Ok(());
+    }
+
+    let mut message = format!(
+        "shard scavenger final audit found {} unresolved observation(s) for {context}",
+        unresolved.len()
+    );
+    for observation in unresolved.iter().take(16) {
+        message.push_str(&format!(
+            "\n  node={} data_pg={} shard_index={} shard_key={} reason={:?} file_exists={} shard_row_exists={} count={} last_error={}",
+            observation.key.node_id,
+            observation.key.data_pg_id,
+            observation.key.shard_index.get(),
+            observation.key.shard_key.hex(),
+            observation.reason,
+            observation.file_exists,
+            observation.shard_row_exists,
+            observation.observation_count,
+            observation.last_error.as_deref().unwrap_or("<none>"),
+        ));
+    }
+    if unresolved.len() > 16 {
+        message.push_str(&format!(
+            "\n  ... {} more unresolved observation(s) omitted",
+            unresolved.len() - 16
+        ));
+    }
+    Err(message)
 }
 
 fn configure_local_tracing() {

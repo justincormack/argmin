@@ -14,7 +14,7 @@ use std::thread;
 use std::time::Duration;
 use storage::{
     install_bucket_scoped_test_hooks, BucketScopedTestHooks, MetadataCommandApplyTestKind, PgId,
-    StorageCluster,
+    ShardScavengerObservationReason, StorageCluster,
 };
 
 const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -3928,6 +3928,57 @@ fn delete_object_eventually_reclaims_simple_shards() {
 
     reclaim_object_payload(&coord, "bucket", "key", generation_id);
     assert_shard_set_deleted(&coord, data_pg_id, &okh, segment_vid, ec);
+}
+
+#[test]
+fn shard_scavenger_worker_records_audit_observations() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_without_lifecycle_sweeper(tmp.path());
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let reservation_id = storage::SessionId::try_from("77".repeat(16)).unwrap();
+    let generation_id = coord
+        .storage_node
+        .reserve_put_object_generation(&bucket, &key, &reservation_id)
+        .unwrap();
+    let written = coord
+        .storage_node
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            generation_id,
+            0,
+            &[0xe7; 16],
+            b"background shard scavenger audit candidate",
+        )
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    loop {
+        let observations = coord
+            .storage_node
+            .test_list_shard_scavenger_observations(written.data_pg_id)
+            .unwrap();
+        if written.written_shards.iter().all(|shard| {
+            observations.iter().any(|observation| {
+                observation.reason == ShardScavengerObservationReason::FileWithoutShardRow
+                    && observation.resolved_at.is_none()
+                    && observation.key.data_pg_id == written.data_pg_id
+                    && observation.key.shard_key == shard.key
+            })
+        }) {
+            return;
+        }
+        assert!(
+            start.elapsed() < TEST_EVENT_TIMEOUT,
+            "shard scavenger worker did not record file-without-row observations; observations={observations:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]

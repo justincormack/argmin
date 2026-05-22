@@ -5102,6 +5102,17 @@ impl StorageCluster {
             .exists())
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_list_shard_scavenger_observations(
+        &self,
+        data_pg_id: u32,
+    ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
+        let data_pg = self
+            .metadata_pg_primary_node(data_pg_id)?
+            .get_pg(data_pg_id)?;
+        data_pg.list_shard_scavenger_observations()
+    }
+
     fn emit_best_effort_payload_cleanup_error(&self, operation: &'static str, error: &StoreError) {
         let Some(trace) = observability::current_context() else {
             return;

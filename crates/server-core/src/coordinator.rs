@@ -53,7 +53,7 @@ pub use self::request_types::*;
 use self::request_types::{AuthorizedWriteTags, BucketCreateOutcome};
 pub use self::response_types::*;
 use self::response_types::{DeleteMarkerLifecycleExpiration, NoncurrentLifecycleExpiration};
-use self::runtime::{LifecycleSweeper, ReclaimSweeper};
+use self::runtime::{LifecycleSweeper, ReclaimSweeper, ShardScavengerSweeper};
 #[cfg(test)]
 use self::test_hooks::*;
 pub use crate::checksum_claim::{ChecksumClaim, EncodedChecksumClaim};
@@ -144,6 +144,10 @@ pub const MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 pub const INTERNAL_SEGMENT_SIZE: usize = 8 * 1024 * 1024;
 
 const LIFECYCLE_SWEEP_INTERVAL_MILLIS: u64 = 1000;
+#[cfg(test)]
+const SHARD_SCAVENGER_SWEEP_INTERVAL_MILLIS: u64 = 50;
+#[cfg(not(test))]
+const SHARD_SCAVENGER_SWEEP_INTERVAL_MILLIS: u64 = 60_000;
 const BUCKET_FAST_PATH_MAX_ENTRIES: usize = 1024;
 #[cfg(test)]
 const BUCKET_FAST_PATH_WATCH_INTERVAL_MILLIS: u64 = 50;
@@ -404,6 +408,7 @@ pub struct Coordinator {
     sse_c_validator: Option<SseCustomerValidatorConfig>,
     managed_key_provider: Option<StaticManagedKeyProvider>,
     _reclaim_sweeper: ReclaimSweeper,
+    _shard_scavenger_sweeper: Arc<ShardScavengerSweeper>,
     _lifecycle_sweeper: Arc<LifecycleSweeper>,
 }
 

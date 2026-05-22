@@ -8,7 +8,7 @@ use super::payload::PayloadBufferPool;
 use super::read_core::ReadRuntime;
 use super::request_types::AuthorizePutObjectRequest;
 use super::response_types::{BucketSummary, ModernBucketSummary};
-use super::runtime::{LifecycleSweeper, ReclaimSweeper};
+use super::runtime::{LifecycleSweeper, ReclaimSweeper, ShardScavengerSweeper};
 #[cfg(test)]
 use super::trusted_bucket_name;
 use super::{shared_caches_for_storage_cluster, Coordinator, CoordinatorSharedCaches};
@@ -334,6 +334,7 @@ impl Coordinator {
                 reason: format!("failed to start reclaim worker: {e}"),
             })?;
         let lifecycle_sweeper = lifecycle_sweeper_factory(&storage_cluster, read_runtime.clone())?;
+        let shard_scavenger_sweeper = ShardScavengerSweeper::acquire_shared(&storage_cluster)?;
         let sweeper_storage_node = Arc::clone(&storage_cluster);
         Ok(Self {
             storage_node: storage_cluster,
@@ -347,6 +348,7 @@ impl Coordinator {
                 stop,
                 handle: Some(handle),
             },
+            _shard_scavenger_sweeper: shard_scavenger_sweeper,
             _lifecycle_sweeper: lifecycle_sweeper,
         })
     }
