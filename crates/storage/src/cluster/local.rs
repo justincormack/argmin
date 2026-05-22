@@ -8189,6 +8189,236 @@ mod tests {
     }
 
     #[test]
+    fn cluster_shard_scavenger_marks_slow_writer_candidate_and_resolves_after_publish() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let local_map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = local_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let (bucket, key, _object_pg, _data_pg) =
+            bucket_key_with_distinct_object_and_data_pg(topology);
+        let map = Arc::new(local_map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let reservation_id =
+            crate::SessionId::try_from("67676767676767676767676767676767".to_string()).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        let payload = b"slow writer shard scavenger candidate";
+        let segment_okh = [0xd4; 16];
+        let written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                payload,
+            )
+            .unwrap();
+        let shard_batch: Vec<(&crate::ShardKey, crate::WriteAck)> = written
+            .written_shards
+            .iter()
+            .map(|shard| (&shard.key, shard.ack))
+            .collect();
+        cluster
+            .register_payload_shard_acks(written.data_pg_id, &shard_batch)
+            .unwrap();
+
+        let observations = cluster.audit_shard_storage_for_scavenger().unwrap();
+        let unreferenced: Vec<_> = observations
+            .iter()
+            .filter(|observation| {
+                observation.reason
+                    == crate::ShardScavengerObservationReason::UnreferencedShardRowAndFile
+                    && observation.key.data_pg_id == written.data_pg_id
+                    && written
+                        .written_shards
+                        .iter()
+                        .any(|shard| shard.key == observation.key.shard_key)
+            })
+            .collect();
+        assert_eq!(
+            unreferenced.len(),
+            written.written_shards.len(),
+            "pre-publish shards with rows and files should be audit candidates, not deletion proof"
+        );
+        for shard in &written.written_shards {
+            assert!(
+                cluster
+                    .test_payload_shard_file_exists(
+                        written.data_pg_id,
+                        written.ec,
+                        &segment_okh,
+                        generation_id,
+                        shard.key.shard_index().get(),
+                    )
+                    .unwrap(),
+                "audit-only scavenger must not delete slow-writer shard files"
+            );
+        }
+
+        let commit_req = direct_put_commit_req(
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id,
+                generation_id,
+                payload,
+                segment_okh,
+                written: &written,
+            },
+        );
+        let _outcome = cluster
+            .commit_direct_put_object_from_payload_shards(
+                &commit_req,
+                &written.written_shards,
+                |_| Ok::<(), ()>(()),
+            )
+            .unwrap();
+
+        let observations = cluster.audit_shard_storage_for_scavenger().unwrap();
+        let unresolved_unreferenced = observations.iter().any(|observation| {
+            observation.reason
+                == crate::ShardScavengerObservationReason::UnreferencedShardRowAndFile
+                && observation.resolved_at.is_none()
+                && observation.key.data_pg_id == written.data_pg_id
+                && written
+                    .written_shards
+                    .iter()
+                    .any(|shard| shard.key == observation.key.shard_key)
+        });
+        assert!(
+            !unresolved_unreferenced,
+            "published metadata reference should resolve the apparent orphan observations"
+        );
+    }
+
+    #[test]
+    fn cluster_shard_scavenger_reports_wrong_node_file_and_expected_missing_file() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let local_map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = local_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let (bucket, key, _object_pg, _data_pg) =
+            bucket_key_with_distinct_object_and_data_pg(topology);
+        let map = Arc::new(local_map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let reservation_id =
+            crate::SessionId::try_from("68686868686868686868686868686868".to_string()).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        let payload = b"wrong-node shard scavenger candidate";
+        let segment_okh = [0xd5; 16];
+        let written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                payload,
+            )
+            .unwrap();
+        let commit_req = direct_put_commit_req(
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id,
+                generation_id,
+                payload,
+                segment_okh,
+                written: &written,
+            },
+        );
+        let _outcome = cluster
+            .commit_direct_put_object_from_payload_shards(
+                &commit_req,
+                &written.written_shards,
+                |_| Ok::<(), ()>(()),
+            )
+            .unwrap();
+
+        let misplaced_shard = &written.written_shards[0].key;
+        let data_pg = DataPgId::new(PgId::new(written.data_pg_id));
+        let placement_key =
+            super::super::segment_payload_placement_key(&segment_okh, generation_id);
+        let locations = cluster
+            .place_payload_shards(data_pg, written.ec, &placement_key)
+            .unwrap();
+        let expected_node_id =
+            locations[usize::from(misplaced_shard.shard_index().get())].node_id();
+        let wrong_node_id = node_ids
+            .into_iter()
+            .find(|node_id| *node_id != expected_node_id)
+            .unwrap();
+        let expected_path = cluster
+            .test_payload_shard_file_path(
+                written.data_pg_id,
+                written.ec,
+                &segment_okh,
+                generation_id,
+                misplaced_shard.shard_index().get(),
+            )
+            .unwrap();
+        let shard_bytes = std::fs::read(&expected_path).unwrap();
+        std::fs::remove_file(&expected_path).unwrap();
+        let wrong_path = map
+            .node(wrong_node_id)
+            .unwrap()
+            .data_dir()
+            .join(format!("pg-{:04}", written.data_pg_id))
+            .join("shards")
+            .join(misplaced_shard.hex_prefix())
+            .join(misplaced_shard.hex());
+        std::fs::create_dir_all(wrong_path.parent().unwrap()).unwrap();
+        std::fs::write(&wrong_path, shard_bytes).unwrap();
+
+        let observations = cluster.audit_shard_storage_for_scavenger().unwrap();
+        assert!(
+            observations.iter().any(|observation| {
+                observation.reason == crate::ShardScavengerObservationReason::ShardRowWithoutFile
+                    && observation.resolved_at.is_none()
+                    && observation.key.node_id == expected_node_id.as_u32()
+                    && observation.key.data_pg_id == written.data_pg_id
+                    && observation.key.shard_key == *misplaced_shard
+            }),
+            "missing referenced shard must be reported at the expected placement node"
+        );
+        assert!(
+            observations.iter().any(|observation| {
+                observation.reason
+                    == crate::ShardScavengerObservationReason::UnreferencedShardRowAndFile
+                    && observation.resolved_at.is_none()
+                    && observation.key.node_id == wrong_node_id.as_u32()
+                    && observation.key.data_pg_id == written.data_pg_id
+                    && observation.key.shard_key == *misplaced_shard
+            }),
+            "same shard key on the wrong node must remain a distinct physical observation"
+        );
+    }
+
+    #[test]
     fn direct_put_command_id_race_drains_winner_and_reruns_precondition_action() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

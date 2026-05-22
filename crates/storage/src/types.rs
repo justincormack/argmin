@@ -2035,6 +2035,34 @@ pub struct MultipartReclaimRecord {
     pub parts: Vec<MultipartReclaimPartRecord>,
 }
 
+/// A payload shard set whose data PG is explicit in durable metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShardScavengerPlacedShardSetReference {
+    pub data_pg_id: u32,
+    pub okh: [u8; 16],
+    pub generation_id: GenerationId,
+    pub ec: EcShape,
+}
+
+/// A non-streamed MPU part whose data PG is derived from object topology.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShardScavengerRoutedMultipartPartReference {
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub object_generation_id: GenerationId,
+    pub part_number: u32,
+    pub part_okh: [u8; 16],
+    pub part_vid: GenerationId,
+    pub ec: EcShape,
+}
+
+/// Durable metadata reference to a payload shard set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShardScavengerPayloadReference {
+    Placed(ShardScavengerPlacedShardSetReference),
+    RoutedMultipartPart(ShardScavengerRoutedMultipartPartReference),
+}
+
 /// Public access block configuration for a bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PublicAccessBlockConfig {

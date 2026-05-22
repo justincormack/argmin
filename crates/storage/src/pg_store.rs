@@ -794,21 +794,21 @@ struct MetadataTableDigestStats {
 }
 
 #[derive(Debug, Clone)]
-struct ScavengerShardRow {
-    key: ShardKey,
-    ack: WriteAck,
+pub(crate) struct ScavengerShardRow {
+    pub(crate) key: ShardKey,
+    pub(crate) ack: WriteAck,
 }
 
 #[derive(Debug, Clone)]
-struct ScavengerShardFile {
-    key: ShardKey,
-    size: u64,
+pub(crate) struct ScavengerShardFile {
+    pub(crate) key: ShardKey,
+    pub(crate) size: u64,
 }
 
 #[derive(Debug, Clone)]
-struct ScavengerShardFileScan {
-    files: Vec<ScavengerShardFile>,
-    errors: Vec<String>,
+pub(crate) struct ScavengerShardFileScan {
+    pub(crate) files: Vec<ScavengerShardFile>,
+    pub(crate) errors: Vec<String>,
 }
 
 fn is_canonical_shard_prefix(prefix: &str) -> bool {
@@ -1151,7 +1151,54 @@ impl PgStore {
         self.list_shard_scavenger_observations()
     }
 
-    fn list_scavenger_shard_rows(&self) -> Result<Vec<ScavengerShardRow>, StoreError> {
+    pub(crate) fn list_shard_scavenger_payload_references(
+        &self,
+    ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {
+        let mut references = Vec::new();
+        self.extend_scavenger_placed_references(
+            &mut references,
+            "SELECT data_pg_id, segment_okh, segment_vid, ec_k, ec_m FROM object_segments",
+            "list object segment shard scavenger references",
+        )?;
+        self.extend_scavenger_placed_references(
+            &mut references,
+            "SELECT data_pg_id, part_okh, part_vid, ec_k, ec_m \
+             FROM object_parts WHERE part_okh != zeroblob(16)",
+            "list object part shard scavenger references",
+        )?;
+        self.extend_scavenger_placed_references(
+            &mut references,
+            "SELECT data_pg_id, segment_okh, segment_vid, ec_k, ec_m FROM stream_upload_segments",
+            "list stream upload segment shard scavenger references",
+        )?;
+        self.extend_scavenger_placed_references(
+            &mut references,
+            "SELECT data_pg_id, segment_okh, segment_vid, ec_k, ec_m FROM multipart_part_segments",
+            "list multipart part segment shard scavenger references",
+        )?;
+        self.extend_scavenger_placed_references(
+            &mut references,
+            "SELECT data_pg_id, segment_okh, segment_vid, ec_k, ec_m \
+             FROM object_segment_reclaim_segments",
+            "list object segment reclaim shard scavenger references",
+        )?;
+        self.extend_scavenger_placed_references(
+            &mut references,
+            "SELECT data_pg_id, part_okh, part_vid, ec_k, ec_m \
+             FROM multipart_reclaim_parts WHERE storage_kind = 0",
+            "list multipart reclaim part shard scavenger references",
+        )?;
+        self.extend_scavenger_placed_references(
+            &mut references,
+            "SELECT data_pg_id, segment_okh, segment_vid, ec_k, ec_m \
+             FROM multipart_reclaim_part_segments",
+            "list multipart reclaim segment shard scavenger references",
+        )?;
+        self.extend_scavenger_routed_multipart_part_references(&mut references)?;
+        Ok(references)
+    }
+
+    pub(crate) fn list_scavenger_shard_rows(&self) -> Result<Vec<ScavengerShardRow>, StoreError> {
         let mut stmt = self
             .conn
             .prepare_cached(
@@ -1192,7 +1239,91 @@ impl PgStore {
         Ok(shard_rows)
     }
 
-    fn list_scavenger_shard_files(&self) -> Result<ScavengerShardFileScan, StoreError> {
+    fn extend_scavenger_placed_references(
+        &self,
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        sql: &'static str,
+        context: &'static str,
+    ) -> Result<(), StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(sql)
+            .map_err(|source| StoreError::Db { context, source })?;
+        let rows = stmt
+            .query_map([], |row| {
+                let okh_blob: Vec<u8> = row.get(1)?;
+                Ok(ShardScavengerPayloadReference::Placed(
+                    ShardScavengerPlacedShardSetReference {
+                        data_pg_id: row.get(0)?,
+                        okh: PgStore::parse_okh_blob(&okh_blob, 1)?,
+                        generation_id: PgStore::parse_generation_id(
+                            row.get::<_, i64>(2)?,
+                            2,
+                            "shard scavenger reference generation",
+                        )?,
+                        ec: EcShape {
+                            k: row.get(3)?,
+                            m: row.get(4)?,
+                        },
+                    },
+                ))
+            })
+            .map_err(|source| StoreError::Db { context, source })?;
+        for row in rows {
+            references.push(row.map_err(|source| StoreError::Db { context, source })?);
+        }
+        Ok(())
+    }
+
+    fn extend_scavenger_routed_multipart_part_references(
+        &self,
+        references: &mut Vec<ShardScavengerPayloadReference>,
+    ) -> Result<(), StoreError> {
+        let context = "list routed multipart part shard scavenger references";
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT u.bucket, u.key, u.object_generation_id, p.part_number, \
+                 p.part_okh, p.part_vid, p.ec_k, p.ec_m \
+                 FROM multipart_parts p \
+                 JOIN multipart_uploads u ON u.upload_id = p.upload_id \
+                 WHERE p.part_okh != zeroblob(16)",
+            )
+            .map_err(|source| StoreError::Db { context, source })?;
+        let rows = stmt
+            .query_map([], |row| {
+                let okh_blob: Vec<u8> = row.get(4)?;
+                Ok(ShardScavengerPayloadReference::RoutedMultipartPart(
+                    ShardScavengerRoutedMultipartPartReference {
+                        bucket: row.get(0)?,
+                        key: row.get(1)?,
+                        object_generation_id: PgStore::parse_generation_id(
+                            row.get::<_, i64>(2)?,
+                            2,
+                            "multipart upload object generation",
+                        )?,
+                        part_number: row.get(3)?,
+                        part_okh: PgStore::parse_okh_blob(&okh_blob, 4)?,
+                        part_vid: PgStore::parse_generation_id(
+                            row.get::<_, i64>(5)?,
+                            5,
+                            "multipart part payload generation",
+                        )?,
+                        ec: EcShape {
+                            k: row.get(6)?,
+                            m: row.get(7)?,
+                        },
+                    },
+                ))
+            })
+            .map_err(|source| StoreError::Db { context, source })?;
+        for row in rows {
+            references.push(row.map_err(|source| StoreError::Db { context, source })?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn list_scavenger_shard_files(&self) -> Result<ScavengerShardFileScan, StoreError> {
         let mut files = Vec::new();
         let mut errors = Vec::new();
         for prefix in fs::read_dir(&self.shards_dir).map_err(|source| StoreError::Io {

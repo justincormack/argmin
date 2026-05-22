@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::Mutex;
 use std::sync::{Arc, Weak};
@@ -27,8 +28,10 @@ use crate::types::{
     MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectPartRecord,
     ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, PgId,
     PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SegmentStoredBytesRequest, SessionId,
-    ShardIndex, ShardKey, StreamUploadCommandRecord, StreamUploadRecord, StreamUploadSegmentRecord,
-    StreamUploadState, StreamUploadTarget, VersionId, WriteAck, WrittenShardAck,
+    ShardIndex, ShardKey, ShardScavengerObservation, ShardScavengerObservationReason,
+    ShardScavengerObservationRecord, ShardScavengerPayloadReference, StreamUploadCommandRecord,
+    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
+    VersionId, WriteAck, WrittenShardAck,
 };
 use crate::{BucketSnapshotLoadError, MetadataError, ObjectEtag, ObjectPgActionError};
 
@@ -82,6 +85,8 @@ pub struct MetadataCommandApplyContextTestHookGuard {
 }
 
 const TRACE_TARGET: &str = "storage";
+
+type ShardScavengerLocationIdentity = (u32, u32, ShardKey);
 
 fn conflicting_pending_object_metadata_command(context: &'static str) -> ObjectPgActionError {
     ObjectPgActionError::Store(StoreError::Io {
@@ -4169,6 +4174,254 @@ impl StorageCluster {
                 .map_err(ObjectPgActionError::Store)?;
             self.read_payload_shard(location, key, *ack)
                 .map_err(|error| ObjectPgActionError::Store(shard_io_error_to_store(error)))?;
+        }
+        Ok(())
+    }
+
+    pub fn audit_shard_storage_for_scavenger(
+        &self,
+    ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
+        let referenced_shards = self.collect_shard_scavenger_referenced_shards()?;
+        let mut expected_nodes_by_shard: HashMap<(u32, ShardKey), HashSet<u32>> = HashMap::new();
+        for (node_id, data_pg_id, shard_key) in &referenced_shards {
+            expected_nodes_by_shard
+                .entry((*data_pg_id, shard_key.clone()))
+                .or_default()
+                .insert(*node_id);
+        }
+        let mut observations = Vec::new();
+
+        for route in self.local_pg_routes() {
+            let primary_node = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), route.pg_id())?;
+            let primary_node_id = primary_node.node_id().as_u32();
+            let data_pg_id = route.pg_id().get();
+            let shard_rows = {
+                let data_pg = primary_node.storage_node().get_pg(data_pg_id)?;
+                data_pg.list_scavenger_shard_rows()?
+            };
+            let rows_by_key: HashMap<ShardKey, WriteAck> = shard_rows
+                .iter()
+                .map(|row| (row.key.clone(), row.ack))
+                .collect();
+
+            let mut files_by_node = Vec::new();
+            let mut scan_errors = Vec::new();
+            for node_id in self.local_map.node_ids() {
+                let Some(node) = self.local_map.node(node_id) else {
+                    continue;
+                };
+                let pg = node.storage_node().get_pg(data_pg_id)?;
+                match pg.list_scavenger_shard_files() {
+                    Ok(scan) if scan.errors.is_empty() => {
+                        files_by_node.push((node_id.as_u32(), scan.files));
+                    }
+                    Ok(scan) => {
+                        scan_errors.extend(
+                            scan.errors
+                                .into_iter()
+                                .map(|error| format!("node {}: {error}", node_id.as_u32())),
+                        );
+                    }
+                    Err(error) => {
+                        scan_errors.push(format!("node {}: {error}", node_id.as_u32()));
+                    }
+                }
+            }
+
+            let data_pg = primary_node.storage_node().get_pg(data_pg_id)?;
+            if !scan_errors.is_empty() {
+                observations.extend(data_pg.list_shard_scavenger_observations()?);
+                continue;
+            }
+
+            let mut active_observations = HashSet::new();
+            let mut file_locations = HashSet::new();
+            for (node_id, files) in files_by_node {
+                for file in files {
+                    file_locations.insert((node_id, data_pg_id, file.key.clone()));
+                    let observation_key = crate::types::ShardScavengerObservationKey {
+                        node_id,
+                        data_pg_id,
+                        shard_index: file.key.shard_index(),
+                        shard_key: file.key.clone(),
+                    };
+                    let Some(row_ack) = rows_by_key.get(&file.key).copied() else {
+                        active_observations.insert(observation_key.clone());
+                        data_pg.record_shard_scavenger_observation(
+                            &ShardScavengerObservationRecord {
+                                key: observation_key,
+                                data_size: Some(file.size),
+                                crc64: None,
+                                file_exists: true,
+                                shard_row_exists: false,
+                                reason: ShardScavengerObservationReason::FileWithoutShardRow,
+                                last_error: None,
+                            },
+                        )?;
+                        continue;
+                    };
+                    let shard_identity = (node_id, data_pg_id, file.key.clone());
+                    if referenced_shards.contains(&shard_identity) {
+                        continue;
+                    }
+                    active_observations.insert(observation_key.clone());
+                    data_pg.record_shard_scavenger_observation(
+                        &ShardScavengerObservationRecord {
+                            key: observation_key,
+                            data_size: Some(row_ack.stored_size),
+                            crc64: Some(row_ack.crc64),
+                            file_exists: true,
+                            shard_row_exists: true,
+                            reason: ShardScavengerObservationReason::UnreferencedShardRowAndFile,
+                            last_error: None,
+                        },
+                    )?;
+                }
+            }
+
+            for row in shard_rows {
+                let shard_identity = (data_pg_id, row.key.clone());
+                if let Some(expected_nodes) = expected_nodes_by_shard.get(&shard_identity) {
+                    for expected_node_id in expected_nodes {
+                        if file_locations.contains(&(
+                            *expected_node_id,
+                            data_pg_id,
+                            row.key.clone(),
+                        )) {
+                            continue;
+                        }
+                        let observation_key = crate::types::ShardScavengerObservationKey {
+                            node_id: *expected_node_id,
+                            data_pg_id,
+                            shard_index: row.key.shard_index(),
+                            shard_key: row.key.clone(),
+                        };
+                        active_observations.insert(observation_key.clone());
+                        data_pg.record_shard_scavenger_observation(
+                            &ShardScavengerObservationRecord {
+                                key: observation_key,
+                                data_size: Some(row.ack.stored_size),
+                                crc64: Some(row.ack.crc64),
+                                file_exists: false,
+                                shard_row_exists: true,
+                                reason: ShardScavengerObservationReason::ShardRowWithoutFile,
+                                last_error: None,
+                            },
+                        )?;
+                    }
+                    continue;
+                }
+
+                if file_locations.iter().any(|(_, file_data_pg_id, file_key)| {
+                    *file_data_pg_id == data_pg_id && file_key == &row.key
+                }) {
+                    continue;
+                }
+                let observation_key = crate::types::ShardScavengerObservationKey {
+                    node_id: primary_node_id,
+                    data_pg_id,
+                    shard_index: row.key.shard_index(),
+                    shard_key: row.key,
+                };
+                active_observations.insert(observation_key.clone());
+                data_pg.record_shard_scavenger_observation(&ShardScavengerObservationRecord {
+                    key: observation_key,
+                    data_size: Some(row.ack.stored_size),
+                    crc64: Some(row.ack.crc64),
+                    file_exists: false,
+                    shard_row_exists: true,
+                    reason: ShardScavengerObservationReason::ShardRowWithoutFile,
+                    last_error: None,
+                })?;
+            }
+
+            for observation in data_pg.list_shard_scavenger_observations()? {
+                if observation.key.data_pg_id != data_pg_id
+                    || observation.resolved_at.is_some()
+                    || !matches!(
+                        observation.reason,
+                        ShardScavengerObservationReason::FileWithoutShardRow
+                            | ShardScavengerObservationReason::ShardRowWithoutFile
+                            | ShardScavengerObservationReason::UnreferencedShardRowAndFile
+                    )
+                {
+                    continue;
+                }
+                if !active_observations.contains(&observation.key) {
+                    data_pg.resolve_shard_scavenger_observation(&observation.key)?;
+                }
+            }
+
+            observations.extend(data_pg.list_shard_scavenger_observations()?);
+        }
+
+        Ok(observations)
+    }
+
+    fn collect_shard_scavenger_referenced_shards(
+        &self,
+    ) -> Result<HashSet<ShardScavengerLocationIdentity>, StoreError> {
+        let mut referenced = HashSet::new();
+        let topology = self.metadata_primary_topology_node().pg_topology();
+
+        for route in self.local_pg_routes() {
+            let node = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), route.pg_id())?;
+            let pg = node.storage_node().get_pg(route.pg_id().get())?;
+            for reference in pg.list_shard_scavenger_payload_references()? {
+                match reference {
+                    ShardScavengerPayloadReference::Placed(reference) => {
+                        self.extend_referenced_shard_set(
+                            &mut referenced,
+                            reference.data_pg_id,
+                            &reference.okh,
+                            reference.generation_id,
+                            reference.ec,
+                        )?;
+                    }
+                    ShardScavengerPayloadReference::RoutedMultipartPart(reference) => {
+                        let data_pg_id = topology
+                            .object_generation_multipart_part_data_pg(
+                                &reference.bucket,
+                                &reference.key,
+                                reference.object_generation_id,
+                                reference.part_number,
+                            )
+                            .get();
+                        self.extend_referenced_shard_set(
+                            &mut referenced,
+                            data_pg_id,
+                            &reference.part_okh,
+                            reference.part_vid,
+                            reference.ec,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        Ok(referenced)
+    }
+
+    fn extend_referenced_shard_set(
+        &self,
+        referenced: &mut HashSet<ShardScavengerLocationIdentity>,
+        data_pg_id: u32,
+        okh: &[u8; 16],
+        generation_id: GenerationId,
+        ec: EcShape,
+    ) -> Result<(), StoreError> {
+        let data_pg = DataPgId::new(PgId::new(data_pg_id));
+        let placement_key = segment_payload_placement_key(okh, generation_id);
+        let locations = self
+            .place_payload_shards(data_pg, ec, &placement_key)
+            .map_err(cluster_build_error_to_store)?;
+        for key in Self::payload_shard_set_keys(okh, generation_id, ec) {
+            let location = Self::placed_payload_shard_location(&locations, &key)?;
+            referenced.insert((location.node_id().as_u32(), data_pg_id, key));
         }
         Ok(())
     }
