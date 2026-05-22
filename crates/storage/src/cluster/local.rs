@@ -8400,6 +8400,105 @@ mod tests {
     }
 
     #[test]
+    fn cluster_shard_scavenger_treats_pending_multipart_completion_as_referenced() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let local_map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = local_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let (bucket, key, object_pg, _data_pg) =
+            bucket_key_with_distinct_object_and_data_pg(topology);
+        let map = Arc::new(local_map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let (req, expected_segment) =
+            seed_streamed_multipart_completion(&cluster, &bucket, &key, "mpuscavenge");
+        let pg_id = PgId::new(object_pg);
+        let primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+            .unwrap();
+        let (command, _) =
+            pending_multipart_completion_command_for_test(&map, &cluster, pg_id, &req, 1234);
+        let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+        pg.try_insert_pending_metadata_command_slot(
+            primary.node_id().as_u32(),
+            &command,
+            Some(&bucket),
+        )
+        .unwrap();
+        pg.connection()
+            .execute(
+                "DELETE FROM multipart_part_segments WHERE upload_id = ?1",
+                rusqlite::params![req.upload_id.as_str()],
+            )
+            .unwrap();
+        drop(pg);
+
+        let ec = EcShape {
+            k: expected_segment.ec_k,
+            m: expected_segment.ec_m,
+        };
+        let shard_keys = (0..(ec.k + ec.m))
+            .map(|shard_index| {
+                ShardKey::new(
+                    &expected_segment.segment_okh,
+                    expected_segment.segment_vid.get(),
+                    shard_index,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let observations = cluster.audit_shard_storage_for_scavenger().unwrap();
+        let unresolved_unreferenced = observations.iter().any(|observation| {
+            observation.reason
+                == crate::ShardScavengerObservationReason::UnreferencedShardRowAndFile
+                && observation.resolved_at.is_none()
+                && observation.key.data_pg_id == expected_segment.data_pg_id
+                && shard_keys.contains(&observation.key.shard_key)
+        });
+        assert!(
+            !unresolved_unreferenced,
+            "pending multipart completion payload references should suppress apparent orphan observations"
+        );
+
+        let primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+            .unwrap();
+        let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+        pg.connection()
+            .execute(
+                "DELETE FROM metadata_command_pending_slot WHERE singleton = 0",
+                [],
+            )
+            .unwrap();
+        drop(pg);
+
+        let observations = cluster.audit_shard_storage_for_scavenger().unwrap();
+        let reported = observations
+            .iter()
+            .filter(|observation| {
+                observation.reason
+                    == crate::ShardScavengerObservationReason::UnreferencedShardRowAndFile
+                    && observation.resolved_at.is_none()
+                    && observation.key.data_pg_id == expected_segment.data_pg_id
+                    && shard_keys.contains(&observation.key.shard_key)
+            })
+            .count();
+        assert_eq!(
+            reported,
+            shard_keys.len(),
+            "without the pending multipart completion, every shard in the detached segment is an audit candidate"
+        );
+    }
+
+    #[test]
     fn cluster_shard_scavenger_reports_wrong_node_file_and_expected_missing_file() {
         let _serial = lock_metadata_command_apply_hook_test();
         let tmp = test_util::tempdir();

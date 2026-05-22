@@ -4112,7 +4112,9 @@ Proposed subphases:
      explicit `scan_incomplete` observation rows are recorded when reference or
      shard-file scans fail, including focused coverage for malformed durable
      pending command references; observation metrics and trace events are
-     emitted from the durable observation write path. Worker wiring remains.
+     emitted from the durable observation write path. Pending-command reference
+     suppression is covered for both direct PUT and multipart completion.
+     Worker wiring remains.
    - start with audit-only orphan detection, not deletion. Negative reference
      scans are too dangerous to use as delete authority while slow writers can
      have acknowledged shard files that are not yet published by metadata. A
@@ -4183,6 +4185,7 @@ Proposed subphases:
      - pending-command reference suppression for a payload-carrying cleanup
        shape beyond direct PUT, preferably an MPU cleanup or completion command
        whose referenced shard set exists only in the durable pending slot
+       (covered for multipart completion)
      - metadata publish fails closed if a previously acknowledged shard file is
        missing at final publish validation
    - exit when apparent unreferenced shard files are detected, persisted,
