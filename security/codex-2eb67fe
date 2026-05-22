@@ -1,0 +1,205 @@
+Stale bucket-finalizer claim can stall bucket deletion cleanup
+Link: https://chatgpt.com/codex/cloud/security/findings/0045f87d1578819193aefb4201c0cf9a?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: low (attack path: low)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 2eb67fe
+Author: justin@specialbusservice.com
+Created: 21/05/2026, 16:02:18
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Fix
+Fixed in: b89f1ca Fix bucket delete finalizer claim recovery
+
+The fix makes durable bucket-delete finalizer recovery claim-aware instead of
+only scanning the lexicographically first Deleting bucket in each metadata PG.
+The scan now returns a bounded set of finalizer roots per PG and prioritizes a
+still-valid expired singleton claim's exact bucket before unrelated deleting
+buckets, so stale claimed work can be rediscovered and converged after a worker
+crash. Claim acquisition still preserves a different-bucket singleton claim
+while that bucket is Deleting, preventing unrelated work from clearing the PG
+work-class owner, but it clears an expired claim if the claimed bucket is no
+longer Deleting.
+
+The scan and acquisition paths now use consistent lease semantics:
+`lease_deadline = NULL` means busy/non-expiring, while only
+`lease_deadline <= now` is treated as expired recovery work. Regression coverage
+was added for expired later-bucket claims hidden by an earlier deleting bucket,
+different-bucket claim preservation, stale non-deleting claim cleanup, and NULL
+deadline behavior.
+
+# Summary
+Introduced: production bucket-delete finalization now depends on a singleton durable claim and a durable scan that only discovers the first deleting bucket per PG. The existing different-bucket claim behavior becomes unsafe in production because the scan may never revisit the claimed bucket needed to clear an expired claim.
+The commit wires bucket delete finalization to the existing durable finalizer claim table and adds a periodic scan that enqueues only one deleting bucket per metadata PG, chosen lexicographically. Claim acquisition, however, refuses to clear or steal an expired claim unless it is for the same bucket/incarnation. If a worker crashes after claiming finalization for a lexicographically later bucket, and a lexicographically earlier bucket is also or later becomes Deleting, restart recovery will always enqueue the earlier bucket. That bucket's finalizer then calls acquire_bucket_delete_finalize_claim, sees the expired claim for a different bucket, returns None/Pending, and the scan repeats the same earlier bucket forever. The claimed later bucket is never enqueued, so the expired claim is never cleared and bucket finalization for that PG can be stuck indefinitely. This is an availability/storage-reclamation issue rather than a confidentiality or integrity bypass.
+
+# Validation
+## Rubric
+- [x] Confirm the durable recovery root discovers only one Deleting bucket per metadata PG and that selection is lexicographic (`ORDER BY name ASC LIMIT 1`).
+- [x] Confirm production durable scan enqueues only that single root bucket and does not enumerate other Deleting buckets on the same PG.
+- [x] Confirm bucket-delete finalizer claim acquisition uses a singleton claim and refuses to clear/steal an expired claim for a different bucket/incarnation.
+- [x] Confirm a failed claim acquisition is treated as Pending, so the work item is dropped and must rely on later scan rediscovery.
+- [x] Dynamically reproduce the stuck state: stale claim for later bucket B, earlier bucket A becomes scan root, A claim returns None repeatedly, and B is recoverable only if directly enqueued.
+## Report
+Validated the finding as a production logic/availability bug, not a memory crash. Key code facts: `crates/storage/src/pg_store.rs:11868-11876` implements `get_bucket_delete_finalize_root()` as `WHERE state = Deleting ORDER BY name ASC LIMIT 1`, so only the lexicographically first deleting bucket in a metadata PG is returned. `crates/storage/src/cluster/request_ops.rs:5936-5973` calls that once per PG and enqueues only `root.bucket`. `crates/storage/src/pg_store.rs:12183-12199` loads the singleton `bucket_delete_finalize_claims` row and, after the lease is expired, still returns `Ok(None)` if the existing claim is for different bucket/incarnation (`!same_work`). `crates/storage/src/cluster/request_ops.rs:2102-2108` converts `None` to `BucketDeleteFinalizeOutcome::Pending`, dropping that work item until a later scan. I added a targeted unit-test PoC in `poc_test.patch`: bucket B is marked Deleting and receives a claim with lease deadline 20; after time 21, lexicographically earlier bucket A is marked Deleting. The scan root remains A, but `acquire_bucket_delete_finalize_claim(A, ...)` returns `None` twice because the stale singleton claim belongs to B. A direct claim for B then succeeds with `attempt_count == 2`, proving the stale claim would be recoverable only if B were rediscovered. Command evidence: `cargo test -p storage poc_stale_later_bucket_claim_blocks_lexicographic_scan_root -- --nocapture` completed with `running 1 test ... ok`. I also attempted crash-style execution; the PoC does not crash because the bug is logical. Valgrind was attempted but unavailable (`bash: command not found: valgrind`). I used LLDB non-interactively with a breakpoint at `pg_store.rs:12197`; it stopped in `acquire_bucket_delete_finalize_claim` from the PoC with `same_work = false`, `claim_id = claim-a-new`, `now = 21`, and an existing claim record from the earlier B claim, confirming the expired different-bucket path that returns `None`.
+
+# Evidence
+crates/storage/src/cluster/request_ops.rs (L2085 to 2109)
+  Note: The finalizer treats a failed claim acquisition as Pending and drops the work item, causing the scanner to requeue the same blocked bucket repeatedly.
+```
+        let claim_id = self.next_bucket_delete_finalize_claim_id()?;
+        let owner_token = self.bucket_write_owner_token();
+        let claimed_at = crate::clock::current_time_millis();
+        let claim = {
+            let bucket_pg = self.metadata_pg(bucket_pg_id)?;
+            PgMetadataStore::acquire_bucket_delete_finalize_claim(
+                &*bucket_pg,
+                bucket,
+                bucket_incarnation_generation,
+                &claim_id,
+                &owner_token,
+                self.operation_epoch(),
+                claimed_at,
+                claimed_at.checked_add(60_000),
+                claimed_at,
+            )?
+        };
+        let Some(claim) = claim else {
+            let _ = observability::event(
+                super::TRACE_TARGET,
+                "bucket_finalize_claim_busy",
+                Some(format_args!("bucket={:?} pg_id={}", bucket, bucket_pg_id)),
+            );
+            return Ok(BucketDeleteFinalizeOutcome::Pending);
+        };
+```
+
+crates/storage/src/cluster/request_ops.rs (L5936 to 5973)
+  Note: The periodic durable scan enqueues just that single root bucket for each PG and does not scan or enqueue other deleting buckets.
+```
+    pub(crate) fn enqueue_durable_bucket_delete_finalize_roots(
+        &self,
+    ) -> DurableBucketDeleteFinalizeScan {
+        if self.operation_epoch() != self.cluster_epoch() {
+            return DurableBucketDeleteFinalizeScan::default();
+        }
+
+        let mut scan = DurableBucketDeleteFinalizeScan::default();
+        for pg_id in self.metadata_pg_ids() {
+            let pg = match self.metadata_pg(pg_id) {
+                Ok(pg) => pg,
+                Err(error) => {
+                    scan.errors += 1;
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "bucket_finalize_durable_scan_pg_error",
+                        Some(format_args!("pg_id={} error={:?}", pg_id, error)),
+                    );
+                    continue;
+                }
+            };
+            let root = match PgMetadataStore::get_bucket_delete_finalize_root(&*pg) {
+                Ok(root) => root,
+                Err(error) => {
+                    scan.errors += 1;
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "bucket_finalize_durable_scan_pg_error",
+                        Some(format_args!("pg_id={} error={:?}", pg_id, error)),
+                    );
+                    continue;
+                }
+            };
+            let Some(root) = root else {
+                continue;
+            };
+            self.enqueue_bucket_delete_finalize(&root.bucket);
+            scan.queued += 1;
+```
+
+crates/storage/src/pg_store.rs (L11868 to 11876)
+  Note: The durable recovery root returns only the first deleting bucket on the PG, so later deleting buckets, including one that owns a stale claim, may never be rediscovered.
+```
+    fn get_bucket_delete_finalize_root(
+        &self,
+    ) -> Result<Option<BucketDeleteFinalizeRoot>, MetadataError> {
+        self.query_row_cached_optional_metadata(
+            "SELECT name, bucket_incarnation_generation
+             FROM buckets
+             WHERE state = ?1
+             ORDER BY name ASC
+             LIMIT 1",
+```
+
+crates/storage/src/pg_store.rs (L12183 to 12199)
+  Note: Claim acquisition returns None for an expired claim belonging to a different bucket instead of clearing/stealing it or exposing the claimed bucket for recovery.
+```
+                if let Some(existing) = existing {
+                    let same_work = existing.bucket == *bucket
+                        && existing.bucket_incarnation_generation
+                            == bucket_incarnation_generation as u64;
+                    if same_work
+                        && existing.claim_id == claim_id
+                        && existing.owner_token == owner_token
+                        && existing.cluster_epoch == cluster_epoch
+                    {
+                        return Ok(Some(existing));
+                    }
+                    if existing.lease_deadline.is_none_or(|deadline| deadline > now) {
+                        return Ok(None);
+                    }
+                    if !same_work {
+                        return Ok(None);
+                    }
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Severity remains low. The code evidence supports the logic bug and the validation PoC demonstrates the stuck state at the storage layer, but the security impact is limited to availability/storage reclamation. Reachability is through production DeleteBucket, but strong authz applies and the exploit requires a stale expired claim from a crash/restart condition. There is no C/I impact, no privilege escalation, and no unauthenticated or reliable network-only exploit path.
+## Likelihood
+low - An attacker must already be authenticated and authorized to delete buckets, must arrange two relevant Deleting buckets in the same metadata PG with specific lexicographic ordering, and must rely on or induce a crash/interruption after a later bucket finalizer claim is acquired. Repository evidence does not show a direct external way to force that crash at the needed point.
+## Impact
+low - The proven effect is stalled bucket deletion cleanup and delayed/permanent storage reclamation for a metadata PG. It does not bypass authentication or authorization, disclose data, corrupt live objects, or execute code. Service capacity may degrade if unreclaimed deleted-bucket data accumulates.
+## Assumptions
+- The attacker has valid S3 credentials with permission to create/delete buckets or otherwise cause buckets they control to enter Deleting state.
+- A worker/process crash or equivalent interruption can leave a bucket-delete finalizer claim persisted until its lease expires.
+- The affected deployment has at least two Deleting buckets in the same metadata placement group where the stale-claimed bucket is lexicographically later than another Deleting bucket.
+- No repository deployment manifests were present to prove public internet exposure; exposure is inferred from the configurable HTTP listener.
+- authenticated DeleteBucket-capable requester
+- two Deleting buckets in the same metadata PG with attacker-influenced names/order
+- stale bucket_delete_finalize_claims singleton row for the lexicographically later bucket
+- claim lease expired before recovery scan attempts the earlier bucket
+## Path
+HTTP DELETE bucket -> Deleting state -> finalizer claim for B -> crash/stale claim
+                                      -> recovery scan: ORDER BY name ASC LIMIT 1 selects A
+                                      -> acquire(A) sees expired different-bucket claim B and returns None
+                                      -> Pending/drop -> repeat A forever -> cleanup stall
+## Path evidence
+- `crates/argmin-s3/src/config.rs:51-65` - Runtime configuration is environment-driven; credentials are required and the listener defaults to 127.0.0.1:9000 with optional limits.
+- `crates/argmin-s3/src/main.rs:184-247` - Main production binary binds the configured TCP listener and starts the HTTP/TLS server with configured connection and in-flight request limits.
+- `crates/server-http/src/http/router.rs:437-442` - HTTP DELETE on a bucket route maps to S3Operation::DeleteBucket.
+- `crates/server-http/src/http/mod.rs:1288-1295` - DeleteBucket requests are dispatched to Coordinator::delete_bucket using the authenticated requester.
+- `crates/server-core/src/coordinator/authz/bucket.rs:90-101` - DeleteBucket is authorization-gated through authorize_loaded_bucket_write_action_for with PolicyAction::DeleteBucket.
+- `crates/server-core/src/coordinator/bucket.rs:339-367` - Authorized bucket deletion marks the bucket for deletion and enqueues bucket-delete finalization.
+- `crates/storage/src/schema.rs:347-362` - bucket_delete_finalize_claims is a singleton table keyed by singleton = 0, so one claim can block unrelated bucket finalization work in the same metadata store.
+- `crates/storage/src/pg_store.rs:11868-11876` - Durable recovery root selection returns only the lexicographically first Deleting bucket in the PG.
+- `crates/storage/src/cluster/request_ops.rs:5936-5973` - Periodic durable scan enqueues only the single selected root bucket for each metadata PG.
+- `crates/storage/src/pg_store.rs:12183-12199` - Claim acquisition returns None for an expired claim belonging to a different bucket/incarnation instead of clearing, stealing, or exposing that stale-claimed bucket for recovery.
+- `crates/storage/src/cluster/request_ops.rs:2102-2108` - The finalizer converts failed claim acquisition to Pending, causing the queued work item to be dropped until a later scan repeats the same blocked path.
+- `crates/storage/src/cluster/request_ops.rs:5613-5616` - The reclaim worker periodically invokes durable bucket-delete finalization root scanning.
+## Narrative
+The finding is a real production logic bug in the bucket-delete finalization path. The repository shows DeleteBucket is reachable through the HTTP S3 API and authorized in server-core, then storage asynchronously finalizes deletion. The recovery scan selects only one Deleting bucket per metadata PG using ORDER BY name ASC LIMIT 1, while the durable claim table is a singleton. If a stale expired claim belongs to a different, lexicographically later bucket, acquire_bucket_delete_finalize_claim returns None instead of clearing or recovering that claim. The finalizer treats None as Pending and drops the work item, so repeated scans can keep requeueing the earlier bucket and never rediscover the stale-claimed bucket. This supports the original low severity: impact is availability/storage reclamation only, and exploitation requires valid bucket-delete privilege plus an unusual crash/stale-lease condition.
+## Controls
+- AWS SigV4 authentication is required for private bucket operations
+- DeleteBucket is protected by server-core bucket write authorization
+- Default listener is localhost 127.0.0.1:9000 unless configured otherwise
+- HTTP server has max connection and max in-flight request limits
+- Claim leases exist, but expired different-bucket singleton claims are not cleared by the blocked recovery path
+## Blindspots
+- Static repository review found no deployment manifests, so public exposure and load balancer type could not be verified.
+- The provided PoC is a targeted storage-layer test, not a full end-to-end HTTP exploit.
+- No repository evidence proves an attacker can reliably crash the worker after acquiring the finalizer claim.
+- Cross-account impact depends on deployment/multi-tenant use and bucket placement in the same metadata PG, which were not externally validated.
