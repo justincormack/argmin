@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::Mutex;
 use std::sync::{Arc, Weak};
@@ -28,10 +28,11 @@ use crate::types::{
     MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectPartRecord,
     ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, PgId,
     PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SegmentStoredBytesRequest, SessionId,
-    ShardIndex, ShardKey, ShardScavengerObservation, ShardScavengerObservationReason,
-    ShardScavengerObservationRecord, ShardScavengerPayloadReference, StreamUploadCommandRecord,
-    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
-    VersionId, WriteAck, WrittenShardAck,
+    ShardIndex, ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
+    ShardScavengerObservationReason, ShardScavengerObservationRecord,
+    ShardScavengerPayloadReference, StreamUploadCommandRecord, StreamUploadRecord,
+    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, VersionId, WriteAck,
+    WrittenShardAck,
 };
 use crate::{BucketSnapshotLoadError, MetadataError, ObjectEtag, ObjectPgActionError};
 
@@ -4181,7 +4182,15 @@ impl StorageCluster {
     pub fn audit_shard_storage_for_scavenger(
         &self,
     ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
-        let referenced_shards = self.collect_shard_scavenger_referenced_shards()?;
+        let referenced_scan = self.collect_shard_scavenger_referenced_shards();
+        let mut reference_scan_errors = Vec::new();
+        let referenced_shards = match referenced_scan {
+            Ok(referenced_shards) => referenced_shards,
+            Err(error) => {
+                reference_scan_errors.push(format!("reference scan failed: {error}"));
+                HashSet::new()
+            }
+        };
         let mut expected_nodes_by_shard: HashMap<(u32, ShardKey), HashSet<u32>> = HashMap::new();
         for (node_id, data_pg_id, shard_key) in &referenced_shards {
             expected_nodes_by_shard
@@ -4221,17 +4230,37 @@ impl StorageCluster {
                         scan_errors.extend(
                             scan.errors
                                 .into_iter()
-                                .map(|error| format!("node {}: {error}", node_id.as_u32())),
+                                .map(|error| (node_id.as_u32(), error)),
                         );
                     }
                     Err(error) => {
-                        scan_errors.push(format!("node {}: {error}", node_id.as_u32()));
+                        scan_errors.push((node_id.as_u32(), error.to_string()));
                     }
                 }
             }
 
             let data_pg = primary_node.storage_node().get_pg(data_pg_id)?;
+            if !reference_scan_errors.is_empty() {
+                self.record_shard_scavenger_scan_incomplete(
+                    &data_pg,
+                    primary_node_id,
+                    data_pg_id,
+                    &reference_scan_errors,
+                )?;
+                observations.extend(data_pg.list_shard_scavenger_observations()?);
+                continue;
+            }
+
             if !scan_errors.is_empty() {
+                let mut errors_by_node: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+                for (node_id, error) in scan_errors {
+                    errors_by_node.entry(node_id).or_default().push(error);
+                }
+                for (node_id, errors) in errors_by_node {
+                    self.record_shard_scavenger_scan_incomplete(
+                        &data_pg, node_id, data_pg_id, &errors,
+                    )?;
+                }
                 observations.extend(data_pg.list_shard_scavenger_observations()?);
                 continue;
             }
@@ -4345,6 +4374,7 @@ impl StorageCluster {
                         ShardScavengerObservationReason::FileWithoutShardRow
                             | ShardScavengerObservationReason::ShardRowWithoutFile
                             | ShardScavengerObservationReason::UnreferencedShardRowAndFile
+                            | ShardScavengerObservationReason::ScanIncomplete
                     )
                 {
                     continue;
@@ -4358,6 +4388,30 @@ impl StorageCluster {
         }
 
         Ok(observations)
+    }
+
+    fn record_shard_scavenger_scan_incomplete(
+        &self,
+        data_pg: &crate::PgStore,
+        node_id: u32,
+        data_pg_id: u32,
+        errors: &[String],
+    ) -> Result<(), StoreError> {
+        let shard_key = ShardKey::new(&[0; 16], 0, 0);
+        data_pg.record_shard_scavenger_observation(&ShardScavengerObservationRecord {
+            key: ShardScavengerObservationKey {
+                node_id,
+                data_pg_id,
+                shard_index: shard_key.shard_index(),
+                shard_key,
+            },
+            data_size: None,
+            crc64: None,
+            file_exists: false,
+            shard_row_exists: false,
+            reason: ShardScavengerObservationReason::ScanIncomplete,
+            last_error: Some(errors.join("; ")),
+        })
     }
 
     fn collect_shard_scavenger_referenced_shards(

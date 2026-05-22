@@ -8515,6 +8515,84 @@ mod tests {
     }
 
     #[test]
+    fn cluster_shard_scavenger_scan_incomplete_suppresses_negative_reference_claims() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let local_map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let data_pg_id = 2;
+        let primary = local_map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(data_pg_id))
+            .unwrap();
+        let primary_node_id = primary.node_id().as_u32();
+        let malformed_node_id = NodeId::new(1);
+        let candidate_key = ShardKey::new(&[0xd7; 16], 42, 1);
+        let pg = primary.storage_node().get_pg(data_pg_id).unwrap();
+        crate::traits::ShardStore::write_shard(&*pg, &candidate_key, b"candidate").unwrap();
+        drop(pg);
+
+        let malformed_dir = local_map
+            .node(malformed_node_id)
+            .unwrap()
+            .data_dir()
+            .join(format!("pg-{data_pg_id:04}"))
+            .join("shards")
+            .join("aa");
+        std::fs::create_dir_all(&malformed_dir).unwrap();
+        let malformed_path = malformed_dir.join("not-a-shard-key");
+        std::fs::write(&malformed_path, b"junk").unwrap();
+
+        let cluster = crate::StorageCluster::from_local_map(Arc::new(local_map)).unwrap();
+        let observations = cluster.audit_shard_storage_for_scavenger().unwrap();
+        assert!(
+            observations.iter().any(|observation| {
+                observation.reason == crate::ShardScavengerObservationReason::ScanIncomplete
+                    && observation.resolved_at.is_none()
+                    && observation.key.node_id == malformed_node_id.as_u32()
+                    && observation.key.data_pg_id == data_pg_id
+                    && observation
+                        .last_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("not-a-shard-key"))
+            }),
+            "incomplete shard file scan should be persisted as an audit observation"
+        );
+        assert!(
+            observations.iter().all(|observation| {
+                observation.reason
+                    != crate::ShardScavengerObservationReason::UnreferencedShardRowAndFile
+                    || observation.key.shard_key != candidate_key
+                    || observation.resolved_at.is_some()
+            }),
+            "negative-reference candidates from an incomplete scan must not be reported"
+        );
+
+        std::fs::remove_file(&malformed_path).unwrap();
+        let observations = cluster.audit_shard_storage_for_scavenger().unwrap();
+        assert!(
+            observations.iter().any(|observation| {
+                observation.reason == crate::ShardScavengerObservationReason::ScanIncomplete
+                    && observation.key.node_id == malformed_node_id.as_u32()
+                    && observation.key.data_pg_id == data_pg_id
+                    && observation.resolved_at.is_some()
+            }),
+            "a later complete scan should resolve the scan-incomplete observation"
+        );
+        assert!(
+            observations.iter().any(|observation| {
+                observation.reason
+                    == crate::ShardScavengerObservationReason::UnreferencedShardRowAndFile
+                    && observation.resolved_at.is_none()
+                    && observation.key.node_id == primary_node_id
+                    && observation.key.data_pg_id == data_pg_id
+                    && observation.key.shard_key == candidate_key
+            }),
+            "once the scan completes, the apparent unreferenced shard can be reported"
+        );
+    }
+
+    #[test]
     fn direct_put_command_id_race_drains_winner_and_reruns_precondition_action() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

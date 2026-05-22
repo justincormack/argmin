@@ -4109,8 +4109,8 @@ Proposed subphases:
      command payload references, and resolves apparent
      unreferenced observations once metadata is published. Pending-command
      reference decoding is implemented for payload-carrying command variants;
-     explicit `scan_incomplete` observation rows, metrics/log surfacing, and
-     worker wiring remain.
+     explicit `scan_incomplete` observation rows are recorded when reference or
+     shard-file scans fail; metrics/log surfacing and worker wiring remain.
    - start with audit-only orphan detection, not deletion. Negative reference
      scans are too dangerous to use as delete authority while slow writers can
      have acknowledged shard files that are not yet published by metadata. A
@@ -4169,7 +4169,8 @@ Proposed subphases:
        observation and surfaces an audit/corruption signal
      - if any metadata PG/reference scan fails, the scan records
        `scan_incomplete`, keeps existing observations conservative, and does
-       not report anything as stable/deletable
+       not report anything as stable/deletable (covered for cluster shard-file
+       scan failure; add focused reference-scan failure coverage later)
      - a later durable metadata reference clears or resolves a prior apparent
        orphan observation (covered for the cluster slow-writer publish path)
      - slow-writer simulation: shard files are written and acknowledged before
