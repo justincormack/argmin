@@ -19,7 +19,7 @@ use s3_types::{AclGrants, BucketObjectLockConfig, BucketVersioningState, Canonic
 #[cfg(test)]
 use crate::error::BucketWriteDrainError;
 use crate::error::{BucketSnapshotLoadError, ObjectPgActionError, StoreError};
-use crate::pg_store::PgStore;
+use crate::pg_store::{PgStore, ScavengerShardFileScan};
 use crate::pg_topology::PgTopology;
 use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 #[cfg(test)]
@@ -1279,6 +1279,25 @@ impl SharedStorageNode {
         }
     }
 
+    /// List local shard files for scavenger audit without taking the per-PG
+    /// metadata mutex.
+    pub(crate) fn list_scavenger_shard_files(
+        &self,
+        pg_id: u32,
+    ) -> Result<ScavengerShardFileScan, StoreError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "SharedStorageNode::list_scavenger_shard_files",
+            "pg_id={}",
+            pg_id
+        );
+        let paths = self
+            .pg_paths
+            .get(&pg_id)
+            .ok_or(StoreError::PgNotFound { pg_id })?;
+        PgStore::list_scavenger_shard_files_in_dir(&paths.shards_dir)
+    }
+
     /// Acquire an in-memory lease on an object payload generation.
     ///
     /// Returns false if this storage node has fenced the generation for
@@ -2005,6 +2024,32 @@ mod tests {
         assert!(matches!(err, StoreError::NotFound));
         pg.register_written_shard(&key, ack).unwrap();
         assert_eq!(pg.read_shard(&key).unwrap().data, b"hello");
+    }
+
+    #[test]
+    fn shared_node_scavenger_file_scan_does_not_wait_for_pg_mutex() {
+        let tmp = test_util::tempdir();
+        let node = Arc::new(SharedStorageNode::open(tmp.path(), &[0]).unwrap());
+        let key = crate::types::ShardKey::new(&[0xDE; 16], 7, 0);
+        node.write_shard_file(0, &key, b"hello").unwrap();
+
+        let pg_guard = node.get_pg(0).unwrap();
+        let scan_node = Arc::clone(&node);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let result = scan_node
+                .list_scavenger_shard_files(0)
+                .map(|scan| scan.files.len());
+            tx.send(result).unwrap();
+        });
+
+        let scanned = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("scavenger file scan should not wait for PgStore mutex")
+            .unwrap();
+        assert_eq!(scanned, 1);
+        drop(pg_guard);
+        handle.join().unwrap();
     }
 
     #[test]

@@ -8304,6 +8304,43 @@ mod tests {
     }
 
     #[test]
+    fn cluster_shard_scavenger_audit_does_not_wait_for_non_primary_pg_mutex() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut local_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        set_route_primary(&mut local_map, 0, NodeId::new(0));
+        let map = Arc::new(local_map);
+        let cluster = Arc::new(crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap());
+
+        let non_primary_pg_guard = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(0)
+            .unwrap();
+        let audit_cluster = Arc::clone(&cluster);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let result = audit_cluster
+                .audit_shard_storage_for_scavenger()
+                .map(|observations| observations.len());
+            tx.send(result).unwrap();
+        });
+
+        let audit_result = rx.recv_timeout(std::time::Duration::from_secs(1));
+        drop(non_primary_pg_guard);
+        assert!(
+            audit_result.is_ok(),
+            "cluster shard-scavenger audit should not wait for non-primary PgStore mutex"
+        );
+        assert_eq!(audit_result.unwrap().unwrap(), 0);
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn cluster_shard_scavenger_treats_pending_direct_put_as_referenced() {
         let _serial = lock_metadata_command_apply_hook_test();
         let tmp = test_util::tempdir();

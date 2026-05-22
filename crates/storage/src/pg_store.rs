@@ -1654,9 +1654,15 @@ impl PgStore {
     }
 
     pub(crate) fn list_scavenger_shard_files(&self) -> Result<ScavengerShardFileScan, StoreError> {
+        Self::list_scavenger_shard_files_in_dir(&self.shards_dir)
+    }
+
+    pub(crate) fn list_scavenger_shard_files_in_dir(
+        shards_dir: &Path,
+    ) -> Result<ScavengerShardFileScan, StoreError> {
         let mut files = Vec::new();
         let mut errors = Vec::new();
-        for prefix in fs::read_dir(&self.shards_dir).map_err(|source| StoreError::Io {
+        for prefix in fs::read_dir(shards_dir).map_err(|source| StoreError::Io {
             context: "scan shard prefix directory",
             source,
         })? {
