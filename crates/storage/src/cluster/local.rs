@@ -8304,6 +8304,102 @@ mod tests {
     }
 
     #[test]
+    fn cluster_shard_scavenger_treats_pending_direct_put_as_referenced() {
+        let _serial = lock_metadata_command_apply_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let local_map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = local_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let (bucket, key, object_pg, _data_pg) =
+            bucket_key_with_distinct_object_and_data_pg(topology);
+        let map = Arc::new(local_map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let reservation_id =
+            crate::SessionId::try_from("69696969696969696969696969696969".to_string()).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        let payload = b"pending direct put shard scavenger reference";
+        let segment_okh = [0xd6; 16];
+        let written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                payload,
+            )
+            .unwrap();
+        let shard_batch: Vec<(&crate::ShardKey, crate::WriteAck)> = written
+            .written_shards
+            .iter()
+            .map(|shard| (&shard.key, shard.ack))
+            .collect();
+        cluster
+            .register_payload_shard_acks(written.data_pg_id, &shard_batch)
+            .unwrap();
+
+        let commit_req = direct_put_commit_req(
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id,
+                generation_id,
+                payload,
+                segment_okh,
+                written: &written,
+            },
+        );
+        let pg_id = PgId::new(object_pg);
+        let primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+            .unwrap();
+        let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+        let command = cluster
+            .prepare_commit_direct_put_object_command(
+                pg_id,
+                &pg,
+                &commit_req,
+                crate::VersionId::Null,
+                commit_req.bucket_write_reservation.clone(),
+            )
+            .unwrap();
+        pg.try_insert_pending_metadata_command_slot(
+            primary.node_id().as_u32(),
+            &command,
+            Some(&bucket),
+        )
+        .unwrap();
+        drop(pg);
+
+        let observations = cluster.audit_shard_storage_for_scavenger().unwrap();
+        let unresolved_unreferenced = observations.iter().any(|observation| {
+            observation.reason
+                == crate::ShardScavengerObservationReason::UnreferencedShardRowAndFile
+                && observation.resolved_at.is_none()
+                && observation.key.data_pg_id == written.data_pg_id
+                && written
+                    .written_shards
+                    .iter()
+                    .any(|shard| shard.key == observation.key.shard_key)
+        });
+        assert!(
+            !unresolved_unreferenced,
+            "pending metadata command payload references should suppress apparent orphan observations"
+        );
+    }
+
+    #[test]
     fn cluster_shard_scavenger_reports_wrong_node_file_and_expected_missing_file() {
         let _serial = lock_metadata_command_apply_hook_test();
         let tmp = test_util::tempdir();

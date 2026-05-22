@@ -4105,10 +4105,12 @@ Proposed subphases:
      nodes for physical shard files, compares them with data-PG primary shard
      rows, builds a topology-aware reference set from object segments,
      committed MPU manifests, in-progress MPU parts, staged stream segments,
-     MPU segment rows, and durable reclaim roots, and resolves apparent
+     MPU segment rows, durable reclaim roots, and durable pending metadata
+     command payload references, and resolves apparent
      unreferenced observations once metadata is published. Pending-command
-     reference decoding, explicit `scan_incomplete` observation rows,
-     metrics/log surfacing, and worker wiring remain.
+     reference decoding is implemented for payload-carrying command variants;
+     explicit `scan_incomplete` observation rows, metrics/log surfacing, and
+     worker wiring remain.
    - start with audit-only orphan detection, not deletion. Negative reference
      scans are too dangerous to use as delete authority while slow writers can
      have acknowledged shard files that are not yet published by metadata. A
@@ -4131,9 +4133,8 @@ Proposed subphases:
      MPU shard-set segment rows in `multipart_part_segments`, staged stream
      upload segments, object/multipart reclaim roots, durable pending metadata
      commands, and terminal cleanup state that still owns payload cleanup.
-     Current code covers the table-backed sources and reclaim roots; durable
-     pending metadata command payload references remain to be decoded in this
-     phase.
+     Current code covers the table-backed sources, reclaim roots, and
+     payload-carrying durable pending metadata command variants.
    - classify observations at least as:
      - `file_without_shard_row`: a shard file exists but the data-PG `shards`
        row is missing
@@ -4174,6 +4175,9 @@ Proposed subphases:
      - slow-writer simulation: shard files are written and acknowledged before
        metadata publish; the audit scan may observe them but must not delete or
        block the later successful publish (covered for direct PUT)
+     - pending-command reference suppression for a payload-carrying cleanup
+       shape beyond direct PUT, preferably an MPU cleanup or completion command
+       whose referenced shard set exists only in the durable pending slot
      - metadata publish fails closed if a previously acknowledged shard file is
        missing at final publish validation
    - exit when apparent unreferenced shard files are detected, persisted,

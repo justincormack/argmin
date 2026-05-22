@@ -1195,7 +1195,310 @@ impl PgStore {
             "list multipart reclaim segment shard scavenger references",
         )?;
         self.extend_scavenger_routed_multipart_part_references(&mut references)?;
+        self.extend_scavenger_pending_command_references(&mut references)?;
         Ok(references)
+    }
+
+    fn extend_scavenger_pending_command_references(
+        &self,
+        references: &mut Vec<ShardScavengerPayloadReference>,
+    ) -> Result<(), StoreError> {
+        let Some(command_bytes) = self.query_row_cached_optional(
+            "SELECT command_bytes FROM metadata_command_pending_slot WHERE singleton = 0",
+            [],
+            "load pending metadata command for shard scavenger references",
+            |row| row.get::<_, Vec<u8>>(0),
+        )?
+        else {
+            return Ok(());
+        };
+        let command = decode_metadata_command_envelope(&command_bytes).map_err(|reason| {
+            StoreError::ShardScavengerScanIncomplete {
+                context: "decode pending metadata command for shard scavenger references",
+                errors: reason,
+            }
+        })?;
+        self.extend_scavenger_command_payload_references(references, command.payload());
+        Ok(())
+    }
+
+    fn extend_scavenger_command_payload_references(
+        &self,
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        payload: &MetadataCommandPayload,
+    ) {
+        match payload {
+            MetadataCommandPayload::CommitDirectPutObject(command) => {
+                Self::extend_object_segment_references(references, &command.segments);
+                if let Some(stale_payload) = &command.stale_payload {
+                    Self::extend_reclaim_payload_references(references, stale_payload);
+                }
+            }
+            MetadataCommandPayload::CommitMultipartObject(command) => {
+                Self::extend_object_part_references(references, &command.parts);
+                Self::extend_multipart_part_segment_references(
+                    references,
+                    &command.selected_streaming_segments,
+                );
+                Self::extend_routed_multipart_part_references(
+                    references,
+                    &command.object.bucket,
+                    &command.object.key,
+                    command.object.generation_id,
+                    &command.omitted_parts,
+                );
+                Self::extend_multipart_part_segment_references(
+                    references,
+                    &command.omitted_streaming_segments,
+                );
+                Self::extend_stream_segment_references(references, &command.stream_upload_segments);
+                if let Some(stale_payload) = &command.stale_payload {
+                    Self::extend_reclaim_payload_references(references, stale_payload);
+                }
+            }
+            MetadataCommandPayload::DeleteObjectVersion(command) => {
+                if let DeleteObjectVersionTarget::Live { payload, .. } = &command.target {
+                    Self::extend_reclaim_payload_references(references, payload);
+                }
+            }
+            MetadataCommandPayload::InsertDeleteMarker(command) => {
+                if let Some(stale_payload) = &command.stale_payload {
+                    Self::extend_reclaim_payload_references(references, stale_payload);
+                }
+            }
+            MetadataCommandPayload::AppendStreamSegment(command) => {
+                Self::extend_stream_segment_reference(references, &command.segment);
+            }
+            MetadataCommandPayload::AbortStreamUpload(command) => {
+                Self::extend_stream_segment_references(references, &command.staged_segments);
+            }
+            MetadataCommandPayload::CommitStreamPart(command) => {
+                Self::extend_multipart_part_segment_references(references, &command.segments);
+                if let Some(existing_part) = &command.existing_part {
+                    Self::extend_routed_multipart_part_references(
+                        references,
+                        &command.upload.bucket,
+                        &command.upload.key,
+                        command.upload.object_generation_id,
+                        std::slice::from_ref(existing_part),
+                    );
+                }
+                Self::extend_multipart_part_segment_references(
+                    references,
+                    &command.displaced_segments,
+                );
+            }
+            MetadataCommandPayload::AbortMultipartUpload(command) => {
+                Self::extend_routed_multipart_part_references(
+                    references,
+                    &command.cleanup.upload.bucket,
+                    &command.cleanup.upload.key,
+                    command.cleanup.upload.object_generation_id,
+                    &command.cleanup.parts,
+                );
+                Self::extend_multipart_part_segment_references(
+                    references,
+                    &command.cleanup.streaming_segments,
+                );
+                Self::extend_stream_segment_references(
+                    references,
+                    &command.cleanup.stream_upload_segments,
+                );
+            }
+            MetadataCommandPayload::DeleteObjectPayloadReclaim(command) => {
+                Self::extend_reclaim_payload_references(references, &command.payload);
+            }
+            MetadataCommandPayload::CreateBucket(_)
+            | MetadataCommandPayload::PutBucketVersioning(_)
+            | MetadataCommandPayload::PutBucketAcl(_)
+            | MetadataCommandPayload::PutBucketProperty(_)
+            | MetadataCommandPayload::PutBucketSubresource(_)
+            | MetadataCommandPayload::MarkBucketDeleting(_)
+            | MetadataCommandPayload::ReserveObjectGeneration(_)
+            | MetadataCommandPayload::ReleaseObjectGeneration(_)
+            | MetadataCommandPayload::ReserveObjectVersion(_)
+            | MetadataCommandPayload::PutObjectMetadata(_)
+            | MetadataCommandPayload::CreateStreamUpload(_)
+            | MetadataCommandPayload::CreateMultipartUpload(_)
+            | MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
+            | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {}
+        }
+    }
+
+    fn extend_object_segment_references(
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        segments: &[ObjectSegmentRecord],
+    ) {
+        for segment in segments {
+            Self::push_placed_reference(
+                references,
+                segment.data_pg_id,
+                segment.segment_okh,
+                segment.segment_vid,
+                EcShape {
+                    k: segment.ec_k,
+                    m: segment.ec_m,
+                },
+            );
+        }
+    }
+
+    fn extend_object_part_references(
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        parts: &[ObjectPartRecord],
+    ) {
+        for part in parts {
+            if part.part_okh == [0; 16] {
+                continue;
+            }
+            Self::push_placed_reference(
+                references,
+                part.data_pg_id,
+                part.part_okh,
+                part.part_vid,
+                EcShape {
+                    k: part.ec_k,
+                    m: part.ec_m,
+                },
+            );
+        }
+    }
+
+    fn extend_stream_segment_references(
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        segments: &[StreamUploadSegmentRecord],
+    ) {
+        for segment in segments {
+            Self::extend_stream_segment_reference(references, segment);
+        }
+    }
+
+    fn extend_stream_segment_reference(
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        segment: &StreamUploadSegmentRecord,
+    ) {
+        Self::push_placed_reference(
+            references,
+            segment.data_pg_id,
+            segment.segment_okh,
+            segment.segment_vid,
+            EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            },
+        );
+    }
+
+    fn extend_multipart_part_segment_references(
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        segments: &[MultipartPartSegmentRecord],
+    ) {
+        for segment in segments {
+            Self::push_placed_reference(
+                references,
+                segment.data_pg_id,
+                segment.segment_okh,
+                segment.segment_vid,
+                EcShape {
+                    k: segment.ec_k,
+                    m: segment.ec_m,
+                },
+            );
+        }
+    }
+
+    fn extend_routed_multipart_part_references(
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        object_generation_id: GenerationId,
+        parts: &[MultipartPartRecord],
+    ) {
+        for part in parts {
+            if part.part_okh == [0; 16] {
+                continue;
+            }
+            references.push(ShardScavengerPayloadReference::RoutedMultipartPart(
+                ShardScavengerRoutedMultipartPartReference {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    object_generation_id,
+                    part_number: part.part_number,
+                    part_okh: part.part_okh,
+                    part_vid: part.part_vid,
+                    ec: EcShape {
+                        k: part.ec_k,
+                        m: part.ec_m,
+                    },
+                },
+            ));
+        }
+    }
+
+    fn extend_reclaim_payload_references(
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        payload: &ObjectPayloadReclaimCommand,
+    ) {
+        match payload {
+            ObjectPayloadReclaimCommand::Segments(reclaim) => {
+                for segment in &reclaim.segments {
+                    Self::push_placed_reference(
+                        references,
+                        segment.data_pg_id,
+                        segment.segment_okh,
+                        segment.segment_vid,
+                        segment.ec,
+                    );
+                }
+            }
+            ObjectPayloadReclaimCommand::Multipart(reclaim) => {
+                for part in &reclaim.parts {
+                    match part {
+                        MultipartReclaimPartRecord::ShardSet {
+                            part_okh,
+                            part_vid,
+                            data_pg_id,
+                            ec,
+                            ..
+                        } => Self::push_placed_reference(
+                            references,
+                            *data_pg_id,
+                            *part_okh,
+                            *part_vid,
+                            *ec,
+                        ),
+                        MultipartReclaimPartRecord::Segments { segments, .. } => {
+                            for segment in segments {
+                                Self::push_placed_reference(
+                                    references,
+                                    segment.data_pg_id,
+                                    segment.segment_okh,
+                                    segment.segment_vid,
+                                    segment.ec,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn push_placed_reference(
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        data_pg_id: u32,
+        okh: [u8; 16],
+        generation_id: GenerationId,
+        ec: EcShape,
+    ) {
+        references.push(ShardScavengerPayloadReference::Placed(
+            ShardScavengerPlacedShardSetReference {
+                data_pg_id,
+                okh,
+                generation_id,
+                ec,
+            },
+        ));
     }
 
     pub(crate) fn list_scavenger_shard_rows(&self) -> Result<Vec<ScavengerShardRow>, StoreError> {
