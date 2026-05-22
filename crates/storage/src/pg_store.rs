@@ -78,6 +78,20 @@ FROM buckets WHERE name = ?1";
 /// Must differ from any real version_id (0 for unversioned, 1+ for versioned) so that
 /// in-progress staging rows are invisible to reads of completed objects.
 const PART_SEGMENT_STAGING_VERSION_ID: VersionId = MULTIPART_PART_SEGMENT_STAGING_VERSION_ID;
+
+fn shard_scavenger_observation_reason_name(
+    reason: ShardScavengerObservationReason,
+) -> &'static str {
+    match reason {
+        ShardScavengerObservationReason::FileWithoutShardRow => "file_without_shard_row",
+        ShardScavengerObservationReason::ShardRowWithoutFile => "shard_row_without_file",
+        ShardScavengerObservationReason::UnreferencedShardRowAndFile => {
+            "unreferenced_shard_row_and_file"
+        }
+        ShardScavengerObservationReason::ScanIncomplete => "scan_incomplete",
+    }
+}
+
 #[cfg(test)]
 type StreamSessionRow = (u8, u8, BucketName, ObjectKey, Option<UploadId>, Option<i64>);
 
@@ -947,6 +961,19 @@ impl PgStore {
                 context: "record shard scavenger observation",
                 source,
             })?;
+        let _ = observability::emit_shard_scavenger_observation(
+            TRACE_TARGET,
+            observability::ShardScavengerObservationSummary {
+                node_id: observation.key.node_id,
+                data_pg_id: observation.key.data_pg_id,
+                shard_index: observation.key.shard_index.get(),
+                shard_key_hex: &observation.key.shard_key.hex(),
+                reason: shard_scavenger_observation_reason_name(observation.reason),
+                file_exists: observation.file_exists,
+                shard_row_exists: observation.shard_row_exists,
+                last_error: observation.last_error.as_deref(),
+            },
+        );
         Ok(())
     }
 

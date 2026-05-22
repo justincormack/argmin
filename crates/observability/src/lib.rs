@@ -89,6 +89,8 @@ static REQUEST_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SLOW_REQUEST_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BUCKET_LOCK_WAIT_EXCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static MULTIPART_COMPLETION_BUCKET_LOCK_WAIT_EXCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHARD_SCAVENGER_OBSERVATION_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHARD_SCAVENGER_SCAN_INCOMPLETE_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 const TRACE_FILE_QUEUE_CAPACITY: usize = 16_384;
 const TRACE_FILE_IDLE_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
@@ -385,6 +387,18 @@ pub struct RequestSummary<'a> {
     pub lifetime_us: u128,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShardScavengerObservationSummary<'a> {
+    pub node_id: u32,
+    pub data_pg_id: u32,
+    pub shard_index: u8,
+    pub shard_key_hex: &'a str,
+    pub reason: &'static str,
+    pub file_exists: bool,
+    pub shard_row_exists: bool,
+    pub last_error: Option<&'a str>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MetricsSnapshot {
     pub inflight_requests: u64,
@@ -393,6 +407,8 @@ pub struct MetricsSnapshot {
     pub slow_request_total: u64,
     pub bucket_lock_wait_exceeded_total: u64,
     pub multipart_completion_bucket_lock_wait_exceeded_total: u64,
+    pub shard_scavenger_observation_total: u64,
+    pub shard_scavenger_scan_incomplete_total: u64,
 }
 
 pub struct InflightRequestsGuard {
@@ -424,6 +440,10 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
         bucket_lock_wait_exceeded_total: BUCKET_LOCK_WAIT_EXCEEDED_TOTAL.load(Ordering::Relaxed),
         multipart_completion_bucket_lock_wait_exceeded_total:
             MULTIPART_COMPLETION_BUCKET_LOCK_WAIT_EXCEEDED_TOTAL.load(Ordering::Relaxed),
+        shard_scavenger_observation_total: SHARD_SCAVENGER_OBSERVATION_TOTAL
+            .load(Ordering::Relaxed),
+        shard_scavenger_scan_incomplete_total: SHARD_SCAVENGER_SCAN_INCOMPLETE_TOTAL
+            .load(Ordering::Relaxed),
     }
 }
 
@@ -552,6 +572,31 @@ pub fn emit_multipart_completion_bucket_lock_wait_exceeded<T: fmt::Debug>(
         Some(format_args!(
             "bucket={:?} stripe={} wait_us={}",
             bucket, stripe, wait_us
+        )),
+    )
+}
+
+pub fn emit_shard_scavenger_observation(
+    target: &'static str,
+    summary: ShardScavengerObservationSummary<'_>,
+) -> bool {
+    SHARD_SCAVENGER_OBSERVATION_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if summary.reason == "scan_incomplete" {
+        SHARD_SCAVENGER_SCAN_INCOMPLETE_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    event(
+        target,
+        "shard_scavenger_observation",
+        Some(format_args!(
+            "node_id={} data_pg_id={} shard_index={} shard_key={} reason={} file_exists={} shard_row_exists={} last_error={}",
+            summary.node_id,
+            summary.data_pg_id,
+            summary.shard_index,
+            summary.shard_key_hex,
+            summary.reason,
+            summary.file_exists,
+            summary.shard_row_exists,
+            summary.last_error.map_or("<none>".to_string(), |error| escaped(error).to_string())
         )),
     )
 }
@@ -935,6 +980,19 @@ mod tests {
         emit_slow_request(&ctx, "server_http", summary, "error", Some("InternalError"));
         emit_bucket_lock_wait_exceeded(&ctx, "storage", &"bucket", 3, 1_500);
         emit_multipart_completion_bucket_lock_wait_exceeded(&ctx, "storage", &"bucket", 7, 2_500);
+        emit_shard_scavenger_observation(
+            "storage",
+            ShardScavengerObservationSummary {
+                node_id: 1,
+                data_pg_id: 2,
+                shard_index: 3,
+                shard_key_hex: "0000000000000000000000000000000000000000000000000000000000000000",
+                reason: "scan_incomplete",
+                file_exists: false,
+                shard_row_exists: false,
+                last_error: Some("scan failed"),
+            },
+        );
 
         let after = metrics_snapshot();
         assert_eq!(after.request_finish_total, before.request_finish_total + 1);
@@ -947,6 +1005,14 @@ mod tests {
         assert_eq!(
             after.multipart_completion_bucket_lock_wait_exceeded_total,
             before.multipart_completion_bucket_lock_wait_exceeded_total + 1
+        );
+        assert_eq!(
+            after.shard_scavenger_observation_total,
+            before.shard_scavenger_observation_total + 1
+        );
+        assert_eq!(
+            after.shard_scavenger_scan_incomplete_total,
+            before.shard_scavenger_scan_incomplete_total + 1
         );
     }
 
