@@ -441,7 +441,7 @@ production_metadata_methods=$(
             || name == "payload_reclaim_exists" \
             || name == "get_bucket_payload_reclaim_root" \
             || name == "get_payload_reclaim_root" \
-            || name == "get_bucket_delete_finalize_root" \
+            || name == "get_bucket_delete_finalize_roots" \
             || name == "acquire_object_payload_reclaim_claim" \
             || name == "release_object_payload_reclaim_claim" \
             || name == "acquire_bucket_delete_finalize_claim" \

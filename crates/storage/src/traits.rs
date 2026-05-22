@@ -506,13 +506,17 @@ pub(crate) trait PgMetadataStore {
     /// were lost across process restart.
     fn get_payload_reclaim_root(&self) -> Result<Option<PayloadReclaimRoot>, MetadataError>;
 
-    /// Return one deleting bucket on this metadata PG, if any exists.
+    /// Return deleting bucket finalizer roots on this metadata PG.
     ///
     /// Used by bucket finalizer workers to recover durable roots when local
-    /// wakeup hints were lost across process restart.
-    fn get_bucket_delete_finalize_root(
+    /// wakeup hints were lost across process restart. Expired singleton
+    /// finalizer claims are returned first so their exact work remains
+    /// recoverable even when another deleting bucket sorts earlier.
+    fn get_bucket_delete_finalize_roots(
         &self,
-    ) -> Result<Option<BucketDeleteFinalizeRoot>, MetadataError>;
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<BucketDeleteFinalizeRoot>, MetadataError>;
 
     /// Acquire the single durable object-payload reclaim claim for this PG.
     ///

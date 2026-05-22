@@ -10319,6 +10319,23 @@ fn bucket_delete_finalize_claim_from_row(
     })
 }
 
+fn bucket_delete_finalize_root_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<BucketDeleteFinalizeRoot, rusqlite::Error> {
+    let incarnation = row.get::<_, i64>(1)?;
+    let bucket_incarnation_generation = u64::try_from(incarnation).map_err(|source| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Integer,
+            Box::new(source),
+        )
+    })?;
+    Ok(BucketDeleteFinalizeRoot {
+        bucket: row.get(0)?,
+        bucket_incarnation_generation,
+    })
+}
+
 impl PgMetadataStore for PgStore {
     #[cfg(test)]
     fn create_bucket(
@@ -12823,33 +12840,90 @@ impl PgMetadataStore for PgStore {
         )
     }
 
-    fn get_bucket_delete_finalize_root(
+    fn get_bucket_delete_finalize_roots(
         &self,
-    ) -> Result<Option<BucketDeleteFinalizeRoot>, MetadataError> {
-        self.query_row_cached_optional_metadata(
-            "SELECT name, bucket_incarnation_generation
-             FROM buckets
-             WHERE state = ?1
-             ORDER BY name ASC
-             LIMIT 1",
-            params![BucketState::Deleting as u8],
-            "get bucket delete finalize root",
-            |row| {
-                let incarnation = row.get::<_, i64>(1)?;
-                let bucket_incarnation_generation =
-                    u64::try_from(incarnation).map_err(|source| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            1,
-                            rusqlite::types::Type::Integer,
-                            Box::new(source),
-                        )
-                    })?;
-                Ok(BucketDeleteFinalizeRoot {
-                    bucket: row.get(0)?,
-                    bucket_incarnation_generation,
-                })
-            },
-        )
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<BucketDeleteFinalizeRoot>, MetadataError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let now = i64::try_from(now).map_err(|source| MetadataError::Db {
+            context: "get bucket delete finalize roots now",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
+        let limit_i64 = i64::try_from(limit).map_err(|source| MetadataError::Db {
+            context: "get bucket delete finalize roots limit",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
+
+        let mut roots = Vec::new();
+        let expired_claim_root = self.query_row_cached_optional_metadata(
+            "SELECT c.bucket, c.bucket_incarnation_generation
+             FROM bucket_delete_finalize_claims c
+             JOIN buckets b
+               ON b.name = c.bucket
+              AND b.bucket_incarnation_generation = c.bucket_incarnation_generation
+              AND b.state = ?1
+             WHERE c.singleton = 0
+               AND c.lease_deadline <= ?2",
+            params![BucketState::Deleting as u8, now],
+            "get expired bucket delete finalize claim root",
+            bucket_delete_finalize_root_from_row,
+        )?;
+        if let Some(root) = expired_claim_root {
+            roots.push(root);
+        }
+
+        if roots.len() == limit {
+            return Ok(roots);
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT name, bucket_incarnation_generation
+                 FROM buckets b
+                 WHERE b.state = ?1
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM bucket_delete_finalize_claims c
+                     WHERE c.singleton = 0
+                       AND c.bucket = b.name
+                       AND c.bucket_incarnation_generation = b.bucket_incarnation_generation
+                       AND (c.lease_deadline IS NULL OR c.lease_deadline > ?3)
+                   )
+                 ORDER BY name ASC
+                 LIMIT ?2",
+            )
+            .map_err(|source| MetadataError::Db {
+                context: "prepare get bucket delete finalize roots",
+                source,
+            })?;
+        let rows = stmt
+            .query_map(
+                params![BucketState::Deleting as u8, limit_i64, now],
+                bucket_delete_finalize_root_from_row,
+            )
+            .map_err(|source| MetadataError::Db {
+                context: "query get bucket delete finalize roots",
+                source,
+            })?;
+        for row in rows {
+            let root = row.map_err(|source| MetadataError::Db {
+                context: "row get bucket delete finalize roots",
+                source,
+            })?;
+            if roots.iter().any(|existing| existing == &root) {
+                continue;
+            }
+            roots.push(root);
+            if roots.len() == limit {
+                break;
+            }
+        }
+
+        Ok(roots)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -13153,25 +13227,56 @@ impl PgMetadataStore for PgStore {
                         return Ok(None);
                     }
                     if !same_work {
-                        return Ok(None);
+                        let existing_bucket_still_deleting = store
+                            .conn
+                            .query_row(
+                                "SELECT 1 FROM buckets \
+                                 WHERE name = ?1 AND state = ?2 AND bucket_incarnation_generation = ?3",
+                                params![
+                                    &existing.bucket,
+                                    BucketState::Deleting as u8,
+                                    existing.bucket_incarnation_generation as i64,
+                                ],
+                                |_| Ok(()),
+                            )
+                            .optional()
+                            .map_err(|source| MetadataError::Db {
+                                context: "acquire bucket delete finalize claim (check existing claim bucket)",
+                                source,
+                            })?
+                            .is_some();
+                        if existing_bucket_still_deleting {
+                            return Ok(None);
+                        }
+                        store
+                            .conn
+                            .execute(
+                                "DELETE FROM bucket_delete_finalize_claims WHERE singleton = 0",
+                                [],
+                            )
+                            .map_err(|source| MetadataError::Db {
+                                context: "clear expired terminal bucket delete finalize claim",
+                                source,
+                            })?;
+                    } else {
+                        attempt_count =
+                            i64::try_from(existing.attempt_count.saturating_add(1)).map_err(
+                                |source| MetadataError::Db {
+                                    context: "acquire bucket delete finalize claim attempt_count",
+                                    source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                                },
+                            )?;
+                        store
+                            .conn
+                            .execute(
+                                "DELETE FROM bucket_delete_finalize_claims WHERE singleton = 0",
+                                [],
+                            )
+                            .map_err(|source| MetadataError::Db {
+                                context: "clear expired bucket delete finalize claim",
+                                source,
+                            })?;
                     }
-                    attempt_count =
-                        i64::try_from(existing.attempt_count.saturating_add(1)).map_err(
-                            |source| MetadataError::Db {
-                                context: "acquire bucket delete finalize claim attempt_count",
-                                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
-                            },
-                        )?;
-                    store
-                        .conn
-                        .execute(
-                            "DELETE FROM bucket_delete_finalize_claims WHERE singleton = 0",
-                            [],
-                        )
-                        .map_err(|source| MetadataError::Db {
-                            context: "clear expired bucket delete finalize claim",
-                            source,
-                        })?;
                 }
 
                 let deleting_bucket_exists = store
@@ -16787,7 +16892,7 @@ mod tests {
     }
 
     #[test]
-    fn get_bucket_delete_finalize_root_returns_first_deleting_bucket() {
+    fn get_bucket_delete_finalize_roots_returns_deleting_buckets_in_order() {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 11).unwrap();
         let bucket_a = trusted_bucket_name("finalize-root-a");
@@ -16796,29 +16901,46 @@ mod tests {
         create_probe_bucket_direct(&store, &bucket_b);
 
         assert!(
-            store.get_bucket_delete_finalize_root().unwrap().is_none(),
+            store
+                .get_bucket_delete_finalize_roots(10, 16)
+                .unwrap()
+                .is_empty(),
             "active buckets are not finalizer roots"
         );
 
         store.mark_bucket_deleting(&bucket_b).unwrap();
         let bucket_b_record = store.head_bucket_record_raw(&bucket_b).unwrap();
         assert_eq!(
-            store.get_bucket_delete_finalize_root().unwrap(),
-            Some(BucketDeleteFinalizeRoot {
+            store.get_bucket_delete_finalize_roots(10, 16).unwrap(),
+            vec![BucketDeleteFinalizeRoot {
                 bucket: bucket_b.clone(),
                 bucket_incarnation_generation: bucket_b_record.bucket_incarnation_generation,
-            })
+            }]
         );
 
         store.mark_bucket_deleting(&bucket_a).unwrap();
         let bucket_a_record = store.head_bucket_record_raw(&bucket_a).unwrap();
         assert_eq!(
-            store.get_bucket_delete_finalize_root().unwrap(),
-            Some(BucketDeleteFinalizeRoot {
-                bucket: bucket_a,
+            store.get_bucket_delete_finalize_roots(10, 16).unwrap(),
+            vec![
+                BucketDeleteFinalizeRoot {
+                    bucket: bucket_a,
+                    bucket_incarnation_generation: bucket_a_record.bucket_incarnation_generation,
+                },
+                BucketDeleteFinalizeRoot {
+                    bucket: bucket_b,
+                    bucket_incarnation_generation: bucket_b_record.bucket_incarnation_generation,
+                }
+            ],
+            "scan roots should be deterministic when multiple deleting buckets exist"
+        );
+        assert_eq!(
+            store.get_bucket_delete_finalize_roots(10, 1).unwrap(),
+            vec![BucketDeleteFinalizeRoot {
+                bucket: trusted_bucket_name("finalize-root-a"),
                 bucket_incarnation_generation: bucket_a_record.bucket_incarnation_generation,
-            }),
-            "scan root should be deterministic when multiple deleting buckets exist"
+            }],
+            "scan root limit should bound work per pass"
         );
     }
 
@@ -16891,6 +17013,164 @@ mod tests {
                 ClusterEpoch::INITIAL,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn bucket_delete_finalize_claim_clears_expired_non_deleting_different_bucket() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 11).unwrap();
+        let bucket_a = trusted_bucket_name("finalize-stale-claim-a");
+        let bucket_b = trusted_bucket_name("finalize-stale-claim-b");
+        create_probe_bucket_direct(&store, &bucket_a);
+        create_probe_bucket_direct(&store, &bucket_b);
+        store.mark_bucket_deleting(&bucket_a).unwrap();
+        store.mark_bucket_deleting(&bucket_b).unwrap();
+        let bucket_a_record = store.head_bucket_record_raw(&bucket_a).unwrap();
+        let bucket_b_record = store.head_bucket_record_raw(&bucket_b).unwrap();
+
+        store
+            .acquire_bucket_delete_finalize_claim(
+                &bucket_b,
+                bucket_b_record.bucket_incarnation_generation,
+                "claim-b",
+                "owner-b",
+                ClusterEpoch::INITIAL,
+                10,
+                Some(20),
+                10,
+            )
+            .unwrap()
+            .expect("later bucket finalizer should be claimable");
+        store
+            .connection()
+            .execute(
+                "UPDATE buckets SET state = ?1 WHERE name = ?2",
+                params![BucketState::Active as u8, &bucket_b],
+            )
+            .unwrap();
+
+        let claimed_a = store
+            .acquire_bucket_delete_finalize_claim(
+                &bucket_a,
+                bucket_a_record.bucket_incarnation_generation,
+                "claim-a",
+                "owner-a",
+                ClusterEpoch::INITIAL,
+                21,
+                Some(40),
+                21,
+            )
+            .unwrap()
+            .expect("expired non-deleting different-bucket claim should be cleared");
+        assert_eq!(claimed_a.bucket, bucket_a);
+        assert_eq!(claimed_a.claim_id, "claim-a");
+        assert_eq!(claimed_a.attempt_count, 1);
+
+        store
+            .release_bucket_delete_finalize_claim(
+                &claimed_a.bucket,
+                claimed_a.bucket_incarnation_generation,
+                &claimed_a.claim_id,
+                &claimed_a.owner_token,
+                claimed_a.cluster_epoch,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn bucket_delete_finalize_roots_include_expired_claim_before_earlier_bucket() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 11).unwrap();
+        let bucket_a = trusted_bucket_name("finalize-claim-root-a");
+        let bucket_b = trusted_bucket_name("finalize-claim-root-b");
+        create_probe_bucket_direct(&store, &bucket_a);
+        create_probe_bucket_direct(&store, &bucket_b);
+        store.mark_bucket_deleting(&bucket_b).unwrap();
+        let bucket_b_record = store.head_bucket_record_raw(&bucket_b).unwrap();
+
+        store
+            .acquire_bucket_delete_finalize_claim(
+                &bucket_b,
+                bucket_b_record.bucket_incarnation_generation,
+                "claim-b",
+                "owner-b",
+                ClusterEpoch::INITIAL,
+                10,
+                Some(20),
+                10,
+            )
+            .unwrap()
+            .expect("later deleting bucket should be claimable");
+
+        store.mark_bucket_deleting(&bucket_a).unwrap();
+        let bucket_a_record = store.head_bucket_record_raw(&bucket_a).unwrap();
+        assert_eq!(
+            store.get_bucket_delete_finalize_roots(21, 16).unwrap(),
+            vec![
+                BucketDeleteFinalizeRoot {
+                    bucket: bucket_b.clone(),
+                    bucket_incarnation_generation: bucket_b_record.bucket_incarnation_generation,
+                },
+                BucketDeleteFinalizeRoot {
+                    bucket: bucket_a,
+                    bucket_incarnation_generation: bucket_a_record.bucket_incarnation_generation,
+                },
+            ],
+            "expired singleton claim work must be rediscovered before unrelated roots"
+        );
+        assert_eq!(
+            store.get_bucket_delete_finalize_roots(21, 1).unwrap(),
+            vec![BucketDeleteFinalizeRoot {
+                bucket: bucket_b,
+                bucket_incarnation_generation: bucket_b_record.bucket_incarnation_generation,
+            }],
+            "claim recovery must not be hidden by an earlier deleting bucket"
+        );
+    }
+
+    #[test]
+    fn bucket_delete_finalize_roots_skip_busy_null_deadline_claim() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 11).unwrap();
+        let bucket_a = trusted_bucket_name("finalize-null-claim-root-a");
+        let bucket_b = trusted_bucket_name("finalize-null-claim-root-b");
+        create_probe_bucket_direct(&store, &bucket_a);
+        create_probe_bucket_direct(&store, &bucket_b);
+        store.mark_bucket_deleting(&bucket_b).unwrap();
+        let bucket_b_record = store.head_bucket_record_raw(&bucket_b).unwrap();
+
+        store
+            .acquire_bucket_delete_finalize_claim(
+                &bucket_b,
+                bucket_b_record.bucket_incarnation_generation,
+                "claim-b",
+                "owner-b",
+                ClusterEpoch::INITIAL,
+                10,
+                None,
+                10,
+            )
+            .unwrap()
+            .expect("later deleting bucket should be claimable");
+
+        assert!(
+            store
+                .get_bucket_delete_finalize_roots(21, 16)
+                .unwrap()
+                .is_empty(),
+            "non-expiring finalizer claims should remain busy, not expired scan work"
+        );
+
+        store.mark_bucket_deleting(&bucket_a).unwrap();
+        let bucket_a_record = store.head_bucket_record_raw(&bucket_a).unwrap();
+        assert_eq!(
+            store.get_bucket_delete_finalize_roots(21, 16).unwrap(),
+            vec![BucketDeleteFinalizeRoot {
+                bucket: bucket_a,
+                bucket_incarnation_generation: bucket_a_record.bucket_incarnation_generation,
+            }],
+            "busy claimed buckets should not hide unrelated unclaimed deleting roots"
+        );
     }
 
     fn assert_metadata_state_digest_mismatch(err: StoreError) {

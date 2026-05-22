@@ -32,6 +32,7 @@ use crate::*;
 
 const INTERNAL_LIST_PAGE_SIZE: u32 = 1_000;
 const ORPHAN_OBJECT_PAYLOAD_RECLAIM_BUCKET_INCARNATION: u64 = 0;
+const BUCKET_DELETE_FINALIZE_SCAN_LIMIT_PER_PG: usize = 16;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct DurableObjectPayloadReclaimScan {
@@ -5954,8 +5955,12 @@ impl super::StorageCluster {
                     continue;
                 }
             };
-            let root = match PgMetadataStore::get_bucket_delete_finalize_root(&*pg) {
-                Ok(root) => root,
+            let roots = match PgMetadataStore::get_bucket_delete_finalize_roots(
+                &*pg,
+                crate::clock::current_time_millis(),
+                BUCKET_DELETE_FINALIZE_SCAN_LIMIT_PER_PG,
+            ) {
+                Ok(roots) => roots,
                 Err(error) => {
                     scan.errors += 1;
                     let _ = observability::event(
@@ -5966,11 +5971,10 @@ impl super::StorageCluster {
                     continue;
                 }
             };
-            let Some(root) = root else {
-                continue;
-            };
-            self.enqueue_bucket_delete_finalize(&root.bucket);
-            scan.queued += 1;
+            for root in roots {
+                self.enqueue_bucket_delete_finalize(&root.bucket);
+                scan.queued += 1;
+            }
         }
         scan
     }
