@@ -8593,6 +8593,117 @@ mod tests {
     }
 
     #[test]
+    fn cluster_shard_scavenger_reference_scan_failure_suppresses_negative_reference_claims() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let local_map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let data_pg_id = 2;
+        let primary = local_map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(data_pg_id))
+            .unwrap();
+        let primary_node_id = primary.node_id().as_u32();
+        let candidate_key = ShardKey::new(&[0xd8; 16], 42, 1);
+        let pg = primary.storage_node().get_pg(data_pg_id).unwrap();
+        crate::traits::ShardStore::write_shard(&*pg, &candidate_key, b"candidate").unwrap();
+        drop(pg);
+
+        let reference_pg_id = 1;
+        let reference_primary = local_map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(reference_pg_id))
+            .unwrap();
+        let reference_pg = reference_primary
+            .storage_node()
+            .get_pg(reference_pg_id)
+            .unwrap();
+        let malformed_bytes = b"not a metadata command".to_vec();
+        let malformed_checksum = checksum::crc64::checksum(&malformed_bytes);
+        reference_pg
+            .connection()
+            .execute(
+                "INSERT INTO metadata_command_pending_slot \
+                 (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, scope_bucket) \
+                 VALUES (0, ?1, ?2, ?3, ?4, ?5, NULL)",
+                rusqlite::params![
+                    ClusterEpoch::INITIAL.get() as i64,
+                    reference_pg_id as i64,
+                    1_i64,
+                    malformed_checksum as i64,
+                    malformed_bytes,
+                ],
+            )
+            .unwrap();
+        drop(reference_pg);
+
+        let map = Arc::new(local_map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let observations = cluster.audit_shard_storage_for_scavenger().unwrap();
+        assert!(
+            observations.iter().any(|observation| {
+                observation.reason == crate::ShardScavengerObservationReason::ScanIncomplete
+                    && observation.resolved_at.is_none()
+                    && observation.key.node_id == primary_node_id
+                    && observation.key.data_pg_id == data_pg_id
+                    && observation.last_error.as_deref().is_some_and(|error| {
+                        error.contains("reference scan failed")
+                            && error.contains(
+                                "decode pending metadata command for shard scavenger references",
+                            )
+                    })
+            }),
+            "reference scan failures should be persisted as scan-incomplete observations"
+        );
+        assert!(
+            observations.iter().all(|observation| {
+                observation.reason
+                    != crate::ShardScavengerObservationReason::UnreferencedShardRowAndFile
+                    || observation.key.shard_key != candidate_key
+                    || observation.resolved_at.is_some()
+            }),
+            "negative-reference candidates from an incomplete reference scan must not be reported"
+        );
+
+        let reference_primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(reference_pg_id))
+            .unwrap();
+        let reference_pg = reference_primary
+            .storage_node()
+            .get_pg(reference_pg_id)
+            .unwrap();
+        reference_pg
+            .connection()
+            .execute(
+                "DELETE FROM metadata_command_pending_slot WHERE singleton = 0",
+                [],
+            )
+            .unwrap();
+        drop(reference_pg);
+
+        let observations = cluster.audit_shard_storage_for_scavenger().unwrap();
+        assert!(
+            observations.iter().any(|observation| {
+                observation.reason == crate::ShardScavengerObservationReason::ScanIncomplete
+                    && observation.key.node_id == primary_node_id
+                    && observation.key.data_pg_id == data_pg_id
+                    && observation.resolved_at.is_some()
+            }),
+            "a later complete reference scan should resolve scan-incomplete observations"
+        );
+        assert!(
+            observations.iter().any(|observation| {
+                observation.reason
+                    == crate::ShardScavengerObservationReason::UnreferencedShardRowAndFile
+                    && observation.resolved_at.is_none()
+                    && observation.key.node_id == primary_node_id
+                    && observation.key.data_pg_id == data_pg_id
+                    && observation.key.shard_key == candidate_key
+            }),
+            "once the reference scan completes, the apparent unreferenced shard can be reported"
+        );
+    }
+
+    #[test]
     fn direct_put_command_id_race_drains_winner_and_reruns_precondition_action() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
