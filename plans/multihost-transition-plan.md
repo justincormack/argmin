@@ -4203,12 +4203,124 @@ Proposed subphases:
      until a later phase adds durable write intents or an equivalent publish
      fence. Full suite passed after the final harness settling adjustment.
 9. Phase 9.8 lifecycle/background mutation ownership
-   - make lifecycle sweeper ownership, progress, and retry state durable or
-     otherwise cluster-visible
-   - multiple processes must not apply the same lifecycle mutation twice, and a
-     stopped process must not leave lifecycle work permanently abandoned
-   - exit when lifecycle expiry and transition work does not depend on a
-     process-local sweeper registry or local wakeup
+   - make lifecycle sweeper ownership, progress, and retry state durable and
+     cluster-visible. `LIFECYCLE_SWEEPER_REGISTRY` may remain as
+     process-local thread deduplication/backpressure only; it must not be a
+     correctness owner.
+   - target model: durable, lease-backed lifecycle sweep ownership per bucket
+     incarnation on the bucket metadata PG. Do not start by persisting every
+     candidate object/version as scheduled work. Candidate work is derivable
+     from durable bucket lifecycle config, object metadata, and multipart
+     upload state, and the existing mutation paths already re-read and
+     re-check lifecycle/config/current state at apply time. The durable unit
+     of ownership should therefore be a bucket sweep pass, with object-PG
+     metadata commands providing the final idempotency/recheck layer.
+   - add a `lifecycle_sweep_claims` table keyed by bucket and
+     `bucket_incarnation_generation`, with `claim_id`, `owner_token`,
+     `cluster_epoch`, `claimed_at`, `heartbeat_at`, `lease_deadline`,
+     `attempt_count`, and `last_error` or equivalent retry context. Claim
+     acquire/release/heartbeat/steal operations must be token-fenced and
+     incarnation-fenced. A stale claim for a deleted/recreated bucket must not
+     block the new incarnation.
+   - a lifecycle worker may sweep a bucket only after acquiring that durable
+     claim. If another process owns a live claim, the bucket is skipped for
+     this pass. If a process crashes, the lease expires and another process can
+     resume by re-scanning the bucket and re-deriving candidates.
+   - lifecycle claims do not bypass bucket deletion fences. Claim acquisition
+     and every lifecycle mutation must recheck that the bucket incarnation is
+     still Active and not protected by an active durable DeleteBucket drain.
+     If DeleteBucket starts after a lifecycle claim is acquired, current
+     object expiration, noncurrent expiration, expired delete-marker cleanup,
+     MPU abort, and finishing `Aborting` uploads must either observe the
+     drain/Deleting state and stop without publishing, or be converged by the
+     DeleteBucket drain before DeleteBucket trusts bucket emptiness.
+   - durable root scanning must use the same stale-claim discipline as bucket
+     finalizer claims. Expired lifecycle claims are surfaced first and
+     deterministically, so their exact bucket/incarnation cannot be hidden by
+     an earlier ordinary bucket root. Busy claimed buckets are skipped by the
+     ordinary lifecycle-config/aborting-upload root scan. `lease_deadline =
+     NULL` means busy/non-expiring; only `lease_deadline <= now` is expired
+     recovery work. If the claimed bucket is gone, recreated with a different
+     incarnation, or no longer a lifecycle/aborting root, stale claim cleanup
+     must be token/incarnation-safe and must not clear a newer claim.
+   - the bucket sweep claim covers all background lifecycle mutations for that
+     bucket:
+     - current object expiration
+     - noncurrent version expiration
+     - expired delete-marker cleanup
+     - abort-incomplete-multipart-upload
+     - finishing uploads already in `Aborting` state
+   - preserve the current fail-closed mutation semantics: after claim
+     acquisition, every object/MPU mutation still rechecks the current bucket
+     lifecycle configuration, current object/upload state, object lock, and
+     command-stream pending state before publishing metadata changes. A claim
+     only serializes/retries the bucket sweep; it is not proof that a candidate
+     is still due.
+   - one bad candidate must not silently starve later due work in the same
+     bucket. Candidate enumeration should isolate per-key/per-upload errors
+     where it can do so safely: record typed error context on the claim,
+     continue to independent later candidates, and keep enough retry state for
+     the failed candidate to be revisited on a later pass. If a failure makes
+     the bucket-wide snapshot incomplete or candidate ordering unsafe, the
+     pass may fail closed, but it must emit an explicit starvation/error signal
+     and a focused regression should document that tradeoff.
+   - implementation slices:
+     1. add the plan/docs, claim schema/types, and low-level PgStore helpers
+        for acquire, release, heartbeat, expired-claim steal, stale terminal
+        cleanup, and deterministic durable root listing
+     2. route `run_lifecycle_sweep_at` through durable bucket claims: discover
+        buckets as today, attempt a claim per bucket, skip busy buckets, run
+        the existing sweep logic while holding the claim, release on success,
+        and record error/retry context on failure
+     3. add startup/periodic durable root scanning so restart without local
+        lifecycle worker state discovers buckets with lifecycle config,
+        buckets with aborting multipart uploads, and expired lifecycle claims
+        using the deterministic expired-claim-first and busy-claim-skipping
+        rules above
+     4. downgrade or update the process-local lifecycle sweeper registry tests
+        so they prove only local thread sharing, not correctness ownership
+     5. add observability for claim acquire/busy/steal/release/error paths and
+        bounded per-pass scan stats
+   - required regressions:
+     - two coordinators/process handles racing the same lifecycle bucket:
+       exactly one acquires the durable sweep claim and the other skips/busy
+     - expired lifecycle claim is stealable and the bucket sweep resumes after
+       simulated worker loss
+     - stale claim for a deleted/recreated bucket incarnation cannot block the
+       recreated bucket
+     - `lease_deadline = NULL` lifecycle claims are treated as busy in both
+       root scanning and claim acquisition
+     - an expired later-bucket lifecycle claim is rediscovered before an
+       earlier ordinary lifecycle bucket root, so stale claimed work cannot be
+       hidden by scan ordering
+     - a busy claimed lifecycle bucket is skipped by ordinary root scanning
+       without hiding unrelated unclaimed buckets
+     - lifecycle claim acquired, then DeleteBucket starts: current-object,
+       noncurrent-version, delete-marker, MPU abort, and `Aborting` upload
+       finishing paths observe the drain/Deleting state or are drained before
+       DeleteBucket emptiness is trusted
+     - lifecycle config changed after claim acquisition is re-read before
+       mutation, so stale candidates are not applied
+     - object current-version/noncurrent/delete-marker lifecycle mutations
+       remain idempotent when a matching pending metadata command already
+       exists
+     - abort-incomplete-multipart-upload and finishing `Aborting` uploads
+       resume after local sweeper loss
+     - a corrupt/transiently failing object or MPU candidate records error
+       context and does not indefinitely starve independent later due work, or
+       an explicit fail-closed starvation regression documents the intended
+       bucket-wide abort behavior
+     - local wakeup loss or process-local registry loss does not strand due
+       lifecycle work
+   - lifecycle transition rules are out of scope for this phase until
+     transition support exists; the current lifecycle parser rejects transition
+     elements as not implemented.
+   - exit when lifecycle expiration, delete-marker cleanup, and multipart
+     abort work does not depend on a process-local sweeper registry or local
+     wakeup; multiple processes cannot concurrently own the same bucket
+     lifecycle sweep; stopped workers resume through durable claim expiry and
+     deterministic root scanning; and all lifecycle mutations still recheck
+     current state before applying.
 10. Phase 9.9 cache freshness across processes
    - make bucket/object fast-path cache invalidation depend on PG or cluster
      notifications, generation checks, or fail-closed reloads rather than local
