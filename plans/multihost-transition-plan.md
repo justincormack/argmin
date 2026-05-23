@@ -4336,12 +4336,134 @@ Proposed subphases:
      deterministic root scanning; and all lifecycle mutations still recheck
      current state before applying.
 10. Phase 9.9 cache freshness across processes
-   - make bucket/object fast-path cache invalidation depend on PG or cluster
-     notifications, generation checks, or fail-closed reloads rather than local
-     invalidation alone
-   - a second process mutating bucket metadata must not leave this process
-     serving stale policy, versioning, ownership, or public-access state
-   - exit when correctness does not depend on same-process cache invalidation
+   - problem:
+     - `CoordinatorSharedCaches`, `BucketFastPathCache`, the local watcher
+       thread, and the process-local cache registry are process-local
+       performance state.
+     - Bucket mutations already advance durable `bucket_execution_generation`,
+       but a second process can mutate policy, versioning, ownership controls,
+       public access block, tags, lifecycle-visible state, or delete/recreate
+       state while this process still has a warm fast-path entry.
+     - The local watcher may reduce the stale window, but it cannot be the
+       correctness mechanism: it polls, can skip unavailable PGs, and only
+       observes entries known to the current process.
+   - target invariant:
+     - bucket fast-path state is never authoritative by itself.
+     - every request that makes an authorization, ownership, versioning,
+       public-access, tag/ABAC, encryption, lifecycle-visible, object-lock, or
+       bucket-state decision from a cached fast-path entry must first prove that
+       the cached bucket identity is still current in the bucket metadata PG.
+       The proof must include both `bucket_execution_generation` and
+       `bucket_incarnation_generation`, or an equivalent full bucket-row
+       identity/digest. Generation-only freshness is not enough because
+       incarnation is the delete/recreate fence introduced in Phase 9.4.7.
+     - if the freshness proof cannot be obtained, the request must fail closed
+       by reloading the full bucket snapshot or by returning the same safe
+       error it would return if the bucket snapshot load failed. It must not
+       continue with the cached entry.
+     - the watcher remains an optimization that can proactively mark entries
+       stale or remove missing buckets, but request-time generation validation
+       is the correctness boundary.
+   - implementation slices:
+     1. audit all bucket fast-path reads and document which fields they can
+        influence:
+        - BOE object reads and parsed bucket policy fast path
+        - bucket tags used for ABAC evaluation
+        - ownership controls and ACL-free decisions
+        - public access block and bucket policy public classification
+        - versioning and object-lock-sensitive paths
+        - default encryption and SSE-C-blocking decisions
+        - lifecycle-visible state and lifecycle generation if exposed through
+          fast-path data
+        - owner/canonical-id fields used for expected-owner or authorization
+          decisions
+        - bucket state and delete/recreate handling
+     2. build a field/mutator freshness matrix for `BucketFastPathInfo`:
+        - every cached field must be mapped to the production mutations that can
+          change it
+        - every such mutation must have an existing or new regression proving
+          that it advances the durable freshness token used by Phase 9.9
+        - fields currently included in the fast-path record include owner,
+          state, versioning, object lock/default retention, public access block,
+          ownership controls, policy metadata, lifecycle metadata, ABAC/tags,
+          encryption/SSE-C policy, execution generation, and incarnation
+          generation
+        - if a cached field does not affect any fast-path decision, either
+          remove it from the fast-path record or document why stale values cannot
+          affect behavior
+     3. add a narrow storage/cluster freshness API:
+        - input: bucket name, cached `bucket_execution_generation`, and cached
+          `bucket_incarnation_generation`
+        - output: fresh, stale/missing, or load error
+        - group by bucket PG for batched checks where useful, but provide a
+          single-bucket path for request-time use
+        - stale/missing removes or marks the cached entry stale before falling
+          back to a snapshot load
+        - load errors are visible to callers; they must not be silently
+          interpreted as fresh
+     4. change `BucketFastPathCache` accessors so "fresh" means durable-fresh
+        or so callers cannot accidentally use local freshness as the
+        correctness proof:
+        - local `known_generation` may remain as a watcher hint
+        - request paths should call a coordinator helper that performs durable
+          validation before returning a usable fast-path handle
+        - parsed policy cache lookup must also be guarded by the same durable
+          generation proof
+     5. keep mutation-side cache updates as hints:
+        - same-process bucket mutations should still observe the new generation
+          or remove entries to avoid unnecessary reloads
+        - correctness must not rely on these updates firing in the mutating
+          process or being shared with other processes
+     6. harden delete/recreate handling:
+        - cache keys remain bucket-name based, so durable validation must treat
+          missing buckets, lower/impossible generations, incarnation mismatch,
+          and recreated buckets as stale and force reload/removal
+        - a cached entry for an old incarnation must not authorize requests
+          against a recreated bucket with the same name
+     7. update docs and names to make the authority clear:
+        - rename or comment local freshness helpers so they are visibly
+          process-local hints
+        - document that the metadata digest clean-revision cache remains
+          acceptable only because every skip is guarded by durable revision
+          state, not process-local invalidation
+   - required regressions:
+     - two independent process-shaped coordinator handles sharing storage, with
+       independent `CoordinatorSharedCaches` rather than the normal
+       same-process shared-cache registry path. The reader warms the BOE fast
+       path, the writer deletes or tightens the bucket policy, writer-side
+       mutation hints must not touch the reader cache, the watcher is
+       disabled/delayed, and the reader must not authorize through stale cached
+       policy before the watcher runs.
+     - stale-deny/loosening coverage: reader warms a cached deny, writer loosens
+       or removes the blocking policy/public-access/ownership/tag condition,
+       watcher is delayed, and the reader must validate/reload before denying.
+     - the same cross-process stale-cache shape for bucket ownership controls
+       changing away from BOE, public access block/policy-public state, and
+       bucket tags used by ABAC.
+     - delete/recreate with the same bucket name: a cached entry from the old
+       bucket must be removed or reloaded before any authorization decision for
+       the recreated bucket. The regression must force old-incarnation cache
+       rejection even if a test hook makes execution-generation behavior collide
+       or appear unchanged.
+     - field/mutator matrix coverage for every `BucketFastPathInfo` field that
+       can affect behavior, including versioning, object lock/default retention,
+       default encryption/SSE-C blocking, owner/state, lifecycle-visible
+       metadata, public access block, ownership controls, policy metadata, and
+       tags/ABAC.
+     - freshness-check storage failure: the fast path must be bypassed and the
+       request must reload or fail safely; no stale cached allow/deny decision
+       may be returned.
+     - watcher-disabled or watcher-delayed test hook: correctness must still
+       hold with only request-time validation.
+     - batched watcher/load path continues to mark entries stale opportunistically
+       and does not make unavailable PGs look fresh.
+   - exit when:
+     - no authorization or bucket-configuration correctness path depends on
+       same-process invalidation, local watcher timing, or shared in-process
+       cache registry state.
+     - bucket fast-path cache is demonstrably a performance cache: durable
+       generation validation or fail-closed reload is required before cached
+       state can affect request behavior.
 11. Phase 9.10 test harness de-single-process pass
    - audit tests and helpers that still use local constructors, raw hooks, or
      direct store access in ways that bypass the production cluster path
