@@ -52,7 +52,9 @@ fn open_test_storage_cluster(dir: &Path, pg_ids: &[u32]) -> Arc<StorageCluster> 
         .expect("open local storage cluster")
 }
 
-fn setup_coordinator_with_storage_cluster(storage_cluster: Arc<StorageCluster>) -> Coordinator {
+fn setup_same_process_coordinator_with_storage_cluster(
+    storage_cluster: Arc<StorageCluster>,
+) -> Coordinator {
     let shared_caches = shared_caches_for_storage_cluster(&storage_cluster);
     Coordinator::new_with_shared_caches_and_lifecycle_sweeper_factory(
         storage_cluster,
@@ -536,9 +538,10 @@ fn run_stream_duplicate_segment_race_invariant_test(pg_count: u32, require_cross
     let dir = test_util::tempdir();
     let pg_ids: Vec<u32> = (0..pg_count).collect();
     let storage_cluster = open_test_storage_cluster(dir.path(), &pg_ids);
-    let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
-    let writer_a = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
-    let writer_b = setup_coordinator_with_storage_cluster(storage_cluster);
+    let admin = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let writer_a =
+        setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let writer_b = setup_same_process_coordinator_with_storage_cluster(storage_cluster);
     let invariant =
         "duplicate stream appends at the same segment index must leave exactly one staged winner";
     let state = InvariantHarness::new(&admin);
@@ -1148,9 +1151,10 @@ fn abort_wins_over_complete_after_snapshot_without_leaking_multipart_state() {
     let dir = test_util::tempdir();
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(dir.path(), &pg_ids);
-    let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
-    let completer = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
-    let aborter = setup_coordinator_with_storage_cluster(storage_cluster);
+    let admin = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let completer =
+        setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let aborter = setup_same_process_coordinator_with_storage_cluster(storage_cluster);
     let bucket = "race-complete-bucket";
     let key = "race-complete-key";
     let invariant =

@@ -1337,8 +1337,8 @@ fn delete_bucket_returns_before_payload_lease_and_reclaim_complete() {
     let tmp = test_util::tempdir();
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
-    let deleter = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let admin = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let deleter = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     admin
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();

@@ -2037,7 +2037,8 @@ fn lifecycle_sweep_expires_nonversioned_current_object() {
 #[test]
 fn lifecycle_sweep_skips_bucket_with_live_durable_claim() {
     let tmp = test_util::tempdir();
-    let (first, second) = setup_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
+    let (first, second) =
+        setup_same_process_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
     let bucket = trusted_bucket_name("bucket");
     first
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)

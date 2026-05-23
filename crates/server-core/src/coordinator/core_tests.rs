@@ -904,7 +904,7 @@ fn create_bucket_persists_explicit_grants() {
 fn list_buckets_with_sparse_pg_topology() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0, 2, 5]);
-    let coord = setup_coordinator_with_storage_cluster(storage_cluster);
+    let coord = setup_same_process_coordinator_with_storage_cluster(storage_cluster);
     let bucket = "bucket-sparse";
     coord
         .create_bucket_for_owner("default-owner", bucket, false)
@@ -925,7 +925,7 @@ fn list_buckets_with_sparse_pg_topology() {
 fn list_objects_with_sparse_pg_topology() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0, 2, 5]);
-    let coord = setup_coordinator_with_storage_cluster(storage_cluster);
+    let coord = setup_same_process_coordinator_with_storage_cluster(storage_cluster);
     let bucket = "bucket-sparse";
     coord
         .create_bucket_for_owner("default-owner", bucket, false)
@@ -948,7 +948,7 @@ fn list_objects_with_sparse_pg_topology() {
 fn list_object_versions_with_sparse_pg_topology() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0, 2, 5]);
-    let coord = setup_coordinator_with_storage_cluster(storage_cluster);
+    let coord = setup_same_process_coordinator_with_storage_cluster(storage_cluster);
     let bucket = "bucket-sparse";
     coord
         .create_bucket_for_owner("default-owner", bucket, false)
@@ -1029,7 +1029,7 @@ fn list_object_versions_clamps_oversized_max_keys() {
 fn list_object_versions_paginates_across_pgs() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0, 2, 5]);
-    let coord = setup_coordinator_with_storage_cluster(storage_cluster);
+    let coord = setup_same_process_coordinator_with_storage_cluster(storage_cluster);
     let metadata = MetadataBlob::new();
     let system_metadata = SystemMetadata::EMPTY;
 
@@ -1353,7 +1353,7 @@ fn list_object_versions_delimiter_filters_common_prefix_at_or_before_key_marker(
 fn list_multipart_uploads_with_sparse_pg_topology() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0, 2, 5]);
-    let coord = setup_coordinator_with_storage_cluster(storage_cluster);
+    let coord = setup_same_process_coordinator_with_storage_cluster(storage_cluster);
     let bucket = "bucket-sparse";
     let key = "key-sparse";
     coord
@@ -1529,12 +1529,12 @@ fn put_object_does_not_wait_for_bucket_lock() {
     let bucket = "bucket-put-no-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
-        &storage_cluster,
-    ));
-    let writer = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
-        &storage_cluster,
-    ));
+    let admin = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
+        Arc::clone(&storage_cluster),
+    );
+    let writer = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
+        Arc::clone(&storage_cluster),
+    );
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
@@ -1602,12 +1602,12 @@ fn create_multipart_upload_does_not_wait_for_bucket_lock() {
     let bucket = "bucket-create-mpu-no-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
-        &storage_cluster,
-    ));
-    let creator = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
-        &storage_cluster,
-    ));
+    let admin = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
+        Arc::clone(&storage_cluster),
+    );
+    let creator = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
+        Arc::clone(&storage_cluster),
+    );
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
@@ -1746,12 +1746,12 @@ fn delete_bucket_does_not_wait_for_bucket_lock() {
     let bucket = "bucket-delete-no-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
-        &storage_cluster,
-    ));
-    let deleter = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
-        &storage_cluster,
-    ));
+    let admin = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
+        Arc::clone(&storage_cluster),
+    );
+    let deleter = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
+        Arc::clone(&storage_cluster),
+    );
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
@@ -1856,8 +1856,8 @@ fn head_object_waits_for_bucket_pg_when_non_boe_bucket_fast_path_is_warm() {
     let bucket = "bucket-head-fast-no-pg";
     let pg_ids: Vec<u32> = (0..METADATA_FANOUT_TEST_PG_COUNT).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
-    let reader = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let admin = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let reader = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
@@ -1949,8 +1949,8 @@ fn head_object_uses_validated_boe_fast_path_when_warm() {
     let bucket = "bucket-head-boe-fast-no-pg";
     let pg_ids: Vec<u32> = (0..METADATA_FANOUT_TEST_PG_COUNT).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
-    let reader = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let admin = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let reader = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
@@ -2034,8 +2034,8 @@ fn head_object_uses_validated_boe_policy_and_abac_tags_fast_path_when_warm() {
     let bucket = "bucket-head-policy-abac-fast";
     let pg_ids: Vec<u32> = (0..METADATA_FANOUT_TEST_PG_COUNT).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
-    let reader = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let admin = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let reader = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     admin
         .create_bucket_for_owner("111122223333", bucket, false)
@@ -2185,8 +2185,8 @@ fn head_object_fast_path_denies_with_non_matching_boe_abac_bucket_tags() {
     let bucket = "bucket-head-policy-abac-fast-deny";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
-    let reader = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let admin = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let reader = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     admin
         .create_bucket_for_owner("111122223333", bucket, false)
@@ -2317,9 +2317,10 @@ fn head_object_reloads_after_boe_policy_mutation_rebuilds_fast_path() {
     let bucket = "bucket-head-policy-cold-fallback";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
-    let reader = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
-    let reader_after_reload = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let admin = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let reader = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let reader_after_reload =
+        setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
@@ -4122,8 +4123,8 @@ fn delete_object_falls_back_to_storage_load_when_bucket_fast_path_is_acl_free() 
     let bucket = "bucket-delete-fast-no-pg";
     let pg_ids: Vec<u32> = (0..METADATA_FANOUT_TEST_PG_COUNT).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
-    let deleter = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let admin = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let deleter = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
@@ -4227,12 +4228,12 @@ fn complete_multipart_upload_does_not_wait_for_bucket_lock() {
     let bucket = "bucket-complete-no-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
-        &storage_cluster,
-    ));
-    let completer = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
-        &storage_cluster,
-    ));
+    let admin = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
+        Arc::clone(&storage_cluster),
+    );
+    let completer = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
+        Arc::clone(&storage_cluster),
+    );
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
@@ -4303,12 +4304,12 @@ fn complete_multipart_upload_waits_for_multipart_completion_lock() {
     let bucket = "bucket-complete-waits-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
-        &storage_cluster,
-    ));
-    let completer = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
-        &storage_cluster,
-    ));
+    let admin = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
+        Arc::clone(&storage_cluster),
+    );
+    let completer = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
+        Arc::clone(&storage_cluster),
+    );
     admin
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
@@ -4374,12 +4375,12 @@ fn complete_multipart_upload_does_not_deadlock_when_bucket_policy_shares_pg() {
     let bucket = "bucket-complete-same-pg";
     let pg_ids: Vec<u32> = (0..METADATA_FANOUT_TEST_PG_COUNT).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
-        &storage_cluster,
-    ));
-    let completer = setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
-        &storage_cluster,
-    ));
+    let admin = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
+        Arc::clone(&storage_cluster),
+    );
+    let completer = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
+        Arc::clone(&storage_cluster),
+    );
 
     admin
         .create_bucket_for_owner("default-owner", bucket, false)

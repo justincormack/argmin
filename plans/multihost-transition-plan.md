@@ -4497,14 +4497,15 @@ Proposed subphases:
        generation validation or fail-closed reload is required before cached
        state can affect request behavior.
 11. Phase 9.10 test harness de-single-process pass
-   - status: audit started. The initial audit table is in
-     `plans/phase-9.10-test-harness-audit.md`, covering shared coordinator
-     setup helpers, independent-cache Phase 9.9 tests, BOE fast-path model
-     tests, representative lifecycle claim tests, multipart stream-race tests,
-     reclaim trace tests, object-state concurrency tests, and storage-cluster
-     reopen/pending-slot/scavenger test shapes. Continue extending that table
-     before broad rewrites. The current test tree contains many valid
-     single-process unit tests, but Phase 9 closeout needs a focused audit of
+   - status: audit table pass complete; targeted gap review in progress. The
+     audit table is in `plans/phase-9.10-test-harness-audit.md`, covering
+     shared coordinator setup helpers, independent-cache Phase 9.9 tests, BOE
+     fast-path model tests, representative lifecycle claim tests, multipart API
+     and model tests, multipart stream-race tests, reclaim trace tests,
+     object-state concurrency tests, storage-cluster
+     reopen/pending-slot/scavenger test shapes, and external/local S3 harness
+     crates. The current test tree contains many valid single-process unit
+     tests, but Phase 9 closeout needs the focused audit to stay current for
      tests that claim cross-process, restart, convergence, race, drain, reclaim,
      lifecycle, cache-freshness, or scavenger correctness. Those tests must not
      accidentally pass because they share a `StorageCluster`, shared
@@ -4579,16 +4580,17 @@ Proposed subphases:
        exists
    - likely first files/helpers to audit:
      - `crates/server-core/src/coordinator/test_support.rs`: the default
-       `setup_coordinators_*` helpers share one `StorageCluster` and the
-       process-local shared-cache registry; add explicit helpers for
-       independent process-shaped handles and make tests choose deliberately.
+       `setup_same_process_coordinators_*` helpers share one `StorageCluster`
+       and the process-local shared-cache registry; use explicit helpers for
+       independent process-shaped caches when tests need that shape.
      - `crates/server-core/src/coordinator/core_tests.rs`,
        `multipart_tests.rs`, `multipart_stateful_tests.rs`,
-       `multipart_reclaim_trace_tests.rs`, `object_state_tests.rs`,
-       `bucket_tests.rs`, `authz_model_tests.rs`, and `runtime.rs`: identify
-       tests whose names mention concurrent, restart, reopen, retry, drain,
-       reclaim, lifecycle, watcher, stale cache behavior, BOE fast-path
-       invariants, process-global fast-path hooks, or custom coordinator setup.
+       `multipart_trace_tests.rs`, `multipart_reclaim_trace_tests.rs`,
+       `object_state_tests.rs`, `bucket_tests.rs`, `authz_model_tests.rs`, and
+       `runtime.rs`: identify tests whose names mention concurrent, restart,
+       reopen, retry, drain, reclaim, lifecycle, watcher, stale cache behavior,
+       BOE fast-path invariants, process-global fast-path hooks, or custom
+       coordinator setup.
      - `crates/storage/src/cluster/local.rs`: separate genuine
        `StorageCluster` authority tests from raw `get_pg`/pending-slot
        seeders, and add reopen/two-handle variants where a local map or PG

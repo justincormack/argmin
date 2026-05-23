@@ -3646,7 +3646,7 @@ fn put_object_version_acl_bucket_policy_grant_read_condition_applies() {
 #[test]
 fn bucket_policy_cache_invalidates_across_coordinators_on_replace() {
     let tmp = test_util::tempdir();
-    let (admin, reader) = setup_coordinators_with_pg_count(tmp.path(), 4);
+    let (admin, reader) = setup_same_process_coordinators_with_pg_count(tmp.path(), 4);
     admin
         .create_bucket_for_owner("owner-a", "bucket", false)
         .unwrap();
@@ -3721,7 +3721,7 @@ fn bucket_policy_cache_invalidates_across_coordinators_on_replace() {
 #[test]
 fn lifecycle_sweeper_registry_shares_process_local_worker_per_storage_node() {
     let tmp = test_util::tempdir();
-    let (first, second) = setup_coordinators_with_pg_count(tmp.path(), 4);
+    let (first, second) = setup_same_process_coordinators_with_pg_count(tmp.path(), 4);
 
     // The registry is only a process-local worker deduplication mechanism. Durable
     // lifecycle claims provide correctness across coordinator/process handles.
@@ -3754,7 +3754,7 @@ fn lifecycle_sweeper_registry_drops_process_local_worker_with_last_coordinator()
 #[test]
 fn bucket_lifecycle_update_is_visible_across_coordinators_on_replace() {
     let tmp = test_util::tempdir();
-    let (admin, reader) = setup_coordinators_with_pg_count(tmp.path(), 4);
+    let (admin, reader) = setup_same_process_coordinators_with_pg_count(tmp.path(), 4);
     admin
         .create_bucket_for_owner("owner-a", "bucket", false)
         .unwrap();
@@ -4427,7 +4427,8 @@ fn put_bucket_acl_bucket_policy_same_pg_completes_without_deadlock() {
 fn get_object_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-get-object-policy-same-pg";
-    let (admin, reader) = setup_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
+    let (admin, reader) =
+        setup_same_process_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
     admin
         .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
@@ -4492,7 +4493,8 @@ fn get_object_bucket_policy_same_pg_completes_without_deadlock() {
 fn get_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-get-object-tagging-policy-same-pg";
-    let (admin, reader) = setup_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
+    let (admin, reader) =
+        setup_same_process_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
     admin
         .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
@@ -4612,7 +4614,8 @@ fn put_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
 fn get_object_retention_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-get-object-retention-policy-same-pg";
-    let (admin, reader) = setup_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
+    let (admin, reader) =
+        setup_same_process_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
     let owner_requester = test_helpers::requester("owner-a");
 
     admin
@@ -4695,7 +4698,8 @@ fn get_object_retention_bucket_policy_same_pg_completes_without_deadlock() {
 fn delete_object_object_lock_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-delete-object-lock-policy-same-pg";
-    let (admin, deleter) = setup_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
+    let (admin, deleter) =
+        setup_same_process_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
     let owner_requester = test_helpers::requester("owner-a");
 
     admin

@@ -174,7 +174,7 @@ pub(crate) fn setup_coordinator_without_lifecycle_sweeper(dir: &Path) -> Coordin
 /// that storage cluster. Use
 /// `setup_process_isolated_cache_coordinator_with_storage_cluster` when a test
 /// needs process-shaped cache isolation.
-pub(crate) fn setup_coordinator_with_storage_cluster(
+pub(crate) fn setup_same_process_coordinator_with_storage_cluster(
     storage_cluster: Arc<StorageCluster>,
 ) -> Coordinator {
     let shared_caches = shared_caches_for_storage_cluster(&storage_cluster);
@@ -195,7 +195,7 @@ pub(crate) fn setup_coordinator_with_storage_cluster(
 /// that storage cluster. Use
 /// `setup_process_isolated_cache_coordinator_with_storage_cluster` when a test
 /// needs process-shaped cache isolation.
-pub(crate) fn setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(
+pub(crate) fn setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
     storage_cluster: Arc<StorageCluster>,
 ) -> Coordinator {
     let shared_caches = shared_caches_for_storage_cluster(&storage_cluster);
@@ -231,36 +231,38 @@ pub(crate) fn setup_process_isolated_cache_coordinator_with_storage_cluster(
     .unwrap()
 }
 
-pub(crate) fn setup_coordinators_with_pg_count(
+pub(crate) fn setup_same_process_coordinators_with_pg_count(
     dir: &Path,
     pg_count: u32,
 ) -> (Coordinator, Coordinator) {
     let pg_ids: Vec<u32> = (0..pg_count).collect();
     let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
     (
-        setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster)),
-        setup_coordinator_with_storage_cluster(storage_cluster),
+        setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster)),
+        setup_same_process_coordinator_with_storage_cluster(storage_cluster),
     )
 }
 
-pub(crate) fn setup_coordinators_with_pg_count_without_lifecycle_sweeper(
+pub(crate) fn setup_same_process_coordinators_with_pg_count_without_lifecycle_sweeper(
     dir: &Path,
     pg_count: u32,
 ) -> (Coordinator, Coordinator) {
     let pg_ids: Vec<u32> = (0..pg_count).collect();
     let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
     (
-        setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
+        setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(Arc::clone(
             &storage_cluster,
         )),
-        setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(storage_cluster),
+        setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
+            storage_cluster,
+        ),
     )
 }
 
-pub(crate) fn setup_coordinators_with_single_pg_without_lifecycle_sweeper(
+pub(crate) fn setup_same_process_coordinators_with_single_pg_without_lifecycle_sweeper(
     dir: &Path,
 ) -> (Coordinator, Coordinator) {
-    setup_coordinators_with_pg_count_without_lifecycle_sweeper(dir, 1)
+    setup_same_process_coordinators_with_pg_count_without_lifecycle_sweeper(dir, 1)
 }
 
 pub(crate) fn setup_coordinator_with_sse_c(dir: &Path) -> Coordinator {

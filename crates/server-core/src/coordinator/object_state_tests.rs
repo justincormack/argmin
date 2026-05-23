@@ -5544,7 +5544,8 @@ fn versioned_put_is_safe_across_concurrent_frontends() {
     let tmp = test_util::tempdir();
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let make_coord = || setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let make_coord =
+        || setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     let admin = make_coord();
     admin
@@ -5639,7 +5640,8 @@ fn get_object_is_consistent_during_concurrent_overwrite() {
     let tmp = test_util::tempdir();
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let make_coord = || setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let make_coord =
+        || setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     let admin = make_coord();
     admin
@@ -5742,7 +5744,8 @@ fn copy_object_is_consistent_during_concurrent_overwrite() {
     let tmp = test_util::tempdir();
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let make_coord = || setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let make_coord =
+        || setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     let admin = make_coord();
     admin
@@ -5875,7 +5878,8 @@ fn upload_part_copy_is_consistent_during_concurrent_overwrite() {
     let tmp = test_util::tempdir();
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let make_coord = || setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let make_coord =
+        || setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     let admin = make_coord();
     admin
@@ -6039,7 +6043,8 @@ fn delete_object_is_consistent_during_concurrent_overwrite() {
     let tmp = test_util::tempdir();
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let make_coord = || setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let make_coord =
+        || setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     let admin = make_coord();
     admin
@@ -6159,7 +6164,8 @@ fn multipart_get_object_survives_metadata_delete_mid_read() {
     let tmp = test_util::tempdir();
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let make_coord = || setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let make_coord =
+        || setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     let admin = make_coord();
     admin
@@ -6222,7 +6228,8 @@ fn multipart_get_object_part_survives_metadata_delete_mid_read() {
     let tmp = test_util::tempdir();
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let make_coord = || setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let make_coord =
+        || setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     let admin = make_coord();
     admin
@@ -6297,7 +6304,8 @@ fn object_segments_get_object_survives_delete_mid_read() {
     let tmp = test_util::tempdir();
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let make_coord = || setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let make_coord =
+        || setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     let admin = make_coord();
     admin
@@ -6395,7 +6403,8 @@ fn upload_part_copy_survives_source_metadata_delete_mid_read() {
     let tmp = test_util::tempdir();
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let make_coord = || setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let make_coord =
+        || setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     let admin = make_coord();
     admin
@@ -6478,7 +6487,8 @@ fn copy_object_survives_source_metadata_delete_mid_read() {
     let tmp = test_util::tempdir();
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let make_coord = || setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let make_coord =
+        || setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     let admin = make_coord();
     admin
