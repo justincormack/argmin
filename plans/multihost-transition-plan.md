@@ -4335,7 +4335,18 @@ Proposed subphases:
      lifecycle sweep; stopped workers resume through durable claim expiry and
      deterministic root scanning; and all lifecycle mutations still recheck
      current state before applying.
-10. Phase 9.9 cache freshness across processes
+10. Phase 9.9 cache freshness across processes (done)
+   - status: done. Bucket fast-path entries and parsed-policy cache entries
+     are now process-local performance hints only: request paths validate the
+     cached `BucketFastPathIdentity` against durable bucket metadata before
+     using cached state, and fall back to full snapshot loading when the proof
+     is stale or unavailable. The identity proof includes both execution and
+     incarnation generation, so delete/recreate is fenced independently of
+     ordinary bucket metadata changes. Independent-cache regressions cover
+     stale allow and stale deny policy decisions, ABAC tags, ownership controls,
+     public access block, delete/recreate, storage proof failure for both
+     bucket summary and parsed policy paths, the storage-level field/mutator
+     freshness matrix, and watcher hint behavior.
    - problem:
      - `CoordinatorSharedCaches`, `BucketFastPathCache`, the local watcher
        thread, and the process-local cache registry are process-local
