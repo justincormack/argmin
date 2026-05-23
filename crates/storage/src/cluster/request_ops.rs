@@ -33,6 +33,7 @@ use crate::*;
 const INTERNAL_LIST_PAGE_SIZE: u32 = 1_000;
 const ORPHAN_OBJECT_PAYLOAD_RECLAIM_BUCKET_INCARNATION: u64 = 0;
 const BUCKET_DELETE_FINALIZE_SCAN_LIMIT_PER_PG: usize = 16;
+const LIFECYCLE_SWEEP_ROOT_SCAN_LIMIT_PER_PG: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct DurableObjectPayloadReclaimScan {
@@ -44,6 +45,35 @@ pub(crate) struct DurableObjectPayloadReclaimScan {
 pub(crate) struct DurableBucketDeleteFinalizeScan {
     pub queued: usize,
     pub errors: usize,
+}
+
+const LIFECYCLE_SWEEP_CLAIM_LEASE_MILLIS: u64 = 60_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbortMultipartUploadDrainMode {
+    Wait,
+    Stop,
+}
+
+fn metadata_command_is_matching_multipart_abort(
+    command: &MetadataCommandEnvelope,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    upload_id: &UploadId,
+) -> bool {
+    matches!(
+        command.payload(),
+        MetadataCommandPayload::AbortMultipartUpload(abort)
+            if abort.bucket == *bucket && abort.key == *key && abort.upload_id == *upload_id
+    )
+}
+
+fn lifecycle_sweep_root_source_rank(source: LifecycleSweepRootSource) -> u8 {
+    match source {
+        LifecycleSweepRootSource::ExpiredClaim => 0,
+        LifecycleSweepRootSource::LifecycleConfig => 1,
+        LifecycleSweepRootSource::AbortingMultipartUpload => 2,
+    }
 }
 
 struct InsertDeleteMarkerDraft<'a> {
@@ -2986,6 +3016,104 @@ impl super::StorageCluster {
         })
     }
 
+    pub fn list_lifecycle_sweep_roots(
+        &self,
+        now: u64,
+    ) -> Result<Vec<LifecycleSweepRoot>, ObjectPgActionError> {
+        let mut roots = Vec::new();
+        for pg_id in self.metadata_pg_ids() {
+            let pg = self.metadata_pg(pg_id)?;
+            roots.extend(PgMetadataStore::get_lifecycle_sweep_roots(
+                &*pg,
+                now,
+                LIFECYCLE_SWEEP_ROOT_SCAN_LIMIT_PER_PG,
+            )?);
+        }
+        for bucket in self.list_lifecycle_sweep_buckets()?.aborting_buckets {
+            match self.head_bucket_info(&bucket) {
+                Ok(bucket_info) => roots.push(LifecycleSweepRoot {
+                    bucket,
+                    bucket_incarnation_generation: bucket_info.bucket_incarnation_generation,
+                    source: LifecycleSweepRootSource::AbortingMultipartUpload,
+                }),
+                Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound {
+                    ..
+                })) => {}
+                Err(BucketSnapshotLoadError::Metadata(error)) => return Err(error.into()),
+                Err(BucketSnapshotLoadError::Store(error)) => return Err(error.into()),
+            }
+        }
+        roots.sort_by(|left, right| {
+            lifecycle_sweep_root_source_rank(left.source)
+                .cmp(&lifecycle_sweep_root_source_rank(right.source))
+                .then_with(|| left.bucket.cmp(&right.bucket))
+                .then_with(|| {
+                    left.bucket_incarnation_generation
+                        .cmp(&right.bucket_incarnation_generation)
+                })
+        });
+        roots.dedup_by(|left, right| {
+            left.bucket == right.bucket
+                && left.bucket_incarnation_generation == right.bucket_incarnation_generation
+        });
+        Ok(roots)
+    }
+
+    pub fn acquire_lifecycle_sweep_claim(
+        &self,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        now: u64,
+    ) -> Result<Option<LifecycleSweepClaimRecord>, ObjectPgActionError> {
+        let claim_id = self.next_lifecycle_sweep_claim_id()?;
+        let owner_token = self.bucket_write_owner_token();
+        let bucket_pg = self.metadata_pg(self.bucket_metadata_pg_id(bucket))?;
+        Ok(PgMetadataStore::acquire_lifecycle_sweep_claim(
+            &*bucket_pg,
+            bucket,
+            bucket_incarnation_generation,
+            &claim_id,
+            &owner_token,
+            self.operation_epoch(),
+            now,
+            now.checked_add(LIFECYCLE_SWEEP_CLAIM_LEASE_MILLIS),
+            now,
+        )?)
+    }
+
+    pub fn heartbeat_lifecycle_sweep_claim(
+        &self,
+        claim: &LifecycleSweepClaimRecord,
+        now: u64,
+    ) -> Result<LifecycleSweepClaimRecord, ObjectPgActionError> {
+        let bucket_pg = self.metadata_pg(self.bucket_metadata_pg_id(&claim.bucket))?;
+        Ok(PgMetadataStore::heartbeat_lifecycle_sweep_claim(
+            &*bucket_pg,
+            &claim.bucket,
+            claim.bucket_incarnation_generation,
+            &claim.claim_id,
+            &claim.owner_token,
+            claim.cluster_epoch,
+            now,
+            now.checked_add(LIFECYCLE_SWEEP_CLAIM_LEASE_MILLIS),
+        )?)
+    }
+
+    pub fn release_lifecycle_sweep_claim(
+        &self,
+        claim: &LifecycleSweepClaimRecord,
+    ) -> Result<(), ObjectPgActionError> {
+        let bucket_pg = self.metadata_pg(self.bucket_metadata_pg_id(&claim.bucket))?;
+        Ok(PgMetadataStore::release_lifecycle_sweep_claim(
+            &*bucket_pg,
+            &claim.bucket,
+            claim.bucket_incarnation_generation,
+            &claim.claim_id,
+            &claim.owner_token,
+            claim.cluster_epoch,
+        )?)
+    }
+
     pub fn list_all_objects_for_bucket(
         &self,
         bucket: &BucketName,
@@ -4115,6 +4243,21 @@ impl super::StorageCluster {
         key: &ObjectKey,
         operation_kind: &'static str,
     ) -> Result<Option<BucketWriteReservationProof>, ObjectPgActionError> {
+        self.try_acquire_bucket_write_proof_for_object_metadata_command(
+            bucket,
+            key,
+            operation_kind,
+            true,
+        )
+    }
+
+    fn try_acquire_bucket_write_proof_for_object_metadata_command(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        operation_kind: &'static str,
+        wait_for_drain: bool,
+    ) -> Result<Option<BucketWriteReservationProof>, ObjectPgActionError> {
         match self.acquire_durable_bucket_write_reservation(
             bucket,
             operation_kind,
@@ -4122,8 +4265,10 @@ impl super::StorageCluster {
         ) {
             Ok(reservation) => Ok(Some(BucketWriteReservationProof::from(&reservation.record))),
             Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
-                self.wait_for_durable_bucket_write_drain(bucket)
-                    .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+                if wait_for_drain {
+                    self.wait_for_durable_bucket_write_drain(bucket)
+                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+                }
                 Ok(None)
             }
             Err(error) => Err(super::bucket_snapshot_error_to_object_pg_action_error(
@@ -8397,7 +8542,31 @@ impl super::StorageCluster {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let _bucket_guard = primary_node.lock_bucket(bucket);
-        self.abort_multipart_upload_locked(pg_id, bucket, key, upload_id)
+        self.abort_multipart_upload_locked(
+            pg_id,
+            bucket,
+            key,
+            upload_id,
+            AbortMultipartUploadDrainMode::Wait,
+        )
+    }
+
+    pub fn abort_multipart_upload_for_lifecycle_sweep(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<bool, ObjectPgActionError> {
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let _bucket_guard = primary_node.lock_bucket(bucket);
+        self.abort_multipart_upload_locked(
+            pg_id,
+            bucket,
+            key,
+            upload_id,
+            AbortMultipartUploadDrainMode::Stop,
+        )
     }
 
     fn abort_multipart_upload_locked(
@@ -8406,17 +8575,11 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
+        drain_mode: AbortMultipartUploadDrainMode,
     ) -> Result<bool, ObjectPgActionError> {
         'retry_after_pending_conflict: loop {
             while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
-                let matching_abort = matches!(
-                    command.payload(),
-                    MetadataCommandPayload::AbortMultipartUpload(abort)
-                        if abort.bucket == *bucket
-                            && abort.key == *key
-                            && abort.upload_id == *upload_id
-                );
-                if matching_abort {
+                if metadata_command_is_matching_multipart_abort(&command, bucket, key, upload_id) {
                     self.apply_exact_pending_object_metadata_command(
                         pg_id,
                         super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
@@ -8426,18 +8589,42 @@ impl super::StorageCluster {
                 self.drain_pending_object_metadata_command(pg_id, &command)?;
             }
 
-            let command =
-                match self.prepare_abort_multipart_upload_command(pg_id, bucket, key, upload_id) {
-                    Ok(Some(command)) => command,
-                    Ok(None) => return Ok(false),
-                    Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
-                        ..
-                    })) => {
-                        self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
-                        continue 'retry_after_pending_conflict;
-                    }
-                    Err(error) => return Err(error),
-                };
+            let proof = match self.try_acquire_bucket_write_proof_for_object_metadata_command(
+                bucket,
+                key,
+                "abort-multipart-upload",
+                drain_mode == AbortMultipartUploadDrainMode::Wait,
+            )? {
+                Some(proof) => proof,
+                None if drain_mode == AbortMultipartUploadDrainMode::Wait => {
+                    continue 'retry_after_pending_conflict;
+                }
+                None => return Ok(false),
+            };
+            let command = match self.prepare_abort_multipart_upload_command(
+                pg_id,
+                bucket,
+                key,
+                upload_id,
+                proof.clone(),
+            ) {
+                Ok(Some(command)) => command,
+                Ok(None) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
+                    return Ok(false);
+                }
+                Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                    ..
+                })) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
+                    self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                    continue 'retry_after_pending_conflict;
+                }
+                Err(error) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
+                    return Err(error);
+                }
+            };
             let MetadataCommandPayload::AbortMultipartUpload(_) = command.payload() else {
                 unreachable!("prepared abort multipart command changed payload kind");
             };
@@ -8445,10 +8632,48 @@ impl super::StorageCluster {
             maybe_run_before_abort_multipart_pending_install_hook(
                 self.metadata_command_apply_test_hook_scope_id(),
             );
-            if !self.try_install_object_pg_pending_command_or_drain(pg_id, bucket, &command)? {
-                continue 'retry_after_pending_conflict;
+            self.maybe_run_before_metadata_command_pending_install_hook();
+            match self.try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command) {
+                Ok(Some(())) => {}
+                Ok(None) | Err(StoreError::MetadataCommandLogConflict { .. }) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
+                    if let Some(pending) =
+                        self.pending_metadata_command_for_bucket(pg_id, bucket)?
+                    {
+                        if metadata_command_is_matching_multipart_abort(
+                            &pending, bucket, key, upload_id,
+                        ) {
+                            self.apply_exact_pending_object_metadata_command(
+                                pg_id,
+                                super::ExactPendingObjectMetadataCommand::for_checked_request(
+                                    &pending,
+                                ),
+                            )?;
+                            return Ok(true);
+                        }
+                    }
+                    self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                    continue 'retry_after_pending_conflict;
+                }
+                Err(error) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
+                    return Err(error.into());
+                }
             }
-            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            if let Err(error) =
+                self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
+            {
+                match self
+                    .pending_metadata_command_uses_bucket_write_reservation(pg_id, bucket, &proof)
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
+                    }
+                    Err(lookup_error) => return Err(lookup_error),
+                }
+                return Err(error);
+            }
             return Ok(true);
         }
     }
@@ -8475,14 +8700,7 @@ impl super::StorageCluster {
         let upload_id = &authorized_upload.record().upload_id;
         'retry_after_pending_conflict: loop {
             while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
-                let matching_abort = matches!(
-                    command.payload(),
-                    MetadataCommandPayload::AbortMultipartUpload(abort)
-                        if abort.bucket == *bucket
-                            && abort.key == *key
-                            && abort.upload_id == *upload_id
-                );
-                if matching_abort {
+                if metadata_command_is_matching_multipart_abort(&command, bucket, key, upload_id) {
                     self.apply_exact_pending_object_metadata_command(
                         pg_id,
                         super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
@@ -8492,18 +8710,36 @@ impl super::StorageCluster {
                 self.drain_pending_object_metadata_command(pg_id, &command)?;
             }
 
-            let command = match self
-                .prepare_authorized_abort_multipart_upload_command(pg_id, authorized_upload)
-            {
+            let proof = match self.try_acquire_bucket_write_proof_for_object_metadata_command(
+                bucket,
+                key,
+                "abort-multipart-upload",
+                true,
+            )? {
+                Some(proof) => proof,
+                None => continue 'retry_after_pending_conflict,
+            };
+            let command = match self.prepare_authorized_abort_multipart_upload_command(
+                pg_id,
+                authorized_upload,
+                proof.clone(),
+            ) {
                 Ok(Some(command)) => command,
-                Ok(None) => return Ok(false),
+                Ok(None) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
+                    return Ok(false);
+                }
                 Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
                     ..
                 })) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
                     self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
                     continue 'retry_after_pending_conflict;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
+                    return Err(error);
+                }
             };
             let MetadataCommandPayload::AbortMultipartUpload(_) = command.payload() else {
                 unreachable!("prepared abort multipart command changed payload kind");
@@ -8512,10 +8748,48 @@ impl super::StorageCluster {
             maybe_run_before_abort_multipart_pending_install_hook(
                 self.metadata_command_apply_test_hook_scope_id(),
             );
-            if !self.try_install_object_pg_pending_command_or_drain(pg_id, bucket, &command)? {
-                continue 'retry_after_pending_conflict;
+            self.maybe_run_before_metadata_command_pending_install_hook();
+            match self.try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command) {
+                Ok(Some(())) => {}
+                Ok(None) | Err(StoreError::MetadataCommandLogConflict { .. }) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
+                    if let Some(pending) =
+                        self.pending_metadata_command_for_bucket(pg_id, bucket)?
+                    {
+                        if metadata_command_is_matching_multipart_abort(
+                            &pending, bucket, key, upload_id,
+                        ) {
+                            self.apply_exact_pending_object_metadata_command(
+                                pg_id,
+                                super::ExactPendingObjectMetadataCommand::for_checked_request(
+                                    &pending,
+                                ),
+                            )?;
+                            return Ok(true);
+                        }
+                    }
+                    self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                    continue 'retry_after_pending_conflict;
+                }
+                Err(error) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
+                    return Err(error.into());
+                }
             }
-            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            if let Err(error) =
+                self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
+            {
+                match self
+                    .pending_metadata_command_uses_bucket_write_reservation(pg_id, bucket, &proof)
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
+                    }
+                    Err(lookup_error) => return Err(lookup_error),
+                }
+                return Err(error);
+            }
             return Ok(true);
         }
     }
@@ -8526,6 +8800,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
+        bucket_write_reservation: BucketWriteReservationProof,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let cleanup = {
@@ -8544,6 +8819,7 @@ impl super::StorageCluster {
                 key: key.clone(),
                 upload_id: upload_id.clone(),
                 cleanup,
+                bucket_write_reservation,
             })),
         )))
     }
@@ -8552,6 +8828,7 @@ impl super::StorageCluster {
         &self,
         pg_id: PgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
+        bucket_write_reservation: BucketWriteReservationProof,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
         let primary_node = self.object_metadata_primary_node(
             &authorized_upload.record().bucket,
@@ -8573,6 +8850,7 @@ impl super::StorageCluster {
                 key: authorized_upload.record().key.clone(),
                 upload_id: authorized_upload.record().upload_id.clone(),
                 cleanup,
+                bucket_write_reservation,
             })),
         )))
     }
@@ -8632,7 +8910,13 @@ impl super::StorageCluster {
 
         if upload.state == UploadState::Aborting {
             return self
-                .abort_multipart_upload_locked(pg_id, bucket, key, upload_id)
+                .abort_multipart_upload_locked(
+                    pg_id,
+                    bucket,
+                    key,
+                    upload_id,
+                    AbortMultipartUploadDrainMode::Stop,
+                )
                 .map(Ok);
         }
         if upload.state != UploadState::InProgress || raw_lifecycle.is_none() {
@@ -8647,8 +8931,14 @@ impl super::StorageCluster {
             return Ok(Ok(false));
         }
 
-        self.abort_multipart_upload_locked(pg_id, bucket, key, upload_id)
-            .map(Ok)
+        self.abort_multipart_upload_locked(
+            pg_id,
+            bucket,
+            key,
+            upload_id,
+            AbortMultipartUploadDrainMode::Stop,
+        )
+        .map(Ok)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -8955,6 +9245,36 @@ impl super::StorageCluster {
     ) -> Result<Vec<MultipartPartSegmentRecord>, ObjectPgActionError> {
         self.metadata_primary_bridge_node()?
             .test_get_all_multipart_part_segments_for_upload(bucket, key, upload_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_insert_lifecycle_sweep_claim(
+        &self,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        lease_deadline: Option<u64>,
+    ) -> Result<(), ObjectPgActionError> {
+        let pg = self.metadata_pg(self.bucket_metadata_pg_id(bucket))?;
+        pg.test_insert_lifecycle_sweep_claim(
+            bucket,
+            bucket_incarnation_generation,
+            "test-lifecycle-claim",
+            "test-owner-token",
+            self.operation_epoch(),
+            lease_deadline,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_begin_durable_bucket_delete_drain(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<(), BucketWriteDrainError> {
+        match self.begin_durable_bucket_delete_drain(bucket)? {
+            super::DurableBucketDeleteDrainBegin::Acquired(_)
+            | super::DurableBucketDeleteDrainBegin::AlreadyDeleting => Ok(()),
+        }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

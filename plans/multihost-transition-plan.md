@@ -4225,7 +4225,13 @@ Proposed subphases:
    - a lifecycle worker may sweep a bucket only after acquiring that durable
      claim. If another process owns a live claim, the bucket is skipped for
      this pass. If a process crashes, the lease expires and another process can
-     resume by re-scanning the bucket and re-deriving candidates.
+     resume by re-scanning the bucket and re-deriving candidates. Long sweeps
+     must heartbeat the claim while enumerating and mutating candidates, so a
+     healthy worker does not lose ownership solely because a large bucket takes
+     longer than one lease interval to scan. Claim scan/acquire/heartbeat uses
+     the wall-clock lease clock; lifecycle due evaluation may use an injected
+     timestamp and must not be used to decide whether another worker's lease has
+     expired.
    - lifecycle claims do not bypass bucket deletion fences. Claim acquisition
      and every lifecycle mutation must recheck that the bucket incarnation is
      still Active and not protected by an active durable DeleteBucket drain.
@@ -4267,16 +4273,20 @@ Proposed subphases:
    - implementation slices:
      1. add the plan/docs, claim schema/types, and low-level PgStore helpers
         for acquire, release, heartbeat, expired-claim steal, stale terminal
-        cleanup, and deterministic durable root listing
+        cleanup, and deterministic durable root listing (done)
      2. route `run_lifecycle_sweep_at` through durable bucket claims: discover
-        buckets as today, attempt a claim per bucket, skip busy buckets, run
-        the existing sweep logic while holding the claim, release on success,
-        and record error/retry context on failure
+        roots through the deterministic root scanner, attempt a claim per
+        bucket incarnation, skip busy buckets, run the existing sweep logic
+        while holding and heartbeating the claim, release on success, and record
+        error/retry context on failure (done for claim routing and in-pass
+        heartbeat; durable claim `last_error` persistence remains for a
+        follow-up slice)
      3. add startup/periodic durable root scanning so restart without local
         lifecycle worker state discovers buckets with lifecycle config,
         buckets with aborting multipart uploads, and expired lifecycle claims
         using the deterministic expired-claim-first and busy-claim-skipping
-        rules above
+        rules above (done for the runtime sweep entry point and routed
+        metadata-PG aborting-upload discovery)
      4. downgrade or update the process-local lifecycle sweeper registry tests
         so they prove only local thread sharing, not correctness ownership
      5. add observability for claim acquire/busy/steal/release/error paths and
@@ -4295,6 +4305,10 @@ Proposed subphases:
        hidden by scan ordering
      - a busy claimed lifecycle bucket is skipped by ordinary root scanning
        without hiding unrelated unclaimed buckets
+     - old-incarnation expired claims do not suppress a current-incarnation root
+       for the same bucket during one sweep pass
+     - long bucket sweeps heartbeat while enumerating and before mutating
+       candidates, so the active owner cannot be stolen during normal progress
      - lifecycle claim acquired, then DeleteBucket starts: current-object,
        noncurrent-version, delete-marker, MPU abort, and `Aborting` upload
        finishing paths observe the drain/Deleting state or are drained before

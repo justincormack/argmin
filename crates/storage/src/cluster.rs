@@ -1664,6 +1664,9 @@ impl StorageCluster {
             MetadataCommandPayload::CreateMultipartUpload(create) => {
                 Some(&create.bucket_write_reservation)
             }
+            MetadataCommandPayload::AbortMultipartUpload(abort) => {
+                Some(&abort.bucket_write_reservation)
+            }
             _ => None,
         }
     }
@@ -1793,6 +1796,13 @@ impl StorageCluster {
         self.next_bucket_write_coordination_id(
             "bucket-finalize-",
             "generate bucket delete finalize claim id",
+        )
+    }
+
+    fn next_lifecycle_sweep_claim_id(&self) -> Result<String, StoreError> {
+        self.next_bucket_write_coordination_id(
+            "lifecycle-sweep-",
+            "generate lifecycle sweep claim id",
         )
     }
 

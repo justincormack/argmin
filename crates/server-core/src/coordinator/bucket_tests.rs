@@ -2031,6 +2031,114 @@ fn lifecycle_sweep_expires_nonversioned_current_object() {
 }
 
 #[test]
+fn lifecycle_sweep_skips_bucket_with_live_durable_claim() {
+    let tmp = test_util::tempdir();
+    let (first, second) = setup_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
+    let bucket = trusted_bucket_name("bucket");
+    first
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+    put_bucket_lifecycle_test(
+        &first,
+        bucket.as_str(),
+        "<LifecycleConfiguration><Rule><ID>expire</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
+        test_requester(),
+        None,
+    )
+    .unwrap();
+
+    let bucket_info = first.storage_node.head_bucket_info(&bucket).unwrap();
+    let claim_now = storage::clock::wall_time_millis();
+    let claim = first
+        .storage_node
+        .acquire_lifecycle_sweep_claim(
+            &bucket,
+            bucket_info.bucket_incarnation_generation,
+            claim_now,
+        )
+        .unwrap()
+        .expect("first coordinator should acquire lifecycle sweep claim");
+
+    let future_lifecycle_evaluation_time = claim_now.saturating_add(120_000);
+    let stats = second
+        .run_lifecycle_sweep_at(future_lifecycle_evaluation_time)
+        .unwrap();
+    assert_eq!(stats.scanned_buckets, 0);
+    assert_eq!(stats.expired_current_objects, 0);
+    assert_eq!(stats.expired_noncurrent_versions, 0);
+    assert_eq!(stats.expired_delete_markers, 0);
+    assert_eq!(stats.aborted_multipart_uploads, 0);
+
+    first
+        .storage_node
+        .release_lifecycle_sweep_claim(&claim)
+        .unwrap();
+}
+
+#[test]
+fn lifecycle_sweep_old_incarnation_expired_claim_does_not_skip_current_root() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_without_lifecycle_sweeper(tmp.path());
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    coord
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+    put_bucket_lifecycle_test(
+        &coord,
+        bucket.as_str(),
+        "<LifecycleConfiguration><Rule><ID>expire</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
+        test_requester(),
+        None,
+    )
+    .unwrap();
+
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                bucket.as_str(),
+                key.as_str(),
+                test_requester(),
+                None,
+            ),
+            data: b"hello",
+            metadata: &MetadataBlob::default(),
+            system_metadata: &SystemMetadata::default(),
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let last_modified = coord
+        .storage_node
+        .test_get_object_meta(&bucket, &key)
+        .unwrap()
+        .as_live()
+        .unwrap()
+        .last_modified;
+    let bucket_info = coord.storage_node.head_bucket_info(&bucket).unwrap();
+    coord
+        .storage_node
+        .test_insert_lifecycle_sweep_claim(
+            &bucket,
+            bucket_info.bucket_incarnation_generation.saturating_sub(1),
+            Some(50),
+        )
+        .unwrap();
+
+    let deadline = Coordinator::lifecycle_day_based_deadline(last_modified, 1).unwrap();
+    let stats = coord.run_lifecycle_sweep_at(deadline).unwrap();
+    assert_eq!(stats.scanned_buckets, 1);
+    assert_eq!(stats.expired_current_objects, 1);
+}
+
+#[test]
 fn lifecycle_sweep_expires_versioned_current_with_delete_marker() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
@@ -3249,6 +3357,76 @@ fn lifecycle_abort_rechecks_current_bucket_lifecycle_before_aborting_upload() {
             &upload.upload_id
         )
         .is_ok());
+}
+
+#[test]
+fn lifecycle_abort_stops_when_delete_drain_starts_after_claim() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_without_lifecycle_sweeper(tmp.path());
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("logs/app");
+    coord
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+    put_bucket_lifecycle_test(
+            &coord,
+            bucket.as_str(),
+            "<LifecycleConfiguration><Rule><ID>abort-mpu</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>",
+            test_requester(),
+            None,
+        )
+        .unwrap();
+
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(
+                bucket.as_str(),
+                key.as_str(),
+                test_requester(),
+                None,
+            ),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let deadline = {
+        let upload_record = coord
+            .storage_node
+            .test_get_multipart_upload(&bucket, &key, &upload.upload_id)
+            .unwrap();
+        Coordinator::lifecycle_day_based_deadline(upload_record.initiated_at, 1).unwrap()
+    };
+    let bucket_info = coord.storage_node.head_bucket_info(&bucket).unwrap();
+    let claim = coord
+        .storage_node
+        .acquire_lifecycle_sweep_claim(&bucket, bucket_info.bucket_incarnation_generation, deadline)
+        .unwrap()
+        .expect("lifecycle claim should be acquirable before delete drain");
+    coord
+        .storage_node
+        .test_begin_durable_bucket_delete_drain(&bucket)
+        .unwrap();
+
+    assert!(!coord
+        .read_runtime()
+        .abort_multipart_upload_if_due(&bucket, &key, &upload.upload_id, deadline)
+        .unwrap());
+    assert!(coord
+        .storage_node
+        .test_get_multipart_upload(&bucket, &key, &upload.upload_id)
+        .is_ok());
+
+    coord
+        .storage_node
+        .release_lifecycle_sweep_claim(&claim)
+        .unwrap();
 }
 
 #[test]

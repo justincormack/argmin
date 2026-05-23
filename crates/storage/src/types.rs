@@ -1955,6 +1955,38 @@ pub struct BucketDeleteFinalizeRoot {
     pub bucket_incarnation_generation: u64,
 }
 
+/// Durable lifecycle sweep worker claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleSweepClaimRecord {
+    pub bucket: BucketName,
+    pub bucket_incarnation_generation: u64,
+    pub claim_id: String,
+    pub owner_token: String,
+    pub cluster_epoch: ClusterEpoch,
+    pub pg_id: u32,
+    pub claimed_at: u64,
+    pub heartbeat_at: u64,
+    pub lease_deadline: Option<u64>,
+    pub attempt_count: u64,
+    pub last_error: Option<String>,
+}
+
+/// Why a bucket was returned as lifecycle sweep work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleSweepRootSource {
+    ExpiredClaim,
+    LifecycleConfig,
+    AbortingMultipartUpload,
+}
+
+/// Durable lifecycle sweep root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleSweepRoot {
+    pub bucket: BucketName,
+    pub bucket_incarnation_generation: u64,
+    pub source: LifecycleSweepRootSource,
+}
+
 /// Segment entry for a durable standard-object reclaim record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectSegmentsReclaimSegmentRecord {

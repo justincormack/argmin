@@ -10342,6 +10342,110 @@ fn bucket_delete_finalize_root_from_row(
     })
 }
 
+fn lifecycle_sweep_claim_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<LifecycleSweepClaimRecord, rusqlite::Error> {
+    let bucket_raw: String = row.get(0)?;
+    let bucket_incarnation_raw: i64 = row.get(1)?;
+    let cluster_epoch_raw: i64 = row.get(4)?;
+    let pg_id_raw: i64 = row.get(5)?;
+    let claimed_at_raw: i64 = row.get(6)?;
+    let heartbeat_at_raw: i64 = row.get(7)?;
+    let lease_deadline_raw: Option<i64> = row.get(8)?;
+    let attempt_count_raw: i64 = row.get(9)?;
+    Ok(LifecycleSweepClaimRecord {
+        bucket: BucketName::new(bucket_raw).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::from(error),
+            )
+        })?,
+        bucket_incarnation_generation: u64::try_from(bucket_incarnation_raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Integer,
+                Box::from(format!(
+                    "invalid bucket_incarnation_generation: {bucket_incarnation_raw}"
+                )),
+            )
+        })?,
+        claim_id: row.get(2)?,
+        owner_token: row.get(3)?,
+        cluster_epoch: u64::try_from(cluster_epoch_raw)
+            .ok()
+            .and_then(ClusterEpoch::new)
+            .ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Integer,
+                    Box::from(format!("invalid cluster_epoch: {cluster_epoch_raw}")),
+                )
+            })?,
+        pg_id: u32::try_from(pg_id_raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid pg_id: {pg_id_raw}")),
+            )
+        })?,
+        claimed_at: u64::try_from(claimed_at_raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid claimed_at: {claimed_at_raw}")),
+            )
+        })?,
+        heartbeat_at: u64::try_from(heartbeat_at_raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid heartbeat_at: {heartbeat_at_raw}")),
+            )
+        })?,
+        lease_deadline: PgStore::parse_optional_u64(lease_deadline_raw, 8, "lease_deadline")?,
+        attempt_count: u64::try_from(attempt_count_raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                9,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid attempt_count: {attempt_count_raw}")),
+            )
+        })?,
+        last_error: row.get(10)?,
+    })
+}
+
+fn lifecycle_sweep_root_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<LifecycleSweepRoot, rusqlite::Error> {
+    let incarnation = row.get::<_, i64>(1)?;
+    let bucket_incarnation_generation = u64::try_from(incarnation).map_err(|source| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Integer,
+            Box::new(source),
+        )
+    })?;
+    let source_raw: i64 = row.get(2)?;
+    let source = match source_raw {
+        0 => LifecycleSweepRootSource::ExpiredClaim,
+        1 => LifecycleSweepRootSource::LifecycleConfig,
+        2 => LifecycleSweepRootSource::AbortingMultipartUpload,
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid lifecycle sweep root source: {source_raw}")),
+            ));
+        }
+    };
+    Ok(LifecycleSweepRoot {
+        bucket: row.get(0)?,
+        bucket_incarnation_generation,
+        source,
+    })
+}
+
 impl PgMetadataStore for PgStore {
     #[cfg(test)]
     fn create_bucket(
@@ -12932,6 +13036,126 @@ impl PgMetadataStore for PgStore {
         Ok(roots)
     }
 
+    fn get_lifecycle_sweep_roots(
+        &self,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<LifecycleSweepRoot>, MetadataError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let now = i64::try_from(now).map_err(|source| MetadataError::Db {
+            context: "get lifecycle sweep roots now",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
+        let limit_i64 = i64::try_from(limit).map_err(|source| MetadataError::Db {
+            context: "get lifecycle sweep roots limit",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
+
+        let mut roots = Vec::new();
+        let mut expired_stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT bucket, bucket_incarnation_generation, 0 AS source \
+                 FROM lifecycle_sweep_claims \
+                 WHERE lease_deadline <= ?1 \
+                 ORDER BY bucket ASC, bucket_incarnation_generation ASC \
+                 LIMIT ?2",
+            )
+            .map_err(|source| MetadataError::Db {
+                context: "prepare get expired lifecycle sweep claim roots",
+                source,
+            })?;
+        let expired_rows = expired_stmt
+            .query_map(params![now, limit_i64], lifecycle_sweep_root_from_row)
+            .map_err(|source| MetadataError::Db {
+                context: "query get expired lifecycle sweep claim roots",
+                source,
+            })?;
+        for row in expired_rows {
+            roots.push(row.map_err(|source| MetadataError::Db {
+                context: "row get expired lifecycle sweep claim roots",
+                source,
+            })?);
+        }
+
+        if roots.len() == limit {
+            return Ok(roots);
+        }
+
+        let remaining_limit =
+            i64::try_from(limit - roots.len()).map_err(|source| MetadataError::Db {
+                context: "get lifecycle sweep roots remaining limit",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+
+        let mut stmt = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT b.name, b.bucket_incarnation_generation, \
+                        CASE \
+                          WHEN EXISTS ( \
+                            SELECT 1 FROM bucket_subresources lifecycle \
+                            WHERE lifecycle.bucket_name = b.name \
+                              AND lifecycle.kind = {LIFECYCLE_SUBRESOURCE_KIND_SQL} \
+                              AND lifecycle.body IS NOT NULL \
+                          ) THEN 1 \
+                          ELSE 2 \
+                        END AS source \
+                 FROM buckets b \
+                 WHERE b.state = ?1 \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM lifecycle_sweep_claims c \
+                     WHERE c.bucket = b.name \
+                       AND c.bucket_incarnation_generation = b.bucket_incarnation_generation \
+                   ) \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM bucket_write_drains d WHERE d.bucket_name = b.name \
+                   ) \
+                   AND ( \
+                     EXISTS ( \
+                       SELECT 1 FROM bucket_subresources lifecycle \
+                       WHERE lifecycle.bucket_name = b.name \
+                         AND lifecycle.kind = {LIFECYCLE_SUBRESOURCE_KIND_SQL} \
+                         AND lifecycle.body IS NOT NULL \
+                     ) \
+                     OR EXISTS ( \
+                       SELECT 1 FROM multipart_uploads m \
+                       WHERE m.bucket = b.name AND m.state = ?3 \
+                     ) \
+                   ) \
+                 ORDER BY b.name ASC \
+                 LIMIT ?2"
+            ))
+            .map_err(|source| MetadataError::Db {
+                context: "prepare get lifecycle sweep roots",
+                source,
+            })?;
+        let rows = stmt
+            .query_map(
+                params![
+                    BucketState::Active as u8,
+                    remaining_limit,
+                    UploadState::Aborting as u8,
+                ],
+                lifecycle_sweep_root_from_row,
+            )
+            .map_err(|source| MetadataError::Db {
+                context: "query get lifecycle sweep roots",
+                source,
+            })?;
+        for row in rows {
+            let root = row.map_err(|source| MetadataError::Db {
+                context: "row get lifecycle sweep roots",
+                source,
+            })?;
+            roots.push(root);
+        }
+
+        Ok(roots)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn acquire_object_payload_reclaim_claim(
         &self,
@@ -13396,6 +13620,321 @@ impl PgMetadataStore for PgStore {
                         .optional()
                         .map_err(|source| MetadataError::Db {
                             context: "release bucket delete finalize claim (check existing)",
+                            source,
+                        })?
+                        .is_some();
+                    let error = if claim_exists {
+                        MetadataError::ReclaimClaimConflict {
+                            claim_id: claim_id.to_string(),
+                        }
+                    } else {
+                        MetadataError::ReclaimClaimNotFound {
+                            claim_id: claim_id.to_string(),
+                        }
+                    };
+                    return Err(error);
+                }
+                Ok(())
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_lifecycle_sweep_claim(
+        &self,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<LifecycleSweepClaimRecord>, MetadataError> {
+        let bucket_incarnation_generation =
+            i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
+                context: "acquire lifecycle sweep claim incarnation",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        let claimed_at = i64::try_from(claimed_at).map_err(|source| MetadataError::Db {
+            context: "acquire lifecycle sweep claim claimed_at",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
+        let lease_deadline = lease_deadline
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|source| MetadataError::Db {
+                context: "acquire lifecycle sweep claim lease_deadline",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+
+        self.with_immediate_txn(
+            "acquire lifecycle sweep claim (begin txn)",
+            "acquire lifecycle sweep claim (commit txn)",
+            |store| {
+                let existing = store
+                    .conn
+                    .query_row(
+                        "SELECT bucket, bucket_incarnation_generation, claim_id, owner_token, \
+                                cluster_epoch, pg_id, claimed_at, heartbeat_at, lease_deadline, \
+                                attempt_count, last_error \
+                         FROM lifecycle_sweep_claims \
+                         WHERE bucket = ?1 AND bucket_incarnation_generation = ?2",
+                        params![bucket, bucket_incarnation_generation],
+                        lifecycle_sweep_claim_from_row,
+                    )
+                    .optional()
+                    .map_err(|source| MetadataError::Db {
+                        context: "load lifecycle sweep claim",
+                        source,
+                    })?;
+                let mut attempt_count = 1_i64;
+                if let Some(existing) = existing {
+                    if existing.claim_id == claim_id
+                        && existing.owner_token == owner_token
+                        && existing.cluster_epoch == cluster_epoch
+                    {
+                        return Ok(Some(existing));
+                    }
+                    if existing.lease_deadline.is_none_or(|deadline| deadline > now) {
+                        return Ok(None);
+                    }
+                    attempt_count =
+                        i64::try_from(existing.attempt_count.saturating_add(1)).map_err(
+                            |source| MetadataError::Db {
+                                context: "acquire lifecycle sweep claim attempt_count",
+                                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                            },
+                        )?;
+                    store
+                        .conn
+                        .execute(
+                            "DELETE FROM lifecycle_sweep_claims \
+                             WHERE bucket = ?1 AND bucket_incarnation_generation = ?2",
+                            params![bucket, bucket_incarnation_generation],
+                        )
+                        .map_err(|source| MetadataError::Db {
+                            context: "clear expired lifecycle sweep claim",
+                            source,
+                        })?;
+                }
+
+                let claimable_bucket_exists = store
+                    .conn
+                    .query_row(
+                        "SELECT 1 FROM buckets b \
+                         WHERE b.name = ?1 AND b.state = ?2 AND b.bucket_incarnation_generation = ?3 \
+                           AND NOT EXISTS ( \
+                             SELECT 1 FROM bucket_write_drains d WHERE d.bucket_name = b.name \
+                           )",
+                        params![
+                            bucket,
+                            BucketState::Active as u8,
+                            bucket_incarnation_generation,
+                        ],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(|source| MetadataError::Db {
+                        context: "acquire lifecycle sweep claim (check bucket)",
+                        source,
+                    })?
+                    .is_some();
+                if !claimable_bucket_exists {
+                    return Ok(None);
+                }
+
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO lifecycle_sweep_claims \
+                         (bucket, bucket_incarnation_generation, claim_id, owner_token, \
+                          cluster_epoch, pg_id, claimed_at, heartbeat_at, lease_deadline, \
+                          attempt_count, last_error) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, NULL)",
+                        params![
+                            bucket,
+                            bucket_incarnation_generation,
+                            claim_id,
+                            owner_token,
+                            cluster_epoch.get(),
+                            store.pg_id,
+                            claimed_at,
+                            lease_deadline,
+                            attempt_count,
+                        ],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "insert lifecycle sweep claim",
+                        source,
+                    })?;
+
+                store
+                    .conn
+                    .query_row(
+                        "SELECT bucket, bucket_incarnation_generation, claim_id, owner_token, \
+                                cluster_epoch, pg_id, claimed_at, heartbeat_at, lease_deadline, \
+                                attempt_count, last_error \
+                         FROM lifecycle_sweep_claims \
+                         WHERE bucket = ?1 AND bucket_incarnation_generation = ?2",
+                        params![bucket, bucket_incarnation_generation],
+                        lifecycle_sweep_claim_from_row,
+                    )
+                    .optional()
+                    .map_err(|source| MetadataError::Db {
+                        context: "reload lifecycle sweep claim",
+                        source,
+                    })
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn heartbeat_lifecycle_sweep_claim(
+        &self,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        heartbeat_at: u64,
+        lease_deadline: Option<u64>,
+    ) -> Result<LifecycleSweepClaimRecord, MetadataError> {
+        let bucket_incarnation_generation =
+            i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
+                context: "heartbeat lifecycle sweep claim incarnation",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        let heartbeat_at = i64::try_from(heartbeat_at).map_err(|source| MetadataError::Db {
+            context: "heartbeat lifecycle sweep claim heartbeat_at",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
+        let lease_deadline = lease_deadline
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|source| MetadataError::Db {
+                context: "heartbeat lifecycle sweep claim lease_deadline",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+
+        self.with_immediate_txn(
+            "heartbeat lifecycle sweep claim (begin txn)",
+            "heartbeat lifecycle sweep claim (commit txn)",
+            |store| {
+                let updated = store
+                    .conn
+                    .execute(
+                        "UPDATE lifecycle_sweep_claims \
+                         SET heartbeat_at = ?6, lease_deadline = ?7 \
+                         WHERE bucket = ?1 AND bucket_incarnation_generation = ?2 \
+                           AND claim_id = ?3 AND owner_token = ?4 AND cluster_epoch = ?5",
+                        params![
+                            bucket,
+                            bucket_incarnation_generation,
+                            claim_id,
+                            owner_token,
+                            cluster_epoch.get(),
+                            heartbeat_at,
+                            lease_deadline,
+                        ],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "heartbeat lifecycle sweep claim",
+                        source,
+                    })?;
+                if updated == 0 {
+                    let claim_exists = store
+                        .conn
+                        .query_row(
+                            "SELECT 1 FROM lifecycle_sweep_claims \
+                             WHERE bucket = ?1 AND bucket_incarnation_generation = ?2",
+                            params![bucket, bucket_incarnation_generation],
+                            |_| Ok(()),
+                        )
+                        .optional()
+                        .map_err(|source| MetadataError::Db {
+                            context: "heartbeat lifecycle sweep claim (check existing)",
+                            source,
+                        })?
+                        .is_some();
+                    let error = if claim_exists {
+                        MetadataError::ReclaimClaimConflict {
+                            claim_id: claim_id.to_string(),
+                        }
+                    } else {
+                        MetadataError::ReclaimClaimNotFound {
+                            claim_id: claim_id.to_string(),
+                        }
+                    };
+                    return Err(error);
+                }
+
+                store
+                    .conn
+                    .query_row(
+                        "SELECT bucket, bucket_incarnation_generation, claim_id, owner_token, \
+                                cluster_epoch, pg_id, claimed_at, heartbeat_at, lease_deadline, \
+                                attempt_count, last_error \
+                         FROM lifecycle_sweep_claims \
+                         WHERE bucket = ?1 AND bucket_incarnation_generation = ?2",
+                        params![bucket, bucket_incarnation_generation],
+                        lifecycle_sweep_claim_from_row,
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "reload heartbeat lifecycle sweep claim",
+                        source,
+                    })
+            },
+        )
+    }
+
+    fn release_lifecycle_sweep_claim(
+        &self,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<(), MetadataError> {
+        let bucket_incarnation_generation =
+            i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
+                context: "release lifecycle sweep claim incarnation",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        self.with_immediate_txn(
+            "release lifecycle sweep claim (begin txn)",
+            "release lifecycle sweep claim (commit txn)",
+            |store| {
+                let deleted = store
+                    .conn
+                    .execute(
+                        "DELETE FROM lifecycle_sweep_claims \
+                         WHERE bucket = ?1 AND bucket_incarnation_generation = ?2 \
+                           AND claim_id = ?3 AND owner_token = ?4 AND cluster_epoch = ?5",
+                        params![
+                            bucket,
+                            bucket_incarnation_generation,
+                            claim_id,
+                            owner_token,
+                            cluster_epoch.get(),
+                        ],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "release lifecycle sweep claim",
+                        source,
+                    })?;
+                if deleted == 0 {
+                    let claim_exists = store
+                        .conn
+                        .query_row(
+                            "SELECT 1 FROM lifecycle_sweep_claims \
+                             WHERE bucket = ?1 AND bucket_incarnation_generation = ?2",
+                            params![bucket, bucket_incarnation_generation],
+                            |_| Ok(()),
+                        )
+                        .optional()
+                        .map_err(|source| MetadataError::Db {
+                            context: "release lifecycle sweep claim (check existing)",
                             source,
                         })?
                         .is_some();
@@ -16164,6 +16703,51 @@ impl PgMetadataStore for PgStore {
 }
 
 impl PgStore {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_insert_lifecycle_sweep_claim(
+        &self,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        lease_deadline: Option<u64>,
+    ) -> Result<(), MetadataError> {
+        let bucket_incarnation_generation =
+            i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
+                context: "test insert lifecycle sweep claim incarnation",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        let lease_deadline = lease_deadline
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|source| MetadataError::Db {
+                context: "test insert lifecycle sweep claim lease deadline",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        self.conn
+            .execute(
+                "INSERT INTO lifecycle_sweep_claims \
+                 (bucket, bucket_incarnation_generation, claim_id, owner_token, cluster_epoch, \
+                  pg_id, claimed_at, heartbeat_at, lease_deadline, attempt_count, last_error) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, ?7, 1, NULL)",
+                params![
+                    bucket,
+                    bucket_incarnation_generation,
+                    claim_id,
+                    owner_token,
+                    cluster_epoch.get(),
+                    self.pg_id,
+                    lease_deadline,
+                ],
+            )
+            .map_err(|source| MetadataError::Db {
+                context: "test insert lifecycle sweep claim",
+                source,
+            })?;
+        Ok(())
+    }
+
     fn delete_object_generation_reservation_direct(
         &self,
         bucket: &BucketName,
@@ -16476,6 +17060,301 @@ mod tests {
                 object_lock: BucketObjectLockConfig::default(),
             })
             .unwrap();
+    }
+
+    fn put_probe_lifecycle_direct(store: &PgStore, bucket: &BucketName) {
+        store
+            .put_bucket_subresource(
+                bucket,
+                PutBucketSubresource {
+                    kind: BucketSubresourceKind::Lifecycle,
+                    body: "<LifecycleConfiguration/>",
+                    aux: BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn lifecycle_sweep_claim_is_bucket_incarnation_owner_and_expires() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 12).unwrap();
+        let bucket = trusted_bucket_name("lifecycle-claim-bucket");
+        create_probe_bucket_direct(&store, &bucket);
+        let record = store.head_bucket_record_raw(&bucket).unwrap();
+
+        let first = store
+            .acquire_lifecycle_sweep_claim(
+                &bucket,
+                record.bucket_incarnation_generation,
+                "claim-a",
+                "owner-a",
+                ClusterEpoch::INITIAL,
+                10,
+                Some(20),
+                10,
+            )
+            .unwrap()
+            .expect("active bucket should be lifecycle-claimable");
+        assert_eq!(first.claim_id, "claim-a");
+        assert_eq!(first.pg_id, 12);
+        assert_eq!(first.claimed_at, 10);
+        assert_eq!(first.heartbeat_at, 10);
+        assert_eq!(first.attempt_count, 1);
+
+        assert!(
+            store
+                .acquire_lifecycle_sweep_claim(
+                    &bucket,
+                    record.bucket_incarnation_generation,
+                    "claim-b",
+                    "owner-b",
+                    ClusterEpoch::INITIAL,
+                    11,
+                    Some(30),
+                    11,
+                )
+                .unwrap()
+                .is_none(),
+            "non-expired lifecycle claim must block another owner"
+        );
+
+        let idempotent = store
+            .acquire_lifecycle_sweep_claim(
+                &bucket,
+                record.bucket_incarnation_generation,
+                "claim-a",
+                "owner-a",
+                ClusterEpoch::INITIAL,
+                12,
+                Some(40),
+                12,
+            )
+            .unwrap()
+            .expect("same owner should reacquire idempotently");
+        assert_eq!(idempotent, first);
+
+        let heartbeat = store
+            .heartbeat_lifecycle_sweep_claim(
+                &bucket,
+                record.bucket_incarnation_generation,
+                "claim-a",
+                "owner-a",
+                ClusterEpoch::INITIAL,
+                15,
+                Some(25),
+            )
+            .unwrap();
+        assert_eq!(heartbeat.claim_id, "claim-a");
+        assert_eq!(heartbeat.heartbeat_at, 15);
+        assert_eq!(heartbeat.lease_deadline, Some(25));
+
+        let stolen = store
+            .acquire_lifecycle_sweep_claim(
+                &bucket,
+                record.bucket_incarnation_generation,
+                "claim-b",
+                "owner-b",
+                ClusterEpoch::INITIAL,
+                26,
+                Some(40),
+                26,
+            )
+            .unwrap()
+            .expect("expired lifecycle claim should be stealable");
+        assert_eq!(stolen.claim_id, "claim-b");
+        assert_eq!(stolen.attempt_count, 2);
+
+        let stale_release = store
+            .release_lifecycle_sweep_claim(
+                &bucket,
+                record.bucket_incarnation_generation,
+                "claim-a",
+                "owner-a",
+                ClusterEpoch::INITIAL,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            stale_release,
+            MetadataError::ReclaimClaimConflict { .. }
+        ));
+
+        store
+            .release_lifecycle_sweep_claim(
+                &bucket,
+                record.bucket_incarnation_generation,
+                "claim-b",
+                "owner-b",
+                ClusterEpoch::INITIAL,
+            )
+            .unwrap();
+        let missing_release = store
+            .release_lifecycle_sweep_claim(
+                &bucket,
+                record.bucket_incarnation_generation,
+                "claim-b",
+                "owner-b",
+                ClusterEpoch::INITIAL,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            missing_release,
+            MetadataError::ReclaimClaimNotFound { .. }
+        ));
+    }
+
+    #[test]
+    fn lifecycle_sweep_claim_rejects_deleting_or_drained_bucket() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 12).unwrap();
+        let drained = trusted_bucket_name("lifecycle-drained-bucket");
+        let deleting = trusted_bucket_name("lifecycle-deleting-bucket");
+        create_probe_bucket_direct(&store, &drained);
+        create_probe_bucket_direct(&store, &deleting);
+        let drained_record = store.head_bucket_record_raw(&drained).unwrap();
+        store
+            .begin_durable_bucket_write_drain(
+                &drained,
+                "delete-drain",
+                "delete-owner",
+                ClusterEpoch::INITIAL,
+                10,
+                Some(30),
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .acquire_lifecycle_sweep_claim(
+                    &drained,
+                    drained_record.bucket_incarnation_generation,
+                    "claim",
+                    "owner",
+                    ClusterEpoch::INITIAL,
+                    11,
+                    Some(30),
+                    11,
+                )
+                .unwrap()
+                .is_none(),
+            "active delete drains must fence lifecycle claims"
+        );
+
+        store.mark_bucket_deleting(&deleting).unwrap();
+        let deleting_record = store.head_bucket_record_raw(&deleting).unwrap();
+        assert!(
+            store
+                .acquire_lifecycle_sweep_claim(
+                    &deleting,
+                    deleting_record.bucket_incarnation_generation,
+                    "claim",
+                    "owner",
+                    ClusterEpoch::INITIAL,
+                    11,
+                    Some(30),
+                    11,
+                )
+                .unwrap()
+                .is_none(),
+            "Deleting buckets must not be lifecycle-claimable"
+        );
+    }
+
+    #[test]
+    fn lifecycle_sweep_roots_include_expired_claim_before_earlier_bucket() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 12).unwrap();
+        let bucket_a = trusted_bucket_name("lifecycle-root-a");
+        let bucket_b = trusted_bucket_name("lifecycle-root-b");
+        create_probe_bucket_direct(&store, &bucket_a);
+        create_probe_bucket_direct(&store, &bucket_b);
+        put_probe_lifecycle_direct(&store, &bucket_b);
+        let bucket_b_record = store.head_bucket_record_raw(&bucket_b).unwrap();
+
+        store
+            .acquire_lifecycle_sweep_claim(
+                &bucket_b,
+                bucket_b_record.bucket_incarnation_generation,
+                "claim-b",
+                "owner-b",
+                ClusterEpoch::INITIAL,
+                10,
+                Some(20),
+                10,
+            )
+            .unwrap()
+            .expect("later lifecycle bucket should be claimable");
+
+        put_probe_lifecycle_direct(&store, &bucket_a);
+        let bucket_a_record = store.head_bucket_record_raw(&bucket_a).unwrap();
+        assert_eq!(
+            store.get_lifecycle_sweep_roots(21, 16).unwrap(),
+            vec![
+                LifecycleSweepRoot {
+                    bucket: bucket_b.clone(),
+                    bucket_incarnation_generation: bucket_b_record.bucket_incarnation_generation,
+                    source: LifecycleSweepRootSource::ExpiredClaim,
+                },
+                LifecycleSweepRoot {
+                    bucket: bucket_a,
+                    bucket_incarnation_generation: bucket_a_record.bucket_incarnation_generation,
+                    source: LifecycleSweepRootSource::LifecycleConfig,
+                },
+            ],
+            "expired lifecycle claim work must be rediscovered before unrelated roots"
+        );
+        assert_eq!(
+            store.get_lifecycle_sweep_roots(21, 1).unwrap(),
+            vec![LifecycleSweepRoot {
+                bucket: bucket_b,
+                bucket_incarnation_generation: bucket_b_record.bucket_incarnation_generation,
+                source: LifecycleSweepRootSource::ExpiredClaim,
+            }],
+            "claim recovery must not be hidden by an earlier lifecycle bucket"
+        );
+    }
+
+    #[test]
+    fn lifecycle_sweep_roots_skip_busy_null_deadline_claim() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 12).unwrap();
+        let bucket_a = trusted_bucket_name("lifecycle-null-root-a");
+        let bucket_b = trusted_bucket_name("lifecycle-null-root-b");
+        create_probe_bucket_direct(&store, &bucket_a);
+        create_probe_bucket_direct(&store, &bucket_b);
+        put_probe_lifecycle_direct(&store, &bucket_b);
+        let bucket_b_record = store.head_bucket_record_raw(&bucket_b).unwrap();
+
+        store
+            .acquire_lifecycle_sweep_claim(
+                &bucket_b,
+                bucket_b_record.bucket_incarnation_generation,
+                "claim-b",
+                "owner-b",
+                ClusterEpoch::INITIAL,
+                10,
+                None,
+                10,
+            )
+            .unwrap()
+            .expect("later lifecycle bucket should be claimable");
+
+        assert!(
+            store.get_lifecycle_sweep_roots(21, 16).unwrap().is_empty(),
+            "non-expiring lifecycle claims should remain busy, not expired scan work"
+        );
+
+        put_probe_lifecycle_direct(&store, &bucket_a);
+        let bucket_a_record = store.head_bucket_record_raw(&bucket_a).unwrap();
+        assert_eq!(
+            store.get_lifecycle_sweep_roots(21, 16).unwrap(),
+            vec![LifecycleSweepRoot {
+                bucket: bucket_a,
+                bucket_incarnation_generation: bucket_a_record.bucket_incarnation_generation,
+                source: LifecycleSweepRootSource::LifecycleConfig,
+            }],
+            "busy claimed buckets should not hide unrelated unclaimed lifecycle roots"
+        );
     }
 
     #[test]
@@ -18846,6 +19725,18 @@ mod tests {
             )
             .unwrap();
 
+        let bucket_write_reservation = BucketWriteReservationProof {
+            bucket: upload.bucket.clone(),
+            reservation_id: "abort-proof".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
+            operation_kind: "abort-multipart-upload".to_string(),
+            created_at: 456,
+            lease_deadline: None,
+            target_context: Some(upload.key.as_str().to_string()),
+        };
         let command = AbortMultipartUploadCommand {
             bucket: upload.bucket.clone(),
             key: upload.key.clone(),
@@ -18857,6 +19748,7 @@ mod tests {
                 stream_uploads: vec![TerminalStreamCleanupRecord::from(&session)],
                 stream_upload_segments: Vec::new(),
             },
+            bucket_write_reservation,
         };
         store
             .apply_abort_multipart_upload_command(&command)

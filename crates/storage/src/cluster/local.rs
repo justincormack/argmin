@@ -1633,6 +1633,9 @@ fn command_bucket_write_reservation_proof(
         crate::metadata_command::MetadataCommandPayload::CreateMultipartUpload(create) => {
             Some(&create.bucket_write_reservation)
         }
+        crate::metadata_command::MetadataCommandPayload::AbortMultipartUpload(abort) => {
+            Some(&abort.bucket_write_reservation)
+        }
         _ => None,
     }
 }
@@ -16168,6 +16171,12 @@ mod tests {
                 .unwrap()
                 .expect("upload is still abortable")
         };
+        let bucket_write_reservation = acquire_test_bucket_write_proof(
+            &cluster,
+            &bucket,
+            "abort-multipart-upload",
+            Some(key.as_str()),
+        );
         let command = MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 ClusterEpoch::INITIAL,
@@ -16179,6 +16188,7 @@ mod tests {
                 key: key.clone(),
                 upload_id: upload_id.clone(),
                 cleanup,
+                bucket_write_reservation,
             })),
         );
         let inserted = Arc::new(AtomicBool::new(false));
@@ -16936,6 +16946,12 @@ mod tests {
         let hook_key = key.clone();
         let hook_upload = upload.clone();
         let hook_upload_id = upload_id.clone();
+        let hook_bucket_write_reservation = acquire_test_bucket_write_proof(
+            &first_cluster,
+            &bucket,
+            "abort-multipart-upload",
+            Some(key.as_str()),
+        );
         let _hook_guard = first_cluster.test_install_before_metadata_command_pending_install_hook(
             Arc::new(move || {
                 if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
@@ -16959,6 +16975,7 @@ mod tests {
                                 stream_uploads: Vec::new(),
                                 stream_upload_segments: Vec::new(),
                             },
+                            bucket_write_reservation: hook_bucket_write_reservation.clone(),
                         },
                     )),
                 );
@@ -20889,6 +20906,12 @@ mod tests {
         let hook_bucket = bucket.clone();
         let hook_key = key.clone();
         let hook_upload_id = upload_id.clone();
+        let hook_bucket_write_reservation = acquire_test_bucket_write_proof(
+            &first_cluster,
+            &bucket,
+            "abort-multipart-upload",
+            Some(key.as_str()),
+        );
         let _hook_guard = first_cluster.test_install_before_metadata_command_pending_install_hook(
             Arc::new(move || {
                 if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
@@ -20922,6 +20945,7 @@ mod tests {
                             key: hook_key.clone(),
                             upload_id: hook_upload_id.clone(),
                             cleanup,
+                            bucket_write_reservation: hook_bucket_write_reservation.clone(),
                         },
                     )),
                 );
@@ -31285,7 +31309,7 @@ mod tests {
         let upload_bucket =
             crate::BucketName::try_from("multipart-fanout-bucket".to_string()).unwrap();
         let lifecycle_bucket = bucket_for_pg(topology, 1, "lifecycle-bucket-");
-        let aborting_bucket = bucket_for_pg(topology, 2, "aborting-bucket-");
+        let aborting_bucket = bucket_for_pg(topology, 1, "aborting-bucket-");
         let key_a = key_for_object_pg(topology, &upload_bucket, 1, "uploads/a-");
         let key_b = key_for_object_pg(topology, &upload_bucket, 2, "uploads/b-");
         let aborting_key = key_for_object_pg(topology, &aborting_bucket, 2, "abort-");
@@ -31376,7 +31400,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![&lifecycle_bucket]
         );
-        assert_eq!(sweep.aborting_buckets, vec![aborting_bucket]);
+        assert_eq!(sweep.aborting_buckets, vec![aborting_bucket.clone()]);
+
+        let roots = cluster.list_lifecycle_sweep_roots(0).unwrap();
+        assert_eq!(
+            roots
+                .iter()
+                .map(|root| (&root.bucket, root.source))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    &lifecycle_bucket,
+                    crate::LifecycleSweepRootSource::LifecycleConfig
+                ),
+                (
+                    &aborting_bucket,
+                    crate::LifecycleSweepRootSource::AbortingMultipartUpload,
+                ),
+            ]
+        );
     }
 
     #[test]

@@ -385,6 +385,24 @@ CREATE TABLE IF NOT EXISTS bucket_delete_finalize_claims (
     FOREIGN KEY (bucket) REFERENCES buckets(name) ON DELETE CASCADE
 )";
 
+/// Durable lifecycle sweep worker claims, keyed by bucket incarnation.
+const CREATE_LIFECYCLE_SWEEP_CLAIMS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS lifecycle_sweep_claims (
+    bucket          TEXT NOT NULL,
+    bucket_incarnation_generation INTEGER NOT NULL CHECK (bucket_incarnation_generation >= 0),
+    claim_id        TEXT NOT NULL CHECK (length(claim_id) BETWEEN 1 AND 256),
+    owner_token     TEXT NOT NULL CHECK (length(owner_token) BETWEEN 1 AND 256),
+    cluster_epoch   INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    pg_id           INTEGER NOT NULL CHECK (pg_id >= 0),
+    claimed_at      INTEGER NOT NULL CHECK (claimed_at >= 0),
+    heartbeat_at    INTEGER NOT NULL CHECK (heartbeat_at >= 0),
+    lease_deadline  INTEGER CHECK (lease_deadline IS NULL OR lease_deadline >= 0),
+    attempt_count   INTEGER NOT NULL CHECK (attempt_count >= 0),
+    last_error      TEXT,
+    PRIMARY KEY (bucket, bucket_incarnation_generation),
+    FOREIGN KEY (bucket) REFERENCES buckets(name) ON DELETE CASCADE
+)";
+
 /// Committed multipart part segments.
 const CREATE_MULTIPART_PART_CHUNKS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS multipart_part_segments (
@@ -637,6 +655,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_BUCKET_WRITE_RESERVATIONS_TABLE, [])?;
     conn.execute(CREATE_BUCKET_WRITE_DRAINS_TABLE, [])?;
     conn.execute(CREATE_BUCKET_DELETE_FINALIZE_CLAIMS_TABLE, [])?;
+    conn.execute(CREATE_LIFECYCLE_SWEEP_CLAIMS_TABLE, [])?;
     conn.execute(CREATE_BUCKETS_OWNER_LIST_INDEX, [])?;
     conn.execute(CREATE_PG_COUNTERS_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_LOG_TABLE, [])?;

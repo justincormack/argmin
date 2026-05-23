@@ -986,6 +986,7 @@ pub(crate) struct AbortMultipartUploadCommand {
     pub(crate) key: ObjectKey,
     pub(crate) upload_id: UploadId,
     pub(crate) cleanup: AbortMultipartUploadCleanup,
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1422,7 +1423,8 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 self.skip_str()?;
                 self.skip_str()?;
                 self.skip_str()?;
-                self.skip_abort_multipart_upload_cleanup()
+                self.skip_abort_multipart_upload_cleanup()?;
+                self.skip_required_bucket_write_reservation_proof()
             }
             METADATA_COMMAND_DELETE_OBJECT_PAYLOAD_RECLAIM => {
                 self.skip_str()?;
@@ -1639,6 +1641,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                         key: self.read_object_key()?,
                         upload_id: self.read_upload_id()?,
                         cleanup: self.read_abort_multipart_upload_cleanup()?,
+                        bucket_write_reservation: self.read_bucket_write_reservation_proof()?,
                     },
                 )))
             }
@@ -3166,6 +3169,7 @@ fn encode_abort_multipart_upload(out: &mut Vec<u8>, command: &AbortMultipartUplo
     put_str(out, command.key.as_str());
     put_str(out, command.upload_id.as_str());
     encode_abort_multipart_upload_cleanup(out, &command.cleanup);
+    encode_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
 }
 
 fn encode_delete_object_payload_reclaim(
@@ -5006,6 +5010,7 @@ mod tests {
                     }],
                     stream_upload_segments: vec![stream_segment.clone()],
                 },
+                bucket_write_reservation: bucket_write_reservation.clone(),
             })),
             MetadataCommandPayload::CreateStreamUpload(Box::new(
                 CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
@@ -5159,7 +5164,7 @@ mod tests {
                 0x48fb53d34217c071,
                 0x60d07b32ba40633a,
                 0x5905759308d55e48,
-                0x8f0590d0286f0dc4,
+                0xe480fc355cba3a12,
                 0x2d6608601fded1d8,
                 0xe3226a0437ce53d4,
                 0x85aa88f98640917b,

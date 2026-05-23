@@ -518,6 +518,17 @@ pub(crate) trait PgMetadataStore {
         limit: usize,
     ) -> Result<Vec<BucketDeleteFinalizeRoot>, MetadataError>;
 
+    /// Return lifecycle sweep roots on this bucket metadata PG.
+    ///
+    /// Expired lifecycle claims are returned first so their exact bucket
+    /// incarnation remains recoverable even when another lifecycle bucket sorts
+    /// earlier. Busy claims are skipped by ordinary lifecycle root scanning.
+    fn get_lifecycle_sweep_roots(
+        &self,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<LifecycleSweepRoot>, MetadataError>;
+
     /// Acquire the single durable object-payload reclaim claim for this PG.
     ///
     /// Returns `Ok(None)` when the reclaim root is absent or a non-expired
@@ -568,6 +579,43 @@ pub(crate) trait PgMetadataStore {
 
     /// Release a durable bucket-delete finalizer claim by exact token-fenced identity.
     fn release_bucket_delete_finalize_claim(
+        &self,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<(), MetadataError>;
+
+    /// Acquire a durable lifecycle sweep claim for one bucket incarnation.
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_lifecycle_sweep_claim(
+        &self,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<LifecycleSweepClaimRecord>, MetadataError>;
+
+    /// Heartbeat a durable lifecycle sweep claim by exact token-fenced identity.
+    #[allow(clippy::too_many_arguments)]
+    fn heartbeat_lifecycle_sweep_claim(
+        &self,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        heartbeat_at: u64,
+        lease_deadline: Option<u64>,
+    ) -> Result<LifecycleSweepClaimRecord, MetadataError>;
+
+    /// Release a durable lifecycle sweep claim by exact token-fenced identity.
+    fn release_lifecycle_sweep_claim(
         &self,
         bucket: &BucketName,
         bucket_incarnation_generation: u64,

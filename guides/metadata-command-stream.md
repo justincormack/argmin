@@ -206,15 +206,18 @@ return the response from that command. Every such exception must be documented
 in the table above, listed in the boundary script allowlist as a
 matching-outcome path, and covered by an install-race regression where the
 equivalent command wins the pending slot after snapshot/command construction.
-Terminal-session retry publishers follow the same lower-level install rule,
-but the reason is different: they preserve the equivalent pending command for
-the next loop iteration instead of draining a command that deletes the session
-row needed by the matching branch. Every such publisher needs a same-command
-install-race regression. If the raw install reports `MetadataCommandLogConflict`
-because the prebuilt command id is already terminal, that is still ordinary
-unrelated contention: drain the current PG slot and restart from a fresh
-snapshot. Only an occupied slot with an equivalent terminal command is preserved
-for the matching branch.
+Terminal-session retry publishers follow the same lower-level install rule, but
+the reason is different: they preserve the equivalent pending command instead
+of draining a command that deletes the session row needed by the matching
+branch. If they need to inspect an occupied slot before generic drain, they may
+call `try_set_pending_metadata_command_for_bucket` directly; any caller-owned
+proof or reservation that did not enter the winning command must be released
+before the publisher finishes the equivalent contender. Every such publisher
+needs a same-command install-race regression. If the raw install reports
+`MetadataCommandLogConflict` because the prebuilt command id is already
+terminal, that is still ordinary unrelated contention: drain the current PG
+slot and restart from a fresh snapshot. Only an occupied slot with an equivalent
+terminal command is preserved for the matching branch.
 If a PG-wide pending slot appears after the publisher has taken its snapshot
 but before it allocates the command id, `MetadataCommandLogConflict` is the
 same pre-publish contention class: the publisher must drain the winner and
@@ -282,6 +285,10 @@ Multipart publisher rules:
 - `abort_multipart_upload_locked` and
   `abort_authorized_multipart_upload_locked` must rebuild upload, part, active
   stream session, staged segment, and cleanup snapshots after contention.
+  Matching pending abort contenders are inspected before generic drain because
+  draining them can delete the upload row needed to report a successful abort;
+  these paths release their unused bucket-write proof before finishing the
+  matching abort command.
   Authorized abort must compare the current upload row with the already
   authorized row before publishing; if the row changed, storage returns the
   normal missing/non-abortable outcome instead of applying a stale

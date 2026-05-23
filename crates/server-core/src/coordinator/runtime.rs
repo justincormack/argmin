@@ -32,6 +32,7 @@ static LIFECYCLE_SWEEPER_REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<LifecycleS
 static SHARD_SCAVENGER_SWEEPER_REGISTRY: OnceLock<
     Mutex<HashMap<usize, Weak<ShardScavengerSweeper>>>,
 > = OnceLock::new();
+const LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS: usize = 256;
 
 /// The coordinator ties together EC, storage, and metadata.
 pub(super) struct ReclaimSweeper {
@@ -309,35 +310,93 @@ impl ReadRuntime {
             expired_delete_markers: 0,
             aborted_multipart_uploads: 0,
         };
-        let mut processed_buckets: HashSet<BucketName> = HashSet::new();
-        let sweep_buckets = self
+        let mut processed_buckets: HashSet<(BucketName, u64)> = HashSet::new();
+        let claim_now_millis = storage::clock::wall_time_millis();
+        let sweep_roots = self
             .storage_node
-            .list_lifecycle_sweep_buckets()
+            .list_lifecycle_sweep_roots(claim_now_millis)
             .map_err(Coordinator::map_object_pg_action_error)?;
 
-        for bucket in sweep_buckets.lifecycle_buckets {
-            if processed_buckets.insert(bucket.name.clone()) {
-                stats.scanned_buckets += 1;
+        for root in sweep_roots {
+            let claim_now_millis = storage::clock::wall_time_millis();
+            let Some(claim) = self
+                .storage_node
+                .acquire_lifecycle_sweep_claim(
+                    &root.bucket,
+                    root.bucket_incarnation_generation,
+                    claim_now_millis,
+                )
+                .map_err(Coordinator::map_object_pg_action_error)?
+            else {
+                continue;
+            };
+            if !processed_buckets.insert((root.bucket.clone(), root.bucket_incarnation_generation))
+            {
+                self.storage_node
+                    .release_lifecycle_sweep_claim(&claim)
+                    .map_err(Coordinator::map_object_pg_action_error)?;
+                continue;
             }
-            self.expire_due_current_objects_for_bucket(&bucket, now_millis, &mut stats)?;
-            self.expire_due_noncurrent_versions_for_bucket(&bucket, now_millis, &mut stats)?;
-            self.expire_due_delete_markers_for_bucket(&bucket, now_millis, &mut stats)?;
-            self.abort_due_multipart_uploads_for_bucket(&bucket, now_millis, &mut stats)?;
-        }
+            let claim = self
+                .storage_node
+                .heartbeat_lifecycle_sweep_claim(&claim, storage::clock::wall_time_millis())
+                .map_err(Coordinator::map_object_pg_action_error)?;
 
-        for bucket in sweep_buckets.aborting_buckets {
-            if processed_buckets.insert(bucket.clone()) {
-                stats.scanned_buckets += 1;
+            stats.scanned_buckets += 1;
+            let result =
+                self.run_claimed_lifecycle_sweep_for_bucket(&claim, now_millis, &mut stats);
+            let release_result = self
+                .storage_node
+                .release_lifecycle_sweep_claim(&claim)
+                .map_err(Coordinator::map_object_pg_action_error);
+            match (result, release_result) {
+                (Ok(()), Ok(())) => {}
+                (Err(error), _) => return Err(error),
+                (Ok(()), Err(error)) => return Err(error),
             }
-            stats.aborted_multipart_uploads +=
-                self.finish_aborting_multipart_uploads_for_bucket(&bucket)?;
         }
 
         Ok(stats)
     }
 
+    fn run_claimed_lifecycle_sweep_for_bucket(
+        &self,
+        claim: &storage::LifecycleSweepClaimRecord,
+        now_millis: u64,
+        stats: &mut LifecycleSweepStats,
+    ) -> Result<(), ServerError> {
+        let bucket = &claim.bucket;
+        let bucket_info = match self.storage_node.head_bucket_info(bucket) {
+            Ok(bucket_info) => bucket_info,
+            Err(storage::BucketSnapshotLoadError::Metadata(
+                storage::MetadataError::BucketNotFound { .. },
+            )) => return Ok(()),
+            Err(error) => return Err(Self::map_bucket_snapshot_error(error)),
+        };
+
+        self.expire_due_current_objects_for_bucket(claim, &bucket_info, now_millis, stats)?;
+        self.expire_due_noncurrent_versions_for_bucket(claim, &bucket_info, now_millis, stats)?;
+        self.expire_due_delete_markers_for_bucket(claim, &bucket_info, now_millis, stats)?;
+        self.abort_due_multipart_uploads_for_bucket(claim, &bucket_info, now_millis, stats)?;
+        self.heartbeat_lifecycle_sweep_claim(claim)?;
+        stats.aborted_multipart_uploads +=
+            self.finish_aborting_multipart_uploads_for_bucket(claim, &bucket_info.name)?;
+        Ok(())
+    }
+
+    fn heartbeat_lifecycle_sweep_claim(
+        &self,
+        claim: &storage::LifecycleSweepClaimRecord,
+    ) -> Result<(), ServerError> {
+        self.storage_node
+            .heartbeat_lifecycle_sweep_claim(claim, storage::clock::wall_time_millis())
+            .map(drop)
+            .map_err(Coordinator::map_object_pg_action_error)
+    }
+
     fn expire_due_current_objects_for_bucket(
         &self,
+        claim: &storage::LifecycleSweepClaimRecord,
         bucket_info: &BucketInfo,
         now_millis: u64,
         stats: &mut LifecycleSweepStats,
@@ -351,7 +410,10 @@ impl ReadRuntime {
             .storage_node
             .list_all_objects_for_bucket(&bucket_info.name)
             .map_err(Coordinator::map_object_pg_action_error)?;
-        for object in objects {
+        for (index, object) in objects.into_iter().enumerate() {
+            if index > 0 && index % LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS == 0 {
+                self.heartbeat_lifecycle_sweep_claim(claim)?;
+            }
             let Some(record) = object.into_live() else {
                 continue;
             };
@@ -374,6 +436,7 @@ impl ReadRuntime {
         }
 
         for (key, version_id) in candidates {
+            self.heartbeat_lifecycle_sweep_claim(claim)?;
             if self.expire_current_object_if_due(&bucket_info.name, &key, version_id, now_millis)? {
                 stats.expired_current_objects += 1;
             }
@@ -384,6 +447,7 @@ impl ReadRuntime {
 
     fn finish_aborting_multipart_uploads_for_bucket(
         &self,
+        claim: &storage::LifecycleSweepClaimRecord,
         bucket: &BucketName,
     ) -> Result<u64, ServerError> {
         let mut candidates = Vec::new();
@@ -391,7 +455,10 @@ impl ReadRuntime {
             .storage_node
             .list_all_multipart_uploads_for_bucket(bucket)
             .map_err(Coordinator::map_object_pg_action_error)?;
-        for upload in uploads {
+        for (index, upload) in uploads.into_iter().enumerate() {
+            if index > 0 && index % LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS == 0 {
+                self.heartbeat_lifecycle_sweep_claim(claim)?;
+            }
             if upload.state == UploadState::Aborting {
                 candidates.push((upload.key, upload.upload_id));
             }
@@ -399,7 +466,7 @@ impl ReadRuntime {
 
         let mut finished = 0u64;
         for (key, upload_id) in candidates {
-            if self.abort_multipart_upload_internal_for(bucket, &key, &upload_id)? {
+            if self.abort_multipart_upload_for_lifecycle_sweep(bucket, &key, &upload_id)? {
                 finished += 1;
             }
         }
@@ -408,6 +475,7 @@ impl ReadRuntime {
 
     fn expire_due_noncurrent_versions_for_bucket(
         &self,
+        claim: &storage::LifecycleSweepClaimRecord,
         bucket_info: &BucketInfo,
         now_millis: u64,
         stats: &mut LifecycleSweepStats,
@@ -422,7 +490,14 @@ impl ReadRuntime {
             .list_all_object_versions_for_bucket(&bucket_info.name)
             .map_err(Coordinator::map_object_pg_action_error)?;
         let mut group_start = 0usize;
+        let mut groups_seen = 0usize;
         while group_start < versions.len() {
+            if groups_seen > 0
+                && groups_seen.is_multiple_of(LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS)
+            {
+                self.heartbeat_lifecycle_sweep_claim(claim)?;
+            }
+            groups_seen += 1;
             let key = versions[group_start].key().clone();
             let mut group_end = group_start + 1;
             while group_end < versions.len() && versions[group_end].key() == &key {
@@ -442,6 +517,7 @@ impl ReadRuntime {
         }
 
         for key in candidate_keys {
+            self.heartbeat_lifecycle_sweep_claim(claim)?;
             stats.expired_noncurrent_versions +=
                 self.expire_noncurrent_versions_if_due(&bucket_info.name, &key, now_millis)?;
         }
@@ -547,6 +623,7 @@ impl ReadRuntime {
 
     fn expire_due_delete_markers_for_bucket(
         &self,
+        claim: &storage::LifecycleSweepClaimRecord,
         bucket_info: &BucketInfo,
         now_millis: u64,
         stats: &mut LifecycleSweepStats,
@@ -561,7 +638,14 @@ impl ReadRuntime {
             .list_all_object_versions_for_bucket(&bucket_info.name)
             .map_err(Coordinator::map_object_pg_action_error)?;
         let mut group_start = 0usize;
+        let mut groups_seen = 0usize;
         while group_start < versions.len() {
+            if groups_seen > 0
+                && groups_seen.is_multiple_of(LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS)
+            {
+                self.heartbeat_lifecycle_sweep_claim(claim)?;
+            }
+            groups_seen += 1;
             let key = versions[group_start].key().clone();
             let mut group_end = group_start + 1;
             while group_end < versions.len() && versions[group_end].key() == &key {
@@ -579,6 +663,7 @@ impl ReadRuntime {
         }
 
         for (key, version_id) in candidates {
+            self.heartbeat_lifecycle_sweep_claim(claim)?;
             if self.expire_delete_marker_if_due(&bucket_info.name, &key, version_id, now_millis)? {
                 stats.expired_delete_markers += 1;
             }
@@ -618,6 +703,7 @@ impl ReadRuntime {
 
     fn abort_due_multipart_uploads_for_bucket(
         &self,
+        claim: &storage::LifecycleSweepClaimRecord,
         bucket_info: &BucketInfo,
         now_millis: u64,
         stats: &mut LifecycleSweepStats,
@@ -631,7 +717,10 @@ impl ReadRuntime {
             .storage_node
             .list_all_multipart_uploads_for_bucket(&bucket_info.name)
             .map_err(Coordinator::map_object_pg_action_error)?;
-        for upload in uploads {
+        for (index, upload) in uploads.into_iter().enumerate() {
+            if index > 0 && index % LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS == 0 {
+                self.heartbeat_lifecycle_sweep_claim(claim)?;
+            }
             if upload.state != UploadState::InProgress && upload.state != UploadState::Aborting {
                 continue;
             }
@@ -648,6 +737,7 @@ impl ReadRuntime {
         }
 
         for (key, upload_id) in candidates {
+            self.heartbeat_lifecycle_sweep_claim(claim)?;
             if self.abort_multipart_upload_if_due(
                 &bucket_info.name,
                 &key,
@@ -699,14 +789,14 @@ impl ReadRuntime {
             .map_err(Coordinator::map_object_pg_action_error)?
     }
 
-    pub(super) fn abort_multipart_upload_internal_for(
+    pub(super) fn abort_multipart_upload_for_lifecycle_sweep(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<bool, ServerError> {
         self.storage_node
-            .abort_multipart_upload(bucket, key, upload_id)
+            .abort_multipart_upload_for_lifecycle_sweep(bucket, key, upload_id)
             .map_err(Coordinator::map_object_pg_action_error)
     }
 

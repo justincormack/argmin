@@ -28,13 +28,15 @@ pub fn override_time_millis() -> Option<u64> {
     TIME_OVERRIDE_MILLIS.with(Cell::get)
 }
 
+pub fn wall_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 pub fn current_time_millis() -> u64 {
-    override_time_millis().unwrap_or_else(|| {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
-    })
+    override_time_millis().unwrap_or_else(wall_time_millis)
 }
 
 pub fn current_time_secs() -> u64 {
