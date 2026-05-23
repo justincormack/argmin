@@ -4497,20 +4497,20 @@ Proposed subphases:
        generation validation or fail-closed reload is required before cached
        state can affect request behavior.
 11. Phase 9.10 test harness de-single-process pass
-   - status: audit table pass complete; targeted gap review in progress. The
-     audit table is in `plans/phase-9.10-test-harness-audit.md`, covering
+   - status: implementation complete; full-suite clean on 2026-05-23. The audit
+     table is in `plans/phase-9.10-test-harness-audit.md`, covering
      shared coordinator setup helpers, independent-cache Phase 9.9 tests, BOE
      fast-path model tests, representative lifecycle claim tests, multipart API
      and model tests, multipart stream-race tests, reclaim trace tests,
      object-state concurrency tests, storage-cluster
      reopen/pending-slot/scavenger test shapes, and external/local S3 harness
      crates. The current test tree contains many valid single-process unit
-     tests, but Phase 9 closeout needs the focused audit to stay current for
-     tests that claim cross-process, restart, convergence, race, drain, reclaim,
-     lifecycle, cache-freshness, or scavenger correctness. Those tests must not
-     accidentally pass because they share a `StorageCluster`, shared
-     `CoordinatorSharedCaches`, a local mutex/condition variable, process-global
-     test hooks, or direct `PgStore` state.
+     tests, and the audit now records which local helpers are acceptable local
+     units or crash-state seeders. Tests that claim cross-process, restart,
+     convergence, race, drain, reclaim, lifecycle, cache-freshness, or scavenger
+     correctness must continue to avoid accidentally passing because they share a
+     `StorageCluster`, shared `CoordinatorSharedCaches`, a local mutex/condition
+     variable, process-global test hooks, or direct `PgStore` state.
    - audit tests and helpers that still use local constructors, raw hooks, or
      direct store access in ways that bypass the production cluster path. Classify
      each use rather than mechanically removing it:

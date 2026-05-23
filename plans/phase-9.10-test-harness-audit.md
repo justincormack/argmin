@@ -27,7 +27,7 @@ Classifications:
 | File | Helper | Current Shape | Classification | Action |
 | --- | --- | --- | --- | --- |
 | `crates/server-core/src/coordinator/test_support.rs` | `setup_coordinator*` | Opens a fresh local `StorageCluster` and uses the normal process-local shared-cache registry. | production-shaped for single-process request tests | Keep. Do not use as cross-process cache proof. |
-| `crates/server-core/src/coordinator/test_support.rs` | `setup_same_process_coordinator_with_storage_cluster` | Reuses an existing `Arc<StorageCluster>` and obtains caches from `shared_caches_for_storage_cluster`. Multiple coordinators over the same cluster therefore share process-local caches. | production-shaped for same-process frontend tests; suspect for cache-freshness claims | Keep but treat as same-process. Add or use explicit isolated-cache helpers for stale-cache/cross-process assertions. |
+| `crates/server-core/src/coordinator/test_support.rs` | `setup_same_process_coordinator_with_storage_cluster` | Reuses an existing `Arc<StorageCluster>` and obtains caches from `shared_caches_for_storage_cluster`. Multiple coordinators over the same cluster therefore share process-local caches. | production-shaped for same-process frontend tests; not process-shaped for cache/watch correctness | Keep. The helper name is intentionally explicit that the coordinator shares process-local cache/watch state; use the independent-cache helper for stale-cache/cross-process assertions. |
 | `crates/server-core/src/coordinator/test_support.rs` | `setup_same_process_coordinators_with_pg_count*` | Builds two coordinators over one `StorageCluster` via the shared-cache registry. | production-shaped for durable storage coordination where caches are irrelevant; not process-shaped for cache/watch correctness | Keep. The helper name is intentionally explicit that both coordinators are same-process; use the independent-cache helper for cache-freshness assertions. |
 | `crates/server-core/src/coordinator/test_support.rs` | `setup_process_isolated_cache_coordinator_with_storage_cluster` | Builds a coordinator over a shared `StorageCluster` but passes a new `CoordinatorSharedCaches::default()` and no watcher. | production-shaped for Phase 9.9 watcher-disabled stale-cache tests | Keep. Use this helper for request-time stale-cache assertions where writer-side hints and watcher invalidation must not touch the reader cache; do not use it as proof of watcher delivery. |
 | `crates/server-core/src/coordinator/multipart_stateful_tests.rs` | local `setup_same_process_coordinator_with_storage_cluster` | Reuses one `StorageCluster` and shared cache registry for multipart race tests. | production-shaped for durable command-stream races where hooks only synchronize production windows; not cache-shaped | Keep. Classified call sites use hooks as barriers around prepare/pre-commit points, not as command authority. |
@@ -88,9 +88,9 @@ Classifications:
 
 ## Immediate Follow-Up Work
 
-1. No first-pass high-risk files remain unaudited in this document. Keep adding
-   rows when future Phase 9 review finds a raw/local helper that is not already
-   covered by the classifications above.
-2. For each `suspect` row, either add a focused multi-handle regression, narrow
-   the test name/comment to local coverage, or replace shared-cache/same-handle
-   setup with an independent process-shaped helper.
+1. No first-pass high-risk files remain unaudited in this document.
+2. No unresolved `suspect` rows remain. Former shared-cache helper ambiguity is
+   closed by explicit `setup_same_process_*` helper names and separate
+   independent-cache helpers for Phase 9.9 stale-cache coverage.
+3. Keep adding rows when future Phase 9 review finds a raw/local helper that is
+   not already covered by the classifications above.
