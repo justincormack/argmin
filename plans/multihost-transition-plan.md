@@ -4202,7 +4202,7 @@ Proposed subphases:
      durable abandonment/reclaim proof. Negative-reference deletion is deferred
      until a later phase adds durable write intents or an equivalent publish
      fence. Full suite passed after the final harness settling adjustment.
-9. Phase 9.8 lifecycle/background mutation ownership
+9. Phase 9.8 lifecycle/background mutation ownership (done)
    - make lifecycle sweeper ownership, progress, and retry state durable and
      cluster-visible. `LIFECYCLE_SWEEPER_REGISTRY` may remain as
      process-local thread deduplication/backpressure only; it must not be a
@@ -4329,7 +4329,7 @@ Proposed subphases:
    - lifecycle transition rules are out of scope for this phase until
      transition support exists; the current lifecycle parser rejects transition
      elements as not implemented.
-   - exit when lifecycle expiration, delete-marker cleanup, and multipart
+   - exit criteria met: lifecycle expiration, delete-marker cleanup, and multipart
      abort work does not depend on a process-local sweeper registry or local
      wakeup; multiple processes cannot concurrently own the same bucket
      lifecycle sweep; stopped workers resume through durable claim expiry and
