@@ -1080,6 +1080,15 @@ fn file_bucket_metadata_config_roundtrip() {
 fn file_bucket_execution_generation_tracks_bucket_mutations() {
     let (_dir, store) = make_pg_store();
     let bucket = bucket_name("bucket");
+    let assert_generation = |expected| {
+        assert_eq!(
+            store
+                .head_bucket_raw(&bucket)
+                .unwrap()
+                .bucket_execution_generation,
+            expected
+        );
+    };
     store
         .create_bucket(
             &bucket,
@@ -1091,24 +1100,17 @@ fn file_bucket_execution_generation_tracks_bucket_mutations() {
         )
         .unwrap();
 
-    assert_eq!(
-        store
-            .head_bucket(&bucket)
-            .unwrap()
-            .bucket_execution_generation,
-        1
-    );
+    assert_generation(1);
 
     store
         .put_bucket_versioning(&bucket, BucketVersioningState::Enabled)
         .unwrap();
-    assert_eq!(
-        store
-            .head_bucket(&bucket)
-            .unwrap()
-            .bucket_execution_generation,
-        2
-    );
+    assert_generation(2);
+
+    store
+        .put_bucket_acl(&bucket, &AclGrants::default(), true, false)
+        .unwrap();
+    assert_generation(3);
 
     store
         .put_bucket_subresource(
@@ -1120,33 +1122,49 @@ fn file_bucket_execution_generation_tracks_bucket_mutations() {
             },
         )
         .unwrap();
-    assert_eq!(
-        store
-            .head_bucket(&bucket)
-            .unwrap()
-            .bucket_execution_generation,
-        3
-    );
+    assert_generation(4);
 
     store
         .delete_bucket_subresource(&bucket, BucketSubresourceKind::Tagging)
         .unwrap();
-    assert_eq!(
-        store
-            .head_bucket(&bucket)
-            .unwrap()
-            .bucket_execution_generation,
-        4
-    );
+    assert_generation(5);
+
+    store
+        .put_bucket_subresource(
+            &bucket,
+            PutBucketSubresource {
+                kind: BucketSubresourceKind::Policy,
+                body: "{}",
+                aux: BucketSubresourceAux::policy(false),
+            },
+        )
+        .unwrap();
+    assert_generation(6);
+
+    store
+        .delete_bucket_subresource(&bucket, BucketSubresourceKind::Policy)
+        .unwrap();
+    assert_generation(7);
+
+    store
+        .put_bucket_subresource(
+            &bucket,
+            PutBucketSubresource {
+                kind: BucketSubresourceKind::Lifecycle,
+                body: "<LifecycleConfiguration/>",
+                aux: BucketSubresourceAux::None,
+            },
+        )
+        .unwrap();
+    assert_generation(8);
+
+    store
+        .delete_bucket_subresource(&bucket, BucketSubresourceKind::Lifecycle)
+        .unwrap();
+    assert_generation(9);
 
     store.put_bucket_abac_enabled(&bucket, true).unwrap();
-    assert_eq!(
-        store
-            .head_bucket(&bucket)
-            .unwrap()
-            .bucket_execution_generation,
-        5
-    );
+    assert_generation(10);
 
     store
         .put_bucket_public_access_block(
@@ -1159,12 +1177,70 @@ fn file_bucket_execution_generation_tracks_bucket_mutations() {
             },
         )
         .unwrap();
+    assert_generation(11);
+
+    store.delete_bucket_public_access_block(&bucket).unwrap();
+    assert_generation(12);
+
+    store
+        .put_bucket_ownership_controls(
+            &bucket,
+            BucketOwnershipControls {
+                object_ownership: BucketObjectOwnership::BucketOwnerPreferred,
+            },
+        )
+        .unwrap();
+    assert_generation(13);
+
+    store.delete_bucket_ownership_controls(&bucket).unwrap();
+    assert_generation(14);
+
+    store
+        .put_bucket_encryption(
+            &bucket,
+            BucketEncryptionConfig {
+                default_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
+                sse_c_blocked: false,
+            },
+        )
+        .unwrap();
+    assert_generation(15);
+
+    store.mark_bucket_deleting(&bucket).unwrap();
+    assert_generation(16);
+
+    let object_lock_bucket = bucket_name("object-lock-bucket");
+    store
+        .create_bucket_with_config(&CreateBucketConfig {
+            name: object_lock_bucket.as_str(),
+            owner_principal: "owner",
+            owner_canonical_id: &CanonicalUserId::from_principal("owner"),
+            acl_grants: &AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            versioning: BucketVersioningState::Enabled,
+            object_lock: BucketObjectLockConfig {
+                enabled: true,
+                default_retention: None,
+            },
+        })
+        .unwrap();
     assert_eq!(
         store
-            .head_bucket(&bucket)
+            .head_bucket(&object_lock_bucket)
             .unwrap()
             .bucket_execution_generation,
-        6
+        17
+    );
+    store
+        .put_bucket_object_lock(&object_lock_bucket, sample_bucket_object_lock())
+        .unwrap();
+    assert_eq!(
+        store
+            .head_bucket(&object_lock_bucket)
+            .unwrap()
+            .bucket_execution_generation,
+        18
     );
 }
 

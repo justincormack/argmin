@@ -4433,13 +4433,18 @@ Proposed subphases:
        path, the writer deletes or tightens the bucket policy, writer-side
        mutation hints must not touch the reader cache, the watcher is
        disabled/delayed, and the reader must not authorize through stale cached
-       policy before the watcher runs.
+       policy before the watcher runs. Covered by the Phase 9.9 independent
+       policy-tightening regression.
      - stale-deny/loosening coverage: reader warms a cached deny, writer loosens
        or removes the blocking policy/public-access/ownership/tag condition,
        watcher is delayed, and the reader must validate/reload before denying.
+       Covered for policy loosening by the Phase 9.9 independent stale-deny
+       regression.
      - the same cross-process stale-cache shape for bucket ownership controls
        changing away from BOE, public access block/policy-public state, and
-       bucket tags used by ABAC.
+       bucket tags used by ABAC. Bucket tags/ABAC are covered by an independent
+       reader/writer cache regression; ownership controls and public-access
+       block/policy-public state remain follow-up matrix entries.
      - delete/recreate with the same bucket name: a cached entry from the old
        bucket must be removed or reloaded before any authorization decision for
        the recreated bucket. The regression must force old-incarnation cache
@@ -4449,7 +4454,10 @@ Proposed subphases:
        can affect behavior, including versioning, object lock/default retention,
        default encryption/SSE-C blocking, owner/state, lifecycle-visible
        metadata, public access block, ownership controls, policy metadata, and
-       tags/ABAC.
+       tags/ABAC. The storage-level matrix now covers versioning, ACL/owner
+       flags, tagging, policy, lifecycle, ABAC, public-access block,
+       ownership controls, encryption, Deleting state, create owner identity,
+       incarnation allocation, and object-lock default-retention mutation.
      - freshness-check storage failure: the fast path must be bypassed and the
        request must reload or fail safely; no stale cached allow/deny decision
        may be returned.

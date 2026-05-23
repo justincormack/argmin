@@ -2856,6 +2856,150 @@ fn head_object_validates_independent_fast_path_before_stale_policy_deny() {
 }
 
 #[test]
+fn head_object_validates_independent_fast_path_before_stale_abac_tags() {
+    let tmp = test_util::tempdir();
+    let bucket = "bucket-fast-path-cross-process-tags";
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let admin = setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let reader =
+        setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let writer =
+        setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let owner_account = "111122223333";
+    let owner_requester = test_helpers::requester(owner_account);
+
+    admin
+        .create_bucket_for_owner(owner_account, bucket, false)
+        .unwrap();
+    put_bucket_ownership_controls_test(
+        &admin,
+        bucket,
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        owner_requester.clone(),
+        None,
+    )
+    .unwrap();
+    admin
+        .put_bucket_tags(&PutBucketConfigRequest {
+            bucket: bucket_request_with_expected_owner(bucket, owner_requester.clone(), None),
+            config:
+                "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+        })
+        .unwrap();
+    admin
+        .put_bucket_abac(&PutBucketAbacRequest {
+            bucket: bucket_request_with_expected_owner(bucket, owner_requester.clone(), None),
+            enabled: true,
+        })
+        .unwrap();
+    put_bucket_policy_test(
+        &admin,
+        bucket,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket-fast-path-cross-process-tags/*","Condition":{"StringEquals":{"s3:BucketTag/security":"public"}}}]}"#,
+        owner_requester.clone(),
+        None,
+    )
+    .unwrap();
+    let key = find_key_with_object_pg_ne_bucket_pg(&admin, bucket, "cross-process-tags");
+    test_helpers::put_object(
+        &admin,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(bucket, &key, owner_requester.clone(), None),
+            data: b"data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    reader
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                &key,
+                None,
+                test_helpers::requester("444455556666"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    let bucket_name = trusted_bucket_name(bucket);
+    assert_eq!(
+        reader.bucket_fast_path_is_fresh_for_test(&bucket_name),
+        Some(true)
+    );
+    let cached = reader
+        .get_bucket_fast_path(&bucket_name)
+        .expect("reader should warm shared fast path");
+    assert!(matches!(
+        cached.policy,
+        storage::BucketFastPathPolicy::Loaded(_)
+    ));
+    assert!(matches!(
+        cached.tags,
+        storage::BucketFastPathTags::Loaded(_)
+    ));
+
+    writer
+        .put_bucket_tags_for_tag_resource(&PutBucketTagControlRequest {
+            control: BucketTagControlRequest {
+                bucket: bucket_request_with_expected_owner(bucket, owner_requester, None),
+                account_id: owner_account,
+            },
+            config:
+                "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
+            request_tags: &[],
+        })
+        .unwrap();
+    assert_eq!(
+        reader.bucket_fast_path_is_fresh_for_test(&bucket_name),
+        Some(true),
+        "writer-side cache hints must not touch an independent reader cache"
+    );
+
+    let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let (event_tx, event_rx) = mpsc::channel::<LockWaitEvent>();
+    let event_tx_fast_path = event_tx.clone();
+    let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
+        bucket: Some(bucket.to_string()),
+        before_storage_load: Some(Arc::new(move || {
+            let _ = event_tx.send(LockWaitEvent::Progress);
+        })),
+        after_policy_fast_path_hit: Some(Arc::new(move || {
+            let _ = event_tx_fast_path.send(LockWaitEvent::UnexpectedStorageLoad);
+        })),
+    });
+
+    let err = reader
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                &key,
+                None,
+                test_helpers::requester("444455556666"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert!(matches!(err, ServerError::AccessDenied));
+    assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
+}
+
+#[test]
 fn bucket_fast_path_watcher_survives_first_cluster_handle_drop() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-fast-path-watch-first-handle-drop";
