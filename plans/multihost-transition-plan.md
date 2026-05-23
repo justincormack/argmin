@@ -4497,7 +4497,13 @@ Proposed subphases:
        generation validation or fail-closed reload is required before cached
        state can affect request behavior.
 11. Phase 9.10 test harness de-single-process pass
-   - status: audit needed. The current test tree contains many valid
+   - status: audit started. The initial audit table is in
+     `plans/phase-9.10-test-harness-audit.md`, covering shared coordinator
+     setup helpers, independent-cache Phase 9.9 tests, BOE fast-path model
+     tests, representative lifecycle claim tests, multipart stream-race tests,
+     reclaim trace tests, object-state concurrency tests, and storage-cluster
+     reopen/pending-slot/scavenger test shapes. Continue extending that table
+     before broad rewrites. The current test tree contains many valid
      single-process unit tests, but Phase 9 closeout needs a focused audit of
      tests that claim cross-process, restart, convergence, race, drain, reclaim,
      lifecycle, cache-freshness, or scavenger correctness. Those tests must not

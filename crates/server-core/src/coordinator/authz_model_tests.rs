@@ -1972,6 +1972,12 @@ mod harness {
     pub(super) fn setup_coordinator(dir: &Path) -> Coordinator {
         let pg_ids: Vec<u32> = (0..1).collect();
         let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
+        setup_coordinator_with_storage_cluster(storage_cluster)
+    }
+
+    pub(super) fn setup_coordinator_with_storage_cluster(
+        storage_cluster: Arc<storage::StorageCluster>,
+    ) -> Coordinator {
         Coordinator::new_with_managed_key_provider_for_storage_cluster(
             storage_cluster,
             "us-east-1".to_string(),
@@ -4658,7 +4664,7 @@ mod phase5_model {
 }
 
 mod phase5_harness {
-    use super::harness::{setup_coordinator, IdentityFixtures};
+    use super::harness::{setup_coordinator_with_storage_cluster, IdentityFixtures};
     use super::model::Outcome;
     use super::phase5_model::{
         TransitionMutation, TransitionPolicyState, TransitionProbe, TransitionScenario,
@@ -4684,8 +4690,9 @@ mod phase5_harness {
     impl Phase5Harness {
         pub(super) fn new() -> Self {
             let tmp = test_util::tempdir();
-            let admin = setup_coordinator(tmp.path());
-            let reader = setup_coordinator(tmp.path());
+            let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+            let admin = setup_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+            let reader = setup_coordinator_with_storage_cluster(storage_cluster);
             let fixtures = IdentityFixtures::new();
             Self {
                 _tmp: tmp,

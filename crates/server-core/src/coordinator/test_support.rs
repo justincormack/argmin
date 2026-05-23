@@ -168,6 +168,12 @@ pub(crate) fn setup_coordinator_without_lifecycle_sweeper(dir: &Path) -> Coordin
     .unwrap()
 }
 
+/// Build a same-process frontend over an existing storage cluster.
+///
+/// Coordinators created this way share the process-local cache registry for
+/// that storage cluster. Use
+/// `setup_process_isolated_cache_coordinator_with_storage_cluster` when a test
+/// needs process-shaped cache isolation.
 pub(crate) fn setup_coordinator_with_storage_cluster(
     storage_cluster: Arc<StorageCluster>,
 ) -> Coordinator {
@@ -183,6 +189,12 @@ pub(crate) fn setup_coordinator_with_storage_cluster(
     .unwrap()
 }
 
+/// Build a second same-process frontend over an existing storage cluster.
+///
+/// Coordinators created this way share the process-local cache registry for
+/// that storage cluster. Use
+/// `setup_process_isolated_cache_coordinator_with_storage_cluster` when a test
+/// needs process-shaped cache isolation.
 pub(crate) fn setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(
     storage_cluster: Arc<StorageCluster>,
 ) -> Coordinator {
@@ -190,6 +202,27 @@ pub(crate) fn setup_coordinator_with_storage_cluster_without_lifecycle_sweeper(
     Coordinator::new_with_shared_caches_and_lifecycle_sweeper_factory(
         storage_cluster,
         shared_caches,
+        "us-east-1".to_string(),
+        None,
+        Some(test_sse_s3_provider()),
+        |_, _| Ok(LifecycleSweeper::disabled()),
+    )
+    .unwrap()
+}
+
+/// Build a coordinator with a fresh cache domain over an existing storage
+/// cluster.
+///
+/// This models watcher-disabled separate-process cache state for tests where
+/// request-time cache freshness is the invariant under test. It still shares the
+/// in-process storage cluster handle, so use it only when shared storage is
+/// intentional and the reader cache must be isolated from writer-side hints.
+pub(crate) fn setup_process_isolated_cache_coordinator_with_storage_cluster(
+    storage_cluster: Arc<StorageCluster>,
+) -> Coordinator {
+    Coordinator::new_with_shared_caches_and_lifecycle_sweeper_factory(
+        storage_cluster,
+        Arc::new(CoordinatorSharedCaches::default()),
         "us-east-1".to_string(),
         None,
         Some(test_sse_s3_provider()),

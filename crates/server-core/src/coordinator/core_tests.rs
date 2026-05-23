@@ -40,20 +40,6 @@ fn setup_direct_coordinator_with_storage_cluster(
     .unwrap()
 }
 
-fn setup_isolated_cache_coordinator_with_storage_cluster(
-    storage_cluster: Arc<StorageCluster>,
-) -> Coordinator {
-    Coordinator::new_with_shared_caches_and_lifecycle_sweeper_factory(
-        storage_cluster,
-        Arc::new(CoordinatorSharedCaches::default()),
-        "us-east-1".to_string(),
-        None,
-        Some(test_sse_s3_provider()),
-        |_, _| Ok(super::runtime::LifecycleSweeper::disabled()),
-    )
-    .unwrap()
-}
-
 #[test]
 fn lock_mutex_unpoisoned_recovers_after_panic() {
     let lock = Mutex::new(vec![1usize]);
@@ -2632,11 +2618,12 @@ fn head_object_validates_independent_fast_path_before_stale_policy_allow() {
     let bucket = "bucket-fast-path-cross-process-tighten";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let admin =
+        setup_process_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let reader =
-        setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+        setup_process_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let writer =
-        setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+        setup_process_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     admin
         .create_bucket_for_owner("111122223333", bucket, false)
@@ -2750,11 +2737,12 @@ fn head_object_validates_independent_fast_path_before_stale_policy_deny() {
     let bucket = "bucket-fast-path-cross-process-loosen";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let admin =
+        setup_process_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let reader =
-        setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+        setup_process_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let writer =
-        setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+        setup_process_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     admin
         .create_bucket_for_owner("111122223333", bucket, false)
@@ -2861,11 +2849,12 @@ fn head_object_validates_independent_fast_path_before_stale_abac_tags() {
     let bucket = "bucket-fast-path-cross-process-tags";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let admin =
+        setup_process_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let reader =
-        setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+        setup_process_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let writer =
-        setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+        setup_process_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let owner_account = "111122223333";
     let owner_requester = test_helpers::requester(owner_account);
 
@@ -3005,11 +2994,12 @@ fn get_object_validates_independent_fast_path_before_stale_ownership_controls() 
     let bucket = "bucket-fast-path-cross-process-ownership";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let admin =
+        setup_process_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let reader =
-        setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+        setup_process_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let writer =
-        setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+        setup_process_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let owner_canonical_id = CanonicalUserId::from_principal("owner-a");
 
     create_bucket_for_owner_with_flags(
@@ -3148,11 +3138,12 @@ fn get_object_validates_independent_fast_path_before_stale_public_access_block()
     let bucket = "bucket-fast-path-cross-process-pab";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let admin =
+        setup_process_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let reader =
-        setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+        setup_process_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let writer =
-        setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+        setup_process_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let owner_requester = test_helpers::requester("111122223333");
 
     admin
@@ -3268,7 +3259,7 @@ fn head_object_bypasses_fast_path_when_identity_validation_fails() {
     let bucket = "bucket-fast-path-identity-load-failure";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let coord = setup_isolated_cache_coordinator_with_storage_cluster(storage_cluster);
+    let coord = setup_process_isolated_cache_coordinator_with_storage_cluster(storage_cluster);
     let owner_requester = test_helpers::requester("111122223333");
 
     coord
@@ -3376,7 +3367,7 @@ fn parsed_policy_cache_bypasses_fast_path_when_identity_validation_fails() {
     let bucket = "bucket-parsed-policy-identity-load-failure";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let coord = setup_isolated_cache_coordinator_with_storage_cluster(storage_cluster);
+    let coord = setup_process_isolated_cache_coordinator_with_storage_cluster(storage_cluster);
     let owner_requester = test_helpers::requester("111122223333");
 
     coord
@@ -3462,9 +3453,10 @@ fn head_object_rejects_old_incarnation_fast_path_after_delete_recreate() {
     let bucket = "bucket-fast-path-cross-process-recreate";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let admin =
+        setup_process_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
     let reader =
-        setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+        setup_process_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
 
     admin
         .create_bucket_for_owner("111122223333", bucket, false)
