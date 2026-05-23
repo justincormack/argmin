@@ -449,6 +449,7 @@ production_metadata_methods=$(
             || name == "release_bucket_delete_finalize_claim" \
             || name == "acquire_lifecycle_sweep_claim" \
             || name == "heartbeat_lifecycle_sweep_claim" \
+            || name == "record_lifecycle_sweep_claim_error" \
             || name == "release_lifecycle_sweep_claim" \
             || name == "get_object_tags" \
             || name == "get_multipart_upload" \

@@ -6,9 +6,13 @@ use s3_types::{
     AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, LifecycleExpiration,
     LifecycleRule, LifecycleRuleFilter, LifecycleRuleStatus, LifecycleTag,
 };
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use storage::{install_bucket_scoped_test_hooks, BucketScopedTestHooks};
+use storage::{
+    install_bucket_scoped_test_hooks, BucketScopedTestHooks, BucketSubresourceAux,
+    BucketSubresourceKind, PutBucketSubresource,
+};
 
 fn delete_bucket_test(coord: &Coordinator, name: &str) -> Result<(), ServerError> {
     coord.delete_bucket(&bucket_request_with_expected_owner(
@@ -2076,6 +2080,60 @@ fn lifecycle_sweep_skips_bucket_with_live_durable_claim() {
 }
 
 #[test]
+fn lifecycle_sweep_failure_records_durable_claim_error() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_without_lifecycle_sweeper(tmp.path());
+    let bucket = trusted_bucket_name("bucket");
+    coord
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+    coord
+        .storage_node
+        .put_bucket_subresource_and_load_info(
+            &bucket,
+            PutBucketSubresource {
+                kind: BucketSubresourceKind::Lifecycle,
+                body: "<LifecycleConfiguration><Rule><ID>broken",
+                aux: BucketSubresourceAux::None,
+            },
+        )
+        .unwrap();
+
+    let err = coord.run_lifecycle_sweep_at(0).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("lifecycle configuration"),
+        "expected lifecycle parse failure, got {err:?}"
+    );
+
+    let steal_now = storage::clock::wall_time_millis().saturating_add(120_000);
+    let roots = coord
+        .storage_node
+        .list_lifecycle_sweep_roots(steal_now)
+        .unwrap();
+    let root = roots
+        .iter()
+        .find(|root| root.bucket == bucket)
+        .expect("failed lifecycle claim should be rediscovered after lease expiry");
+    let claim = coord
+        .storage_node
+        .acquire_lifecycle_sweep_claim(&bucket, root.bucket_incarnation_generation, steal_now)
+        .unwrap()
+        .expect("expired failed lifecycle claim should be stealable");
+    assert!(
+        claim
+            .last_error
+            .as_deref()
+            .is_some_and(|last_error| last_error.contains("lifecycle configuration")),
+        "stolen claim should carry retry context, got {:?}",
+        claim.last_error
+    );
+    coord
+        .storage_node
+        .release_lifecycle_sweep_claim(&claim)
+        .unwrap();
+}
+
+#[test]
 fn lifecycle_sweep_old_incarnation_expired_claim_does_not_skip_current_root() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator_without_lifecycle_sweeper(tmp.path());
@@ -3422,6 +3480,344 @@ fn lifecycle_abort_stops_when_delete_drain_starts_after_claim() {
         .storage_node
         .test_get_multipart_upload(&bucket, &key, &upload.upload_id)
         .is_ok());
+
+    coord
+        .storage_node
+        .release_lifecycle_sweep_claim(&claim)
+        .unwrap();
+}
+
+#[test]
+fn lifecycle_current_expiry_stops_when_delete_drain_starts_after_claim() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_without_lifecycle_sweeper(tmp.path());
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    coord
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+    put_bucket_lifecycle_test(
+        &coord,
+        bucket.as_str(),
+        "<LifecycleConfiguration><Rule><ID>expire</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
+        test_requester(),
+        None,
+    )
+    .unwrap();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                bucket.as_str(),
+                key.as_str(),
+                test_requester(),
+                None,
+            ),
+            data: b"hello",
+            metadata: &MetadataBlob::default(),
+            system_metadata: &SystemMetadata::default(),
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let version_id = coord
+        .storage_node
+        .test_get_object_meta(&bucket, &key)
+        .unwrap()
+        .as_live()
+        .unwrap()
+        .version_id;
+    let bucket_info = coord.storage_node.head_bucket_info(&bucket).unwrap();
+    let claim = coord
+        .storage_node
+        .acquire_lifecycle_sweep_claim(
+            &bucket,
+            bucket_info.bucket_incarnation_generation,
+            storage::clock::wall_time_millis(),
+        )
+        .unwrap()
+        .expect("lifecycle claim should be acquirable before delete drain");
+    coord
+        .storage_node
+        .test_begin_durable_bucket_delete_drain(&bucket)
+        .unwrap();
+
+    let outcome = coord
+        .storage_node
+        .expire_current_object_if_due(&bucket, &key, version_id, |_, _| {
+            Ok::<bool, ServerError>(true)
+        })
+        .unwrap()
+        .unwrap();
+    assert!(
+        outcome.is_none(),
+        "lifecycle current expiry should stop behind DeleteBucket drain"
+    );
+    assert!(coord
+        .storage_node
+        .test_get_object_meta(&bucket, &key)
+        .is_ok());
+
+    coord
+        .storage_node
+        .release_lifecycle_sweep_claim(&claim)
+        .unwrap();
+}
+
+#[test]
+fn lifecycle_noncurrent_expiry_stops_when_delete_drain_starts_after_claim() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_without_lifecycle_sweeper(tmp.path());
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    coord
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+    put_bucket_lifecycle_test(
+            &coord,
+            bucket.as_str(),
+            "<LifecycleConfiguration><Rule><ID>expire-noncurrent</ID><Filter><Prefix/></Filter><Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>",
+            test_requester(),
+            None,
+        )
+        .unwrap();
+    coord
+        .put_bucket_versioning(&PutBucketVersioningRequest {
+            bucket: bucket_request_with_expected_owner(bucket.as_str(), test_requester(), None),
+            state: BucketVersioningState::Enabled,
+        })
+        .unwrap();
+    for data in [b"old".as_slice(), b"new".as_slice()] {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    bucket.as_str(),
+                    key.as_str(),
+                    test_requester(),
+                    None,
+                ),
+                data,
+                metadata: &MetadataBlob::default(),
+                system_metadata: &SystemMetadata::default(),
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+    }
+    let noncurrent_version_id = coord
+        .storage_node
+        .list_all_object_versions_for_bucket(&bucket)
+        .unwrap()
+        .into_iter()
+        .filter(|stored| stored.key() == &key)
+        .find_map(|stored| {
+            let live = stored.as_live()?;
+            live.became_noncurrent_at
+                .is_some()
+                .then_some(live.version_id)
+        })
+        .expect("first version should be noncurrent");
+    let bucket_info = coord.storage_node.head_bucket_info(&bucket).unwrap();
+    let claim = coord
+        .storage_node
+        .acquire_lifecycle_sweep_claim(
+            &bucket,
+            bucket_info.bucket_incarnation_generation,
+            storage::clock::wall_time_millis(),
+        )
+        .unwrap()
+        .expect("lifecycle claim should be acquirable before delete drain");
+    coord
+        .storage_node
+        .test_begin_durable_bucket_delete_drain(&bucket)
+        .unwrap();
+
+    let reclaimed = coord
+        .storage_node
+        .delete_noncurrent_live_versions_if_due(&bucket, &key, |_, _| {
+            Ok::<HashSet<VersionId>, ServerError>(HashSet::from([noncurrent_version_id]))
+        })
+        .unwrap()
+        .unwrap();
+    assert!(
+        reclaimed.is_empty(),
+        "lifecycle noncurrent expiry should stop behind DeleteBucket drain"
+    );
+    assert!(coord
+        .storage_node
+        .test_get_object_version(&bucket, &key, noncurrent_version_id)
+        .is_ok());
+
+    coord
+        .storage_node
+        .release_lifecycle_sweep_claim(&claim)
+        .unwrap();
+}
+
+#[test]
+fn lifecycle_delete_marker_cleanup_stops_when_delete_drain_starts_after_claim() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_without_lifecycle_sweeper(tmp.path());
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    coord
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+    put_bucket_lifecycle_test(
+            &coord,
+            bucket.as_str(),
+            "<LifecycleConfiguration><Rule><ID>expire-marker</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration></Rule></LifecycleConfiguration>",
+            test_requester(),
+            None,
+        )
+        .unwrap();
+    coord
+        .put_bucket_versioning(&PutBucketVersioningRequest {
+            bucket: bucket_request_with_expected_owner(bucket.as_str(), test_requester(), None),
+            state: BucketVersioningState::Enabled,
+        })
+        .unwrap();
+    let deleted = coord
+        .delete_object(&delete_object_request(
+            bucket.as_str(),
+            key.as_str(),
+            None,
+            test_requester(),
+            false,
+            NO_DELETE,
+        ))
+        .unwrap();
+    let marker_version_id = deleted.version_id;
+    let bucket_info = coord.storage_node.head_bucket_info(&bucket).unwrap();
+    let claim = coord
+        .storage_node
+        .acquire_lifecycle_sweep_claim(
+            &bucket,
+            bucket_info.bucket_incarnation_generation,
+            storage::clock::wall_time_millis(),
+        )
+        .unwrap()
+        .expect("lifecycle claim should be acquirable before delete drain");
+    coord
+        .storage_node
+        .test_begin_durable_bucket_delete_drain(&bucket)
+        .unwrap();
+
+    let deleted = coord
+        .storage_node
+        .delete_expired_delete_marker_if_due(&bucket, &key, marker_version_id, |_, _| {
+            Ok::<bool, ServerError>(true)
+        })
+        .unwrap()
+        .unwrap();
+    assert!(
+        !deleted,
+        "lifecycle delete-marker cleanup should stop behind DeleteBucket drain"
+    );
+    assert!(coord
+        .storage_node
+        .test_get_object_version(&bucket, &key, marker_version_id)
+        .is_ok());
+
+    coord
+        .storage_node
+        .release_lifecycle_sweep_claim(&claim)
+        .unwrap();
+}
+
+#[test]
+fn lifecycle_aborting_upload_finish_stops_when_delete_drain_starts_after_claim() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_without_lifecycle_sweeper(tmp.path());
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("logs/app");
+    coord
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+    put_bucket_lifecycle_test(
+            &coord,
+            bucket.as_str(),
+            "<LifecycleConfiguration><Rule><ID>abort-mpu</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>",
+            test_requester(),
+            None,
+        )
+        .unwrap();
+
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(
+                bucket.as_str(),
+                key.as_str(),
+                test_requester(),
+                None,
+            ),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+    test_helpers::upload_part(
+        &coord,
+        &UploadPartRequest {
+            upload: multipart_object_request_with_expected_owner(
+                bucket.as_str(),
+                key.as_str(),
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number: 1,
+            data: b"hello multipart",
+            claimed_checksum: None,
+            sse_customer: None,
+        },
+    )
+    .unwrap();
+    coord
+        .storage_node
+        .test_set_upload_state(&bucket, &key, &upload.upload_id, UploadState::Aborting)
+        .unwrap();
+
+    let bucket_info = coord.storage_node.head_bucket_info(&bucket).unwrap();
+    let claim = coord
+        .storage_node
+        .acquire_lifecycle_sweep_claim(
+            &bucket,
+            bucket_info.bucket_incarnation_generation,
+            storage::clock::wall_time_millis(),
+        )
+        .unwrap()
+        .expect("lifecycle claim should be acquirable before delete drain");
+    coord
+        .storage_node
+        .test_begin_durable_bucket_delete_drain(&bucket)
+        .unwrap();
+
+    assert!(!coord
+        .read_runtime()
+        .abort_multipart_upload_for_lifecycle_sweep(&bucket, &key, &upload.upload_id)
+        .unwrap());
+    let upload_record = coord
+        .storage_node
+        .test_get_multipart_upload(&bucket, &key, &upload.upload_id)
+        .unwrap();
+    assert_eq!(upload_record.state, UploadState::Aborting);
 
     coord
         .storage_node

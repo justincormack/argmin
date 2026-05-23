@@ -4278,19 +4278,19 @@ Proposed subphases:
         roots through the deterministic root scanner, attempt a claim per
         bucket incarnation, skip busy buckets, run the existing sweep logic
         while holding and heartbeating the claim, release on success, and record
-        error/retry context on failure (done for claim routing and in-pass
-        heartbeat; durable claim `last_error` persistence remains for a
-        follow-up slice)
+        error/retry context on failure (done)
      3. add startup/periodic durable root scanning so restart without local
         lifecycle worker state discovers buckets with lifecycle config,
         buckets with aborting multipart uploads, and expired lifecycle claims
         using the deterministic expired-claim-first and busy-claim-skipping
         rules above (done for the runtime sweep entry point and routed
-        metadata-PG aborting-upload discovery)
+        metadata-PG aborting-upload discovery, including stale expired-claim
+        cleanup for gone, recreated, drained, or no-longer-eligible roots)
      4. downgrade or update the process-local lifecycle sweeper registry tests
         so they prove only local thread sharing, not correctness ownership
+        (done)
      5. add observability for claim acquire/busy/steal/release/error paths and
-        bounded per-pass scan stats
+        bounded per-pass scan stats (done)
    - required regressions:
      - two coordinators/process handles racing the same lifecycle bucket:
        exactly one acquires the durable sweep claim and the other skips/busy

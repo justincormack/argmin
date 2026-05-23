@@ -33,6 +33,7 @@ static SHARD_SCAVENGER_SWEEPER_REGISTRY: OnceLock<
     Mutex<HashMap<usize, Weak<ShardScavengerSweeper>>>,
 > = OnceLock::new();
 const LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS: usize = 256;
+const LIFECYCLE_SWEEP_ERROR_CONTEXT_MAX_CHARS: usize = 1024;
 
 /// The coordinator ties together EC, storage, and metadata.
 pub(super) struct ReclaimSweeper {
@@ -55,6 +56,12 @@ pub(super) struct ShardScavengerSweeper {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct LifecycleSweepStats {
+    pub(super) discovered_roots: u64,
+    pub(super) acquired_claims: u64,
+    pub(super) busy_claims: u64,
+    pub(super) recovered_expired_claims: u64,
+    pub(super) released_claims: u64,
+    pub(super) failed_claims: u64,
     pub(super) scanned_buckets: u64,
     pub(super) expired_current_objects: u64,
     pub(super) expired_noncurrent_versions: u64,
@@ -304,6 +311,12 @@ impl ReadRuntime {
         now_millis: u64,
     ) -> Result<LifecycleSweepStats, ServerError> {
         let mut stats = LifecycleSweepStats {
+            discovered_roots: 0,
+            acquired_claims: 0,
+            busy_claims: 0,
+            recovered_expired_claims: 0,
+            released_claims: 0,
+            failed_claims: 0,
             scanned_buckets: 0,
             expired_current_objects: 0,
             expired_noncurrent_versions: 0,
@@ -316,6 +329,15 @@ impl ReadRuntime {
             .storage_node
             .list_lifecycle_sweep_roots(claim_now_millis)
             .map_err(Coordinator::map_object_pg_action_error)?;
+        stats.discovered_roots = sweep_roots.len() as u64;
+        let _ = observability::event(
+            TRACE_TARGET,
+            "lifecycle_sweep_pass_start",
+            Some(format_args!(
+                "roots={} lifecycle_now_millis={} claim_now_millis={}",
+                stats.discovered_roots, now_millis, claim_now_millis
+            )),
+        );
 
         for root in sweep_roots {
             let claim_now_millis = storage::clock::wall_time_millis();
@@ -328,13 +350,39 @@ impl ReadRuntime {
                 )
                 .map_err(Coordinator::map_object_pg_action_error)?
             else {
+                stats.busy_claims += 1;
+                let _ = observability::event(
+                    TRACE_TARGET,
+                    "lifecycle_sweep_claim_busy",
+                    Some(format_args!(
+                        "bucket={:?} incarnation={} source={:?}",
+                        root.bucket, root.bucket_incarnation_generation, root.source
+                    )),
+                );
                 continue;
             };
+            stats.acquired_claims += 1;
+            if claim.attempt_count > 1 {
+                stats.recovered_expired_claims += 1;
+            }
+            let _ = observability::event(
+                TRACE_TARGET,
+                "lifecycle_sweep_claim_acquired",
+                Some(format_args!(
+                    "bucket={:?} incarnation={} claim_id={} source={:?} attempt_count={}",
+                    claim.bucket,
+                    claim.bucket_incarnation_generation,
+                    claim.claim_id,
+                    root.source,
+                    claim.attempt_count
+                )),
+            );
             if !processed_buckets.insert((root.bucket.clone(), root.bucket_incarnation_generation))
             {
                 self.storage_node
                     .release_lifecycle_sweep_claim(&claim)
                     .map_err(Coordinator::map_object_pg_action_error)?;
+                stats.released_claims += 1;
                 continue;
             }
             let claim = self
@@ -345,16 +393,76 @@ impl ReadRuntime {
             stats.scanned_buckets += 1;
             let result =
                 self.run_claimed_lifecycle_sweep_for_bucket(&claim, now_millis, &mut stats);
-            let release_result = self
-                .storage_node
-                .release_lifecycle_sweep_claim(&claim)
-                .map_err(Coordinator::map_object_pg_action_error);
-            match (result, release_result) {
-                (Ok(()), Ok(())) => {}
-                (Err(error), _) => return Err(error),
-                (Ok(()), Err(error)) => return Err(error),
+            match result {
+                Ok(()) => {
+                    self.storage_node
+                        .release_lifecycle_sweep_claim(&claim)
+                        .map_err(Coordinator::map_object_pg_action_error)?;
+                    stats.released_claims += 1;
+                    let _ = observability::event(
+                        TRACE_TARGET,
+                        "lifecycle_sweep_claim_released",
+                        Some(format_args!(
+                            "bucket={:?} incarnation={} claim_id={}",
+                            claim.bucket, claim.bucket_incarnation_generation, claim.claim_id
+                        )),
+                    );
+                }
+                Err(error) => {
+                    stats.failed_claims += 1;
+                    let error_context = lifecycle_sweep_error_context(&error);
+                    let record_result = self
+                        .storage_node
+                        .record_lifecycle_sweep_claim_error(&claim, &error_context);
+                    match record_result {
+                        Ok(_) => {
+                            let _ = observability::event(
+                                TRACE_TARGET,
+                                "lifecycle_sweep_claim_error_recorded",
+                                Some(format_args!(
+                                    "bucket={:?} incarnation={} claim_id={} failed_claims={} error={}",
+                                    claim.bucket,
+                                    claim.bucket_incarnation_generation,
+                                    claim.claim_id,
+                                    stats.failed_claims,
+                                    error_context
+                                )),
+                            );
+                        }
+                        Err(record_error) => {
+                            let _ = observability::event(
+                                TRACE_TARGET,
+                                "lifecycle_sweep_claim_error_record_failed",
+                                Some(format_args!(
+                                    "bucket={:?} claim_id={} failed_claims={} error={} record_error={record_error}",
+                                    claim.bucket, claim.claim_id, stats.failed_claims, error_context
+                                )),
+                            );
+                        }
+                    }
+                    return Err(error);
+                }
             }
         }
+
+        let _ = observability::event(
+            TRACE_TARGET,
+            "lifecycle_sweep_pass_complete",
+            Some(format_args!(
+                "roots={} acquired_claims={} busy_claims={} recovered_expired_claims={} released_claims={} failed_claims={} scanned_buckets={} expired_current_objects={} expired_noncurrent_versions={} expired_delete_markers={} aborted_multipart_uploads={}",
+                stats.discovered_roots,
+                stats.acquired_claims,
+                stats.busy_claims,
+                stats.recovered_expired_claims,
+                stats.released_claims,
+                stats.failed_claims,
+                stats.scanned_buckets,
+                stats.expired_current_objects,
+                stats.expired_noncurrent_versions,
+                stats.expired_delete_markers,
+                stats.aborted_multipart_uploads
+            )),
+        );
 
         Ok(stats)
     }
@@ -1165,6 +1273,17 @@ impl MultipartReader {
             });
         }
     }
+}
+
+fn lifecycle_sweep_error_context(error: &ServerError) -> String {
+    let raw = format!("{error:?}");
+    if raw.chars().count() <= LIFECYCLE_SWEEP_ERROR_CONTEXT_MAX_CHARS {
+        return raw;
+    }
+
+    raw.chars()
+        .take(LIFECYCLE_SWEEP_ERROR_CONTEXT_MAX_CHARS)
+        .collect()
 }
 
 #[cfg(test)]

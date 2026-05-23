@@ -3099,6 +3099,23 @@ impl super::StorageCluster {
         )?)
     }
 
+    pub fn record_lifecycle_sweep_claim_error(
+        &self,
+        claim: &LifecycleSweepClaimRecord,
+        last_error: &str,
+    ) -> Result<LifecycleSweepClaimRecord, ObjectPgActionError> {
+        let bucket_pg = self.metadata_pg(self.bucket_metadata_pg_id(&claim.bucket))?;
+        Ok(PgMetadataStore::record_lifecycle_sweep_claim_error(
+            &*bucket_pg,
+            &claim.bucket,
+            claim.bucket_incarnation_generation,
+            &claim.claim_id,
+            &claim.owner_token,
+            claim.cluster_epoch,
+            last_error,
+        )?)
+    }
+
     pub fn release_lifecycle_sweep_claim(
         &self,
         claim: &LifecycleSweepClaimRecord,
@@ -5012,13 +5029,14 @@ impl super::StorageCluster {
             }
 
             let bucket_write_reservation = match self
-                .acquire_bucket_write_proof_for_object_metadata_command(
+                .try_acquire_bucket_write_proof_for_object_metadata_command(
                     bucket,
                     key,
                     "lifecycle-current-expiry",
+                    false,
                 )? {
                 Some(proof) => proof,
-                None => continue,
+                None => return Ok(Ok(None)),
             };
             let object_pg = match primary_node.get_pg(pg_id.get()) {
                 Ok(object_pg) => object_pg,
@@ -5368,13 +5386,14 @@ impl super::StorageCluster {
 
             for (version_id, target, reclaim_generation_id) in delete_targets {
                 let bucket_write_reservation = match self
-                    .acquire_bucket_write_proof_for_object_metadata_command(
+                    .try_acquire_bucket_write_proof_for_object_metadata_command(
                         bucket,
                         key,
                         "lifecycle-noncurrent-expiry",
+                        false,
                     )? {
                     Some(proof) => proof,
-                    None => continue 'retry,
+                    None => return Ok(Ok(completed_reclaimed_generation_ids)),
                 };
                 let command_id = match self.next_object_metadata_command_id(pg_id) {
                     Ok(command_id) => command_id,
@@ -5502,13 +5521,14 @@ impl super::StorageCluster {
             }
 
             let bucket_write_reservation = match self
-                .acquire_bucket_write_proof_for_object_metadata_command(
+                .try_acquire_bucket_write_proof_for_object_metadata_command(
                     bucket,
                     key,
                     "lifecycle-expired-delete-marker",
+                    false,
                 )? {
                 Some(proof) => proof,
-                None => continue,
+                None => return Ok(Ok(false)),
             };
             let object_pg = match primary_node.get_pg(pg_id.get()) {
                 Ok(object_pg) => object_pg,

@@ -614,6 +614,18 @@ pub(crate) trait PgMetadataStore {
         lease_deadline: Option<u64>,
     ) -> Result<LifecycleSweepClaimRecord, MetadataError>;
 
+    /// Record retry context on a durable lifecycle sweep claim by exact token-fenced identity.
+    #[allow(clippy::too_many_arguments)]
+    fn record_lifecycle_sweep_claim_error(
+        &self,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        last_error: &str,
+    ) -> Result<LifecycleSweepClaimRecord, MetadataError>;
+
     /// Release a durable lifecycle sweep claim by exact token-fenced identity.
     fn release_lifecycle_sweep_claim(
         &self,

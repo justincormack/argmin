@@ -3719,10 +3719,12 @@ fn bucket_policy_cache_invalidates_across_coordinators_on_replace() {
 }
 
 #[test]
-fn lifecycle_sweeper_is_shared_per_storage_node() {
+fn lifecycle_sweeper_registry_shares_process_local_worker_per_storage_node() {
     let tmp = test_util::tempdir();
     let (first, second) = setup_coordinators_with_pg_count(tmp.path(), 4);
 
+    // The registry is only a process-local worker deduplication mechanism. Durable
+    // lifecycle claims provide correctness across coordinator/process handles.
     assert!(Arc::ptr_eq(
         &first._lifecycle_sweeper,
         &second._lifecycle_sweeper,
@@ -3730,7 +3732,7 @@ fn lifecycle_sweeper_is_shared_per_storage_node() {
 }
 
 #[test]
-fn lifecycle_sweeper_drops_with_last_coordinator() {
+fn lifecycle_sweeper_registry_drops_process_local_worker_with_last_coordinator() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
     let lifecycle_sweeper = Arc::downgrade(&coord._lifecycle_sweeper);
