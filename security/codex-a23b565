@@ -1,0 +1,279 @@
+Periodic shard audit can stall storage operations
+Link: https://chatgpt.com/codex/cloud/security/findings/fbbf96e12a9c819194ec9d101052a1b3?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: medium (attack path: medium)
+Status: fixed
+Fixed-in: f268687
+
+# Metadata
+Repo: justincormack/argmin
+Commit: a23b565
+Author: justin@specialbusservice.com
+Created: 22/05/2026, 16:51:34
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Fixed in `f268687 Avoid shard scavenger scan under PG mutex`.
+
+The fix keeps the shard scavenger audit on the same production schedule, but changes the file enumeration path so it no longer acquires a `PgStore` mutex before walking shard directories. `StorageCluster::audit_shard_storage_for_scavenger()` now calls `SharedStorageNode::list_scavenger_shard_files()`, which resolves the PG shard directory from node paths and delegates to `PgStore::list_scavenger_shard_files_in_dir()` for filesystem-only scanning. Metadata row reads still use the PG mutex where needed, but the expensive recursive shard-file scan no longer holds that lock.
+
+Regression coverage was added at both levels:
+- `shared_node_scavenger_file_scan_does_not_wait_for_pg_mutex` verifies the node helper completes while the PG mutex is held.
+- `cluster_shard_scavenger_audit_does_not_wait_for_non_primary_pg_mutex` verifies the production cluster audit path does not block on a non-primary node's PG mutex.
+
+The fix was validated with the full workspace test suite:
+`cargo nextest run --workspace --all-targets --no-fail-fast` passed with `4735` tests.
+
+# Summary
+Introduced: automatic background execution of the existing full shard scavenger audit creates a recurring availability hazard. The underlying scan existed previously, but this commit wires it into normal Coordinator startup and runs it periodically in production.
+The new Coordinator wiring unconditionally acquires a shared ShardScavengerSweeper for each storage cluster. That sweeper runs audit_shard_storage_for_scavenger() immediately and then every 60 seconds in non-test builds. The audit walks all local PG routes and, for each node/PG, obtains the PgStore mutex and calls list_scavenger_shard_files(). That method recursively enumerates all shard prefix directories and stats every shard file. Because SharedStorageNode::get_pg() returns a MutexGuard<PgStore>, the file-system scan is performed while the per-PG metadata/store mutex is held. A network client with write access can create a very large number of small objects/shards; once present, the background worker will repeatedly scan those files and block normal operations for that PG during each scan. There is no configuration gate, rate limit, batching, or try-lock behavior in this commit.
+
+# Validation
+## Rubric
+- [x] Coordinator startup unconditionally acquires/starts shard scavenger sweeper.
+- [x] Sweeper calls `audit_shard_storage_for_scavenger()` immediately and then at fixed intervals with no production disable/configuration gate.
+- [x] Audit reaches `list_scavenger_shard_files()` while a `MutexGuard<PgStore>` from `SharedStorageNode::get_pg()` is live.
+- [x] File scan recursively/enumeratively visits shard directories and stats every file without batching/rate limiting/try-locking.
+- [x] Dynamic PoC/debugger evidence shows a concurrent PG operation blocked by the scan-held mutex.
+## Report
+Validated the suspected availability issue. Rubric checklist:
+- [x] Confirm commit wires shard scavenger into normal Coordinator startup: `crates/server-core/src/coordinator/infra.rs` constructs `ShardScavengerSweeper::acquire_shared(&storage_cluster)?`; commit diff also adds `_shard_scavenger_sweeper` to `Coordinator`.
+- [x] Confirm worker runs automatically and repeatedly without a production configuration gate: `crates/server-core/src/coordinator/runtime.rs` spawns thread `argmin-shard-scavenger` and calls `storage_cluster.audit_shard_storage_for_scavenger()` before waiting; `crates/server-core/src/coordinator.rs` sets non-test interval to fixed `60_000` ms.
+- [x] Confirm audit scans PGs while holding the per-PG mutex: `crates/storage/src/node.rs:1144-1150` returns `MutexGuard<'_, PgStore>` from `SharedStorageNode::get_pg`; `crates/storage/src/cluster.rs:4224-4225` stores that guard in `pg` and calls `pg.list_scavenger_shard_files()`.
+- [x] Confirm file scan is unbounded over attacker-inflatable shard files: `crates/storage/src/pg_store.rs:1656-1740` iterates shard prefix directories, entries, and calls `entry.metadata()` for each shard file, with no batch, rate, or count limit.
+- [x] Dynamically demonstrate lock contention caused by the scan and that the background worker path is active.
+
+Commands/evidence:
+1. Direct non-crash reproduction attempt: `cargo test -p storage poc_scavenger_scan_holds_pg_mutex_and_blocks_operations -- --nocapture` after applying the PoC patch. It completed successfully but reproduced the availability symptom: `POC: scan_files=30000 scan_elapsed_ms=261 blocked_get_pg_ms=262`. This shows a normal `get_pg(0)` operation was blocked for essentially the full scan duration.
+2. Valgrind attempt: `valgrind` is not installed in the container (`valgrind not installed in container`). ASan/Valgrind are not well-suited because this is not a memory-safety crash.
+3. Debugger validation with LLDB: breakpoint on `storage::pg_store::PgStore::list_scavenger_shard_files` while running the PoC showed one thread stopped at `pg_store.rs:1657` inside the scan and another thread blocked in `std::sync::mutex::Mutex::lock` via `storage::node::SharedStorageNode::get_pg` at `node.rs:1150`, called from the PoC at `node.rs:2071`. This directly proves the scan holds the PG mutex and blocks concurrent PG access.
+4. Existing background-worker test: `cargo test -p server-core shard_scavenger_worker_records_audit_observations -- --nocapture` passed, demonstrating that constructing a coordinator starts the shard scavenger worker and it records audit observations in the background, even when the lifecycle sweeper is disabled.
+
+Conclusion: the finding is valid. The commit introduced automatic periodic production execution of an existing full shard scavenger audit. The audit performs an unbounded filesystem enumeration/stat scan of shard files while holding the per-PG `PgStore` mutex. A writer who can create many shard files can inflate scan cost, causing periodic lock contention and availability degradation for operations on that PG.
+
+# Evidence
+crates/server-core/src/coordinator.rs (L146 to 150)
+  Note: The non-test sweep interval is fixed at 60 seconds with no configuration or disable switch.
+```
+const LIFECYCLE_SWEEP_INTERVAL_MILLIS: u64 = 1000;
+#[cfg(test)]
+const SHARD_SCAVENGER_SWEEP_INTERVAL_MILLIS: u64 = 50;
+#[cfg(not(test))]
+const SHARD_SCAVENGER_SWEEP_INTERVAL_MILLIS: u64 = 60_000;
+```
+
+crates/server-core/src/coordinator/infra.rs (L336 to 337)
+  Note: Coordinator construction now unconditionally acquires/starts the shard scavenger sweeper for production coordinators.
+```
+        let lifecycle_sweeper = lifecycle_sweeper_factory(&storage_cluster, read_runtime.clone())?;
+        let shard_scavenger_sweeper = ShardScavengerSweeper::acquire_shared(&storage_cluster)?;
+```
+
+crates/server-core/src/coordinator/runtime.rs (L190 to 213)
+  Note: The new background thread repeatedly invokes audit_shard_storage_for_scavenger() and waits a fixed interval between full audits.
+```
+        let handle = std::thread::Builder::new()
+            .name("argmin-shard-scavenger".to_string())
+            .spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    if let Err(error) = storage_cluster.audit_shard_storage_for_scavenger() {
+                        let _ = observability::event(
+                            TRACE_TARGET,
+                            "shard_scavenger_audit_error",
+                            Some(format_args!("error={error}")),
+                        );
+                    }
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let stop_guard = lock_mutex_unpoisoned(&wake.0);
+                    if *stop_guard {
+                        break;
+                    }
+                    let _ = wake
+                        .1
+                        .wait_timeout_while(
+                            stop_guard,
+                            Duration::from_millis(super::SHARD_SCAVENGER_SWEEP_INTERVAL_MILLIS),
+                            |stop_requested| !*stop_requested,
+```
+
+crates/storage/src/cluster.rs (L4203 to 4242)
+  Note: The audit iterates each PG/node and calls list_scavenger_shard_files() while holding the PgStore mutex guard returned by get_pg().
+```
+        for route in self.local_pg_routes() {
+            let primary_node = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), route.pg_id())?;
+            let primary_node_id = primary_node.node_id().as_u32();
+            let data_pg_id = route.pg_id().get();
+            let shard_rows = {
+                let data_pg = primary_node.storage_node().get_pg(data_pg_id)?;
+                data_pg.list_scavenger_shard_rows()?
+            };
+            let rows_by_key: HashMap<ShardKey, WriteAck> = shard_rows
+                .iter()
+                .map(|row| (row.key.clone(), row.ack))
+                .collect();
+
+            let mut files_by_node = Vec::new();
+            let mut scan_errors = Vec::new();
+            for node_id in self.local_map.node_ids() {
+                let Some(node) = self.local_map.node(node_id) else {
+                    continue;
+                };
+                let pg = node.storage_node().get_pg(data_pg_id)?;
+                match pg.list_scavenger_shard_files() {
+                    Ok(scan) if scan.errors.is_empty() => {
+                        files_by_node.push((node_id.as_u32(), scan.files));
+                    }
+                    Ok(scan) => {
+                        scan_errors.extend(
+                            scan.errors
+                                .into_iter()
+                                .map(|error| (node_id.as_u32(), error)),
+                        );
+                    }
+                    Err(error) => {
+                        scan_errors.push((node_id.as_u32(), error.to_string()));
+                    }
+                }
+            }
+
+            let data_pg = primary_node.storage_node().get_pg(data_pg_id)?;
+```
+
+crates/storage/src/pg_store.rs (L1656 to 1740)
+  Note: The shard file scan performs an unbounded directory walk and metadata stat for every shard file, which can become very expensive when many objects/shards exist.
+```
+    pub(crate) fn list_scavenger_shard_files(&self) -> Result<ScavengerShardFileScan, StoreError> {
+        let mut files = Vec::new();
+        let mut errors = Vec::new();
+        for prefix in fs::read_dir(&self.shards_dir).map_err(|source| StoreError::Io {
+            context: "scan shard prefix directory",
+            source,
+        })? {
+            let prefix = prefix.map_err(|source| StoreError::Io {
+                context: "read shard prefix directory entry",
+                source,
+            })?;
+            let file_type = prefix.file_type().map_err(|source| StoreError::Io {
+                context: "read shard prefix directory entry type",
+                source,
+            })?;
+            let prefix_path = prefix.path();
+            if !file_type.is_dir() {
+                errors.push(format!(
+                    "unexpected non-directory entry under shard root {}",
+                    prefix_path.display()
+                ));
+                continue;
+            }
+            let prefix_name = prefix.file_name();
+            let Some(prefix_name) = prefix_name.to_str() else {
+                errors.push(format!(
+                    "non-UTF8 shard prefix directory {}",
+                    prefix_path.display()
+                ));
+                continue;
+            };
+            if !is_canonical_shard_prefix(prefix_name) {
+                errors.push(format!(
+                    "invalid shard prefix directory {}",
+                    prefix_path.display()
+                ));
+                continue;
+            }
+            for entry in fs::read_dir(prefix.path()).map_err(|source| StoreError::Io {
+                context: "scan shard directory",
+                source,
+            })? {
+                let entry = entry.map_err(|source| StoreError::Io {
+                    context: "read shard directory entry",
+                    source,
+                })?;
+                let file_type = entry.file_type().map_err(|source| StoreError::Io {
+                    context: "read shard directory entry type",
+                    source,
+                })?;
+                let path = entry.path();
+                if !file_type.is_file() {
+                    errors.push(format!(
+                        "unexpected non-file entry under shard prefix {}",
+                        path.display()
+                    ));
+                    continue;
+                }
+                let file_name = entry.file_name();
+                let Some(file_name) = file_name.to_str() else {
+                    errors.push(format!("non-UTF8 shard file {}", path.display()));
+                    continue;
+                };
+                let Ok(key) = ShardKey::from_hex(file_name) else {
+                    errors.push(format!("invalid shard file name {}", path.display()));
+                    continue;
+                };
+                let canonical_prefix = key.hex_prefix();
+                let canonical_file_name = key.to_string();
+                if prefix_name != canonical_prefix || file_name != canonical_file_name {
+                    errors.push(format!(
+                        "non-canonical shard file {} expected shards/{}/{}",
+                        path.display(),
+                        canonical_prefix,
+                        canonical_file_name
+                    ));
+                    continue;
+                };
+                let metadata = entry.metadata().map_err(|source| StoreError::Io {
+                    context: "stat shard file during scavenger scan",
+                    source,
+                })?;
+                files.push(ScavengerShardFile {
+                    key,
+                    size: metadata.len(),
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Kept at medium. The code evidence supports the reported bug: the production Coordinator starts an always-on shard scavenger, the worker repeatedly audits, and the audit scans attacker-inflatable shard files while holding the per-PG PgStore mutex. The attack is in scope because it is reachable through the S3 object write surface in the main service. However, the required attacker capability is write access or a public-write bucket, the effect is availability stalls rather than confidentiality/integrity compromise, and no evidence shows full service takeover, credential exposure, code execution, or irreversible data loss. That fits the project calibration for transient denial of service rather than high or critical severity.
+## Likelihood
+high - The path is automatically active in normal Coordinator startup and is reachable through ordinary object writes. Exploitation requires write permission or a public-write bucket and enough small-object/shard volume to make scans expensive, which is plausible but not universal. Default listen address is localhost, and many deployments will rely on authenticated users only. | Remote network vector
+## Impact
+medium - The vulnerability can block normal reads/writes for affected placement groups and can recur every production sweep interval, affecting other clients of the same service. It does not directly expose object data, bypass authentication, corrupt integrity, or execute code, and the impact is primarily transient availability degradation.
+## Assumptions
+- The deployed service runs the main argmin-s3 binary with a Coordinator, not only storage unit tests.
+- An attacker can perform object writes through valid S3 credentials, bucket policy, ACL-granted write access, or a public-write bucket.
+- Creating many small objects causes many shard files under the storage data directory, increasing traversal and stat cost during the scavenger audit.
+- The default listener is localhost, but deployments may expose ARGMIN_LISTEN_ADDR on an internal or public interface.
+- Coordinator-based argmin-s3 runtime is started
+- attacker has object write capability or target bucket permits public writes
+- attacker can create enough small objects/shards to make filesystem scanning expensive
+## Path
+Remote S3 writer -> PUT/multipart writes -> many shard files
+                                         |
+argmin-s3 Coordinator starts scavenger --+
+argmin-shard-scavenger -> get_pg() mutex -> list_scavenger_shard_files() unbounded scan -> PG operations stall
+## Path evidence
+- `crates/argmin-s3/src/config.rs:102` - The S3 server listener is environment-configurable and defaults to 127.0.0.1:9000; deployments can expose it beyond localhost by setting ARGMIN_LISTEN_ADDR.
+- `crates/argmin-s3/src/main.rs:184-246` - The main product binary binds a TCP listener and serves HTTP/TLS frontends using the configured connection and in-flight limits.
+- `crates/server-core/src/coordinator/infra.rs:336-337` - Coordinator construction unconditionally acquires the shard scavenger sweeper for the shared storage cluster.
+- `crates/server-core/src/coordinator/runtime.rs:190-215` - The argmin-shard-scavenger background thread calls audit_shard_storage_for_scavenger() in a loop before sleeping.
+- `crates/server-core/src/coordinator.rs:146-150` - The production shard scavenger interval is fixed at 60,000 ms with no visible configuration gate.
+- `crates/storage/src/node.rs:1144-1150` - SharedStorageNode::get_pg() returns a MutexGuard<PgStore>, confirming callers hold the per-PG mutex until the guard is dropped.
+- `crates/storage/src/cluster.rs:4220-4225` - The audit obtains the PG guard and then calls list_scavenger_shard_files() through that guard, keeping the mutex held during the scan.
+- `crates/storage/src/pg_store.rs:1656-1741` - list_scavenger_shard_files() walks shard prefix directories, iterates every entry, validates names, and calls entry.metadata() for each file without an apparent bound.
+- `crates/server-core/src/coordinator/authz.rs:440-454` - Object writes are allowed for bucket owner/admin, ACL-granted writers, or effective public-write buckets, establishing a realistic attacker-controlled write path under the project threat model.
+## Narrative
+The finding is a real, in-scope availability vulnerability in the main argmin-s3 runtime. Coordinator construction unconditionally acquires the ShardScavengerSweeper, whose background thread immediately and repeatedly invokes audit_shard_storage_for_scavenger() and waits a fixed 60 seconds in non-test builds. During the audit, cluster code obtains a PgStore mutex via get_pg() and calls list_scavenger_shard_files() while still holding the guard. That scan recursively enumerates shard prefix directories and stats every shard file without a count, batch, time, or rate limit. A client with write access, or an unauthenticated user of a public-write bucket, can create many small objects/shards so the next periodic scan holds the PG mutex for a long time, stalling other operations for that placement group. The impact is availability degradation rather than data compromise or code execution, so medium severity is appropriate.
+## Controls
+- SigV4 authentication for non-public requests
+- S3 ACL and bucket-policy authorization before object writes
+- configurable max_connections and max_inflight_requests at HTTP serving layer
+- optional TLS when ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH are configured
+- no code evidence of shard-scavenger batching, rate limiting, try-lock behavior, or production disable flag
+## Blindspots
+- No deployment manifests or load balancer configuration were present to confirm whether real deployments bind ARGMIN_LISTEN_ADDR publicly, internally, or only to localhost.
+- Static repository review cannot quantify production scan duration for specific filesystems, disks, object sizes, or PG distributions.
+- Static review cannot determine whether operators deploy public-write buckets or only tightly controlled authenticated writers.
+- No quota/rate-limit configuration outside the reviewed repository artifacts was available.
