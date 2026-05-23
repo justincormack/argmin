@@ -1477,6 +1477,17 @@ impl super::StorageCluster {
         batches
     }
 
+    pub fn load_bucket_fast_path_identity(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Option<BucketFastPathIdentity>, BucketSnapshotLoadError> {
+        let pg_id = self.bucket_metadata_pg_id(bucket);
+        let node = self.metadata_pg_primary_node(pg_id)?;
+        let mut identities =
+            node.load_bucket_fast_path_identities_for_pg(pg_id, std::slice::from_ref(bucket))?;
+        Ok(identities.remove(bucket))
+    }
+
     pub fn with_bucket_write_snapshot<T, E>(
         &self,
         bucket: &BucketName,

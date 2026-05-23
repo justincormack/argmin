@@ -2482,6 +2482,23 @@ pub struct BucketFastPathInfo {
     pub encryption: EffectiveBucketEncryptionConfig,
 }
 
+/// Durable identity used to prove a bucket fast-path cache entry is current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BucketFastPathIdentity {
+    pub bucket_execution_generation: u64,
+    pub bucket_incarnation_generation: u64,
+}
+
+impl BucketFastPathInfo {
+    #[must_use]
+    pub const fn identity(&self) -> BucketFastPathIdentity {
+        BucketFastPathIdentity {
+            bucket_execution_generation: self.bucket_execution_generation,
+            bucket_incarnation_generation: self.bucket_incarnation_generation,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum BucketFastPathPolicy {
     Absent,
@@ -2541,6 +2558,10 @@ impl std::fmt::Debug for BucketFastPathInfo {
             .field(
                 "bucket_execution_generation",
                 &self.bucket_execution_generation,
+            )
+            .field(
+                "bucket_incarnation_generation",
+                &self.bucket_incarnation_generation,
             )
             .field("bucket_abac_enabled", &self.bucket_abac_enabled)
             .field("tags", &self.tags)

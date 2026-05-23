@@ -3,12 +3,12 @@ use super::*;
 use s3_types::{AclGrants, BucketVersioningState};
 use std::collections::HashMap;
 
-use crate::BucketInfo;
 #[cfg(test)]
 use crate::{
     BucketEncryptionConfig, BucketObjectLockConfig, BucketOwnershipControls, CreateBucketConfig,
     PublicAccessBlockConfig, PutBucketSubresource,
 };
+use crate::{BucketFastPathIdentity, BucketInfo};
 
 impl SharedStorageNode {
     #[cfg(test)]
@@ -218,6 +218,15 @@ impl SharedStorageNode {
     ) -> Result<HashMap<BucketName, u64>, BucketSnapshotLoadError> {
         let bucket_pg = self.get_pg(pg_id)?;
         Ok(bucket_pg.load_bucket_execution_generations(buckets)?)
+    }
+
+    pub fn load_bucket_fast_path_identities_for_pg(
+        &self,
+        pg_id: u32,
+        buckets: &[BucketName],
+    ) -> Result<HashMap<BucketName, BucketFastPathIdentity>, BucketSnapshotLoadError> {
+        let bucket_pg = self.get_pg(pg_id)?;
+        Ok(bucket_pg.load_bucket_fast_path_identities(buckets)?)
     }
 
     pub fn get_bucket_subresource(

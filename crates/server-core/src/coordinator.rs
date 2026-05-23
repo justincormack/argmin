@@ -277,7 +277,7 @@ impl BucketFastPathCache {
         &self,
         bucket: &BucketName,
         bucket_policy_generation: u64,
-    ) -> Option<Arc<auth::BucketPolicy>> {
+    ) -> Option<(Arc<auth::BucketPolicy>, storage::BucketFastPathIdentity)> {
         let entry = self.entries.get(bucket)?;
         if !(entry.is_fresh()
             && entry.info.bucket_policy_present
@@ -285,7 +285,10 @@ impl BucketFastPathCache {
         {
             return None;
         }
-        entry.parsed_policy.as_ref().cloned()
+        Some((
+            entry.parsed_policy.as_ref().cloned()?,
+            entry.info.identity(),
+        ))
     }
 
     fn insert(&mut self, info: storage::BucketFastPathInfo) -> Result<(), ServerError> {
@@ -429,7 +432,15 @@ impl Coordinator {
         &self,
         bucket: &BucketName,
     ) -> Option<storage::BucketFastPathInfo> {
-        read_rwlock_unpoisoned(&self.shared_caches.bucket_fast_path).get_if_fresh(bucket)
+        let info =
+            read_rwlock_unpoisoned(&self.shared_caches.bucket_fast_path).get_if_fresh(bucket)?;
+        match self.storage_node.load_bucket_fast_path_identity(bucket) {
+            Ok(Some(identity)) if identity == info.identity() => Some(info),
+            Ok(_) | Err(_) => {
+                self.remove_bucket_fast_path(bucket);
+                None
+            }
+        }
     }
 
     pub(super) fn parsed_bucket_fast_path_policy_if_fresh(
@@ -437,8 +448,16 @@ impl Coordinator {
         bucket: &BucketName,
         bucket_policy_generation: u64,
     ) -> Option<Arc<auth::BucketPolicy>> {
-        read_rwlock_unpoisoned(&self.shared_caches.bucket_fast_path)
-            .parsed_policy_if_fresh(bucket, bucket_policy_generation)
+        let (parsed, cached_identity) =
+            read_rwlock_unpoisoned(&self.shared_caches.bucket_fast_path)
+                .parsed_policy_if_fresh(bucket, bucket_policy_generation)?;
+        match self.storage_node.load_bucket_fast_path_identity(bucket) {
+            Ok(Some(identity)) if identity == cached_identity => Some(parsed),
+            Ok(_) | Err(_) => {
+                self.remove_bucket_fast_path(bucket);
+                None
+            }
+        }
     }
 
     pub(super) fn upsert_bucket_fast_path(

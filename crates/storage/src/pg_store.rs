@@ -9208,6 +9208,78 @@ impl PgStore {
         Ok(generations)
     }
 
+    pub fn load_bucket_fast_path_identities(
+        &self,
+        buckets: &[BucketName],
+    ) -> Result<HashMap<BucketName, BucketFastPathIdentity>, MetadataError> {
+        if buckets.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", buckets.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT name, bucket_execution_generation, bucket_incarnation_generation \
+             FROM buckets \
+             WHERE name IN ({placeholders})"
+        );
+        let mut stmt = self
+            .conn
+            .prepare_cached(&sql)
+            .map_err(|source| MetadataError::Db {
+                context: "prepare load bucket fast path identities",
+                source,
+            })?;
+        let rows = stmt
+            .query_map(
+                params_from_iter(buckets.iter().map(|bucket| bucket.as_str())),
+                |row| {
+                    Ok((
+                        row.get::<_, BucketName>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .map_err(|source| MetadataError::Db {
+                context: "query load bucket fast path identities",
+                source,
+            })?;
+        let mut identities = HashMap::with_capacity(buckets.len());
+        for row in rows {
+            let (bucket, execution, incarnation) = row.map_err(|source| MetadataError::Db {
+                context: "row load bucket fast path identities",
+                source,
+            })?;
+            let bucket_execution_generation =
+                execution.try_into().map_err(|_| MetadataError::Db {
+                    context: "decode bucket fast path execution generation",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Integer,
+                        Box::from("negative bucket_execution_generation"),
+                    ),
+                })?;
+            let bucket_incarnation_generation =
+                incarnation.try_into().map_err(|_| MetadataError::Db {
+                    context: "decode bucket fast path incarnation generation",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Integer,
+                        Box::from("negative bucket_incarnation_generation"),
+                    ),
+                })?;
+            identities.insert(
+                bucket,
+                BucketFastPathIdentity {
+                    bucket_execution_generation,
+                    bucket_incarnation_generation,
+                },
+            );
+        }
+        Ok(identities)
+    }
+
     pub(crate) fn next_object_write_sequence(
         &self,
         bucket: &str,
