@@ -3000,6 +3000,463 @@ fn head_object_validates_independent_fast_path_before_stale_abac_tags() {
 }
 
 #[test]
+fn get_object_validates_independent_fast_path_before_stale_ownership_controls() {
+    let tmp = test_util::tempdir();
+    let bucket = "bucket-fast-path-cross-process-ownership";
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let admin = setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let reader =
+        setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let writer =
+        setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let owner_canonical_id = CanonicalUserId::from_principal("owner-a");
+
+    create_bucket_for_owner_with_flags(
+        &admin,
+        "owner-a",
+        &owner_canonical_id,
+        bucket,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    put_bucket_ownership_controls_test(
+        &admin,
+        bucket,
+        "<OwnershipControls><Rule><ObjectOwnership>ObjectWriter</ObjectOwnership></Rule></OwnershipControls>",
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+    put_bucket_policy_test(
+        &admin,
+        bucket,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"writer-a"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket-fast-path-cross-process-ownership/*"}]}"#,
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+    test_helpers::put_object(
+        &admin,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                bucket,
+                "key",
+                test_helpers::requester("writer-a"),
+                None,
+            ),
+            data: b"writer-owned",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    put_bucket_policy_test(
+        &admin,
+        bucket,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"owner-a"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket-fast-path-cross-process-ownership/*"}]}"#,
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+    put_bucket_ownership_controls_test(
+        &admin,
+        bucket,
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+
+    let warm = reader
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "key",
+                None,
+                test_helpers::requester("owner-a"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(warm.body.read_all().unwrap(), b"writer-owned");
+    let bucket_name = trusted_bucket_name(bucket);
+    assert_eq!(
+        reader.bucket_fast_path_is_fresh_for_test(&bucket_name),
+        Some(true)
+    );
+
+    writer
+        .delete_bucket_ownership_controls(&bucket_request_with_expected_owner(
+            bucket,
+            test_helpers::requester("owner-a"),
+            None,
+        ))
+        .unwrap();
+    assert_eq!(
+        reader.bucket_fast_path_is_fresh_for_test(&bucket_name),
+        Some(true),
+        "writer-side cache hints must not touch an independent reader cache"
+    );
+
+    let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let (event_tx, event_rx) = mpsc::channel::<LockWaitEvent>();
+    let event_tx_fast_path = event_tx.clone();
+    let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
+        bucket: Some(bucket.to_string()),
+        before_storage_load: Some(Arc::new(move || {
+            let _ = event_tx.send(LockWaitEvent::Progress);
+        })),
+        after_policy_fast_path_hit: Some(Arc::new(move || {
+            let _ = event_tx_fast_path.send(LockWaitEvent::UnexpectedStorageLoad);
+        })),
+    });
+
+    let err = reader
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "key",
+                None,
+                test_helpers::requester("owner-a"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert!(matches!(err, ServerError::AccessDenied));
+    assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
+}
+
+#[test]
+fn get_object_validates_independent_fast_path_before_stale_public_access_block() {
+    let tmp = test_util::tempdir();
+    let bucket = "bucket-fast-path-cross-process-pab";
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let admin = setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let reader =
+        setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let writer =
+        setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let owner_requester = test_helpers::requester("111122223333");
+
+    admin
+        .create_bucket_for_owner("111122223333", bucket, false)
+        .unwrap();
+    put_bucket_ownership_controls_test(
+        &admin,
+        bucket,
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        owner_requester.clone(),
+        None,
+    )
+    .unwrap();
+    test_helpers::put_object(
+        &admin,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                bucket,
+                "key",
+                owner_requester.clone(),
+                None,
+            ),
+            data: b"data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    put_bucket_policy_test(
+        &admin,
+        bucket,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket-fast-path-cross-process-pab/*"},{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket-fast-path-cross-process-pab/*"}]}"#,
+        owner_requester.clone(),
+        None,
+    )
+    .unwrap();
+
+    reader
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "key",
+                None,
+                test_helpers::requester("444455556666"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    let bucket_name = trusted_bucket_name(bucket);
+    assert_eq!(
+        reader.bucket_fast_path_is_fresh_for_test(&bucket_name),
+        Some(true)
+    );
+
+    put_bucket_public_access_block_test(
+        &writer,
+        bucket,
+        "<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+        owner_requester,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        reader.bucket_fast_path_is_fresh_for_test(&bucket_name),
+        Some(true),
+        "writer-side cache hints must not touch an independent reader cache"
+    );
+
+    let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let (event_tx, event_rx) = mpsc::channel::<LockWaitEvent>();
+    let event_tx_fast_path = event_tx.clone();
+    let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
+        bucket: Some(bucket.to_string()),
+        before_storage_load: Some(Arc::new(move || {
+            let _ = event_tx.send(LockWaitEvent::Progress);
+        })),
+        after_policy_fast_path_hit: Some(Arc::new(move || {
+            let _ = event_tx_fast_path.send(LockWaitEvent::UnexpectedStorageLoad);
+        })),
+    });
+
+    let err = reader
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "key",
+                None,
+                test_helpers::requester("444455556666"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert!(matches!(err, ServerError::AccessDenied));
+    assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
+}
+
+#[test]
+fn head_object_bypasses_fast_path_when_identity_validation_fails() {
+    let tmp = test_util::tempdir();
+    let bucket = "bucket-fast-path-identity-load-failure";
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let coord = setup_isolated_cache_coordinator_with_storage_cluster(storage_cluster);
+    let owner_requester = test_helpers::requester("111122223333");
+
+    coord
+        .create_bucket_for_owner("111122223333", bucket, false)
+        .unwrap();
+    put_bucket_ownership_controls_test(
+        &coord,
+        bucket,
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        owner_requester.clone(),
+        None,
+    )
+    .unwrap();
+    put_bucket_policy_test(
+        &coord,
+        bucket,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket-fast-path-identity-load-failure/*"}]}"#,
+        owner_requester.clone(),
+        None,
+    )
+    .unwrap();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(bucket, "key", owner_requester, None),
+            data: b"data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    coord
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "key",
+                None,
+                test_helpers::requester("444455556666"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    let bucket_name = trusted_bucket_name(bucket);
+    assert_eq!(
+        coord.bucket_fast_path_is_fresh_for_test(&bucket_name),
+        Some(true)
+    );
+
+    let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _identity_load_error_guard =
+        install_bucket_fast_path_identity_load_error_test_hook(bucket.to_string());
+    let (event_tx, event_rx) = mpsc::channel::<LockWaitEvent>();
+    let event_tx_fast_path = event_tx.clone();
+    let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
+        bucket: Some(bucket.to_string()),
+        before_storage_load: Some(Arc::new(move || {
+            let _ = event_tx.send(LockWaitEvent::Progress);
+        })),
+        after_policy_fast_path_hit: Some(Arc::new(move || {
+            let _ = event_tx_fast_path.send(LockWaitEvent::UnexpectedStorageLoad);
+        })),
+    });
+
+    let head = coord
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "key",
+                None,
+                test_helpers::requester("444455556666"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(head.size, 4);
+    assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
+    assert!(matches!(
+        event_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    assert_eq!(
+        coord.bucket_fast_path_is_fresh_for_test(&bucket_name),
+        None,
+        "failed identity validation should remove the cached fast-path entry"
+    );
+}
+
+#[test]
+fn parsed_policy_cache_bypasses_fast_path_when_identity_validation_fails() {
+    let tmp = test_util::tempdir();
+    let bucket = "bucket-parsed-policy-identity-load-failure";
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let coord = setup_isolated_cache_coordinator_with_storage_cluster(storage_cluster);
+    let owner_requester = test_helpers::requester("111122223333");
+
+    coord
+        .create_bucket_for_owner("111122223333", bucket, false)
+        .unwrap();
+    put_bucket_ownership_controls_test(
+        &coord,
+        bucket,
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        owner_requester.clone(),
+        None,
+    )
+    .unwrap();
+    put_bucket_policy_test(
+        &coord,
+        bucket,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket-parsed-policy-identity-load-failure/*"}]}"#,
+        owner_requester.clone(),
+        None,
+    )
+    .unwrap();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(bucket, "key", owner_requester, None),
+            data: b"data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    coord
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "key",
+                None,
+                test_helpers::requester("444455556666"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    let bucket_name = trusted_bucket_name(bucket);
+    let bucket_summary = coord.unchecked_active_bucket_summary(bucket).unwrap();
+    assert_eq!(
+        coord.bucket_fast_path_is_fresh_for_test(&bucket_name),
+        Some(true)
+    );
+    assert!(
+        coord
+            .get_bucket_fast_path(&bucket_name)
+            .expect("head_object should populate BOE fast-path policy")
+            .bucket_policy_present
+    );
+
+    let _identity_load_error_guard =
+        install_bucket_fast_path_identity_load_error_test_hook(bucket.to_string());
+    let parsed_policy = coord.cached_bucket_policy(&bucket_summary).unwrap();
+
+    assert!(
+        parsed_policy.is_some(),
+        "loaded bucket policy fallback should still parse after the cached policy proof fails"
+    );
+    assert_eq!(
+        coord.bucket_fast_path_is_fresh_for_test(&bucket_name),
+        None,
+        "failed parsed-policy identity validation should remove the cached fast-path entry"
+    );
+}
+
+#[test]
 fn bucket_fast_path_watcher_survives_first_cluster_handle_drop() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-fast-path-watch-first-handle-drop";

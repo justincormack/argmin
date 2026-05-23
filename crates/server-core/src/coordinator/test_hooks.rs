@@ -29,6 +29,9 @@ pub(super) struct BucketPolicyLoadTestHooks {
 pub(super) static BUCKET_POLICY_LOAD_TEST_HOOKS: OnceLock<Mutex<BucketPolicyLoadTestHooks>> =
     OnceLock::new();
 pub(super) static BUCKET_POLICY_LOAD_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+pub(super) static BUCKET_FAST_PATH_IDENTITY_LOAD_ERROR_TEST_BUCKET: OnceLock<
+    Mutex<Option<String>>,
+> = OnceLock::new();
 
 #[derive(Default, Clone)]
 pub(super) struct BucketWriteHandleTestHooks {
@@ -72,6 +75,8 @@ pub(super) struct StreamAppendTestHookGuard {
 
 pub(super) struct BucketPolicyLoadTestHookGuard;
 
+pub(super) struct BucketFastPathIdentityLoadErrorTestHookGuard;
+
 pub(super) struct BucketWriteHandleTestHookGuard;
 
 impl Drop for StreamAppendTestHookGuard {
@@ -93,6 +98,14 @@ impl Drop for BucketWriteHandleTestHookGuard {
         let hooks = BUCKET_WRITE_HANDLE_TEST_HOOKS
             .get_or_init(|| Mutex::new(BucketWriteHandleTestHooks::default()));
         *hooks.lock().unwrap() = BucketWriteHandleTestHooks::default();
+    }
+}
+
+impl Drop for BucketFastPathIdentityLoadErrorTestHookGuard {
+    fn drop(&mut self) {
+        let bucket =
+            BUCKET_FAST_PATH_IDENTITY_LOAD_ERROR_TEST_BUCKET.get_or_init(|| Mutex::new(None));
+        *bucket.lock().unwrap() = None;
     }
 }
 
@@ -123,6 +136,14 @@ pub(super) fn install_bucket_policy_load_test_hooks(
         .get_or_init(|| Mutex::new(BucketPolicyLoadTestHooks::default()));
     *slot.lock().unwrap() = hooks;
     BucketPolicyLoadTestHookGuard
+}
+
+pub(super) fn install_bucket_fast_path_identity_load_error_test_hook(
+    bucket: String,
+) -> BucketFastPathIdentityLoadErrorTestHookGuard {
+    let slot = BUCKET_FAST_PATH_IDENTITY_LOAD_ERROR_TEST_BUCKET.get_or_init(|| Mutex::new(None));
+    *slot.lock().unwrap() = Some(bucket);
+    BucketFastPathIdentityLoadErrorTestHookGuard
 }
 
 pub(super) fn install_bucket_write_handle_test_hooks(
@@ -267,6 +288,15 @@ pub(super) fn maybe_run_bucket_policy_fast_path_hook(bucket: &str) {
             hook();
         }
     }
+}
+
+pub(super) fn should_fail_bucket_fast_path_identity_load(bucket: &str) -> bool {
+    BUCKET_FAST_PATH_IDENTITY_LOAD_ERROR_TEST_BUCKET
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|target| target == bucket)
 }
 
 pub(super) fn maybe_run_bucket_write_handle_loaded_hook(bucket: &str) {

@@ -4443,8 +4443,10 @@ Proposed subphases:
      - the same cross-process stale-cache shape for bucket ownership controls
        changing away from BOE, public access block/policy-public state, and
        bucket tags used by ABAC. Bucket tags/ABAC are covered by an independent
-       reader/writer cache regression; ownership controls and public-access
-       block/policy-public state remain follow-up matrix entries.
+       reader/writer cache regression. Ownership controls changing away from
+       BOE, and public access block/restrict-public-buckets changing after a
+       public policy is cached, are also covered by independent reader/writer
+       cache regressions.
      - delete/recreate with the same bucket name: a cached entry from the old
        bucket must be removed or reloaded before any authorization decision for
        the recreated bucket. The regression must force old-incarnation cache
@@ -4460,7 +4462,11 @@ Proposed subphases:
        incarnation allocation, and object-lock default-retention mutation.
      - freshness-check storage failure: the fast path must be bypassed and the
        request must reload or fail safely; no stale cached allow/deny decision
-       may be returned.
+       may be returned. Covered by a forced fast-path identity proof failure
+       regression that verifies the request falls back to full storage load
+       instead of making a cached decision, plus a parsed-policy cache
+       regression that forces the same proof failure after a bucket summary is
+       already loaded.
      - watcher-disabled or watcher-delayed test hook: correctness must still
        hold with only request-time validation.
      - batched watcher/load path continues to mark entries stale opportunistically

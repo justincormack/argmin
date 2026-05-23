@@ -434,6 +434,11 @@ impl Coordinator {
     ) -> Option<storage::BucketFastPathInfo> {
         let info =
             read_rwlock_unpoisoned(&self.shared_caches.bucket_fast_path).get_if_fresh(bucket)?;
+        #[cfg(test)]
+        if test_hooks::should_fail_bucket_fast_path_identity_load(bucket.as_str()) {
+            self.remove_bucket_fast_path(bucket);
+            return None;
+        }
         match self.storage_node.load_bucket_fast_path_identity(bucket) {
             Ok(Some(identity)) if identity == info.identity() => Some(info),
             Ok(_) | Err(_) => {
@@ -451,6 +456,11 @@ impl Coordinator {
         let (parsed, cached_identity) =
             read_rwlock_unpoisoned(&self.shared_caches.bucket_fast_path)
                 .parsed_policy_if_fresh(bucket, bucket_policy_generation)?;
+        #[cfg(test)]
+        if test_hooks::should_fail_bucket_fast_path_identity_load(bucket.as_str()) {
+            self.remove_bucket_fast_path(bucket);
+            return None;
+        }
         match self.storage_node.load_bucket_fast_path_identity(bucket) {
             Ok(Some(identity)) if identity == cached_identity => Some(parsed),
             Ok(_) | Err(_) => {
