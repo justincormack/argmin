@@ -4497,12 +4497,107 @@ Proposed subphases:
        generation validation or fail-closed reload is required before cached
        state can affect request behavior.
 11. Phase 9.10 test harness de-single-process pass
+   - status: audit needed. The current test tree contains many valid
+     single-process unit tests, but Phase 9 closeout needs a focused audit of
+     tests that claim cross-process, restart, convergence, race, drain, reclaim,
+     lifecycle, cache-freshness, or scavenger correctness. Those tests must not
+     accidentally pass because they share a `StorageCluster`, shared
+     `CoordinatorSharedCaches`, a local mutex/condition variable, process-global
+     test hooks, or direct `PgStore` state.
    - audit tests and helpers that still use local constructors, raw hooks, or
-     direct store access in ways that bypass the production cluster path
-   - add targeted multi-handle or multi-process-simulated tests for the Phase 9
-     primitives
-   - exit when tests prove the coordination invariants without relying on
-     shared local locks
+     direct store access in ways that bypass the production cluster path. Classify
+     each use rather than mechanically removing it:
+     - production-shaped: uses `StorageCluster`/`LocalClusterMap` APIs in the
+       same shape as runtime code, and for cross-process assertions uses
+       independently opened handles or independent coordinator caches/watcher
+       state as appropriate
+     - acceptable local unit: pure parser/model/codec logic, storage-node
+       internals, direct `PgStore` invariants, or tests whose purpose is to
+       validate the raw helper itself
+     - crash-state seeding: raw writes or pending-slot insertion used only to
+       construct an otherwise unreachable partial/reopen state, followed by
+       production-path recovery/convergence
+     - suspect: a test whose name or assertion claims multi-process,
+       restart/reopen, contention, idempotence, background-worker, or cache
+       correctness while using one process-local handle, shared cache registry,
+       local wakeup, local lock, or direct store mutation as the authority
+   - start the audit from the Phase 9 primitive matrix:
+     1. Phase 9.2 command stream: log index allocation, durable pending slot
+        convergence, duplicate-index reissue, abandoned tail cleanup, reopen
+        validation, and partial apply must be covered through PG-primary durable
+        state. Raw pending/log rows are allowed only as crash-state seeders.
+     2. Phase 9.3 multipart serialization: create/upload-part/finalize/copy/
+        abort/complete races must have tests using separate request handles
+        where local multipart locks would otherwise mask a race. Direct MPU
+        table mutation is acceptable only for model setup or impossible crash
+        states.
+     3. Phase 9.4 bucket write drain: reservations, drains, DeleteBucket begin,
+        rollback, idempotent retry, and finalization must be exercised with at
+        least two independently routed storage/coordinator handles where
+        relevant, and must not depend on node-local counters, bucket locks, or
+        same-process waiters.
+     4. Phase 9.5 read handles: read-handle acquisition and physical delete
+        fences must be tested at storage-node/shard-owner boundaries, including
+        multi-shard all-or-release and failed acquisition cleanup. Coordinator
+        tests should not prove safety through coordinator-local lease state.
+     5. Phase 9.6 reclaim claiming: object reclaim and bucket finalization
+        tests must prove durable claims, token-fenced release/steal, stale
+        terminal cleanup, lost wakeup recovery, and restart discovery without
+        relying on local reclaim queues.
+     6. Phase 9.7 shard scavenger: tests must distinguish local audit helpers
+        from cluster-level location-aware scans, and must cover scan-incomplete,
+        reference-source failure, pending-command references, and final harness
+        clean checks without treating negative-reference observations as delete
+        authority.
+     7. Phase 9.8 lifecycle: lifecycle sweep tests must use durable bucket
+        incarnation claims for ownership/retry, isolate local registry tests to
+        local deduplication only, and prove drain/state rechecks for lifecycle
+        mutations after a claim is acquired.
+     8. Phase 9.9 fast-path cache freshness: stale-cache tests must use
+        independent process-shaped `CoordinatorSharedCaches` and delayed or
+        disabled watcher behavior; same-process cache invalidation is only an
+        optimization test.
+   - produce an audit table before broad rewrites. For every audited
+     raw/local-helper use that is not already clearly production-shaped, record
+     file, test/helper name, claimed invariant, current harness shape,
+     classification, and required action. This includes acceptable local units
+     and crash-state seeders, because the closeout proof depends on documenting
+     why each non-production-shaped use is safe:
+     - keep as local unit
+     - rename/comment so it does not claim cross-process coverage
+     - replace shared-cache/same-handle setup with independent process-shaped
+       handles
+     - add a new focused multi-handle regression and leave the local test as
+       helper/unit coverage
+     - remove obsolete raw-helper coverage once production-shaped coverage
+       exists
+   - likely first files/helpers to audit:
+     - `crates/server-core/src/coordinator/test_support.rs`: the default
+       `setup_coordinators_*` helpers share one `StorageCluster` and the
+       process-local shared-cache registry; add explicit helpers for
+       independent process-shaped handles and make tests choose deliberately.
+     - `crates/server-core/src/coordinator/core_tests.rs`,
+       `multipart_tests.rs`, `multipart_stateful_tests.rs`,
+       `multipart_reclaim_trace_tests.rs`, `object_state_tests.rs`,
+       `bucket_tests.rs`, `authz_model_tests.rs`, and `runtime.rs`: identify
+       tests whose names mention concurrent, restart, reopen, retry, drain,
+       reclaim, lifecycle, watcher, stale cache behavior, BOE fast-path
+       invariants, process-global fast-path hooks, or custom coordinator setup.
+     - `crates/storage/src/cluster/local.rs`: separate genuine
+       `StorageCluster` authority tests from raw `get_pg`/pending-slot
+       seeders, and add reopen/two-handle variants where a local map or PG
+       mutex could otherwise hide the issue.
+     - `crates/s3-local-tests`, `crates/s3-tests`, and `crates/s3-http-tests`:
+       keep public API conformance tests production-shaped, and reserve direct
+       final-audit hooks for explicit local harness assertions.
+   - add targeted multi-handle or multi-process-simulated tests for gaps found
+     by the audit. Prefer small regressions tied to one Phase 9 invariant over
+     broad integration tests that obscure which process-local assumption was
+     removed.
+   - exit when tests prove the Phase 9 coordination invariants without relying
+     on shared local locks, shared in-process caches, process-global hooks,
+     local wakeups, or direct store mutation except where the audit table marks
+     the test as local-only or crash-state seeding.
 
 Phase 9.1 audit checklist:
 
