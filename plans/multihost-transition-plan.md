@@ -4498,7 +4498,7 @@ Proposed subphases:
        state can affect request behavior.
 11. Phase 9.10 test harness de-single-process pass
    - status: implementation complete; full-suite clean on 2026-05-23. The audit
-     table is in `plans/phase-9.10-test-harness-audit.md`, covering
+     table is in `plans/completed/phase-9.10-test-harness-audit.md`, covering
      shared coordinator setup helpers, independent-cache Phase 9.9 tests, BOE
      fast-path model tests, representative lifecycle claim tests, multipart API
      and model tests, multipart stream-race tests, reclaim trace tests,
