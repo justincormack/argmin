@@ -3457,6 +3457,136 @@ fn parsed_policy_cache_bypasses_fast_path_when_identity_validation_fails() {
 }
 
 #[test]
+fn head_object_rejects_old_incarnation_fast_path_after_delete_recreate() {
+    let tmp = test_util::tempdir();
+    let bucket = "bucket-fast-path-cross-process-recreate";
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let admin = setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let reader =
+        setup_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+
+    admin
+        .create_bucket_for_owner("111122223333", bucket, false)
+        .unwrap();
+    put_bucket_ownership_controls_test(
+        &admin,
+        bucket,
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+    put_bucket_policy_test(
+        &admin,
+        bucket,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket-fast-path-cross-process-recreate/*"},{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket-fast-path-cross-process-recreate"}]}"#,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+
+    let warm_err = reader
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "missing-key",
+                None,
+                test_helpers::requester("444455556666"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(warm_err, ServerError::ObjectNotFound { .. }),
+        "unexpected warm error: {warm_err:?}"
+    );
+    let bucket_name = trusted_bucket_name(bucket);
+    let cached_identity = reader
+        .get_bucket_fast_path(&bucket_name)
+        .expect("BOE read should warm cache")
+        .identity();
+    assert_eq!(
+        reader.bucket_fast_path_is_fresh_for_test(&bucket_name),
+        Some(true)
+    );
+
+    storage_cluster.begin_bucket_delete(&bucket_name).unwrap();
+    storage_cluster
+        .test_delete_bucket_metadata(&bucket_name)
+        .unwrap();
+    let recreated_owner = CanonicalUserId::from_principal("777788889999");
+    storage_cluster
+        .create_bucket_with_config_and_load_info(&storage::CreateBucketConfig {
+            name: bucket,
+            owner_principal: "777788889999",
+            owner_canonical_id: &recreated_owner,
+            acl_grants: &AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            versioning: BucketVersioningState::Disabled,
+            object_lock: BucketObjectLockConfig::default(),
+        })
+        .unwrap();
+    let recreated = storage_cluster
+        .load_bucket_fast_path_identity(&bucket_name)
+        .unwrap()
+        .expect("recreated bucket should have a fast-path identity");
+    assert_ne!(
+        recreated.bucket_incarnation_generation, cached_identity.bucket_incarnation_generation,
+        "delete/recreate must change the bucket incarnation used by cache validation"
+    );
+    assert_eq!(
+        reader.bucket_fast_path_is_fresh_for_test(&bucket_name),
+        Some(true),
+        "isolated reader cache should not receive writer-side invalidation"
+    );
+
+    let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let (event_tx, event_rx) = mpsc::channel::<LockWaitEvent>();
+    let event_tx_fast_path = event_tx.clone();
+    let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
+        bucket: Some(bucket.to_string()),
+        before_storage_load: Some(Arc::new(move || {
+            let _ = event_tx.send(LockWaitEvent::Progress);
+        })),
+        after_policy_fast_path_hit: Some(Arc::new(move || {
+            let _ = event_tx_fast_path.send(LockWaitEvent::UnexpectedStorageLoad);
+        })),
+    });
+
+    let err = reader
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "missing-key",
+                None,
+                test_helpers::requester("444455556666"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
+    assert!(matches!(
+        event_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    assert!(matches!(err, ServerError::AccessDenied));
+    assert_eq!(
+        reader.bucket_fast_path_is_fresh_for_test(&bucket_name),
+        None,
+        "old-incarnation cache entry should be removed after request-time validation"
+    );
+}
+
+#[test]
 fn bucket_fast_path_watcher_survives_first_cluster_handle_drop() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-fast-path-watch-first-handle-drop";

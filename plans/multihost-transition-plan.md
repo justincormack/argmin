@@ -4422,7 +4422,10 @@ Proposed subphases:
           against a recreated bucket with the same name
      7. update docs and names to make the authority clear:
         - rename or comment local freshness helpers so they are visibly
-          process-local hints
+          process-local hints. The cache entry local freshness and parsed-policy
+          helper comments now state that request paths must still validate
+          cached identity against durable bucket metadata before trusting
+          fast-path state.
         - document that the metadata digest clean-revision cache remains
           acceptable only because every skip is guarded by durable revision
           state, not process-local invalidation
@@ -4451,7 +4454,9 @@ Proposed subphases:
        bucket must be removed or reloaded before any authorization decision for
        the recreated bucket. The regression must force old-incarnation cache
        rejection even if a test hook makes execution-generation behavior collide
-       or appear unchanged.
+       or appear unchanged. Covered by an independent-cache delete/recreate
+       regression that keeps the reader cache locally fresh until request-time
+       incarnation validation rejects it.
      - field/mutator matrix coverage for every `BucketFastPathInfo` field that
        can affect behavior, including versioning, object lock/default retention,
        default encryption/SSE-C blocking, owner/state, lifecycle-visible
@@ -4470,7 +4475,9 @@ Proposed subphases:
      - watcher-disabled or watcher-delayed test hook: correctness must still
        hold with only request-time validation.
      - batched watcher/load path continues to mark entries stale opportunistically
-       and does not make unavailable PGs look fresh.
+       and does not make unavailable PGs look fresh. Existing watcher
+       regressions cover direct storage policy mutation, delete/recreate, and
+       missing-bucket removal before recreate.
    - exit when:
      - no authorization or bucket-configuration correctness path depends on
        same-process invalidation, local watcher timing, or shared in-process

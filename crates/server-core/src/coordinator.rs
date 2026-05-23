@@ -227,6 +227,9 @@ impl BucketFastPathCacheEntry {
     }
 
     fn is_fresh(&self) -> bool {
+        // This is only a process-local watcher hint. Request paths must still
+        // validate the cached identity against durable bucket metadata before
+        // using any fast-path state for authorization or bucket configuration.
         self.info.bucket_execution_generation == self.known_generation.load(Ordering::Relaxed)
     }
 
@@ -279,6 +282,9 @@ impl BucketFastPathCache {
         bucket_policy_generation: u64,
     ) -> Option<(Arc<auth::BucketPolicy>, storage::BucketFastPathIdentity)> {
         let entry = self.entries.get(bucket)?;
+        // Local freshness only prevents obviously stale entries from reaching
+        // the parsed-policy fast path. The returned identity must be validated
+        // durably by the caller before the parsed policy is trusted.
         if !(entry.is_fresh()
             && entry.info.bucket_policy_present
             && entry.info.bucket_policy_generation == bucket_policy_generation)
