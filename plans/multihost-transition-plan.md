@@ -5002,6 +5002,12 @@ Progress:
   snapshot-sensitive command construction, so re-locking through the client
   would deadlock until the callers are reshaped. The guardrail permits only that
   named raw use.
+- Migrated metadata command replica state/log hash checks, apply-and-record, and
+  abandoned-log record/read through the local node client, and extended the
+  guardrail to keep those command-log paths behind the boundary.
+- Included `cluster/local.rs` command acceptance and open-time command-log
+  convergence in that migration, so the guardrail now scans local cluster
+  production code for the migrated command-log operations too.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

@@ -3,7 +3,9 @@ use std::sync::Arc;
 use placement::NodeId;
 
 use crate::error::{BucketSnapshotLoadError, StoreError};
-use crate::metadata_command::MetadataCommandEnvelope;
+use crate::metadata_command::{
+    MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandReplicaState,
+};
 use crate::node::SharedStorageNode;
 use crate::pg_store::ScavengerShardFileScan;
 use crate::traits::PgMetadataStore;
@@ -132,6 +134,54 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<bool, BucketSnapshotLoadError>;
+
+    fn metadata_command_replica_state(
+        &self,
+        pg_id: PgId,
+    ) -> Result<MetadataCommandReplicaState, StoreError>;
+
+    fn metadata_command_acceptance(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError>;
+
+    fn metadata_command_abandon_acceptance(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError>;
+
+    fn applied_metadata_command_log_entry_hashes(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<Option<(u64, u64)>, StoreError>;
+
+    fn has_matching_applied_metadata_command_log_entry(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        expected_previous_log_hash: u64,
+    ) -> Result<bool, StoreError>;
+
+    fn apply_metadata_command_and_record(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
+
+    fn record_metadata_command_abandoned(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, StoreError>;
+
+    fn metadata_command_abandoned(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError>;
 }
 
 pub(crate) struct LocalStorageNodeClient {
@@ -333,5 +383,81 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<bool, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(PgMetadataStore::durable_bucket_write_drain(&*pg, bucket)?.is_some())
+    }
+
+    fn metadata_command_replica_state(
+        &self,
+        pg_id: PgId,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.metadata_command_replica_state()
+    }
+
+    fn metadata_command_acceptance(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.metadata_command_acceptance(self.node_id.as_u32(), command)
+    }
+
+    fn metadata_command_abandon_acceptance(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.metadata_command_abandon_acceptance(self.node_id.as_u32(), command)
+    }
+
+    fn applied_metadata_command_log_entry_hashes(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.applied_metadata_command_log_entry_hashes(self.node_id.as_u32(), command)
+    }
+
+    fn has_matching_applied_metadata_command_log_entry(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        expected_previous_log_hash: u64,
+    ) -> Result<bool, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.has_matching_applied_metadata_command_log_entry(
+            self.node_id.as_u32(),
+            command,
+            expected_previous_log_hash,
+        )
+    }
+
+    fn apply_metadata_command_and_record(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.apply_metadata_command_and_record(self.node_id.as_u32(), command)
+    }
+
+    fn record_metadata_command_abandoned(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.record_metadata_command_abandoned(self.node_id.as_u32(), command)
+    }
+
+    fn metadata_command_abandoned(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.metadata_command_abandoned(self.node_id.as_u32(), command)
     }
 }

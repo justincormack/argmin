@@ -927,13 +927,8 @@ impl super::StorageCluster {
                     source: source.into(),
                 })?;
             if acceptance == MetadataCommandAcceptance::AlreadyApplied {
-                let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
-                    MetadataCommandApplyFailure {
-                        applied_nodes,
-                        source: source.into(),
-                    }
-                })?;
-                pg.apply_metadata_command_and_record(node.node_id().as_u32(), command)
+                node.storage_client()
+                    .apply_metadata_command_and_record(pg_id, command)
                     .map_err(|source| MetadataCommandApplyFailure {
                         applied_nodes,
                         source,
@@ -954,13 +949,8 @@ impl super::StorageCluster {
                 applied_nodes,
                 source: source.into(),
             })?;
-            let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
-                MetadataCommandApplyFailure {
-                    applied_nodes,
-                    source: source.into(),
-                }
-            })?;
-            pg.apply_metadata_command_and_record(node.node_id().as_u32(), command)
+            node.storage_client()
+                .apply_metadata_command_and_record(pg_id, command)
                 .map_err(|source| MetadataCommandApplyFailure {
                     applied_nodes,
                     source,
@@ -1011,13 +1001,8 @@ impl super::StorageCluster {
             if acceptance == MetadataCommandAcceptance::AlreadyApplied {
                 continue;
             }
-            let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
-                MetadataCommandApplyFailure {
-                    applied_nodes,
-                    source: source.into(),
-                }
-            })?;
-            pg.record_metadata_command_abandoned(node.node_id().as_u32(), command)
+            node.storage_client()
+                .record_metadata_command_abandoned(pg_id, command)
                 .map_err(|source| MetadataCommandApplyFailure {
                     applied_nodes,
                     source: source.into(),
@@ -1039,14 +1024,9 @@ impl super::StorageCluster {
                 source: source.into(),
             })?;
         for (applied_nodes, node) in nodes.into_iter().enumerate() {
-            let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
-                MetadataCommandApplyFailure {
-                    applied_nodes,
-                    source: source.into(),
-                }
-            })?;
-            if pg
-                .metadata_command_abandoned(node.node_id().as_u32(), command)
+            if node
+                .storage_client()
+                .metadata_command_abandoned(pg_id, command)
                 .map_err(|source| MetadataCommandApplyFailure {
                     applied_nodes,
                     source: source.into(),

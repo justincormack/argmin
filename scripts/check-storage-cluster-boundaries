@@ -239,9 +239,12 @@ migrated_metadata_pg_bypasses=$(
         if ($0 ~ /\.storage_client\(\)/) {
             pending_storage_client = 1
         }
-        if ($0 ~ /\.(pending_metadata_command_slot|pending_metadata_command_envelope|try_insert_pending_metadata_command_slot|try_insert_bucket_control_pending_metadata_command_slot|remove_pending_metadata_command_slot|replace_pending_metadata_command_slot_for_reissue)\(/) {
+        if ($0 ~ /\.(pending_metadata_command_slot|pending_metadata_command_envelope|try_insert_pending_metadata_command_slot|try_insert_bucket_control_pending_metadata_command_slot|remove_pending_metadata_command_slot|replace_pending_metadata_command_slot_for_reissue|metadata_command_replica_state|metadata_command_acceptance|metadata_command_abandon_acceptance|applied_metadata_command_log_entry_hashes|has_matching_applied_metadata_command_log_entry|apply_metadata_command_and_record|record_metadata_command_abandoned|metadata_command_abandoned)\(/) {
             if (pending_storage_client || $0 ~ /\.storage_client\(\)/) {
                 pending_storage_client = 0
+                next
+            }
+            if ($0 ~ /storage_client\./) {
                 next
             }
             if (current_fn == "next_metadata_command_id_from_locked_pg_at_least" \
@@ -255,7 +258,8 @@ migrated_metadata_pg_bypasses=$(
         }
     }
     ' crates/storage/src/cluster.rs \
-      crates/storage/src/cluster/request_ops.rs
+      crates/storage/src/cluster/request_ops.rs \
+      crates/storage/src/cluster/local.rs
 )
 fail_with_matches \
     "Production pending metadata command slot operations must go through the node client boundary" \

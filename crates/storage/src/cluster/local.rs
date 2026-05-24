@@ -912,8 +912,9 @@ impl LocalClusterMap {
                 cluster_epoch: self.epoch,
             })?;
 
-        let target_pg = target_node.storage_node().get_pg(target_pg_id.get())?;
-        target_pg.metadata_command_acceptance(target_node_id.as_u32(), command)
+        target_node
+            .storage_client()
+            .metadata_command_acceptance(target_pg_id, command)
     }
 
     pub(crate) fn validate_metadata_command_abandon_for_replica(
@@ -996,8 +997,9 @@ impl LocalClusterMap {
                 pg_id: target_pg_id.get(),
                 cluster_epoch: self.epoch,
             })?;
-        let target_pg = target_node.storage_node().get_pg(target_pg_id.get())?;
-        target_pg.metadata_command_abandon_acceptance(target_node_id.as_u32(), command)
+        target_node
+            .storage_client()
+            .metadata_command_abandon_acceptance(target_pg_id, command)
     }
 
     pub fn place_payload_shards(
@@ -1264,13 +1266,15 @@ fn validate_metadata_command_replay_state(
                 node_id: node_id.as_u32(),
                 source,
             })?;
-            let pending_slot = pg
-                .pending_metadata_command_slot(node_id.as_u32(), cluster_epoch)
+            drop(pg);
+            let pending_command = node
+                .storage_client()
+                .pending_metadata_command_envelope(pg_id, cluster_epoch)
                 .map_err(|source| ClusterBuildError::OpenLocalNode {
                     node_id: node_id.as_u32(),
                     source,
                 })?;
-            if pending_slot.is_some() && node_id != primary_node_id {
+            if pending_command.is_some() && node_id != primary_node_id {
                 return Err(ClusterBuildError::OpenLocalNode {
                     node_id: node_id.as_u32(),
                     source: StoreError::MetadataCommandPendingOnNonPrimary {
@@ -1281,13 +1285,8 @@ fn validate_metadata_command_replay_state(
                     },
                 });
             }
-            if pending_slot.is_some() && node_id == primary_node_id {
-                primary_pending_command = pg
-                    .pending_metadata_command_envelope(node_id.as_u32(), cluster_epoch)
-                    .map_err(|source| ClusterBuildError::OpenLocalNode {
-                        node_id: node_id.as_u32(),
-                        source,
-                    })?;
+            if pending_command.is_some() && node_id == primary_node_id {
+                primary_pending_command = pending_command;
             }
             replica_states.push((node_id, state));
         }
@@ -1342,21 +1341,16 @@ fn clean_terminal_primary_pending_slot_on_open(
     let primary = nodes
         .get(&primary_node_id)
         .expect("validated route primary must be in local node set");
-    let primary_pg = primary
-        .storage_node()
-        .get_pg(pg_id.get())
+    primary
+        .storage_client()
+        .remove_pending_metadata_command_slot(pg_id, command)
         .map_err(|source| ClusterBuildError::OpenLocalNode {
             node_id: primary_node_id.as_u32(),
             source,
         })?;
-    primary_pg
-        .remove_pending_metadata_command_slot(primary_node_id.as_u32(), command)
-        .map_err(|source| ClusterBuildError::OpenLocalNode {
-            node_id: primary_node_id.as_u32(),
-            source,
-        })?;
-    if primary_pg
-        .pending_metadata_command_slot(primary_node_id.as_u32(), cluster_epoch)
+    if primary
+        .storage_client()
+        .pending_metadata_command_envelope(pg_id, cluster_epoch)
         .map_err(|source| ClusterBuildError::OpenLocalNode {
             node_id: primary_node_id.as_u32(),
             source,
@@ -1463,13 +1457,8 @@ fn converge_in_flight_metadata_command_on_open(
     nodes_primary_last.sort_by_key(|(node_id, _node)| **node_id == primary_node_id);
     for (node_id, node) in nodes_primary_last {
         validate_open_metadata_command_bucket_write_reservation(nodes, pg_routes, command)?;
-        let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
-            ClusterBuildError::OpenLocalNode {
-                node_id: node_id.as_u32(),
-                source,
-            }
-        })?;
-        pg.apply_metadata_command_and_record(node_id.as_u32(), command)
+        node.storage_client()
+            .apply_metadata_command_and_record(pg_id, command)
             .map_err(|source| ClusterBuildError::OpenLocalNode {
                 node_id: node_id.as_u32(),
                 source: bucket_snapshot_error_to_store_error(source),
@@ -1779,15 +1768,10 @@ fn validate_metadata_command_replica_agreement_or_in_flight_recovery(
             let node = nodes
                 .get(node_id)
                 .expect("replica state node must exist in local node set");
-            let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
-                ClusterBuildError::OpenLocalNode {
-                    node_id: node_id.as_u32(),
-                    source,
-                }
-            })?;
-            let matches_pending = pg
+            let matches_pending = node
+                .storage_client()
                 .has_matching_applied_metadata_command_log_entry(
-                    node_id.as_u32(),
+                    pg_id,
                     command,
                     unadvanced_state.applied_log_hash,
                 )
@@ -1848,15 +1832,10 @@ fn validate_metadata_command_replica_agreement_or_in_flight_recovery(
         let node = nodes
             .get(node_id)
             .expect("replica state node must exist in local node set");
-        let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
-            ClusterBuildError::OpenLocalNode {
-                node_id: node_id.as_u32(),
-                source,
-            }
-        })?;
-        let matches_pending = pg
+        let matches_pending = node
+            .storage_client()
             .has_matching_applied_metadata_command_log_entry(
-                node_id.as_u32(),
+                pg_id,
                 command,
                 primary_state.applied_log_hash,
             )
