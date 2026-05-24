@@ -34,6 +34,8 @@ pub mod pg_store;
 pub mod pg_topology;
 pub mod schema;
 pub mod shard_key_hash;
+#[allow(dead_code)]
+pub(crate) mod storage_rpc;
 pub mod traits;
 pub mod types;
 
