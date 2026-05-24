@@ -5,13 +5,16 @@ use placement::NodeId;
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{
     MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandReplicaState,
+    ObjectPayloadReclaimCommand,
 };
 use crate::node::SharedStorageNode;
 use crate::pg_store::ScavengerShardFileScan;
 use crate::traits::PgMetadataStore;
 use crate::types::{
-    BucketName, BucketState, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
-    DataPgId, GenerationId, ObjectKey, PgId, ShardKey, WriteAck,
+    BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot, BucketName, BucketState,
+    BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch, DataPgId, GenerationId,
+    LifecycleSweepClaimRecord, LifecycleSweepRoot, ObjectKey, ObjectPayloadReclaimClaimRecord,
+    ObjectPayloadReclaimKind, PayloadReclaimRoot, PgId, ShardKey, WriteAck,
 };
 
 pub(crate) trait StorageNodeClient: Send + Sync {
@@ -198,6 +201,117 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<Vec<BucketWriteReservationRecord>, BucketSnapshotLoadError>;
+
+    fn get_bucket_payload_reclaim_root(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError>;
+
+    fn get_payload_reclaim_root(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError>;
+
+    fn get_object_payload_reclaim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<Option<ObjectPayloadReclaimCommand>, BucketSnapshotLoadError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_object_payload_reclaim_claim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        reclaim_kind: ObjectPayloadReclaimKind,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError>;
+
+    fn release_object_payload_reclaim_claim(
+        &self,
+        pg_id: PgId,
+        claim: &ObjectPayloadReclaimClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError>;
+
+    fn get_bucket_delete_finalize_roots(
+        &self,
+        pg_id: PgId,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<BucketDeleteFinalizeRoot>, BucketSnapshotLoadError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_bucket_delete_finalize_claim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError>;
+
+    fn release_bucket_delete_finalize_claim(
+        &self,
+        pg_id: PgId,
+        claim: &BucketDeleteFinalizeClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError>;
+
+    fn get_lifecycle_sweep_roots(
+        &self,
+        pg_id: PgId,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<LifecycleSweepRoot>, BucketSnapshotLoadError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_lifecycle_sweep_claim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<LifecycleSweepClaimRecord>, BucketSnapshotLoadError>;
+
+    fn heartbeat_lifecycle_sweep_claim(
+        &self,
+        pg_id: PgId,
+        claim: &LifecycleSweepClaimRecord,
+        heartbeat_at: u64,
+        lease_deadline: Option<u64>,
+    ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError>;
+
+    fn record_lifecycle_sweep_claim_error(
+        &self,
+        pg_id: PgId,
+        claim: &LifecycleSweepClaimRecord,
+        last_error: &str,
+    ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError>;
+
+    fn release_lifecycle_sweep_claim(
+        &self,
+        pg_id: PgId,
+        claim: &LifecycleSweepClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError>;
 
     fn metadata_command_replica_state(
         &self,
@@ -617,6 +731,242 @@ impl StorageNodeClient for LocalStorageNodeClient {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(PgMetadataStore::durable_bucket_write_reservations(
             &*pg, bucket,
+        )?)
+    }
+
+    fn get_bucket_payload_reclaim_root(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::get_bucket_payload_reclaim_root(
+            &*pg, bucket,
+        )?)
+    }
+
+    fn get_payload_reclaim_root(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::get_payload_reclaim_root(&*pg)?)
+    }
+
+    fn get_object_payload_reclaim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<Option<ObjectPayloadReclaimCommand>, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        if let Some(reclaim) =
+            PgMetadataStore::get_object_segments_reclaim(&*pg, bucket, key, generation_id)?
+        {
+            Ok(Some(ObjectPayloadReclaimCommand::Segments(reclaim)))
+        } else {
+            Ok(
+                PgMetadataStore::get_multipart_reclaim(&*pg, bucket, key, generation_id)?
+                    .map(ObjectPayloadReclaimCommand::Multipart),
+            )
+        }
+    }
+
+    fn acquire_object_payload_reclaim_claim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        reclaim_kind: ObjectPayloadReclaimKind,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::acquire_object_payload_reclaim_claim(
+            &*pg,
+            bucket,
+            bucket_incarnation_generation,
+            key,
+            generation_id,
+            reclaim_kind,
+            claim_id,
+            owner_token,
+            cluster_epoch,
+            claimed_at,
+            lease_deadline,
+            now,
+        )?)
+    }
+
+    fn release_object_payload_reclaim_claim(
+        &self,
+        pg_id: PgId,
+        claim: &ObjectPayloadReclaimClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::release_object_payload_reclaim_claim(
+            &*pg,
+            &claim.bucket,
+            claim.bucket_incarnation_generation,
+            &claim.key,
+            claim.generation_id,
+            claim.reclaim_kind,
+            &claim.claim_id,
+            &claim.owner_token,
+            claim.cluster_epoch,
+        )?)
+    }
+
+    fn get_bucket_delete_finalize_roots(
+        &self,
+        pg_id: PgId,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<BucketDeleteFinalizeRoot>, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::get_bucket_delete_finalize_roots(
+            &*pg, now, limit,
+        )?)
+    }
+
+    fn acquire_bucket_delete_finalize_claim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::acquire_bucket_delete_finalize_claim(
+            &*pg,
+            bucket,
+            bucket_incarnation_generation,
+            claim_id,
+            owner_token,
+            cluster_epoch,
+            claimed_at,
+            lease_deadline,
+            now,
+        )?)
+    }
+
+    fn release_bucket_delete_finalize_claim(
+        &self,
+        pg_id: PgId,
+        claim: &BucketDeleteFinalizeClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::release_bucket_delete_finalize_claim(
+            &*pg,
+            &claim.bucket,
+            claim.bucket_incarnation_generation,
+            &claim.claim_id,
+            &claim.owner_token,
+            claim.cluster_epoch,
+        )?)
+    }
+
+    fn get_lifecycle_sweep_roots(
+        &self,
+        pg_id: PgId,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<LifecycleSweepRoot>, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::get_lifecycle_sweep_roots(
+            &*pg, now, limit,
+        )?)
+    }
+
+    fn acquire_lifecycle_sweep_claim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<LifecycleSweepClaimRecord>, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::acquire_lifecycle_sweep_claim(
+            &*pg,
+            bucket,
+            bucket_incarnation_generation,
+            claim_id,
+            owner_token,
+            cluster_epoch,
+            claimed_at,
+            lease_deadline,
+            now,
+        )?)
+    }
+
+    fn heartbeat_lifecycle_sweep_claim(
+        &self,
+        pg_id: PgId,
+        claim: &LifecycleSweepClaimRecord,
+        heartbeat_at: u64,
+        lease_deadline: Option<u64>,
+    ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::heartbeat_lifecycle_sweep_claim(
+            &*pg,
+            &claim.bucket,
+            claim.bucket_incarnation_generation,
+            &claim.claim_id,
+            &claim.owner_token,
+            claim.cluster_epoch,
+            heartbeat_at,
+            lease_deadline,
+        )?)
+    }
+
+    fn record_lifecycle_sweep_claim_error(
+        &self,
+        pg_id: PgId,
+        claim: &LifecycleSweepClaimRecord,
+        last_error: &str,
+    ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::record_lifecycle_sweep_claim_error(
+            &*pg,
+            &claim.bucket,
+            claim.bucket_incarnation_generation,
+            &claim.claim_id,
+            &claim.owner_token,
+            claim.cluster_epoch,
+            last_error,
+        )?)
+    }
+
+    fn release_lifecycle_sweep_claim(
+        &self,
+        pg_id: PgId,
+        claim: &LifecycleSweepClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::release_lifecycle_sweep_claim(
+            &*pg,
+            &claim.bucket,
+            claim.bucket_incarnation_generation,
+            &claim.claim_id,
+            &claim.owner_token,
+            claim.cluster_epoch,
         )?)
     }
 

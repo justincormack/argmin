@@ -5012,6 +5012,11 @@ Progress:
   drain begin/clear, and reservation-list operations through the local node
   client, including open-time reservation validation/release. Added a guardrail
   for production raw `PgMetadataStore` bucket write coordination calls.
+- Migrated durable object reclaim root scanning, object reclaim load/claim
+  acquire/release, bucket-delete finalizer root scan/acquire/release, and
+  lifecycle sweep root/claim acquire/heartbeat/error/release through the local
+  node client. Added a guardrail for production raw finalizer/reclaim/lifecycle
+  worker root and claim calls in cluster code.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

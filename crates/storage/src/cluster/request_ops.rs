@@ -2101,18 +2101,23 @@ impl super::StorageCluster {
         let owner_token = self.bucket_write_owner_token();
         let claimed_at = crate::clock::current_time_millis();
         let claim = {
-            let bucket_pg = self.metadata_pg(bucket_pg_id)?;
-            PgMetadataStore::acquire_bucket_delete_finalize_claim(
-                &*bucket_pg,
-                bucket,
-                bucket_incarnation_generation,
-                &claim_id,
-                &owner_token,
-                self.operation_epoch(),
-                claimed_at,
-                claimed_at.checked_add(60_000),
-                claimed_at,
-            )?
+            let bucket_node = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), PgId::new(bucket_pg_id))?;
+            bucket_node
+                .storage_client()
+                .acquire_bucket_delete_finalize_claim(
+                    PgId::new(bucket_pg_id),
+                    bucket,
+                    bucket_incarnation_generation,
+                    &claim_id,
+                    &owner_token,
+                    self.operation_epoch(),
+                    claimed_at,
+                    claimed_at.checked_add(60_000),
+                    claimed_at,
+                )
+                .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
         };
         let Some(claim) = claim else {
             let _ = observability::event(
@@ -2124,15 +2129,13 @@ impl super::StorageCluster {
         };
 
         let release_finalizer_claim = || -> Result<(), BucketWriteDrainError> {
-            let bucket_pg = self.metadata_pg(bucket_pg_id)?;
-            PgMetadataStore::release_bucket_delete_finalize_claim(
-                &*bucket_pg,
-                bucket,
-                bucket_incarnation_generation,
-                &claim.claim_id,
-                &claim.owner_token,
-                claim.cluster_epoch,
-            )?;
+            let bucket_node = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), PgId::new(bucket_pg_id))?;
+            bucket_node
+                .storage_client()
+                .release_bucket_delete_finalize_claim(PgId::new(bucket_pg_id), &claim)
+                .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
             Ok(())
         };
 
@@ -2246,8 +2249,14 @@ impl super::StorageCluster {
     ) -> Result<Vec<PayloadReclaimRoot>, BucketWriteDrainError> {
         let mut roots = Vec::new();
         for pg_id in self.metadata_pg_ids() {
-            let pg = self.metadata_pg(pg_id)?;
-            if let Some(root) = PgMetadataStore::get_bucket_payload_reclaim_root(&*pg, bucket)? {
+            let node = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
+            if let Some(root) = node
+                .storage_client()
+                .get_bucket_payload_reclaim_root(PgId::new(pg_id), bucket)
+                .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
+            {
                 roots.push(root);
             }
         }
@@ -3006,12 +3015,18 @@ impl super::StorageCluster {
     ) -> Result<Vec<LifecycleSweepRoot>, ObjectPgActionError> {
         let mut roots = Vec::new();
         for pg_id in self.metadata_pg_ids() {
-            let pg = self.metadata_pg(pg_id)?;
-            roots.extend(PgMetadataStore::get_lifecycle_sweep_roots(
-                &*pg,
-                now,
-                LIFECYCLE_SWEEP_ROOT_SCAN_LIMIT_PER_PG,
-            )?);
+            let node = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
+            roots.extend(
+                node.storage_client()
+                    .get_lifecycle_sweep_roots(
+                        PgId::new(pg_id),
+                        now,
+                        LIFECYCLE_SWEEP_ROOT_SCAN_LIMIT_PER_PG,
+                    )
+                    .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?,
+            );
         }
         for bucket in self.list_lifecycle_sweep_buckets()?.aborting_buckets {
             match self.head_bucket_info(&bucket) {
@@ -3051,18 +3066,23 @@ impl super::StorageCluster {
     ) -> Result<Option<LifecycleSweepClaimRecord>, ObjectPgActionError> {
         let claim_id = self.next_lifecycle_sweep_claim_id()?;
         let owner_token = self.bucket_write_owner_token();
-        let bucket_pg = self.metadata_pg(self.bucket_metadata_pg_id(bucket))?;
-        Ok(PgMetadataStore::acquire_lifecycle_sweep_claim(
-            &*bucket_pg,
-            bucket,
-            bucket_incarnation_generation,
-            &claim_id,
-            &owner_token,
-            self.operation_epoch(),
-            now,
-            now.checked_add(LIFECYCLE_SWEEP_CLAIM_LEASE_MILLIS),
-            now,
-        )?)
+        let pg_id = self.bucket_metadata_pg_id(bucket);
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
+        node.storage_client()
+            .acquire_lifecycle_sweep_claim(
+                PgId::new(pg_id),
+                bucket,
+                bucket_incarnation_generation,
+                &claim_id,
+                &owner_token,
+                self.operation_epoch(),
+                now,
+                now.checked_add(LIFECYCLE_SWEEP_CLAIM_LEASE_MILLIS),
+                now,
+            )
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
     }
 
     pub fn heartbeat_lifecycle_sweep_claim(
@@ -3070,17 +3090,18 @@ impl super::StorageCluster {
         claim: &LifecycleSweepClaimRecord,
         now: u64,
     ) -> Result<LifecycleSweepClaimRecord, ObjectPgActionError> {
-        let bucket_pg = self.metadata_pg(self.bucket_metadata_pg_id(&claim.bucket))?;
-        Ok(PgMetadataStore::heartbeat_lifecycle_sweep_claim(
-            &*bucket_pg,
-            &claim.bucket,
-            claim.bucket_incarnation_generation,
-            &claim.claim_id,
-            &claim.owner_token,
-            claim.cluster_epoch,
-            now,
-            now.checked_add(LIFECYCLE_SWEEP_CLAIM_LEASE_MILLIS),
-        )?)
+        let pg_id = self.bucket_metadata_pg_id(&claim.bucket);
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
+        node.storage_client()
+            .heartbeat_lifecycle_sweep_claim(
+                PgId::new(pg_id),
+                claim,
+                now,
+                now.checked_add(LIFECYCLE_SWEEP_CLAIM_LEASE_MILLIS),
+            )
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
     }
 
     pub fn record_lifecycle_sweep_claim_error(
@@ -3088,31 +3109,26 @@ impl super::StorageCluster {
         claim: &LifecycleSweepClaimRecord,
         last_error: &str,
     ) -> Result<LifecycleSweepClaimRecord, ObjectPgActionError> {
-        let bucket_pg = self.metadata_pg(self.bucket_metadata_pg_id(&claim.bucket))?;
-        Ok(PgMetadataStore::record_lifecycle_sweep_claim_error(
-            &*bucket_pg,
-            &claim.bucket,
-            claim.bucket_incarnation_generation,
-            &claim.claim_id,
-            &claim.owner_token,
-            claim.cluster_epoch,
-            last_error,
-        )?)
+        let pg_id = self.bucket_metadata_pg_id(&claim.bucket);
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
+        node.storage_client()
+            .record_lifecycle_sweep_claim_error(PgId::new(pg_id), claim, last_error)
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
     }
 
     pub fn release_lifecycle_sweep_claim(
         &self,
         claim: &LifecycleSweepClaimRecord,
     ) -> Result<(), ObjectPgActionError> {
-        let bucket_pg = self.metadata_pg(self.bucket_metadata_pg_id(&claim.bucket))?;
-        Ok(PgMetadataStore::release_lifecycle_sweep_claim(
-            &*bucket_pg,
-            &claim.bucket,
-            claim.bucket_incarnation_generation,
-            &claim.claim_id,
-            &claim.owner_token,
-            claim.cluster_epoch,
-        )?)
+        let pg_id = self.bucket_metadata_pg_id(&claim.bucket);
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
+        node.storage_client()
+            .release_lifecycle_sweep_claim(PgId::new(pg_id), claim)
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
     }
 
     pub fn list_all_objects_for_bucket(
@@ -5787,7 +5803,11 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<bool, ObjectPgActionError> {
-        let node = self.object_metadata_primary_node(bucket, key)?;
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let node_store = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let node = node_store.storage_node();
         if self
             .local_map
             .object_payload_lease_count(bucket, key, generation_id)
@@ -5796,7 +5816,6 @@ impl super::StorageCluster {
             return Ok(false);
         }
 
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
             let matching_reclaim_delete = matches!(
                 command.payload(),
@@ -5824,7 +5843,6 @@ impl super::StorageCluster {
         }
 
         let reclaim = {
-            let meta_pg = node.get_pg(pg_id.get())?;
             if self
                 .local_map
                 .object_payload_lease_count(bucket, key, generation_id)
@@ -5833,14 +5851,10 @@ impl super::StorageCluster {
                 return Ok(false);
             }
 
-            if let Some(reclaim) =
-                PgMetadataStore::get_object_segments_reclaim(&*meta_pg, bucket, key, generation_id)?
-            {
-                Some(ObjectPayloadReclaimCommand::Segments(reclaim))
-            } else {
-                PgMetadataStore::get_multipart_reclaim(&*meta_pg, bucket, key, generation_id)?
-                    .map(ObjectPayloadReclaimCommand::Multipart)
-            }
+            node_store
+                .storage_client()
+                .get_object_payload_reclaim(pg_id, bucket, key, generation_id)
+                .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
         };
 
         let Some(reclaim) = reclaim else {
@@ -5862,10 +5876,10 @@ impl super::StorageCluster {
         let claim_id = self.next_object_payload_reclaim_claim_id()?;
         let owner_token = self.bucket_write_owner_token();
         let claimed_at = crate::clock::current_time_millis();
-        let claim = {
-            let meta_pg = node.get_pg(pg_id.get())?;
-            PgMetadataStore::acquire_object_payload_reclaim_claim(
-                &*meta_pg,
+        let claim = node_store
+            .storage_client()
+            .acquire_object_payload_reclaim_claim(
+                pg_id,
                 bucket,
                 bucket_incarnation_generation,
                 key,
@@ -5877,26 +5891,17 @@ impl super::StorageCluster {
                 claimed_at,
                 claimed_at.checked_add(60_000),
                 claimed_at,
-            )?
-        };
+            )
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
         let Some(claim) = claim else {
             return Ok(false);
         };
 
         let release_reclaim_claim = || -> Result<(), ObjectPgActionError> {
-            let meta_pg = node.get_pg(pg_id.get())?;
-            PgMetadataStore::release_object_payload_reclaim_claim(
-                &*meta_pg,
-                bucket,
-                bucket_incarnation_generation,
-                key,
-                generation_id,
-                reclaim_kind,
-                &claim.claim_id,
-                &claim.owner_token,
-                claim.cluster_epoch,
-            )?;
-            Ok(())
+            node_store
+                .storage_client()
+                .release_object_payload_reclaim_claim(pg_id, &claim)
+                .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
         };
 
         if !self
@@ -6042,8 +6047,11 @@ impl super::StorageCluster {
 
         let mut scan = DurableObjectPayloadReclaimScan::default();
         for pg_id in self.metadata_pg_ids() {
-            let pg = match self.metadata_pg(pg_id) {
-                Ok(pg) => pg,
+            let node = match self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))
+            {
+                Ok(node) => node,
                 Err(error) => {
                     scan.errors += 1;
                     let _ = observability::event(
@@ -6054,7 +6062,10 @@ impl super::StorageCluster {
                     continue;
                 }
             };
-            let root = match PgMetadataStore::get_payload_reclaim_root(&*pg) {
+            let root = match node
+                .storage_client()
+                .get_payload_reclaim_root(PgId::new(pg_id))
+            {
                 Ok(root) => root,
                 Err(error) => {
                     scan.errors += 1;
@@ -6092,8 +6103,11 @@ impl super::StorageCluster {
 
         let mut scan = DurableBucketDeleteFinalizeScan::default();
         for pg_id in self.metadata_pg_ids() {
-            let pg = match self.metadata_pg(pg_id) {
-                Ok(pg) => pg,
+            let node = match self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))
+            {
+                Ok(node) => node,
                 Err(error) => {
                     scan.errors += 1;
                     let _ = observability::event(
@@ -6104,8 +6118,8 @@ impl super::StorageCluster {
                     continue;
                 }
             };
-            let roots = match PgMetadataStore::get_bucket_delete_finalize_roots(
-                &*pg,
+            let roots = match node.storage_client().get_bucket_delete_finalize_roots(
+                PgId::new(pg_id),
                 crate::clock::current_time_millis(),
                 BUCKET_DELETE_FINALIZE_SCAN_LIMIT_PER_PG,
             ) {
