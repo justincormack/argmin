@@ -14,9 +14,9 @@ use crate::traits::PgMetadataStore;
 use crate::types::{
     BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot, BucketFastPathIdentity, BucketName,
     BucketSnapshot, BucketSnapshotRequest, BucketState, BucketWriteDrainRecord,
-    BucketWriteReservationRecord, ClusterEpoch, DataPgId, GenerationId, LifecycleSweepClaimRecord,
-    LifecycleSweepRoot, ObjectKey, ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind,
-    PayloadReclaimRoot, PgId, ShardKey, WriteAck,
+    BucketWriteReservationRecord, ClusterEpoch, DataPgId, GenerationId, LifecycleSweepBuckets,
+    LifecycleSweepClaimRecord, LifecycleSweepRoot, ObjectKey, ObjectPayloadReclaimClaimRecord,
+    ObjectPayloadReclaimKind, PayloadReclaimRoot, PgId, ShardKey, WriteAck,
 };
 
 pub(crate) trait StorageNodeClient: Send + Sync {
@@ -298,6 +298,11 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         now: u64,
         limit: usize,
     ) -> Result<Vec<LifecycleSweepRoot>, BucketSnapshotLoadError>;
+
+    fn list_lifecycle_sweep_buckets(
+        &self,
+        pg_id: PgId,
+    ) -> Result<LifecycleSweepBuckets, BucketSnapshotLoadError>;
 
     #[allow(clippy::too_many_arguments)]
     fn acquire_lifecycle_sweep_claim(
@@ -937,6 +942,17 @@ impl StorageNodeClient for LocalStorageNodeClient {
         Ok(PgMetadataStore::get_lifecycle_sweep_roots(
             &*pg, now, limit,
         )?)
+    }
+
+    fn list_lifecycle_sweep_buckets(
+        &self,
+        pg_id: PgId,
+    ) -> Result<LifecycleSweepBuckets, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(LifecycleSweepBuckets {
+            lifecycle_buckets: PgMetadataStore::list_buckets_with_lifecycle(&*pg)?,
+            aborting_buckets: PgMetadataStore::list_buckets_with_aborting_multipart_uploads(&*pg)?,
+        })
     }
 
     fn acquire_lifecycle_sweep_claim(

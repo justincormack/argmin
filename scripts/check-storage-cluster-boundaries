@@ -429,7 +429,10 @@ migrated_background_worker_bypasses=$(
         if (in_test_hook) {
             next
         }
-        if ($0 ~ /PgMetadataStore::(get_bucket_payload_reclaim_root|get_payload_reclaim_root|get_object_segments_reclaim|get_multipart_reclaim|acquire_object_payload_reclaim_claim|release_object_payload_reclaim_claim|get_bucket_delete_finalize_roots|acquire_bucket_delete_finalize_claim|release_bucket_delete_finalize_claim|get_lifecycle_sweep_roots|acquire_lifecycle_sweep_claim|heartbeat_lifecycle_sweep_claim|record_lifecycle_sweep_claim_error|release_lifecycle_sweep_claim)/) {
+        if ($0 ~ /PgMetadataStore::(get_bucket_payload_reclaim_root|get_payload_reclaim_root|get_object_segments_reclaim|get_multipart_reclaim|acquire_object_payload_reclaim_claim|release_object_payload_reclaim_claim|get_bucket_delete_finalize_roots|acquire_bucket_delete_finalize_claim|release_bucket_delete_finalize_claim|get_lifecycle_sweep_roots|list_buckets_with_lifecycle|list_buckets_with_aborting_multipart_uploads|acquire_lifecycle_sweep_claim|heartbeat_lifecycle_sweep_claim|record_lifecycle_sweep_claim_error|release_lifecycle_sweep_claim)/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        if ($0 ~ /\.(list_buckets_with_lifecycle|list_buckets_with_aborting_multipart_uploads)\(/) {
             print FILENAME ":" FNR ":" $0
         }
     }

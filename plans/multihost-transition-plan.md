@@ -5027,6 +5027,10 @@ Progress:
   preserves ordered multi-PG locking for pair snapshots. The boundary guardrail
   now allows only that function; migrating pair snapshots needs a pair-shaped
   client/RPC model rather than accidentally weakening the lock ordering.
+- Migrated lifecycle sweep bucket discovery for lifecycle-config buckets and
+  aborting multipart upload buckets through the local node client, and extended
+  the background-worker guardrail so production cluster code cannot call the raw
+  lifecycle bucket discovery PG methods directly.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

@@ -3008,9 +3008,15 @@ impl super::StorageCluster {
         let mut lifecycle_buckets = Vec::new();
         let mut aborting_buckets = Vec::new();
         for pg_id in self.metadata_pg_ids() {
-            let pg = self.metadata_pg(pg_id)?;
-            lifecycle_buckets.extend(pg.list_buckets_with_lifecycle()?);
-            aborting_buckets.extend(pg.list_buckets_with_aborting_multipart_uploads()?);
+            let node = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
+            let buckets = node
+                .storage_client()
+                .list_lifecycle_sweep_buckets(PgId::new(pg_id))
+                .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+            lifecycle_buckets.extend(buckets.lifecycle_buckets);
+            aborting_buckets.extend(buckets.aborting_buckets);
         }
         lifecycle_buckets.sort_by(|a, b| a.name.cmp(&b.name));
         aborting_buckets.sort();
